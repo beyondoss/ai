@@ -2,20 +2,20 @@
   "spec": "exec protocol v1.4 sandbox job notify (crates/agent/src/exec_endpoint.rs, \"Sandbox job notify (v1.4)\"), \"The callback request\" and \"The receiver\"",
   "notes": [
     "requests: what an endpoint sends for a job kept with notify. body is the exact bytes; headers lists every header the endpoint must send (others the HTTP client adds, such as Host and Content-Length, are not listed, and a Cookie header is forbidden).",
-    "receiver: one POST to /_beyond/agent?session_id=<grant.session_id> carrying a verified session grant for grant.tenant and grant.session_id, plus request.authorization and request.body. state is what the replica holds: notify_key (it holds the verifier keys of v1.4-token.json), session_exists (the session is in storage), job (running: the sandbox still runs it; recorded_ended: the session has already recorded its end; absent: the sandbox has no such job), reconcile (ok, or fails: the sandbox cannot be listed). expect: the HTTP status, whether the session may be opened or started, and whether anything is sent to the sandbox.",
-    "authorization null means no Authorization header."
+    "receiver: one request to /_beyond/agent?session_id=<grant.session_id>&keep=<generation>. request.grant is the session grant the edge attached for grant.tenant and grant.session_id: callback (it carries \"purpose\": \"job_ended\"), user (an ordinary grant), or failing (one that does not verify at this replica). request.authorization lists the request's Authorization header values, in order (empty: none). state is what the replica holds: notify_key (it holds the verifier keys of v1.4-token.json), session_exists (the session is in storage), job (released: the session tracks it released and the sandbox still runs it; ended_unreported: the sandbox has it ended and the ledger does not mark its end reported; held: the session holds its stream and the callback is not its proof; end_reported: the ledger marks its end reported; no_record: the transcript's ledger has no record of it), reconcile (ok, or fails: the sandbox cannot be listed), run_in_flight (a run holds the session). expect: the HTTP status, whether the session may be opened or reached, and whether anything is sent to the sandbox.",
+    "edge: how the edge classifies a request by its Authorization header values (E1, with the rules of N30): callback (forwarded with a callback grant), user (handled as any user request), or refused with status, never forwarded."
   ],
   "keep": {
     "scope": "2ff302a37e7401aa95f92ec6c431944a",
     "id": "0123456789abcdef",
-    "url": "https://edge.example/_beyond/agent?session_id=a07-s3.01J9ZQ4N6V",
+    "url": "https://edge.example/_beyond/agent?session_id=a07-s3.01J9ZQ4N6V&keep=5be0c2a19f3d7e41",
     "token": "bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
   },
   "requests": [
     {
       "name": "every attempt, whatever the job's state",
       "method": "POST",
-      "url": "https://edge.example/_beyond/agent?session_id=a07-s3.01J9ZQ4N6V",
+      "url": "https://edge.example/_beyond/agent?session_id=a07-s3.01J9ZQ4N6V&keep=5be0c2a19f3d7e41",
       "headers": {
         "Content-Type": "application/json",
         "Authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
@@ -27,7 +27,7 @@
       "max_body_bytes": 512,
       "covers": [
         "N7",
-        "N13"
+        "N18"
       ]
     }
   ],
@@ -37,17 +37,21 @@
   },
   "receiver": [
     {
-      "name": "a verified callback for a running job: a reconcile, then 200",
+      "name": "a verified callback for a released running job: a live reconcile, then 200",
       "request": {
         "method": "POST",
-        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "grant": "callback",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "notify_key": true,
         "session_exists": true,
-        "job": "running",
-        "reconcile": "ok"
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
       },
       "expect": {
         "status": 200,
@@ -55,23 +59,80 @@
         "contacts_sandbox": true
       },
       "covers": [
-        "N25",
-        "N29",
-        "N32"
+        "N32",
+        "N40",
+        "N43"
       ]
     },
     {
-      "name": "a repeat for a job whose end is recorded",
+      "name": "the same while a run is in flight: served, never busy",
       "request": {
         "method": "POST",
-        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "grant": "callback",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "notify_key": true,
         "session_exists": true,
-        "job": "recorded_ended",
-        "reconcile": "ok"
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": true
+      },
+      "expect": {
+        "status": 200,
+        "opens_session": true,
+        "contacts_sandbox": true
+      },
+      "covers": [
+        "N35",
+        "N40"
+      ]
+    },
+    {
+      "name": "a released job that ended and is not reported yet",
+      "request": {
+        "method": "POST",
+        "grant": "callback",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "ended_unreported",
+        "reconcile": "ok",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 200,
+        "opens_session": true,
+        "contacts_sandbox": true
+      },
+      "covers": [
+        "N40"
+      ]
+    },
+    {
+      "name": "a repeat for a job whose end the ledger marks reported",
+      "request": {
+        "method": "POST",
+        "grant": "callback",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "end_reported",
+        "reconcile": "ok",
+        "run_in_flight": false
       },
       "expect": {
         "status": 200,
@@ -79,43 +140,77 @@
         "contacts_sandbox": false
       },
       "covers": [
-        "N31"
+        "N42"
       ]
     },
     {
-      "name": "the sandbox has no such job after the reconcile",
+      "name": "a callback for a job the session holds a stream to, not its proof",
       "request": {
         "method": "POST",
-        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "grant": "callback",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "notify_key": true,
         "session_exists": true,
-        "job": "absent",
-        "reconcile": "ok"
+        "job": "held",
+        "reconcile": "ok",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 200,
+        "opens_session": true,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N42"
+      ]
+    },
+    {
+      "name": "the ledger has no record of the job",
+      "request": {
+        "method": "POST",
+        "grant": "callback",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "no_record",
+        "reconcile": "ok",
+        "run_in_flight": false
       },
       "expect": {
         "status": 410,
         "opens_session": true,
-        "contacts_sandbox": true
+        "contacts_sandbox": false
       },
       "covers": [
-        "N29"
+        "N40"
       ]
     },
     {
       "name": "the reconcile cannot list the sandbox",
       "request": {
         "method": "POST",
-        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "grant": "callback",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "notify_key": true,
         "session_exists": true,
-        "job": "running",
-        "reconcile": "fails"
+        "job": "released",
+        "reconcile": "fails",
+        "run_in_flight": false
       },
       "expect": {
         "status": 503,
@@ -123,21 +218,25 @@
         "contacts_sandbox": true
       },
       "covers": [
-        "N29"
+        "N40"
       ]
     },
     {
-      "name": "no Authorization: a grant alone",
+      "name": "a user grant cannot end a job, whatever the header",
       "request": {
         "method": "POST",
-        "authorization": null,
+        "grant": "user",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "notify_key": true,
         "session_exists": true,
-        "job": "running",
-        "reconcile": "ok"
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
       },
       "expect": {
         "status": 403,
@@ -145,21 +244,283 @@
         "contacts_sandbox": false
       },
       "covers": [
-        "N24"
+        "N28",
+        "N32"
       ]
     },
     {
-      "name": "a replica with no notify key",
+      "name": "a user grant with no Authorization",
       "request": {
         "method": "POST",
-        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "grant": "user",
+        "authorization": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
-        "notify_key": false,
+        "notify_key": true,
         "session_exists": true,
-        "job": "running",
-        "reconcile": "ok"
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 403,
+        "opens_session": false,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N28"
+      ]
+    },
+    {
+      "name": "a callback grant on another command",
+      "request": {
+        "method": "POST",
+        "grant": "callback",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "body": "{\"type\":\"prompt\",\"message\":\"hi\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 403,
+        "opens_session": false,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N28",
+        "N32"
+      ]
+    },
+    {
+      "name": "a callback grant on a GET (a WebSocket upgrade)",
+      "request": {
+        "method": "GET",
+        "grant": "callback",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "body": ""
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 403,
+        "opens_session": false,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N28",
+        "N32"
+      ]
+    },
+    {
+      "name": "a callback grant with no Authorization: the edge and the replica disagree",
+      "request": {
+        "method": "POST",
+        "grant": "callback",
+        "authorization": [],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 503,
+        "opens_session": false,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N30"
+      ]
+    },
+    {
+      "name": "a callback grant with two Authorization headers",
+      "request": {
+        "method": "POST",
+        "grant": "callback",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 503,
+        "opens_session": false,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N30"
+      ]
+    },
+    {
+      "name": "the scheme in lower case",
+      "request": {
+        "method": "POST",
+        "grant": "callback",
+        "authorization": [
+          "bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 200,
+        "opens_session": true,
+        "contacts_sandbox": true
+      },
+      "covers": [
+        "N30"
+      ]
+    },
+    {
+      "name": "two spaces after the scheme",
+      "request": {
+        "method": "POST",
+        "grant": "callback",
+        "authorization": [
+          "Bearer  bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 200,
+        "opens_session": true,
+        "contacts_sandbox": true
+      },
+      "covers": [
+        "N30"
+      ]
+    },
+    {
+      "name": "spaces around the value are not part of it",
+      "request": {
+        "method": "POST",
+        "grant": "callback",
+        "authorization": [
+          " Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg "
+        ],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 200,
+        "opens_session": true,
+        "contacts_sandbox": true
+      },
+      "covers": [
+        "N30"
+      ]
+    },
+    {
+      "name": "a tab after the scheme",
+      "request": {
+        "method": "POST",
+        "grant": "callback",
+        "authorization": [
+          "Bearer\tbjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 503,
+        "opens_session": false,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N30"
+      ]
+    },
+    {
+      "name": "a grant that fails on a request that looks like a callback: the fleet's fault",
+      "request": {
+        "method": "POST",
+        "grant": "failing",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 503,
+        "opens_session": false,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N32"
+      ]
+    },
+    {
+      "name": "a grant that fails on a request with no Authorization",
+      "request": {
+        "method": "POST",
+        "grant": "failing",
+        "authorization": [],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
       },
       "expect": {
         "status": 401,
@@ -167,65 +528,52 @@
         "contacts_sandbox": false
       },
       "covers": [
-        "N24"
+        "N32"
       ]
     },
     {
-      "name": "a token on another command",
+      "name": "a replica with no notify key",
       "request": {
         "method": "POST",
-        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
-        "body": "{\"type\":\"prompt\",\"message\":\"hi\"}"
+        "grant": "callback",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
-        "notify_key": true,
+        "notify_key": false,
         "session_exists": true,
-        "job": "running",
-        "reconcile": "ok"
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
       },
       "expect": {
-        "status": 403,
+        "status": 503,
         "opens_session": false,
         "contacts_sandbox": false
       },
       "covers": [
-        "N23"
-      ]
-    },
-    {
-      "name": "a token on a GET",
-      "request": {
-        "method": "GET",
-        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
-        "body": ""
-      },
-      "state": {
-        "notify_key": true,
-        "session_exists": true,
-        "job": "running",
-        "reconcile": "ok"
-      },
-      "expect": {
-        "status": 403,
-        "opens_session": false,
-        "contacts_sandbox": false
-      },
-      "covers": [
-        "N23"
+        "N31",
+        "N32"
       ]
     },
     {
       "name": "a body over 4096 bytes",
       "request": {
         "method": "POST",
-        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "grant": "callback",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\",\"pad\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}"
       },
       "state": {
         "notify_key": true,
         "session_exists": true,
-        "job": "running",
-        "reconcile": "ok"
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
       },
       "expect": {
         "status": 413,
@@ -233,21 +581,25 @@
         "contacts_sandbox": false
       },
       "covers": [
-        "N25"
+        "N32"
       ]
     },
     {
       "name": "a body with a fourth member",
       "request": {
         "method": "POST",
-        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "grant": "callback",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\",\"state\":\"ended\"}"
       },
       "state": {
         "notify_key": true,
         "session_exists": true,
-        "job": "running",
-        "reconcile": "ok"
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
       },
       "expect": {
         "status": 400,
@@ -255,21 +607,25 @@
         "contacts_sandbox": false
       },
       "covers": [
-        "N25"
+        "N32"
       ]
     },
     {
       "name": "a body without id",
       "request": {
         "method": "POST",
-        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "grant": "callback",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\"}"
       },
       "state": {
         "notify_key": true,
         "session_exists": true,
-        "job": "running",
-        "reconcile": "ok"
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
       },
       "expect": {
         "status": 400,
@@ -277,21 +633,25 @@
         "contacts_sandbox": false
       },
       "covers": [
-        "N25"
+        "N32"
       ]
     },
     {
       "name": "an id that is not a v1.3 job id",
       "request": {
         "method": "POST",
-        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "grant": "callback",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789ABCDEF\"}"
       },
       "state": {
         "notify_key": true,
         "session_exists": true,
-        "job": "running",
-        "reconcile": "ok"
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
       },
       "expect": {
         "status": 400,
@@ -299,21 +659,25 @@
         "contacts_sandbox": false
       },
       "covers": [
-        "N25"
+        "N32"
       ]
     },
     {
       "name": "a body that is not JSON",
       "request": {
         "method": "POST",
-        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "grant": "callback",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
         "body": "type=job_ended"
       },
       "state": {
         "notify_key": true,
         "session_exists": true,
-        "job": "running",
-        "reconcile": "ok"
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
       },
       "expect": {
         "status": 400,
@@ -321,21 +685,25 @@
         "contacts_sandbox": false
       },
       "covers": [
-        "N25"
+        "N32"
       ]
     },
     {
       "name": "a tampered token",
       "request": {
         "method": "POST",
-        "authorization": "Bearer bjn_v1.4eba5aa3.BdTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "grant": "callback",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.BdTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "notify_key": true,
         "session_exists": true,
-        "job": "running",
-        "reconcile": "ok"
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
       },
       "expect": {
         "status": 401,
@@ -343,22 +711,27 @@
         "contacts_sandbox": false
       },
       "covers": [
-        "N25",
-        "N44"
+        "N32",
+        "N62",
+        "N67"
       ]
     },
     {
       "name": "another job's body under this job's token",
       "request": {
         "method": "POST",
-        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "grant": "callback",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"fedcba9876543210\"}"
       },
       "state": {
         "notify_key": true,
         "session_exists": true,
-        "job": "running",
-        "reconcile": "ok"
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
       },
       "expect": {
         "status": 401,
@@ -366,22 +739,54 @@
         "contacts_sandbox": false
       },
       "covers": [
-        "N25",
-        "N45"
+        "N32",
+        "N63",
+        "N67"
+      ]
+    },
+    {
+      "name": "a token under a key this replica does not hold: retried, never stopped",
+      "request": {
+        "method": "POST",
+        "grant": "callback",
+        "authorization": [
+          "Bearer bjn_v1.e4478834.BRCVCT0I1FP9VySNf8TtfSGz7V_2Zb1BFclygpPeFXY"
+        ],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 503,
+        "opens_session": false,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N32",
+        "N67"
       ]
     },
     {
       "name": "a token that verifies for a scope that is not the session's",
       "request": {
         "method": "POST",
-        "authorization": "Bearer bjn_v1.4eba5aa3.GlqcqfqPV-eIYD_8hmnN2vkAlIS32fC52N22YsAQp0c",
+        "grant": "callback",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.GlqcqfqPV-eIYD_8hmnN2vkAlIS32fC52N22YsAQp0c"
+        ],
         "body": "{\"type\":\"job_ended\",\"scope\":\"fbc971f011ddc0a8be2112840519b253\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "notify_key": true,
         "session_exists": true,
-        "job": "running",
-        "reconcile": "ok"
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
       },
       "expect": {
         "status": 403,
@@ -389,21 +794,25 @@
         "contacts_sandbox": false
       },
       "covers": [
-        "N25"
+        "N32"
       ]
     },
     {
       "name": "a session that does not exist",
       "request": {
         "method": "POST",
-        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "grant": "callback",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "notify_key": true,
         "session_exists": false,
-        "job": "running",
-        "reconcile": "ok"
+        "job": "released",
+        "reconcile": "ok",
+        "run_in_flight": false
       },
       "expect": {
         "status": 404,
@@ -411,7 +820,227 @@
         "contacts_sandbox": false
       },
       "covers": [
-        "N26"
+        "N34"
+      ]
+    }
+  ],
+  "edge": [
+    {
+      "name": "edge: a callback",
+      "method": "POST",
+      "path": "/_beyond/agent",
+      "authorization": [
+        "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+      ],
+      "expect": {
+        "class": "callback",
+        "status": null
+      },
+      "covers": [
+        "E1",
+        "N30"
+      ]
+    },
+    {
+      "name": "edge: the scheme in any case",
+      "method": "POST",
+      "path": "/_beyond/agent",
+      "authorization": [
+        "bEaReR bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+      ],
+      "expect": {
+        "class": "callback",
+        "status": null
+      },
+      "covers": [
+        "E1",
+        "N30"
+      ]
+    },
+    {
+      "name": "edge: more than one space",
+      "method": "POST",
+      "path": "/_beyond/agent",
+      "authorization": [
+        "Bearer   bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+      ],
+      "expect": {
+        "class": "callback",
+        "status": null
+      },
+      "covers": [
+        "E1",
+        "N30"
+      ]
+    },
+    {
+      "name": "edge: a tab after the scheme",
+      "method": "POST",
+      "path": "/_beyond/agent",
+      "authorization": [
+        "Bearer\tbjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+      ],
+      "expect": {
+        "class": "refused",
+        "status": 400
+      },
+      "covers": [
+        "E1",
+        "N30"
+      ]
+    },
+    {
+      "name": "edge: no space after the scheme",
+      "method": "POST",
+      "path": "/_beyond/agent",
+      "authorization": [
+        "Bearerbjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+      ],
+      "expect": {
+        "class": "refused",
+        "status": 400
+      },
+      "covers": [
+        "E1",
+        "N30"
+      ]
+    },
+    {
+      "name": "edge: two callback headers",
+      "method": "POST",
+      "path": "/_beyond/agent",
+      "authorization": [
+        "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+      ],
+      "expect": {
+        "class": "refused",
+        "status": 400
+      },
+      "covers": [
+        "E1",
+        "N30"
+      ]
+    },
+    {
+      "name": "edge: a user's bearer and a callback's",
+      "method": "POST",
+      "path": "/_beyond/agent",
+      "authorization": [
+        "Bearer user-credential",
+        "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+      ],
+      "expect": {
+        "class": "refused",
+        "status": 400
+      },
+      "covers": [
+        "E1",
+        "N30"
+      ]
+    },
+    {
+      "name": "edge: a user's bearer token",
+      "method": "POST",
+      "path": "/_beyond/agent",
+      "authorization": [
+        "Bearer user-credential"
+      ],
+      "expect": {
+        "class": "user",
+        "status": null
+      },
+      "covers": [
+        "E1"
+      ]
+    },
+    {
+      "name": "edge: no Authorization",
+      "method": "POST",
+      "path": "/_beyond/agent",
+      "authorization": [],
+      "expect": {
+        "class": "user",
+        "status": null
+      },
+      "covers": [
+        "E1"
+      ]
+    },
+    {
+      "name": "edge: another scheme",
+      "method": "POST",
+      "path": "/_beyond/agent",
+      "authorization": [
+        "Basic dXNlcjpwdw=="
+      ],
+      "expect": {
+        "class": "user",
+        "status": null
+      },
+      "covers": [
+        "E1"
+      ]
+    },
+    {
+      "name": "edge: a token of another version",
+      "method": "POST",
+      "path": "/_beyond/agent",
+      "authorization": [
+        "Bearer bjn_v2.4eba5aa3.x"
+      ],
+      "expect": {
+        "class": "user",
+        "status": null
+      },
+      "covers": [
+        "E1"
+      ]
+    },
+    {
+      "name": "edge: a callback that is not a POST",
+      "method": "GET",
+      "path": "/_beyond/agent",
+      "authorization": [
+        "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+      ],
+      "expect": {
+        "class": "refused",
+        "status": 403
+      },
+      "covers": [
+        "E1"
+      ]
+    },
+    {
+      "name": "edge: a callback to another path",
+      "method": "POST",
+      "path": "/_beyond/other",
+      "authorization": [
+        "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+      ],
+      "expect": {
+        "class": "refused",
+        "status": 403
+      },
+      "covers": [
+        "E1"
+      ]
+    },
+    {
+      "name": "edge: a callback whose token is not the grammar: refused before any minting",
+      "method": "POST",
+      "path": "/_beyond/agent",
+      "authorization": [
+        "Bearer bjn_v1.4eba5aa3.short"
+      ],
+      "expect": {
+        "class": "refused",
+        "status": 401
+      },
+      "covers": [
+        "E1",
+        "N62"
       ]
     }
   ]

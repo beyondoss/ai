@@ -109,6 +109,7 @@ struct CallbackFile {
     requests: Vec<CallbackRequest>,
     grant: Grant,
     receiver: Vec<ReceiverCase>,
+    edge: Vec<EdgeCase>,
 }
 
 #[derive(Deserialize)]
@@ -154,8 +155,21 @@ struct ReceiverCase {
 #[serde(deny_unknown_fields)]
 struct ReceiverRequest {
     method: String,
-    authorization: Option<String>,
+    grant: GrantKind,
+    authorization: Vec<String>,
     body: String,
+}
+
+/// The session grant the edge attached to a request.
+#[derive(Deserialize, PartialEq, Eq, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+enum GrantKind {
+    /// Carries `"purpose": "job_ended"`.
+    Callback,
+    /// An ordinary grant.
+    User,
+    /// One that does not verify at this replica.
+    Failing,
 }
 
 #[derive(Deserialize)]
@@ -165,14 +179,22 @@ struct ReceiverState {
     session_exists: bool,
     job: JobState,
     reconcile: Reconcile,
+    run_in_flight: bool,
 }
 
 #[derive(Deserialize, PartialEq, Eq, Clone, Copy, Debug)]
 #[serde(rename_all = "snake_case")]
 enum JobState {
-    Running,
-    RecordedEnded,
-    Absent,
+    /// Tracked as released, and still running in the sandbox.
+    Released,
+    /// Ended in the sandbox, its end not yet marked reported in the ledger.
+    EndedUnreported,
+    /// The session holds its stream, and the callback is not its proof.
+    Held,
+    /// The ledger marks its end reported.
+    EndReported,
+    /// The transcript's ledger has no record of it.
+    NoRecord,
 }
 
 #[derive(Deserialize, PartialEq, Eq, Clone, Copy, Debug)]
@@ -188,6 +210,32 @@ struct ReceiverExpect {
     status: u16,
     opens_session: bool,
     contacts_sandbox: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EdgeCase {
+    name: String,
+    method: String,
+    path: String,
+    authorization: Vec<String>,
+    expect: EdgeExpect,
+    covers: Vec<String>,
+}
+
+#[derive(Deserialize, PartialEq, Eq, Debug)]
+#[serde(deny_unknown_fields)]
+struct EdgeExpect {
+    class: EdgeClass,
+    status: Option<u16>,
+}
+
+#[derive(Deserialize, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+enum EdgeClass {
+    Callback,
+    User,
+    Refused,
 }
 
 #[derive(Deserialize)]
@@ -433,7 +481,7 @@ fn every_v14_fixture_loads_into_its_schema() {
             "callback",
             &c.spec,
             &c.notes,
-            c.receiver.len() + c.requests.len(),
+            c.receiver.len() + c.requests.len() + c.edge.len(),
         ),
         ("token", &t.spec, &t.notes, t.vectors.len()),
         (
@@ -456,6 +504,7 @@ fn every_v14_fixture_loads_into_its_schema() {
         .chain(k.cases.iter().map(|x| &x.covers))
         .chain(c.requests.iter().map(|x| &x.covers))
         .chain(c.receiver.iter().map(|x| &x.covers))
+        .chain(c.edge.iter().map(|x| &x.covers))
         .chain(t.vectors.iter().map(|x| &x.covers))
         .chain(r.statuses.iter().map(|x| &x.covers))
         .chain(r.timelines.iter().map(|x| &x.covers));
@@ -571,35 +620,201 @@ fn the_callback_body_is_exactly_type_scope_and_id() {
         );
         assert_eq!(r.forbidden_headers, ["Cookie"]);
     }
-    // A refusal before the session is reached never opens it or contacts the sandbox, and only
-    // 200, 410 and 503 come from past that point.
+}
+
+// ---- the receiver and the edge, from the spec's own rules
+
+/// A header value as N30 reads it: leading and trailing spaces and tabs removed.
+fn ows(v: &str) -> &str {
+    v.trim_matches([' ', '\t'])
+}
+
+/// N30's first rule: exactly one `Authorization` header, `Bearer` in any case, one or more spaces,
+/// then `bjn_v1.`. The token, when the request is a callback.
+fn callback_token(auth: &[String]) -> Option<&str> {
+    let [one] = auth else { return None };
+    let v = ows(one);
+    let scheme = v.get(..6)?;
+    let rest = &v[6..];
+    if !scheme.eq_ignore_ascii_case("bearer") || !rest.starts_with(' ') {
+        return None;
+    }
+    let token = rest.trim_start_matches(' ');
+    token.starts_with("bjn_v1.").then_some(token)
+}
+
+/// N30's second rule: any `Authorization` value that is `bearer` in any case, any run of spaces and
+/// tabs, then `bjn_v1.`.
+fn looks_like_callback(auth: &[String]) -> bool {
+    auth.iter().any(|v| {
+        let v = ows(v);
+        v.get(..6).is_some_and(|s| s.eq_ignore_ascii_case("bearer"))
+            && v[6..]
+                .trim_start_matches([' ', '\t'])
+                .starts_with("bjn_v1.")
+    })
+}
+
+/// A v1.3 job id: lowercase hex, 1 to 32 characters.
+fn is_job_id(id: &str) -> bool {
+    (1..=32).contains(&id.len()) && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The receiver of N32, step by step, then N34, N40 and N42 for a request that passes them all:
+/// the status, whether the session is opened or reached, and whether the sandbox is contacted.
+fn reference_receiver(
+    keys: &[([u8; 32], String)],
+    grant: &Grant,
+    case: &ReceiverCase,
+) -> (u16, bool, bool) {
+    let rq = &case.request;
+    let st = &case.state;
+    let refuse = |status| (status, false, false);
+    // Steps 2 and 3: a grant that fails is the fleet's fault when the edge sent it as a callback.
+    if rq.grant == GrantKind::Failing {
+        return refuse(if looks_like_callback(&rq.authorization) {
+            503
+        } else {
+            401
+        });
+    }
+    // Step 4.
+    if rq.grant == GrantKind::Callback && rq.method != "POST" {
+        return refuse(403);
+    }
+    assert_eq!(
+        rq.method, "POST",
+        "{}: a user grant's case POSTs",
+        case.name
+    );
+    // Step 5.
+    if rq.body.len() > 4096 {
+        return refuse(413);
+    }
+    let Ok(Value::Object(body)) = serde_json::from_str::<Value>(&rq.body) else {
+        return refuse(400);
+    };
+    // `job_ended` under a callback grant, and only there. (A user grant's other commands are not
+    // this file's business.)
+    let is_job_ended = body.get("type").and_then(Value::as_str) == Some("job_ended");
+    assert!(
+        is_job_ended || rq.grant == GrantKind::Callback,
+        "{}: a user grant's case sends job_ended",
+        case.name
+    );
+    if is_job_ended != (rq.grant == GrantKind::Callback) {
+        return refuse(403);
+    }
+    let (Some(scope), Some(id)) = (
+        body.get("scope").and_then(Value::as_str),
+        body.get("id").and_then(Value::as_str),
+    ) else {
+        return refuse(400);
+    };
+    if body.len() != 3 || !is_job_id(id) || scope.len() > 64 {
+        return refuse(400);
+    }
+    // Step 6.
+    let Some(token) = callback_token(&rq.authorization) else {
+        return refuse(503);
+    };
+    // Step 7.
+    if !st.notify_key {
+        return refuse(503);
+    }
+    // Step 8.
+    let cx = Context {
+        tenant: grant.tenant.clone(),
+        session_id: grant.session_id.clone(),
+        scope: scope.to_string(),
+        id: id.to_string(),
+    };
+    match reference_verify(keys, token, &cx) {
+        Verdict::Valid => {}
+        Verdict::Malformed | Verdict::BadMac => return refuse(401),
+        Verdict::UnknownKid => return refuse(503),
+    }
+    // Step 9.
+    if scope != scope_of(&grant.tenant, &grant.session_id) {
+        return refuse(403);
+    }
+    if !st.session_exists {
+        return refuse(404);
+    }
+    match st.job {
+        JobState::EndReported | JobState::Held => (200, true, false),
+        JobState::NoRecord => (410, true, false),
+        JobState::Released | JobState::EndedUnreported => match st.reconcile {
+            Reconcile::Ok => (200, true, true),
+            Reconcile::Fails => (503, true, true),
+        },
+    }
+}
+
+#[test]
+fn receiver_cases_follow_from_the_spec() {
+    let c = callback();
+    let keys = verifier_keys(&token());
+    let mut statuses = BTreeSet::new();
     for case in &c.receiver {
         let e = &case.expect;
-        let past_checks = matches!(e.status, 200 | 410 | 503);
-        assert_eq!(e.opens_session, past_checks, "{}", case.name);
-        if !past_checks {
-            assert!(!e.contacts_sandbox, "{}", case.name);
+        assert_eq!(
+            reference_receiver(&keys, &c.grant, case),
+            (e.status, e.opens_session, e.contacts_sandbox),
+            "{}",
+            case.name
+        );
+        if case.state.run_in_flight {
+            assert_eq!(e.status, 200, "{}: served during a run", case.name);
         }
-        if e.status == 200 && case.state.job == JobState::RecordedEnded {
-            assert!(!e.contacts_sandbox, "{}: a repeat is free", case.name);
-        }
-        assert!(matches!(case.request.method.as_str(), "POST" | "GET"));
-        // Each state that decides the answer by itself does.
-        if !case.state.notify_key {
-            assert_eq!(e.status, 401, "{}: no notify key", case.name);
-        }
-        if !case.state.session_exists {
-            assert_eq!(e.status, 404, "{}: no session", case.name);
-        }
-        if case.state.reconcile == Reconcile::Fails {
-            assert_eq!(e.status, 503, "{}: no reconcile", case.name);
-        }
-        if case.request.authorization.is_none() {
-            assert_eq!(e.status, 403, "{}: a grant alone", case.name);
-        }
-        if case.request.body.len() > 4096 {
-            assert_eq!(e.status, 413, "{}: an oversized body", case.name);
-        }
+        statuses.insert(e.status);
+    }
+    for want in [200, 400, 401, 403, 404, 410, 413, 503] {
+        assert!(statuses.contains(&want), "no receiver case answers {want}");
+    }
+}
+
+/// E1, with N30's rules: how the edge treats a request by its `Authorization` values.
+fn reference_edge(case: &EdgeCase) -> EdgeExpect {
+    let refused = |status| EdgeExpect {
+        class: EdgeClass::Refused,
+        status: Some(status),
+    };
+    if !looks_like_callback(&case.authorization) {
+        return EdgeExpect {
+            class: EdgeClass::User,
+            status: None,
+        };
+    }
+    let Some(token) = callback_token(&case.authorization) else {
+        return refused(400);
+    };
+    if case.method != "POST" || case.path != "/_beyond/agent" {
+        return refused(403);
+    }
+    if parse_token(token).is_none() {
+        return refused(401);
+    }
+    EdgeExpect {
+        class: EdgeClass::Callback,
+        status: None,
+    }
+}
+
+#[test]
+fn edge_cases_follow_from_the_spec() {
+    let c = callback();
+    let mut classes = BTreeSet::new();
+    for case in &c.edge {
+        assert_eq!(reference_edge(case), case.expect, "{}", case.name);
+        classes.insert(case.expect.class);
+    }
+    assert_eq!(classes.len(), 3, "every class has a case");
+    // A callback request the edge would forward is one the replica reads a token from: the two
+    // classify with the same rule, so they never disagree on bytes the edge passed on unchanged.
+    for r in &c.requests {
+        let auth = [r.headers["Authorization"].clone()];
+        assert!(looks_like_callback(&auth) && callback_token(&auth).is_some());
     }
 }
 
@@ -648,10 +863,11 @@ fn mac_input(
 }
 
 /// The spec's verifier, written from the spec alone: the reference the vectors are held to.
-fn reference_verify(keys: &[([u8; 32], String)], token: &str, cx: &Context) -> Verdict {
+/// N62: the kid and the tag of a token that is exactly the grammar, else `None` (malformed).
+fn parse_token(token: &str) -> Option<(&str, Vec<u8>)> {
     let parts: Vec<&str> = token.split('.').collect();
     let [prefix, kid, mac] = parts.as_slice() else {
-        return Verdict::Malformed;
+        return None;
     };
     let hex_kid = kid.len() == 8 && kid.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     let b64url = mac.len() == 43
@@ -659,14 +875,24 @@ fn reference_verify(keys: &[([u8; 32], String)], token: &str, cx: &Context) -> V
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
     if *prefix != "bjn_v1" || !hex_kid || !b64url {
-        return Verdict::Malformed;
+        return None;
     }
-    let Ok(tag) = URL_SAFE_NO_PAD.decode(mac) else {
+    let tag = URL_SAFE_NO_PAD.decode(mac).ok()?;
+    (tag.len() == 32 && URL_SAFE_NO_PAD.encode(&tag) == *mac).then_some((kid, tag))
+}
+
+/// The verifier's keys, as `v1.4-token.json`'s `verifier_keys` names them.
+fn verifier_keys(t: &TokenFile) -> Vec<([u8; 32], String)> {
+    t.verifier_keys
+        .iter()
+        .map(|n| derive(&STANDARD.decode(&t.secrets[n]).unwrap()))
+        .collect()
+}
+
+fn reference_verify(keys: &[([u8; 32], String)], token: &str, cx: &Context) -> Verdict {
+    let Some((kid, tag)) = parse_token(token) else {
         return Verdict::Malformed;
     };
-    if tag.len() != 32 || URL_SAFE_NO_PAD.encode(&tag) != *mac {
-        return Verdict::Malformed;
-    }
     let candidates: Vec<&[u8; 32]> = keys
         .iter()
         .filter(|(_, k)| k == kid)
@@ -759,7 +985,8 @@ fn action(a: Answer) -> Action {
         Answer::Failure(_) => Action::Retry,
         Answer::Status(s) if (200..300).contains(&s) => Action::Done,
         Answer::Status(401 | 403 | 404 | 410) => Action::Stop,
-        Answer::Status(s) if s == 429 || (500..600).contains(&s) => Action::Retry,
+        Answer::Status(407 | 408 | 425 | 429) => Action::Retry,
+        Answer::Status(s) if (500..600).contains(&s) => Action::Retry,
         Answer::Status(_) => Action::Stop,
     }
 }

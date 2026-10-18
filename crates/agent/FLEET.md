@@ -135,49 +135,71 @@ killing one mid-drain is the outage the drain exists to avoid.
 ### Job-end callbacks
 
 A sandbox reports that a background job changed state by POSTing a `job_ended` command to the
-session's own address, `/_beyond/agent?session_id=<id>`, with `Authorization: Bearer bjn_v1.…`. The
-protocol is exec v1.4 ("Sandbox job notify (v1.4)" in `src/exec_endpoint.rs`). The callback is a
-hint: the replica re-reads the job from the sandbox, so a callback that is lost, repeated or forged
-can delay a report but cannot make one wrong. The sandbox retries a callback for up to 12 minutes,
-and stops on `401`, `403`, `404`, `410` or any other status it cannot fix by repeating itself.
+session's own address, `/_beyond/agent?session_id=<id>&keep=<generation>`, with `Authorization:
+Bearer bjn_v1.…`. The protocol is exec v1.4 ("Sandbox job notify (v1.4)" in `src/exec_endpoint.rs`).
+The callback is a hint: the replica re-reads the job from the sandbox, so a callback that is lost,
+repeated or forged can delay a report but cannot make one wrong. The sandbox retries a callback for
+up to 12 minutes. It stops on `401`, `403`, `404`, `410` or a status it cannot fix by repeating
+itself, and retries `503`, which is what every fault of the fleet's own is answered with: a missing
+key, a skewed clock, a rotation or a rollout must never make a sandbox stop.
 
-There is no user behind a callback, and the edge cannot check the token: only replicas hold its
-key. So **the replica authenticates a callback, not the edge**. The edge's part is to place it like
-any other request for the session, and to hand the replica what it needs to check it. Each
-requirement is tagged (E1, E2, …) and names the check that tests it. A check not written yet is
-listed, with its task, in `tests/fixtures/exec/v1.4-checks.json`.
+There is no user behind a callback, and the edge cannot check the token: only replicas hold its key.
+So **the replica authenticates a callback, and the edge limits what it can reach**: it attaches a
+callback grant, whose `purpose` claim lets the request do nothing but `job_ended` at any replica,
+even one that reads its headers differently, and makes a replica that predates the claim refuse it
+outright. Each requirement is tagged (E1, E2, …) and names the check that tests it. A check not
+written yet is listed, with its task, in `tests/fixtures/exec/v1.4-checks.json`.
 
-- **E1** A request with `Authorization: Bearer bjn_v1.…` is a callback. The edge MUST NOT
-  authenticate it as a user, or refuse it for lacking a user's credential. It MUST forward it only
-  when it is a `POST` to `/_beyond/agent`, and answer any other request bearing such a token `403`
-  itself. A replica refuses a token used for anything but `job_ended` anyway; this keeps a token from
-  reaching any other route of the edge. (check: fleet-sim `job-ended-token-reaches-only-job-ended`)
-- **E2** The edge MUST attach the session grant it would attach to a connection to that session,
-  minted for the tenant its own records say owns the session id, and MUST forward the
-  `Authorization` header and the body unchanged. The grant tells the replica which tenant and
-  session the request is for and lets it open the session; it does not authorise the callback, and
-  a replica refuses `job_ended` on a grant alone. (check: fleet-sim `job-ended-reaches-the-owner`)
-- **E3** A session id the edge's records do not have MUST be answered `404`, with no replica
-  contacted.
-  (check: fleet-sim `job-ended-unknown-session-is-404`)
+- **E1** The edge MUST classify a request with exactly the two rules of exec v1.4's N30: a request
+  is a callback when it has exactly one `Authorization` header and its value is `Bearer` (any case),
+  one or more spaces, then `bjn_v1.`; it looks like a callback when any `Authorization` value is
+  `bearer` (any case), any run of spaces and tabs, then `bjn_v1.`. A request that looks like a
+  callback but is not one (two `Authorization` headers, a tab, no space) MUST be answered `400` and
+  never forwarded, as a callback or as a user request. The edge MUST NOT authenticate a callback as
+  a user, or use any user credential it carries. It MUST forward a callback only when it is a `POST`
+  to `/_beyond/agent`, and answer any other request bearing such a token `403` itself. It MUST check
+  the token against N62's grammar before it looks up the tenant or mints anything, and answer one
+  that fails `401`, with E3's body. (check: fleet-sim `job-ended-classified-exactly`; fixture
+  `v1.4-callback.json`)
+- **E2** The edge MUST attach to a callback a callback grant: the session grant it would attach to a
+  connection to that session (minted for the tenant its own records say owns the session id, with
+  the same claims and sealed secrets), plus the claim `"purpose": "job_ended"`, and an `exp` at
+  least 300 s after it mints it, so a replica's clock may run that far ahead of the edge's. It MUST
+  forward the `Authorization` header, the query string and the body unchanged. It MUST NOT attach a
+  callback grant to a request it did not classify as a callback, nor any other grant to a callback.
+  (check: fleet-sim `job-ended-reaches-the-owner`)
+- **E3** A session id the edge's records do not have MUST be answered `401`, with no replica
+  contacted and with the same fixed body as a replica's refusal of a token, so a callback cannot
+  tell a session that does not exist from a token that does not verify. (check: fleet-sim
+  `job-ended-unknown-session-is-401`)
 - **E4** The edge MUST route a callback exactly as any request for that session: Requirements 1, 2
   and 4 apply unchanged. **When no replica owns the session**, the hashed target opens it, exactly
   as for a client's first request: the replica verifies the token before it opens anything, and a
-  session opened by a callback reconciles its jobs at once and starts no model turn unless a client
-  attaches. A `503` is retried on the same target and then by walking the ring. (check: fleet-sim
-  `job-ended-opens-an-unowned-session`)
-- **E5** The edge MUST answer a callback within 25 s, answering `503` when no replica has accepted it
-  by then. The sandbox abandons an attempt at 30 s and retries on its own schedule, which outlasts
-  a takeover (its tenth attempt begins at least 121.5 s after its first), so the 120 s budget of
+  session opened by a callback reconciles its jobs at once (N46) and then behaves as any session
+  that learns of its jobs' ends (N44). A `503` is retried on the same target and then by walking the
+  ring. (check: fleet-sim `job-ended-opens-an-unowned-session`)
+- **E5** The edge MUST answer a callback within 25 s, answering `503` when no replica has accepted
+  it by then, and MUST cancel the request upstream at that point, so the replica stops waiting for
+  it. The sandbox abandons an attempt at 30 s and retries on its own schedule, which outlasts a
+  takeover (its tenth attempt begins at least 121.5 s after its first), so the 120 s budget of
   Requirement 3 is the sandbox's to spend here, not the edge's. (check: fleet-sim
   `job-ended-answers-within-25s`)
 - **E6** The edge MUST pass the replica's status back to the sandbox unchanged: `200`, `400`, `401`,
-  `403`, `404`, `410`, `413` and `503` each tell the sandbox whether to try again. `421` is handled
-  as in Requirement 4 and never returned. (check: fleet-sim `job-ended-status-passes-through`)
+  `403`, `404`, `410`, `411`, `413` and `503` each tell the sandbox whether to try again. `421` is
+  handled as in Requirement 4 and never returned. (check: fleet-sim
+  `job-ended-status-passes-through`)
+- **E7** The edge MUST NOT mint a callback grant while any replica it may route the callback to
+  might not accept the `purpose` claim: before the claim's rollout has reached every replica of the
+  slice, and from the moment a rollback of any replica to a version without it begins. Meanwhile it
+  answers every callback `503` itself, without minting. (check: fleet-sim
+  `job-ended-waits-for-every-replica`)
+- **E8** The edge MUST forward at most 20 callbacks a second for any one session id, and answer the
+  excess `429` itself, before minting. (check: fleet-sim `job-ended-rate-limited-per-session`)
 
-The edge SHOULD NOT log the `Authorization` header of a callback, and MAY rate-limit callbacks per
-session. A replica already bounds the work a stream of valid callbacks can cause (one reconcile at a
-time per session, at most one a second).
+The edge SHOULD NOT log the `Authorization` header of a callback. It SHOULD also rate-limit
+callbacks per source address, and SHOULD answer E3's `401` in about the time a replica's refusal
+takes, so timing does not reveal which sessions exist either. A replica already bounds the work a
+stream of valid callbacks can cause (one reconcile at a time per session, at most one a second).
 
 ## Operating a fleet
 

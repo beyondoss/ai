@@ -1,7 +1,7 @@
 {
   "spec": "exec protocol v1.4 sandbox job notify (crates/agent/src/exec_endpoint.rs, \"Sandbox job notify (v1.4)\"), and crates/agent/FLEET.md \"Job-end callbacks\"",
   "notes": [
-    "Every requirement tag in the spec (N…) and in FLEET.md's edge contract (E…), with the checks its text names, in the same order.",
+    "Every requirement tag in the spec (N\u2026) and in FLEET.md's edge contract (E\u2026), with the checks its text names, in the same order.",
     "kind: fixture (a v1.4-*.json file in this directory, one of whose cases lists the tag in covers), conformance (a conformance::verify check, by its name), test (a test in this repo, module::name), fleet-sim (a fleet-sim scenario). task: the tracker task that writes the check, or exists."
   ],
   "requirements": [
@@ -95,7 +95,7 @@
       "checks": [
         {
           "kind": "conformance",
-          "name": "first callback at keep",
+          "name": "the proof and the end take one path",
           "task": "C3"
         }
       ]
@@ -104,9 +104,14 @@
       "id": "N9",
       "checks": [
         {
-          "kind": "conformance",
-          "name": "callback after the job ends",
-          "task": "C3"
+          "kind": "test",
+          "name": "sandbox_jobs_notify::the_supervisor_sends_the_proof",
+          "task": "C1"
+        },
+        {
+          "kind": "test",
+          "name": "sandbox_jobs_notify::an_older_supervisor_refuses_notify",
+          "task": "C1"
         }
       ]
     },
@@ -115,7 +120,7 @@
       "checks": [
         {
           "kind": "conformance",
-          "name": "callback after the job ends",
+          "name": "keep does not wait for its callback",
           "task": "C3"
         }
       ]
@@ -125,7 +130,7 @@
       "checks": [
         {
           "kind": "conformance",
-          "name": "no callback after remove",
+          "name": "first callback at keep",
           "task": "C3"
         }
       ]
@@ -135,13 +140,63 @@
       "checks": [
         {
           "kind": "conformance",
-          "name": "no callback without notify",
+          "name": "callback after the job ends",
           "task": "C3"
         }
       ]
     },
     {
       "id": "N13",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "exited only with leftovers",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N14",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "sandbox_jobs_notify::no_leftovers_never_lists_exited",
+          "task": "C1"
+        }
+      ]
+    },
+    {
+      "id": "N15",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "callback after the job ends",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N16",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "no callback after remove",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N17",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "no callback without notify",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N18",
       "checks": [
         {
           "kind": "conformance",
@@ -155,7 +210,7 @@
       ]
     },
     {
-      "id": "N14",
+      "id": "N19",
       "checks": [
         {
           "kind": "conformance",
@@ -169,7 +224,7 @@
       ]
     },
     {
-      "id": "N15",
+      "id": "N20",
       "checks": [
         {
           "kind": "conformance",
@@ -179,79 +234,79 @@
       ]
     },
     {
-      "id": "N16",
-      "checks": [
-        {
-          "kind": "fixture",
-          "name": "v1.4-retry.json"
-        },
-        {
-          "kind": "conformance",
-          "name": "callback retry and stop",
-          "task": "C3"
-        }
-      ]
-    },
-    {
-      "id": "N17",
-      "checks": [
-        {
-          "kind": "conformance",
-          "name": "callback retry and stop",
-          "task": "C3"
-        }
-      ]
-    },
-    {
-      "id": "N18",
-      "checks": [
-        {
-          "kind": "fixture",
-          "name": "v1.4-retry.json"
-        },
-        {
-          "kind": "conformance",
-          "name": "callback retry and stop",
-          "task": "C3"
-        }
-      ]
-    },
-    {
-      "id": "N19",
-      "checks": [
-        {
-          "kind": "fixture",
-          "name": "v1.4-retry.json"
-        },
-        {
-          "kind": "conformance",
-          "name": "callback retry and stop",
-          "task": "C3"
-        }
-      ]
-    },
-    {
-      "id": "N20",
-      "checks": [
-        {
-          "kind": "conformance",
-          "name": "the token never reaches argv, environment or answers",
-          "task": "C3"
-        }
-      ]
-    },
-    {
       "id": "N21",
       "checks": [
         {
+          "kind": "fixture",
+          "name": "v1.4-retry.json"
+        },
+        {
           "kind": "conformance",
-          "name": "the token never reaches argv, environment or answers",
+          "name": "callback retry and stop",
           "task": "C3"
         }
       ]
     },
     {
       "id": "N22",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "callback retry and stop",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N23",
+      "checks": [
+        {
+          "kind": "fixture",
+          "name": "v1.4-retry.json"
+        },
+        {
+          "kind": "conformance",
+          "name": "callback retry and stop",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N24",
+      "checks": [
+        {
+          "kind": "fixture",
+          "name": "v1.4-retry.json"
+        },
+        {
+          "kind": "conformance",
+          "name": "callback retry and stop",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N25",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "the token never reaches argv, environment or answers",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N26",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "the token never reaches argv, environment or answers",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N27",
       "checks": [
         {
           "kind": "test",
@@ -261,27 +316,70 @@
       ]
     },
     {
-      "id": "N23",
+      "id": "N28",
       "checks": [
         {
           "kind": "test",
-          "name": "serve_job_ended::a_token_authorises_nothing_else",
+          "name": "grant::a_purpose_claim_limits_the_request",
+          "task": "B2"
+        },
+        {
+          "kind": "test",
+          "name": "serve_job_ended::a_callback_grant_runs_nothing_else",
+          "task": "B2"
+        },
+        {
+          "kind": "test",
+          "name": "serve_job_ended::a_user_grant_cannot_end_a_job",
+          "task": "B2"
+        },
+        {
+          "kind": "fixture",
+          "name": "v1.4-callback.json"
+        }
+      ]
+    },
+    {
+      "id": "N29",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "grant::verifier_rejects_each_negative_vector_with_its_own_error",
+          "task": "exists"
+        },
+        {
+          "kind": "fleet-sim",
+          "name": "job-ended-waits-for-every-replica",
+          "task": "D2"
+        }
+      ]
+    },
+    {
+      "id": "N30",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "serve_job_ended::the_token_header_is_read_exactly",
+          "task": "B2"
+        },
+        {
+          "kind": "fixture",
+          "name": "v1.4-callback.json"
+        }
+      ]
+    },
+    {
+      "id": "N31",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "serve_job_ended::job_ended_is_only_a_callback",
           "task": "B2"
         }
       ]
     },
     {
-      "id": "N24",
-      "checks": [
-        {
-          "kind": "test",
-          "name": "serve_job_ended::a_grant_alone_cannot_end_a_job",
-          "task": "B2"
-        }
-      ]
-    },
-    {
-      "id": "N25",
+      "id": "N32",
       "checks": [
         {
           "kind": "test",
@@ -295,27 +393,7 @@
       ]
     },
     {
-      "id": "N26",
-      "checks": [
-        {
-          "kind": "test",
-          "name": "serve_job_ended::never_creates_a_session",
-          "task": "B2"
-        }
-      ]
-    },
-    {
-      "id": "N27",
-      "checks": [
-        {
-          "kind": "test",
-          "name": "serve_job_ended::the_callback_is_not_a_client",
-          "task": "B2"
-        }
-      ]
-    },
-    {
-      "id": "N28",
+      "id": "N33",
       "checks": [
         {
           "kind": "test",
@@ -325,7 +403,67 @@
       ]
     },
     {
-      "id": "N29",
+      "id": "N34",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "serve_job_ended::never_creates_a_session",
+          "task": "B2"
+        }
+      ]
+    },
+    {
+      "id": "N35",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "serve_job_ended::served_during_a_run",
+          "task": "B2"
+        }
+      ]
+    },
+    {
+      "id": "N36",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "serve_job_ended::each_callback_gets_its_own_answer",
+          "task": "B2"
+        }
+      ]
+    },
+    {
+      "id": "N37",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "serve_job_ended::the_callback_is_not_a_client",
+          "task": "B2"
+        }
+      ]
+    },
+    {
+      "id": "N38",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "job_notify::the_open_reconcile_spares_tracked_jobs",
+          "task": "B6"
+        }
+      ]
+    },
+    {
+      "id": "N39",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "job_notify::the_live_reconcile_changes_only_released_jobs",
+          "task": "B4"
+        }
+      ]
+    },
+    {
+      "id": "N40",
       "checks": [
         {
           "kind": "test",
@@ -339,7 +477,7 @@
       ]
     },
     {
-      "id": "N30",
+      "id": "N41",
       "checks": [
         {
           "kind": "test",
@@ -349,17 +487,21 @@
       ]
     },
     {
-      "id": "N31",
+      "id": "N42",
       "checks": [
         {
           "kind": "test",
           "name": "serve_job_ended::repeats_are_free",
           "task": "B2"
+        },
+        {
+          "kind": "fixture",
+          "name": "v1.4-callback.json"
         }
       ]
     },
     {
-      "id": "N32",
+      "id": "N43",
       "checks": [
         {
           "kind": "test",
@@ -369,17 +511,17 @@
       ]
     },
     {
-      "id": "N33",
+      "id": "N44",
       "checks": [
         {
           "kind": "test",
-          "name": "serve_job_ended::no_turn_without_a_client",
+          "name": "job_notify::a_notified_end_behaves_as_a_streamed_one",
           "task": "B3"
         }
       ]
     },
     {
-      "id": "N34",
+      "id": "N45",
       "checks": [
         {
           "kind": "test",
@@ -394,7 +536,7 @@
       ]
     },
     {
-      "id": "N35",
+      "id": "N46",
       "checks": [
         {
           "kind": "test",
@@ -404,17 +546,57 @@
       ]
     },
     {
-      "id": "N36",
+      "id": "N47",
       "checks": [
         {
           "kind": "test",
-          "name": "serve_job_ended::the_notice_is_persisted_before_the_record_goes",
+          "name": "job_ledger::survives_compaction_and_takeover",
           "task": "B3"
         }
       ]
     },
     {
-      "id": "N37",
+      "id": "N48",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "job_ledger::the_record_precedes_the_keep",
+          "task": "B3"
+        }
+      ]
+    },
+    {
+      "id": "N49",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "job_ledger::reported_with_the_notice",
+          "task": "B3"
+        }
+      ]
+    },
+    {
+      "id": "N50",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "job_ledger::reopen_reports_each_end_once",
+          "task": "B3"
+        }
+      ]
+    },
+    {
+      "id": "N51",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "job_ledger::a_new_transcript_wipes_first",
+          "task": "B3"
+        }
+      ]
+    },
+    {
+      "id": "N52",
       "checks": [
         {
           "kind": "test",
@@ -424,7 +606,7 @@
       ]
     },
     {
-      "id": "N38",
+      "id": "N53",
       "checks": [
         {
           "kind": "test",
@@ -434,7 +616,7 @@
       ]
     },
     {
-      "id": "N39",
+      "id": "N54",
       "checks": [
         {
           "kind": "test",
@@ -444,7 +626,7 @@
       ]
     },
     {
-      "id": "N40",
+      "id": "N55",
       "checks": [
         {
           "kind": "test",
@@ -459,7 +641,17 @@
       ]
     },
     {
-      "id": "N41",
+      "id": "N56",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "job_notify::a_stale_proof_counts_for_nothing",
+          "task": "B4"
+        }
+      ]
+    },
+    {
+      "id": "N57",
       "checks": [
         {
           "kind": "test",
@@ -474,26 +666,27 @@
       ]
     },
     {
-      "id": "N42",
-      "checks": [
-        {
-          "kind": "fixture",
-          "name": "v1.4-token.json"
-        }
-      ]
-    },
-    {
-      "id": "N43",
+      "id": "N58",
       "checks": [
         {
           "kind": "test",
-          "name": "job_notify::takeover_proves_again",
+          "name": "job_notify::the_sweep_bounds_a_lost_end",
           "task": "B4"
         }
       ]
     },
     {
-      "id": "N44",
+      "id": "N59",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "job_notify::no_idle_connection_to_the_endpoint",
+          "task": "B4"
+        }
+      ]
+    },
+    {
+      "id": "N60",
       "checks": [
         {
           "kind": "fixture",
@@ -502,7 +695,22 @@
       ]
     },
     {
-      "id": "N45",
+      "id": "N61",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "job_notify::takeover_proves_again",
+          "task": "B4"
+        },
+        {
+          "kind": "test",
+          "name": "job_notify::a_live_reconcile_never_keeps",
+          "task": "B4"
+        }
+      ]
+    },
+    {
+      "id": "N62",
       "checks": [
         {
           "kind": "fixture",
@@ -511,7 +719,16 @@
       ]
     },
     {
-      "id": "N46",
+      "id": "N63",
+      "checks": [
+        {
+          "kind": "fixture",
+          "name": "v1.4-token.json"
+        }
+      ]
+    },
+    {
+      "id": "N64",
       "checks": [
         {
           "kind": "test",
@@ -525,7 +742,7 @@
       ]
     },
     {
-      "id": "N47",
+      "id": "N65",
       "checks": [
         {
           "kind": "fixture",
@@ -535,11 +752,16 @@
           "kind": "test",
           "name": "notify_token::mints_only_under_the_current_key",
           "task": "B1"
+        },
+        {
+          "kind": "test",
+          "name": "notify_token::refuses_keys_that_share_a_kid",
+          "task": "B1"
         }
       ]
     },
     {
-      "id": "N48",
+      "id": "N66",
       "checks": [
         {
           "kind": "test",
@@ -549,12 +771,39 @@
       ]
     },
     {
+      "id": "N67",
+      "checks": [
+        {
+          "kind": "fixture",
+          "name": "v1.4-token.json"
+        },
+        {
+          "kind": "fixture",
+          "name": "v1.4-callback.json"
+        }
+      ]
+    },
+    {
+      "id": "N68",
+      "checks": [
+        {
+          "kind": "fleet-sim",
+          "name": "notify-key-rotation-refuses-nothing",
+          "task": "D2"
+        }
+      ]
+    },
+    {
       "id": "E1",
       "checks": [
         {
           "kind": "fleet-sim",
-          "name": "job-ended-token-reaches-only-job-ended",
+          "name": "job-ended-classified-exactly",
           "task": "D2"
+        },
+        {
+          "kind": "fixture",
+          "name": "v1.4-callback.json"
         }
       ]
     },
@@ -573,7 +822,7 @@
       "checks": [
         {
           "kind": "fleet-sim",
-          "name": "job-ended-unknown-session-is-404",
+          "name": "job-ended-unknown-session-is-401",
           "task": "D2"
         }
       ]
@@ -604,6 +853,26 @@
         {
           "kind": "fleet-sim",
           "name": "job-ended-status-passes-through",
+          "task": "D2"
+        }
+      ]
+    },
+    {
+      "id": "E7",
+      "checks": [
+        {
+          "kind": "fleet-sim",
+          "name": "job-ended-waits-for-every-replica",
+          "task": "D2"
+        }
+      ]
+    },
+    {
+      "id": "E8",
+      "checks": [
+        {
+          "kind": "fleet-sim",
+          "name": "job-ended-rate-limited-per-session",
           "task": "D2"
         }
       ]
