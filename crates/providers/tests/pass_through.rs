@@ -5,7 +5,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use providers::WireFormat;
-use providers::pricing::{Tool, ToolCounts, UsageRow, price};
+use providers::pricing::{Geo, Speed, Tier, Tool, ToolCounts, UsageRow, parse_usd_atto, price};
 use providers::rates::ROW_RATES;
 use serde_json::Value;
 
@@ -71,10 +71,10 @@ fn every_card_prices_at_cost() {
                                     cache_write_1h_tokens: w1h,
                                     gateway_cache_write_tokens: gw,
                                     server_tools: ToolCounts::new().with(Tool::WebSearch, 2),
-                                    service_tier: tier,
-                                    speed,
-                                    inference_geo: geo,
-                                    upstream_cost_usd: reported,
+                                    service_tier: tier.map(Tier::parse),
+                                    speed: speed.map(Speed::parse),
+                                    inference_geo: geo.map(Geo::parse),
+                                    upstream_cost_usd: reported.map(parse_usd_atto),
                                     unix_secs: 1_791_806_400, // a Monday, 12:00 UTC
                                     ..UsageRow::default()
                                 };

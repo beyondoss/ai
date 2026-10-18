@@ -194,6 +194,92 @@ impl OffPeak {
     }
 }
 
+/// The row's `service_tier`, read once into what the pricer decides on. Every spelling maps to
+/// exactly one variant, and a spelling the pricer does not know is [`Tier::Unknown`] rather than an
+/// error, so the refusal it earns ([`Unpriced::UnknownClass`]) is raised where the pricer reaches
+/// the class, after the checks that precede it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Tier {
+    /// `standard`: Anthropic's own name for its standard tier. Kept apart from [`Tier::Default`]
+    /// because Anthropic and Bedrock refuse every other tier ([`price`]).
+    Standard,
+    /// `default` (OpenAI), `on_demand` (Groq), `auto`: the standard class under another name.
+    /// `auto` is the request's default echoed back unresolved (Meta, through OpenRouter, reports
+    /// it on every Muse Spark answer and bills the standard rate): no other tier was asked for, so
+    /// none was served.
+    Default,
+    /// `priority` or `fast`: fast mode ([`Class::Fast`]).
+    Priority,
+    /// `ultrafast`.
+    Ultrafast,
+    /// `flex`.
+    Flex,
+    /// Any other spelling: refused as [`Unpriced::UnknownClass`].
+    Unknown,
+}
+
+impl Tier {
+    pub fn parse(s: &str) -> Tier {
+        match s {
+            "standard" => Tier::Standard,
+            "default" | "on_demand" | "auto" => Tier::Default,
+            "priority" | "fast" => Tier::Priority,
+            "ultrafast" => Tier::Ultrafast,
+            "flex" => Tier::Flex,
+            _ => Tier::Unknown,
+        }
+    }
+}
+
+/// The row's `speed`, read once (see [`Tier`] for why an unknown one is a variant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Speed {
+    /// `standard`.
+    Standard,
+    /// `fast`: Anthropic fast mode.
+    Fast,
+    /// Any other spelling: refused as [`Unpriced::UnknownClass`].
+    Unknown,
+}
+
+impl Speed {
+    pub fn parse(s: &str) -> Speed {
+        match s {
+            "standard" => Speed::Standard,
+            "fast" => Speed::Fast,
+            _ => Speed::Unknown,
+        }
+    }
+}
+
+/// The row's `inference_geo`, read once (see [`Tier`] for why an unknown one is a variant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Geo {
+    /// `global`, or `not_available`, which Anthropic reports on models without data residency
+    /// (the 4.5 family): no premium.
+    Global,
+    /// `us`: Anthropic data residency ([`Card::geo_us`]).
+    Us,
+    /// Any other spelling: refused as [`Unpriced::UnknownGeo`].
+    Unknown,
+}
+
+impl Geo {
+    pub fn parse(s: &str) -> Geo {
+        match s {
+            "global" | "not_available" => Geo::Global,
+            "us" => Geo::Us,
+            _ => Geo::Unknown,
+        }
+    }
+}
+
+/// A vendor-reported dollar amount as exact attodollars (1e-18 USD). From a row's text it is
+/// [`parse_usd_atto`]'s result, refusal included: the refusal is raised only where the pricer
+/// uses the amount, so a repricer reading the text refuses a row for the same reason, at the same
+/// point, as the gateway, which hands the pricer the vendor's integer directly.
+pub type Reported = Result<u128, Unpriced>;
+
 /// A server-side tool kind, as the row's `server_tools` field names it
 /// (`crates/gateway/ARCHITECTURE.md`, "Server-side tools"). A card prices a kind per call (or per
 /// item); a kind it does not list is refused.
@@ -429,19 +515,20 @@ pub struct UsageRow<'a> {
     /// Cache writes from breakpoints the gateway added: already inside `input_tokens` (on both
     /// wires) and not in `cache_write_tokens`.
     pub gateway_cache_write_tokens: u64,
-    /// The row's `server_tools`, parsed ([`ToolCounts::parse`]).
+    /// The row's `server_tools` by kind. From the row's text, [`ToolCounts::parse`].
     pub server_tools: ToolCounts,
-    /// The service tier the provider says it served at.
-    pub service_tier: Option<&'a str>,
-    /// The speed the provider says it served at (`standard` | `fast`).
-    pub speed: Option<&'a str>,
-    /// Where the provider says inference ran (`us` | `global`).
-    pub inference_geo: Option<&'a str>,
-    /// The vendor's own reported cost, a decimal USD string: OpenRouter `usage.cost`, xAI
-    /// `cost_in_usd_ticks` ÷ 10^10.
-    pub upstream_cost_usd: Option<&'a str>,
-    /// OpenRouter's metered server-tool and plugin cost (`cost_details.server_tool_cost`).
-    pub upstream_tool_cost_usd: Option<&'a str>,
+    /// The service tier the provider says it served at. From the row's text, [`Tier::parse`].
+    pub service_tier: Option<Tier>,
+    /// The speed the provider says it served at. From the row's text, [`Speed::parse`].
+    pub speed: Option<Speed>,
+    /// Where the provider says inference ran. From the row's text, [`Geo::parse`].
+    pub inference_geo: Option<Geo>,
+    /// The vendor's own reported cost (OpenRouter `usage.cost`, xAI `cost_in_usd_ticks` ÷ 10^10),
+    /// exact. From the row's decimal USD text, [`parse_usd_atto`].
+    pub upstream_cost_usd: Option<Reported>,
+    /// OpenRouter's metered server-tool and plugin cost (`cost_details.server_tool_cost`), as
+    /// [`Self::upstream_cost_usd`].
+    pub upstream_tool_cost_usd: Option<Reported>,
     /// The host OpenRouter routed to (its provider name: `Anthropic`, `Amazon Bedrock`, …).
     pub served_by: Option<&'a str>,
     /// Some count on the row is the gateway's estimate.
@@ -826,20 +913,16 @@ impl Tokens {
 /// The class a row was served at, from its `service_tier` and `speed`.
 fn served_class(r: &UsageRow<'_>) -> Result<Class, Unpriced> {
     let tier = match r.service_tier {
-        // `default` (OpenAI), `standard` (Anthropic), `on_demand` (Groq): the standard tier.
-        // `auto` is the request's default echoed back unresolved (Meta, through OpenRouter,
-        // reports it on every Muse Spark answer and bills the standard rate): no other tier was
-        // asked for, so none was served.
-        None | Some("default" | "standard" | "on_demand" | "auto") => Class::Standard,
-        Some("priority" | "fast") => Class::Fast,
-        Some("ultrafast") => Class::Ultrafast,
-        Some("flex") => Class::Flex,
-        Some(_) => return Err(Unpriced::UnknownClass),
+        None | Some(Tier::Standard | Tier::Default) => Class::Standard,
+        Some(Tier::Priority) => Class::Fast,
+        Some(Tier::Ultrafast) => Class::Ultrafast,
+        Some(Tier::Flex) => Class::Flex,
+        Some(Tier::Unknown) => return Err(Unpriced::UnknownClass),
     };
     let speed = match r.speed {
-        None | Some("standard") => Class::Standard,
-        Some("fast") => Class::Fast,
-        Some(_) => return Err(Unpriced::UnknownClass),
+        None | Some(Speed::Standard) => Class::Standard,
+        Some(Speed::Fast) => Class::Fast,
+        Some(Speed::Unknown) => return Err(Unpriced::UnknownClass),
     };
     match (tier, speed) {
         (t, Class::Standard) => Ok(t),
@@ -852,11 +935,9 @@ fn served_class(r: &UsageRow<'_>) -> Result<Class, Unpriced> {
 
 fn geo_us(r: &UsageRow<'_>) -> Result<bool, Unpriced> {
     match r.inference_geo {
-        // Anthropic reports `not_available` on models without data residency (the 4.5 family): no
-        // premium, as global.
-        None | Some("global" | "not_available") => Ok(false),
-        Some("us") => Ok(true),
-        Some(_) => Err(Unpriced::UnknownGeo),
+        None | Some(Geo::Global) => Ok(false),
+        Some(Geo::Us) => Ok(true),
+        Some(Geo::Unknown) => Err(Unpriced::UnknownGeo),
     }
 }
 
@@ -989,7 +1070,7 @@ pub fn price(r: &UsageRow<'_>) -> Result<Priced, Unpriced> {
     // sold and priced by contract, not fast mode (which it reports as `usage.speed`). Only
     // OpenRouter spells fast mode `priority`.
     if matches!(provider, ProviderId::Anthropic | ProviderId::Bedrock)
-        && r.service_tier.is_some_and(|t| t != "standard")
+        && r.service_tier.is_some_and(|t| t != Tier::Standard)
     {
         return Err(Unpriced::UnknownClass);
     }
@@ -1005,8 +1086,8 @@ pub fn price(r: &UsageRow<'_>) -> Result<Priced, Unpriced> {
         // The vendor's own figure is the cost of goods wherever it reports one (OpenRouter, xAI).
         // It already carries the host's price, the tier, any regional premium and tool fees. On
         // OpenRouter it does not carry the fee on the credits that paid for it.
-        (_, Some(raw)) => {
-            let atto = parse_usd_atto(raw)?;
+        (_, Some(atto)) => {
+            let atto = atto?;
             let fee = if provider == ProviderId::OpenRouter {
                 rates::OPENROUTER_CREDIT_FEE
             } else {
@@ -1229,7 +1310,7 @@ mod tests {
     #[test]
     fn a_side_displays_its_breakdown() {
         let p = price(&UsageRow {
-            inference_geo: Some("us"),
+            inference_geo: Some(Geo::parse("us")),
             server_tools: ToolCounts::new().with(Tool::WebSearch, 1),
             ..row("claude-opus-4-8", "anthropic")
         })
@@ -1244,6 +1325,102 @@ mod tests {
     #[test]
     fn unpriced_displays_its_code() {
         assert_eq!(Unpriced::NoToolFee.to_string(), "no_tool_fee");
+    }
+
+    /// The pricer's three readings of `service_tier`, `speed` and `inference_geo` as they were
+    /// when [`UsageRow`] held the row's text, kept verbatim as the oracle for the typed ones.
+    mod text_oracle {
+        use super::*;
+
+        pub fn served_class(tier: Option<&str>, speed: Option<&str>) -> Result<Class, Unpriced> {
+            let tier = match tier {
+                None | Some("default" | "standard" | "on_demand" | "auto") => Class::Standard,
+                Some("priority" | "fast") => Class::Fast,
+                Some("ultrafast") => Class::Ultrafast,
+                Some("flex") => Class::Flex,
+                Some(_) => return Err(Unpriced::UnknownClass),
+            };
+            let speed = match speed {
+                None | Some("standard") => Class::Standard,
+                Some("fast") => Class::Fast,
+                Some(_) => return Err(Unpriced::UnknownClass),
+            };
+            match (tier, speed) {
+                (t, Class::Standard) => Ok(t),
+                (Class::Standard | Class::Fast, Class::Fast) => Ok(Class::Fast),
+                _ => Err(Unpriced::UnknownClass),
+            }
+        }
+
+        pub fn geo_us(geo: Option<&str>) -> Result<bool, Unpriced> {
+            match geo {
+                None | Some("global" | "not_available") => Ok(false),
+                Some("us") => Ok(true),
+                Some(_) => Err(Unpriced::UnknownGeo),
+            }
+        }
+
+        /// Anthropic's and Bedrock's refusal of any tier but their own `standard`.
+        pub fn first_party_refuses(tier: Option<&str>) -> bool {
+            tier.is_some_and(|t| t != "standard")
+        }
+    }
+
+    /// Every way [`price`] consumes `service_tier`, `speed` and `inference_geo` is one of the three
+    /// decisions above, so agreeing on all three for every value is agreeing on every price. The
+    /// corpus is every spelling either side names, near misses (case, whitespace, a prefix), and
+    /// the empty string; `None` is in every product.
+    #[test]
+    fn typed_tiers_decide_as_the_text_did() {
+        const TEXT: &[&str] = &[
+            "default",
+            "standard",
+            "on_demand",
+            "auto",
+            "priority",
+            "fast",
+            "ultrafast",
+            "flex",
+            "scale",
+            "batch",
+            "global",
+            "us",
+            "not_available",
+            "eu",
+            "Standard",
+            "FAST",
+            " us",
+            "flex ",
+            "prio",
+            "",
+        ];
+        let all = || std::iter::once(None).chain(TEXT.iter().copied().map(Some));
+        for tier in all() {
+            assert_eq!(
+                tier.map(Tier::parse).is_some_and(|t| t != Tier::Standard),
+                text_oracle::first_party_refuses(tier),
+                "{tier:?}"
+            );
+            for speed in all() {
+                let r = UsageRow {
+                    service_tier: tier.map(Tier::parse),
+                    speed: speed.map(Speed::parse),
+                    ..UsageRow::default()
+                };
+                assert_eq!(
+                    served_class(&r),
+                    text_oracle::served_class(tier, speed),
+                    "{tier:?} {speed:?}"
+                );
+            }
+        }
+        for geo in all() {
+            let r = UsageRow {
+                inference_geo: geo.map(Geo::parse),
+                ..UsageRow::default()
+            };
+            assert_eq!(geo_us(&r), text_oracle::geo_us(geo), "{geo:?}");
+        }
     }
 
     fn row(model: &'static str, provider: &'static str) -> UsageRow<'static> {
@@ -1261,7 +1438,7 @@ mod tests {
         let plain = price(&row("claude-opus-4-8", "anthropic")).unwrap();
         assert_eq!(plain.cost.multiplier, 10_000);
         let geo = price(&UsageRow {
-            inference_geo: Some("us"),
+            inference_geo: Some(Geo::parse("us")),
             ..row("claude-opus-4-8", "anthropic")
         })
         .unwrap();
@@ -1271,7 +1448,7 @@ mod tests {
         );
         let or = price(&UsageRow {
             usage_wire: WireFormat::OpenAi,
-            upstream_cost_usd: Some("0.01"),
+            upstream_cost_usd: Some(parse_usd_atto("0.01")),
             ..row("claude-opus-4-8", "openrouter")
         })
         .unwrap();
@@ -1285,9 +1462,9 @@ mod tests {
     #[test]
     fn service_tier_auto_is_the_standard_class() {
         let muse = price(&UsageRow {
-            service_tier: Some("auto"),
+            service_tier: Some(Tier::parse("auto")),
             usage_wire: WireFormat::OpenAi,
-            upstream_cost_usd: Some("0.0000212"),
+            upstream_cost_usd: Some(parse_usd_atto("0.0000212")),
             ..row("meta/muse-spark-1.3-contributor", "openrouter")
         })
         .unwrap();
@@ -1298,7 +1475,7 @@ mod tests {
         assert_eq!(muse.price.micros, 22);
         assert_eq!(
             price(&UsageRow {
-                service_tier: Some("auto"),
+                service_tier: Some(Tier::parse("auto")),
                 ..row("claude-opus-4-8", "anthropic")
             }),
             Err(Unpriced::UnknownClass)
@@ -1375,8 +1552,8 @@ mod tests {
                 cache_write_tokens: 20_000,
                 cache_write_1h_tokens: 5_000,
                 output_tokens: 2_500,
-                speed: Some("fast"),
-                inference_geo: Some("us"),
+                speed: Some(Speed::parse("fast")),
+                inference_geo: Some(Geo::parse("us")),
                 server_tools: ToolCounts::new().with(Tool::WebSearch, 3),
                 ..UsageRow::default()
             },

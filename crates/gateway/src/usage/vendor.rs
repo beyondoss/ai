@@ -4,7 +4,9 @@
 //! that value, never the usage block.
 
 use super::{ServiceTier, Usage};
+use crate::route::Dialect;
 use arrayvec::ArrayString;
+use providers::pricing::{Geo, Speed, Tier, Tool, ToolCounts, UsageRow};
 use serde::Deserialize;
 
 /// A provider id echoed in a response (a generation, message, response or container id).
@@ -133,6 +135,79 @@ impl ServerTools {
     }
 }
 
+/// The pricer's counts, kind by kind: the same numbers [`ServerTools::to_row`] logs, without
+/// writing them out and reading them back. Exhaustive by destructuring, so a kind added to
+/// `ServerTools` and not mapped here fails to compile.
+impl From<&ServerTools> for ToolCounts {
+    fn from(t: &ServerTools) -> Self {
+        let ServerTools {
+            web_search,
+            web_search_preview,
+            web_search_page,
+            web_fetch,
+            code_execution,
+            file_search,
+            image_generation,
+            computer_use,
+            mcp,
+            shell,
+            tool_search,
+            x_search,
+            x_posts,
+            x_users,
+            document_search,
+            sources,
+            tool_calls,
+        } = *t;
+        ToolCounts::new()
+            .with(Tool::WebSearch, u64::from(web_search))
+            .with(Tool::WebSearchPreview, u64::from(web_search_preview))
+            .with(Tool::WebSearchPage, u64::from(web_search_page))
+            .with(Tool::WebFetch, u64::from(web_fetch))
+            .with(Tool::CodeExecution, u64::from(code_execution))
+            .with(Tool::FileSearch, u64::from(file_search))
+            .with(Tool::ImageGeneration, u64::from(image_generation))
+            .with(Tool::ComputerUse, u64::from(computer_use))
+            .with(Tool::Mcp, u64::from(mcp))
+            .with(Tool::Shell, u64::from(shell))
+            .with(Tool::ToolSearch, u64::from(tool_search))
+            .with(Tool::XSearch, u64::from(x_search))
+            .with(Tool::XPosts, u64::from(x_posts))
+            .with(Tool::XUsers, u64::from(x_users))
+            .with(Tool::DocumentSearch, u64::from(document_search))
+            .with(Tool::Sources, u64::from(sources))
+            .with(Tool::ToolCalls, u64::from(tool_calls))
+    }
+}
+
+impl Usage {
+    /// The row as the pricer reads it, from these typed facts rather than their log text: every
+    /// field `Usage` holds, with `usage_wire` falling back to `wire` (the request's) when the
+    /// extractor read none. The fields only `logging` knows (`price_model`, `provider`,
+    /// `price_variant`, the estimate and cache flags, `unix_secs`) are left at their defaults for
+    /// the caller to set. `vendor_tests` holds this equal to pricing the logged text.
+    pub fn pricer_row(&self, wire: Dialect) -> UsageRow<'_> {
+        let atto = |e10: Option<u64>| e10.map(|v| Ok(e10_to_atto(v)));
+        UsageRow {
+            usage_wire: self.wire.unwrap_or(wire),
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            cache_write_1h_tokens: self.cache_write_1h_tokens,
+            gateway_cache_write_tokens: self.gateway_cache_write_tokens,
+            server_tools: ToolCounts::from(&self.server_tools),
+            service_tier: self.service_tier.as_deref().map(Tier::parse),
+            speed: self.speed.as_deref().map(Speed::parse),
+            inference_geo: self.inference_geo.as_deref().map(Geo::parse),
+            upstream_cost_usd: atto(self.upstream.cost_e10),
+            upstream_tool_cost_usd: atto(self.upstream.tool_cost_e10),
+            served_by: self.upstream.served_by.as_deref(),
+            ..UsageRow::default()
+        }
+    }
+}
+
 /// What the upstream itself reported about the call, for reconciling a row against the vendor:
 /// its ids and, where it reports one, its own price.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -170,7 +245,7 @@ pub(super) fn usd_to_e10(v: f64) -> Option<u64> {
 }
 
 /// 1e-10 USD units as a decimal USD string (`12345` → `"0.0000012345"`), trailing zeros trimmed:
-/// exact, so a pricer reads a decimal rather than a float.
+/// exact, so a repricer reads a decimal rather than a float.
 pub fn e10_to_usd(v: u64) -> String {
     let whole = v / 10_000_000_000;
     let frac = v % 10_000_000_000;
@@ -179,6 +254,13 @@ pub fn e10_to_usd(v: u64) -> String {
     }
     let f = format!("{frac:010}");
     format!("{whole}.{}", f.trim_end_matches('0'))
+}
+
+/// 1e-10 USD units as the pricer's exact attodollars (1e-18 USD): the value [`e10_to_usd`]'s text
+/// parses back to ([`providers::pricing::parse_usd_atto`]). Cannot overflow: `u64::MAX × 10^8` is
+/// below 2^91.
+fn e10_to_atto(v: u64) -> u128 {
+    u128::from(v) * 100_000_000
 }
 
 /// Deserialize a string into an inline `ArrayString` when every byte passes `ok`, leniently: any

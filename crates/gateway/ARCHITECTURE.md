@@ -2028,9 +2028,13 @@ refusal before any response head, such as a catalog miss on `/{provider}`, D267)
 target `ai.usage`, written as one JSON line whose fields are under `fields`. A field that has no
 value is **absent**, never `null`. Types below are JSON types. Token counts are integers.
 
-The pricer reads the same facts as typed values at emission (`usage::Usage`,
-`proxy::RequestedKnobs`, and the locals `logging` names), so a pricer called in the gateway gets
-the numbers, not their log text.
+The pricer reads the same facts as typed values at emission (`usage::Usage::pricer_row`, and the
+locals `logging` names), so a pricer called in the gateway gets the numbers, not their log text:
+`server_tools` as counts (`ToolCounts` from `ServerTools`), the reported costs as exact
+attodollars from their 1e-10 USD integers, and `service_tier`, `speed` and `inference_geo` read
+once into `pricing::Tier`, `Speed` and `Geo`. The logged fields are written from the same values,
+byte for byte as before, and pricing their text back gives the same result (held by
+`usage::vendor_tests`).
 
 **Identity and route**
 
@@ -2284,9 +2288,10 @@ still flagged `upstream_may_continue`.
 
 **The price (authoritative)**
 
-`logging` calls `providers::pricing::price` with the row's own facts, as the row logs them
-(`server_tools` is read back from its logged text), so a repricer working from the row gets the
-same inputs. The pricing contract (the model, every dimension, rounding, the rate table and the
+`logging` calls `providers::pricing::price` with the row's own facts, typed (`Usage::pricer_row`).
+A repricer working from the row parses the logged text back to the same inputs
+(`ToolCounts::parse`, `parse_usd_atto`, `Tier::parse`, `Speed::parse`, `Geo::parse`), and
+`usage::vendor_tests` holds the two paths to the same price on every catalog row. The pricing contract (the model, every dimension, rounding, the rate table and the
 golden vectors) is `crates/providers/ARCHITECTURE.md`, "Pricing contract". The rate table is
 generated from snapshots of every vendor's primary pricing source. A daily workflow
 (`rates-drift.yml`) re-fetches them and, when a rate moved, opens a `rates/sync-*` PR with the new
