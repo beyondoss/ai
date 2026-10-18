@@ -32,7 +32,7 @@ fn every_ending_has_its_own_outcome() {
     assert_eq!(outcome(&rc, Some(&down), false, false), "upstream_error");
 }
 
-/// Only a 401 is a pool key failing (D84): a 402 or 403 is about the request or the account,
+/// Only a 401 is a pool key failing: a 402 or 403 is about the request or the account,
 /// a candidate refusal that walks the catalog but never cools or walks keys.
 /// claim: REL-4
 #[test]
@@ -285,7 +285,7 @@ fn forcing_include_usage_keeps_other_stream_options() {
     assert_eq!(v["stream_options"]["include_obfuscation"], false);
 }
 
-/// D80 resends only when **every** condition holds: a reused connection, pingora's
+/// A reused connection's failure resends only when **every** condition holds: a reused connection, pingora's
 /// `ReusedOnly` verdict, a read error, and a reset or abort at the root. With any one false the
 /// request may have reached a server, so it is never sent twice.
 /// claim: REL-1, REL-11
@@ -353,7 +353,7 @@ fn the_usage_tail_wraps_at_exactly_its_capacity() {
     assert_eq!(tail.contiguous(), &whole[whole.len() - USAGE_TAIL_CAP..]);
 }
 
-/// A body write that met an HTTP/2 stream already closed (D248) is pingora's `H2Error` with a
+/// A body write that met an HTTP/2 stream already closed is pingora's `H2Error` with a
 /// capacity context, found anywhere down the cause chain; another type or context is not it.
 /// claim: REL-22
 #[test]
@@ -427,7 +427,7 @@ fn an_allowed_beta_line_is_forwarded_untouched() {
 }
 
 /// Fast mode's beta rides on a managed request to direct Anthropic, the only provider with fast
-/// mode, and is dropped on the way to any other (D266).
+/// mode, and is dropped on the way to any other.
 /// claim: SEC-6
 /// defect: D266
 #[test]
@@ -447,7 +447,7 @@ fn the_fast_mode_beta_reaches_direct_anthropic_only() {
 
 /// The fine-grained-tool-streaming beta rides only to a candidate that takes fine-grained tool
 /// streaming; for any other (an older Bedrock stack) it goes with each tool's
-/// `eager_input_streaming` (D272). Alone on the line, the header goes entirely.
+/// `eager_input_streaming`. Alone on the line, the header goes entirely.
 /// claim: SEC-6
 /// defect: D272
 #[test]

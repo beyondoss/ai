@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 const ERROR_BODY: &str = r#"{"error":{"message":"This endpoint's maximum context length is 400000 tokens.","type":"invalid_request_error","code":400}}"#;
 
 /// What the upstream does after sending its complete 400. `StopReading` and `NeverAnswer` reproduce
-/// D118 (accepted: the fix belongs in pingora-proxy's h2 loop); they stay so the shapes can be
+/// a known pingora-proxy h2 loop behaviour (its fix belongs there); they stay so the shapes can be
 /// re-checked after a pingora upgrade.
 #[derive(Clone, Copy)]
 #[allow(dead_code)]

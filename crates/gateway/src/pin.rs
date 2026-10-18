@@ -3,8 +3,8 @@
 //! A managed `/auto` or `/v1` request walks one catalog row — no provider the row does not already
 //! name. What this module decides is the **order** of that walk when the caller did not fix it
 //! (`x-beyond-order` / `x-beyond-split`). It is the only ordering function: there is no latency
-//! ranking (removed after D253 left it ordering only walks with no caller identity, which a managed
-//! request never is).
+//! ranking, which could only order walks with no caller identity, and a managed request always
+//! has one.
 //!
 //! A session pin keeps one caller on one provider. Provider prompt caches are per provider, so a
 //! walk that moves an agent loop from Anthropic to Bedrock and back re-reads the whole prefix at
@@ -20,7 +20,7 @@
 //! then the rest in catalog order. Candidates that cannot be used on this pod (no pool key, every
 //! key cooling, cannot serve the body) move to the back. No latency, no probe, no failure history:
 //! nothing a pod observes moves the pin, so every replica computes the same walk and there is no
-//! per-pod table to disagree (D253: a remembered per-pod pin let pod A keep a key on its failover
+//! per-pod table to disagree (a remembered per-pod pin let pod A keep a key on its failover
 //! after one transient 5xx while pod B served the primary, and alternating turns re-bought the
 //! prefix every time). An aggregator is never hashed in; it serves only when no first-party host
 //! before it can.
@@ -204,7 +204,7 @@ mod tests {
         assert!(order(Walk::identity(3), &route, aff(), ALL).is_none());
     }
 
-    /// D253: the walk is a pure function of the caller, the row and the usable set, so every pod
+    /// The walk is a pure function of the caller, the row and the usable set, so every pod
     /// computes the same one. Across callers the pooled first-party hosts share the load, and the
     /// aggregator never leads while one of them is usable.
     /// claim: R4
@@ -236,7 +236,7 @@ mod tests {
     }
 
     /// A candidate with no pool key here (or cooling, or unable to serve the body) goes behind
-    /// every one that can, keeping the others' order: the dispatchable mask D119 introduced.
+    /// every one that can, keeping the others' order (the dispatchable mask).
     /// claim: R4
     /// defect: D119
     #[test]

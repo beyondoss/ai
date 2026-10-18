@@ -56,7 +56,7 @@ fn number_after_n(text: &str) -> Option<String> {
 /// Any JSON number literal: integers in and past `i64`/`u64`, decimals of any length (money,
 /// coordinates, scores, and the 15-20 digit floats a model writes), exponent forms, and the
 /// subnormal and huge magnitudes at `f64`'s edges. A `Value` keeps every integer within `u64` as
-/// written; anything else was the D127 shape (`-1.32417719719006e-11` came out as
+/// written; anything else is reshaped (`-1.32417719719006e-11` comes out as
 /// `-1.3241771971900598e-11`, a 30-digit integer as `1.2345678901234568e29`).
 fn number() -> impl Strategy<Value = String> {
     let digits = |n: std::ops::Range<usize>| prop::collection::vec(0u8..10, n);

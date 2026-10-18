@@ -62,8 +62,8 @@ pub(super) fn drains_on_cancel(rc: &RequestCtx, status: u16) -> bool {
             .is_some_and(|id| MAY_CONTINUE.contains(&id))
 }
 
-/// Scrubs a managed error body (status >= 400) as it streams past: the pool key the attempt sent
-/// (D66), and a provider-account remedy (D174). The one rewrite of a provider's error body, made
+/// Scrubs a managed error body (status >= 400) as it streams past: the pool key the attempt sent,
+/// and a provider-account remedy. The one rewrite of a provider's error body, made
 /// before translation, capture and the cache see it.
 ///
 /// **Pool key.** A provider, or a proxy in between, that echoes the credential it received in an
@@ -72,13 +72,13 @@ pub(super) fn drains_on_cancel(rc: &RequestCtx, status: u16) -> bool {
 /// `key.len() - 1` bytes of each chunk are held back until the next one, so a key split across
 /// chunks is caught too; memory is bounded by the key, not the body. Each JSON-escaped spelling of
 /// the key (`\/`, `+`: [`route::key_finders`]) is overwritten the same way, since a JSON client
-/// decodes it to the key (D203).
+/// decodes it to the key.
 ///
 /// **Account remedy.** A JSON error (`whole`) is held until its end, at most
 /// [`remedy::MAX_BODY`], and handed to [`remedy::neutralize`] after the key is masked: "add your
 /// own key", a billing page and the like become a neutral message (`response_filter` dropped the
 /// `Content-Length`, since that changes the length). Past the cap it streams as above. An
-/// out-of-credit answer sets `unfunded`, which `logging` reads to cool the key (D180).
+/// out-of-credit answer sets `unfunded`, which `logging` reads to cool the key.
 #[derive(Default)]
 pub(super) struct Redact {
     pub(super) carry: Vec<u8>,
@@ -129,7 +129,7 @@ impl Redact {
                 buf = n.body;
                 self.unfunded = n.unfunded;
                 // The rewrite decoded every string and wrote it back unescaped: an echo in a
-                // spelling no searcher knew (`A` for `A`) is now the key as sent (D203).
+                // spelling no searcher knew (`A` for `A`) is now the key as sent.
                 if let Some(key) = keys.first() {
                     mask_all(&mut buf, key);
                 }
@@ -141,7 +141,7 @@ impl Redact {
                 && mask_all(&mut plain, key)
             {
                 // Any other `\uXXXX` spelling of the key: a JSON client decodes it to the key, so
-                // the body is relayed decoded and masked (D203). Only a body with such an escape
+                // the body is relayed decoded and masked. Only a body with such an escape
                 // and the key behind it is re-serialized.
                 buf = plain;
             }
@@ -195,11 +195,11 @@ impl AiProxy {
     }
 
     /// Hold, in the process body budget, the heap translating `body` will take
-    /// ([`translate::translation_heap`]) for as long as the hold lives (D216). A body past the
+    /// ([`translate::translation_heap`]) for as long as the hold lives. A body past the
     /// replay buffer only, like every other budget charge: smaller ones are bounded by concurrency.
     /// Never exempt on a `FullBody` re-run, whose parent reserved two copies of the body, not the
     /// `Value`s built from it. A translation that needs more than the whole budget is a 413 naming
-    /// translation; one that does not fit now is the budget's retryable 503. With the budget off
+    /// translation; one that does not fit right now is the budget's retryable 503. With the budget off
     /// there is nothing to hold, and nothing is refused. On a response the status line is already
     /// downstream, so either refusal aborts it.
     pub(super) fn hold_translation_heap(

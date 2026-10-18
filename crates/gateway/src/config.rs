@@ -419,7 +419,7 @@ pub struct AiConfig {
     /// memory bound: one line carries up to two `capture_max_bytes` bodies, more after JSON
     /// escaping, so a full queue of 1 024 could hold gigabytes while the log pipeline stalls. A
     /// line that would cross this bound is **dropped** (counted on `ai_capture_dropped_total`),
-    /// never waited for (D262).
+    /// never waited for.
     pub capture_queue_bytes: usize,
     /// Directory for `ai.usage` billing rows (`AI_USAGE_DIR`). Set: rows go to hourly
     /// `ai-usage-YYYYMMDDTHH.jsonl` files here, **only** there, with the same blocking, lossless
@@ -1478,8 +1478,8 @@ mod tests {
 
     #[test]
     fn config_file_is_read_exactly_once() {
-        // Validating the key set and then merging used to open, read and parse the file twice —
-        // and, worse than the wasted parse, at two different instants, so a file rewritten in
+        // Validating the key set and then merging must not open, read and parse the file twice —
+        // worse than the wasted parse, at two different instants, so a file rewritten in
         // between produced a config that had been validated against different content than it
         // loaded. Prove single-read by making the *second* read return something the first didn't:
         // load, then delete the file mid-flight is untestable, so instead assert the parsed data is

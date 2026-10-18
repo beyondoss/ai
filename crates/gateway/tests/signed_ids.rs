@@ -1,5 +1,5 @@
 //! End-to-end: tenant-bound ids for the Responses state OpenAI keeps under Beyond's pool key
-//! (`signed_id.rs`, D230, D231).
+//! (`signed_id.rs`).
 //!
 //! Every managed tenant shares one OpenAI organization through the pool key, and OpenAI stores
 //! each response by default. So the ids in a managed Responses answer are signed for the tenant it
@@ -645,8 +645,8 @@ async fn compaction_ids_are_bound_too() {
 }
 
 /// A row with no store is untouched: a Claude row's translated answer carries ids nothing upstream
-/// can resolve and is not signed, a grok row's relay to xAI still goes as `store: false` (D145),
-/// and D175's rule still drops a tool step's `item_reference` and refuses a turn's, whatever form
+/// can resolve and is not signed, a grok row's relay to xAI still goes as `store: false`,
+/// and the `item_reference` rule still drops a tool step's `item_reference` and refuses a turn's, whatever form
 /// its id takes.
 /// claim: SEC-25, E3
 /// defect: D175

@@ -288,8 +288,8 @@ async fn anthropic_format_images_do_not_inflate_the_input_estimate() {
 
 /// A client that closes before the end of its own body (a `Content-Length` body with bytes still
 /// to come, a chunked one without its last chunk) never gave the provider the request: the half
-/// it was sent is no prompt it bills. Not estimated (D259), unlike a client that sent the whole
-/// body and then gave up waiting (D130).
+/// it was sent is no prompt it bills. Not estimated, unlike a client that sent the whole
+/// body and then gave up waiting.
 /// claim: BIL-3
 /// defect: D259
 #[tokio::test]

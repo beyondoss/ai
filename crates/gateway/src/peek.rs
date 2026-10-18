@@ -560,7 +560,7 @@ pub const OUTPUT_LIMIT_KEYS: [&[u8]; 3] = [
 /// Semantics are exactly the two walks it fused, including the details that look incidental:
 /// `stream_options` anywhere at root wins regardless of `stream`, a key spelled with escapes is
 /// decoded and the last `stream` decides (as the provider's parser does; a duplicate or escaped
-/// `stream_options` is flagged in `stream_options_ambiguous` instead, D88), and the model value
+/// `stream_options` is flagged in `stream_options_ambiguous` instead), and the model value
 /// *is* unescaped because `ModelScanner` unescapes it. `fused_scan_matches_the_two_walks_it_replaces` cross-checks a corpus against both.
 pub fn scan_buffered(body: &[u8]) -> BufferedScan {
     // Not a JSON object ⇒ nothing to inject into. A non-object root also has no root-level `model`,
@@ -695,7 +695,7 @@ impl Fused<'_> {
             self.stream_options_ambiguous = true;
         }
         // The provider decodes an escaped key and keeps the last duplicate, so each key that
-        // decodes to `stream` decides afresh (D88).
+        // decodes to `stream` decides afresh.
         self.last_key_is_stream = key_names(key, escaped, "stream");
         if self.last_key_is_stream {
             self.stream_true = false;
@@ -1624,7 +1624,7 @@ mod tests {
         assert_eq!(structure(br#""unterminated {"#), Structure::default());
     }
 
-    /// Only a root member whose value is the literal `null` is removed (D101): not a string that
+    /// Only a root member whose value is the literal `null` is removed: not a string that
     /// starts with `n`, not a nested `null`, not a role named user.
     #[test]
     fn remove_root_nulls_removes_only_root_nulls() {

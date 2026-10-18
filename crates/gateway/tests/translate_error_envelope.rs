@@ -99,7 +99,7 @@ async fn an_error_already_in_the_clients_envelope_is_relayed_untouched() {
     assert_eq!(resp.text().await.unwrap(), OPENAI_SHAPED);
 }
 
-/// The same-endpoint half of D100: a Chat client on a row whose candidate is a non-OpenAI Chat
+/// The same-endpoint half: a Chat client on a row whose candidate is a non-OpenAI Chat
 /// Completions vendor (DeepSeek) gets that vendor's foreign error shape re-encoded in OpenAI's
 /// envelope, with no translation in play.
 /// claim: T6

@@ -435,7 +435,7 @@ async fn a_large_body_survives_a_failover_intact() {
     let cap = fallback.captured().expect("fallback served the request");
     let received = String::from_utf8(cap.body).unwrap();
     // The rewrite lengthens the id by exactly the vendor prefix, and OpenRouter is asked not to
-    // compress the prompt (D109); nothing else may change.
+    // compress the prompt; nothing else may change.
     const NO_COMPRESSION: &str = r#""plugins":[{"id":"context-compression","enabled":false}],"#;
     assert_eq!(
         received.len(),
@@ -643,7 +643,7 @@ async fn agreeing_header_and_body_count_no_mismatch() {
 
 /// Provider-routed traffic keeps the old meaning: the body is untouched, so the body's `model` *is*
 /// what was requested, and no `routed_model` appears at all. A dated snapshot is no catalog name
-/// (a walk would 404 it) but prices at its row, so a managed key may send it here (D267).
+/// (a walk would 404 it) but prices at its row, so a managed key may send it here.
 #[tokio::test]
 async fn provider_routed_requested_model_still_comes_from_the_body() {
     let nats_port = unused_nats_port();
@@ -1272,7 +1272,7 @@ async fn byo_v1_forwards_an_unknown_model() {
 }
 
 /// `/{provider}/…` is the escape hatch: no catalog walk. The body is relayed as sent, never re-spelled
-/// for a candidate: a managed key's model need only price at a catalog row (D267; a dated snapshot,
+/// for a candidate: a managed key's model need only price at a catalog row (a dated snapshot,
 /// which a walk would 404, does), and a BYO key's may be anything.
 #[tokio::test]
 async fn explicit_provider_path_ignores_the_catalog() {

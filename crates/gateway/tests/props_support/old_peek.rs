@@ -697,7 +697,7 @@ pub const OUTPUT_LIMIT_KEYS: [&[u8]; 3] = [
 /// Semantics are exactly the two functions it replaces, including the details that look incidental:
 /// `stream_options` anywhere at root wins regardless of `stream`, a key spelled with escapes is
 /// decoded and the last `stream` decides (as the provider's parser does; a duplicate or escaped
-/// `stream_options` is flagged in `stream_options_ambiguous` instead, D88), and the model value
+/// `stream_options` is flagged in `stream_options_ambiguous` instead), and the model value
 /// *is* unescaped because `ModelScanner` unescapes it. `fused_scan_matches_the_two_walks_it_replaces` cross-checks a corpus against both.
 #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 pub fn scan_buffered(body: &[u8]) -> BufferedScan {
@@ -802,7 +802,7 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
                             stream_options_ambiguous = true;
                         }
                         // The provider decodes an escaped key and keeps the last duplicate,
-                        // so each key that decodes to `stream` decides afresh (D88).
+                        // so each key that decodes to `stream` decides afresh.
                         last_key_is_stream = key == b"stream"
                             || (key.contains(&b'\\')
                                 && escaped_key_is(&body[key_start - 1..=j], "stream"));

@@ -6,7 +6,7 @@
 //! decision keeps: **a body the provider may already have is never sent again, unless the
 //! provider proved it unprocessed** (an HTTP/2 refusal, or a pooled HTTP/1.1 connection it reset
 //! with the request unread). A provider holding the whole body may be generating, and billing,
-//! already (D09, D51). An error status at the head is the provider's answer, so the request is
+//! already. An error status at the head is the provider's answer, so the request is
 //! over there and may go to the next key or candidate; whether pingora can resend it is then only
 //! whether it still holds the body ([`Body::replayable`]).
 
@@ -71,25 +71,25 @@ pub(crate) enum Failure {
 /// A connection that failed once it was up, and what that says about the body.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Lost {
-    /// The client is gone: its error, or a stalled upload retagged as its (D260).
+    /// The client is gone: its error, or a stalled upload retagged as its.
     pub downstream: bool,
     /// The response already started reaching the client.
     pub responded: bool,
     /// The provider may have the whole body: the connection was up, the body read to its end,
     /// and nothing failed writing it (`body_delivered`).
     pub delivered: bool,
-    /// The provider refused the stream unprocessed (D72): `RST_STREAM(REFUSED_STREAM)`, or a
+    /// The provider refused the stream unprocessed: `RST_STREAM(REFUSED_STREAM)`, or a
     /// GOAWAY above its last stream id.
     pub refused: bool,
     /// The refusal was a GOAWAY.
     pub goaway: bool,
-    /// A pooled HTTP/1.1 connection was reset with the request unread in it (D80).
+    /// A pooled HTTP/1.1 connection was reset with the request unread in it.
     pub reset_unread: bool,
     /// The connection came from the pool.
     pub reused: bool,
     /// This leg already spent its one refused-stream resend.
     pub refused_resent: bool,
-    /// An HTTP/2 body write met a stream already closed (D248): a reused connection's failure
+    /// An HTTP/2 body write met a stream already closed: a reused connection's failure
     /// before delivery.
     pub h2_body_unsent: bool,
     /// Pingora's own verdict on the error, its `RetryType` decided for `reused`.
@@ -104,14 +104,14 @@ impl Lost {
         !self.downstream && !self.responded && !unproven
     }
 
-    /// A GOAWAY draining a connection this request found already open (D248): the provider
+    /// A GOAWAY draining a connection this request found already open: the provider
     /// retiring a connection that carried other streams, not refusing work, so its resend does
     /// not spend the leg's one.
     fn drain(&self) -> bool {
         self.refused && self.reused && self.goaway
     }
 
-    /// Whether a refused stream is resent on its leg: once (D72), and on every drain.
+    /// Whether a refused stream is resent on its leg: once, and on every drain.
     pub fn resends_refusal(&self) -> bool {
         self.refused && (self.drain() || !self.refused_resent)
     }
@@ -261,11 +261,11 @@ fn answered(
 /// body ([`Lost::may_resend`]), to the same candidate or the next, pingora's reused-connection
 /// retry included.
 ///
-/// A refused stream gets one resend on its candidate (D72). Refused again there, the provider is
+/// A refused stream gets one resend on its candidate. Refused again there, the provider is
 /// failing to take work (its stream limit, a drain that never ends): a provider failure like any
-/// other, so the walk fails over and the breaker hears of it (D91), rather than a tight loop of
-/// resends up to pingora's retry limit. A drain GOAWAY does not spend that resend (D248): one
-/// GOAWAY refuses every multiplexed stream above its last id at once (D160) and retires the
+/// other, so the walk fails over and the breaker hears of it, rather than a tight loop of
+/// resends up to pingora's retry limit. A drain GOAWAY does not spend that resend: one
+/// GOAWAY refuses every multiplexed stream above its last id at once and retires the
 /// connection, so the resend lands on another, and pingora's retry limit bounds them all.
 ///
 /// A body pingora cannot resend goes back to its `FullBody` parent, if it has one: a reused or

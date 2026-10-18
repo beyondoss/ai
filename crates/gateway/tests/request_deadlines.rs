@@ -4,7 +4,7 @@
 //! Run via `mise run test:integration:rs` (needs `nats-server` on PATH).
 //!
 //! Every other bound is per read or per write, so a stream that keeps moving, or a silent one an
-//! HTTP/2 PING keeps alive (OpenAI's `-pro` rows have no silence bound at all, D252), held its
+//! HTTP/2 PING keeps alive (OpenAI's `-pro` rows have no silence bound at all), held its
 //! tenant slot for as long as nobody hung up; and pingora's HTTP/2 server has no body read timeout,
 //! so an h2c client that stopped mid-body held one forever with nothing upstream open. What must
 //! hold: each ends within its bound, gives its tenant slot back, and charges no provider for it.
@@ -134,10 +134,10 @@ async fn a_stream_that_never_ends_is_cut_at_request_max_secs() {
 
 /// A provider that takes the request and never answers is a 504 at `request_max_secs` when that
 /// comes before the silence bound, on an ordinary row (below `read_timeout_secs`) and on a `-pro`
-/// row (which has no silence bound at all, D252). Not a provider failure: with a breaker threshold
+/// row (which has no silence bound at all). Not a provider failure: with a breaker threshold
 /// of 1 the next request still reaches the provider, no pool key is cooled, and the walk does not
 /// fail over. The tenant slot comes back. The prompt is billed as an estimate, as any wait the
-/// gateway gives up on after delivery is (D130).
+/// gateway gives up on after delivery is.
 /// claim: REL-1, SEC-16, BIL-3
 /// defect: D264
 #[tokio::test]

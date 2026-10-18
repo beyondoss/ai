@@ -84,7 +84,7 @@ pub(super) enum RouteMiss {
     UnknownModel,
     /// The first segment matches no provider, is not the bare default, and is not `/auto`.
     UnknownProvider,
-    /// Bare `/v1` with BYO keys for two different providers (D82): a 400, never a guess.
+    /// Bare `/v1` with BYO keys for two different providers: a 400, never a guess.
     AmbiguousCredential,
 }
 
@@ -137,7 +137,7 @@ pub(super) struct Lineup {
     pub(super) usable: u8,
     pub(super) walk: control::Walk,
     pub(super) arms: &'static [route::Candidate],
-    /// The client asked for priority processing (`route::SpeedAsk::Priority`, D266).
+    /// The client asked for priority processing (`route::SpeedAsk::Priority`).
     pub(super) priority: bool,
 }
 
@@ -682,8 +682,8 @@ impl AiProxy {
         let model_route = plan.row();
         let path = session.req_header().uri.path();
 
-        // Two root `model` keys (D34), refused before connecting wherever the body is already in
-        // hand, with a JSON 400 and the request id (D94). A body streamed through is still refused
+        // Two root `model` keys, refused before connecting wherever the body is already in
+        // hand, with a JSON 400 and the request id. A body streamed through is still refused
         // in `request_body_filter`, after the request headers went upstream.
         let shape = shape(model_route, body_complete.as_deref())?;
 
@@ -802,9 +802,9 @@ impl AiProxy {
         };
         // Every billable managed `/{provider}/…` body is buffered too, so a model outside the
         // catalog is refused before a byte of it goes upstream: a managed key runs only what its
-        // billing row can price (D267). So is a `/responses` body's `background: true` (a
-        // generation the provider runs after the request ends, which no usage tap can meter,
-        // D202). The free token counts are left to stream: nothing there bills. A catalog walk
+        // billing row can price. So is a `/responses` body's `background: true` (a
+        // generation the provider runs after the request ends, which no usage tap can meter).
+        // The free token counts are left to stream: nothing there bills. A catalog walk
         // checked its body above.
         let catalog_check = managed
             && plan
@@ -925,7 +925,7 @@ impl AiProxy {
             model_route.is_some(),
             full_body.as_ref().is_some_and(|fb| fb.slot_held),
         )?;
-        // Past any key cooling off from a 401 (D71); a catalog walk picks per candidate.
+        // Past any key cooling off from a 401; a catalog walk picks per candidate.
         let pool_key = provider.first_key();
         held.tenant = slot;
 
@@ -1067,7 +1067,7 @@ impl AiProxy {
                 row.responses
             }
             // More tools than Chat Completions takes, from a translated client: the
-            // Responses arm takes them (`route::tools_need_responses_arm`, D131).
+            // Responses arm takes them (`route::tools_need_responses_arm`).
             None if match full_body {
                 Some(fb) => fb.responses_tools,
                 None => body_complete.is_some_and(|b| {
@@ -1124,7 +1124,7 @@ impl AiProxy {
             }
             // A re-run of a large body skips the candidates earlier attempts failed on. A
             // key walk in progress is not a filter: its candidate goes first below
-            // (`FullBody::resume`), and the rest stay for failover (D81).
+            // (`FullBody::resume`), and the rest stay for failover.
             let failed = full_body
                 .as_ref()
                 .is_some_and(|fb| fb.skip & (1 << orig) != 0);
@@ -1143,7 +1143,7 @@ impl AiProxy {
             (None, Some(b)) => route::unserved(arms, b),
             (None, None) => 0,
         };
-        // Anthropic fast mode (D266). A Messages client's `speed: "fast"` is served fast or
+        // Anthropic fast mode. A Messages client's `speed: "fast"` is served fast or
         // refused, as Anthropic itself does: only a candidate that serves fast mode may
         // take it, and a walk with none is a 400 here rather than an answer at standard
         // speed (or Bedrock's own refusal) under a fast request. A Chat Completions or
@@ -1176,7 +1176,7 @@ impl AiProxy {
             dispatchable &= !unserved;
         }
         // A provider whose every key was refused within `KEY_COOLDOWN` (revoked, or out of
-        // credit: D180) is not sent to while another candidate can take the request; when
+        // credit) is not sent to while another candidate can take the request; when
         // none can, it is tried anyway, and its own answer is the client's.
         if dispatchable & walked & !cooling != 0 {
             dispatchable &= !cooling;

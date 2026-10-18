@@ -72,11 +72,11 @@ pub(super) const MANAGED_ANTHROPIC_BETAS: [&str; 8] = [
 /// every `anthropic-beta` token not in [`MANAGED_ANTHROPIC_BETAS`], plus
 /// [`translate::FAST_MODE_BETA`] when `anthropic` (the attempt goes to direct Anthropic, the only
 /// provider with fast mode). Fast mode is a product Beyond sells at its price: the row records the
-/// speed asked and the speed served (`usage.speed`), so it is billed as served (D266). Without
+/// speed asked and the speed served (`usage.speed`), so it is billed as served. Without
 /// `eager_tool_streaming` (the attempt's candidate does not take fine-grained tool streaming,
 /// `providers::catalog::serves_eager_input_streaming`), [`FINE_GRAINED_TOOL_STREAMING_BETA`] is
-/// dropped too, as `request_body_filter` drops each tool's `eager_input_streaming` (D272). The
-/// header sweep allocates nothing (D92: it collected the names into a `Vec` on nearly every
+/// dropped too, as `request_body_filter` drops each tool's `eager_input_streaming`. The
+/// header sweep allocates nothing (it collected the names into a `Vec` on nearly every
 /// managed request); only an `anthropic-beta` value with a token to drop is rebuilt.
 pub(super) fn retain_managed_client_headers(
     req: &mut pingora::http::RequestHeader,
@@ -115,12 +115,12 @@ pub(super) fn retain_managed_client_headers(
     Ok(())
 }
 
-/// Drop every `x-beyond-*` header from a request about to go upstream (D67). Allocates nothing.
+/// Drop every `x-beyond-*` header from a request about to go upstream. Allocates nothing.
 pub(super) fn strip_beyond_headers(req: &mut pingora::http::RequestHeader) {
     remove_headers_where(req, |name| name.starts_with("x-beyond-"));
 }
 
-/// Remove every header whose (lower-case) name `drop` matches, allocating nothing (D92): names are
+/// Remove every header whose (lower-case) name `drop` matches, allocating nothing: names are
 /// copied in batches onto the stack, since the map cannot be borrowed while it is edited. A name
 /// past the stack slot's length (no real header) is cloned instead.
 pub(super) fn remove_headers_where(
@@ -233,7 +233,7 @@ pub(super) struct Presented<'a> {
 /// OpenAI's `Authorization: Bearer` (scheme matched case-insensitively). Borrowed from the request —
 /// no per-request copy. Empty values count as absent.
 ///
-/// **A managed key anywhere wins** (D29, D65). Every value of every location is read: each line of a
+/// **A managed key anywhere wins**. Every value of every location is read: each line of a
 /// repeated header, each `key` param (including a percent-encoded name such as `k%65y`, and a
 /// percent-encoded value), and a `Bearer` with extra whitespace. When any of them carries a virtual
 /// key the request is managed, and `upstream_request_filter` / `strip_key_param` strip every
@@ -308,7 +308,7 @@ pub(super) fn strip_key_param(path_and_query: &str) -> Option<String> {
 
 /// Set OpenRouter's attribution headers when (and only when) the provider is OpenRouter
 /// **and** the request is managed — every other provider, and every BYO request regardless of
-/// provider, is untouched. Task #22 (pi-parity, Medium): pi gates this dashboard-attribution
+/// provider, is untouched. Pi gates this dashboard-attribution
 /// behind a user-controllable telemetry setting (`isInstallTelemetryEnabled`,
 /// `packages/coding-agent/src/core/provider-attribution.ts`); this gateway has no per-user
 /// telemetry-opt-out setting to consult, but it already has an unambiguous, always-correct proxy
@@ -335,7 +335,7 @@ pub(super) fn apply_provider_attribution(
 /// [`route::DEFAULT_PREFIX`] (see [`route::is_default_prefix`]) so a lookalike like Google
 /// Gemini's `/v1beta/…` doesn't qualify — with the dialect picking openai/anthropic
 /// ([`dialect_for_path`]); `None` for anything else, which the caller turns into a 404 rather than
-/// silently guessing a provider (Task #7, pi-parity).
+/// silently guessing a provider.
 ///
 /// `credential`: the provider the request's BYO credentials belong to
 /// ([`byo_credential_dialect`]). It wins over the path, so an Anthropic SDK call to `/v1/files`
@@ -362,7 +362,7 @@ pub(super) fn byo_key_dialect(key: &str) -> Option<Dialect> {
 }
 
 /// The provider the BYO credentials on a bare `/v1` request belong to, read from every value the
-/// gateway would forward (D82): each `x-api-key` line (Anthropic's header, so Anthropic unless the
+/// gateway would forward: each `x-api-key` line (Anthropic's header, so Anthropic unless the
 /// key's shape says otherwise) and each `Authorization: Bearer` token (by its shape only; an
 /// opaque token says nothing). Managed and empty values do not count. `Ok(None)`: nothing says.
 /// `Err(())`: they name different providers; every one would be forwarded, so whichever provider

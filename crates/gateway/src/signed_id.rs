@@ -1,11 +1,11 @@
-//! Tenant-bound ids for the state a provider keeps under Beyond's pool key (D230, D231).
+//! Tenant-bound ids for the state a provider keeps under Beyond's pool key.
 //!
 //! Every managed tenant reaches OpenAI through the same pool key, so every response OpenAI stores
 //! (`store` defaults to true) lives in one organization: its response id (`resp_…`), its
 //! conversation id (`conv_…`) and its output item ids (`msg_…`, `rs_…`, `fc_…`, …). OpenAI resolves
 //! any of them for anyone holding the key: `previous_response_id` and `conversation` continue the
 //! conversation, an `item_reference` expands the item, and so does a *full* input item that carries
-//! a stored item's `id` (OpenAI answers from the stored content, not the content sent: D231). A
+//! a stored item's `id` (OpenAI answers from the stored content, not the content sent). A
 //! tenant holding another tenant's id (a log, a ticket, a client bug) could read and continue that
 //! tenant's conversation. OpenAI isolates organizations; this module isolates tenants.
 //!
@@ -55,7 +55,7 @@
 //!
 //! **Translated rows** (Claude, grok, …) have no store behind them: a translated response's ids are
 //! the gateway's or another vendor's, nothing upstream can resolve them, and grok goes to xAI as
-//! `store: false` (D145). They are not signed and not checked; D175's item_reference rule applies
+//! `store: false`. They are not signed and not checked; the `item_reference` rule applies
 //! there unchanged.
 
 #![deny(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
@@ -345,12 +345,12 @@ impl Signer {
     /// root `previous_response_id`, root `conversation` (a string, or an object's `id`), and the
     /// `id` of every `input` item. A reference that does not verify is refused; a full item's id
     /// that does not verify is cut, since OpenAI answers a full item carrying a stored item's id
-    /// from the store (D231) and reads one with no id from its own content ([`Self::unsign_item`]).
+    /// from the store and reads one with no id from its own content ([`Self::unsign_item`]).
     /// Every occurrence of each key is checked, whatever its spelling (escapes included), since the
     /// provider's parser decodes them all.
     ///
     /// `catalog`: the body is a catalog walk's, whose relay cuts the reasoning items the gateway
-    /// minted from Claude's thinking (`translate::strip_gateway_reasoning`, D50): they are cut here
+    /// minted from Claude's thinking (`translate::strip_gateway_reasoning`): they are cut here
     /// first, with that same function, so their `rs_gw…` ids are neither checked nor sent. A
     /// `/{provider}` relay cuts nothing, so there every id is checked.
     ///

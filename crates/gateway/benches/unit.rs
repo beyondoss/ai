@@ -34,9 +34,9 @@ fn main() {
 
 /// One process-wide registry for every bench that touches metrics.
 ///
-/// `Metrics::new` registers on the default registry, which rejects a second registration. `admin`
-/// and `reject` each used to build their own, so a full `divan` run — `admin` is alphabetical,
-/// so it always goes first — panicked in `reject` with "registered once". The provider child
+/// `Metrics::new` registers on the default registry, which rejects a second registration: if
+/// `admin` and `reject` each built their own, a full `divan` run — `admin` is alphabetical, so it
+/// always goes first — would panic in `reject` with "registered once". The provider child
 /// series are materialised here too: that cross-product is what makes a scrape body tens of KiB
 /// from the first sample, and it has to happen exactly once regardless of which module runs first.
 fn bench_metrics() -> &'static std::sync::Arc<beyond_ai::__bench::metrics::Metrics> {
@@ -764,8 +764,8 @@ mod usage {
     }
 
     /// The same shape *oversized*, sliced to the 64 KiB tail `proxy::logging` actually passes — so
-    /// the buffer starts mid-value and the whole-document parse fails. This used to meter nothing at
-    /// all; it now recovers from the trailing `usage`, and does so faster than parsing a whole body,
+    /// the buffer starts mid-value and the whole-document parse fails. It recovers from the trailing
+    /// `usage`, and does so faster than parsing a whole body,
     /// because the anchored parse skips straight to the object instead of walking the array.
     #[divan::bench]
     fn openai_body_truncated_tail(bencher: Bencher) {
@@ -830,7 +830,7 @@ mod peek {
     ///   so a root-only scanner never matches, never sets `done`, and byte-walks the *entire*
     ///   stream to return `None`. Linear in stream size, for nothing.
     ///
-    /// Both are now skipped outright for BYO traffic, whose extracted model is never read.
+    /// Both are skipped outright for BYO traffic, whose extracted model is never read.
     #[divan::bench(args = [64 * 1024, 1024 * 1024])]
     fn scan_response_stream(bencher: Bencher, bytes: usize) {
         let openai = {
@@ -1281,7 +1281,7 @@ mod translate {
         });
     }
 
-    /// Tool arguments with only integers, or with a decimal (the D127 path: their text is kept).
+    /// Tool arguments with only integers, or with a decimal (whose text is kept as written).
     const TOOL_ARGS: [&str; 2] = [
         r#"{"path":"src/main.rs","line":42,"limit":200}"#,
         r#"{"lat":48.858370,"lon":2.294481,"zoom":12}"#,
@@ -1871,7 +1871,7 @@ mod chat_relay {
 }
 
 /// `SseBridge::feed` handed many events in one chunk (a provider that batches, or a reader that
-/// fell behind): each event used to drain the buffer from the front.
+/// fell behind): the buffer is compacted once per chunk, not drained per event.
 mod sse_feed {
     use super::*;
     use beyond_ai::__bench::route::Endpoint;

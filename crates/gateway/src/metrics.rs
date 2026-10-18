@@ -88,7 +88,7 @@ pub enum Rejection {
     /// 503, fail-closed, rather than relaying ids every tenant could resolve.
     IdSigningUnset,
     /// Translating this request body onto the candidate's API would take more heap than the whole
-    /// `max_buffered_body_bytes` budget (`translate::translation_heap`, D216). 413 before any
+    /// `max_buffered_body_bytes` budget (`translate::translation_heap`). 413 before any
     /// upstream.
     TranslateTooLarge,
     /// A request outlived `request_max_secs` and was ended: a 504 before its response head, a cut
@@ -223,16 +223,16 @@ impl Rejection {
     }
 }
 
-/// Why a pool key was cooled off — the closed label set of `ai_key_auth_failures_total` (D204).
+/// Why a pool key was cooled off — the closed label set of `ai_key_auth_failures_total`.
 /// `Revoked` and `KeyNamed403` mean the key needs replacing; `Unfunded` means its account needs
 /// funding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyCooled {
     /// The provider answered 401.
     Revoked,
-    /// The provider's error says the account is out of credit or quota (D180, D200).
+    /// The provider's error says the account is out of credit or quota.
     Unfunded,
-    /// A 403 whose body names the key itself (`invalid_api_key`, `authentication_error`; D84).
+    /// A 403 whose body names the key itself (`invalid_api_key`, `authentication_error`).
     KeyNamed403,
 }
 
@@ -307,7 +307,7 @@ pub struct Metrics {
     /// Requests that hit a retryable upstream status (a 5xx with a candidate left, a 429 with a key
     /// left) and could **not** retry because the request body was not provably replayable.
     ///
-    /// Managed catalog walks no longer land here for size: a body past pingora's 64 KiB replay
+    /// Managed catalog walks do not land here for size: a body past pingora's 64 KiB replay
     /// buffer is read in full and re-run as a subrequest that can fail over (`FullBody` in `proxy`).
     /// What remains: `/{provider}/…` requests past the buffer, and small bodies that had not
     /// finished arriving when the upstream answered, so replayability was not yet knowable.
@@ -327,7 +327,7 @@ pub struct Metrics {
     /// served" — a 429 is not a vendor outage.
     pub key_walks_total: IntCounter,
     /// Managed responses where a pool key drew a 401, a 403 whose body names the key (revoked,
-    /// invalid), or an out-of-credit answer (D180). Each one cools that key off for later requests;
+    /// invalid), or an out-of-credit answer. Each one cools that key off for later requests;
     /// a 401 also walks to the next key when there is one (also counted on `key_walks_total`). Any
     /// rate here means a pool key needs replacing or its account funding; `reason` says which
     /// ([`KeyCooled`]). Bump it with [`Self::key_cooled`].
@@ -392,7 +392,7 @@ pub struct Metrics {
     /// Payload bytes handed to the capture sink (request + response). This is the cost signal — it
     /// predicts the log-pipeline and storage bill before the invoice does.
     pub capture_bytes_total: IntCounter,
-    /// Captures dropped because the sink queue was full (in lines or in bytes, D262), the
+    /// Captures dropped because the sink queue was full (in lines or in bytes), the
     /// destination refused the write, or shutdown had begun. **The important one.** Capture is
     /// deliberately lossy so a stalled log sink can never backpressure the proxy, which means a
     /// missing payload is ambiguous — was capture off for that request, or did we lose it? Without
@@ -428,7 +428,7 @@ pub struct Metrics {
     /// to the log pipeline, so this counter, and the line on stderr, are the only record of it.
     pub usage_write_errors_total: IntCounter,
     /// Diagnostic log lines (every target but `ai.usage` and `ai.payload`) dropped because the log
-    /// sink's queue was full or the destination refused the write (D263). Diagnostics are written
+    /// sink's queue was full or the destination refused the write. Diagnostics are written
     /// off the worker threads, lossy, so a stalled stdout costs log lines rather than parking the
     /// workers that serve traffic; a non-zero rate means the log pipeline is not keeping up.
     pub log_dropped_total: IntCounter,
@@ -739,7 +739,7 @@ impl Metrics {
         &self.rejections[reason.as_index()]
     }
 
-    /// Count a pool key cooled off for `reason` on `ai_key_auth_failures_total` (D204).
+    /// Count a pool key cooled off for `reason` on `ai_key_auth_failures_total`.
     #[inline]
     pub fn key_cooled(&self, reason: KeyCooled) {
         let i = match reason {

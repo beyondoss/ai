@@ -129,7 +129,7 @@ async fn a_half_failing_provider_opens_the_breaker() {
     );
 }
 
-/// Control for D37: a solid 5xx run does open it (the breaker is wired; only the brownout fails).
+/// Control for the brownout: a solid 5xx run does open it (the breaker is wired; only the brownout fails).
 /// claim: REL-6
 /// defect: D37
 #[tokio::test]
@@ -453,7 +453,7 @@ async fn a_probe_with_no_provider_outcome_leaves_the_breaker_half_open() {
 
 /// A pool key failing on every candidate relays the last candidate's own 401, and never opens a
 /// breaker: the providers answered, so the next request still reaches them. The one whose every
-/// key drew a 401 is cooled, so that request skips it while another candidate remains (D180).
+/// key drew a 401 is cooled, so that request skips it while another candidate remains.
 /// claim: REL-4
 /// defect: D10
 #[tokio::test]

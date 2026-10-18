@@ -54,7 +54,7 @@ pub(super) fn catalog_serving_endpoint(auto: &ModelRouting) -> Option<route::End
 }
 
 /// Whether this attempt, translated onto candidate `c`, asks it for Anthropic fast mode: the client
-/// asked for priority processing and `c` serves fast mode (D266). One decision for the attempt's
+/// asked for priority processing and `c` serves fast mode. One decision for the attempt's
 /// `anthropic-beta` header and its translated body, so the two never disagree.
 pub(super) fn translated_fast(auto: &ModelRouting, c: &route::Candidate) -> bool {
     auto.priority && providers::catalog::serves_fast_mode(c)
@@ -68,14 +68,14 @@ pub(super) fn catalog_translating(auto: &ModelRouting) -> bool {
 }
 
 /// This attempt asked a stream-only candidate for a stream its client did not ask for, and
-/// assembles it into one body (D147; see `translate::SseBridge::assembling`).
+/// assembles it into one body (see `translate::SseBridge::assembling`).
 pub(super) fn catalog_assembling(auto: &ModelRouting) -> bool {
     auto.translate.as_ref().is_some_and(|t| t.assemble)
 }
 
 /// A non-stream error from a same-endpoint candidate, buffered (it is small, and capped by
 /// `MAX_TRANSLATE_BUFFER`) so a vendor's own error shape reaches the client in its API's envelope
-/// (`translate::response_json_tools`, D100). One already in that envelope is relayed unchanged.
+/// (`translate::response_json_tools`). One already in that envelope is relayed unchanged.
 pub(super) fn catalog_error_relay(
     auto: &ModelRouting,
     status: Option<u16>,

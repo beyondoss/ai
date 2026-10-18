@@ -1,5 +1,5 @@
 //! A pool key that is out of credit is a candidate refusal: later requests go to the next
-//! candidate rather than to the unfunded one (D180).
+//! candidate rather than to the unfunded one.
 //!
 //! Run via `mise run test:integration:rs`.
 
@@ -94,7 +94,7 @@ async fn an_unfunded_pool_key_sends_later_requests_to_the_next_candidate() {
 /// (`X: Extra inputs are not permitted`). A tenant who puts an out-of-credit phrase in one of
 /// those (a model named "insufficient balance", a root key named after Anthropic's billing
 /// sentence) gets a 400 or 404 that quotes it. That is the tenant's own mistake: it must not cool
-/// Beyond's shared pool key for every tenant (the D84 class), and the tenant's error is relayed as
+/// Beyond's shared pool key for every tenant, and the tenant's error is relayed as
 /// the provider wrote it, never replaced with the "cannot serve" text. Every request goes to the
 /// provider that answered, and no key is counted as failing.
 /// claim: REL-4, SEC-16, T6
@@ -263,13 +263,13 @@ async fn an_unfunded_candidate_cools_off_from_any_catalog_slot() {
     );
 }
 
-/// A catalog walk fails over on a 402 at the response head (D84), so the body `logging` reads to
-/// cool an out-of-credit key (D180) is never read. Anthropic's `billing_error` 402 says out of
+/// A catalog walk fails over on a 402 at the response head, so the body `logging` reads to
+/// cool an out-of-credit key is never read. Anthropic's `billing_error` 402 says out of
 /// credit by its status alone, so the walk cools the key there: the first request is served by the
 /// next candidate, and every request after it, for the cooldown, goes straight to it. OpenRouter's
 /// 402 can instead be one request larger than the balance ("This request requires more credits"),
 /// which a smaller request is not: that one fails over too, and cools nothing, so OpenRouter keeps
-/// getting the row's requests (until enough arrive in a row with no success between them: D261,
+/// getting the row's requests (until enough arrive in a row with no success between them:
 /// `reliability_openrouter_402.rs`, so this sends one fewer). Both hold for a body pingora replays and for one past its 64 KiB
 /// retry buffer, which fails over by a `FullBody` re-run.
 /// claim: REL-4
@@ -313,7 +313,7 @@ async fn a_402_the_walk_fails_over_on_cools_an_unfunded_key() {
             .provider_authority(next, &serving.authority())
             .start()
             .await;
-        // Below OpenRouter's strike count (D261), which would cool its key.
+        // Below OpenRouter's strike count, which would cool its key.
         let requests = if cools { 3 } else { strikes() - 1 };
         for n in 1..=requests {
             let resp = test_client()

@@ -20,16 +20,16 @@
 //! the exact entanglement the queue is here to prevent. On a graceful shutdown the drain in `main`
 //! writes out what is queued before it exits ([`CaptureDrain::finish`]), bounded so a wedged log
 //! pipeline cannot hold teardown up; anything still queued then is lost with a warn line. A line
-//! the destination refuses is counted as dropped, like one the full queue drops (D208).
+//! the destination refuses is counted as dropped, like one the full queue drops.
 //!
 //! The queue is bounded twice: by line count (`depth`) and by the bytes those lines hold
-//! (`max_bytes`, D262). A line count alone is not a memory bound here — one payload line holds up to
+//! (`max_bytes`). A line count alone is not a memory bound here — one payload line holds up to
 //! two `capture_max_bytes` bodies, more after JSON escaping — so 1 024 queued lines could pin
 //! gigabytes while the log pipeline stalls, uncounted by any other budget. A line that would take the
 //! queued bytes past `max_bytes` is dropped and counted like a full-queue drop.
 //!
 //! The same sink carries the diagnostic log (every target but `ai.usage` and `ai.payload`) on a
-//! second instance with its own thread and counter (`ai_log_dropped_total`, D263): a stalled stdout
+//! second instance with its own thread and counter (`ai_log_dropped_total`): a stalled stdout
 //! must not park the Tokio workers that emit a `warn!`. `ai.usage` stays synchronous and lossless.
 
 use prometheus::IntCounter;
@@ -51,7 +51,7 @@ pub struct CaptureSink {
     queued: Arc<QueuedBytes>,
 }
 
-/// The bytes held by lines that are queued or being written, against the sink's byte budget (D262).
+/// The bytes held by lines that are queued or being written, against the sink's byte budget.
 /// Charged when a line is enqueued, released once the drain thread has written it (or failed to).
 struct QueuedBytes {
     held: AtomicUsize,
@@ -75,7 +75,7 @@ impl QueuedBytes {
     }
 }
 
-/// The shutdown handle for a [`CaptureSink`]'s drain thread (D208).
+/// The shutdown handle for a [`CaptureSink`]'s drain thread.
 ///
 /// The `tracing` subscriber keeps a sender for the life of the process, so dropping senders can
 /// never close the queue. [`Self::finish`] instead enqueues an empty line, which no event produces
@@ -151,8 +151,8 @@ impl CaptureSink {
                 // Ends at `CaptureDrain::finish`'s empty line, or when every sender is dropped.
                 for line in rx.iter().take_while(|l| !l.is_empty()) {
                     // A line the destination refused is as lost as one the full queue dropped:
-                    // counted the same way, so `ai_capture_dropped_total` means every lost line
-                    // (D208). Nothing else to report it to: the failed write was the log.
+                    // counted the same way, so `ai_capture_dropped_total` means every lost line.
+                    // Nothing else to report it to: the failed write was the log.
                     if out.write_all(&line).is_err() {
                         lost.inc();
                     }
@@ -215,7 +215,7 @@ impl Drop for QueueWriter {
         if line.is_empty() {
             return;
         }
-        // Over the byte budget: dropped and counted, like a full queue (D262).
+        // Over the byte budget: dropped and counted, like a full queue.
         let len = line.len();
         if !self.sink.queued.charge(len) {
             self.sink.dropped.inc();

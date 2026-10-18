@@ -1,6 +1,6 @@
 //! An OpenRouter `402` a catalog walk fails over on is read at the head only, so it cannot say
-//! whether the account is out of credit or one request was too costly for the balance left (D258).
-//! A run of them on one key with no success between is the account: the key cools (D261).
+//! whether the account is out of credit or one request was too costly for the balance left.
+//! A run of them on one key with no success between is the account: the key cools.
 //!
 //! Run via `mise run test:integration:rs`.
 
@@ -211,7 +211,7 @@ async fn a_burst_of_openrouter_402s_cools_its_key_once() {
 }
 
 /// Only a 402 is a strike. A 403 the walk fails over on is a refusal of this request or account,
-/// never a sign the key is out of credit (D84): however many come in a row, OpenRouter's key is not
+/// never a sign the key is out of credit: however many come in a row, OpenRouter's key is not
 /// cooled and every request still tries it first.
 /// claim: REL-4
 /// defect: D261

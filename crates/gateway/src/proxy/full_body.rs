@@ -103,7 +103,7 @@ impl AiProxy {
                     reap_attempt(attempt, &request_id).await;
                     match decision {
                         // The key walk (if any) ended on this candidate: the rest of the walk is
-                        // vendor failover, as on a small body (D81).
+                        // vendor failover, as on a small body.
                         RelayRetry::Candidate(i) => {
                             skip |= 1 << i;
                             resume = None;
@@ -121,7 +121,7 @@ impl AiProxy {
                     }
                 }
                 AttemptEnd::Fail => {
-                    // A panicked attempt is logged with the request id before its 502 (D207).
+                    // A panicked attempt is logged with the request id before its 502.
                     let reaped = reap_attempt(attempt, &request_id).await;
                     return Err(match piped {
                         Err(e) => e,
@@ -304,14 +304,14 @@ pub(super) struct FullBody {
     /// (`route::tools_need_responses_arm`), read by the parent while it held the whole body.
     pub(super) responses_tools: bool,
     /// Per catalog index, the pool key an earlier attempt's key walk moved to, or [`NO_KEY_WALK`]:
-    /// start on the provider's first key not cooling off (`Provider::first_key`, D71/D83).
+    /// start on the provider's first key not cooling off (`Provider::first_key`).
     pub(super) keys: [u8; route::MAX_CANDIDATES],
     /// Catalog indices (bit per index) that already had their one same-candidate retry after a
     /// stale reused connection failed before the upstream had the body.
     pub(super) reset: u8,
     /// A key walk in progress on this catalog index: it goes first in the walk, so a re-ordered row
     /// cannot move a 429's key walk onto another vendor. The other candidates stay usable, so a
-    /// 5xx (or a last key's auth failure) that ends the key walk still fails over (D81).
+    /// 5xx (or a last key's auth failure) that ends the key walk still fails over.
     pub(super) resume: Option<u8>,
     /// The parent's attempt bound is reached: record no retry, relay this attempt's answer.
     final_attempt: bool,
@@ -398,7 +398,7 @@ pub(super) enum AttemptEnd {
 /// Decide from how an attempt's pipe ended and the retry (if any) the attempt recorded. The
 /// client gone (a downstream error) is the end whatever the attempt recorded: a re-run would send
 /// the whole body to another candidate or key for nobody, a generation billed upstream that no
-/// client reads (D206).
+/// client reads.
 pub(super) fn attempt_end(piped: &Result<Piped>, decision: Option<RelayRetry>) -> AttemptEnd {
     match (piped, decision) {
         (Ok(Piped::Written), _) => AttemptEnd::Done,
@@ -432,7 +432,7 @@ impl Reaped {
 }
 
 /// Wait, at most [`ABANDONED_ATTEMPT_GRACE`], for an attempt's task to end, and say how it did. A
-/// panic is logged at error with the request id (D207): the subrequest dies with it, and the
+/// panic is logged at error with the request id: the subrequest dies with it, and the
 /// client would otherwise get a 502 no log line explains.
 pub(super) async fn reap_attempt<T>(
     attempt: tokio::task::JoinHandle<T>,

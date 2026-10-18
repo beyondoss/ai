@@ -419,7 +419,7 @@ fn remove_headers_where_removes_every_match_in_stack_batches() {
 }
 
 /// Each pool key's echo searcher is built once at boot, for exactly the bare key a provider
-/// would echo (D92): `response_filter` and `Redact` borrow it rather than rebuild it per
+/// would echo: `response_filter` and `Redact` borrow it rather than rebuild it per
 /// response or per chunk.
 #[test]
 fn a_pool_key_carries_its_boot_built_searcher() {
@@ -730,7 +730,7 @@ fn extract_virtual_key_recognizes_openai_bearer() {
 
 #[test]
 fn extract_virtual_key_recognizes_azure_api_key_header() {
-    // Task #31: Azure OpenAI authenticates via the bare `api-key` header (no `Bearer` prefix, no
+    // Azure OpenAI authenticates via the bare `api-key` header (no `Bearer` prefix, no
     // OAuth). Before this fix, a client presenting only this header got a 401.
     let req = req_with_headers("/v1/responses", &[("api-key", "azure-secret")]);
     assert_eq!(
@@ -741,7 +741,7 @@ fn extract_virtual_key_recognizes_azure_api_key_header() {
 
 #[test]
 fn extract_virtual_key_recognizes_google_goog_api_key_header() {
-    // Task #31: Google Gemini authenticates via `x-goog-api-key`.
+    // Google Gemini authenticates via `x-goog-api-key`.
     let req = req_with_headers(
         "/v1beta/models/gemini-2.5-pro:generateContent",
         &[("x-goog-api-key", "goog-secret")],
@@ -754,7 +754,7 @@ fn extract_virtual_key_recognizes_google_goog_api_key_header() {
 
 #[test]
 fn extract_virtual_key_recognizes_google_key_query_param() {
-    // Task #31: Google Gemini also accepts the key as a `?key=` query param — no header at all.
+    // Google Gemini also accepts the key as a `?key=` query param — no header at all.
     let req = req_with_headers(
         "/v1beta/models/gemini-2.5-pro:generateContent?key=goog-query-secret",
         &[],
@@ -1247,7 +1247,7 @@ fn price_model_resolves_echoed_snapshots_and_vendor_slugs() {
     // The echo names nothing priced, the request does.
     assert_eq!(price_model("unknown", "gpt-5"), Some("gpt-5"));
     assert_eq!(price_model("my-finetune-2025-08-07", "nope"), None);
-    // The managed `/{provider}` refusal (D267) asks exactly this of the requested model: any
+    // The managed `/{provider}` refusal asks exactly this of the requested model: any
     // candidate's provider spelling counts, as does a dated snapshot; nothing else does.
     let row = |m| price_row(m).map(|r| r.model);
     assert_eq!(
@@ -1336,10 +1336,10 @@ fn dialect_for_path_selects_anthropic_only_for_messages() {
 
 #[test]
 fn bare_default_provider_name_rejects_gemini_v1beta_lookalike() {
-    // Task #7 (pi-parity, High): a raw `path.starts_with("/v1")` absorbed Google Gemini's real
-    // path shape (`/v1beta/models/{model}:generateContent`) into the bare-default branch, which
-    // then routed it to OpenAI — a silent misroute that 404s against `api.openai.com` instead of
-    // failing with a clear "unknown provider" error. Boundary-checking must reject it.
+    // A raw `path.starts_with("/v1")` would absorb Google Gemini's real path shape
+    // (`/v1beta/models/{model}:generateContent`) into the bare-default branch, which routes it to
+    // OpenAI — a silent misroute that 404s against `api.openai.com` instead of failing with a
+    // clear "unknown provider" error. Boundary-checking must reject it.
     assert_eq!(
         bare_default_provider_name("/v1beta/models/gemini-2.5-pro:generateContent", None),
         None,
@@ -1395,7 +1395,7 @@ fn a_byo_x_api_key_on_bare_v1_routes_to_anthropic_on_every_path() {
     }
 }
 
-/// The BYO credential that will be forwarded picks the provider (D82): by shape where it has
+/// The BYO credential that will be forwarded picks the provider: by shape where it has
 /// one, `x-api-key` meaning Anthropic otherwise, every value read; keys for two providers on one
 /// request are ambiguous.
 #[test]
@@ -2186,7 +2186,7 @@ fn openrouter_attribution_present_only_for_openrouter_managed_traffic() {
 
 #[test]
 fn openrouter_attribution_gated_off_for_byo_traffic() {
-    // Task #22 (pi-parity, Medium): pi gates its OpenRouter dashboard-attribution headers
+    // Pi gates its OpenRouter dashboard-attribution headers
     // behind a user-controllable telemetry opt-out (`isInstallTelemetryEnabled`) — before this
     // fix, this gateway injected them unconditionally, including onto a BYO caller's own
     // OpenRouter key, misattributing *their* traffic to Beyond's dashboard app. `managed=false`

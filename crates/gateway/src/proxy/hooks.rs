@@ -178,10 +178,10 @@ impl ProxyHttp for AiProxy {
                         }
                     },
                 };
-                // New vendor ⇒ that vendor's first key not cooling off (D71). A re-run of a large
+                // New vendor ⇒ that vendor's first key not cooling off. A re-run of a large
                 // body resumes the key walk an earlier attempt started on this candidate (see
-                // `FullBody`); one with no walk starts past the cooling keys like any other request
-                // (D83). A new leg starts at the candidate's first address, with its own
+                // `FullBody`); one with no walk starts past the cooling keys like any other request.
+                // A new leg starts at the candidate's first address, with its own
                 // refused-stream resend, owing the permit (if this breaker has one to give).
                 let pool_key = full_body_ctx(session)
                     .zip(rc.auto.as_ref().and_then(|a| a.walk.catalog_index(i)))
@@ -285,12 +285,12 @@ impl ProxyHttp for AiProxy {
     /// Two distinct retries, never mixed:
     ///
     /// - **Managed 429 or 401 → next unused key, same provider.** A 429 is a healthy provider
-    ///   throttling *that credential*, not a vendor outage; a 401 is that credential revoked
-    ///   (D71), which also cools the key off for later requests
+    ///   throttling *that credential*, not a vendor outage; a 401 is that credential revoked,
+    ///   which also cools the key off for later requests
     ///   (`Provider::mark_key_bad`, counted on `ai_key_auth_failures_total`). Walks `/{provider}`
     ///   and `/auto`. BYO does not walk. The last 429 is relayed, `Retry-After` included; the last
     ///   key's 401 is relayed on a provider route and is a candidate failure on a catalog walk.
-    ///   Counted on `ai_key_walks_total`. A 403 never walks or cools a key (D84): it is usually
+    ///   Counted on `ai_key_walks_total`. A 403 never walks or cools a key: it is usually
     ///   about the request; one whose body names the key cools it from `logging`.
     /// - **Model-routed 5xx → next candidate.** A provider-routed request named its provider; there
     ///   is nowhere else to go. A 429 is *not* a vendor failover — re-asking a different vendor
@@ -312,13 +312,13 @@ impl ProxyHttp for AiProxy {
             "upstream_response_filter reached without request context",
         )?;
         let status = upstream_response.status.as_u16();
-        // A 2xx says this key's account pays: forget its unread OpenRouter 402s (D261).
+        // A 2xx says this key's account pays: forget its unread OpenRouter 402s.
         if rc.managed() && (200..300).contains(&status) {
             rc.leg.provider.key_served(rc.leg.pool_key);
         }
 
-        // Managed 401: this pool key is revoked (D71). Never the caller's fault. Cool it off so
-        // later requests start on a good key, then walk like a 429. Not a 403 (D84, see
+        // Managed 401: this pool key is revoked. Never the caller's fault. Cool it off so
+        // later requests start on a good key, then walk like a 429. Not a 403 (see
         // `is_pool_key_failure`).
         let key_auth = rc.managed() && is_pool_key_failure(status);
         if key_auth {
@@ -347,11 +347,11 @@ impl ProxyHttp for AiProxy {
         // the permit outstanding, so recording it here as well would double-count.
         let key_failure = rc.managed() && is_candidate_refusal(status);
         // Failing over abandons this response at its head, so `Redact` never reads the body that
-        // tells `logging` an account is out of credit (D180), and every later request would pay a
+        // tells `logging` an account is out of credit, and every later request would pay a
         // round trip to it first. A 402 says so by its status alone except on OpenRouter, whose
         // 402 may be one request too large for the balance (`remedy::unfunded_402`): cool that key
-        // here, as `logging` would have, on either abandoning path below (D258). OpenRouter's
-        // unread 402 is a strike against its key instead, and enough in a row cool it (D261).
+        // here, as `logging` would have, on either abandoning path below. OpenRouter's
+        // unread 402 is a strike against its key instead, and enough in a row cool it.
         let unfunded_402 = || {
             (key_failure && status == 402)
                 .then(|| rc.auto.as_ref().and_then(|a| a.candidate_at(at)))
@@ -472,18 +472,18 @@ impl ProxyHttp for AiProxy {
         // Managed: swap the virtual key for the real pool key (precomputed at boot) in the scheme
         // the upstream wants — removing every inbound static-key header first (see
         // `STATIC_KEY_HEADERS`) so the virtual key never leaks upstream, and so a provider whose own
-        // auth header (e.g. Azure's `api-key` — Task #8) happens to be the same header the client
+        // auth header (e.g. Azure's `api-key`) happens to be the same header the client
         // presented its virtual key in doesn't end up with two stacked values. BYO (`!managed`):
         // leave the user's own auth header exactly as presented.
         if rc.managed() {
             // Strip **unconditionally**, before deciding whether there is a pool key to insert.
             //
-            // These two used to sit inside the `if let Some(av)` below, which was safe only because
-            // a managed request without a pool key is rejected earlier. That is a load-bearing
-            // invariant expressed nowhere near here, and if it ever failed the consequence was not a
-            // degraded request but a *credential disclosure*: nothing removed, nothing inserted, and
-            // the caller's Ed25519 virtual key forwarded verbatim to a third-party provider. Now the
-            // worst case is an unauthenticated request the provider rejects with a 401.
+            // Not inside the `if let Some(av)` below: that would be safe only because a managed
+            // request without a pool key is rejected earlier, an invariant expressed nowhere near
+            // here, and if it ever failed the consequence would be a *credential disclosure*:
+            // nothing removed, nothing inserted, and the caller's Ed25519 virtual key forwarded
+            // verbatim to a third-party provider. Stripped first, the worst case is an
+            // unauthenticated request the provider rejects with a 401.
             //
             // The allowlist would drop these too; they are removed by name so this invariant does
             // not hang on the list's contents.
@@ -526,7 +526,7 @@ impl ProxyHttp for AiProxy {
 
         // `x-beyond-*` is Beyond's namespace: the routing header, the control headers, and any name
         // the gateway does not (yet) define. None of it reaches a provider, on any route, managed or
-        // BYO (D67) — a provider that rejects unknown headers would turn an opt-in into their 400,
+        // BYO — a provider that rejects unknown headers would turn an opt-in into their 400,
         // and a header the gateway adds later must not have leaked from old clients first. A sweep
         // by prefix rather than a list of names, so a new header cannot be forgotten here. Runs on
         // every attempt (pingora rebuilds the head from the downstream request each time), and
@@ -539,7 +539,7 @@ impl ProxyHttp for AiProxy {
             None => upstream_request.insert_header("host", rc.leg.provider.host.as_str())?,
         }
 
-        // Dashboard-attribution headers (OpenRouter, managed traffic only — Task #22, see
+        // Dashboard-attribution headers (OpenRouter, managed traffic only, see
         // `apply_provider_attribution`).
         apply_provider_attribution(upstream_request, rc.leg.provider.id, rc.managed())?;
 
@@ -579,7 +579,7 @@ impl ProxyHttp for AiProxy {
                 merge_anthropic_beta(upstream_request, beta)?;
             }
             // A Chat Completions or Responses client's `service_tier: "priority"`, translated to
-            // fast mode on a candidate that serves it (D266). The same decision makes
+            // fast mode on a candidate that serves it. The same decision makes
             // `translate::request_with_tools` add `speed: "fast"` to this attempt's body.
             if translated_fast(a, c) {
                 merge_anthropic_beta(upstream_request, translate::FAST_MODE_BETA)?;
@@ -591,10 +591,8 @@ impl ProxyHttp for AiProxy {
         // framing (Content-Length / chunked) is preserved.
         //
         // `None` means the bare-path default, where the path is already what the upstream should
-        // see, so there is nothing to build and nothing to parse. That used to be expressed by
-        // reconstructing the path anyway and comparing it against the inbound `path_and_query`;
-        // encoding it in the type instead skips the allocation rather than detecting it after
-        // the fact.
+        // see, so there is nothing to build and nothing to parse: encoded in the type, so the
+        // allocation is skipped rather than a rebuilt path compared against the inbound one.
         if let Some(forward_path) = rc.forward_path.as_str()
             && let Ok(uri) = forward_path.parse()
         {
@@ -678,9 +676,8 @@ impl ProxyHttp for AiProxy {
             // Eligible requests are buffered so we can splice the root object before any byte reaches
             // the upstream (injection inserts near the front, so we can't have forwarded it already).
             // When we're buffering anyway, the incremental scan is skipped entirely and both answers
-            // come from one walk of the finished buffer below — the body was previously traversed
-            // twice, once here for `model` and once by the injection planner, over the same bytes
-            // with the same depth/string/escape bookkeeping.
+            // come from one walk of the finished buffer below, rather than one here for `model`
+            // and another by the injection planner over the same bytes.
             // Only where no copy of the body will be left for `logging` to read (`tally_eager`):
             // everywhere else the estimate is made there, and only when a row needs one.
             if rc.tally_eager {
@@ -746,7 +743,7 @@ impl ProxyHttp for AiProxy {
                     unpriced::Inspection::default()
                 };
                 let refused = {
-                    // A managed `/{provider}/…` billable call naming no catalog row (D267): its
+                    // A managed `/{provider}/…` billable call naming no catalog row: its
                     // billing row would carry no `price_model`. Told by the client's id.
                     let miss = (rc.plan.catalog_check
                         && scanned.model().and_then(price_row).is_none())
@@ -772,7 +769,7 @@ impl ProxyHttp for AiProxy {
                         refused_input: None,
                         unpriced: inspection.refused,
                         catalog_miss: miss.as_deref(),
-                        // Managed `/{provider}/…/responses` asking for `background: true` (D202).
+                        // Managed `/{provider}/…/responses` asking for `background: true`.
                         background: rc.plan.catalog_check
                             && rc.forward_path.as_str().is_some_and(|p| {
                                 route::forward_is_responses(p.split_once('?').map_or(p, |(p, _)| p))
@@ -800,9 +797,9 @@ impl ProxyHttp for AiProxy {
                 if let Some(a) = rc.auto.as_mut() {
                     // An output limit past the row's maximum is a 400 by name; capped before the
                     // translation, so what it derives (a thinking budget) fits under the cap too.
-                    // Only a vendor-published maximum: an unpublished one is a placeholder (D85).
+                    // Only a vendor-published maximum: an unpublished one is a placeholder.
                     // The edits below are opaque to the scan, so they open the body and close it
-                    // re-scanned when one changed it. A clamp alone no longer re-scans, so a
+                    // re-scanned when one changed it. A clamp alone does not re-scan, so a
                     // `model` the miss path took stays taken: unreachable, as every miss refuses at
                     // `Point::Buffered` (`Rule::CatalogMiss`) before this.
                     let mut buf = scanned
@@ -834,7 +831,7 @@ impl ProxyHttp for AiProxy {
                         t.cache_1h = false;
                         if t.client != to {
                             // Translation builds `Value`s of the body: its heap is held in the
-                            // body budget for the step, or the body is refused (D216).
+                            // body budget for the step, or the body is refused.
                             let _heap = self.hold_translation_heap(&buf)?;
                             // The tool names this attempt's response maps calls back through, and
                             // whether its cache breakpoints are the gateway's (per attempt: a
@@ -855,7 +852,7 @@ impl ProxyHttp for AiProxy {
                             // (session state there is a 400): onto a Responses candidate (xAI's)
                             // it must not be stored, and xAI stores by default. Nothing there holds
                             // a tool step's `item_reference` either: dropped, as translation drops
-                            // it (one for an earlier turn was the 400, D175).
+                            // it (one for an earlier turn was the 400).
                             changed |= buf.len() != len;
                             if a.route.responses.is_empty() {
                                 changed |= translate::store_false(&mut buf);
@@ -863,31 +860,31 @@ impl ProxyHttp for AiProxy {
                             }
                         } else if to == route::Endpoint::ChatCompletions && claude {
                             // A Claude model behind Chat Completions (OpenRouter): a tool turn
-                            // with no thinking to replay goes without reasoning (D14's rule).
+                            // with no thinking to replay goes without reasoning, as Anthropic requires of one.
                             let len = buf.len();
                             buf.map(|b| translate::claude_chat_relay_reasoning(b, upstream_model));
                             changed |= buf.len() != len;
                         }
                         // Same-wire Chat to another host: an explicit null is "not set", as
-                        // translation treats it; OpenRouter 400s `user: null` (D101).
+                        // translation treats it; OpenRouter 400s `user: null`.
                         if t.client == to && to == route::Endpoint::ChatCompletions && !openai_host
                         {
                             changed |= peek::remove_root_nulls(&mut buf);
                         }
                         if to == route::Endpoint::ChatCompletions {
-                            // `developer` is `system` to a host that is not OpenAI's (D173); a
+                            // `developer` is `system` to a host that is not OpenAI's; a
                             // translated Responses body already says so.
                             if t.client == to && !reads_developer {
                                 changed |= translate::developer_as_system(&mut buf);
                             }
-                            // A candidate whose thinking breaks tools gets them with thinking off
-                            // (D171, D172): every candidate of its row refuses or garbles the
+                            // A candidate whose thinking breaks tools gets them with thinking off:
+                            // every candidate of its row refuses or garbles the
                             // combination, so steering around it would not help.
                             changed |= translate::fit_tools_to_thinking(&mut buf, tool_thinking);
                         }
                         // A candidate that answers only streams, for a client that did not ask
                         // for one: ask it for the stream and assemble the answer into the
-                        // client's own body (D147). Per attempt, like the tools: a failover
+                        // client's own body. Per attempt, like the tools: a failover
                         // candidate gets the client's body as it came. Its usage is asked for by
                         // the splice below, as on every Chat Completions stream
                         // (`ScannedBody::into_upstream`); a Messages body takes no
@@ -897,7 +894,7 @@ impl ProxyHttp for AiProxy {
                             && translate::force_stream(&mut buf, false);
                         changed |= t.assemble;
                     }
-                    // Fine-grained tool streaming only where the candidate takes it (D272): an
+                    // Fine-grained tool streaming only where the candidate takes it: an
                     // older Bedrock stack 400s the field, and a 400 is not failed over. Per
                     // attempt, so direct Anthropic still gets the client's bytes (and its prompt
                     // cache key) unchanged; `upstream_request_filter` drops the matching beta.
@@ -1061,7 +1058,7 @@ impl ProxyHttp for AiProxy {
             upstream_response.remove_header(name);
         }
 
-        // The pool key never reaches the client (D66). A provider, or anything between us and
+        // The pool key never reaches the client. A provider, or anything between us and
         // it, that echoes the credential it was sent would otherwise hand Beyond's key to a
         // tenant: any header carrying it is dropped, and an error body (>= 400, where an echo
         // lives: "Incorrect API key provided: …") is scrubbed as it streams (`Redact`). A 2xx
@@ -1087,7 +1084,7 @@ impl ProxyHttp for AiProxy {
                 upstream_response.remove_header(name);
             }
         }
-        // A managed JSON error is held whole and checked for a provider-account remedy (D174):
+        // A managed JSON error is held whole and checked for a provider-account remedy:
         // the rewrite changes its length, so it loses its `Content-Length` here, on the error
         // path only. A BYO error is the caller's own account talking and is relayed as sent.
         if rc.managed() && status >= 400 {
@@ -1129,7 +1126,7 @@ impl ProxyHttp for AiProxy {
             upstream_response.insert_header(UPSTREAM_MODEL_HEADER, c.upstream_model)?;
         }
 
-        // An assembled answer (D147): the upstream streams, the client gets one JSON body.
+        // An assembled answer: the upstream streams, the client gets one JSON body.
         if rc.streaming && rc.auto.as_ref().is_some_and(|a| catalog_assembling(a)) {
             upstream_response.insert_header("content-type", "application/json")?;
         }
@@ -1201,7 +1198,7 @@ impl ProxyHttp for AiProxy {
     where
         Self::CTX: Send + Sync,
     {
-        // Usage taps read the *upstream* dialect. Cache fill (#68) and capture read the bytes
+        // Usage taps read the *upstream* dialect. Cache fill and capture read the bytes
         // the client sees — post-translate on a wire-mismatched catalog walk, the relayed
         // chunk otherwise. SSE is converted event-by-event; the full stream is never buffered.
         let Ctx { rc, held } = ctx;
@@ -1216,7 +1213,7 @@ impl ProxyHttp for AiProxy {
             return Err(self.deadline_cut(&rc.request_id));
         }
         // First, so nothing downstream — translation, capture, the cache, the usage tail — ever
-        // holds the pool key (D66).
+        // holds the pool key.
         if let Some(r) = rc.redact.as_mut() {
             let keys = rc
                 .leg
@@ -1327,8 +1324,8 @@ impl ProxyHttp for AiProxy {
                         return Err(self.translate_overflow(&rc.request_id, "json_body"));
                     }
                     if end_of_stream {
-                        // The response's `Value`s are held in the body budget like a request's
-                        // (D216). Headers are already downstream, so a refusal aborts the response,
+                        // The response's `Value`s are held in the body budget like a request's.
+                        // Headers are already downstream, so a refusal aborts the response,
                         // as `translate_overflow` does. A same-wire 2xx is relayed as bytes.
                         let _heap = if upstream == t.client && (200..300).contains(&status) {
                             None
@@ -1409,7 +1406,7 @@ impl ProxyHttp for AiProxy {
     /// reused-connection retry and for the `FullBody` reset retry alike. A 5xx or 429 is an
     /// answer, not a failure, and keeps walking as before.
     ///
-    /// The one exception is a stream the provider refused ([`upstream_refused_stream`], D72): an
+    /// The one exception is a stream the provider refused ([`upstream_refused_stream`]): an
     /// HTTP/2 GOAWAY that left it above `last_stream_id`, or `RST_STREAM(REFUSED_STREAM)`. That is
     /// the provider's guarantee it processed none of the request, so it is resent — on a fresh
     /// connection to the same candidate — however much of the body went out. Routine H2
@@ -1439,7 +1436,7 @@ impl ProxyHttp for AiProxy {
         if matches!(e.etype(), T::HTTPStatus(_) | T::CustomCode(..)) {
             return e;
         }
-        // A client that stalled mid-upload timed its own request out (D260): retag the timeout as
+        // A client that stalled mid-upload timed its own request out: retag the timeout as
         // the client's, so the walk below ends here rather than failing over with a body nobody
         // will finish, `logging` charges no breaker and bills no estimate, and `fail_to_proxy`
         // answers 408 rather than blaming the provider with a 504.
@@ -1581,8 +1578,8 @@ impl ProxyHttp for AiProxy {
                 .rc
                 .as_ref()
                 .is_some_and(|rc| body_delivered(session, rc, Some(e)));
-        // A stream the provider refused (D72) was not processed, however much of the body went
-        // out: say exactly that, so a client knows its own retry is safe (D91).
+        // A stream the provider refused was not processed, however much of the body went
+        // out: say exactly that, so a client knows its own retry is safe.
         let refused = upstream_refused_stream(e);
         let status = match (after_delivery && !refused, status) {
             _ if refused => {
@@ -1794,12 +1791,11 @@ impl ProxyHttp for AiProxy {
                 // No response head arrived. Blame the provider only when the failure actually came
                 // *from* upstream. Pingora tags a client-side abort `ErrorSource::Downstream` (the
                 // `into_down()` at proxy_h1.rs's downstream read/write sites), and a user hitting
-                // ESC on a slow turn says nothing about the provider's health. Counting those was a
-                // live bug: cancellation is routine for a coding agent, and
-                // `circuit_breaker_threshold` cancellations inside `circuit_breaker_window_secs`
-                // would open the breaker and 503 *everyone*. Worse, `half_open_permits` is 1, so a
-                // cancel-prone request drawn as the probe reopened it every time — the breaker could
-                // not recover while users were cancelling.
+                // ESC on a slow turn says nothing about the provider's health. Cancellation is
+                // routine for a coding agent: counted, `circuit_breaker_threshold` cancellations
+                // inside `circuit_breaker_window_secs` would open the breaker and 503 *everyone*.
+                // Worse, `half_open_permits` is 1, so a cancel-prone request drawn as the probe
+                // would reopen it every time, and the breaker could not recover while users cancel.
                 //
                 // Nor is a client still uploading when the request died: the upstream was waiting
                 // on *our* bytes, so its read timeout or reset says the client stalled, not that
@@ -1808,7 +1804,7 @@ impl ProxyHttp for AiProxy {
                     rc.leg.fail();
                 }
                 // Client went away, its upload stalled, or the request ended with no error at all:
-                // no provider outcome. Give the permit back without one (D86). A success here closed
+                // no provider outcome. Give the permit back without one. A success here closed
                 // a half-open breaker on a probe that never heard from the provider, letting every
                 // caller flood one that may still be broken; `release` returns the probe permit so
                 // the next request probes instead.
@@ -1846,7 +1842,7 @@ impl ProxyHttp for AiProxy {
             .is_some_and(|sub| !sub.billed());
         // Someone gave up waiting for the response head after the provider had the whole request
         // (a long reasoning turn, a huge prompt): the client, or the gateway's own read timeout
-        // with the connection still up (D130). The provider cannot tell who hung up and bills that
+        // with the connection still up. The provider cannot tell who hung up and bills that
         // prompt either way. A request that never reached it (every breaker open, a connect
         // failure) costs nothing and stays 0, and so does a peer that closed or reset the
         // connection before answering: that is a refusal, not a wait (see `gave_up_waiting`).
@@ -1860,7 +1856,7 @@ impl ProxyHttp for AiProxy {
         } else {
             let tail = rc.resp_tail.contiguous();
             // A relayed managed 403 whose body names the key (not the request) is that key being
-            // refused: cool it so later requests start past it, as a 401 does at the head (D84).
+            // refused: cool it so later requests start past it, as a 401 does at the head.
             // This request already answered; it does not walk.
             if managed && upstream_status == Some(403) && body_names_the_key(tail) {
                 self.state.metrics.key_cooled(KeyCooled::KeyNamed403);
@@ -1870,9 +1866,9 @@ impl ProxyHttp for AiProxy {
             // credit-balance 400, OpenAI's insufficient_quota 429: read from the body by `Redact`)
             // is that key refused until someone pays, which waiting does not fix. Cool it as a 401
             // is cooled: later requests start past it, and a catalog walk leaves the provider out
-            // once all its keys cool (D180). This request already answered. Not an abandoned
+            // once all its keys cool. This request already answered. Not an abandoned
             // `FullBody` attempt: its body never reaches the client and is read only if it raced
-            // the parent's drop, and a walk's 402 was already judged at the head (D258).
+            // the parent's drop, and a walk's 402 was already judged at the head.
             if managed
                 && !rc.attempt.relay_abandoned
                 && rc.redact.as_ref().is_some_and(|r| r.unfunded)
@@ -1891,8 +1887,8 @@ impl ProxyHttp for AiProxy {
             };
             // A managed 2xx stream that ended before its usage block: the client hung up (a
             // cancelled agent turn) or the upstream died mid-stream. The provider bills us for what
-            // it generated before it noticed, so bill an estimate rather than the zero this used to
-            // emit — which made "stream, then disconnect before the last event" free. Anthropic's
+            // it generated before it noticed, so bill an estimate, never a zero that would make
+            // "stream, then disconnect before the last event" free. Anthropic's
             // `message_start` already carries exact input and cache counts, so only the missing
             // side is estimated. See `usage`'s estimate section: input is a pre-token lower bound,
             // output a measured divisor; both err low.
@@ -1918,10 +1914,10 @@ impl ProxyHttp for AiProxy {
             let body_cut = managed && !rc.streaming && ok_2xx && parsed.is_none() && e.is_some();
             // A non-stream 2xx that ended cleanly with no usage (OpenRouter's `"usage": null` on
             // an answer that failed mid-generation, a shape change) is a turn the provider took
-            // and may bill, as a finished stream without usage is: estimated, never 0/0 (D195).
+            // and may bill, as a finished stream without usage is: estimated, never 0/0.
             // Except a body that is only an error object (OpenRouter's error-in-200, `{"error":
             // {...}}` with no answer), the non-stream form of an error-only stream: not work we
-            // were billed for. Read from the root's members, in any order (D205). The tail is the
+            // were billed for. Read from the root's members, in any order. The tail is the
             // whole body when the body fits in it.
             let error_only_body = !rc.streaming
                 && ok_2xx
@@ -1944,7 +1940,7 @@ impl ProxyHttp for AiProxy {
             };
             // The 2xx head is the provider's word that it took the request, and it bills the
             // prompt from there: a stream that went silent or died before its first event is
-            // estimated too (D123), like one cut after a few. Only a 200 stream carrying nothing
+            // estimated too, like one cut after a few. Only a 200 stream carrying nothing
             // but an error event (`overloaded_error` before any output) is not work we were billed
             // for. A finished stream whose usage we could not read (a shape change, a final event
             // we could not recover) is a turn the provider billed, never a silent 0/0.
@@ -2032,10 +2028,9 @@ impl ProxyHttp for AiProxy {
         // ships with lag — the counter is the alerting surface for a cache-hit-rate cliff after a
         // deploy.
         m.record_tokens(&usage);
-        // Read the clock once for both consumers below. Beyond saving a vDSO call, this is a
-        // correctness fix: the latency histogram and the `ai.usage` billing line used to call
-        // `elapsed()` about forty lines apart, so they reported *different* durations for the same
-        // request and could never be reconciled against each other.
+        // Read the clock once for both consumers below: the latency histogram and the `ai.usage`
+        // billing line must report the *same* duration for a request, or they can never be
+        // reconciled against each other.
         let elapsed = rc.start.elapsed();
         if cache_hit.is_none() {
             rc.leg

@@ -8,7 +8,7 @@
 //! - **Shared:** the NATS deny/allowance sets (a write lands on every replica within the bound) and
 //!   the id signing keys (an id one replica signs verifies on another; rotation is two-phase).
 //! - **Computed, so the same everywhere:** session pins. No pod keeps any pin state; each computes
-//!   the same provider for a caller every turn from the caller and the row (D253, fixed). The one
+//!   the same provider for a caller every turn from the caller and the row (fixed). The one
 //!   residual divergence is an open breaker on one pod during a real outage.
 //! - **Per pod:** `tenant_max_in_flight` and the per-credential rate limit (N replicas admit N × the
 //!   limit).
@@ -245,7 +245,7 @@ async fn lands_within(gw: &Gateway, key: &str, want: u16, bound: Duration, what:
 }
 
 /// A tenant deny or an exhausted allowance written once to the shared NATS KV refuses that tenant
-/// on **both** replicas within the documented 2s bound (D121, SEC-17), and the delete restores
+/// on **both** replicas within the documented 2s bound (SEC-17), and the delete restores
 /// both. Another tenant is untouched.
 /// claim: SEC-17, A2
 #[tokio::test]
@@ -315,8 +315,8 @@ async fn post_auto(gw: &Gateway, key: &str) -> String {
 
 /// Two replicas whose outcomes differ for one key: replica A saw the primary fail once and failed
 /// over to the fallback for that request; replica B never saw the failure and served the primary.
-/// Both providers are healthy from then on. Before D253's fix each pod remembered its own pin (A
-/// the fallback, B the primary) for up to an hour.
+/// Both providers are healthy from then on, so both pods must compute the same pin: a pod that
+/// remembered its own (A the fallback, B the primary) would split the caller for up to an hour.
 async fn split_pins() -> (ReplyUpstream, MockUpstream, Gateway, Gateway, String) {
     let nats_port = unused_nats_port();
     let (pubkey, sk) = test_keypair(45);

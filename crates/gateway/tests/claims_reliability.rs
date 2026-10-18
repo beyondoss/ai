@@ -1286,7 +1286,7 @@ async fn a_slow_drip_stream_survives_a_short_read_timeout() {
 /// A non-stream call to a pro row can stay silent before its head for longer than
 /// `read_timeout_secs`: OpenAI documents those models as taking "several minutes" and publishes no
 /// maximum. That row has no gateway silence deadline, so the answer arrives and is billed as
-/// answered; the same silence on any other row is still the gateway's 504 (D130).
+/// answered; the same silence on any other row is still the gateway's 504.
 /// claim: REL-1
 /// claim: BIL-3
 /// defect: D252
@@ -1592,7 +1592,7 @@ async fn counting_h2_upstream(
 
 /// A request to an H2 provider rides the connection already open to it while that connection has
 /// stream room. Pingora allows one stream per upstream H2 connection unless told otherwise, so a
-/// second request during the first opened its own TLS connection (D160, found live against OpenAI
+/// second request during the first opened its own TLS connection (found live against OpenAI
 /// and Anthropic by `REL-22::raw::*::h2_burst`).
 ///
 /// The second request starts only once the upstream has the first one's body, so the first
@@ -1959,7 +1959,7 @@ async fn refusing_h2_upstream(
 
 /// A request whose stream the upstream refused — GOAWAY with a `last_stream_id` below it, or
 /// RST_STREAM(REFUSED_STREAM) — was not processed, so it is retried on a new connection even
-/// though its whole body went out. The "never resend a delivered body" rule (D09) is about a
+/// though its whole body went out. The "never resend a delivered body" rule is about a
 /// provider that may be generating; a refused stream is the provider's guarantee it is not.
 /// claim: REL-22
 /// defect: D72
@@ -2089,7 +2089,7 @@ async fn a_stream_refused_on_a_fresh_connection_is_retried() {
     }
 }
 
-/// The other side of D72: a stream the upstream resets with any code but REFUSED_STREAM, after
+/// The other side of the refused-stream resend: a stream the upstream resets with any code but REFUSED_STREAM, after
 /// its whole body went out, may have been processed — it is not resent (that could run, and bill,
 /// the request twice). The client gets the 502 that says the provider had the request.
 /// claim: REL-22, BIL-14
@@ -2198,8 +2198,8 @@ async fn upstream_goaway_is_handled() {
     assert!(served.load(Ordering::SeqCst) >= 26);
 }
 
-/// One GOAWAY refuses every multiplexed stream above its `last_stream_id` at once (D160 carries up
-/// to 100 streams per upstream connection), and the connection a resend lands on can be drained
+/// One GOAWAY refuses every multiplexed stream above its `last_stream_id` at once (one upstream
+/// connection carries up to 100 streams), and the connection a resend lands on can be drained
 /// the same way before it gets to it. Sixteen concurrent requests against an upstream that serves
 /// one stream per connection and GOAWAYs the rest: every refused request is resent until a
 /// connection takes it, so all sixteen succeed and each reaches the upstream exactly once (a

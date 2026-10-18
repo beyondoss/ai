@@ -103,7 +103,7 @@ impl ScannedBody {
     /// serving candidate's id, on a model-routed request. In order:
     ///
     /// 1. An ambiguous `stream_options` (duplicated, or escaped: OpenAI takes the last, decoded) is
-    ///    removed and the body re-scanned, so step 4 adds the one that counts (D88).
+    ///    removed and the body re-scanned, so step 4 adds the one that counts.
     /// 2. A client-sent `stream_options` is made to ask for usage (`force_include_usage`).
     /// 3. `model` is overwritten with the candidate's id (`overwrite`).
     /// 4. A stream that sent no `stream_options` gets [`STREAM_OPTIONS_FRAG`] just inside the root.

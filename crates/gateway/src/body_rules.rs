@@ -54,17 +54,17 @@ pub struct Facts<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rule {
     /// Two root `model` keys: the row came from one, and the provider would serve whichever its
-    /// parser keeps (D34).
+    /// parser keeps.
     DuplicateModel,
-    /// A limit the clamp cannot hold to the row's maximum (D275).
+    /// A limit the clamp cannot hold to the row's maximum.
     OutputLimit,
     /// Input the row does not take (an image, tools).
     RefusedInput,
-    /// Something no row could price (D268).
+    /// Something no row could price.
     Unpriced,
-    /// A managed key runs only what its billing row can price (D267).
+    /// A managed key runs only what its billing row can price.
     CatalogMiss,
-    /// A generation run after the request ends, which no usage tap can meter (D202).
+    /// A generation run after the request ends, which no usage tap can meter.
     Background,
 }
 

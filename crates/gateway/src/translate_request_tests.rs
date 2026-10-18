@@ -149,7 +149,7 @@ fn openai_model_parses_families_and_hosts() {
 }
 
 /// OpenAI 400s `max_tokens` ("Use 'max_completion_tokens'") and non-default sampling on every
-/// reasoning model: the Anthropic SDK's everyday body used to fail on every GPT-5 row.
+/// reasoning model: sent as is, the Anthropic SDK's everyday body fails on every GPT-5 row.
 #[test]
 fn anthropic_sdk_onto_gpt5_sends_max_completion_tokens_and_no_sampling() {
     let v = m2c(
@@ -323,8 +323,9 @@ fn responses_parallel_function_calls_become_one_assistant_message() {
     assert_eq!(v["messages"][4]["tool_calls"][0]["id"], "call_c");
 }
 
-/// Hosted and custom tools used to vanish: the model answered without a tool the client offered.
-/// The hosted search is the documented exception (D78, see
+/// Hosted and custom tools must not vanish: the model would answer without a tool the client
+/// offered.
+/// The hosted search is the documented exception (see
 /// `hosted_web_search_is_dropped_leaving_responses_unless_chosen`).
 #[test]
 fn responses_hosted_tools_are_forwarded_and_custom_tools_mapped() {
@@ -1294,7 +1295,7 @@ fn signed_thinking_crosses_from_every_chat_shape() {
         ]}),
     ] {
         let v = c2m(
-            // Thinking on: a request that does not think drops replayed thinking (D79).
+            // Thinking on: a request that does not think drops replayed thinking.
             &chat(json!({"reasoning_effort": "medium", "messages": [
                 {"role": "user", "content": "2+2?"}, assistant.clone(), {"role": "user", "content": "3+3?"},
             ]})),
@@ -1683,7 +1684,7 @@ fn a_tool_turn_without_echoed_thinking_is_still_accepted_on_budget_claude() {
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 
-// ---- verification phase 0: translation detail (D44-D50) ----------------------------------------
+// ---- translation detail ------------------------------------------------------------------------
 
 /// Two consecutive user messages onto Messages, which wants one user turn: the turn may merge, but
 /// each message keeps its own text block (or a separator), never `"Hello" + "World"` fused into one
@@ -1725,8 +1726,8 @@ fn consecutive_user_messages_keep_their_text_apart() {
 
 /// A long run of same-role messages (queued user turns; an assistant turn whose parallel calls a
 /// client split across messages) merges in time linear in its length, and every message keeps its
-/// block. Each merge used to copy every block gathered so far: 256 KiB of user turns took 4.4 s of
-/// CPU in a release build, 1 MiB over a minute, all on one request.
+/// block. A merge that copied every block gathered so far would be quadratic: 256 KiB of user
+/// turns took 4.4 s of CPU in a release build that way, 1 MiB over a minute, all on one request.
 ///
 /// Asserted as allocation volume, not time, so no host load can move it: the bytes this test's
 /// process allocates converting a run, counted by `stats_alloc`. Quadrupling the run must allocate
@@ -1955,7 +1956,7 @@ fn a_responses_developer_message_is_system_on_a_non_openai_chat_host() {
 /// Responses input items the gateway has no mapping for must reach the upstream so it rejects
 /// them by name, never silently vanish: a dropped `computer_call_output` / `local_shell_call`
 /// leaves the model answering a different history. (`compaction` and `item_reference` are
-/// OpenAI-held state, dropped when translating: see D95.)
+/// OpenAI-held state, dropped when translating.)
 /// claim: TRN-17
 /// defect: D49
 #[test]
@@ -2172,9 +2173,9 @@ fn an_unknown_role_is_forwarded_onto_responses() {
 /// instead of failing: `compaction` (an encrypted summary only OpenAI can read) and
 /// `item_reference` (a pointer into OpenAI's store) are OpenAI-held state no translated upstream
 /// can resolve, so translation drops them and the request runs on the history the client holds.
-/// (A catalog walk refuses an `item_reference` that stands for an earlier turn before translation,
-/// D175; only a tool step's reaches it.) The same-wire Responses relay keeps them; D49's rule (forward anything the gateway has no
-/// mapping for) still holds for every other item.
+/// (A catalog walk refuses an `item_reference` that stands for an earlier turn before translation;
+/// only a tool step's reaches it.) The same-wire Responses relay keeps them; anything else the
+/// gateway has no mapping for is still forwarded.
 /// claim: TRN-17
 /// defect: D95
 #[test]
@@ -2671,7 +2672,7 @@ fn session_field_reads_item_references_only_from_a_well_formed_input_array() {
     assert_eq!(responses_session_field(said, false), None);
     let malformed = br#"{"store": false, "input": [{"type": "item_reference" "id": "msg_1"}]}"#;
     assert_eq!(responses_session_field(malformed, false), Some("store"));
-    // An `input` that never says `item_reference` is never walked (D215), so its malformed items
+    // An `input` that never says `item_reference` is never walked, so its malformed items
     // are the provider's to reject.
     let unwalked = br#"{"store": false, "input": [{"type": "message" "role": "user"}]}"#;
     assert_eq!(responses_session_field(unwalked, false), None);
@@ -2991,7 +2992,7 @@ fn fast_req(from: Endpoint, to: Endpoint, body: &Value, model: &str, fast: bool)
 
 /// OpenAI's `service_tier: "priority"` becomes Anthropic fast mode where the caller decided the
 /// attempt asks for it (a direct Anthropic candidate with fast mode), from a Chat Completions and
-/// a Responses client alike; otherwise it goes, as every `service_tier` onto Messages does (D266).
+/// a Responses client alike; otherwise it goes, as every `service_tier` onto Messages does.
 /// claim: CAT-6
 /// defect: D266
 #[test]
@@ -3025,7 +3026,7 @@ fn priority_onto_messages_is_fast_mode_only_when_the_attempt_asks_for_it() {
 /// the body never sends it there. One that did not forwards it for the provider to refuse, rather
 /// than serve the answer at standard speed; it is never respelled as `service_tier`, a best effort
 /// that may be served at the default tier. Anthropic's own `service_tier` values (`auto`,
-/// `standard_only`) mean nothing on that wire and are dropped, as is `speed: "standard"` (D266).
+/// `standard_only`) mean nothing on that wire and are dropped, as is `speed: "standard"`.
 /// claim: CAT-6
 /// defect: D266
 #[test]

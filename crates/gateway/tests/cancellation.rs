@@ -147,8 +147,8 @@ async fn upstream_failures_still_open_the_breaker() {
 /// request, then closes) is **not** retried. Pingora would resend it on its own, without calling
 /// `fail_to_connect`, but the provider may already be generating and billing that request, so the
 /// gateway declines the reuse retry once the body was delivered (`error_while_proxy`) and the
-/// client gets a JSON 502. This test used to assert the retry; that resend is the duplicate spend
-/// D09 removed. The breaker still sees exactly one outcome per attempt.
+/// client gets a JSON 502: that resend would be a duplicate spend. The breaker still sees exactly
+/// one outcome per attempt.
 ///
 /// The mock kills any request that is not the first on its connection, so the scenario fires the
 /// moment pingora reuses a pooled connection — whenever that happens to be, rather than on a fixed
@@ -285,7 +285,7 @@ async fn closes_reused_connections_unread() -> (u16, std::sync::Arc<std::sync::a
 /// any response byte) never reached a server, so the gateway resends it on a fresh connection, as
 /// pingora does for a reused connection. A small body is read straight through to the upstream:
 /// nothing reads it ahead of connecting, so "the body was read" is not mistaken for "the provider
-/// took it" (D80). A clean end-of-file after the body stays unretried (see the test above, D09).
+/// took it". A clean end-of-file after the body stays unretried (see the test above).
 /// claim: REL-1
 /// defect: D80
 #[tokio::test]
@@ -487,7 +487,7 @@ async fn a_client_gone_mid_upload_is_not_failed_over() {
 
 /// A provider-routed request whose client stalls mid-upload on a pooled connection ends at the read
 /// timeout, and is not resent: the timeout is a liveness verdict on an attempt that may still be
-/// running, not a reused connection's failure before delivery (D248's `ReusedOnly` rule is for a
+/// running, not a reused connection's failure before delivery (the `ReusedOnly` rule is for a
 /// body write that met a closed stream only).
 /// claim: REL-1
 #[tokio::test]
@@ -584,7 +584,7 @@ async fn h2_stalled_upload(port: u16, headers: &[(&str, String)], sent: &str) ->
 
 /// A managed client that stalls mid-upload, connection open, ends its own request: the upstream's
 /// read timeout fires on a provider still waiting for the client's bytes, which is the client's
-/// stall, not the provider failing (D260). So the walk does not fail over to the next candidate,
+/// stall, not the provider failing. So the walk does not fail over to the next candidate,
 /// the candidate's breaker hears nothing (the next request still reaches it, with a threshold of
 /// 1), no pool key is cooled, the client gets a 408, and the half a provider was sent is not
 /// billed.

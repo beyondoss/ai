@@ -388,7 +388,7 @@ pub(super) enum Ending {
     Free,
     /// Answered from the exact-match cache: the usage stored at fill, no provider called.
     CacheHit(Count),
-    /// The gateway's own refusal before any response head (D267): no provider had the request
+    /// The gateway's own refusal before any response head: no provider had the request
     /// whole, so it writes no row, as every other rejection writes none.
     Refused,
     /// The provider answered with an error status (4xx/5xx).

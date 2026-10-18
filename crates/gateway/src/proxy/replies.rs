@@ -158,7 +158,7 @@ impl AiProxy {
     }
 }
 
-/// Most `request rejected` lines logged per second, process-wide (D263). A rejection is the one
+/// Most `request rejected` lines logged per second, process-wide. A rejection is the one
 /// line a client can make the gateway write at will — bad keys, a rate-limited flood — and one line
 /// per rejected request made the log the bottleneck of a flood the rejection was meant to shed. A
 /// second's first lines still carry their `request_id` for the oncall's grep; past the allowance

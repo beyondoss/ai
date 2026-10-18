@@ -230,15 +230,15 @@ const USAGE_HEAD_CAP: usize = 8 * 1024;
 /// failover, and not a breaker failure.
 const MAX_CONNECT_RETRIES: u8 = 2;
 
-/// Concurrent streams the gateway opens on one upstream H2 connection before it opens another
-/// (D160). 100 is the least RFC 9113 §6.5.2 recommends a server allow; a provider whose
+/// Concurrent streams the gateway opens on one upstream H2 connection before it opens another.
+/// 100 is the least RFC 9113 §6.5.2 recommends a server allow; a provider whose
 /// `SETTINGS_MAX_CONCURRENT_STREAMS` is lower lowers it (pingora takes the smaller).
 const UPSTREAM_H2_MAX_STREAMS: usize = 100;
 
 pub struct AiProxy {
     /// The gateway state, which lives as long as the process: a `&'static` borrow, so a request
     /// context holds it without an `Arc` clone (a shared-cache-line RMW pair on every request,
-    /// fast rejects included; D92). Built with [`AiProxy::new`].
+    /// fast rejects included). Built with [`AiProxy::new`].
     pub state: &'static GatewayState,
 }
 
@@ -503,7 +503,7 @@ pub struct RequestCtx {
     redact: Option<Box<Redact>>,
     /// Whether the bytes sent to the client so far end with the stream's terminal event (`[DONE]`,
     /// `message_stop`, `response.completed`). Fed on managed streams only; read in `logging` so a
-    /// client that closes once it has the whole answer is not a cancel (D120, D122).
+    /// client that closes once it has the whole answer is not a cancel.
     terminal: TerminalTracker,
     /// A managed Responses relay to a provider's store (`signed_id`): the ids in its 2xx are signed
     /// for this tenant, and the ids the client sent were verified and are stripped back in
@@ -580,9 +580,9 @@ struct BodyPlan {
     /// Managed `/{provider}/…` billable call (every allowlisted endpoint but the free token counts):
     /// held whole so a request whose root `model` names no catalog row ([`price_row`]) is refused
     /// before any byte of it goes upstream, with the catalog walk's 404. A managed key runs priced
-    /// models only (D267). BYO keys never set it.
+    /// models only. BYO keys never set it.
     ///
-    /// The same buffer refuses a `/responses` body's `background: true` (D202): that endpoint is
+    /// The same buffer refuses a `/responses` body's `background: true`: that endpoint is
     /// billable, so it is always checked here (a catalog walk reads its body in `request_filter`
     /// and refuses there).
     catalog_check: bool,
@@ -615,10 +615,10 @@ impl BodyPlan {
     ///   edits a walk makes (the output-limit cap, `max_tokens` respelled for native OpenAI, dropped
     ///   nulls and unreplayable reasoning).
     /// - `catalog_check`: a managed `/{provider}/…` billable body is held whole so a model outside
-    ///   the catalog (D267), or a `/responses` body's `background: true` (D202), is refused before
+    ///   the catalog, or a `/responses` body's `background: true`, is refused before
     ///   any byte goes upstream.
     /// - `signed`: a managed Responses relay to a provider's store swaps each tenant-signed id for
-    ///   the provider's (`signed_id`, D230).
+    ///   the provider's (`signed_id`).
     ///
     /// Several can apply to the same request, in which case every edit is made to the one buffer.
     fn rewrites_body(self) -> bool {
@@ -634,7 +634,7 @@ impl BodyPlan {
 /// The permit is the breaker ledger: `Some` iff one `allow()` against `provider` is unresolved.
 /// Every resolution takes it, so an attempt can never be recorded twice; resolving with the permit
 /// (not just "the breaker") lets a half-open breaker ignore an attempt whose probe it has since
-/// reclaimed (D256). A leg dropped with its permit still out (a panic unwinding the request) gives
+/// reclaimed. A leg dropped with its permit still out (a panic unwinding the request) gives
 /// it back without an outcome, so a half-open breaker's only probe permit is never stranded.
 struct Leg {
     /// The resolved upstream provider, shared from the boot-time registry: a cheap `Arc` clone,
@@ -649,7 +649,7 @@ struct Leg {
     /// Which of the provider's resolved addresses this attempt dials: advanced by each connect
     /// retry (see `fail_to_connect`).
     addr: u8,
-    /// This attempt is the one resend a refused H2 stream gets on its candidate (D72, D91). A
+    /// This attempt is the one resend a refused H2 stream gets on its candidate. A
     /// second refusal there is a provider failure: fail over, or end the request.
     refused_resent: bool,
     /// The retry the hook that asked pingora for another attempt declared, read by `upstream_peer`
@@ -797,7 +797,7 @@ struct ModelRouting {
     /// the 503 when every candidate was skipped. `None` while no breaker skipped one.
     open_retry_after: Option<u16>,
     /// The client asked for priority processing (`route::SpeedAsk::Priority`): an attempt
-    /// translated onto a candidate that serves fast mode asks it for fast mode (D266).
+    /// translated onto a candidate that serves fast mode asks it for fast mode.
     priority: bool,
 }
 
@@ -1009,7 +1009,7 @@ fn requests_background(body: &[u8]) -> bool {
 
 /// The `/{provider}/…` endpoints a managed key may reach: the metered generation calls and their
 /// token-count / compact sub-resources ([`route::ENDPOINT_PATHS`], the table every routing
-/// decision reads too, D209), matched by suffix so every provider's mount prefix (`/api/v1`,
+/// decision reads too), matched by suffix so every provider's mount prefix (`/api/v1`,
 /// `/openai/v1`, `/inference/v1`, `/anthropic/v1`, `/backend-api/codex`) works. Everything else on
 /// a provider (files, batches, stored responses, fine-tuning, models) is refused for managed keys.
 /// A query string is ignored.

@@ -457,9 +457,8 @@ async fn a_relayed_failover_writes_one_usage_row_under_the_clients_id() {
 /// the next: the provider may already be generating, and billing, the answer. The request ends
 /// with a JSON 502 and the fallback never sees the body.
 ///
-/// This test used to expect the held body to be retried and every request to succeed — the
-/// unsafe behavior D09 removed. The mock's shape (drain, then close) is exactly the case the
-/// policy forbids resending, so the expectation changed with it.
+/// The mock's shape (drain, then close) is exactly the case the policy forbids resending: the
+/// held body is not retried, since the provider may have run it.
 #[tokio::test]
 async fn a_reset_after_the_body_was_delivered_is_not_resent() {
     let (pubkey, sk) = test_keypair(1);

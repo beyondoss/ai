@@ -25,8 +25,8 @@ pub(super) fn body_delivered(
         })
 }
 
-/// Whether the client closed its HTTP/1.1 connection before its body's framing-defined end
-/// (D259): a `Content-Length` body with bytes still to come, or a chunked one without its
+/// Whether the client closed its HTTP/1.1 connection before its body's framing-defined end:
+/// a `Content-Length` body with bytes still to come, or a chunked one without its
 /// terminating chunk. Pingora then marks the body *done* (`is_body_done`), though never complete,
 /// so without this the half a provider was sent read as the whole request, and `logging` billed
 /// it an estimate. Like [`h2_body_unsent`], the context string is pingora's only handle on it.
@@ -56,7 +56,7 @@ pub(super) fn client_body_cut_short(e: &pingora_core::Error) -> bool {
 /// closed with body bytes still unsent: pingora's `reserve_and_send` found no capacity to get
 /// (`cannot reserve capacity`, `while waiting for capacity`), a write failure it labels `H2Error`
 /// rather than `WriteError`. END_STREAM never went out, so the upstream cannot have the whole
-/// request. The usual cause is a GOAWAY that closed a stream mid-upload (D248); pingora gives no
+/// request. The usual cause is a GOAWAY that closed a stream mid-upload; pingora gives no
 /// other handle on it than the context string.
 pub(super) fn h2_body_unsent(e: &pingora_core::Error) -> bool {
     let mut at = Some(e);
@@ -82,7 +82,7 @@ pub(super) fn h2_body_unsent(e: &pingora_core::Error) -> bool {
 
 /// Whether `e` ended a request because someone stopped waiting for its response, rather than the
 /// provider ending it: the client went away, or the gateway's `read_timeout_secs` expired on an
-/// upstream connection that was still up (D130). Once the provider has the whole request
+/// upstream connection that was still up. Once the provider has the whole request
 /// ([`body_delivered`]), it is working on, and billing, the prompt in both cases.
 ///
 /// Not a reset or a close from the upstream before any head: that is the peer declining to answer,
@@ -97,7 +97,7 @@ pub(super) fn h2_body_unsent(e: &pingora_core::Error) -> bool {
 /// Not the gateway's own refusal of a body it withheld (a downstream-tagged status from
 /// `request_body_filter`: a catalog miss, a duplicate `model`, `background`, a foreign id, the
 /// body budget). The client read in full, but the provider never had the body's last byte, so
-/// nothing was waited on and nothing is billed (D267).
+/// nothing was waited on and nothing is billed.
 pub(super) fn gave_up_waiting(e: &pingora_core::Error) -> bool {
     match e.esource() {
         pingora_core::ErrorSource::Downstream => !gateway_refusal(e),
@@ -109,7 +109,7 @@ pub(super) fn gave_up_waiting(e: &pingora_core::Error) -> bool {
 /// Whether `e` is the gateway's own answer to the client (a `CustomCode` or `HTTPStatus` tagged
 /// downstream: a catalog miss, a duplicate `model`, `background`, a foreign id, an oversized body),
 /// not the client going away. Before any response head, such a request never reached a provider
-/// whole, so it bills nothing and writes no `ai.usage` row (rejections write none, D267).
+/// whole, so it bills nothing and writes no `ai.usage` row (rejections write none).
 pub(super) fn gateway_refusal(e: &pingora_core::Error) -> bool {
     use pingora_core::ErrorType::{CustomCode, HTTPStatus};
     e.esource() == &pingora_core::ErrorSource::Downstream
@@ -117,7 +117,7 @@ pub(super) fn gateway_refusal(e: &pingora_core::Error) -> bool {
 }
 
 /// Whether the upstream refused this request's HTTP/2 stream with a GOAWAY, one shape of
-/// [`upstream_refused_stream`]: the connection is retired, so a resend takes another (D248).
+/// [`upstream_refused_stream`]: the connection is retired, so a resend takes another.
 pub(super) fn upstream_goaway(e: &pingora_core::Error) -> bool {
     e.root_cause()
         .downcast_ref::<h2::Error>()
@@ -125,7 +125,7 @@ pub(super) fn upstream_goaway(e: &pingora_core::Error) -> bool {
 }
 
 /// Whether the upstream refused this request's HTTP/2 stream before processing any of it, so it
-/// is safe to resend whatever was written (D72). Two shapes, both guaranteed by RFC 9113:
+/// is safe to resend whatever was written. Two shapes, both guaranteed by RFC 9113:
 ///
 /// - `RST_STREAM(REFUSED_STREAM)` from the peer (§8.7: "closed prior to any processing").
 /// - A remote GOAWAY on the stream. The `h2` client hands a stream that error only when its id is
@@ -139,13 +139,13 @@ pub(super) fn upstream_refused_stream(e: &pingora_core::Error) -> bool {
     })
 }
 
-/// Whether a **reused** HTTP/1.1 connection was reset before any response byte (D80): the
+/// Whether a **reused** HTTP/1.1 connection was reset before any response byte: the
 /// provider's kernel answered with RST because the socket was closed with our request unread in it,
 /// the idle-close race on a pooled connection, so the request reached no server. Pingora marks this
 /// `ReusedOnly`, retryable on a reused connection.
 ///
 /// Not a clean end-of-file: a server that read the request and then closed looks exactly like one
-/// that closed first, and the first may be generating (D09). Not a timeout either (`ETIMEDOUT` is a
+/// that closed first, and the first may be generating. Not a timeout either (`ETIMEDOUT` is a
 /// liveness verdict on a dead peer that may have taken the request), nor an HTTP/2 I/O error, which
 /// carries no such guarantee ([`upstream_refused_stream`] covers HTTP/2's own refusals).
 pub(super) fn reset_before_reading(e: &pingora_core::Error, client_reused: bool) -> bool {
@@ -162,8 +162,8 @@ pub(super) fn reset_before_reading(e: &pingora_core::Error, client_reused: bool)
             })
 }
 
-/// Whether `e` is the client closing after the stream's terminal event was written to it (D120,
-/// D122). openai-python closes at `[DONE]`, Codex at `response.completed`; when that close lands
+/// Whether `e` is the client closing after the stream's terminal event was written to it.
+/// openai-python closes at `[DONE]`, Codex at `response.completed`; when that close lands
 /// before the provider's end of stream, pingora ends the request with a downstream error although
 /// the client read the whole answer.
 ///
@@ -203,7 +203,7 @@ pub(super) const HEALTH_PREFIX_CAP: usize = 1024;
 /// the key off and walks to the next one; on a catalog walk's last key it is a candidate failure.
 /// A 403 is not: it is usually about the request (moderation, a model the key's project may not
 /// use, Anthropic's `permission_error`), so one tenant's 403 must not move the shared pool off a
-/// key (D84). A 403 whose body names the key is cooled from the body ([`body_names_the_key`]).
+/// key. A 403 whose body names the key is cooled from the body ([`body_names_the_key`]).
 pub(crate) fn is_pool_key_failure(status: u16) -> bool {
     status == 401
 }
@@ -216,7 +216,7 @@ pub(crate) fn is_pool_key_failure(status: u16) -> bool {
 /// key ([`body_names_the_key`]), and an out-of-credit answer under any status (a 402, Anthropic's
 /// credit-balance 400, OpenAI's `insufficient_quota` 429: `remedy::Neutralized::unfunded`). A 402
 /// the walk fails over on is abandoned at its head, body unread, so its key is cooled there when
-/// the status alone says out of credit (`remedy::unfunded_402`, D258). Each is counted on
+/// the status alone says out of credit (`remedy::unfunded_402`). Each is counted on
 /// `ai_key_auth_failures_total` by reason (`metrics::KeyCooled`).
 pub(crate) fn is_candidate_refusal(status: u16) -> bool {
     (401..=403).contains(&status)
@@ -287,7 +287,7 @@ pub(super) fn json_is_error_object(bytes: &[u8]) -> Option<bool> {
     }
 }
 
-/// Whether a whole non-stream body is only an error (D195, D205): a root object with a non-null
+/// Whether a whole non-stream body is only an error: a root object with a non-null
 /// `error` member and none of the members an answer is carried in (`choices`, `output`,
 /// `content`), whatever order its keys come in. OpenRouter's error-in-200 is `{"error": {...}}`,
 /// but a provider may write `id`, `object` or `model` first; a Responses answer carries
@@ -392,7 +392,7 @@ impl AiProxy {
             ALPN::H1
         };
         // Pingora allows one stream per upstream H2 connection unless told otherwise, which made
-        // every concurrent request open its own TLS connection: H2 without the multiplexing (D160).
+        // every concurrent request open its own TLS connection: H2 without the multiplexing.
         // The provider's own SETTINGS_MAX_CONCURRENT_STREAMS still caps this (pingora takes the
         // lower), and a full connection makes the next request open another.
         peer.options.max_h2_streams = UPSTREAM_H2_MAX_STREAMS;
@@ -410,9 +410,9 @@ impl AiProxy {
         // SDKs' default request timeout. A *dead* peer is detected by transport liveness instead.
         // Pingora applies it to every read, so before the head it is the whole wait. A row whose
         // vendor documents requests running "several minutes" and publishes no maximum
-        // (`long_running`: OpenAI's `-pro` models) gets no silence deadline at all (D252): a
+        // (`long_running`: OpenAI's `-pro` models) gets no silence deadline at all: a
         // non-stream call there can outlast 600s, and a 504 is still billed by the provider. Its
-        // end is the client's own timeout (a cancel the gateway sees and bills, D130) or a dead
+        // end is the client's own timeout (a cancel the gateway sees and bills) or a dead
         // transport.
         peer.options.read_timeout = (!row.is_some_and(providers::catalog::long_running))
             .then(|| Duration::from_secs(self.state.config.read_timeout_secs()));
@@ -425,7 +425,7 @@ impl AiProxy {
         peer
     }
 
-    /// Cool this attempt's pool key because its account is out of credit (D180): later requests
+    /// Cool this attempt's pool key because its account is out of credit: later requests
     /// start past it, and a catalog walk leaves the provider out once all its keys cool. Waiting
     /// does not fix it, so it is cooled as a 401 is.
     pub(super) fn cool_unfunded_key(
@@ -448,9 +448,9 @@ impl AiProxy {
 
     /// Judge a `402` a catalog walk abandons at its head, unread (`by_status`: `None` for any other
     /// answer, else [`remedy::unfunded_402`]'s verdict). Out of credit by its status alone: cool
-    /// the key (D258). OpenRouter's, which may be one request too costly instead: a strike against
-    /// the key, and the [`route::OPENROUTER_402_STRIKES`]th in a row with no 2xx between cools it
-    /// (D261). A relayed 402 is read by `logging` instead: out of credit cools the key (which spends
+    /// the key. OpenRouter's, which may be one request too costly instead: a strike against
+    /// the key, and the [`route::OPENROUTER_402_STRIKES`]th in a row with no 2xx between cools it.
+    /// A relayed 402 is read by `logging` instead: out of credit cools the key (which spends
     /// its strikes), too costly neither counts nor resets one.
     pub(super) fn abandon_402(&self, rc: &RequestCtx, by_status: Option<bool>, status: u16) {
         let cool = match by_status {
@@ -539,7 +539,7 @@ pub(super) fn client_still_uploading(session: &mut Session, rc: &RequestCtx) -> 
     rc.attempt.upload.started() && !session.as_mut().is_body_done()
 }
 
-/// Whether the upstream's read timeout fired while the client still owed body bytes (D260): the
+/// Whether the upstream's read timeout fired while the client still owed body bytes: the
 /// client stalled mid-upload with its connection open. Pingora's upstream half waits on the
 /// response and on the next body chunk at once, re-arming the read timeout on each chunk, and a
 /// body write blocked on an upstream that stopped reading is a `WriteTimedout` instead; so this

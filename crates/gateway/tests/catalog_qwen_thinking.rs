@@ -1,13 +1,13 @@
 //! End-to-end: Together's (and OpenRouter's) Qwen rows get what their backend can serve.
 //!
 //! - A forced `tool_choice` on Qwen3.7 Plus or Qwen3.8 Flash goes with thinking off: thinking on,
-//!   it is a 400 on every candidate of the row (D172). Qwen3.8 Omni Flash too.
+//!   it is a 400 on every candidate of the row. Qwen3.8 Omni Flash too.
 //! - A forced `tool_choice` on Qwen3.8 Max Prime, which cannot think off, goes as `auto` with a
-//!   closing system message naming the tool (D269).
+//!   closing system message naming the tool.
 //! - Tools on Qwen3.7 Plus go with thinking off unless the client asked for reasoning: thinking,
-//!   it sometimes writes the call as text (D171).
+//!   it sometimes writes the call as text.
 //! - A `developer` message reaches Together as `system`, which its Qwen backend reads and
-//!   `developer` it refuses (D173). OpenRouter maps the role itself and gets it as sent.
+//!   `developer` it refuses. OpenRouter maps the role itself and gets it as sent.
 //!
 //! The mock Together behaves like the real one: stream only, a 400 on a forced tool while
 //! thinking, a 400 on `developer`.

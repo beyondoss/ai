@@ -68,7 +68,7 @@
 //!   them as input, as they are billed (see [`request_with_tools`]).
 //! - **Added onto Responses:** `store: false` unless the client asked to store; Chat Completions
 //!   stores nothing by default, Responses stores everything.
-//! - **Speed (D266):** a Chat Completions or Responses client's `service_tier: "priority"` becomes
+//! - **Speed:** a Chat Completions or Responses client's `service_tier: "priority"` becomes
 //!   Anthropic fast mode (`speed: "fast"`, beta from `proxy`) on an attempt the caller says serves
 //!   it ([`request_with_tools`]'s `fast`), and is dropped onto any other Messages candidate. A
 //!   Messages client's `speed: "fast"` is forwarded onto Chat Completions and Responses for the
@@ -111,7 +111,7 @@ const MAX_CATALOG_OUTPUT_TOKENS: usize = {
 /// `cl100k_base` vocabularies is 128 bytes (measured 2026-10-01 from the published files).
 const MAX_TOKEN_BYTES: usize = 128;
 
-/// Most output a translated stream may gather (D218): every answer the catalog allows, at the most
+/// Most output a translated stream may gather: every answer the catalog allows, at the most
 /// bytes a token can be (384,000 tokens x 128 bytes, 46.9 MiB). A bridge onto a Responses client
 /// keeps every text, reasoning and argument delta for the closing `response.completed`, and onto
 /// Messages a queued call's arguments wait whole; past this the upstream is sending more than any
@@ -119,7 +119,7 @@ const MAX_TOKEN_BYTES: usize = 128;
 /// "response_too_large"}`), as it does past [`MAX_TRANSLATE_BUFFER`].
 pub const MAX_STREAM_OUTPUT: usize = MAX_CATALOG_OUTPUT_TOKENS * MAX_TOKEN_BYTES;
 
-/// The most heap translating `body` onto another wire takes at its peak (D216): the parsed `Value`,
+/// The most heap translating `body` onto another wire takes at its peak: the parsed `Value`,
 /// the translated `Value` and the encoded output, bounded from the body's length and structure
 /// ([`peek::structure`], one pass, no parse) as
 /// `5 × len + 2048 × non-empty objects + 128 × structural tokens`.
@@ -247,7 +247,7 @@ pub fn chat_cache_is_1h(chat: &Value) -> bool {
 /// `fast` is the caller's decision that this attempt asks for Anthropic fast mode: a Chat
 /// Completions or Responses client's `service_tier: "priority"` bound for a candidate that serves
 /// it (`providers::catalog::serves_fast_mode`). The Messages body then carries `speed: "fast"`, and
-/// `proxy` sends [`FAST_MODE_BETA`] on the same attempt's headers from the same decision (D266).
+/// `proxy` sends [`FAST_MODE_BETA`] on the same attempt's headers from the same decision.
 pub fn request_with_tools(
     from: Endpoint,
     to: Endpoint,
@@ -440,7 +440,7 @@ pub fn response_json(upstream: Endpoint, client: Endpoint, body: &[u8]) -> Vec<u
 
 /// Map a non-stream JSON response carrying HTTP `status`. Any non-2xx JSON body is an error
 /// whatever its shape — Bedrock's `{"message": …}` and FastAPI's `{"detail": …}` have no `error`
-/// key, and used to be reshaped as an empty success. A body that is not JSON passes unchanged.
+/// key, and must not be reshaped as an empty success. A body that is not JSON passes unchanged.
 pub fn response_json_status(
     upstream: Endpoint,
     client: Endpoint,
@@ -471,7 +471,7 @@ pub fn response_json_tools(
     };
     // The same endpoint on another vendor's error shape (xAI's `{"code", "error": "<string>"}`,
     // Bedrock's `{"message"}`): an SDK reads the envelope its own API sends, so anything else is
-    // re-encoded in it. One already in it is relayed as it came, byte for byte (D100).
+    // re-encoded in it. One already in it is relayed as it came, byte for byte.
     if upstream == client {
         if in_client_envelope(&v, client) {
             return body.to_vec();
@@ -520,7 +520,7 @@ fn encode(v: &Value) -> Vec<u8> {
 // hands them to its tool. Translation moves them between a JSON string (Chat Completions and
 // Responses `arguments`) and a JSON value (Messages `tool_use.input`), which parsing into a `Value`
 // would do lossily: an integer past `u64` becomes an `f64`, and a decimal is rounded to the nearest
-// `f64` (D127). serde_json's `arbitrary_precision` would keep every number's text, but it is a
+// `f64`. serde_json's `arbitrary_precision` would keep every number's text, but it is a
 // crate-wide feature that breaks `untagged` enums holding numbers, which async-nats' JetStream
 // responses are. So only arguments holding a number a `Value` keeps as an `f64` (a decimal, an
 // exponent, a huge integer) keep their text, as a one-entry object (`RAW_JSON_KEY`) that [`Exact`]
@@ -598,9 +598,8 @@ impl serde::Serialize for Exact<'_> {
 }
 
 /// A request or response body as a `Value`. A Messages body is parsed once with [`KeepInputs`],
-/// which keeps each `input`'s text where a `Value` would not reproduce its numbers (D127); any
-/// other body is parsed once, plainly. (A Messages body with such a number used to be parsed
-/// twice: plainly, to find it, then again with `KeepInputs`.)
+/// which keeps each `input`'s text where a `Value` would not reproduce its numbers; any
+/// other body is parsed once, plainly.
 fn parse_body(wire: Endpoint, body: &[u8]) -> Option<Value> {
     if wire != Endpoint::Messages {
         return serde_json::from_slice::<Value>(body).ok();
@@ -722,7 +721,7 @@ fn in_client_envelope(v: &Value, client: Endpoint) -> bool {
     }
 }
 
-/// The error type an HTTP status means when the body names none (D100: xAI's 400 has no type,
+/// The error type an HTTP status means when the body names none (xAI's 400 has no type,
 /// and `api_error` told a Messages client its invalid image was a server fault). Anthropic's
 /// closed set on Messages; on the OpenAI endpoints the gateway's own envelope's words.
 fn status_error_type(status: u16, client: Endpoint) -> &'static str {
@@ -1091,7 +1090,7 @@ fn openai_req_to_anthropic(v: &Value, claude: ClaudeModel) -> (Value, bool) {
                 // it would vanish from, so the provider rejects it by name.
                 //
                 // So is a message whose role no dialect has (a typo, a framework's private role),
-                // role unchanged: the provider's 400 names it, as it does called directly (D103).
+                // role unchanged: the provider's 400 names it, as it does called directly.
                 _ if !matches!(role, "user" | "") || m.get("role").is_none() => {
                     in_conversation = true;
                     flush_tool_results(&mut messages, &mut pending_tool_results);
@@ -1153,7 +1152,7 @@ fn openai_req_to_anthropic(v: &Value, claude: ClaudeModel) -> (Value, bool) {
 
 /// "No reasoning" on a model whose lowest setting is `between_tools` (Sonnet 5.5): it rejects
 /// `thinking: disabled`, and an omitted `thinking` is adaptive thinking, so `reasoning_effort:
-/// "none"` used to think anyway. `between_tools` does no extended thinking (the model's short notes
+/// "none"` would think anyway. `between_tools` does no extended thinking (the model's short notes
 /// between tool calls still come back as thinking blocks) and takes effort `high` or below — the
 /// effort here is `low`.
 ///
@@ -1204,7 +1203,7 @@ fn claude_chat_reasoning_guard(mut body: Value, up: Upstream) -> Value {
     body
 }
 
-/// D79's rule, Chat Completions side: a body that asks a Claude model for no reasoning (none of
+/// Chat Completions side: a body that asks a Claude model for no reasoning (none of
 /// [`CHAT_REASONING_KEYS`] on, after [`drop_unreplayable_chat_reasoning`]) loses the thinking its
 /// assistant messages carry (`reasoning_details`, and the gateway's `thinking` array). Anthropic on
 /// Bedrock, which serves Claude behind OpenRouter, rejects thinking in the final turn ("When
@@ -1236,7 +1235,7 @@ fn drop_chat_reasoning_when_off(out: &mut Map<String, Value>, claude: ClaudeMode
     removed
 }
 
-/// D79's rule, Messages side (see [`drop_chat_reasoning_when_off`]): when the request does not
+/// Messages side (see [`drop_chat_reasoning_when_off`]): when the request does not
 /// think, assistant messages lose their thinking blocks, unless they are all one holds (an empty
 /// message is a 400 of its own). "Does not think" is `thinking: disabled`, or no `thinking` on a
 /// model where that means none (an adaptive-generation model thinks adaptively without one).
@@ -1260,7 +1259,7 @@ fn drop_thinking_when_off(out: &Map<String, Value>, messages: &mut [Value], clau
     }
 }
 
-/// D14's rule for a Claude model behind Chat Completions (OpenRouter's `anthropic/…`, same wire or
+/// Anthropic's signed-thinking rule for a Claude model behind Chat Completions (OpenRouter's `anthropic/…`, same wire or
 /// translated): OpenRouter sends the request's reasoning to Anthropic as enabled thinking, and
 /// Anthropic 400s a tool turn whose last assistant message does not open on a signed thinking
 /// block ("a final `assistant` message must start with a thinking block"). OpenRouter replays a
@@ -1407,7 +1406,7 @@ pub const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 /// The `anthropic-beta` value Anthropic fast mode needs beside `speed: "fast"`
 /// (platform.claude.com/docs/en/build-with-claude/fast-mode). A managed client may send it to
 /// direct Anthropic itself; `proxy` adds it to a translated attempt that [`request_with_tools`]
-/// asks for fast mode (D266).
+/// asks for fast mode.
 pub const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 
 /// The `anthropic-beta` value a request translated onto Messages needs for `upstream_model`, if
@@ -1752,7 +1751,7 @@ fn push_anth_message(messages: &mut Vec<Value>, role: &str, content: Value) {
 
 /// Append `add` to `msg`'s content, in place. Each block moves once: a run of same-role messages
 /// merges in time linear in its length (copying the gathered blocks on every merge made a long run
-/// quadratic, D217).
+/// quadratic).
 fn merge_content(msg: &mut Value, add: Value) {
     let Some(existing) = msg.get_mut("content") else {
         msg["content"] = add;
@@ -2740,13 +2739,13 @@ fn copy_if(out: &mut Map<String, Value>, v: &Value, key: &str) {
 /// (or `null`) `store` is OpenAI's default `true`, so it is session state only where the row has a
 /// Responses arm to keep it (`responses_arm`); elsewhere it is the stock `responses.create()` call,
 /// which translates rather than 400s. An `item_reference` input item that stands for an earlier
-/// turn is session state too (D175, [`turn_reference_in_input`]): a pointer into a store that a
+/// turn is session state too ([`turn_reference_in_input`]): a pointer into a store that a
 /// row with no Responses arm cannot resolve (the gateway stores no customer content). One inside a
 /// tool step is not: it is dropped. A body that is not one well-formed object is `Some("store")`
 /// so a catalog walk fail-closes onto a real Responses arm rather than silently stripping session
 /// state.
 ///
-/// Read by span, never into a `Value` (D215): this runs on every Responses body before the walk,
+/// Read by span, never into a `Value`: this runs on every Responses body before the walk,
 /// up to `MAX_REQUEST_BODY`, and a `Value` costs 10-250 bytes of heap per byte of JSON. Each field
 /// is the last of its key, as a provider's parser keeps it.
 pub fn responses_session_field(body: &[u8], responses_arm: bool) -> Option<&'static str> {
@@ -2796,8 +2795,8 @@ pub fn responses_session_field(body: &[u8], responses_arm: bool) -> Option<&'sta
     }
 }
 
-/// Whether `input` carries an `item_reference` that stands for an earlier conversation turn
-/// (D175): the one kind a row with no Responses arm refuses rather than drops.
+/// Whether `input` carries an `item_reference` that stands for an earlier conversation turn:
+/// the one kind a row with no Responses arm refuses rather than drops.
 ///
 /// The Vercel AI SDK's default Responses model sends each earlier assistant text or reasoning item
 /// that has an id as `{"type":"item_reference","id":…}`, but each client-executed tool call in
@@ -2898,7 +2897,7 @@ fn anthropic_req_to_openai(v: &Value, up: Upstream) -> Value {
     // Remote MCP servers have no Chat Completions equivalent and change what the model can do.
     copy_if(&mut out, v, "mcp_servers");
     // Anthropic fast mode is served by direct Anthropic only, and a walk that read the body never
-    // sends `speed: "fast"` anywhere else (`route::speed_ask`, D266). One that did not read it may
+    // sends `speed: "fast"` anywhere else (`route::speed_ask`). One that did not read it may
     // still fail over here: the field goes on for the provider to refuse rather than be served at
     // standard speed under a fast request. `standard` is the default and means nothing here.
     if v.get("speed").and_then(Value::as_str) == Some("fast") {
@@ -2981,7 +2980,7 @@ fn anthropic_req_to_openai(v: &Value, up: Upstream) -> Value {
                 "system" => messages.extend(m.get("content").and_then(anthropic_system_to_openai)),
                 "user" => messages.extend(anthropic_user_to_openai(m)),
                 // A role no dialect has: forwarded whole, role unchanged, for the provider's 400
-                // to name (D103).
+                // to name.
                 _ => messages.push(m.clone()),
             }
         }
@@ -3581,7 +3580,7 @@ impl Usage {
         // reasoning) and bills it as output, like `usage::openai_body` does; a translated client
         // must be shown the output it is billed.
         let r = reasoning.unwrap_or(0);
-        // Saturating: provider numbers are untrusted and overflow-checks are on (D87).
+        // Saturating: provider numbers are untrusted and overflow-checks are on.
         let outside =
             u64_at(u, "/total_tokens") == Some(prompt.saturating_add(completion).saturating_add(r));
         Self {
@@ -4192,7 +4191,7 @@ fn openai_req_to_responses(v: &Value, openai: OpenAiModel) -> Value {
     copy_if(&mut out, v, "model");
     copy_if(&mut out, v, "stream");
     // A Messages client's fast mode, carried by `anthropic_req_to_openai` for the provider to
-    // refuse (D266).
+    // refuse.
     if v.get("speed").and_then(Value::as_str) == Some("fast") {
         out.insert("speed".into(), json!("fast"));
     }
@@ -4254,7 +4253,7 @@ fn openai_req_to_responses(v: &Value, openai: OpenAiModel) -> Value {
     }
     // OpenAI's Responses API caps `user` at 64 characters (400 "string too long"), though its Chat
     // Completions and xAI's Responses take longer ones; Claude Code's `metadata.user_id` is ~150.
-    // A longer one becomes a hash of itself: the same user still maps to the same id (D146).
+    // A longer one becomes a hash of itself: the same user still maps to the same id.
     if openai.native
         && let Some(Value::String(user)) = out.get("user")
         && user.chars().count() > RESPONSES_MAX_USER
@@ -4369,7 +4368,7 @@ fn openai_req_to_responses(v: &Value, openai: OpenAiModel) -> Value {
                     }));
                 }
                 // A role no dialect has: forwarded whole, role unchanged, for the provider's 400
-                // to name (D103).
+                // to name.
                 _ => {
                     in_conversation = true;
                     input.push(m.clone());
@@ -4819,9 +4818,9 @@ fn responses_input_to_messages(input: Option<&Value>, up: Upstream) -> Vec<Value
             // OpenAI can decrypt, an `item_reference` a pointer into its store. A catalog walk
             // brings only a tool step's `item_reference` here (its preamble or reasoning; the
             // call and output follow in full): one for an earlier turn is session state that
-            // `responses_session_field` names, so the row walks its Responses arm or 400s (D175).
+            // `responses_session_field` names, so the row walks its Responses arm or 400s.
             // A `compaction` is dropped, so a compacted session on a translated candidate runs on
-            // the history the client holds (D95). The same-wire relay keeps both.
+            // the history the client holds. The same-wire relay keeps both.
             "compaction" | "item_reference" => {}
             // Anything else (`computer_call_output`, `local_shell_call`, …) is history the client
             // holds and the model would answer without. Forwarded as-is in place, so the provider
@@ -4845,7 +4844,7 @@ const GATEWAY_SIGNATURE_PREFIX: &str = "rs_gw:";
 /// Whether a Responses input item is a `reasoning` item this gateway minted: our `rs_gw…` id
 /// (items minted before [`GATEWAY_SIGNATURE_PREFIX`]) or our prefix on its `encrypted_content`.
 /// [`is_gateway_reasoning`] for the item object at `start`, read by span: an item can be most of a
-/// 100 MiB body, and a `Value` of it would cost many times that (D215).
+/// 100 MiB body, and a `Value` of it would cost many times that.
 fn is_gateway_reasoning_span(body: &[u8], start: usize) -> bool {
     let field = |key: &str| peek::last_member(body, start, key).flatten();
     let starts = |key: &str, prefix: &str| {
@@ -4894,7 +4893,7 @@ pub fn store_false(body: &mut Vec<u8>) -> bool {
 /// with no Responses arm (xAI's, as `store: false`): nothing there holds the item (xAI answers one
 /// 422 "unknown item type"). Such a row walks its candidates only when every reference is a tool
 /// step's (`responses_session_field`: one for an earlier turn is a 400 there), so this drops what
-/// translation drops for any other candidate (D175). Every other byte stays as sent. `true` when
+/// translation drops for any other candidate. Every other byte stays as sent. `true` when
 /// the body changed; a body without the string is untouched and unparsed.
 pub fn strip_item_references(body: &mut Vec<u8>) -> bool {
     const NEEDLE: &[u8] = b"item_reference";
@@ -4913,7 +4912,7 @@ pub fn strip_item_references(body: &mut Vec<u8>) -> bool {
     let Some(items) = peek::array_elements(body, input.value.0) else {
         return false;
     };
-    // Each item's `type` by span: one item can be most of a 100 MiB body (D215).
+    // Each item's `type` by span: one item can be most of a 100 MiB body.
     let refs: Vec<bool> = items
         .iter()
         .map(|&(s, e)| {
@@ -4925,7 +4924,7 @@ pub fn strip_item_references(body: &mut Vec<u8>) -> bool {
 }
 
 /// A Messages body for a candidate that does not accept fine-grained tool input streaming
-/// (`providers::catalog::serves_eager_input_streaming`, D272: Bedrock's older serving stack 400s
+/// (`providers::catalog::serves_eager_input_streaming`: Bedrock's older serving stack 400s
 /// the field, and a 400 is not failed over): every `eager_input_streaming` member of each root
 /// `tools` element is cut out by span. The tools then stream the API's default way, each parameter
 /// buffered and validated before it is sent. Every other byte stays as sent; one `memmem` keeps a
@@ -4949,7 +4948,7 @@ pub fn strip_eager_input_streaming(body: &mut Vec<u8>) -> bool {
     })
 }
 
-/// A body for a candidate that answers only streams (`providers::catalog::stream_only`, D147),
+/// A body for a candidate that answers only streams (`providers::catalog::stream_only`),
 /// asking for a stream when the client did not: every root `stream` member (and, with `usage`,
 /// every `stream_options`) is cut out by span, and `"stream":true` (with
 /// `"stream_options":{"include_usage":true}`, so a Chat Completions stream ends in its usage chunk)
@@ -4975,7 +4974,7 @@ pub fn force_stream(body: &mut Vec<u8>, usage: bool) -> bool {
 }
 
 /// A Chat Completions body for a host that does not read the `developer` role
-/// (`providers::catalog::reads_developer_role`, D173): each root `messages` element whose `role` is
+/// (`providers::catalog::reads_developer_role`): each root `messages` element whose `role` is
 /// `"developer"` says `"system"` instead, which is what `developer` means for a model that is not
 /// OpenAI's. Only those role values change; every other byte stays as sent. One `memmem` keeps a
 /// body without `developer` unwalked. `true` when the body changed.
@@ -5018,7 +5017,7 @@ pub fn developer_as_system(body: &mut Vec<u8>) -> bool {
 }
 
 /// A Chat Completions body for a candidate whose thinking conflicts with tools
-/// (`providers::catalog::ToolThinking`, D171/D172/D269), when it offers tools and the rule says so.
+/// (`providers::catalog::ToolThinking`), when it offers tools and the rule says so.
 /// Thinking off: every root `reasoning` and `reasoning_effort` member is cut out by span and
 /// `"reasoning":{"enabled":false}` goes first. A forced `tool_choice` (`"required"` or a named
 /// function) turns thinking off under `OffWhenForced` and `OffWithTools`, since the candidate
@@ -5026,7 +5025,7 @@ pub fn developer_as_system(body: &mut Vec<u8>) -> bool {
 /// for reasoning itself. Under `ForcedAsInstruction` (the candidate cannot think off) a forced
 /// request goes as `"tool_choice":"auto"` with a closing system message naming what must be called
 /// instead. Under `AutoOnly` a forced request goes that way too, and a `"tool_choice":"none"`
-/// request goes with its root `tools` and `tool_choice` cut out by span (D270). Every other byte
+/// request goes with its root `tools` and `tool_choice` cut out by span. Every other byte
 /// stays as sent. `true` when the body changed.
 pub fn fit_tools_to_thinking(body: &mut Vec<u8>, rule: providers::catalog::ToolThinking) -> bool {
     use providers::catalog::ToolThinking;
@@ -5116,7 +5115,7 @@ fn forced_as_instruction(body: &mut Vec<u8>, must: &str) -> bool {
 ///
 /// The items are cut out by span ([`peek::remove_items`]); every other byte stays as the client
 /// sent it. A `Value` round-trip would sort every object's keys (a strict structured output's
-/// schema property order, and with it the prompt-cache prefix) and respace the body (D90). Only an
+/// schema property order, and with it the prompt-cache prefix) and respace the body. Only an
 /// `input` element that mentions `rs_gw` is parsed, to check it is ours.
 pub fn strip_gateway_reasoning(mut body: Vec<u8>) -> Vec<u8> {
     if memchr::memmem::find(&body, b"rs_gw").is_none() {
@@ -5846,7 +5845,7 @@ fn index_of(item: &Value, pos: usize) -> u64 {
 /// An SSE comment line, sent to a translated stream's client in place of upstream events that
 /// map to nothing for it: Anthropic's `event: ping`, OpenRouter's `: OPENROUTER PROCESSING`, and
 /// thinking or a reasoning summary the client's dialect does not carry, or holds until its block
-/// is whole (D251). Dropping them left the client no byte for as long as the model thought, and a
+/// is whole. Dropping them left the client no byte for as long as the model thought, and a
 /// load balancer's or proxy's idle timeout (often 60–100 s) cut the stream. Every SSE parser
 /// ignores a line that starts with `:`, so the client's events are unchanged. At most one per
 /// [`SseBridge::feed`] call that consumed an event and wrote nothing, so the cadence is the
@@ -5897,7 +5896,7 @@ impl SseBridge {
 
     /// A bridge that assembles an upstream stream into one non-streaming answer instead of
     /// relaying it, for a client that did not ask for a stream from a candidate that answers only
-    /// streams (`providers::catalog::stream_only`, D147). It reads the stream the way a Responses
+    /// streams (`providers::catalog::stream_only`). It reads the stream the way a Responses
     /// client's bridge does, since that already builds the whole response (`response.completed`
     /// repeats every output item and the usage), but writes no event: [`Self::feed`] returns
     /// nothing, and [`Self::assembled`] gives the body once the upstream has ended. Reasoning,
@@ -5994,7 +5993,7 @@ impl SseBridge {
     }
 
     /// Whether a translated stream owes its client a [`KEEP_ALIVE`] for upstream events that
-    /// mapped to nothing (D251). A same-wire relay forwards the provider's own pings and comments
+    /// mapped to nothing. A same-wire relay forwards the provider's own pings and comments
     /// as they came; an assembling bridge writes no event; and nothing follows an error or the
     /// client's terminal event.
     fn keeps_alive(&self) -> bool {
@@ -6202,7 +6201,7 @@ impl SseBridge {
     /// The client was sent its terminal event (a Chat `[DONE]`, a Messages `message_stop`, a
     /// Responses `response.completed`). Nothing follows it: an upstream that writes past its own
     /// end (an error after the usage chunk, a chunk after `message_stop`) must not hand the client
-    /// a second ending (D124), and `proxy`'s [`crate::terminal::TerminalTracker`] reads the end of
+    /// a second ending, and `proxy`'s [`crate::terminal::TerminalTracker`] reads the end of
     /// what the client was sent to tell a close after the answer from a cancel.
     fn client_ended(&self) -> bool {
         match self.client {
@@ -6844,8 +6843,8 @@ enum CallStep {
 /// Chat Completions tool-call deltas, keyed the way the stream means them.
 ///
 /// A delta names its call by `index`. Some upstreams repeat the `id` on every delta, some omit
-/// `index`, and some reuse one `index` for parallel calls with different ids; all three used to
-/// open a new call per delta or pour one call's arguments into another's. A call opens once its
+/// `index`, and some reuse one `index` for parallel calls with different ids; keyed on either
+/// alone, all three open a new call per delta or pour one call's arguments into another's. A call opens once its
 /// name is known (or at the end), so a client never sees a nameless tool.
 ///
 /// Each delta finds its call in O(1) (`slots`, `by_id`) rather than by a backward scan of every
@@ -7058,7 +7057,7 @@ struct OaiToAnt {
 
 /// Where a streamed call's JSON arguments end, found incrementally: each step scans only the bytes
 /// that arrived since the last, so a live call with queued calls behind it costs O(len) overall,
-/// not a full re-parse per step (D96). The one full parse runs when the outer value closes, to
+/// not a full re-parse per step. The one full parse runs when the outer value closes, to
 /// confirm it is whole JSON.
 #[derive(Default)]
 struct ArgsEnd {
@@ -7319,7 +7318,7 @@ impl OaiToAnt {
 
     /// Whether the live call can take no more arguments. Its JSON has closed; or it has none and
     /// the upstream is already streaming a queued call's arguments, so it is a call that takes no
-    /// arguments, not one whose arguments are late (D96).
+    /// arguments, not one whose arguments are late.
     fn live_whole(&mut self) -> bool {
         let Some(c) = self.live.and_then(|at| self.calls.calls.get(at)) else {
             return true;
@@ -8960,8 +8959,8 @@ mod tests {
         assert_eq!(back["content"][0]["input"]["city"], "SF");
     }
 
-    /// A Messages history call's `input` reaches a Chat upstream with its numbers as written
-    /// (D127), next to an integer-only call that takes the ordinary path.
+    /// A Messages history call's `input` reaches a Chat upstream with its numbers as written,
+    /// next to an integer-only call that takes the ordinary path.
     #[test]
     fn messages_history_tool_input_keeps_its_number_text() {
         let body = br#"{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"f","input":{"n":0.30000000000000001,"big":123456789012345678901234567890}},{"type":"tool_use","id":"toolu_2","name":"g","input":{"k":7}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"},{"type":"tool_result","tool_use_id":"toolu_2","content":"ok"}]}]}"#;
@@ -9265,7 +9264,7 @@ mod tests {
         let empty_prev = br#"{"model":"gpt-4o","previous_response_id":"","store":false}"#;
         assert_eq!(responses_session_field(empty_prev, true), None);
         assert_eq!(responses_session_field(b"not-json", false), Some("store"));
-        // A reference-only input stands for an earlier turn, on every row (D175).
+        // A reference-only input stands for an earlier turn, on every row.
         let reference =
             br#"{"model":"m","store":false,"input":[{"type":"item_reference","id":"msg_1"}]}"#;
         assert_eq!(
@@ -9285,7 +9284,7 @@ mod tests {
         assert_eq!(responses_session_field(step, true), None);
     }
 
-    /// The D175 rule over the Responses input item sequence: a reference inside a step (a run of
+    /// The `item_reference` rule over the Responses input item sequence: a reference inside a step (a run of
     /// references, reasoning and tool calls) that holds a call is dropped; one in a step without a
     /// call is an earlier turn.
     #[test]
@@ -9388,7 +9387,7 @@ mod tests {
     /// A Bedrock-bound Messages body loses each tool's `eager_input_streaming` — first, middle or
     /// last member, any value, an escaped key spelling — and nothing else, byte for byte, with the
     /// spacing as sent. The string elsewhere (a prompt, a tool's description) is not a member of a
-    /// tool and stays; a body without it is untouched (D272).
+    /// tool and stays; a body without it is untouched.
     /// defect: D272
     #[test]
     fn strip_eager_input_streaming_cuts_only_the_tool_field() {
@@ -10026,7 +10025,7 @@ mod tests {
         assert!(v.get("temperature").is_none(), "{v}");
     }
 
-    // ---- Fields that used to vanish ----
+    // ---- Fields that must not vanish ----
 
     fn schema() -> Value {
         json!({
