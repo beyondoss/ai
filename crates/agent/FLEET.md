@@ -135,11 +135,11 @@ killing one mid-drain is the outage the drain exists to avoid.
 ### Job-end callbacks
 
 A sandbox reports that a background job changed state by POSTing a `job_ended` command to the
-session's own address, `/_beyond/agent?session_id=<id>&tenant=<tenant>&keep=<generation>`, with
+session's own address, `/_beyond/agent?session_id=<id>&tenant=<tenant>`, with
 `Authorization: Bearer bjn_v1.…`. The protocol is exec v1.4 ("Sandbox job notify (v1.4)" in
 `src/exec_endpoint.rs`). The callback is a hint: the replica re-reads the job from the sandbox, so a
 callback that is lost, repeated or forged can delay a report but cannot make one wrong. The sandbox
-retries a callback for up to 12 minutes. It stops on `2xx`, on `401`, `403`, `404`, `410`, or on a
+retries a callback for at most 723 s. It stops on `2xx`, on `401`, `403`, `404`, `410`, or on a
 status it cannot fix by repeating itself, and retries `503`.
 
 **The edge attaches, mints and verifies nothing for a callback.** There is no user behind it, and
@@ -150,18 +150,21 @@ answers `200` with `{"listener": false}` and does nothing. Each requirement is t
 and names the check that tests it. A check not written yet is listed, with its task, in
 `tests/fixtures/exec/v1.4-checks.json`.
 
-- **E1** The edge MUST classify a request with exactly the two rules of exec v1.4's N28: a request
+- **E1** The edge MUST classify a request with exactly the two rules of exec v1.4's N21: a request
   is a callback when it has exactly one `Authorization` header and its value is `Bearer` (any case),
   one or more spaces, then `bjn_v1.`; it looks like a callback when any `Authorization` value is
   `bearer` (any case), any run of spaces and tabs, then `bjn_v1.`. A request that looks like a
   callback but is not one (two `Authorization` headers, a tab, no space) MUST be answered `400` and
   never forwarded, as a callback or as a user request. The edge MUST NOT authenticate a callback as
   a user, or use any user credential it carries. It MUST forward a callback only when it is a `POST`
-  to `/_beyond/agent`, and answer any other request bearing such a token `403` itself. (check:
-  fleet-sim `job-ended-classified-exactly`; fixture `v1.4-callback.json`)
-- **E2** The edge MUST forward a callback unchanged, and MUST NOT attach, mint or check anything for
-  it: no session grant, no tenant lookup, no token check. The token is opaque to it. (check:
-  fleet-sim `job-ended-forwarded-unchanged`)
+  to `/_beyond/agent`, and answer any other request bearing such a token `403` itself. It MUST
+  answer `400` itself a callback whose query names `session_id` more than once, so it never routes
+  by a different value than the replica reads. (check: fleet-sim `job-ended-classified-exactly`;
+  fixture `v1.4-callback.json`)
+- **E2** The edge MUST forward a callback unchanged, its `Content-Length` and any
+  `Transfer-Encoding` included, and MUST NOT attach, mint or check anything for it: no session
+  grant, no tenant lookup, no token check. The token is opaque to it. (check: fleet-sim
+  `job-ended-forwarded-unchanged`)
 - **E3** The edge MUST send a callback to the replica its session id hashes to, by Requirements 1
   and 4, and to no other: it MUST NOT walk the ring for a callback (Requirement 2) or retry it on
   another replica, since any replica but the one holding the session answers `{"listener": false}`,
@@ -170,23 +173,23 @@ and names the check that tests it. A check not written yet is listed, with its t
   `job-ended-goes-only-to-the-hashed-replica`)
 - **E4** The edge MUST answer a callback within 25 s, answering `503` when the replica has not
   answered by then, and MUST cancel the request upstream at that point, so the replica stops waiting
-  for it. The sandbox abandons an attempt at 30 s and retries on its own schedule. (check: fleet-sim
-  `job-ended-answers-within-25s`)
+  for it. The replica answers within 20 s on its own (N31), and the sandbox abandons an attempt at
+  30 s. (check: fleet-sim `job-ended-answers-within-25s`)
 - **E5** The edge MUST pass the replica's status back to the sandbox unchanged: `200`, `400`, `401`,
-  `403`, `410`, `411`, `413` and `503` each tell the sandbox whether to try again. (check: fleet-sim
-  `job-ended-status-passes-through`)
+  `403`, `404`, `410`, `411`, `413` and `503` each tell the sandbox whether to try again. (check:
+  fleet-sim `job-ended-status-passes-through`)
 - **E6** The edge MUST forward at most 20 callbacks a second for any one session id, and answer the
   excess `429` itself. (check: fleet-sim `job-ended-rate-limited-per-session`)
 
 The edge SHOULD NOT log the `Authorization` header of a callback, and SHOULD rate-limit callbacks
 per source address. A replica already bounds the work a stream of valid callbacks can cause (one
-reconcile at a time per session, at most one a second), and refuses a forged one before it looks for
-the session.
+reconcile at a time per session, at most one a second, at most 16 callbacks waiting), and refuses a
+forged one before it looks for the session.
 
 A replica that predates v1.4 answers a callback `401`, as it answers any request without a grant,
 and the sandbox stops that notification. That never loses an end: a pre-v1.4 replica holds its own
-jobs' streams, and a v1.4 owner's sweep finds the end of a job whose callback went astray. So the
-edge needs no rollout order.
+jobs' streams, and a v1.4 owner whose callback went astray notices the end at its session's next
+use of the sandbox or next open. So the edge needs no rollout order.
 
 ## Operating a fleet
 

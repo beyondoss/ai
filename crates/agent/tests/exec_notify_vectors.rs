@@ -156,7 +156,12 @@ struct ReceiverCase {
 #[serde(deny_unknown_fields)]
 struct ReceiverRequest {
     method: String,
+    path: String,
+    /// The request target's query, after `?`.
+    query: String,
     authorization: Vec<String>,
+    content_length: Vec<String>,
+    transfer_encoding: Vec<String>,
     body: String,
 }
 
@@ -164,45 +169,67 @@ struct ReceiverRequest {
 #[serde(deny_unknown_fields)]
 struct ReceiverState {
     service_mode: bool,
-    notify_key: bool,
-    /// A session task in this process holds the URL's session for the URL's tenant.
+    /// A session task in this process holds the query's session for the query's tenant.
     open_here: bool,
-    job: JobState,
-    reconcile: Reconcile,
+    /// That session's open reconcile has run.
+    open_reconcile_done: bool,
+    job: Tracking,
+    /// For a proving job: its `keep` with `notify` succeeded.
+    keep_succeeded: bool,
+    /// For a proving job: the callback arrives inside its proof window.
+    in_window: bool,
+    sandbox: Listed,
     run_in_flight: bool,
 }
 
+/// How the session tracks the job the callback names.
 #[derive(Deserialize, PartialEq, Eq, Clone, Copy, Debug)]
 #[serde(rename_all = "snake_case")]
-enum JobState {
-    /// Tracked as released, and still running in the sandbox.
-    Released,
-    /// Ended in the sandbox, its end not yet recorded by the session.
-    EndedUnreported,
-    /// The session holds its stream, and the callback is not its proof.
+enum Tracking {
+    Proving,
+    /// Its stream, a follow, or a tool call in flight has it.
     Held,
-    /// The session has recorded its end.
-    EndReported,
-    /// The session's open reconcile has not run yet.
-    OpenReconcilePending,
+    Released,
+    EndRecorded,
     /// The session neither tracks it nor has recorded its end.
     Untracked,
 }
 
+/// What a `list` of the scope would say of the job.
 #[derive(Deserialize, PartialEq, Eq, Clone, Copy, Debug)]
 #[serde(rename_all = "snake_case")]
-enum Reconcile {
-    Ok,
-    Fails,
+enum Listed {
+    Running,
+    Exited,
+    Ended,
+    Lost,
+    Missing,
+    /// The sandbox cannot be listed.
+    Unreachable,
 }
 
-#[derive(Deserialize)]
+/// What the callback does to the job.
+#[derive(Deserialize, PartialEq, Eq, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+enum Effect {
+    None,
+    /// The stream is closed and a live reconcile started.
+    Release,
+    /// Applied as a held stream's `shell_exit`.
+    ShellExit,
+    /// Today's follow starts.
+    Follow,
+}
+
+#[derive(Deserialize, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
 struct ReceiverExpect {
     status: u16,
     /// A `200`'s `data.listener`: whether a session task in this process took the callback.
     listener: Option<bool>,
-    contacts_sandbox: bool,
+    /// The answer waits for a live reconcile's `list`.
+    answer_waits_for_list: bool,
+    effect: Effect,
 }
 
 #[derive(Deserialize)]
@@ -211,6 +238,7 @@ struct EdgeCase {
     name: String,
     method: String,
     path: String,
+    query: String,
     authorization: Vec<String>,
     expect: EdgeExpect,
     covers: Vec<String>,
@@ -599,11 +627,11 @@ fn the_callback_body_is_exactly_type_scope_and_id() {
         "the keep's scope is the url's session's"
     );
     assert!(
-        c.keep.url.contains(&format!(
-            "session_id={}&tenant={}&keep=",
+        c.keep.url.ends_with(&format!(
+            "/_beyond/agent?session_id={}&tenant={}",
             c.url_session.session_id, c.url_session.tenant
         )),
-        "the url names the session and the tenant, then the generation"
+        "the url names the session and the tenant, and nothing else"
     );
     for r in &c.requests {
         assert_eq!(r.method, "POST", "{}", r.name);
@@ -618,18 +646,24 @@ fn the_callback_body_is_exactly_type_scope_and_id() {
             r.headers.get("Content-Type").map(String::as_str),
             Some("application/json")
         );
-        assert_eq!(r.forbidden_headers, ["Cookie"]);
+        assert_eq!(
+            r.headers.get("Content-Length").map(String::as_str),
+            Some(r.body.len().to_string().as_str()),
+            "{}: the sender sends Content-Length",
+            r.name
+        );
+        assert_eq!(r.forbidden_headers, ["Cookie", "Transfer-Encoding"]);
     }
 }
 
 // ---- the receiver and the edge, from the spec's own rules
 
-/// A header value as N28 reads it: leading and trailing spaces and tabs removed.
+/// A header value as N21 reads it: leading and trailing spaces and tabs removed.
 fn ows(v: &str) -> &str {
     v.trim_matches([' ', '\t'])
 }
 
-/// N28's first rule: exactly one `Authorization` header, `Bearer` in any case, one or more spaces,
+/// N21's first rule: exactly one `Authorization` header, `Bearer` in any case, one or more spaces,
 /// then `bjn_v1.`. The token, when the request is a callback.
 fn callback_token(auth: &[String]) -> Option<&str> {
     let [one] = auth else { return None };
@@ -643,7 +677,7 @@ fn callback_token(auth: &[String]) -> Option<&str> {
     token.starts_with("bjn_v1.").then_some(token)
 }
 
-/// N28's second rule: any `Authorization` value that is `bearer` in any case, any run of spaces and
+/// N21's second rule: any `Authorization` value that is `bearer` in any case, any run of spaces and
 /// tabs, then `bjn_v1.`.
 fn looks_like_callback(auth: &[String]) -> bool {
     auth.iter().any(|v| {
@@ -660,18 +694,39 @@ fn is_job_id(id: &str) -> bool {
     (1..=32).contains(&id.len()) && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// The receiver of N30, step by step, then N31, N38 and N40 for a callback that passes them all:
-/// the status, a `200`'s `data.listener`, and whether the sandbox is contacted. Nothing here can
-/// open a session, because a callback never does (N31).
-fn reference_receiver(
-    keys: &[([u8; 32], String)],
-    session: &UrlSession,
-    case: &ReceiverCase,
-) -> (u16, Option<bool>, bool) {
+/// N23 step 2: the query's `session_id` and `tenant`, each exactly once and non-empty.
+fn query_session(query: &str) -> Option<UrlSession> {
+    let (mut session, mut tenant) = (Vec::new(), Vec::new());
+    for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+        match k.as_ref() {
+            "session_id" => session.push(v.into_owned()),
+            "tenant" => tenant.push(v.into_owned()),
+            _ => {}
+        }
+    }
+    match (session.as_slice(), tenant.as_slice()) {
+        ([s], [t]) if !s.is_empty() && !t.is_empty() => Some(UrlSession {
+            tenant: t.clone(),
+            session_id: s.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// The receiver of N21 and N23, step by step, then N24, N31, N32 and the release row for a
+/// callback that passes them all. Nothing here can open a session, because a callback never does
+/// (N24).
+fn reference_receiver(keys: &[([u8; 32], String)], case: &ReceiverCase) -> ReceiverExpect {
     let rq = &case.request;
     let st = &case.state;
-    let refuse = |status| (status, None, false);
-    // N28: what is a callback; a look-alike is refused, and job_ended outside a callback too (N29).
+    let refuse = |status| ReceiverExpect {
+        status,
+        listener: None,
+        answer_waits_for_list: false,
+        effect: Effect::None,
+    };
+    // N21: what is a callback, from the head alone; a look-alike is refused before anything else,
+    // and job_ended outside a callback too (N22).
     let Some(token) = callback_token(&rq.authorization) else {
         return refuse(if looks_like_callback(&rq.authorization) {
             400
@@ -680,10 +735,30 @@ fn reference_receiver(
         });
     };
     // Step 1.
+    if rq.path != "/_beyond/agent" {
+        return refuse(404);
+    }
     if rq.method != "POST" {
         return refuse(403);
     }
-    // Step 3 (the url, step 2, is the fixture's own and well formed).
+    // Step 2.
+    let Some(session) = query_session(&rq.query) else {
+        return refuse(400);
+    };
+    // Step 3.
+    match (
+        rq.content_length.as_slice(),
+        rq.transfer_encoding.is_empty(),
+    ) {
+        ([], true) => return refuse(411),
+        ([n], true) => assert_eq!(
+            n.parse::<usize>().ok(),
+            Some(rq.body.len()),
+            "{}: a case's Content-Length is its body's",
+            case.name
+        ),
+        _ => return refuse(400),
+    }
     if rq.body.len() > 4096 {
         return refuse(413);
     }
@@ -706,9 +781,6 @@ fn reference_receiver(
     if !st.service_mode {
         return refuse(403);
     }
-    if !st.notify_key {
-        return refuse(503);
-    }
     // Step 5.
     let cx = Context {
         tenant: session.tenant.clone(),
@@ -725,18 +797,39 @@ fn reference_receiver(
     if scope != scope_of(&session.tenant, &session.session_id) {
         return refuse(403);
     }
-    // N31: nobody here holds the session, so nothing happens.
+    let answer = |listener, waits, effect| ReceiverExpect {
+        status: 200,
+        listener: Some(listener),
+        answer_waits_for_list: waits,
+        effect,
+    };
+    // N24: nobody here holds the session, so nothing happens.
     if !st.open_here {
-        return (200, Some(false), false);
+        return answer(false, false, Effect::None);
+    }
+    // N32: answered without contacting the sandbox.
+    if !st.open_reconcile_done {
+        return answer(true, false, Effect::None);
     }
     match st.job {
-        JobState::EndReported | JobState::Held | JobState::OpenReconcilePending => {
-            (200, Some(true), false)
+        Tracking::Held | Tracking::EndRecorded => answer(true, false, Effect::None),
+        Tracking::Untracked => refuse(410),
+        // The release row (N38): it waits for no list; the release starts a live reconcile.
+        Tracking::Proving if st.in_window && st.keep_succeeded => {
+            answer(true, false, Effect::Release)
         }
-        JobState::Untracked => (410, None, false),
-        JobState::Released | JobState::EndedUnreported => match st.reconcile {
-            Reconcile::Ok => (200, Some(true), true),
-            Reconcile::Fails => (503, None, true),
+        Tracking::Proving => answer(true, false, Effect::None),
+        // N31 and the `released` rows.
+        Tracking::Released => match st.sandbox {
+            Listed::Running => answer(true, true, Effect::None),
+            Listed::Exited => answer(true, true, Effect::ShellExit),
+            Listed::Ended | Listed::Lost | Listed::Missing => answer(true, true, Effect::Follow),
+            Listed::Unreachable => ReceiverExpect {
+                status: 503,
+                listener: None,
+                answer_waits_for_list: true,
+                effect: Effect::Follow,
+            },
         },
     }
 }
@@ -746,30 +839,36 @@ fn receiver_cases_follow_from_the_spec() {
     let c = callback();
     let keys = verifier_keys(&token());
     let mut statuses = BTreeSet::new();
+    let mut effects = BTreeSet::new();
     for case in &c.receiver {
-        let e = &case.expect;
         assert_eq!(
-            reference_receiver(&keys, &c.url_session, case),
-            (e.status, e.listener, e.contacts_sandbox),
+            reference_receiver(&keys, case),
+            case.expect,
             "{}",
             case.name
         );
         if case.state.run_in_flight {
-            assert_eq!(e.status, 200, "{}: served during a run", case.name);
+            assert_eq!(
+                case.expect.status, 200,
+                "{}: served during a run",
+                case.name
+            );
         }
-        statuses.insert(e.status);
+        statuses.insert(case.expect.status);
+        effects.insert(format!("{:?}", case.expect.effect));
     }
-    for want in [200, 400, 401, 403, 410, 413, 503] {
+    for want in [200, 400, 401, 403, 404, 410, 411, 413, 503] {
         assert!(statuses.contains(&want), "no receiver case answers {want}");
     }
+    assert_eq!(effects.len(), 4, "a case for every effect");
     assert!(
         c.receiver.iter().any(|x| x.expect.listener == Some(false)),
         "a case where no session here takes the callback"
     );
 }
 
-/// E1, with N28's rules: how the edge treats a request by its `Authorization` values. It checks
-/// nothing else about a callback (E2).
+/// E1, with N21's rules: how the edge treats a request by its `Authorization` values, and for a
+/// callback its method, path and `session_id`. It checks nothing else about a callback (E2).
 fn reference_edge(case: &EdgeCase) -> EdgeExpect {
     let refused = |status| EdgeExpect {
         class: EdgeClass::Refused,
@@ -786,6 +885,12 @@ fn reference_edge(case: &EdgeCase) -> EdgeExpect {
     }
     if case.method != "POST" || case.path != "/_beyond/agent" {
         return refused(403);
+    }
+    let session_ids = url::form_urlencoded::parse(case.query.as_bytes())
+        .filter(|(k, _)| k == "session_id")
+        .count();
+    if session_ids > 1 {
+        return refused(400);
     }
     EdgeExpect {
         class: EdgeClass::Callback,
@@ -855,7 +960,7 @@ fn mac_input(
 }
 
 /// The spec's verifier, written from the spec alone: the reference the vectors are held to.
-/// N58: the kid and the tag of a token that is exactly the grammar, else `None` (malformed).
+/// N46: the kid and the tag of a token that is exactly the grammar, else `None` (malformed).
 fn parse_token(token: &str) -> Option<(&str, Vec<u8>)> {
     let parts: Vec<&str> = token.split('.').collect();
     let [prefix, kid, mac] = parts.as_slice() else {

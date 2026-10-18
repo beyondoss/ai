@@ -1,243 +1,570 @@
 {
   "spec": "exec protocol v1.4 sandbox job notify (crates/agent/src/exec_endpoint.rs, \"Sandbox job notify (v1.4)\"), \"The callback request\" and \"The receiver\"",
   "notes": [
-    "requests: what an endpoint sends for a job kept with notify. body is the exact bytes; headers lists every header the endpoint must send (others the HTTP client adds, such as Host and Content-Length, are not listed, and a Cookie header is forbidden).",
-    "receiver: one request to keep.url, which names url_session's tenant and session id. It carries no session grant. request.authorization lists its Authorization header values, in order (empty: none). state is what the replica holds: service_mode, notify_key (it holds the verifier keys of v1.4-token.json), open_here (a session task in this process holds that session for that tenant), job (released: the session tracks it released and the sandbox still runs it; ended_unreported: the sandbox has it ended and the session has not recorded its end; held: the session holds its stream and the callback is not its proof; end_reported: the session has recorded its end; open_reconcile_pending: the session's open reconcile has not run yet; untracked: the session neither tracks the job nor has recorded its end), reconcile (ok, or fails: the sandbox cannot be listed), run_in_flight (a run holds the session). expect: the HTTP status, the response's data.listener on a 200, and whether anything is sent to the sandbox. No case opens a session: a callback never does.",
-    "edge: how the edge classifies a request by its Authorization header values (E1, with the rules of N28): callback (forwarded unchanged to the hashed replica), user (handled as any user request), or refused with status, never forwarded."
+    "requests: what an endpoint sends for a job kept with notify. body is the exact bytes; headers lists every header the endpoint must send, Content-Length included (others the HTTP client adds, such as Host, are not listed); forbidden_headers must not be sent.",
+    "receiver: one request to the replica. request: method, path, query (the part after ?), authorization (its Authorization header values, in order; empty: none), content_length and transfer_encoding (the values of those headers, in order) and body. It carries no session grant. state: service_mode; open_here (a session task in this process holds the query's session for its tenant); open_reconcile_done (that session's open reconcile has run); job (proving, held, released, end_recorded or untracked: how the session tracks the job, a job a tool call has counting as held); keep_succeeded and in_window (for a proving job: its keep with notify succeeded, and the callback arrives inside its proof window); sandbox (what a list of the scope would say of the job: running, exited, ended, lost, missing, or unreachable when the sandbox cannot be listed); run_in_flight. expect: the HTTP status, a 200's data.listener, whether the answer waits for a live reconcile's list (answer_waits_for_list), and the effect on the job (none; release: the stream is closed and a live reconcile started; shell_exit: applied as a held stream's; follow: today's follow starts). No case opens a session: a callback never does.",
+    "edge: how the edge classifies a request by its method, path, query and Authorization values (E1, with the rules of N21): callback (forwarded unchanged to the hashed replica), user (handled as any user request), or refused with status, never forwarded."
   ],
   "keep": {
     "scope": "2ff302a37e7401aa95f92ec6c431944a",
     "id": "0123456789abcdef",
-    "url": "https://edge.example/_beyond/agent?session_id=a07-s3.01J9ZQ4N6V&tenant=acme&keep=5be0c2a19f3d7e41",
+    "url": "https://edge.example/_beyond/agent?session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
     "token": "bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
   },
   "requests": [
     {
       "name": "every attempt, whatever the job's state",
       "method": "POST",
-      "url": "https://edge.example/_beyond/agent?session_id=a07-s3.01J9ZQ4N6V&tenant=acme&keep=5be0c2a19f3d7e41",
+      "url": "https://edge.example/_beyond/agent?session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
       "headers": {
         "Content-Type": "application/json",
-        "Authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        "Authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "Content-Length": "87"
       },
       "forbidden_headers": [
-        "Cookie"
+        "Cookie",
+        "Transfer-Encoding"
       ],
       "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}",
       "max_body_bytes": 512,
       "covers": [
         "N7",
-        "N18"
+        "N14"
       ]
     }
   ],
   "receiver": [
     {
-      "name": "a verified callback for a released running job: a live reconcile, then 200",
+      "name": "a verified callback for a released running job: the answer waits for the list, then 200",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 200,
         "listener": true,
-        "contacts_sandbox": true
+        "answer_waits_for_list": true,
+        "effect": "none"
       },
       "covers": [
-        "N30",
-        "N38",
-        "N41"
+        "N23",
+        "N28",
+        "N31"
       ]
     },
     {
       "name": "the same while a run is in flight: served, never busy",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": true
       },
       "expect": {
         "status": 200,
         "listener": true,
-        "contacts_sandbox": true
+        "answer_waits_for_list": true,
+        "effect": "none"
       },
       "covers": [
-        "N33",
-        "N38"
+        "N26",
+        "N31"
       ]
     },
     {
-      "name": "a released job that ended and is not reported yet",
+      "name": "a released job listed exited: applied as a stream's shell_exit",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
-        "job": "ended_unreported",
-        "reconcile": "ok",
+        "open_reconcile_done": true,
+        "job": "released",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "exited",
         "run_in_flight": false
       },
       "expect": {
         "status": 200,
         "listener": true,
-        "contacts_sandbox": true
+        "answer_waits_for_list": true,
+        "effect": "shell_exit"
       },
       "covers": [
-        "N38"
+        "N31",
+        "N33"
+      ]
+    },
+    {
+      "name": "a released job listed ended: today's follow reads it to its end",
+      "request": {
+        "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "service_mode": true,
+        "open_here": true,
+        "open_reconcile_done": true,
+        "job": "released",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "ended",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 200,
+        "listener": true,
+        "answer_waits_for_list": true,
+        "effect": "follow"
+      },
+      "covers": [
+        "N31",
+        "N33"
+      ]
+    },
+    {
+      "name": "a released job listed lost: today's follow",
+      "request": {
+        "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "service_mode": true,
+        "open_here": true,
+        "open_reconcile_done": true,
+        "job": "released",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "lost",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 200,
+        "listener": true,
+        "answer_waits_for_list": true,
+        "effect": "follow"
+      },
+      "covers": [
+        "N31",
+        "N33"
+      ]
+    },
+    {
+      "name": "a released job missing from the listing: today's follow",
+      "request": {
+        "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "service_mode": true,
+        "open_here": true,
+        "open_reconcile_done": true,
+        "job": "released",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "missing",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 200,
+        "listener": true,
+        "answer_waits_for_list": true,
+        "effect": "follow"
+      },
+      "covers": [
+        "N31",
+        "N33"
+      ]
+    },
+    {
+      "name": "the sandbox cannot be listed: 503, and the released job is followed as today",
+      "request": {
+        "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "service_mode": true,
+        "open_here": true,
+        "open_reconcile_done": true,
+        "job": "released",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "unreachable",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 503,
+        "listener": null,
+        "answer_waits_for_list": true,
+        "effect": "follow"
+      },
+      "covers": [
+        "N31"
       ]
     },
     {
       "name": "a repeat for a job whose end the session has recorded",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
-        "job": "end_reported",
-        "reconcile": "ok",
+        "open_reconcile_done": true,
+        "job": "end_recorded",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 200,
         "listener": true,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N40"
+        "N32"
       ]
     },
     {
-      "name": "a callback for a job the session holds a stream to, not its proof",
+      "name": "a callback for a held job (its stream, a follow, or a tool call has it)",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "held",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 200,
         "listener": true,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N40"
+        "N32"
       ]
     },
     {
       "name": "a session whose open reconcile has not run yet",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
-        "job": "open_reconcile_pending",
-        "reconcile": "ok",
+        "open_reconcile_done": false,
+        "job": "released",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 200,
         "listener": true,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N40"
+        "N32"
       ]
     },
     {
       "name": "a job the session neither tracks nor has recorded",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "untracked",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 410,
         "listener": null,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N38"
+        "N32"
       ]
     },
     {
-      "name": "the reconcile cannot list the sandbox",
+      "name": "the proof: a proving job, keep succeeded, inside the window: released at once, no list waited for",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
-        "job": "released",
-        "reconcile": "fails",
+        "open_reconcile_done": true,
+        "job": "proving",
+        "keep_succeeded": true,
+        "in_window": true,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
-        "status": 503,
-        "listener": null,
-        "contacts_sandbox": true
+        "status": 200,
+        "listener": true,
+        "answer_waits_for_list": false,
+        "effect": "release"
+      },
+      "covers": [
+        "N32",
+        "N38"
+      ]
+    },
+    {
+      "name": "a proof that overtakes keep's answer: answered, released only once keep succeeds",
+      "request": {
+        "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "service_mode": true,
+        "open_here": true,
+        "open_reconcile_done": true,
+        "job": "proving",
+        "keep_succeeded": false,
+        "in_window": true,
+        "sandbox": "running",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 200,
+        "listener": true,
+        "answer_waits_for_list": false,
+        "effect": "none"
+      },
+      "covers": [
+        "N32",
+        "N38",
+        "N40"
+      ]
+    },
+    {
+      "name": "a callback for a proving job after its window: a hint only",
+      "request": {
+        "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "service_mode": true,
+        "open_here": true,
+        "open_reconcile_done": true,
+        "job": "proving",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 200,
+        "listener": true,
+        "answer_waits_for_list": false,
+        "effect": "none"
+      },
+      "covers": [
+        "N32",
+        "N38"
+      ]
+    },
+    {
+      "name": "a proof while the sandbox cannot be listed: it contacts nothing, so it still releases",
+      "request": {
+        "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "service_mode": true,
+        "open_here": true,
+        "open_reconcile_done": true,
+        "job": "proving",
+        "keep_succeeded": true,
+        "in_window": true,
+        "sandbox": "unreachable",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 200,
+        "listener": true,
+        "answer_waits_for_list": false,
+        "effect": "release"
       },
       "covers": [
         "N38"
@@ -247,580 +574,1092 @@
       "name": "the session is not open in this process: no listener, nothing opened",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": false,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 200,
         "listener": false,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N31"
+        "N24"
       ]
     },
     {
       "name": "a forged token for a session not open here is refused all the same",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.BdTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": false,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 401,
         "listener": null,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N30",
-        "N31"
+        "N23",
+        "N24"
       ]
     },
     {
       "name": "job_ended without a callback's Authorization",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 403,
         "listener": null,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N29"
+        "N22"
       ]
     },
     {
       "name": "a callback on another command",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "32"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"prompt\",\"message\":\"hi\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 403,
         "listener": null,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N29",
-        "N30"
+        "N22",
+        "N23"
       ]
     },
     {
       "name": "a callback on a GET (a WebSocket upgrade)",
       "request": {
         "method": "GET",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [],
+        "transfer_encoding": [],
         "body": ""
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 403,
         "listener": null,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N30"
+        "N23"
+      ]
+    },
+    {
+      "name": "a callback to another path: 404, as today",
+      "request": {
+        "method": "POST",
+        "path": "/_beyond/other",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "service_mode": true,
+        "open_here": true,
+        "open_reconcile_done": true,
+        "job": "released",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 404,
+        "listener": null,
+        "answer_waits_for_list": false,
+        "effect": "none"
+      },
+      "covers": [
+        "N23"
+      ]
+    },
+    {
+      "name": "session_id twice in the query",
+      "request": {
+        "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&session_id=other&tenant=acme",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "service_mode": true,
+        "open_here": true,
+        "open_reconcile_done": true,
+        "job": "released",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 400,
+        "listener": null,
+        "answer_waits_for_list": false,
+        "effect": "none"
+      },
+      "covers": [
+        "N23"
+      ]
+    },
+    {
+      "name": "tenant twice in the query",
+      "request": {
+        "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme&tenant=acme",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "service_mode": true,
+        "open_here": true,
+        "open_reconcile_done": true,
+        "job": "released",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 400,
+        "listener": null,
+        "answer_waits_for_list": false,
+        "effect": "none"
+      },
+      "covers": [
+        "N23"
+      ]
+    },
+    {
+      "name": "no tenant in the query",
+      "request": {
+        "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "service_mode": true,
+        "open_here": true,
+        "open_reconcile_done": true,
+        "job": "released",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 400,
+        "listener": null,
+        "answer_waits_for_list": false,
+        "effect": "none"
+      },
+      "covers": [
+        "N23"
+      ]
+    },
+    {
+      "name": "an unknown query parameter is ignored",
+      "request": {
+        "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme&keep=5be0c2a19f3d7e41",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "service_mode": true,
+        "open_here": true,
+        "open_reconcile_done": true,
+        "job": "released",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 200,
+        "listener": true,
+        "answer_waits_for_list": true,
+        "effect": "none"
+      },
+      "covers": [
+        "N23"
+      ]
+    },
+    {
+      "name": "no Content-Length",
+      "request": {
+        "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "content_length": [],
+        "transfer_encoding": [],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "service_mode": true,
+        "open_here": true,
+        "open_reconcile_done": true,
+        "job": "released",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 411,
+        "listener": null,
+        "answer_waits_for_list": false,
+        "effect": "none"
+      },
+      "covers": [
+        "N23"
+      ]
+    },
+    {
+      "name": "two Content-Length headers",
+      "request": {
+        "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "content_length": [
+          "87",
+          "87"
+        ],
+        "transfer_encoding": [],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "service_mode": true,
+        "open_here": true,
+        "open_reconcile_done": true,
+        "job": "released",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 400,
+        "listener": null,
+        "answer_waits_for_list": false,
+        "effect": "none"
+      },
+      "covers": [
+        "N23"
+      ]
+    },
+    {
+      "name": "a Transfer-Encoding",
+      "request": {
+        "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "content_length": [],
+        "transfer_encoding": [
+          "chunked"
+        ],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "service_mode": true,
+        "open_here": true,
+        "open_reconcile_done": true,
+        "job": "released",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 400,
+        "listener": null,
+        "answer_waits_for_list": false,
+        "effect": "none"
+      },
+      "covers": [
+        "N23"
+      ]
+    },
+    {
+      "name": "a Content-Length and a Transfer-Encoding",
+      "request": {
+        "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [
+          "chunked"
+        ],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "service_mode": true,
+        "open_here": true,
+        "open_reconcile_done": true,
+        "job": "released",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 400,
+        "listener": null,
+        "answer_waits_for_list": false,
+        "effect": "none"
+      },
+      "covers": [
+        "N23"
       ]
     },
     {
       "name": "the scheme in lower case",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 200,
         "listener": true,
-        "contacts_sandbox": true
+        "answer_waits_for_list": true,
+        "effect": "none"
       },
       "covers": [
-        "N28"
+        "N21"
       ]
     },
     {
       "name": "two spaces after the scheme",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer  bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 200,
         "listener": true,
-        "contacts_sandbox": true
+        "answer_waits_for_list": true,
+        "effect": "none"
       },
       "covers": [
-        "N28"
+        "N21"
       ]
     },
     {
       "name": "spaces around the value are not part of it",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           " Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg "
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 200,
         "listener": true,
-        "contacts_sandbox": true
+        "answer_waits_for_list": true,
+        "effect": "none"
       },
       "covers": [
-        "N28"
+        "N21"
       ]
     },
     {
       "name": "a tab after the scheme",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer\tbjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 400,
         "listener": null,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N28"
+        "N21"
       ]
     },
     {
       "name": "no space after the scheme",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearerbjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 400,
         "listener": null,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N28"
+        "N21"
       ]
     },
     {
       "name": "two Authorization headers",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
           "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 400,
         "listener": null,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N28"
+        "N21"
+      ]
+    },
+    {
+      "name": "a look-alike is refused before its Content-Length is read",
+      "request": {
+        "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
+        "authorization": [
+          "Bearer\tbjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "content_length": [
+          "x"
+        ],
+        "transfer_encoding": [],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "service_mode": true,
+        "open_here": true,
+        "open_reconcile_done": true,
+        "job": "released",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 400,
+        "listener": null,
+        "answer_waits_for_list": false,
+        "effect": "none"
+      },
+      "covers": [
+        "N21",
+        "N25"
       ]
     },
     {
       "name": "outside service mode",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "service_mode": false,
-        "notify_key": false,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 403,
         "listener": null,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N29",
-        "N30"
-      ]
-    },
-    {
-      "name": "a replica with no notify key",
-      "request": {
-        "method": "POST",
-        "authorization": [
-          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
-        ],
-        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
-      },
-      "state": {
-        "service_mode": true,
-        "notify_key": false,
-        "open_here": true,
-        "job": "released",
-        "reconcile": "ok",
-        "run_in_flight": false
-      },
-      "expect": {
-        "status": 503,
-        "listener": null,
-        "contacts_sandbox": false
-      },
-      "covers": [
-        "N29",
-        "N30"
+        "N22",
+        "N23"
       ]
     },
     {
       "name": "a body over 4096 bytes",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "5096"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\",\"pad\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 413,
         "listener": null,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N30"
+        "N23"
       ]
     },
     {
       "name": "a body with a fourth member",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "103"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\",\"state\":\"ended\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 400,
         "listener": null,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N30"
+        "N23"
       ]
     },
     {
       "name": "a body without id",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "63"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 400,
         "listener": null,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N30"
+        "N23"
       ]
     },
     {
       "name": "an id that is not a v1.3 job id",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789ABCDEF\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 400,
         "listener": null,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N30"
+        "N23"
       ]
     },
     {
       "name": "a body that is not JSON",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "14"
+        ],
+        "transfer_encoding": [],
         "body": "type=job_ended"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 400,
         "listener": null,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N30"
+        "N23"
       ]
     },
     {
       "name": "a tampered token",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.BdTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 401,
         "listener": null,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N30",
-        "N58",
-        "N63"
+        "N23",
+        "N46",
+        "N50"
       ]
     },
     {
       "name": "another job's body under this job's token",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"fedcba9876543210\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 401,
         "listener": null,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N30",
-        "N59",
-        "N63"
+        "N23",
+        "N47",
+        "N50"
       ]
     },
     {
-      "name": "a token under a key this replica does not hold: retried, never stopped",
+      "name": "a token under a seal secret this replica does not hold: retried, never stopped",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.e4478834.BRCVCT0I1FP9VySNf8TtfSGz7V_2Zb1BFclygpPeFXY"
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 503,
         "listener": null,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N30",
-        "N63"
+        "N23",
+        "N50"
       ]
     },
     {
       "name": "a token that verifies for a scope that is not the session's",
       "request": {
         "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
         "authorization": [
           "Bearer bjn_v1.4eba5aa3.GlqcqfqPV-eIYD_8hmnN2vkAlIS32fC52N22YsAQp0c"
         ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
         "body": "{\"type\":\"job_ended\",\"scope\":\"fbc971f011ddc0a8be2112840519b253\",\"id\":\"0123456789abcdef\"}"
       },
       "state": {
         "service_mode": true,
-        "notify_key": true,
         "open_here": true,
+        "open_reconcile_done": true,
         "job": "released",
-        "reconcile": "ok",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
         "status": 403,
         "listener": null,
-        "contacts_sandbox": false
+        "answer_waits_for_list": false,
+        "effect": "none"
       },
       "covers": [
-        "N30"
+        "N23"
       ]
     }
   ],
@@ -829,6 +1668,7 @@
       "name": "edge: a callback",
       "method": "POST",
       "path": "/_beyond/agent",
+      "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
       "authorization": [
         "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
       ],
@@ -838,13 +1678,14 @@
       },
       "covers": [
         "E1",
-        "N28"
+        "N21"
       ]
     },
     {
       "name": "edge: the scheme in any case",
       "method": "POST",
       "path": "/_beyond/agent",
+      "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
       "authorization": [
         "bEaReR bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
       ],
@@ -854,13 +1695,14 @@
       },
       "covers": [
         "E1",
-        "N28"
+        "N21"
       ]
     },
     {
       "name": "edge: more than one space",
       "method": "POST",
       "path": "/_beyond/agent",
+      "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
       "authorization": [
         "Bearer   bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
       ],
@@ -870,13 +1712,14 @@
       },
       "covers": [
         "E1",
-        "N28"
+        "N21"
       ]
     },
     {
       "name": "edge: a tab after the scheme",
       "method": "POST",
       "path": "/_beyond/agent",
+      "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
       "authorization": [
         "Bearer\tbjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
       ],
@@ -886,13 +1729,14 @@
       },
       "covers": [
         "E1",
-        "N28"
+        "N21"
       ]
     },
     {
       "name": "edge: no space after the scheme",
       "method": "POST",
       "path": "/_beyond/agent",
+      "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
       "authorization": [
         "Bearerbjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
       ],
@@ -902,13 +1746,14 @@
       },
       "covers": [
         "E1",
-        "N28"
+        "N21"
       ]
     },
     {
       "name": "edge: two callback headers",
       "method": "POST",
       "path": "/_beyond/agent",
+      "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
       "authorization": [
         "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
         "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
@@ -919,13 +1764,14 @@
       },
       "covers": [
         "E1",
-        "N28"
+        "N21"
       ]
     },
     {
       "name": "edge: a user's bearer and a callback's",
       "method": "POST",
       "path": "/_beyond/agent",
+      "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
       "authorization": [
         "Bearer user-credential",
         "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
@@ -936,13 +1782,14 @@
       },
       "covers": [
         "E1",
-        "N28"
+        "N21"
       ]
     },
     {
       "name": "edge: a user's bearer token",
       "method": "POST",
       "path": "/_beyond/agent",
+      "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
       "authorization": [
         "Bearer user-credential"
       ],
@@ -958,6 +1805,7 @@
       "name": "edge: no Authorization",
       "method": "POST",
       "path": "/_beyond/agent",
+      "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
       "authorization": [],
       "expect": {
         "class": "user",
@@ -971,6 +1819,7 @@
       "name": "edge: another scheme",
       "method": "POST",
       "path": "/_beyond/agent",
+      "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
       "authorization": [
         "Basic dXNlcjpwdw=="
       ],
@@ -986,6 +1835,7 @@
       "name": "edge: a token of another version",
       "method": "POST",
       "path": "/_beyond/agent",
+      "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
       "authorization": [
         "Bearer bjn_v2.4eba5aa3.x"
       ],
@@ -1001,6 +1851,7 @@
       "name": "edge: a callback that is not a POST",
       "method": "GET",
       "path": "/_beyond/agent",
+      "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
       "authorization": [
         "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
       ],
@@ -1016,12 +1867,45 @@
       "name": "edge: a callback to another path",
       "method": "POST",
       "path": "/_beyond/other",
+      "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
       "authorization": [
         "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
       ],
       "expect": {
         "class": "refused",
         "status": 403
+      },
+      "covers": [
+        "E1"
+      ]
+    },
+    {
+      "name": "edge: session_id twice in a callback's query",
+      "method": "POST",
+      "path": "/_beyond/agent",
+      "query": "session_id=a&session_id=b&tenant=acme",
+      "authorization": [
+        "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+      ],
+      "expect": {
+        "class": "refused",
+        "status": 400
+      },
+      "covers": [
+        "E1"
+      ]
+    },
+    {
+      "name": "edge: a user request's query is not the callback rule's concern",
+      "method": "POST",
+      "path": "/_beyond/agent",
+      "query": "session_id=a&session_id=b",
+      "authorization": [
+        "Bearer user-credential"
+      ],
+      "expect": {
+        "class": "user",
+        "status": null
       },
       "covers": [
         "E1"
