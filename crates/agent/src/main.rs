@@ -3540,6 +3540,9 @@ struct TextOut {
     pending: String,
     /// Whether anything of the current attempt reached the terminal (gates the separator).
     shown: bool,
+    /// The last thing written was a tool marker or its streamed arguments, which carry no trailing
+    /// newline; the next model text must start on a fresh line.
+    after_tool: bool,
 }
 
 impl TextOut {
@@ -3548,7 +3551,35 @@ impl TextOut {
             live,
             pending: String::new(),
             shown: false,
+            after_tool: false,
         }
+    }
+
+    /// Model text. Starts on its own line when it follows a tool marker.
+    fn write_text(
+        &mut self,
+        text: &str,
+        cancel: &agent_core::CancellationToken,
+        broken_pipe: &AtomicBool,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        if std::mem::take(&mut self.after_tool) {
+            self.write("\n", cancel, broken_pipe);
+        }
+        self.write(text, cancel, broken_pipe);
+    }
+
+    /// A tool marker or its argument fragments: leaves the line open.
+    fn write_tool(
+        &mut self,
+        text: &str,
+        cancel: &agent_core::CancellationToken,
+        broken_pipe: &AtomicBool,
+    ) {
+        self.after_tool = true;
+        self.write(text, cancel, broken_pipe);
     }
 
     fn write(
@@ -3581,6 +3612,7 @@ impl TextOut {
         broken_pipe: &AtomicBool,
     ) {
         self.pending.clear();
+        self.after_tool = false;
         if std::mem::take(&mut self.shown) {
             write_stdout_or_exit(RETRY_SEPARATOR, cancel, broken_pipe);
         }
@@ -3750,17 +3782,17 @@ async fn run_turn_once(
                     };
                     match ev {
                         StreamEvent::TextDelta { text, .. } => {
-                            text_out.write(text, cancel, broken_pipe);
+                            text_out.write_text(text, cancel, broken_pipe);
                         }
                         StreamEvent::ToolUseStart { name, .. } => {
                             // No trailing newline: `InputJsonDelta` fragments print immediately after, live,
                             // on this same line — a growing preview of the call's arguments as they stream
                             // in, rather than the model appearing to hang until the whole call (and its
                             // result) land.
-                            text_out.write(&format!("\n[tool: {name}] "), cancel, broken_pipe);
+                            text_out.write_tool(&format!("\n[tool: {name}] "), cancel, broken_pipe);
                         }
                         StreamEvent::InputJsonDelta { partial_json, .. } => {
-                            text_out.write(partial_json, cancel, broken_pipe);
+                            text_out.write_tool(partial_json, cancel, broken_pipe);
                         }
                         StreamEvent::MessageStop { stop_reason: r } => {
                             stop_reason = *r;
