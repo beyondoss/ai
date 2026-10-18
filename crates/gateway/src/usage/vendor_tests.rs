@@ -198,3 +198,247 @@ fn a_cache_entry_does_not_replay_the_upstream_call() {
     assert_eq!(u.upstream, Upstream::default());
     assert_eq!(u.input_tokens, 3);
 }
+
+/// The typed facts the gateway prices from ([`Usage::pricer_row`]) price exactly as the row's
+/// logged text did when the pricer read that text back: `server_tools` through
+/// [`ServerTools::to_row`] and `ToolCounts::parse`, the reported costs through [`e10_to_usd`] and
+/// `parse_usd_atto`, the tiers from their logged strings. Across every catalog row and candidate,
+/// both wires, and a corpus of every tool kind (alone, at one and at its largest count, all at
+/// once), costs from zero to `u64::MAX`, and every tier, speed and geo spelling, known and not,
+/// the two give the same `Result`, refusal reason included. (`providers::pricing`'s
+/// `typed_tiers_decide_as_the_text_did` holds the typed tier readings to the old text matching.)
+#[test]
+fn pricer_row_prices_as_the_logged_text() {
+    use providers::pricing::{Geo, Speed, Tier, ToolCounts, UsageRow, parse_usd_atto, price};
+
+    const SPELLINGS: &[&str] = &[
+        "default",
+        "standard",
+        "on_demand",
+        "auto",
+        "priority",
+        "fast",
+        "ultrafast",
+        "flex",
+        "scale",
+        "global",
+        "us",
+        "not_available",
+        "eu",
+    ];
+    let tier = |s: &str| Some(tier_from(s).unwrap());
+
+    let mut facts = vec![Usage::default()];
+    let mut every = ServerTools::default();
+    for (i, (k, _)) in ServerTools::default().entries().into_iter().enumerate() {
+        for n in [1, u32::MAX] {
+            let mut u = Usage::default();
+            set_kind(&mut u.server_tools, k, n);
+            facts.push(u);
+        }
+        set_kind(&mut every, k, u32::try_from(i).unwrap() + 1);
+    }
+    facts.push(Usage {
+        server_tools: every,
+        ..Usage::default()
+    });
+    // OpenRouter's web searches beside its every-kind `tool_calls`, the pair its pricing compares.
+    for (w, c) in [(2, 2), (1, 2), (3, 0)] {
+        let mut u = Usage::default();
+        u.server_tools.web_search = w;
+        u.server_tools.tool_calls = c;
+        facts.push(u);
+    }
+    let costs = [
+        None,
+        Some(0),
+        Some(1),
+        Some(12_345),
+        Some(10_000_000_000),
+        Some(15_000_000_000),
+        Some(123_456_789_012),
+        Some(u64::MAX),
+    ];
+    for cost_e10 in costs {
+        for tool_cost_e10 in costs {
+            let mut u = Usage::default();
+            u.upstream.cost_e10 = cost_e10;
+            u.upstream.tool_cost_e10 = tool_cost_e10;
+            facts.push(u);
+        }
+    }
+    let spelled = || std::iter::once(None).chain(SPELLINGS.iter().map(|s| tier(s)));
+    for service_tier in spelled() {
+        for speed in spelled() {
+            facts.push(Usage {
+                service_tier,
+                speed,
+                ..Usage::default()
+            });
+        }
+        facts.push(Usage {
+            inference_geo: service_tier,
+            ..Usage::default()
+        });
+    }
+    // Several facts on one row, and a named OpenRouter host.
+    for (t, s, g, c) in [
+        ("priority", "fast", "us", Some(4_200_000)),
+        ("flex", "standard", "global", None),
+        ("standard", "fast", "not_available", Some(0)),
+    ] {
+        let mut u = Usage {
+            service_tier: tier(t),
+            speed: tier(s),
+            inference_geo: tier(g),
+            ..Usage::default()
+        };
+        u.server_tools.web_search = 2;
+        u.upstream.cost_e10 = c;
+        u.upstream.served_by = host_from("Anthropic");
+        facts.push(u);
+    }
+
+    let (mut rows, mut priced) = (0usize, 0usize);
+    let mut reasons = std::collections::BTreeSet::new();
+    for rr in providers::rates::ROW_RATES {
+        for cc in rr.cost {
+            let provider = providers::by_id(cc.provider).name;
+            for wire in [Dialect::Anthropic, Dialect::OpenAi] {
+                for f in &facts {
+                    let u = Usage {
+                        input_tokens: 100_000,
+                        output_tokens: 777,
+                        cache_read_tokens: 40_000,
+                        cache_write_tokens: 5_000,
+                        cache_write_1h_tokens: 2_000,
+                        ..*f
+                    };
+                    let typed = price(&UsageRow {
+                        price_model: Some(rr.model),
+                        provider: Some(provider),
+                        unix_secs: 1_791_806_400,
+                        ..u.pricer_row(wire)
+                    });
+                    // The old path: the row's text exactly as `logging` writes it, read back.
+                    let tools_text = u.server_tools.to_row();
+                    let cost_text = u.upstream.cost_e10.map(e10_to_usd);
+                    let tool_cost_text = u.upstream.tool_cost_e10.map(e10_to_usd);
+                    let text = ToolCounts::parse(tools_text.as_deref().unwrap_or("")).and_then(
+                        |server_tools| {
+                            price(&UsageRow {
+                                price_model: Some(rr.model),
+                                provider: Some(provider),
+                                usage_wire: u.wire.unwrap_or(wire),
+                                input_tokens: u.input_tokens,
+                                output_tokens: u.output_tokens,
+                                cache_read_tokens: u.cache_read_tokens,
+                                cache_write_tokens: u.cache_write_tokens,
+                                cache_write_1h_tokens: u.cache_write_1h_tokens,
+                                gateway_cache_write_tokens: u.gateway_cache_write_tokens,
+                                server_tools,
+                                service_tier: u.service_tier.as_deref().map(Tier::parse),
+                                speed: u.speed.as_deref().map(Speed::parse),
+                                inference_geo: u.inference_geo.as_deref().map(Geo::parse),
+                                upstream_cost_usd: cost_text.as_deref().map(parse_usd_atto),
+                                upstream_tool_cost_usd: tool_cost_text
+                                    .as_deref()
+                                    .map(parse_usd_atto),
+                                served_by: u.upstream.served_by.as_deref(),
+                                unix_secs: 1_791_806_400,
+                                ..UsageRow::default()
+                            })
+                        },
+                    );
+                    assert_eq!(typed, text, "{} on {provider} ({wire:?}): {u:?}", rr.model);
+                    rows += 1;
+                    match typed {
+                        Ok(_) => priced += 1,
+                        Err(e) => {
+                            reasons.insert(e.as_str());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Not vacuous: rows price, and the refusals the corpus is built to reach are reached.
+    assert!(priced * 10 > rows, "{priced} of {rows} priced");
+    for want in ["unknown_class", "unknown_geo", "no_tool_fee", "no_rate"] {
+        assert!(reasons.contains(want), "{want} never reached: {reasons:?}");
+    }
+}
+
+/// The two halves of the typed path, held to the text they replace directly, below the price
+/// (where two kinds with the same fee would agree even if swapped): each kind's typed count is
+/// what its logged `kind=count` text parses to, alone and with every kind at once, and an e10
+/// cost's attodollars are what its logged decimal parses to.
+#[test]
+fn typed_tools_and_costs_equal_their_text() {
+    use providers::pricing::{ToolCounts, parse_usd_atto};
+    let same = |t: &ServerTools| {
+        let text = t.to_row();
+        assert_eq!(
+            ToolCounts::from(t),
+            ToolCounts::parse(text.as_deref().unwrap_or("")).unwrap(),
+            "{text:?}"
+        );
+    };
+    same(&ServerTools::default());
+    let mut every = ServerTools::default();
+    for (i, (k, _)) in ServerTools::default().entries().into_iter().enumerate() {
+        for n in [1, 7, u32::MAX] {
+            let mut t = ServerTools::default();
+            set_kind(&mut t, k, n);
+            same(&t);
+        }
+        set_kind(&mut every, k, u32::try_from(i).unwrap() + 1);
+    }
+    same(&every);
+    for v in [
+        0,
+        1,
+        9,
+        12_345,
+        10_000_000_000,
+        15_000_000_000,
+        u64::MAX - 1,
+        u64::MAX,
+    ] {
+        let mut u = Usage::default();
+        u.upstream.cost_e10 = Some(v);
+        u.upstream.tool_cost_e10 = Some(v);
+        let r = u.pricer_row(Dialect::Anthropic);
+        let text = Some(parse_usd_atto(&e10_to_usd(v)));
+        assert_eq!(
+            (r.upstream_cost_usd, r.upstream_tool_cost_usd),
+            (text, text),
+            "{v}"
+        );
+    }
+}
+
+/// Set one [`ServerTools`] kind by its row key, so a corpus built from [`ServerTools::entries`]
+/// names every kind the row can; a kind added there and not here panics.
+fn set_kind(t: &mut ServerTools, k: &str, n: u32) {
+    *match k {
+        "web_search" => &mut t.web_search,
+        "web_search_preview" => &mut t.web_search_preview,
+        "web_search_page" => &mut t.web_search_page,
+        "web_fetch" => &mut t.web_fetch,
+        "code_execution" => &mut t.code_execution,
+        "file_search" => &mut t.file_search,
+        "image_generation" => &mut t.image_generation,
+        "computer_use" => &mut t.computer_use,
+        "mcp" => &mut t.mcp,
+        "shell" => &mut t.shell,
+        "tool_search" => &mut t.tool_search,
+        "x_search" => &mut t.x_search,
+        "x_posts" => &mut t.x_posts,
+        "x_users" => &mut t.x_users,
+        "document_search" => &mut t.document_search,
+        "sources" => &mut t.sources,
+        "tool_calls" => &mut t.tool_calls,
+        k => panic!("unmapped kind {k}"),
+    } = n;
+}

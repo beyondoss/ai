@@ -72,7 +72,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use libtest_mimic::{Arguments, Failed, Trial};
-use providers::pricing::{ToolCounts, UsageRow, parse_usd_atto, price};
+use providers::pricing::{Geo, Speed, Tier, ToolCounts, UsageRow, parse_usd_atto, price};
 use recon::{Gateway, Provider, Totals, Window, common};
 use serde_json::{Value, json};
 
@@ -465,15 +465,15 @@ fn reprice(row: &Value, token_math: bool) -> Result<providers::pricing::Priced, 
         cache_write_1h_tokens: n("cache_write_1h_tokens"),
         gateway_cache_write_tokens: n("gateway_cache_write_tokens"),
         server_tools: tools,
-        service_tier: s("service_tier"),
-        speed: s("speed"),
-        inference_geo: s("inference_geo"),
+        service_tier: s("service_tier").map(Tier::parse),
+        speed: s("speed").map(Speed::parse),
+        inference_geo: s("inference_geo").map(Geo::parse),
         upstream_cost_usd: if token_math {
             None
         } else {
-            s("upstream_cost_usd")
+            s("upstream_cost_usd").map(parse_usd_atto)
         },
-        upstream_tool_cost_usd: s("upstream_tool_cost_usd"),
+        upstream_tool_cost_usd: s("upstream_tool_cost_usd").map(parse_usd_atto),
         served_by: s("served_by"),
         usage_estimated: row["usage_estimated"] == true,
         upstream_may_continue: row["upstream_may_continue"] == true,

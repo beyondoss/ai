@@ -82,29 +82,35 @@ below half a micro-dollar.
 `crates/gateway/ARCHITECTURE.md`, "The `ai.usage` row"). The pricer prices what was **served**,
 never the `requested_*` values.
 
-| Field                        | Meaning                                                                                                                   | Default     |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ----------- |
-| `price_model`                | The catalog row to price at                                                                                               | none        |
-| `provider`                   | The provider that served (`anthropic`, `bedrock`, `openrouter`, …)                                                        | none        |
-| `price_variant`              | `regional` / `global`. Accepted: `regional` on Bedrock (every Bedrock candidate is a `us.` profile), either on OpenRouter | none        |
-| `usage_wire`                 | `openai` or `anthropic`: the convention `input_tokens` follows                                                            | `anthropic` |
-| `input_tokens`               | As the wire reports it (see Normalization)                                                                                | 0           |
-| `output_tokens`              | Reasoning included                                                                                                        | 0           |
-| `cache_read_tokens`          |                                                                                                                           | 0           |
-| `cache_write_tokens`         | All cache writes, 1-hour included                                                                                         | 0           |
-| `cache_write_1h_tokens`      | The 1-hour subset of `cache_write_tokens`                                                                                 | 0           |
-| `gateway_cache_write_tokens` | Writes from breakpoints the gateway added: inside `input_tokens`, not in `cache_write_tokens`                             | 0           |
-| `server_tools`               | The row's text, `kind=count` joined with `,` (see Server tools). An unknown kind or bad count is `unknown_tool`           | empty       |
-| `service_tier`               | The tier the provider says it served at                                                                                   | none        |
-| `speed`                      | The speed the provider says it served at (`standard` / `fast`)                                                            | none        |
-| `inference_geo`              | Where the provider says inference ran (`us` / `global`)                                                                   | none        |
-| `upstream_cost_usd`          | The vendor's own reported cost, decimal USD (OpenRouter `usage.cost`; xAI `cost_in_usd_ticks` ÷ 10^10)                    | none        |
-| `upstream_tool_cost_usd`     | OpenRouter's metered tool and plugin cost                                                                                 | none        |
-| `served_by`                  | The host OpenRouter routed to (its provider name)                                                                         | none        |
-| `usage_estimated`            | Some count is the gateway's estimate                                                                                      | false       |
-| `upstream_may_continue`      | The stream ended early on a provider that keeps generating: the tokens are a lower bound                                  | false       |
-| `cache_hit`                  | Served from the gateway's response cache                                                                                  | false       |
-| `unix_secs`                  | Request start, Unix seconds UTC: the row's timestamp less `latency_ms`                                                    | 0           |
+The fields are typed. The gateway fills them from its numbers; a repricer reading the row's text
+parses each one with the function the table names. A parsed value that the pricer refuses (an
+unknown tier spelling, an unreadable cost) is still a value: `Tier::Unknown`, or an `Err` held in
+`upstream_cost_usd`. The refusal is raised where the pricer reaches that field, so text and typed
+input refuse a row with the same code.
+
+| Field                        | Meaning                                                                                                                                                                  | Default     |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------- |
+| `price_model`                | The catalog row to price at                                                                                                                                              | none        |
+| `provider`                   | The provider that served (`anthropic`, `bedrock`, `openrouter`, …)                                                                                                       | none        |
+| `price_variant`              | `regional` / `global`. Accepted: `regional` on Bedrock (every Bedrock candidate is a `us.` profile), either on OpenRouter                                                | none        |
+| `usage_wire`                 | `openai` or `anthropic`: the convention `input_tokens` follows                                                                                                           | `anthropic` |
+| `input_tokens`               | As the wire reports it (see Normalization)                                                                                                                               | 0           |
+| `output_tokens`              | Reasoning included                                                                                                                                                       | 0           |
+| `cache_read_tokens`          |                                                                                                                                                                          | 0           |
+| `cache_write_tokens`         | All cache writes, 1-hour included                                                                                                                                        | 0           |
+| `cache_write_1h_tokens`      | The 1-hour subset of `cache_write_tokens`                                                                                                                                | 0           |
+| `gateway_cache_write_tokens` | Writes from breakpoints the gateway added: inside `input_tokens`, not in `cache_write_tokens`                                                                            | 0           |
+| `server_tools`               | Counts by kind (`ToolCounts`). From the row's text, `kind=count` joined with `,` (see Server tools), `ToolCounts::parse`: an unknown kind or bad count is `unknown_tool` | empty       |
+| `service_tier`               | The tier the provider says it served at (`Tier`; from text, `Tier::parse`)                                                                                               | none        |
+| `speed`                      | The speed the provider says it served at, `standard` / `fast` (`Speed`; from text, `Speed::parse`)                                                                       | none        |
+| `inference_geo`              | Where the provider says inference ran, `us` / `global` (`Geo`; from text, `Geo::parse`)                                                                                  | none        |
+| `upstream_cost_usd`          | The vendor's own reported cost (OpenRouter `usage.cost`; xAI `cost_in_usd_ticks` ÷ 10^10), exact attodollars. From the row's decimal USD text, `parse_usd_atto`          | none        |
+| `upstream_tool_cost_usd`     | OpenRouter's metered tool and plugin cost, as `upstream_cost_usd`                                                                                                        | none        |
+| `served_by`                  | The host OpenRouter routed to (its provider name)                                                                                                                        | none        |
+| `usage_estimated`            | Some count is the gateway's estimate                                                                                                                                     | false       |
+| `upstream_may_continue`      | The stream ended early on a provider that keeps generating: the tokens are a lower bound                                                                                 | false       |
+| `cache_hit`                  | Served from the gateway's response cache                                                                                                                                 | false       |
+| `unix_secs`                  | Request start, Unix seconds UTC: the row's timestamp less `latency_ms`                                                                                                   | 0           |
 
 `reasoning_tokens` is on the row for audit, but the pricer never reads it. Reasoning is already
 inside `output_tokens` on every wire the gateway meters, and the extractor folds xAI's

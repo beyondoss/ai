@@ -5,7 +5,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use providers::WireFormat;
-use providers::pricing::{Priced, Tool, ToolCounts, Unpriced, UsageRow, price};
+use providers::pricing::{
+    Geo, Priced, Speed, Tier, Tool, ToolCounts, Unpriced, UsageRow, parse_usd_atto, price,
+};
 use providers::rates::RATE_VERSION;
 use serde_json::Value;
 
@@ -68,11 +70,11 @@ fn row(v: &Value) -> Result<UsageRow<'_>, Unpriced> {
         cache_write_1h_tokens: n("cache_write_1h_tokens"),
         gateway_cache_write_tokens: n("gateway_cache_write_tokens"),
         server_tools: tools,
-        service_tier: s("service_tier"),
-        speed: s("speed"),
-        inference_geo: s("inference_geo"),
-        upstream_cost_usd: s("upstream_cost_usd"),
-        upstream_tool_cost_usd: s("upstream_tool_cost_usd"),
+        service_tier: s("service_tier").map(Tier::parse),
+        speed: s("speed").map(Speed::parse),
+        inference_geo: s("inference_geo").map(Geo::parse),
+        upstream_cost_usd: s("upstream_cost_usd").map(parse_usd_atto),
+        upstream_tool_cost_usd: s("upstream_tool_cost_usd").map(parse_usd_atto),
         served_by: s("served_by"),
         usage_estimated: b("usage_estimated"),
         upstream_may_continue: b("upstream_may_continue"),

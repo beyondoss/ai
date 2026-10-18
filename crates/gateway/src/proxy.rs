@@ -7764,36 +7764,20 @@ impl ProxyHttp for AiProxy {
                 .map_or(0, |d| d.as_secs())
                 .saturating_sub(elapsed.as_secs());
             // Price the row from the very facts it logs (the contract is `providers::pricing`;
-            // `crates/providers/ARCHITECTURE.md`, "Pricing contract"). `server_tools` is read
-            // back from its logged text so a repricer working from the row gets the same counts.
-            // Pure and allocation-free: a few hundred nanoseconds, after the response.
-            let priced =
-                providers::pricing::ToolCounts::parse(server_tools.as_deref().unwrap_or(""))
-                    .and_then(|server_tools| {
-                        providers::pricing::price(&providers::pricing::UsageRow {
-                            price_model,
-                            provider: usage_provider,
-                            price_variant,
-                            usage_wire: usage.wire.unwrap_or(rc.dialect),
-                            input_tokens: usage.input_tokens,
-                            output_tokens: usage.output_tokens,
-                            cache_read_tokens: usage.cache_read_tokens,
-                            cache_write_tokens: usage.cache_write_tokens,
-                            cache_write_1h_tokens: usage.cache_write_1h_tokens,
-                            gateway_cache_write_tokens: usage.gateway_cache_write_tokens,
-                            server_tools,
-                            service_tier: usage.service_tier.as_deref(),
-                            speed: usage.speed.as_deref(),
-                            inference_geo: usage.inference_geo.as_deref(),
-                            upstream_cost_usd: upstream_cost_usd.as_deref(),
-                            upstream_tool_cost_usd: upstream_tool_cost_usd.as_deref(),
-                            served_by: usage.upstream.served_by.as_deref(),
-                            usage_estimated,
-                            upstream_may_continue,
-                            cache_hit: cache_hit.is_some(),
-                            unix_secs: start_unix_secs,
-                        })
-                    });
+            // `crates/providers/ARCHITECTURE.md`, "Pricing contract"), typed: the numbers, not
+            // their log text, which a repricer parses back to the same inputs (`usage::vendor`
+            // tests hold the two equal). Pure and allocation-free: a few hundred nanoseconds,
+            // after the response.
+            let priced = providers::pricing::price(&providers::pricing::UsageRow {
+                price_model,
+                provider: usage_provider,
+                price_variant,
+                usage_estimated,
+                upstream_may_continue,
+                cache_hit: cache_hit.is_some(),
+                unix_secs: start_unix_secs,
+                ..usage.pricer_row(rc.dialect)
+            });
             let (price_status, price_reason) = match &priced {
                 Ok(p) => (p.status.as_str(), None),
                 Err(reason) => {
