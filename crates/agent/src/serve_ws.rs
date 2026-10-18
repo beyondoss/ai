@@ -122,6 +122,7 @@ use crate::session_store::{
 };
 
 mod browser_guard;
+mod tls;
 
 /// The fixed URL path a WebSocket upgrade must target. The front door maps a service subdomain to this
 /// path on the loopback listener; any other path is rejected at the handshake.
@@ -1594,6 +1595,9 @@ fn resolve_idle_timeout(configured: Option<Duration>, service_mode: bool) -> Opt
 pub struct ServeListeners {
     /// Loopback/internal TCP address to bind, if any. The agent authenticates no caller over TCP.
     pub tcp: Option<SocketAddr>,
+    /// A TLS listener (`--tls-listen`) beside [`Self::tcp`]: the same protocol and the same guards
+    /// over rustls. The certificate chain and key are PEM files, read once at startup.
+    pub tls: Option<TlsListen>,
     /// Unix-domain socket path to bind, if any — kernel-enforced local authz via filesystem perms.
     #[cfg(unix)]
     pub uds: Option<std::path::PathBuf>,
@@ -1608,14 +1612,23 @@ pub struct ServeListeners {
     pub systemd: bool,
 }
 
+/// Where and with what certificate `--tls-listen` serves.
+pub struct TlsListen {
+    pub addr: SocketAddr,
+    /// PEM certificate chain, leaf first.
+    pub cert: std::path::PathBuf,
+    /// PEM private key for [`Self::cert`].
+    pub key: std::path::PathBuf,
+}
+
+pub use tls::load_acceptor as load_tls_acceptor;
+
 /// Await the next TCP connection, or `pending()` forever when there's no TCP listener — so this can
 /// sit in a `select!` arm unconditionally without `select!` needing to branch on the `Option`. Never
-/// gives up on a failed accept: see [`accept_retrying`].
-async fn accept_tcp(listener: &Option<TcpListener>) -> TcpStream {
+/// gives up on a failed accept: see [`accept_retrying`]. `transport` names the listener in the log.
+async fn accept_tcp(transport: &str, listener: &Option<TcpListener>) -> TcpStream {
     match listener {
-        Some(l) => {
-            accept_retrying("websocket", || async { l.accept().await.map(|(s, _)| s) }).await
-        }
+        Some(l) => accept_retrying(transport, || async { l.accept().await.map(|(s, _)| s) }).await,
         None => std::future::pending().await,
     }
 }
@@ -1801,6 +1814,12 @@ pub async fn serve_ws(
     // on stderr (the protocol never uses stderr): `h2c` against an h1-only gateway fails *every*
     // request, so an operator who flipped this on must see the mode they're running.
     cfg.shared_http = build_shared_h2_client(&cfg)?;
+    // Before anything is bound or spawned: a missing file, a bad key or a key that does not match
+    // the certificate stops the daemon here, with the flag and path in the message.
+    let tls_acceptor = match &listeners.tls {
+        Some(t) => Some(tls::load_acceptor(&t.cert, &t.key)?),
+        None => None,
+    };
     if let Some(callback) = &cfg.mcp_events_callback_url {
         crate::tools::mcp_events::enable_receiver_document(callback);
     }
@@ -1843,6 +1862,18 @@ pub async fn serve_ws(
             }
             None => None,
         },
+    };
+
+    let tls_listener = match &listeners.tls {
+        Some(t) => {
+            let listener = TcpListener::bind(t.addr).await?;
+            eprintln!(
+                "serve: websocket tls listening on {} (path {WS_PATH})",
+                listener.local_addr()?
+            );
+            Some(listener)
+        }
+        None => None,
     };
 
     // Only a socket WE bound is ours to unlink on shutdown — never a systemd-owned one.
@@ -2124,11 +2155,29 @@ pub async fn serve_ws(
                     return Ok(Some(sig));
                 }
             }
-            stream = accept_tcp(&tcp_listener) => {
+            stream = accept_tcp("websocket", &tcp_listener) => {
                 let supervisor = supervisor.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(&supervisor, stream, Transport::Tcp).await {
                         eprintln!("serve: websocket connection error: {e}");
+                    }
+                });
+            }
+            stream = accept_tcp("websocket tls", &tls_listener) => {
+                // The handshake runs in the connection's own task, under a deadline, so a slow
+                // client holds that task and not the accept loop. What follows is the same path as
+                // `--listen`: TLS only changes the bytes on the wire, so the browser guard, the
+                // service-mode grant check and the head and body limits all apply unchanged.
+                let (supervisor, acceptor) = (supervisor.clone(), tls_acceptor.clone());
+                tokio::spawn(async move {
+                    let Some(acceptor) = acceptor else { return };
+                    match tls::handshake(&acceptor, stream).await {
+                        Ok(stream) => {
+                            if let Err(e) = handle_connection(&supervisor, stream, Transport::Tcp).await {
+                                eprintln!("serve: websocket tls connection error: {e}");
+                            }
+                        }
+                        Err(e) => eprintln!("serve: websocket tls handshake failed: {e}"),
                     }
                 });
             }
