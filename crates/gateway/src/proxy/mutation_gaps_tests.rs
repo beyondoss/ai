@@ -472,6 +472,7 @@ fn the_fine_grained_tool_streaming_beta_reaches_only_a_candidate_that_takes_it()
 /// The first chunk after the client left an armed stream starts the drain and gives the tenant's
 /// slot back there, not at `logging`: the slot bounds what a client has open, and a drain can read
 /// on long after it left.
+/// claim: A3
 #[test]
 fn a_drain_frees_the_tenant_slot_at_its_first_chunk() {
     let state: &'static Arc<GatewayState> = Box::leak(Box::new(
@@ -505,6 +506,7 @@ fn a_drain_frees_the_tenant_slot_at_its_first_chunk() {
 /// A leg gives a half-open breaker's only probe permit back with no outcome, whether released
 /// (the client left) or dropped with it still out (a panic unwinding the request), so the next
 /// request can probe.
+/// claim: REL-6
 #[test]
 fn a_released_or_dropped_leg_returns_its_probe_permit() {
     static NOW: AtomicU64 = AtomicU64::new(1_000);

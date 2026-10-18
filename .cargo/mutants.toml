@@ -133,13 +133,10 @@ exclude_re = [
   '''replace match guard depth == 1 with true in <impl Visit for Fused<'_>>::close''',
   # `emit`'s `upstream_model` and `upstream_host` are each `Some` only when `called`, so the
   # `price_variant` arm's `if called` holds whenever its pattern matches.
-  'replace match guard called with true in emit',
+  'billing\.rs:\d+:\d+: replace match guard called with true in emit$',
   # `upstream_response_filter`'s `status < 400` return is a fast path: `retry::decide` stands on
   # every status below 401 with nothing to warn of, so returning at 400 too (`<=`), or deciding a
   # 2xx or 3xx and returning at 400 alone (`==`), relays the same answer. (It is the only `<`
   # there; re-check this exclusion if another one is added.)
   'replace < with (<=|==) in <impl ProxyHttp for AiProxy>::upstream_response_filter',
-  # `ArgsEnd::whole` reads `scanned` only while the value is open, and the step that adds `end` to
-  # it also sets `closed`, which only a fresh `ArgsEnd` clears: a store nothing reads.
-  'replace \+= with \*= in ArgsEnd::whole',
 ]

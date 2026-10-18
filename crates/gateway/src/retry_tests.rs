@@ -70,7 +70,8 @@ fn connect_before(walk: Option<Walk>, retries_left: bool) -> Decision {
     }
 }
 
-/// `error_while_proxy`'s rules as it ran them inline, with the leg's `refused_resent` after.
+/// `error_while_proxy`'s rules as it ran them inline before `decide`, with the leg's
+/// `refused_resent` after. The facts reach `decide` through `proxy::read_lost`.
 fn lost_before(l: &Lost, walk: Option<Walk>, body: Body) -> (Decision, bool) {
     let mut refused_resent = l.refused_resent;
     let delivered = !l.refused && !l.reset_unread && l.delivered;
@@ -500,12 +501,28 @@ fn the_facts_a_lost_connection_skips_never_change_its_decision() {
             h2_body_unsent: bit(8),
             pingora_retries: bit(9),
         };
+        // Each fact is read only where its gate holds: a skipped read is work not done (the
+        // delivery check reads the session).
+        let reads = std::cell::Cell::new([0u8; 3]);
+        let read = |i: usize, fact: bool| {
+            let mut n = reads.get();
+            n[i] += 1;
+            reads.set(n);
+            fact
+        };
         let skipped = crate::proxy::read_lost(
             lost,
-            || lost.delivered,
-            || lost.goaway,
-            || lost.h2_body_unsent,
+            || read(0, lost.delivered),
+            || read(1, lost.goaway),
+            || read(2, lost.h2_body_unsent),
         );
+        let open = !lost.downstream && !lost.responded;
+        let gates = [
+            open && !lost.refused && !lost.reset_unread,
+            lost.refused,
+            open && !lost.refused,
+        ];
+        assert_eq!(reads.get(), gates.map(u8::from), "{lost:?}");
         assert_eq!(lost.spends_resend(), skipped.spends_resend(), "{lost:?}");
         for walk in walks() {
             for body in bodies() {

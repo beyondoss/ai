@@ -7114,10 +7114,8 @@ impl ArgsEnd {
         if !self.closed {
             let rest = b.get(self.scanned..).unwrap_or_default();
             match self.lex.feed(rest, &mut OuterClose) {
-                Some(end) => {
-                    self.scanned += end;
-                    self.closed = true;
-                }
+                // Once closed, `scanned` is never read again.
+                Some(_) => self.closed = true,
                 None => self.scanned = b.len(),
             }
         }
