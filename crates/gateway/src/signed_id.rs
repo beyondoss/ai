@@ -245,6 +245,7 @@ impl Signer {
             let body = hex.len() / 2;
             let total = body.saturating_add(TAG_LEN);
             let Some((head, tail)) = data.split_at_mut_checked(body) else {
+                debug_assert!(false, "packable caps the hex, so body fits data");
                 return;
             };
             for (dst, pair) in head.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
@@ -256,6 +257,7 @@ impl Signer {
                 *dst = byte;
             }
             let Some(packed) = data.get(..total) else {
+                debug_assert!(false, "packable caps the hex, so body + tag fit data");
                 return;
             };
             let len = URL_SAFE_NO_PAD.encode_slice(packed, &mut b64).unwrap_or(0);
@@ -317,8 +319,8 @@ impl Signer {
     fn verify_verbatim(&self, tenant: u64, token: &str) -> Option<String> {
         let b = token.as_bytes();
         let split = b.len().checked_sub(VERBATIM_TAIL).filter(|&s| s > 0)?;
-        // The tail is `"_v"`, the kid, then the base64url tag; `get` also refuses a split inside a
-        // character.
+        // The tail is `"_v"`, the kid, then the base64url tag. The `_` in the pattern keeps `split`
+        // on a char boundary: a UTF-8 continuation byte is never `_`.
         let [b'_', b'v', kid, encoded @ ..] = b.get(split..)? else {
             return None;
         };
@@ -486,19 +488,19 @@ impl Signer {
             |k| matches!(fates.get(k), Some(Fate::Cut)),
             &mut cuts,
         );
-        let mut all: Vec<((usize, usize), Option<String>)> =
-            cuts.into_iter().map(|span| (span, None)).collect();
+        // Both lists are ascending, so one merge emits every edit in source order. `Edits::write`
+        // silently drops an edit that starts before the previous one.
+        let mut cuts = cuts.into_iter().peekable();
         for (fate, (m, _)) in fates.into_iter().zip(&members) {
+            while let Some(cut) = cuts.next_if(|c| c.0 < m.value.0) {
+                edits.push_cut(cut);
+            }
             if let Fate::Replace(raw) = fate {
-                all.push((m.value, Some(raw)));
+                edits.push_str(m.value, &raw);
             }
         }
-        all.sort_by_key(|(span, _)| span.0);
-        for (span, replacement) in all {
-            match replacement {
-                Some(raw) => edits.push_str(span, &raw),
-                None => edits.push_cut(span),
-            }
+        for cut in cuts {
+            edits.push_cut(cut);
         }
         true
     }
@@ -716,7 +718,8 @@ impl Relay {
         let mut rest = lines;
         while !rest.is_empty() {
             let end = memchr::memchr(b'\n', rest).map_or(rest.len(), |k| k.saturating_add(1));
-            // `end` is within `rest`; the fallback relays the rest unsigned, which cannot happen.
+            // `end` is within `rest`, so the fallback is unreachable. Were it taken, the whole rest
+            // would be one line and still go through the `data:` handling below.
             let (line, after) = rest.split_at_checked(end).unwrap_or((rest, &[]));
             rest = after;
             let Some(data) = line.strip_prefix(b"data:") else {
@@ -861,6 +864,7 @@ impl Memo {
         } else if let Some(slot) = self.entries.get_mut(self.next) {
             *slot = entry;
             // A ring: the oldest entry is the next one overwritten, so the index wraps.
+            // `wrapping_add`: `arithmetic_side_effects` rejects `+`, and `next < CAP` cannot overflow.
             self.next = self.next.wrapping_add(1) % Self::CAP;
         }
     }
@@ -882,6 +886,10 @@ impl Edits {
 
     /// Replace `span` with `s` as a JSON string.
     fn push_str(&mut self, span: (usize, usize), s: &str) {
+        debug_assert!(
+            self.spans.last().is_none_or(|p| p.0 <= span.0),
+            "edits in source order"
+        );
         let start = self.arena.len();
         match serde_json::to_string(s) {
             Ok(q) => self.arena.extend_from_slice(q.as_bytes()),
@@ -892,6 +900,10 @@ impl Edits {
 
     /// Remove `span`.
     fn push_cut(&mut self, span: (usize, usize)) {
+        debug_assert!(
+            self.spans.last().is_none_or(|p| p.0 <= span.0),
+            "edits in source order"
+        );
         let at = self.arena.len();
         self.spans.push((span.0, span.1, at, at));
     }
