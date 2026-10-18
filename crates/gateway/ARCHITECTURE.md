@@ -146,7 +146,7 @@ Client (stock OpenAI/Anthropic SDK)
   │    byte goes upstream (D267). BYO streams through.
   │  Model-routed or managed /{provider}: two root `model` keys (any spelling) ─────── 400
   │  Model-routed: same buffer, and `model` is spliced to the serving candidate's own id
-  │    (rewrite first — the injection offset precedes the value, so it cannot move)
+  │    (before the injection; every edit moves the scan's offsets, see `rewrite.rs`)
   │  Wire-mismatched catalog walk (Chat Completions ↔ Messages ↔ Responses): map the
   │    buffered JSON *before* the model splice. OpenAI→Anthropic does not inject
   │    `stream_options`. Anthropic→OpenAI (and Responses→Chat Completions) injects
@@ -995,7 +995,8 @@ default). Tools, text, and usage still
 round-trip. Anthropic requires `max_tokens`; a missing OpenAI value becomes 4096. On every catalog
 walk, translated or not, a root `max_tokens` / `max_completion_tokens` / `max_output_tokens` above
 the row's **published** max output (`ModelCard::output_cap`) is capped to it (never raised; spans
-found by the same `peek::scan_buffered` walk that finds `model`, spliced in place). A limit that is
+found by the same `peek::scan_buffered` walk that finds `model`, spliced in place by
+`rewrite::ScannedBody::clamp_output_limits`). A limit that is
 no whole number (a string, a fraction, an exponent, a negative) has no span to cap, so on such a row
 the walk refuses the body with a 400 (`ai_rejections_total{reason="output_limit"}`) before any byte
 goes upstream; `null` is no value and is left to the existing null handling. Claude Code sends
@@ -2886,6 +2887,37 @@ verifying them also rewrites the body, and a store relay checks them where it ho
 (first on `Relay` and `Buffered`, after the walk on `Connect`). `tests/refusal_precedence.rs` pins
 which refusal answers each pair at each point, end to end, a foreign id's place included.
 
+### Body rewrites (`rewrite.rs`)
+
+A buffered body is edited in place by splices at offsets the one `peek::scan_buffered` walk found:
+the `model` value, each output limit's digits and key, the `stream_options` value or the point just
+inside the root where one goes. A splice moves every byte after it, so an offset taken before an
+edit and used after it points into the wrong bytes, and the body goes upstream corrupted but still
+JSON-shaped. `rewrite::ScannedBody` owns the bytes and their scan as one value, and its offsets are
+private:
+
+- An edit the scan can follow is a method that consumes the body and returns it with every offset
+  moved by that edit (`Splice`: a byte before it stays, one past it moves by the length change, the
+  edited range becomes the replacement). The clamp, the `stream_options` rewrite and the model
+  splice re-derive nothing: no second walk.
+- An edit it cannot follow (translation, the strips, the null and `developer` rewrites) goes through
+  `ScannedBody::edit`: the scan is sealed in the `Edit` while the bytes may change, and
+  `Edit::finish(changed)` re-scans when they did. The `max_tokens` rename and the ambiguous
+  `stream_options` removal re-scan too; both are rare.
+- What reads the bytes outside borrows them (`ScannedBody::bytes`), so no offset or slice can be
+  held across an edit. `peek::BufferedScan` still reports raw offsets, for tests and the
+  connect-time body rules, but nothing that ships edits with them.
+
+Order. `request_body_filter` runs the clamp, then the opaque edits, then (native OpenAI Chat) the
+rename, then `ScannedBody::into_upstream`: drop an ambiguous `stream_options`, force
+`include_usage` into a client-sent one, re-spell `model`, inject `stream_options` into a stream that
+sent none. Because every offset moves with every edit, that order is the behaviour's (what was
+always sent), not a constraint the offsets impose; debug builds assert each offset stays inside the
+body and that a body never both sent `stream_options` and is given one.
+`prop_scanned_body_edits_*` (`props_lex.rs`, `props_peek.rs`) check the sequence writes the bytes
+the old hand-adjusted free functions wrote (`props_support/old_rewrite.rs`), and valid JSON with
+the expected `model`, limits and `include_usage`.
+
 ### Retries (`retry.rs`)
 
 Whether a failed attempt is retried, and how, is one function, `retry::decide`. The hooks that can
@@ -2954,7 +2986,7 @@ non-streaming body is relayed as sent, without the field.
 
 A client that sends `stream_options` itself does not get to turn metering off: `include_usage:
 false` is rewritten to `true`, an object without it gains it, and a non-object value is replaced
-by `{"include_usage":true}` (`proxy::force_include_usage`, which parses only that value, and only on
+by `{"include_usage":true}` (step 2 of `rewrite::ScannedBody::into_upstream`, which parses only that value, and only on
 the requests that send one). Without the usage chunk the row would be an estimate that cannot see
 hidden reasoning. The visible cost: such a client receives one chunk it did not ask for, OpenAI's
 usage chunk with `choices: []`, which every OpenAI SDK already accepts.
@@ -3844,6 +3876,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `key`             | `bai_v1` / `bai_v2` (explicit `key_id`) parse + Ed25519 verify + mint; keyring with multi-kid rotation support                                                                 | unit ✓         |
 | `route`           | Data-driven provider table (name / authority / auth) + dialect default + model-route re-exports                                                                                | unit ✓         |
 | `peek`            | `ModelScanner` — streaming structural scan for the root-level `model`; O(1) memory                                                                                             | unit ✓         |
+| `rewrite`         | `ScannedBody`: a buffered body and its scan as one value; every edit moves the scan's offsets, so none outlives the edit it predates                                           | unit ✓ + e2e ✓ |
 | `lex`             | The one JSON lexer behind every walker that reads JSON unparsed: resumable string / escape / depth state (`memchr2` in strings), strict string decoding                        | unit ✓         |
 | `usage`           | Token extraction (OpenAI / Anthropic, body + SSE)                                                                                                                              | unit ✓         |
 | `usage/vendor`    | Billing facts beyond tokens: `ServerTools` (server-side tool use by kind), served speed and geography, `Upstream` (the vendor's own ids and price); lenient per value          | unit ✓ + e2e ✓ |

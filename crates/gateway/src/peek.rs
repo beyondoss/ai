@@ -490,6 +490,9 @@ fn utf8_prefix(buf: Vec<u8>) -> String {
 }
 
 /// Both answers the injection path needs from a **fully buffered** request body.
+///
+/// Its offsets index exactly the bytes scanned and go stale at the first edit, so what edits a body
+/// holds them inside `rewrite::ScannedBody`, which moves them with each edit.
 pub struct BufferedScan {
     /// The root-level `model`, as [`ModelScanner`] would have extracted it.
     pub model: Option<String>,
@@ -503,7 +506,7 @@ pub struct BufferedScan {
     /// Where the value of a root `stream_options` begins, when the body streams **and** already
     /// carries one. The client may have turned usage off (`include_usage: false`) or left it out
     /// (`{}`); either way OpenAI would send no usage chunk, so the caller rewrites that value (see
-    /// `proxy::force_include_usage`). `None` whenever `inject_at` is `Some`, and for a non-stream.
+    /// `rewrite::ScannedBody::into_upstream`). `None` whenever `inject_at` is `Some`, and for a non-stream.
     pub stream_options_at: Option<usize>,
     /// Byte range of the root-level `model` **value**, exclusive of its quotes — the span to
     /// overwrite when a model-routed request has to be re-spelled for the candidate serving it.

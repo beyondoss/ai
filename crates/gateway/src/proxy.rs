@@ -73,6 +73,7 @@ use crate::key::{self, Identity};
 use crate::metrics::{DrainEnd, KeyCooled, Rejection};
 use crate::refusal::{self, Refusal, clip_catalog_name};
 use crate::retry::{self, Decision, RelayRetry, Retry};
+use crate::rewrite::{STREAM_OPTIONS_FRAG, ScannedBody};
 use crate::route::{self, Dialect, Provider, ProviderId};
 use crate::signed_id;
 use crate::state::{GatewayState, RequestId};
@@ -3867,187 +3868,11 @@ fn disable_openrouter_compression(mut body: Vec<u8>) -> Vec<u8> {
     body
 }
 
-/// The fragment spliced into a streaming OpenAI chat body. Always followed by a comma, since the
-/// splice point is just inside a root object that is non-empty by construction (a root `"stream"`
-/// key is what made it eligible).
-const STREAM_OPTIONS_FRAG: &[u8] = br#""stream_options":{"include_usage":true},"#;
-
-/// Cap each root-level output limit (`peek::OUTPUT_LIMIT_KEYS`) at `max`, the serving row's
-/// published maximum (`ModelCard::output_cap`), in place. Never raises one; `max == 0` (no
-/// published maximum, or an embeddings row) caps nothing.
-/// `true` when a value changed, so the caller re-scans the moved bytes.
-fn clamp_output_limits(body: &mut Vec<u8>, spans: &[Option<(usize, usize)>; 3], max: u32) -> bool {
-    if max == 0 {
-        return false;
-    }
-    // Back to front, so an earlier span's offsets survive a later splice.
-    let mut spans = *spans;
-    spans.sort_unstable_by(|a, b| b.cmp(a));
-    let mut changed = false;
-    for (start, end) in spans.into_iter().flatten() {
-        let Some(digits) = body.get(start..end) else {
-            continue;
-        };
-        // Digits only (the scan's own span), so a parse fails only past `u64`: over any cap.
-        let over = std::str::from_utf8(digits)
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .is_none_or(|n| n > u64::from(max));
-        if over {
-            body.splice(start..end, max.to_string().into_bytes());
-            changed = true;
-        }
-    }
-    changed
-}
-
 /// Whether a catalog candidate is native OpenAI Chat Completions, which takes the output limit as
 /// `max_completion_tokens` on every model and rejects `max_tokens` on its reasoning models.
 fn native_openai_chat(c: &route::Candidate) -> bool {
     c.provider == providers::ProviderId::OpenAi
         && route::Endpoint::of_upstream_path(c.path) == route::Endpoint::ChatCompletions
-}
-
-/// Respell a root `max_tokens` as `max_completion_tokens`, in place. `keys` is
-/// [`peek::BufferedScan::limit_keys`]. When both are present the explicit `max_completion_tokens`
-/// wins and the `max_tokens` member is removed. `true` when the body changed, so the caller
-/// re-scans the moved bytes.
-fn rename_max_tokens(body: &mut Vec<u8>, keys: &[Option<usize>; 3]) -> bool {
-    const KEY: &[u8] = br#""max_tokens""#;
-    let Some(at) = keys[0] else {
-        return false;
-    };
-    if body.get(at..at + KEY.len()) != Some(KEY) {
-        return false;
-    }
-    if keys[1].is_none() {
-        body.splice(
-            at + 1..at + KEY.len() - 1,
-            b"max_completion_tokens".iter().copied(),
-        );
-        return true;
-    }
-    // Both spellings. Find the end of the `max_tokens` value without building it, then remove
-    // the member and one adjacent comma.
-    let skip_ws = |mut i: usize| {
-        while body.get(i).is_some_and(u8::is_ascii_whitespace) {
-            i += 1;
-        }
-        i
-    };
-    let colon = skip_ws(at + KEY.len());
-    if body.get(colon) != Some(&b':') {
-        return false;
-    }
-    let value = skip_ws(colon + 1);
-    let mut values =
-        serde_json::Deserializer::from_slice(&body[value..]).into_iter::<serde::de::IgnoredAny>();
-    if !matches!(values.next(), Some(Ok(_))) {
-        return false;
-    }
-    let end = value + values.byte_offset();
-    let after = skip_ws(end);
-    let range = if body.get(after) == Some(&b',') {
-        at..after + 1
-    } else {
-        // The last member: take the comma before it instead.
-        match body[..at].iter().rposition(|b| !b.is_ascii_whitespace()) {
-            Some(comma) if body[comma] == b',' => comma..end,
-            _ => at..end,
-        }
-    };
-    body.drain(range);
-    true
-}
-
-/// Overwrite the `model` value's bytes with the id the chosen candidate uses.
-///
-/// `span` comes from [`peek::BufferedScan::model_span`] and covers the raw value, quotes excluded.
-/// The replacement is a catalog string, so it needs no JSON escaping — the catalog charset test
-/// (`model_names_are_lowercase_and_log_safe`, plus the same shape for `upstream_model`) is what
-/// makes a raw byte copy safe here.
-///
-/// Returns the body untouched when the id already matches, which is the common case: candidate 0
-/// usually spells the model the way the catalog names it, so the primary path does no memmove at all
-/// and only a failover pays for one.
-fn apply_model_rewrite(mut body: Vec<u8>, span: (usize, usize), replacement: &[u8]) -> Vec<u8> {
-    let (start, end) = span;
-    // Defensive: a span outside the buffer would panic on the splice. Unreachable — the span is
-    // produced by the same walk over the same bytes — but this runs on every model-routed request.
-    if start > end || end > body.len() {
-        return body;
-    }
-    if body[start..end] == *replacement {
-        return body;
-    }
-    body.splice(start..end, replacement.iter().copied());
-    body
-}
-
-/// Make a client-sent `stream_options` (value at `at`) ask for usage: `include_usage: false` becomes
-/// `true`, an object without it gains it, and a non-object value is replaced by
-/// `{"include_usage":true}`. Billing is not the client's to switch off — without the usage chunk the
-/// row is an estimate that cannot see hidden reasoning. The client may now receive one extra chunk it
-/// did not ask for: OpenAI's usage chunk, `choices: []`, which every SDK already accepts.
-///
-/// Returns `model_span` moved by the edit when it lay after it. Parses only the `stream_options`
-/// value (a few bytes), and only on the rare request that sends one; the value is re-serialized, so
-/// its other members keep their meaning but not their spacing.
-fn force_include_usage(
-    mut body: Vec<u8>,
-    at: usize,
-    model_span: Option<(usize, usize)>,
-) -> (Vec<u8>, Option<(usize, usize)>) {
-    use serde_json::Value;
-    let Some(rest) = body.get(at..) else {
-        return (body, model_span);
-    };
-    let mut values = serde_json::Deserializer::from_slice(rest).into_iter::<Value>();
-    let Some(Ok(value)) = values.next() else {
-        return (body, model_span);
-    };
-    let end = at + values.byte_offset();
-    let mut options = match value {
-        Value::Object(m) if m.get("include_usage") == Some(&Value::Bool(true)) => {
-            return (body, model_span);
-        }
-        Value::Object(m) => m,
-        _ => serde_json::Map::new(),
-    };
-    options.insert("include_usage".to_owned(), Value::Bool(true));
-    let Ok(replacement) = serde_json::to_vec(&options) else {
-        return (body, model_span);
-    };
-    let (removed, added) = (end - at, replacement.len());
-    body.splice(at..end, replacement);
-    let shift = |i: usize| i + added - removed;
-    let model_span = model_span.map(|(s, e)| if s > at { (shift(s), shift(e)) } else { (s, e) });
-    (body, model_span)
-}
-
-/// Splice `stream_options.include_usage` into a buffered OpenAI chat body at `at`, or return it
-/// unchanged when there is nothing to inject. This is what guarantees a usage chunk — hence a
-/// billable token count — from a stock client that never set the option.
-///
-/// Takes the offset rather than computing it: the caller already walked the body once for both the
-/// model and this plan (see `peek::scan_buffered`), and re-deriving it here would restore the second
-/// traversal that walk exists to remove.
-fn apply_stream_usage_injection(mut body: Vec<u8>, at: Option<usize>) -> Vec<u8> {
-    let Some(at) = at else { return body };
-    // Shift the tail right in place rather than copying the whole body into a second buffer.
-    // `req_buf` is pre-sized with `STREAM_OPTIONS_FRAG.len()` of headroom (see `request_filter`), so
-    // when the client declared a Content-Length this `resize` is free and the only work is moving
-    // the `body.len() - at` bytes after the splice point. The old form allocated a second buffer the
-    // size of the whole body and copied every byte into it; at 1 MB that measured 579 µs against
-    // 27.8 µs, because the second allocation dominates.
-    //
-    // Without a declared length (chunked upload) the `resize` may grow once — still a single
-    // allocation, i.e. no worse than before.
-    let old_len = body.len();
-    body.resize(old_len + STREAM_OPTIONS_FRAG.len(), 0);
-    body.copy_within(at..old_len, at + STREAM_OPTIONS_FRAG.len());
-    body[at..at + STREAM_OPTIONS_FRAG.len()].copy_from_slice(STREAM_OPTIONS_FRAG);
-    body
 }
 
 /// What the first path segment resolved to, before the key says whether the request may walk the
@@ -5367,7 +5192,7 @@ impl ProxyHttp for AiProxy {
         // unbounded memory. Every other request leaves it empty and never buffers.
         //
         // The `+ STREAM_OPTIONS_FRAG.len()` is headroom for the splice, which
-        // `apply_stream_usage_injection` performs *in place*: with it the injection never
+        // `ScannedBody::into_upstream` performs *in place*: with it the injection never
         // reallocates, so a body arrives, is spliced, and goes upstream on one allocation.
         if let Some(rc) = ctx.rc.as_mut()
             && rc.plan.rewrites_body()
@@ -6041,7 +5866,7 @@ impl ProxyHttp for AiProxy {
                     }
                 }
                 // --- end signed ids ---
-                let mut scan = peek::scan_buffered(&buf);
+                let mut scanned = ScannedBody::new(buf);
                 // The body rules (`body_rules`), on the client's body: ahead of translation, which
                 // re-serializes it and would hide a second `model`, and of every rewrite, so an
                 // `:online` model is named for what it is. Each refusal ends the request before a
@@ -6051,10 +5876,10 @@ impl ProxyHttp for AiProxy {
                         .auto
                         .as_ref()
                         .map(|a| a.route.model)
-                        .or(scan.model.as_deref())
+                        .or(scanned.model())
                         .unwrap_or(rc.model.as_str());
                     let messages = session.req_header().uri.path().ends_with("/messages");
-                    unpriced::inspect(&buf, model, messages)
+                    unpriced::inspect(scanned.bytes(), model, messages)
                 } else {
                     unpriced::Inspection::default()
                 };
@@ -6062,9 +5887,11 @@ impl ProxyHttp for AiProxy {
                     // A managed `/{provider}/…` billable call naming no catalog row (D267): its
                     // billing row would carry no `price_model`. Told by the client's id.
                     let miss = (rc.plan.catalog_check
-                        && scan.model.as_deref().and_then(price_row).is_none())
+                        && scanned.model().and_then(price_row).is_none())
                     .then(|| match rc.model.is_empty() {
-                        true => scan.model.take().map_or(Cow::Borrowed(""), sanitize_model),
+                        true => scanned
+                            .take_model()
+                            .map_or(Cow::Borrowed(""), sanitize_model),
                         false => Cow::Borrowed(rc.model.as_str()),
                     });
                     let facts = body_rules::Facts {
@@ -6072,10 +5899,10 @@ impl ProxyHttp for AiProxy {
                         // `/{provider}` body is billed by the first: the provider's parser picks
                         // its own (usually the last).
                         duplicate_model: (rc.auto.is_some() || rc.plan.catalog_check)
-                            && scan.duplicate_model,
+                            && scanned.duplicate_model(),
                         // A limit with no span (a string, a fraction, a negative): the clamp below
                         // cannot hold it to the row's maximum.
-                        inexact_limit: scan.inexact_limit
+                        inexact_limit: scanned.inexact_limit()
                             && rc
                                 .auto
                                 .as_ref()
@@ -6088,7 +5915,7 @@ impl ProxyHttp for AiProxy {
                             && rc.forward_path.as_str().is_some_and(|p| {
                                 route::forward_is_responses(p.split_once('?').map_or(p, |(p, _)| p))
                             })
-                            && requests_background(&buf),
+                            && requests_background(scanned.bytes()),
                     };
                     body_rules::refusal(body_rules::Point::Buffered, facts)
                 };
@@ -6112,11 +5939,12 @@ impl ProxyHttp for AiProxy {
                     // An output limit past the row's maximum is a 400 by name; capped before the
                     // translation, so what it derives (a thinking budget) fits under the cap too.
                     // Only a vendor-published maximum: an unpublished one is a placeholder (D85).
-                    let mut changed = clamp_output_limits(
-                        &mut buf,
-                        &scan.limit_spans,
-                        a.route.card.output_cap().unwrap_or(0),
-                    );
+                    // The edits below are opaque to the scan, so they open the body and close it
+                    // re-scanned when one changed it.
+                    let mut buf = scanned
+                        .clamp_output_limits(a.route.card.output_cap().unwrap_or(0))
+                        .edit();
+                    let mut changed = false;
                     let serving = catalog_serving_endpoint(a.as_ref());
                     let candidate = a.candidate_at(a.candidate);
                     let upstream_model = candidate.map_or("", |c| c.upstream_model);
@@ -6147,7 +5975,7 @@ impl ProxyHttp for AiProxy {
                             // The tool names this attempt's response maps calls back through, and
                             // whether its cache breakpoints are the gateway's (per attempt: a
                             // failover candidate on another wire re-decides both).
-                            (buf, t.tools, t.gateway_cache, t.cache_1h) =
+                            (*buf, t.tools, t.gateway_cache, t.cache_1h) =
                                 translate::request_with_tools(
                                     t.client,
                                     to,
@@ -6158,7 +5986,7 @@ impl ProxyHttp for AiProxy {
                             changed = true;
                         } else if to == route::Endpoint::Responses {
                             let len = buf.len();
-                            buf = translate::strip_gateway_reasoning(buf);
+                            buf.map(translate::strip_gateway_reasoning);
                             // A row with no Responses arm walks its candidates only for a one-shot
                             // (session state there is a 400): onto a Responses candidate (xAI's)
                             // it must not be stored, and xAI stores by default. Nothing there holds
@@ -6173,7 +6001,7 @@ impl ProxyHttp for AiProxy {
                             // A Claude model behind Chat Completions (OpenRouter): a tool turn
                             // with no thinking to replay goes without reasoning (D14's rule).
                             let len = buf.len();
-                            buf = translate::claude_chat_relay_reasoning(buf, upstream_model);
+                            buf.map(|b| translate::claude_chat_relay_reasoning(b, upstream_model));
                             changed |= buf.len() != len;
                         }
                         // Same-wire Chat to another host: an explicit null is "not set", as
@@ -6197,9 +6025,9 @@ impl ProxyHttp for AiProxy {
                         // for one: ask it for the stream and assemble the answer into the
                         // client's own body (D147). Per attempt, like the tools: a failover
                         // candidate gets the client's body as it came. Its usage is asked for by
-                        // the splice below, as on every Chat Completions stream (`inject_at`, or
-                        // `force_include_usage` on the client's own `stream_options`); a Messages
-                        // body takes no `stream_options`.
+                        // the splice below, as on every Chat Completions stream
+                        // (`ScannedBody::into_upstream`); a Messages body takes no
+                        // `stream_options`.
                         t.assemble = stream_only
                             && to != route::Endpoint::Responses
                             && translate::force_stream(&mut buf, false);
@@ -6212,19 +6040,15 @@ impl ProxyHttp for AiProxy {
                     if serving == Some(route::Endpoint::Messages) && !eager_tool_streaming {
                         changed |= translate::strip_eager_input_streaming(&mut buf);
                     }
-                    if changed {
-                        scan = peek::scan_buffered(&buf);
-                    }
+                    scanned = buf.finish(changed);
                     // Native OpenAI Chat takes `max_completion_tokens` on every model and 400s
                     // `max_tokens` on its reasoning ones; a translated body already says the former.
-                    if candidate.is_some_and(native_openai_chat)
-                        && rename_max_tokens(&mut buf, &scan.limit_keys)
-                    {
-                        scan = peek::scan_buffered(&buf);
+                    if candidate.is_some_and(native_openai_chat) {
+                        scanned = scanned.rename_max_tokens();
                     }
                 }
                 if rc.model.is_empty()
-                    && let Some(m) = scan.model
+                    && let Some(m) = scanned.take_model()
                 {
                     // The *client's* id, captured before any rewrite below — this is what
                     // `requested_model` means, and it stays the canonical catalog name on a
@@ -6237,43 +6061,17 @@ impl ProxyHttp for AiProxy {
                 // OpenRouter's `anthropic/claude-opus-4-8` — so without this a failover would ask
                 // the fallback for a model it has never heard of.
                 //
-                // Done before the `stream_options` splice, and safe in that order because
-                // `inject_at` points just past the root `{` and so always precedes the model value:
-                // rewriting the value cannot move it. A client-sent `stream_options` can sit on
-                // either side of `model`, so that rewrite runs first and hands back the span it
-                // may have shifted.
-                // A duplicate or escaped `stream_options` (OpenAI takes the last, decoded): drop
-                // them all, so the injection below adds the one that counts (D88).
-                if rc.plan.stream_options
-                    && scan.stream_options_ambiguous
-                    && peek::remove_root_members(&mut buf, "stream_options")
-                {
-                    scan = peek::scan_buffered(&buf);
-                }
-                let (buf, model_span) = match scan.stream_options_at {
-                    Some(at) if rc.plan.stream_options => {
-                        force_include_usage(buf, at, scan.model_span)
-                    }
-                    _ => (buf, scan.model_span),
-                };
-                let buf = match (rc.auto.as_ref(), model_span) {
-                    (Some(a), Some(span)) => match a.candidate_at(a.candidate) {
-                        Some(c) => apply_model_rewrite(buf, span, c.upstream_model.as_bytes()),
-                        None => buf,
-                    },
-                    _ => buf,
-                };
-                // Emit the whole (possibly rewritten) body in one shot; `transfer-encoding: chunked`
-                // (set in `upstream_request_filter`) makes the changed length fine.
                 // `plan.stream_options` is the OpenAI-upstream gate: a translated Anthropic body also
                 // carries `"stream":true`, and splicing `stream_options` into it would be a field
-                // that API does not recognize.
-                let buf = if rc.plan.stream_options {
-                    apply_stream_usage_injection(buf, scan.inject_at)
-                } else {
-                    buf
-                };
-                let buf = match rc.auto.as_ref().and_then(|a| a.candidate_at(a.candidate)) {
+                // that API does not recognize. The edits' order is `into_upstream`'s.
+                let candidate = rc.auto.as_ref().and_then(|a| a.candidate_at(a.candidate));
+                let buf = scanned.into_upstream(
+                    rc.plan.stream_options,
+                    candidate.map(|c| c.upstream_model.as_bytes()),
+                );
+                // Emit the whole (possibly rewritten) body in one shot; `transfer-encoding: chunked`
+                // (set in `upstream_request_filter`) makes the changed length fine.
+                let buf = match candidate {
                     Some(c) if openrouter_chat(c) => disable_openrouter_compression(buf),
                     _ => buf,
                 };
@@ -10423,4 +10221,46 @@ mod mutation_gaps {
         );
         assert_eq!(header(FINE_GRAINED_TOOL_STREAMING_BETA, false), None);
     }
+}
+
+// The body edits are `rewrite::ScannedBody`'s, on a body that carries its own scan. These are
+// their raw-offset forms, for the tests that pin one edit's bytes at a time.
+
+/// Cap each root-level output limit at `max`, back to front, on the scan's raw spans
+/// (`ScannedBody::clamp_output_limits`). `true` when a value changed.
+#[cfg(test)]
+fn clamp_output_limits(body: &mut Vec<u8>, spans: &[Option<(usize, usize)>; 3], max: u32) -> bool {
+    crate::rewrite::raw::clamp_output_limits(body, spans, max)
+}
+
+/// Respell a root `max_tokens` as `max_completion_tokens` (`ScannedBody::rename_max_tokens` on
+/// the scan's raw `limit_keys`). `true` when the body changed.
+#[cfg(test)]
+fn rename_max_tokens(body: &mut Vec<u8>, keys: &[Option<usize>; 3]) -> bool {
+    crate::rewrite::raw::rename_max_tokens(body, keys)
+}
+
+/// Overwrite the `model` value's bytes at `span` with `replacement`, or leave them when they
+/// already match (step 3 of `ScannedBody::into_upstream`).
+#[cfg(test)]
+fn apply_model_rewrite(body: Vec<u8>, span: (usize, usize), replacement: &[u8]) -> Vec<u8> {
+    crate::rewrite::raw::apply_model_rewrite(body, span, replacement)
+}
+
+/// Make a client-sent `stream_options` (value at `at`) ask for usage (step 2 of
+/// `ScannedBody::into_upstream`), returning `model_span` moved by the edit.
+#[cfg(test)]
+fn force_include_usage(
+    body: Vec<u8>,
+    at: usize,
+    model_span: Option<(usize, usize)>,
+) -> (Vec<u8>, Option<(usize, usize)>) {
+    crate::rewrite::raw::force_include_usage(body, at, model_span)
+}
+
+/// Splice `stream_options.include_usage` in at `at`, or nothing when there is no point (step 4
+/// of `ScannedBody::into_upstream`).
+#[cfg(test)]
+fn apply_stream_usage_injection(body: Vec<u8>, at: Option<usize>) -> Vec<u8> {
+    crate::rewrite::raw::apply_stream_usage_injection(body, at)
 }

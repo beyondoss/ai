@@ -39,6 +39,7 @@ pub mod ratelimit;
 pub mod refusal;
 pub mod remedy;
 mod retry;
+pub mod rewrite;
 pub mod route;
 pub mod secret;
 pub mod signed_id;
