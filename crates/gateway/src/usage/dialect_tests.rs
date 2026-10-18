@@ -11,6 +11,12 @@ use serde_json::{Value, json};
 
 /// The parsers as they were, verbatim apart from reporting the spelling each billed usage was in,
 /// and from logging, at each guard, the old rules' spelling beside the new classifier's.
+///
+/// The one deliberate change since is D287: a `usage` naming no input or output count of the
+/// wire's spelling is no usage. Its OpenAI half lives in the live `counts_tokens` both sides call,
+/// so the proptests here cannot see a change to it; the corpus pins it directly instead. Its
+/// Anthropic half (a `message_start` without `input_tokens` assigns nothing) is the one edit to
+/// this copy, marked where it is made.
 mod legacy {
     use super::super::*;
     use std::cell::RefCell;
@@ -267,18 +273,21 @@ mod legacy {
             && let Some(mut u) = m.usage.take()
             && !u.looks_openai_shaped()
         {
-            let counted = u.counts_tokens();
-            usage.input_tokens = u.input_tokens.unwrap_or(0);
-            usage.cache_read_tokens = u.cache_read_input_tokens.unwrap_or(0);
-            usage.cache_write_tokens = u.cache_creation_input_tokens.unwrap_or(0);
-            usage.cache_write_1h_tokens = u.cache_creation.ephemeral_1h_input_tokens;
-            usage.service_tier = u.service_tier;
-            if m.id.is_some() {
-                usage.upstream.generation_id = m.id;
+            // D287, the one edit to this frozen copy: a `message_start` naming no
+            // `input_tokens` assigns nothing and is no usage (it once assigned zeros).
+            if u.input_tokens.is_some() {
+                usage.input_tokens = u.input_tokens.unwrap_or(0);
+                usage.cache_read_tokens = u.cache_read_input_tokens.unwrap_or(0);
+                usage.cache_write_tokens = u.cache_creation_input_tokens.unwrap_or(0);
+                usage.cache_write_1h_tokens = u.cache_creation.ephemeral_1h_input_tokens;
+                usage.service_tier = u.service_tier;
+                if m.id.is_some() {
+                    usage.upstream.generation_id = m.id;
+                }
+                *saw_any = true;
             }
             u.vendor().apply(usage);
             usage.server_tool_calls = u64::from(usage.server_tools.web_search);
-            *saw_any |= counted;
         }
         if let Some(mut u) = chunk.usage
             && !u.looks_openai_shaped()
@@ -476,12 +485,19 @@ fn the_corpus_bills_as_the_inferring_parsers_did() {
         ("responses stream, envelope without total_tokens", Stream, vec![], sse(&[r#"{"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":2}}}"#]), Some(Responses), false),
         ("responses stream, final event cut at the front", Stream, vec![], responses_cut_stream, Some(Responses), false),
         ("responses stream, empty envelope usage", Stream, vec![], sse(&[r#"{"type":"response.completed","response":{"usage":{}}}"#]), None, false),
-        // Pins *existing* behaviour, not intended billing (tracked separately as a possible
-        // billing bug): on the OpenAI wire, a `message_delta` whose `usage` names `output_tokens`
-        // without `input_tokens` escapes the Anthropic guard and bills in Chat's spelling.
-        ("messages stream, head and tail (a message_delta with no input_tokens reads as Chat spelling)", Stream, messages_head.clone(), messages_tail.clone(), Some(Chat), true),
+        // D287, pinned here because both sides call the live `counts_tokens`: a usage naming no
+        // input or output count of the OpenAI spelling is no OpenAI usage.
+        ("output_tokens-only body", Body, vec![], br#"{"usage":{"output_tokens":42}}"#.to_vec(), None, true),
+        ("output_tokens-only stream", Stream, vec![], sse(&[r#"{"type":"message_delta","usage":{"output_tokens":42}}"#]), None, true),
+        ("total_tokens-only body", Body, vec![], br#"{"usage":{"total_tokens":9}}"#.to_vec(), None, false),
+        ("total_tokens-only stream", Stream, vec![], sse(&[r#"{"choices":[],"usage":{"total_tokens":9}}"#]), None, false),
+        ("responses stream, output_tokens-only envelope", Stream, vec![], sse(&[r#"{"type":"response.completed","response":{"usage":{"output_tokens":42}}}"#]), None, false),
+        // D287, a deliberate change: these two once billed in Chat's spelling (0/0) on the OpenAI
+        // wire. A `message_delta` whose `usage` names `output_tokens` without `input_tokens` names
+        // no OpenAI count, so it is no usage there, not a zero.
+        ("messages stream, head and tail (a message_delta with no input_tokens is no OpenAI usage)", Stream, messages_head.clone(), messages_tail.clone(), None, true),
         ("messages stream, server-tool-only delta", Stream, vec![], server_tool_only, None, true),
-        ("messages stream, whole", Stream, vec![], [messages_head, messages_tail].concat(), Some(Chat), true),
+        ("messages stream, whole", Stream, vec![], [messages_head, messages_tail].concat(), None, true),
         ("chat stream on the Anthropic wire", Stream, vec![], sse(&[r#"{"type":"message_delta","usage":{"prompt_tokens":1,"completion_tokens":1}}"#]), Some(Chat), false),
         ("empty stream", Stream, vec![], vec![], None, false),
         ("[DONE] only", Stream, vec![], b"data: [DONE]\n\n".to_vec(), None, false),

@@ -276,17 +276,22 @@ struct OpenAiCompletionDetails {
 }
 
 impl OpenAiUsage {
-    /// Whether the object names a token count at all. `"usage": {}` names none: it is no usage to
-    /// meter, and it must not stand in for a real usage event (a trailing empty one would otherwise
-    /// win a stream scan and bill zeros).
+    /// Whether the object names a token count in a spelling this wire reads. `"usage": {}` names
+    /// none: it is no usage to meter, and it must not stand in for a real usage event (a trailing
+    /// empty one would otherwise win a stream scan and bill zeros).
+    ///
+    /// `input_tokens` or `output_tokens` alone names none either (D287). Neither is a Chat field,
+    /// and the Responses spelling always carries the pair, so a lone one is foreign: an Anthropic
+    /// `message_delta` (`{"output_tokens":42}`) relayed on this wire. Counted, it read as Chat and
+    /// billed 0/0, and being newest it hid the real usage chunk before it.
+    ///
+    /// Only an input or output count qualifies. `total_tokens` and the cache counts qualify a count
+    /// but name neither side, so alone (or beside one side of the Responses pair) they bill 0/0
+    /// just the same.
     fn counts_tokens(&self) -> bool {
         self.prompt_tokens.is_some()
             || self.completion_tokens.is_some()
-            || self.input_tokens.is_some()
-            || self.output_tokens.is_some()
-            || self.total_tokens.is_some()
-            || self.prompt_cache_hit_tokens.is_some()
-            || self.prompt_tokens_details.cached_tokens.is_some()
+            || (self.input_tokens.is_some() && self.output_tokens.is_some())
     }
 
     /// The spelling this object is written in; `None` when it names no token count. Chat
@@ -416,9 +421,11 @@ struct OpenAiResponsesOutputDetails {
 }
 
 impl OpenAiResponsesUsage {
-    /// See [`OpenAiUsage::counts_tokens`].
+    /// See [`OpenAiUsage::counts_tokens`]: the Responses spelling always sends the pair, so the
+    /// envelope and a front-truncated top-level `usage` (read by `OpenAiUsage`) agree on the same
+    /// bytes.
     fn counts_tokens(&self) -> bool {
-        self.input_tokens.is_some() || self.output_tokens.is_some() || self.total_tokens.is_some()
+        self.input_tokens.is_some() && self.output_tokens.is_some()
     }
 }
 
@@ -1011,20 +1018,23 @@ fn anthropic_apply(usage: &mut Usage, saw_any: &mut bool, payload: &[u8]) -> boo
     if let Some(mut m) = chunk.message
         && let Some(mut u) = m.usage.take().and_then(AnthropicUsage::on_anthropic)
     {
-        // Only a block that names a token count is a usage (`saw_any`); the fields and the server
-        // tool count are taken from whatever it carries.
-        let counted = u.counts_tokens();
-        usage.input_tokens = u.input_tokens.unwrap_or(0);
-        usage.cache_read_tokens = u.cache_read_input_tokens.unwrap_or(0);
-        usage.cache_write_tokens = u.cache_creation_input_tokens.unwrap_or(0);
-        usage.cache_write_1h_tokens = u.cache_creation.ephemeral_1h_input_tokens;
-        usage.service_tier = u.service_tier;
-        if m.id.is_some() {
-            usage.upstream.generation_id = m.id;
+        // `message_start` *assigns* input and cache, and a real one always names `input_tokens`.
+        // One that doesn't (`{}`, a foreign `{"completion_tokens":42}`, a lone output or cache
+        // count) leaves them alone: assigned, it zeroed what a real `message_start` had set
+        // (D287). Its server tool counts merge (by max) either way, as a delta's do.
+        if u.input_tokens.is_some() {
+            usage.input_tokens = u.input_tokens.unwrap_or(0);
+            usage.cache_read_tokens = u.cache_read_input_tokens.unwrap_or(0);
+            usage.cache_write_tokens = u.cache_creation_input_tokens.unwrap_or(0);
+            usage.cache_write_1h_tokens = u.cache_creation.ephemeral_1h_input_tokens;
+            usage.service_tier = u.service_tier;
+            if m.id.is_some() {
+                usage.upstream.generation_id = m.id;
+            }
+            *saw_any = true;
         }
         u.vendor().apply(usage);
         usage.server_tool_calls = u64::from(usage.server_tools.web_search);
-        *saw_any |= counted;
     }
     if let Some(mut u) = chunk.usage.and_then(AnthropicUsage::on_anthropic) {
         // A delta that carries only a server tool count (a search with no token change) still
@@ -3040,6 +3050,142 @@ data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":2500,\"cache_read_
         assert!(std::panic::catch_unwind(|| estimate_stream_output(tail, max)).is_ok());
         assert!(
             std::panic::catch_unwind(|| estimate_body_output(br#"{"a":"hello"}"#, max)).is_ok()
+        );
+    }
+
+    /// On the OpenAI wire, an Anthropic-style `message_delta` (`output_tokens` alone) names no
+    /// OpenAI count. Read as Chat it billed 0/0, and the newest-first scan returned it ahead of the
+    /// real usage chunk before it.
+    /// claim: BIL-1
+    /// defect: D287
+    #[test]
+    fn an_output_tokens_only_usage_never_hides_an_earlier_openai_usage() {
+        let sse = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50}}\n\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n";
+        let u = stream(Dialect::OpenAi, &[], sse).expect("the earlier chunk is real usage");
+        assert_eq!((u.input_tokens, u.output_tokens), (100, 50));
+    }
+
+    /// The same delta alone is no usage on the OpenAI wire: `None` (so the row is estimated), not
+    /// a zero count.
+    /// claim: BIL-1
+    /// defect: D287
+    #[test]
+    fn an_output_tokens_only_usage_is_no_usage_on_the_openai_wire() {
+        let delta = b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n";
+        assert_eq!(stream(Dialect::OpenAi, &[], delta), None);
+        assert_eq!(
+            body(Dialect::OpenAi, br#"{"usage":{"output_tokens":42}}"#),
+            None
+        );
+        assert_eq!(
+            body(Dialect::OpenAi, br#"{"usage":{"input_tokens":42}}"#),
+            None
+        );
+    }
+
+    /// The reverse: on the Anthropic wire, a `usage` naming only Chat's `completion_tokens` names
+    /// no Anthropic count. In a `message_start` it still overwrote the input and cache counts
+    /// the real `message_start` had set, so a later one zeroed them.
+    /// claim: BIL-1
+    /// defect: D287
+    #[test]
+    fn a_completion_tokens_only_usage_never_overrides_an_earlier_anthropic_usage() {
+        let sse = b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":30,\"output_tokens\":1}}}\n\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":50}}\n\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"completion_tokens\":42}}}\n\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"completion_tokens\":42}}\n\n";
+        let u = stream(Dialect::Anthropic, &[], sse).expect("the earlier events are real usage");
+        assert_eq!(
+            (u.input_tokens, u.cache_read_tokens, u.output_tokens),
+            (100, 30, 50)
+        );
+        let alone = b"data: {\"type\":\"message_delta\",\"usage\":{\"completion_tokens\":42}}\n\n";
+        assert_eq!(stream(Dialect::Anthropic, &[], alone), None);
+        assert_eq!(
+            body(Dialect::Anthropic, br#"{"usage":{"completion_tokens":42}}"#),
+            None
+        );
+    }
+
+    /// The Responses stream envelope follows the same pair rule as a top-level `usage`: a lone
+    /// `output_tokens` in `response.completed` is no usage, so it neither bills (0, 42) nor hides
+    /// the real line before it. The front-truncated path already read those bytes as `None`.
+    /// claim: BIL-1
+    /// defect: D287
+    #[test]
+    fn a_lone_count_in_the_responses_envelope_is_no_usage() {
+        let envelope = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"output_tokens\":42}}}\n\n";
+        let sse = format!(
+            "data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":100,\"completion_tokens\":50}}}}\n\n{envelope}"
+        );
+        let u = stream(Dialect::OpenAi, &[], sse.as_bytes()).expect("the earlier chunk is usage");
+        assert_eq!((u.input_tokens, u.output_tokens), (100, 50));
+        assert_eq!(stream(Dialect::OpenAi, &[], envelope.as_bytes()), None);
+        // The front-truncated reading of the same event agrees.
+        assert_eq!(
+            stream(Dialect::OpenAi, &[], &envelope.as_bytes()[8..]),
+            None
+        );
+    }
+
+    /// `total_tokens` names no input or output count, alone or beside one side of the
+    /// Responses pair: no usage on a body, and no mask over an earlier real stream line.
+    /// claim: BIL-1
+    /// defect: D287
+    #[test]
+    fn total_tokens_without_a_count_is_no_openai_usage() {
+        for usage in [
+            r#"{"total_tokens":9}"#,
+            r#"{"input_tokens":4,"total_tokens":9}"#,
+            r#"{"output_tokens":5,"total_tokens":9}"#,
+        ] {
+            let b = format!(r#"{{"usage":{usage}}}"#);
+            assert_eq!(body(Dialect::OpenAi, b.as_bytes()), None, "{usage}");
+            let sse = format!(
+                "data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":100,\"completion_tokens\":50}}}}\n\n\
+                 data: {{\"choices\":[],\"usage\":{usage}}}\n\n"
+            );
+            let u = stream(Dialect::OpenAi, &[], sse.as_bytes()).expect(usage);
+            assert_eq!((u.input_tokens, u.output_tokens), (100, 50), "{usage}");
+        }
+    }
+
+    /// A `message_start` that names no `input_tokens` (only `output_tokens`, or only cache
+    /// counts) does not reset the input and cache counts a real one set.
+    /// claim: BIL-1
+    /// defect: D287
+    #[test]
+    fn a_message_start_without_input_tokens_keeps_the_earlier_counts() {
+        let sse = b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":30,\"cache_creation_input_tokens\":20,\"output_tokens\":1}}}\n\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":50}}\n\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"output_tokens\":3}}}\n\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"cache_read_input_tokens\":7}}}\n\n";
+        let u = stream(Dialect::Anthropic, &[], sse).unwrap();
+        assert_eq!(
+            (
+                u.input_tokens,
+                u.cache_read_tokens,
+                u.cache_write_tokens,
+                u.output_tokens
+            ),
+            (100, 30, 20, 50)
+        );
+    }
+
+    /// A `message_start` whose `usage` carries only a server tool count still contributes that
+    /// count, as a `message_delta`'s does, without touching the token counts.
+    /// claim: BIL-1
+    /// defect: D287
+    #[test]
+    fn a_server_tool_only_message_start_keeps_its_count() {
+        let sse = b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"server_tool_use\":{\"web_search_requests\":1}}}}\n\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
+        let u = stream(Dialect::Anthropic, &[], sse).unwrap();
+        assert_eq!(
+            (u.input_tokens, u.output_tokens, u.server_tool_calls),
+            (10, 5, 1)
         );
     }
 }
