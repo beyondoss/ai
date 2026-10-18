@@ -2961,3 +2961,17 @@ state = "fixed"
 test = "a_late_body_verdict_cannot_reopen_a_breaker_another_probe_owns"
 fix = "b20832b"
 note = "Fixed in proxy.rs: PendingHealth keeps a copy of the breaker permit the head resolved (Permit is Copy), and settle_health records the verdict with record_failure_for(permit). A permit claimed while CLOSED decides nothing in HALF_OPEN, so the other probe keeps the breaker. The unscoped record_success and record_failure have no other production caller; removing them is PR 1. Also held by a_late_failure_from_a_closed_permit_cannot_reopen_another_probes_breaker (circuit_breaker.rs), the breaker rule the fix relies on. Behaviour in CLOSED is unchanged: stale() is consulted only in the HALF_OPEN arms, so a late failure in CLOSED still counts toward the threshold. Only a permit from an earlier or other probe is ignored, in HALF_OPEN."
+
+[[defect]]
+id = "D287"
+severity = "med"
+area = "Billing"
+title = "A usage object naming no count of the wire's own spelling billed zeros and hid the real usage (B18)"
+impact = "On the OpenAI wire, an Anthropic-style message_delta usage ({\"output_tokens\":42}) escaped the mismatch guard, which needs both input_tokens and output_tokens, and was classified as Chat spelling, which reads prompt_tokens/completion_tokens, so it billed 0/0. The OpenAI stream scan returns the newest accepted line, so that zero hid an earlier real usage chunk. On the Anthropic wire, a message_start whose usage named no Anthropic count (Chat's completion_tokens alone, or {}) still assigned its absent input and cache counts, zeroing what a real message_start had set. Latent in production: no configured provider sends either shape, but a mis-dialected one would bill zero."
+confidence = "high"
+evidence = "usage.rs OpenAiUsage::counts_tokens counted output_tokens or input_tokens alone; anthropic_apply assigned a message_start usage whatever it named. Reproduced on d4ea080 by an_output_tokens_only_usage_never_hides_an_earlier_openai_usage (billed (0, 0), want (100, 50)), an_output_tokens_only_usage_is_no_usage_on_the_openai_wire (Some(zero), want None) and a_completion_tokens_only_usage_never_overrides_an_earlier_anthropic_usage (input and cache (0, 0), want (100, 30))."
+claims = ["BIL-1"]
+state = "fixed"
+test = "an_output_tokens_only_usage_never_hides_an_earlier_openai_usage"
+fix = ""
+note = "Fixed in usage.rs: on the OpenAI wire input_tokens and output_tokens count only as a pair (Responses always sends both, Chat neither), so a lone one names no count and spelling() is None: no usage, not zero, and the scan falls through to the earlier real line. On the Anthropic wire a message_start usage that names no Anthropic count is skipped, as a message_delta's already was. Both are Option checks on the deserialized struct; might_carry_usage is unchanged. The dialect_tests corpus case that pinned the old 0/0 (messages stream, head and tail, and its whole-stream twin) now expects None."

@@ -11,6 +11,11 @@ use serde_json::{Value, json};
 
 /// The parsers as they were, verbatim apart from reporting the spelling each billed usage was in,
 /// and from logging, at each guard, the old rules' spelling beside the new classifier's.
+///
+/// They call the live `counts_tokens`, so the one deliberate change since (D287: `input_tokens` or
+/// `output_tokens` alone is no OpenAI count) holds on both sides. D287's other half, a
+/// `message_start` naming no Anthropic count no longer assigning zeros, changes nothing a single
+/// generated object can show, since such a block never sets `saw_any`.
 mod legacy {
     use super::super::*;
     use std::cell::RefCell;
@@ -476,12 +481,12 @@ fn the_corpus_bills_as_the_inferring_parsers_did() {
         ("responses stream, envelope without total_tokens", Stream, vec![], sse(&[r#"{"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":2}}}"#]), Some(Responses), false),
         ("responses stream, final event cut at the front", Stream, vec![], responses_cut_stream, Some(Responses), false),
         ("responses stream, empty envelope usage", Stream, vec![], sse(&[r#"{"type":"response.completed","response":{"usage":{}}}"#]), None, false),
-        // Pins *existing* behaviour, not intended billing (tracked separately as a possible
-        // billing bug): on the OpenAI wire, a `message_delta` whose `usage` names `output_tokens`
-        // without `input_tokens` escapes the Anthropic guard and bills in Chat's spelling.
-        ("messages stream, head and tail (a message_delta with no input_tokens reads as Chat spelling)", Stream, messages_head.clone(), messages_tail.clone(), Some(Chat), true),
+        // D287, a deliberate change: these two once billed in Chat's spelling (0/0) on the OpenAI
+        // wire. A `message_delta` whose `usage` names `output_tokens` without `input_tokens` names
+        // no OpenAI count, so it is no usage there, not a zero.
+        ("messages stream, head and tail (a message_delta with no input_tokens is no OpenAI usage)", Stream, messages_head.clone(), messages_tail.clone(), None, true),
         ("messages stream, server-tool-only delta", Stream, vec![], server_tool_only, None, true),
-        ("messages stream, whole", Stream, vec![], [messages_head, messages_tail].concat(), Some(Chat), true),
+        ("messages stream, whole", Stream, vec![], [messages_head, messages_tail].concat(), None, true),
         ("chat stream on the Anthropic wire", Stream, vec![], sse(&[r#"{"type":"message_delta","usage":{"prompt_tokens":1,"completion_tokens":1}}"#]), Some(Chat), false),
         ("empty stream", Stream, vec![], vec![], None, false),
         ("[DONE] only", Stream, vec![], b"data: [DONE]\n\n".to_vec(), None, false),

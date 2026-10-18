@@ -274,14 +274,18 @@ struct OpenAiCompletionDetails {
 }
 
 impl OpenAiUsage {
-    /// Whether the object names a token count at all. `"usage": {}` names none: it is no usage to
-    /// meter, and it must not stand in for a real usage event (a trailing empty one would otherwise
-    /// win a stream scan and bill zeros).
+    /// Whether the object names a token count in a spelling this wire reads. `"usage": {}` names
+    /// none: it is no usage to meter, and it must not stand in for a real usage event (a trailing
+    /// empty one would otherwise win a stream scan and bill zeros).
+    ///
+    /// `input_tokens` or `output_tokens` alone names none either (D287). Neither is a Chat field,
+    /// and the Responses spelling always carries the pair, so a lone one is foreign: an Anthropic
+    /// `message_delta` (`{"output_tokens":42}`) relayed on this wire. Counted, it read as Chat and
+    /// billed 0/0, and being newest it hid the real usage chunk before it.
     fn counts_tokens(&self) -> bool {
         self.prompt_tokens.is_some()
             || self.completion_tokens.is_some()
-            || self.input_tokens.is_some()
-            || self.output_tokens.is_some()
+            || (self.input_tokens.is_some() && self.output_tokens.is_some())
             || self.total_tokens.is_some()
             || self.prompt_cache_hit_tokens.is_some()
             || self.prompt_tokens_details.cached_tokens.is_some()
@@ -1007,11 +1011,15 @@ fn anthropic_apply(usage: &mut Usage, saw_any: &mut bool, payload: &[u8]) -> boo
         usage.upstream.container_id = Some(c);
     }
     if let Some(mut m) = chunk.message
-        && let Some(mut u) = m.usage.take().and_then(AnthropicUsage::on_anthropic)
+        && let Some(mut u) = m
+            .usage
+            .take()
+            .and_then(AnthropicUsage::on_anthropic)
+            .filter(AnthropicUsage::counts_tokens)
     {
-        // Only a block that names a token count is a usage (`saw_any`); the fields and the server
-        // tool count are taken from whatever it carries.
-        let counted = u.counts_tokens();
+        // `message_start` *assigns* its fields, so a block naming no Anthropic count (`{}`, or a
+        // foreign `{"completion_tokens":42}`) is skipped: applied, it zeroed the input and cache
+        // counts a real `message_start` had set (D287).
         usage.input_tokens = u.input_tokens.unwrap_or(0);
         usage.cache_read_tokens = u.cache_read_input_tokens.unwrap_or(0);
         usage.cache_write_tokens = u.cache_creation_input_tokens.unwrap_or(0);
@@ -1022,7 +1030,7 @@ fn anthropic_apply(usage: &mut Usage, saw_any: &mut bool, payload: &[u8]) -> boo
         }
         u.vendor().apply(usage);
         usage.server_tool_calls = u64::from(usage.server_tools.web_search);
-        *saw_any |= counted;
+        *saw_any = true;
     }
     if let Some(mut u) = chunk.usage.and_then(AnthropicUsage::on_anthropic) {
         // A delta that carries only a server tool count (a search with no token change) still
@@ -3038,6 +3046,61 @@ data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":2500,\"cache_read_
         assert!(std::panic::catch_unwind(|| estimate_stream_output(tail, max)).is_ok());
         assert!(
             std::panic::catch_unwind(|| estimate_body_output(br#"{"a":"hello"}"#, max)).is_ok()
+        );
+    }
+
+    /// On the OpenAI wire, an Anthropic-style `message_delta` (`output_tokens` alone) names no
+    /// OpenAI count. Read as Chat it billed 0/0, and the newest-first scan returned it ahead of the
+    /// real usage chunk before it.
+    /// claim: BIL-1
+    /// defect: D287
+    #[test]
+    fn an_output_tokens_only_usage_never_hides_an_earlier_openai_usage() {
+        let sse = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50}}\n\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n";
+        let u = stream(Dialect::OpenAi, &[], sse).expect("the earlier chunk is real usage");
+        assert_eq!((u.input_tokens, u.output_tokens), (100, 50));
+    }
+
+    /// The same delta alone is no usage on the OpenAI wire: `None` (so the row is estimated), not
+    /// a zero count.
+    /// claim: BIL-1
+    /// defect: D287
+    #[test]
+    fn an_output_tokens_only_usage_is_no_usage_on_the_openai_wire() {
+        let delta = b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n";
+        assert_eq!(stream(Dialect::OpenAi, &[], delta), None);
+        assert_eq!(
+            body(Dialect::OpenAi, br#"{"usage":{"output_tokens":42}}"#),
+            None
+        );
+        assert_eq!(
+            body(Dialect::OpenAi, br#"{"usage":{"input_tokens":42}}"#),
+            None
+        );
+    }
+
+    /// The reverse: on the Anthropic wire, a `usage` naming only Chat's `completion_tokens` names
+    /// no Anthropic count. In a `message_start` it still overwrote the input and cache counts
+    /// the real `message_start` had set, so a later one zeroed them.
+    /// claim: BIL-1
+    /// defect: D287
+    #[test]
+    fn a_completion_tokens_only_usage_never_overrides_an_earlier_anthropic_usage() {
+        let sse = b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":30,\"output_tokens\":1}}}\n\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":50}}\n\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"completion_tokens\":42}}}\n\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"completion_tokens\":42}}\n\n";
+        let u = stream(Dialect::Anthropic, &[], sse).expect("the earlier events are real usage");
+        assert_eq!(
+            (u.input_tokens, u.cache_read_tokens, u.output_tokens),
+            (100, 30, 50)
+        );
+        let alone = b"data: {\"type\":\"message_delta\",\"usage\":{\"completion_tokens\":42}}\n\n";
+        assert_eq!(stream(Dialect::Anthropic, &[], alone), None);
+        assert_eq!(
+            body(Dialect::Anthropic, br#"{"usage":{"completion_tokens":42}}"#),
+            None
         );
     }
 }

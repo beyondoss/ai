@@ -1916,6 +1916,15 @@ sends, is what tells it apart. Before that check, every non-stream `/v1/response
 zero. The Responses stream envelope (`response.usage`) is not guarded: Anthropic's wire never
 carries it.
 
+A `usage` object that names no count in the wire's own spelling is **no usage**, never a zero, and
+never overrides an earlier real one (D287). On the OpenAI wire, `input_tokens` or `output_tokens`
+alone is not a count: Chat has neither and the Responses spelling always sends the pair. An
+Anthropic `message_delta` (`{"output_tokens":42}`) relayed there once read as Chat, billed 0/0, and,
+being newest, hid the real usage chunk before it from the newest-first stream scan. On the Anthropic
+wire, a `message_start` whose `usage` names no Anthropic count (`{}`, or Chat's
+`completion_tokens` alone) is skipped instead of assigning zeros over the input and cache counts a
+real one set. Both checks are `Option` tests on the already-deserialized struct.
+
 ### Streams cut short (`usage.rs` estimates)
 
 A stream's usage block is its **last** event. A client that hangs up first — a cancelled agent
