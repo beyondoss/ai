@@ -23,6 +23,8 @@ use clap::{Parser, Subcommand};
 use pingora_core::apps::HttpServerOptions;
 use pingora_core::apps::http_app::HttpServer;
 use pingora_core::listeners::TcpSocketOptions;
+use pingora_core::listeners::tls::TlsSettings;
+use pingora_core::protocols::ALPN;
 use pingora_core::server::configuration::ServerConf;
 use pingora_core::server::{
     RunArgs, Server, ShutdownSignal, ShutdownSignalWatch, UnixShutdownSignalWatch,
@@ -449,6 +451,27 @@ fn main() {
     // bound rather than when the model next speaks. `TcpSocketOptions` is `#[non_exhaustive]`.
     let mut sock = TcpSocketOptions::default();
     sock.tcp_keepalive = state.config.downstream_tcp_keepalive();
+    // The public TLS listener, when configured (`validate_tls` already proved the files load, so
+    // pingora's panicking build cannot fire on a bad file). Same service, so the same filters,
+    // metrics and billing rows. ALPN follows the plaintext side: h2 and http/1.1, or http/1.1 alone
+    // when `downstream_h2c` is off.
+    if let (Some(addr), Some(cert), Some(key)) = (
+        state.config.tls_listen.as_deref(),
+        state.config.tls_cert.as_deref(),
+        state.config.tls_key.as_deref(),
+    ) {
+        let mut tls = match TlsSettings::intermediate(cert, key) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("failed to load the TLS certificate: {e}");
+                exit(1);
+            }
+        };
+        tls.set_alpn(if downstream_h2c { ALPN::H2H1 } else { ALPN::H1 });
+        let mut tls_sock = TcpSocketOptions::default();
+        tls_sock.tcp_keepalive = state.config.downstream_tcp_keepalive();
+        proxy_svc.add_tls_with_settings(addr, Some(tls_sock), tls);
+    }
     proxy_svc.add_tcp_with_settings(&listen, sock);
     // Size the proxy's worker pool. Pingora resolves a service's thread count as
     // `service.threads().unwrap_or(conf.threads)` (`server/mod.rs`), and `ServerConf::default()` is
@@ -489,6 +512,7 @@ fn main() {
 
     tracing::info!(
         %listen,
+        tls_listen = state.config.tls_listen.as_deref().unwrap_or(""),
         %metrics_listen,
         worker_threads,
         grace_period_secs,
