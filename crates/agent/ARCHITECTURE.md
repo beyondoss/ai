@@ -4836,7 +4836,8 @@ is still rooted at the same tenant. An id the caller supplies is never rewritten
 
 `serve --listen … --service` turns the daemon from "a headless agent for whoever is on the other end
 of this socket" into a **fail-closed multi-tenant service**. Every connection presents a
-[session grant](#session-grant-bsg_v1) in the `x-beyond-grant` header; that grant says which tenant
+[session grant](#session-grant-bsg_v1) in the `x-beyond-grant` header (or, for a browser
+`WebSocket`, which cannot set headers, as `Sec-WebSocket-Protocol: beyond.grant, <grant>`); that grant says which tenant
 and session it is, where the session's sandbox and workspace are, and — sealed — the credentials to
 reach them. [`service.rs`](src/service.rs) is the seam: it turns a token into a `ServiceSession`, and
 everything `serve` used to answer from the replica host it now asks that.
@@ -4858,7 +4859,12 @@ diverge on who is allowed in. The `x-beyond-grant` header is taken off the `Http
 is read (`HttpHead::take_grant`): the head is handed to tungstenite's `create_response`, which echoes
 request headers into the handshake, so a grant left in place would be reflected straight back to
 whoever sent it. A value over **12 KiB** is dropped unread — the whole header block is capped at
-16 KiB, so a larger one cannot be a grant this fleet minted. `now` comes from `SystemTime` with
+16 KiB, so a larger one cannot be a grant this fleet minted. The subprotocol form is parsed as an RFC 6455
+comma-separated list and accepted only when it is exactly the `beyond.grant` marker followed by one token;
+the marker with anything else is a 400, a list without the marker is some other negotiation and is left
+alone, and a grant in **both** carriers is a 400 (even if they agree) rather than a silent choice. The
+whole `Sec-WebSocket-Protocol` header is stripped from the head, and the 101 answers
+`Sec-WebSocket-Protocol: beyond.grant` only, never the token. `now` comes from `SystemTime` with
 `unwrap_or(u64::MAX)`: a clock the process cannot read at all expires every grant rather than
 accepting every expired one.
 

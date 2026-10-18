@@ -84,7 +84,8 @@
 //!
 //! `serve --service` is the exception, and the reason is multi-tenancy rather than a change of heart:
 //! one replica serving many tenants cannot infer from a loopback socket *whose* session a connection
-//! is for. So every connection carries a [session grant](crate::grant) in `x-beyond-grant`, verified
+//! is for. So every connection carries a [session grant](crate::grant) in `x-beyond-grant` (or a browser's
+//! `Sec-WebSocket-Protocol: beyond.grant, <grant>`), verified
 //! here — before the method branch, so WebSocket and POST cannot diverge — and turned into the
 //! [`ServiceSession`](crate::service::ServiceSession) that fixes that session's tenant, storage,
 //! sandbox and credentials. The refusals are HTTP statuses (401/400/403/421), answered *before* the
@@ -2269,19 +2270,34 @@ where
     // Before the method branch, so the WebSocket and POST paths cannot diverge on who is allowed in.
     let service = match &supervisor.service {
         None => None,
-        Some(svc) => match crate::service::authorize(
-            &svc.verifier,
-            &svc.shards,
-            grant.as_deref(),
-            requested_id.as_deref(),
-            crate::service::now_unix(),
-        ) {
-            Ok(session) => Some(Arc::new(session)),
-            Err(refusal) => {
-                refuse(&mut stream, &head, &leftover, HttpError::from(refusal)).await;
-                return Ok(());
+        Some(svc) => {
+            let grant = match grant {
+                GrantCarrier::Grant(g) => g,
+                GrantCarrier::Malformed => {
+                    let e = HttpError::BadRequest("malformed Sec-WebSocket-Protocol grant");
+                    refuse(&mut stream, &head, &leftover, e).await;
+                    return Ok(());
+                }
+                GrantCarrier::Ambiguous => {
+                    let e = HttpError::BadRequest("grant given in both header and subprotocol");
+                    refuse(&mut stream, &head, &leftover, e).await;
+                    return Ok(());
+                }
+            };
+            match crate::service::authorize(
+                &svc.verifier,
+                &svc.shards,
+                grant.as_deref(),
+                requested_id.as_deref(),
+                crate::service::now_unix(),
+            ) {
+                Ok(session) => Some(Arc::new(session)),
+                Err(refusal) => {
+                    refuse(&mut stream, &head, &leftover, HttpError::from(refusal)).await;
+                    return Ok(());
+                }
             }
-        },
+        }
     };
 
     match head.method.as_str() {
@@ -2531,7 +2547,17 @@ where
         }
     };
     let response = match create_response(&request) {
-        Ok(r) => r,
+        Ok(mut r) => {
+            // The grant was stripped from `request` by `take_grant`, so nothing can echo it; name
+            // only the marker, which a browser requires back for the handshake to complete.
+            if head.grant_subprotocol {
+                r.headers_mut().insert(
+                    http::header::SEC_WEBSOCKET_PROTOCOL,
+                    http::HeaderValue::from_static(GRANT_SUBPROTOCOL),
+                );
+            }
+            r
+        }
         Err(_) => {
             supervisor.unpin(&pinned.id, pinned.incarnation);
             supervisor
@@ -2811,27 +2837,83 @@ struct HttpHead {
     content_length: Option<usize>,
     transfer_encoding: Option<String>,
     headers: Vec<(String, String)>,
+    /// The grant arrived as a `Sec-WebSocket-Protocol` token; the 101 must answer with the marker.
+    grant_subprotocol: bool,
 }
 
 impl HttpHead {
-    /// Remove and return the `x-beyond-grant` header.
+    /// Remove and return the session grant, from wherever the client put it.
     ///
-    /// **Removing** it is the point. A grant carries sealed credentials, and this head is handed to
-    /// `create_response`, which echoes the request's headers into the handshake — so a grant left in
-    /// place would be reflected straight back to the client, and would sit in the `Debug` of any
-    /// head logged on an error path. Read once, here, and gone.
+    /// Two carriers, because a browser `WebSocket` cannot set custom headers:
+    ///
+    /// - the `x-beyond-grant` header (every non-browser client), or
+    /// - `Sec-WebSocket-Protocol: beyond.grant, <grant>` (the browser workaround Kubernetes uses for
+    ///   bearer tokens). The list is comma-separated per RFC 6455 with optional whitespace. If the
+    ///   `beyond.grant` marker is present the list must be **exactly** the marker followed by one
+    ///   token; anything else is [`GrantCarrier::Malformed`]. A list without the marker is some
+    ///   other subprotocol negotiation and is left alone.
+    ///
+    /// Both carriers at once is [`GrantCarrier::Ambiguous`], even if they agree: a client that sends
+    /// two credentials has a bug, and picking one silently would hide it.
+    ///
+    /// **Removing** is the point. A grant carries sealed credentials, and this head is handed to
+    /// `create_response`, which echoes request headers into the handshake — so a grant left in place
+    /// would be reflected straight back to the client, and would sit in the `Debug` of any head logged
+    /// on an error path. Read once, here, and gone. The 101 then names only the marker
+    /// (`grant_subprotocol`), never the token.
     ///
     /// A value over [`MAX_GRANT_BYTES`](crate::service::MAX_GRANT_BYTES) is dropped rather than
     /// returned: it cannot be a grant this fleet minted, and there is no reason to run crypto over
     /// it. The caller then sees "no grant" — a 401, which is what an unusable token deserves.
-    fn take_grant(&mut self) -> Option<String> {
-        let idx = self
+    fn take_grant(&mut self) -> GrantCarrier {
+        let from_header = self
             .headers
             .iter()
-            .position(|(name, _)| name.eq_ignore_ascii_case(crate::service::GRANT_HEADER))?;
-        let (_, value) = self.headers.remove(idx);
-        (value.len() <= crate::service::MAX_GRANT_BYTES).then_some(value)
+            .position(|(name, _)| name.eq_ignore_ascii_case(crate::service::GRANT_HEADER))
+            .map(|idx| self.headers.remove(idx).1);
+
+        let is_proto = |name: &str| name.eq_ignore_ascii_case("sec-websocket-protocol");
+        let mut tokens: Vec<String> = Vec::new();
+        for (_, v) in self.headers.iter().filter(|(n, _)| is_proto(n)) {
+            tokens.extend(
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_owned),
+            );
+        }
+        let marked = tokens.iter().any(|t| t == GRANT_SUBPROTOCOL);
+        let mut from_proto = None;
+        if marked {
+            self.headers.retain(|(n, _)| !is_proto(n));
+            match tokens.as_slice() {
+                [m, g] if m == GRANT_SUBPROTOCOL && g != GRANT_SUBPROTOCOL => {
+                    from_proto = Some(g.clone());
+                    self.grant_subprotocol = true;
+                }
+                _ => return GrantCarrier::Malformed,
+            }
+        }
+        let fits = |v: String| (v.len() <= crate::service::MAX_GRANT_BYTES).then_some(v);
+        match (from_header, from_proto) {
+            (Some(_), Some(_)) => GrantCarrier::Ambiguous,
+            (Some(v), None) | (None, Some(v)) => GrantCarrier::Grant(fits(v)),
+            (None, None) => GrantCarrier::Grant(None),
+        }
     }
+}
+
+/// The `Sec-WebSocket-Protocol` marker that precedes a grant token. The only subprotocol the 101 names.
+const GRANT_SUBPROTOCOL: &str = "beyond.grant";
+
+/// What [`HttpHead::take_grant`] found.
+enum GrantCarrier {
+    /// At most one grant, from either carrier.
+    Grant(Option<String>),
+    /// The subprotocol list had the marker but not exactly one token after it.
+    Malformed,
+    /// A grant in both the header and the subprotocol list.
+    Ambiguous,
 }
 
 fn session_id_from_query(query: Option<&str>) -> Option<String> {
@@ -2971,6 +3053,7 @@ fn parse_http_head(buf: &[u8]) -> Result<(HttpHead, usize), HttpError> {
             content_length,
             transfer_encoding,
             headers: collected,
+            grant_subprotocol: false,
         },
         header_len,
     ))

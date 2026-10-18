@@ -27,7 +27,9 @@
 //! **Not applied in service mode.** Every request there must carry a session grant in the
 //! `x-beyond-grant` header. That is not an ambient credential: a browser never attaches it on its own,
 //! a page cannot add a custom header to a cross-origin request without a preflight (refused), and a
-//! WebSocket upgrade from a browser cannot carry custom headers at all. Without a grant a forged
+//! WebSocket upgrade from a browser cannot carry custom headers at all — it can carry the grant only
+//! in `Sec-WebSocket-Protocol: beyond.grant, <grant>`, which a page must have been handed the grant
+//! to set, so it is no more ambient than the header. Without a grant a forged
 //! request is a 401, so there is no confused deputy for `Origin` to guard; and `Host` there is
 //! whatever name the load balancer routed, so a loopback rule could never hold.
 
