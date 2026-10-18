@@ -1698,7 +1698,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_schema,
             output_description,
         } => {
-            run_task(
+            // Boxed: each subcommand's future is a separate allocation, so `run_main`'s own future stays
+            // shallow. Inlined, its layout outgrew rustc's query depth limit on newer toolchains.
+            Box::pin(run_task(
                 tasks,
                 model,
                 gateway_url,
@@ -1778,7 +1780,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 json,
                 output_schema,
                 output_description,
-            )
+            ))
             .await?;
         }
         Command::Serve {
@@ -2480,9 +2482,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     uds_mode: serve_cfg.listen_uds_mode,
                     systemd: systemd_activated,
                 };
-                serve_ws::serve_ws(serve_cfg, listeners).await?
+                Box::pin(serve_ws::serve_ws(serve_cfg, listeners)).await?
             } else {
-                serve::serve(serve_cfg).await?
+                Box::pin(serve::serve(serve_cfg)).await?
             };
             // `serve` reads stdin via `tokio::io::stdin()`, which parks a dedicated blocking OS
             // thread doing a blocking read for the life of the process. If stdin is never closed

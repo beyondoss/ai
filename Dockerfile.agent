@@ -37,9 +37,10 @@
 # or read-only, which is what should take a replica out of rotation; `/livez` ignores the shards,
 # because restarting the process does not put a mount back.
 
-# Latest stable 1.x. The crate's MSRV is 1.85, but cargo-chef's own build pulls deps that need a
-# newer rustc, so the image toolchain must lead the MSRV.
-ARG RUST_VERSION=1
+# The toolchain CI tests with (mise.toml's `rust` pin; publish.yml passes it in). A floating `1`
+# let a newer rustc than CI's build the image, and it once failed where CI passed. It must still lead
+# the crate's MSRV (1.85), because cargo-chef's own build pulls deps that need a newer rustc.
+ARG RUST_VERSION=1.92
 ARG ALPINE_VERSION=3.22
 
 # ---------------------------------------------------------------------------

@@ -11,9 +11,9 @@
 # layer that's keyed only on the dependency graph, so source-only changes skip
 # the slow dep compile.
 
-# Latest stable 1.x. The crate's MSRV is 1.85, but cargo-chef's own build pulls
-# deps that need a newer rustc, so the image toolchain must lead the MSRV.
-ARG RUST_VERSION=1
+# The toolchain CI tests with (mise.toml's `rust` pin; publish.yml passes it in).
+# It must still lead the MSRV (1.85): cargo-chef's own build needs a newer rustc.
+ARG RUST_VERSION=1.92
 
 # ---------------------------------------------------------------------------
 # Stage 1: chef — base with cargo-chef installed.
