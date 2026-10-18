@@ -3926,11 +3926,11 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `store_watch`     | Generic `WatchedSet` driver — gap-free seeding + delta watch, instantiated per set                                                                                             | unit ✓ + e2e ✓ |
 | `config`          | Figment config; build keyring; pool keys / authorities by provider name                                                                                                        | unit ✓         |
 | `secret`          | Redacting, zeroize-on-drop `Secret<T>` newtype for pool keys and NATS creds                                                                                                    | unit ✓         |
-| `signed_id`       | Tenant-bound Responses ids: provider ids HMAC-signed for the tenant out, verified and stripped in; no state                                                                    | unit ✓ + e2e ✓ |
+| `signed_id`       | Tenant-bound Responses ids: provider ids HMAC-signed for the tenant out, verified and stripped in; no state; `SignerError` for bad id signing keys                             | unit ✓ + e2e ✓ |
 | `admin`           | `ServeHttp` on the metrics listener: `/livez`, `/readyz`, `/metrics`                                                                                                           | unit ✓ + e2e ✓ |
 | `metrics`         | Prometheus counter/histogram/gauge registration and update helpers                                                                                                             | unit ✓         |
 | `doctor`          | Boot-time diagnostics (`beyond-ai doctor`)                                                                                                                                     | unit ✓         |
-| `error`           | `GatewayError` (`Config` / `Store` / `Dns`) `thiserror` enum and `Result` alias                                                                                                | compile ✓      |
+| `error`           | `GatewayError` (`Config` / `Store` / `Dns` with its `io::Error` source) and `ConfigError`, one variant per boot check; each message is operator-facing text, kept verbatim     | unit ✓         |
 | `lib`             | Library root: declares the modules `main` wires into the Pingora service; test-only clippy allowances                                                                          | compile ✓      |
 | `main`            | CLI (`run` / `doctor`), rustls init, config load, Pingora server + proxy/watchers/admin bootstrap                                                                              | compile ✓      |
 

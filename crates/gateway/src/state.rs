@@ -13,7 +13,7 @@ use crate::capture::{CaptureRule, CaptureSet};
 use crate::concurrency::{BodyBudget, TenantSlots};
 use crate::config::{UpstreamTls, ValidConfig};
 use crate::deny::DenySet;
-use crate::error::{GatewayError, Result};
+use crate::error::{ConfigError, GatewayError, Result};
 use crate::key::Keyring;
 use crate::metrics::{Metrics, ProviderMetrics};
 use crate::ratelimit::RateLimit;
@@ -56,7 +56,11 @@ struct DnsEntry {
 }
 
 /// A lookup's answer as its waiters see it: `None` until it is known (or `DNS_TIMEOUT` passed).
-type DnsAnswer = Option<std::result::Result<Arc<[SocketAddr]>, String>>;
+/// The failure is shared by every waiter, so it is an `Arc`; a timeout or an empty answer is an
+/// `io::Error` of its own, so a waiter sees one kind of cause whatever went wrong.
+type DnsAnswer = Option<LookupResult<Arc<[SocketAddr]>>>;
+
+type LookupResult<T> = std::result::Result<T, Arc<std::io::Error>>;
 
 /// The DNS cache, and the lookups in flight for it (D89).
 #[derive(Default)]
@@ -120,12 +124,12 @@ impl DnsCache {
         let pending = lookup(authority.clone());
         tokio::pin!(pending);
         let looked_up = match tokio::time::timeout(DNS_TIMEOUT, &mut pending).await {
-            Ok(r) => r.map_err(|e| format!("{authority}: {e}")),
+            Ok(r) => r.map_err(Arc::new),
             Err(_) => {
-                let timed_out = format!(
-                    "{authority}: lookup timed out after {}s",
-                    DNS_TIMEOUT.as_secs()
-                );
+                let timed_out = Arc::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("lookup timed out after {}s", DNS_TIMEOUT.as_secs()),
+                ));
                 tx.send_replace(Some(self.settle(&authority, Err(timed_out))));
                 // Still in flight: wait the hung lookup out rather than start another beside it.
                 // A late answer still fills the cache.
@@ -143,8 +147,8 @@ impl DnsCache {
     fn settle(
         &self,
         authority: &str,
-        looked_up: std::result::Result<Vec<SocketAddr>, String>,
-    ) -> std::result::Result<Arc<[SocketAddr]>, String> {
+        looked_up: LookupResult<Vec<SocketAddr>>,
+    ) -> LookupResult<Arc<[SocketAddr]>> {
         let now = Instant::now();
         let e = match looked_up {
             Ok(addrs) if !addrs.is_empty() => {
@@ -166,7 +170,7 @@ impl DnsCache {
                 });
                 return Ok(addrs);
             }
-            Ok(_) => format!("{authority}: no addresses"),
+            Ok(_) => Arc::new(std::io::Error::other("no addresses")),
             Err(e) => e,
         };
         if let Some(entry) = self.entries.load().get(authority)
@@ -174,7 +178,7 @@ impl DnsCache {
         {
             warn!(
                 authority,
-                error = %e,
+                error = %format_args!("{authority}: {e}"),
                 age_s = now.duration_since(entry.resolved_at).as_secs(),
                 "upstream dns re-resolution failed; serving the last good answer",
             );
@@ -249,12 +253,10 @@ fn build_providers(
     // `request_filter`, so a provider registered under that name would shadow the whole feature —
     // silently, and only for requests that were meant to be model-routed. Refuse to boot instead.
     if let Some(authority) = config.provider_authorities().get(route::AUTO_SEGMENT) {
-        return Err(GatewayError::Config(format!(
-            "provider_authorities.{} = {authority:?} uses a reserved name: {}/… is the \
-             model-routed route, which a provider of that name would shadow",
-            route::AUTO_SEGMENT,
-            route::AUTO_SEGMENT,
-        )));
+        return Err(ConfigError::ReservedProviderName {
+            authority: authority.clone(),
+        }
+        .into());
     }
 
     let mut providers = HashMap::new();
@@ -301,21 +303,19 @@ fn build_providers(
                 .map(|k| k.iter().map(|s| s.expose()).collect())
                 .unwrap_or_default();
             let dialect = match config.provider_dialects().get(name) {
-                Some(s) => Dialect::parse_config(s).ok_or_else(|| {
-                    GatewayError::Config(format!(
-                        "provider_dialects.{name} = {s:?} is not a recognized dialect \
-                         (expected \"openai\" or \"anthropic\")"
-                    ))
+                Some(s) => Dialect::parse_config(s).ok_or_else(|| ConfigError::UnknownDialect {
+                    provider: name.to_owned(),
+                    value: s.clone(),
                 })?,
                 None => Dialect::OpenAi,
             };
             let auth = match config.provider_auth_schemes().get(name) {
-                Some(s) => AuthScheme::parse_config(s).ok_or_else(|| {
-                    GatewayError::Config(format!(
-                        "provider_auth_schemes.{name} = {s:?} is not a recognized auth scheme \
-                         (expected \"bearer\", \"x-api-key\", or \"api-key\")"
-                    ))
-                })?,
+                Some(s) => {
+                    AuthScheme::parse_config(s).ok_or_else(|| ConfigError::UnknownAuthScheme {
+                        provider: name.to_owned(),
+                        value: s.clone(),
+                    })?
+                }
                 None => AuthScheme::Bearer,
             };
             providers.insert(
@@ -488,13 +488,7 @@ impl GatewayState {
         // they can't be tenant-bound, so this is a hard boot failure, not a warning. A BYO-only
         // deployment (no `signing_keys`) stores nothing on Beyond's accounts and needs none.
         if id_signer.is_none() && !config.signing_keys().is_empty() {
-            return Err(GatewayError::Config(
-                "signing_keys are configured (managed traffic) but no id_signing_keys are — refusing \
-                 to boot: managed Responses ids would be resolvable by every tenant. Set \
-                 AI_ID_SIGNING_KEY_1 to the base64 of 32 random bytes (e.g. `openssl rand -base64 \
-                 32`)."
-                    .to_string(),
-            ));
+            return Err(ConfigError::IdSigningKeysMissing.into());
         }
         // No signing keys ⇒ every `bai_v1…` fails verify and 401s (fail-closed). BYO still works.
         // That's a *valid* mode (a BYO-only deployment), but a far more common cause is a
@@ -504,12 +498,7 @@ impl GatewayState {
         // the test/e2e harnesses run keyless).
         if config.signing_keys().is_empty() {
             if config.require_signing_keys() {
-                return Err(GatewayError::Config(
-                    "require_signing_keys is set but no signing_keys are configured — refusing to \
-                     boot into a mode where every bai_v1 token 401s. Check the signing_keys \
-                     config / SSM param."
-                        .to_string(),
-                ));
+                return Err(ConfigError::SigningKeysRequired.into());
             }
             warn!(
                 "no signing_keys configured — all managed (bai_v1) traffic will 401 (fail-closed); \
@@ -729,10 +718,14 @@ impl GatewayState {
         };
         match landed {
             Some(Ok(addrs)) => Ok(addrs),
-            Some(Err(e)) => Err(GatewayError::Dns(e)),
-            None => Err(GatewayError::Dns(format!(
-                "{authority}: lookup ended without an answer"
-            ))),
+            Some(Err(source)) => Err(GatewayError::Dns {
+                authority: authority.to_owned(),
+                source,
+            }),
+            None => Err(GatewayError::Dns {
+                authority: authority.to_owned(),
+                source: Arc::new(std::io::Error::other("lookup ended without an answer")),
+            }),
         }
     }
 }
@@ -1006,7 +999,7 @@ mod tests {
         // A guaranteed-NXDOMAIN host (RFC 6761 reserves `.invalid`) → a Dns error, never a panic.
         assert!(matches!(
             state.resolve("nonexistent.invalid:80", 0).await,
-            Err(GatewayError::Dns(_))
+            Err(GatewayError::Dns { .. })
         ));
     }
 
@@ -1037,7 +1030,13 @@ mod tests {
         let got = state
             .resolve_all("hang.test:443", |_| std::future::pending())
             .await;
-        assert!(matches!(got, Err(GatewayError::Dns(ref e)) if e.contains("timed out")));
+        assert!(
+            matches!(got, Err(ref e @ GatewayError::Dns { .. }) if e.to_string().contains("timed out"))
+        );
+        assert!(
+            matches!(got, Err(GatewayError::Dns { ref authority, ref source })
+                if authority == "hang.test:443" && source.kind() == std::io::ErrorKind::TimedOut)
+        );
         assert_eq!(start.elapsed(), DNS_TIMEOUT);
     }
 

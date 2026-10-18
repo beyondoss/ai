@@ -4,7 +4,7 @@
 //! fail-open without NATS; allowance is fail-closed until its watcher stores a scan or snapshot,
 //! so managed traffic 402s until that read. BYO still serves from boot config alone.
 
-use crate::error::{GatewayError, Result};
+use crate::error::{ConfigError, Result};
 use crate::key::{Keyring, Kid};
 use crate::secret::Secret;
 use figment::Figment;
@@ -899,9 +899,7 @@ impl AiConfig {
         // `deny_unknown_fields` note on `AiConfig`) — which is also why pool keys are collected
         // separately below rather than via this flat merge.
         fig = fig.merge(Env::prefixed("AI_"));
-        let mut cfg: AiConfig = fig
-            .extract()
-            .map_err(|e| GatewayError::Config(e.to_string()))?;
+        let mut cfg: AiConfig = fig.extract().map_err(ConfigError::from)?;
         // Before the env fold, which matches names against these tables (`pool_key_env_provider`).
         cfg.normalize_provider_names()?;
         // One pass over the environment for both secret prefixes, and via `vars_os` because
@@ -939,51 +937,32 @@ impl AiConfig {
     /// (Pingora treats them as best-effort), so they're left unconstrained.
     pub fn check(&self) -> Result<()> {
         if self.connect_timeout_secs == 0 {
-            return Err(GatewayError::Config(
-                "connect_timeout_secs must be > 0 (a 0 connect timeout fails every upstream connect)"
-                    .to_string(),
-            ));
+            return Err(ConfigError::ConnectTimeoutZero.into());
         }
         if self.read_timeout_secs == 0 {
-            return Err(GatewayError::Config(
-                "read_timeout_secs must be > 0 (a 0 read timeout aborts every response before it arrives)"
-                    .to_string(),
-            ));
+            return Err(ConfigError::ReadTimeoutZero.into());
         }
         // The kernel rejects a zero probe interval or count (EINVAL), which would fail every
         // upstream connect and leave every accepted client socket without keepalive.
         if self.tcp_keepalive_idle_secs > 0
             && (self.tcp_keepalive_interval_secs == 0 || self.tcp_keepalive_count == 0)
         {
-            return Err(GatewayError::Config(
-                "tcp_keepalive_interval_secs and tcp_keepalive_count must be > 0 when                  tcp_keepalive_idle_secs is set; set tcp_keepalive_idle_secs = 0 to disable keepalive"
-                    .to_string(),
-            ));
+            return Err(ConfigError::KeepaliveProbesZero.into());
         }
         // A breaker with a zero window counts every failure into an already-expired window, so the
         // count never passes 1 and the breaker never opens; a zero reset re-admits a probe at once,
         // so an open breaker sheds nothing. Both read as "breaker on" while doing nothing.
         if self.circuit_breaker_threshold > 0 && self.circuit_breaker_window_secs == 0 {
-            return Err(GatewayError::Config(
-                "circuit_breaker_window_secs must be > 0 (a 0 window never accrues a second \
-                 failure, so the breaker never opens); set circuit_breaker_threshold = 0 to disable it"
-                    .to_string(),
-            ));
+            return Err(ConfigError::BreakerWindowZero.into());
         }
         if self.circuit_breaker_threshold > 0 && self.circuit_breaker_reset_secs == 0 {
-            return Err(GatewayError::Config(
-                "circuit_breaker_reset_secs must be > 0 (a 0 reset half-opens the breaker the \
-                 instant it opens); set circuit_breaker_threshold = 0 to disable it"
-                    .to_string(),
-            ));
+            return Err(ConfigError::BreakerResetZero.into());
         }
         if self.circuit_breaker_threshold > crate::circuit_breaker::MAX_FAILURE_THRESHOLD {
-            return Err(GatewayError::Config(format!(
-                "circuit_breaker_threshold = {} exceeds the maximum of {} (the breaker's packed \
-                 failure count cannot hold more)",
-                self.circuit_breaker_threshold,
-                crate::circuit_breaker::MAX_FAILURE_THRESHOLD,
-            )));
+            return Err(ConfigError::BreakerThresholdTooHigh {
+                threshold: self.circuit_breaker_threshold,
+            }
+            .into());
         }
         self.validate_tls()?;
         // A malformed id signing key is a boot failure, not a 503 on every managed Responses turn.
@@ -1034,36 +1013,35 @@ impl AiConfig {
             (None, None, None) => return Ok(()),
             (Some(a), Some(c), Some(k)) => (a, c, k),
             _ => {
-                return Err(GatewayError::Config(
-                    "tls_listen, tls_cert and tls_key must be set together (set none of them to \
-                     serve plain HTTP only)"
-                        .to_string(),
-                ));
+                return Err(ConfigError::TlsPartial.into());
             }
         };
         if addr.trim().is_empty() {
-            return Err(GatewayError::Config("tls_listen is empty".to_string()));
+            return Err(ConfigError::TlsListenEmpty.into());
         }
         let certs = CertificateDer::pem_file_iter(cert)
             .and_then(|it| it.collect::<std::result::Result<Vec<_>, _>>())
-            .map_err(|e| GatewayError::Config(format!("tls_cert {cert}: {e}")))?;
+            .map_err(|source| ConfigError::TlsCert {
+                path: cert.clone(),
+                source,
+            })?;
         if certs.is_empty() {
-            return Err(GatewayError::Config(format!(
-                "tls_cert {cert}: no certificate found"
-            )));
+            return Err(ConfigError::TlsNoCertificate { path: cert.clone() }.into());
         }
-        let key_der = PrivateKeyDer::from_pem_file(key)
-            .map_err(|e| GatewayError::Config(format!("tls_key {key}: {e}")))?;
+        let key_der = PrivateKeyDer::from_pem_file(key).map_err(|source| ConfigError::TlsKey {
+            path: key.clone(),
+            source,
+        })?;
         let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
         rustls::ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
-            .map_err(|e| GatewayError::Config(format!("tls: {e}")))?
+            .map_err(ConfigError::TlsProtocols)?
             .with_no_client_auth()
             .with_single_cert(certs, key_der)
-            .map_err(|e| {
-                GatewayError::Config(format!(
-                    "tls_cert {cert} and tls_key {key} do not work together: {e}"
-                ))
+            .map_err(|source| ConfigError::TlsMismatch {
+                cert: cert.clone(),
+                key: key.clone(),
+                source,
             })?;
         Ok(())
     }
@@ -1072,7 +1050,7 @@ impl AiConfig {
     /// `id_signing_keys` are set.
     pub fn build_id_signer(&self) -> Result<Option<crate::signed_id::Signer>> {
         crate::signed_id::Signer::from_config(&self.id_signing_keys, &self.id_signing_kid)
-            .map_err(GatewayError::Config)
+            .map_err(|e| ConfigError::IdSigner(e).into())
     }
 
     /// Fold the secret-carrying env prefixes into the config, in a single pass.
@@ -1126,12 +1104,11 @@ impl AiConfig {
     pub fn build_keyring(&self) -> Result<Keyring> {
         let mut ring = Keyring::new();
         for (kid_str, b64) in &self.signing_keys {
-            let kid: Kid = kid_str
-                .parse()
-                .map_err(|_| GatewayError::Config(format!("invalid signing key id {kid_str}")))?;
-            let vk = crate::key::verifying_key_from_value(b64.as_bytes()).ok_or_else(|| {
-                GatewayError::Config(format!("invalid signing public key for kid {kid}"))
+            let kid: Kid = kid_str.parse().map_err(|_| ConfigError::SigningKeyId {
+                kid: kid_str.clone(),
             })?;
+            let vk = crate::key::verifying_key_from_value(b64.as_bytes())
+                .ok_or(ConfigError::SigningPublicKey { kid })?;
             ring.insert(kid, vk);
         }
         Ok(ring)
@@ -1142,19 +1119,18 @@ impl AiConfig {
 /// [`AiConfig::normalize_provider_names`].
 /// A name outside the charset ([`ProviderName::parse`]), or two names that are one once lowercased,
 /// is a boot failure, not a provider that silently has no key.
-fn lowercase_names<V>(table: &str, names: HashMap<String, V>) -> Result<HashMap<String, V>> {
+fn lowercase_names<V>(
+    table: &'static str,
+    names: HashMap<String, V>,
+) -> Result<HashMap<String, V>> {
     let mut out = HashMap::with_capacity(names.len());
     for (name, value) in names {
         let Some(parsed) = ProviderName::parse(&name) else {
-            return Err(GatewayError::Config(format!(
-                "[{table}] provider name {name:?} must be letters, digits, '-' or '_'"
-            )));
+            return Err(ConfigError::ProviderNameCharset { table, name }.into());
         };
         let lower = parsed.0;
         if out.insert(lower.clone(), value).is_some() {
-            return Err(GatewayError::Config(format!(
-                "[{table}] provider name {name:?} is {lower:?} once lowercased, which another name already is"
-            )));
+            return Err(ConfigError::ProviderNameCollision { table, name, lower }.into());
         }
     }
     Ok(out)
@@ -1211,7 +1187,7 @@ impl figment::Provider for PreRead {
 
 /// Read a provider's data once, up front.
 fn pre_read<P: figment::Provider>(p: P) -> Result<PreRead> {
-    let data = p.data().map_err(|e| GatewayError::Config(e.to_string()))?;
+    let data = p.data().map_err(ConfigError::from)?;
     Ok(PreRead {
         meta: p.metadata(),
         data,
@@ -1233,10 +1209,11 @@ fn read_toml(path: &Path) -> Result<PreRead> {
             meta: provider.metadata(),
             data,
         }),
-        Err(e) if path.exists() => Err(GatewayError::Config(format!(
-            "failed to parse {}: {e}",
-            path.display()
-        ))),
+        Err(e) if path.exists() => Err(ConfigError::ParseFile {
+            path: path.to_path_buf(),
+            source: Box::new(e),
+        }
+        .into()),
         // No file (or it vanished between checks): nothing to validate — defaults + env apply.
         Err(_) => Ok(PreRead {
             meta: provider.metadata(),
@@ -1301,17 +1278,18 @@ fn reject_unknown_toml_keys(path: &Path, defaults: &PreRead, toml: &PreRead) -> 
     if unknown.is_empty() {
         return Ok(());
     }
-    Err(GatewayError::Config(format!(
-        "unknown key(s) in {}: {} — check for a typo (known keys: {})",
-        path.display(),
-        unknown.join(", "),
-        known.into_iter().collect::<Vec<_>>().join(", "),
-    )))
+    Err(ConfigError::UnknownKeys {
+        path: path.to_path_buf(),
+        unknown,
+        known: known.into_iter().collect(),
+    }
+    .into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::GatewayError;
 
     #[test]
     fn defaults_are_sane() {
@@ -1428,10 +1406,14 @@ mod tests {
         let err = AiConfig::load_with_path(Some(&path)).unwrap_err();
         let _ = std::fs::remove_file(&path);
         match err {
-            GatewayError::Config(msg) => assert!(
-                msg.contains("reqiure_signing_keys"),
-                "error must name the typo'd key, got: {msg}"
-            ),
+            GatewayError::Config(e) => {
+                assert!(matches!(e, ConfigError::UnknownKeys { .. }), "{e:?}");
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("reqiure_signing_keys"),
+                    "error must name the typo'd key, got: {msg}"
+                )
+            }
             other => panic!("expected Config error, got {other:?}"),
         }
     }
@@ -1444,10 +1426,14 @@ mod tests {
         let err = AiConfig::load_with_path(Some(&path)).unwrap_err();
         let _ = std::fs::remove_file(&path);
         match err {
-            GatewayError::Config(msg) => assert!(
-                msg.contains("malformed") || msg.contains("parse"),
-                "error must indicate a parse failure and name the file, got: {msg}"
-            ),
+            GatewayError::Config(e) => {
+                assert!(matches!(e, ConfigError::ParseFile { .. }), "{e:?}");
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("malformed") || msg.contains("parse"),
+                    "error must indicate a parse failure and name the file, got: {msg}"
+                )
+            }
             other => panic!("expected Config error, got {other:?}"),
         }
     }
