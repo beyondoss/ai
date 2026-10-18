@@ -4,7 +4,9 @@
 //! iPhone app) drives it by sending one JSON command per message and reading one JSON frame per
 //! message. The shape mirrors pi's `rpc` mode and opencode's session server: commands get a
 //! `response` frame, and a `prompt` streams `event` frames (the agent's `AgentEvent`s) before its
-//! response.
+//! response. A `tool_start` event carries `not_run:true` (absent otherwise) for a call that will not
+//! run because the output limit cut its input off or it never parsed: `input` is partial and an
+//! error `tool_end` follows at once, so a client can show it as refused from the start.
 //!
 //! **Three transports, one protocol.** The command/frame protocol below is byte-identical regardless of
 //! transport. [`serve`] is the default stdio transport (one line per command on stdin, one frame per
@@ -8650,6 +8652,7 @@ pub(crate) async fn serve_session(
                 host_bash_seq += 1;
                 let call_id = format!("host-bash-{host_bash_seq}");
                 if let Some(frame) = event_frame(AgentEvent::ToolStart {
+                    not_run: false,
                     id: call_id.clone(),
                     name: "bash".to_string(),
                     input: input.clone(),

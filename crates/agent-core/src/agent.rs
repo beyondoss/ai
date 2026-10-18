@@ -41,11 +41,16 @@ pub enum AgentEvent {
     TurnStart { step: u32 },
     /// A streamed model event (text/tool deltas, usage, stop).
     Stream(StreamEvent),
-    /// A tool is about to run, with the arguments the model supplied.
+    /// A tool is about to run, with the arguments the model supplied. `not_run` is set (and
+    /// serialized only then) for a call that will not run at all -- its input was cut off by the
+    /// output limit or never parsed -- so `input` is partial and a matching `ToolEnd` with
+    /// `is_error` follows straight away; a client can render it as refused from the start.
     ToolStart {
         id: String,
         name: String,
         input: Value,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        not_run: bool,
     },
     /// A progress snapshot from a still-running tool (pi's `tool_execution_update`): the full output so
     /// far (not a delta) plus optional tool-specific `details`. Emitted via the tool's
@@ -1604,6 +1609,7 @@ impl Agent {
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
+                    not_run: not_run.contains_key(id),
                 });
             }
             // Resolve each call's tool exactly once, into a parallel vec, and derive the batch-level
@@ -8361,6 +8367,14 @@ mod tests {
             )),
             "a client must see the refused call end"
         );
+        // ...and the start already says it is refused, so it is never drawn as running.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolStart { id, not_run: true, .. } if id == "tu_1"
+            )),
+            "the cut-off call's ToolStart is flagged not_run"
+        );
     }
 
     #[tokio::test]
@@ -8388,7 +8402,20 @@ mod tests {
         );
         let mut session = Session::new();
         session.user("go");
-        agent.run(&mut session, |_| {}).await.unwrap();
+        let mut flags = Vec::new();
+        agent
+            .run_events(&mut session, |e| {
+                if let AgentEvent::ToolStart { id, not_run, .. } = e {
+                    flags.push((id, not_run));
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            flags,
+            [("tu_1".to_string(), false), ("tu_2".to_string(), true)],
+            "only the cut call is flagged"
+        );
 
         assert_eq!(read_ran.lock().unwrap().len(), 1, "the whole call runs");
         assert!(
