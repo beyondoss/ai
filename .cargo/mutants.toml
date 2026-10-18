@@ -120,7 +120,7 @@ exclude_re = [
   # with a Responses arm has a candidate the mask can flag (pinned by
   # `route::tests::no_row_with_a_responses_arm_has_an_unserved_candidate`), so the parent's mask
   # is 0 there too and the guard (`true`) changes nothing today.
-  'replace match guard std::ptr::eq\(arms, row\.candidates\) with true in <impl ProxyHttp for AiProxy>::request_filter',
+  'replace match guard std::ptr::eq\(arms, row\.candidates\) with true in AiProxy::walk',
   # `keep_usage_head` keeps a head only where it is read (an Anthropic stream); widening the gate
   # (`||`) keeps a bounded head nothing reads.
   'replace && with \|\| in RequestCtx::keep_usage_head',

@@ -8,7 +8,7 @@
 //! only because a rule does not apply there, never because the order differs.
 //!
 //! A rule reads [`Facts`], never the bytes: each point extracts what applies there in one place
-//! (`proxy.rs`), from the scan it already made. Rewriting the body (the output-limit clamp, the
+//! (`proxy`), from the scan it already made. Rewriting the body (the output-limit clamp, the
 //! translation, the strips, the model re-spelling, `stream_options`) is a separate step after the
 //! rules pass, on a buffered body only. Signed ids are checked apart too: verifying them also
 //! rewrites the body, and a store relay checks them where it has the signer, not here. A foreign

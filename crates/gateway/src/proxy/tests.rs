@@ -2209,3 +2209,145 @@ fn openrouter_attribution_gated_off_for_byo_traffic() {
         "BYO OpenRouter traffic must not get X-OpenRouter-Categories"
     );
 }
+
+/// A leaked default gateway state, for the phases that look a provider up.
+fn phase_state() -> &'static crate::state::GatewayState {
+    Box::leak(Box::new(
+        crate::state::GatewayState::new(
+            crate::config::AiConfig::default().validate().unwrap(),
+            crate::state::test_metrics(),
+        )
+        .unwrap(),
+    ))
+}
+
+/// `admit` is the route for this key: BYO never walks the catalog, a managed `?key=` is never
+/// forwarded, and a managed walk without a header waits for the body.
+#[test]
+fn admit_decides_the_route_for_the_key() {
+    let state = phase_state();
+    let openai = state.provider("openai").unwrap();
+    let id = Identity::unverified_for_test(42, 7, None);
+    let row = route::model_route("gpt-5").unwrap();
+    let provider_route = || Route::Provider {
+        provider: openai,
+        forward_path: "/v1/chat/completions?key=bai_v1.x&a=1".into(),
+    };
+
+    for header in [None, Some(row)] {
+        assert!(matches!(
+            admit(Route::Auto { header }, None),
+            Err(Refusal::ByoOnModelRoute)
+        ));
+    }
+    assert!(matches!(
+        admit(Route::Auto { header: Some(row) }, Some(id)),
+        Ok(Admission::Ready(Plan::Catalog(Walk { relay: None, .. })))
+    ));
+    for route in [
+        Route::Auto { header: None },
+        Route::BareDefault { provider: openai },
+    ] {
+        assert!(matches!(admit(route, Some(id)), Ok(Admission::NeedsRow(_))));
+    }
+    assert!(matches!(
+        admit(Route::BareDefault { provider: openai }, None),
+        Ok(Admission::Ready(Plan::Provider {
+            forward: ForwardPath::Inbound,
+            ..
+        }))
+    ));
+    let forwarded = |identity| match admit(provider_route(), identity) {
+        Ok(Admission::Ready(plan)) => plan.stripped().map(str::to_owned),
+        _ => None,
+    };
+    assert_eq!(
+        forwarded(Some(id)).as_deref(),
+        Some("/v1/chat/completions?a=1")
+    );
+    assert_eq!(
+        forwarded(None).as_deref(),
+        Some("/v1/chat/completions?key=bai_v1.x&a=1")
+    );
+}
+
+/// A `FullBody` re-run walks its parent's row, whatever the route resolved.
+#[test]
+fn a_rerun_walks_the_parents_row() {
+    let id = Identity::unverified_for_test(42, 7, None);
+    let parent = route::model_route("gpt-5").unwrap();
+    let other = route::model_route("claude-sonnet-4-5").unwrap();
+    for admission in [
+        Admission::NeedsRow(id),
+        Admission::Ready(Plan::Catalog(Walk {
+            id,
+            row: other,
+            relay: None,
+        })),
+    ] {
+        match admission.rerun(parent) {
+            Admission::Ready(plan) => assert!(std::ptr::eq(plan.row().unwrap(), parent)),
+            Admission::NeedsRow(_) => panic!("a re-run has its row"),
+        }
+    }
+}
+
+/// `managed_endpoint`: an upgrade is refused anywhere, a provider route only on its generation
+/// endpoints (404 otherwise), and anything but POST is a 405.
+#[test]
+fn managed_endpoint_holds_a_managed_key_to_metered_calls() {
+    let state = phase_state();
+    let openai = state.provider("openai").unwrap();
+    let id = Identity::unverified_for_test(42, 7, None);
+    let req = |method: http::Method, path: &str| {
+        pingora::http::RequestHeader::build(method, path.as_bytes(), None).unwrap()
+    };
+    let on = |path: &str| {
+        Admission::Ready(Plan::Provider {
+            provider: openai,
+            forward: ForwardPath::Stripped(path.into()),
+        })
+    };
+
+    assert!(managed_endpoint(&req(http::Method::POST, "/v1"), &Admission::NeedsRow(id)).is_ok());
+    assert!(
+        managed_endpoint(
+            &req(http::Method::POST, "/openai/v1/chat/completions"),
+            &on("/v1/chat/completions?x=1")
+        )
+        .is_ok()
+    );
+    let mut upgrade = req(http::Method::POST, "/v1");
+    upgrade.insert_header("upgrade", "websocket").unwrap();
+    assert!(matches!(
+        managed_endpoint(&upgrade, &Admission::NeedsRow(id)),
+        Err(Refusal::ProtocolUpgrade)
+    ));
+    assert!(matches!(
+        managed_endpoint(&req(http::Method::GET, "/v1"), &Admission::NeedsRow(id)),
+        Err(Refusal::ManagedEndpoint {
+            wrong_method: true,
+            ..
+        })
+    ));
+    for method in [http::Method::POST, http::Method::GET] {
+        assert!(matches!(
+            managed_endpoint(&req(method, "/openai/v1/files"), &on("/v1/files")),
+            Err(Refusal::ManagedEndpoint {
+                wrong_method: false,
+                ..
+            })
+        ));
+    }
+}
+
+/// `shape` reads the body only on a catalog walk: a second root `model` is refused there, and a
+/// provider route's body is left to `request_body_filter`.
+#[test]
+fn shape_refuses_a_second_model_on_a_catalog_walk() {
+    let row = route::model_route("gpt-5").unwrap();
+    let body = br#"{"model":"gpt-5","model":"gpt-5-mini","messages":[]}"#;
+    assert!(shape(Some(row), Some(body)).is_err());
+    assert!(shape(None, Some(body)).is_ok());
+    assert!(shape(Some(row), Some(br#"{"model":"gpt-5"}"#)).is_ok());
+}

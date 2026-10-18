@@ -18,7 +18,7 @@
 //! quote the tenant's own model name or parameter back.
 //!
 //! Run only on a managed error body (status >= 400, JSON, at most [`MAX_BODY`]) by the pool-key
-//! scrub in `proxy.rs`, once, at end of body. A 2xx is never parsed here. A BYO error is the
+//! scrub in `proxy/relay.rs`, once, at end of body. A 2xx is never parsed here. A BYO error is the
 //! caller's own account talking, so it is relayed as sent.
 
 use serde_json::{Map, Value};

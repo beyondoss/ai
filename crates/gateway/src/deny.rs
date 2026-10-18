@@ -32,9 +32,9 @@ use std::hash::BuildHasherDefault;
 /// HashDoS resistance exists to stop an attacker from *choosing* keys that collide. Here the key is
 /// `identity.tenant_id` or `identity.key_id`, which only ever comes out of `keyring.verify(raw_key)`
 /// — an Ed25519 signature check over a token minted by the control plane, which holds the only
-/// signing key. And the ordering is load-bearing: `proxy::request_filter` verifies **first** and
-/// only then looks the id up (`proxy.rs`, step 5), so an unforgeable id is the *only* thing that
-/// ever reaches this map. An attacker cannot pick their tenant or key id, cannot enumerate ids to
+/// signing key. And the ordering is load-bearing: `request_filter`'s `authenticate` phase verifies
+/// **first** and only then looks the id up, so an unforgeable id is the *only* thing that ever
+/// reaches this map. An attacker cannot pick their tenant or key id, cannot enumerate ids to
 /// farm collisions, and never gets an unverified id into the table at all — so SipHash's collision
 /// resistance buys nothing and costs ~4x on a lookup that runs on **every managed request**.
 ///
