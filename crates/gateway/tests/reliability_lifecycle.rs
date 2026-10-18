@@ -691,9 +691,44 @@ async fn a_catalog_candidate_is_tried_on_its_next_address() {
     );
 }
 
+/// Sends a POST head that declares `len` body bytes and no body, then reads the gateway's answer
+/// until the body it names arrives or the connection closes. A refusal from the declared length
+/// closes the connection without reading a byte, so a client that wrote the body would race that
+/// close (BrokenPipe) and might never read the 503. Sending only the head makes the answer
+/// deterministic.
+async fn refused_from_the_declared_length(
+    gw: &Gateway,
+    key: &str,
+    path: &str,
+    extra_headers: &str,
+    len: usize,
+) -> String {
+    let addr = gw.url().trim_start_matches("http://").to_owned();
+    let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nhost: gw\r\nauthorization: Bearer {key}\r\n\
+         content-type: application/json\r\n{extra_headers}content-length: {len}\r\n\r\n"
+    );
+    s.write_all(head.as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    let done = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut buf = [0u8; 4096];
+        while !String::from_utf8_lossy(&out).contains("too many large request bodies") {
+            match s.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+            }
+        }
+    })
+    .await;
+    assert!(done.is_ok(), "no answer to a declared {len}-byte body");
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// A body the process budget cannot hold is refused before it is read: a 503 with `Retry-After`
 /// and a JSON error, counted on `ai_rejections_total{reason="body_memory"}`. A body within the
-/// budget is still served.
+/// budget is still served. The over-budget request is sent as its head alone (see
+/// `refused_from_the_declared_length`), so the client cannot race the gateway's close.
 /// claim: SEC-19
 /// defect: D35
 #[tokio::test]
@@ -718,14 +753,21 @@ async fn a_body_past_the_memory_budget_is_a_retryable_503() {
             .body(body)
             .send()
     };
-    // 1 MiB declared, held twice: past the 1 MiB budget.
-    let resp = send(chat(1 << 20)).await.unwrap();
-    let status = resp.status().as_u16();
-    let retry_after = resp.headers().get("retry-after").is_some();
-    let text = resp.text().await.unwrap_or_default();
+    // 1 MiB declared, held twice: past the 1 MiB budget. Refused from the declared length.
+    let text = refused_from_the_declared_length(
+        &gw,
+        &vkey(&sk, 35),
+        "/v1/chat/completions",
+        "",
+        chat(1 << 20).len(),
+    )
+    .await;
+    let retry_after = text.to_ascii_lowercase().contains("\r\nretry-after: ");
     assert!(
-        status == 503 && retry_after && text.contains("too many large request bodies"),
-        "status {status} retry-after {retry_after}: {text}"
+        text.starts_with("HTTP/1.1 503")
+            && retry_after
+            && text.contains("too many large request bodies"),
+        "retry-after {retry_after}: {text}"
     );
     assert_eq!(mock.hits(), 0, "refused before any upstream attempt");
     wait_for_metric(&gw, "ai_rejections_total", "body_memory", 1.0).await;
@@ -737,7 +779,9 @@ async fn a_body_past_the_memory_budget_is_a_retryable_503() {
 /// The up-front reservation refuses, before reading a byte of it, a body the budget can hold once
 /// but not twice: a catalog walk holds a large body twice (the peek and its full-body re-run),
 /// whether the body or the `x-beyond-model` header names the row. A buffered `/{provider}` body
-/// is held once, and is refused before the upstream sees the request.
+/// is held once, and is refused before the upstream sees the request. Every refusal here is sent
+/// as a declared head with no body (see `refused_from_the_declared_length`): a client that wrote
+/// the body would race the gateway's close and could miss the 503.
 /// claim: SEC-19
 /// defect: D35
 #[tokio::test]
@@ -748,43 +792,16 @@ async fn a_large_body_reserves_every_copy_it_will_hold_before_it_is_read() {
         .config_line("max_buffered_body_bytes = 1048576")
         .start()
         .await;
-    let chat = |pad: usize| {
-        format!(
-            r#"{{"model":"gpt-4o-mini","messages":[{{"role":"user","content":"{}"}}]}}"#,
-            "x".repeat(pad)
-        )
-    };
-    let send = |path: &'static str, header: Option<&'static str>, body: String| {
-        let mut req = test_client()
-            .post(format!("{}{path}", gw.url()))
-            .header("authorization", format!("Bearer {}", vkey(&sk, 35)))
-            .header("content-type", "application/json");
-        if let Some(model) = header {
-            req = req.header("x-beyond-model", model);
-        }
-        req.body(body).send()
-    };
     // 600 KiB fits the 1 MiB budget once, not twice. Declared and never sent: the refusal comes
     // from the declared length, before a byte of the body is read.
+    let key = vkey(&sk, 35);
     for (what, header) in [
         ("body-named", ""),
         ("header-named", "x-beyond-model: gpt-4o-mini\r\n"),
     ] {
-        let addr = gw.url().trim_start_matches("http://").to_owned();
-        let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
-        let head = format!(
-            "POST /v1/chat/completions HTTP/1.1\r\nhost: gw\r\nauthorization: Bearer {}\r\n\
-             content-type: application/json\r\n{header}content-length: {}\r\n\r\n",
-            vkey(&sk, 35),
-            600 * 1024
-        );
-        s.write_all(head.as_bytes()).await.unwrap();
-        let mut buf = vec![0u8; 4096];
-        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
-            .await
-            .unwrap_or_else(|_| panic!("{what}: no answer until the body arrives"))
-            .unwrap();
-        let text = String::from_utf8_lossy(&buf[..n]);
+        let text =
+            refused_from_the_declared_length(&gw, &key, "/v1/chat/completions", header, 600 * 1024)
+                .await;
         assert!(
             text.starts_with("HTTP/1.1 503") && text.contains("too many large request bodies"),
             "{what}: {text}"
@@ -792,35 +809,12 @@ async fn a_large_body_reserves_every_copy_it_will_hold_before_it_is_read() {
     }
     // 1.5 MiB declared on `/openai/…`, buffered for `stream_options`: past the budget even once,
     // and refused from the declared length too, before a byte of it is read.
-    {
-        let addr = gw.url().trim_start_matches("http://").to_owned();
-        let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
-        let head = format!(
-            "POST /openai/v1/chat/completions HTTP/1.1\r\nhost: gw\r\nauthorization: Bearer {}\r\n\
-             content-type: application/json\r\ncontent-length: {}\r\n\r\n",
-            vkey(&sk, 35),
-            1536 * 1024
-        );
-        s.write_all(head.as_bytes()).await.unwrap();
-        let mut buf = vec![0u8; 4096];
-        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
-            .await
-            .expect("provider route: no answer until the body arrives")
-            .unwrap();
-        let text = String::from_utf8_lossy(&buf[..n]);
-        assert!(
-            text.starts_with("HTTP/1.1 503") && text.contains("too many large request bodies"),
-            "provider route, declared: {text}"
-        );
-    }
-    let resp = send("/openai/v1/chat/completions", None, chat(1536 * 1024))
-        .await
-        .unwrap();
-    let status = resp.status().as_u16();
-    let text = resp.text().await.unwrap_or_default();
+    let text =
+        refused_from_the_declared_length(&gw, &key, "/openai/v1/chat/completions", "", 1536 * 1024)
+            .await;
     assert!(
-        status == 503 && text.contains("too many large request bodies"),
-        "provider route: status {status}: {text}"
+        text.starts_with("HTTP/1.1 503") && text.contains("too many large request bodies"),
+        "provider route, declared: {text}"
     );
     assert_eq!(
         mock.hits(),
