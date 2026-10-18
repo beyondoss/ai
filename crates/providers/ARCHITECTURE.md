@@ -178,14 +178,14 @@ vendor bills them as **5-minute writes**, and pass-through bills them the same.
 
 1. **Class**, from `service_tier` and `speed`:
 
-   | Row says                                                                            | Class           |
-   | ----------------------------------------------------------------------------------- | --------------- |
-   | none, `default`, `standard`, `on_demand` (Groq), `auto` (unresolved, e.g. Meta), `asap` (Sail Research) | standard |
-   | `priority` or `fast` (OpenAI, xAI, Fireworks, OpenRouter)                           | fast            |
-   | `speed: fast` (Anthropic; with `service_tier: priority` on OpenRouter)              | fast            |
-   | `ultrafast`                                                                         | ultrafast       |
-   | `flex`                                                                              | flex            |
-   | anything else, two classes at once, or a non-`standard` tier from Anthropic/Bedrock | `unknown_class` |
+   | Row says                                                                                                | Class           |
+   | ------------------------------------------------------------------------------------------------------- | --------------- |
+   | none, `default`, `standard`, `on_demand` (Groq), `auto` (unresolved, e.g. Meta), `asap` (Sail Research) | standard        |
+   | `priority` or `fast` (OpenAI, xAI, Fireworks, OpenRouter)                                               | fast            |
+   | `speed: fast` (Anthropic; with `service_tier: priority` on OpenRouter)                                  | fast            |
+   | `ultrafast`                                                                                             | ultrafast       |
+   | `flex`                                                                                                  | flex            |
+   | anything else, two classes at once, or a non-`standard` tier from Anthropic/Bedrock                     | `unknown_class` |
 
    Anthropic's own `service_tier: priority` is Priority Tier, contract-priced committed capacity
    that can no longer be bought. It is not fast mode, so it is refused.

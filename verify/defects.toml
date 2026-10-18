@@ -2975,3 +2975,17 @@ state = "fixed"
 test = "an_output_tokens_only_usage_never_hides_an_earlier_openai_usage"
 fix = "a8c35ba"
 note = "Fixed in usage.rs: on the OpenAI wire input_tokens and output_tokens count only as a pair (Responses always sends both, Chat neither), so a lone one names no count and spelling() is None: no usage, not zero, and the scan falls through to the earlier real line. On the Anthropic wire a message_start usage that names no Anthropic count is skipped, as a message_delta's already was. Both are Option checks on the deserialized struct; might_carry_usage is unchanged. The dialect_tests corpus case that pinned the old 0/0 (messages stream, head and tail, and its whole-stream twin) now expects None. Review follow-up: the Responses envelope takes the same pair rule (a lone output_tokens there billed (0, 42) and hid the real line; the front-truncated path already read None), total_tokens and the cache counts alone are no OpenAI count (they billed 0/0), a message_start assigns input and cache only when it names input_tokens (a lone output or cache count reset them), and a server-tool-only message_start keeps its count again. Each was reproduced first: a_lone_count_in_the_responses_envelope_is_no_usage, total_tokens_without_a_count_is_no_openai_usage, a_message_start_without_input_tokens_keeps_the_earlier_counts, a_server_tool_only_message_start_keeps_its_count. The rule can let an earlier line win over a lone later one: an under-count, never an over-bill."
+
+[[defect]]
+id = "D288"
+severity = "high"
+area = "Billing"
+title = "Every DeepSeek V4 Pro answer Sail Research served through OpenRouter was unpriced: it reports service_tier asap"
+impact = "Sail Research, through OpenRouter, puts service_tier \"asap\" on its DeepSeek V4 Pro answers. The pricer knew none, default, standard, on_demand and auto as the standard class and refused anything else, so every request OpenRouter routed there logged price_status unpriced (unknown_class), and CAT-6, CAT-6+BIL-9 and CAT-7 failed live on openrouter::deepseek-v4-pro."
+confidence = "high"
+evidence = "verify:live on main 4247da3, 2026-10-18: CAT-6+BIL-9::raw::openrouter::deepseek-v4-pro and CAT-7::raw::openrouter::deepseek-v4-pro failed 'BIL-24 row is not priced: unpriced unknown_class' with service_tier asap, served_by Sail Research. OpenRouter's usage.cost was the endpoint's listed rate to the token: $0.000176576 for 20 in / 144 out and $0.000108504 for 237 in / 2 out, both exactly $0.448/M input + $1.164/M output (GET /api/v1/models/deepseek/deepseek-v4-pro-0813/endpoints, Sail Research, 2026-10-18)."
+claims = ["BIL-24"]
+state = "fixed"
+test = "service_tier_asap_is_the_standard_class"
+fix = "e5316cc"
+note = "Fixed in the contract, as D271 was for auto: a reported service_tier asap is the standard class (providers::pricing::Tier::parse and verify/pricing_reference.py alike; crates/providers/ARCHITECTURE.md's class table). Anthropic and Bedrock still refuse anything but standard. Golden vector openrouter_service_tier_asap_reported, from the reference pricer."
