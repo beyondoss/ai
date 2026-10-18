@@ -70,6 +70,7 @@ const ALLOWED: &[(&str, usize)] = &[
     // Command lines that ask a child `serve` to bind port 0 and report the port it got.
     ("agent/tests/common/mod.rs", 1),
     ("agent/tests/serve_service_mode.rs", 2),
+    ("agent/tests/serve_service_tls.rs", 1),
     ("agent/benches/serve_runtime.rs", 1),
     ("fleet-sim/src/replica.rs", 2),
 ];

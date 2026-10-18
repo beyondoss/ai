@@ -267,6 +267,9 @@ struct Cli {
     command: Command,
 }
 
+// One `Command` is parsed per process and matched once; the flag-heavy `Serve` variant outgrowing the
+// small ones costs a few hundred bytes of stack at startup, not worth boxing every field for.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommands)]
 enum Command {
     /// Run one agent task to completion, streaming output to stdout.
@@ -567,6 +570,16 @@ enum Command {
         /// Bind it privately.
         #[usage(long, env = "AI_AGENT_LISTEN")]
         listen: Option<std::net::SocketAddr>,
+        /// Also serve the same protocol over TLS on this address (needs --tls-cert and
+        /// --tls-key). The certificate is read once; rotating it takes a restart.
+        #[usage(long, env = "AI_AGENT_TLS_LISTEN")]
+        tls_listen: Option<std::net::SocketAddr>,
+        /// PEM certificate chain (leaf first) for --tls-listen.
+        #[usage(long, env = "AI_AGENT_TLS_CERT")]
+        tls_cert: Option<std::path::PathBuf>,
+        /// PEM private key for --tls-listen.
+        #[usage(long, env = "AI_AGENT_TLS_KEY")]
+        tls_key: Option<std::path::PathBuf>,
         /// Serve over a Unix socket at this path.
         #[usage(long, env = "AI_AGENT_LISTEN_UDS")]
         listen_uds: Option<std::path::PathBuf>,
@@ -1775,6 +1788,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             session_file,
             session_dir,
             listen,
+            tls_listen,
+            tls_cert,
+            tls_key,
             listen_uds,
             listen_uds_mode,
             session_idle_timeout,
@@ -1920,14 +1936,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Some(_) => Some(beyond_ai_agent::metrics::Metrics::new()?),
                 None => None,
             };
+            // All three or none, before anything is bound; the files themselves are checked by
+            // `serve_ws` ahead of its first bind.
+            let tls = match (tls_listen, tls_cert, tls_key) {
+                (None, None, None) => None,
+                (Some(addr), Some(cert), Some(key)) => {
+                    Some(serve_ws::TlsListen { addr, cert, key })
+                }
+                _ => {
+                    return Err(
+                        "--tls-listen, --tls-cert and --tls-key must be given together".into(),
+                    );
+                }
+            };
             let systemd_activated = cfg!(unix)
                 && listen.is_none()
+                && tls.is_none()
                 && listen_uds.is_none()
                 && std::env::var_os("LISTEN_FDS").is_some();
             // Webhook callbacks arrive on the daemon's HTTP listener; over stdio nothing would
             // receive them, and a server would fail its verification challenge on every subscribe.
             if mcp_events_callback_url.is_some()
                 && listen.is_none()
+                && tls.is_none()
                 && listen_uds.is_none()
                 && !systemd_activated
             {
@@ -1956,7 +1987,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // lease; a mount that keeps them longer (`nocto`, a large `acdirmax`/`actimeo`)
                 // could lose acknowledged writes, so it is refused before anything is served.
                 beyond_ai_agent::shard_mount::check_shards(&shards)?;
-                if listen.is_none() && listen_uds.is_none() && !systemd_activated {
+                if listen.is_none() && tls.is_none() && listen_uds.is_none() && !systemd_activated {
                     return Err(
                         "--service requires --listen, --listen-uds, or systemd socket activation: \
                          stdio has no place to carry a per-connection session grant"
@@ -2422,8 +2453,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // outlives a `systemctl restart` (connections queue in the kernel). Unix/systemd only, and
             // deferred to `--listen`/`--listen-uds` when either is set. Computed once, up with the
             // `--service` validation, since that refuses stdio and so has to know.
-            let use_ws =
-                serve_cfg.listen.is_some() || serve_cfg.listen_uds.is_some() || systemd_activated;
+            let use_ws = serve_cfg.listen.is_some()
+                || tls.is_some()
+                || serve_cfg.listen_uds.is_some()
+                || systemd_activated;
             let shutdown_cause = if use_ws {
                 #[cfg(not(unix))]
                 if listen_uds.is_some() {
@@ -2440,6 +2473,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let listeners = serve_ws::ServeListeners {
                     tcp: serve_cfg.listen,
+                    tls,
                     #[cfg(unix)]
                     uds: serve_cfg.listen_uds.clone(),
                     #[cfg(unix)]
