@@ -377,6 +377,52 @@ mod tests {
         }
     }
 
+    /// Every copy of a duplicated root key is read, since the provider's parser may keep any one
+    /// of them; a tool type the gate cannot read (undecodable, or longer than any it knows) is
+    /// refused rather than passed; and a `service_tier` that is not a string asks for no tier.
+    #[test]
+    fn every_copy_is_read_and_an_unreadable_type_is_refused() {
+        for (body, want) in [
+            (
+                r#"{"tools":[{"type":"function","name":"f"}],"tools":[{"type":"code_interpreter"}],"messages":[]}"#.to_owned(),
+                CONTAINERS,
+            ),
+            (
+                r#"{"tools":[{"type":"code_interpreter"}],"tools":[],"messages":[]}"#.to_owned(),
+                CONTAINERS,
+            ),
+            (
+                r#"{"service_tier":"auto","messages":[],"service_tier":"priority"}"#.to_owned(),
+                PRIORITY_TIER,
+            ),
+            (
+                r#"{"tools":[{"type":"\ud800"}],"messages":[]}"#.to_owned(),
+                UNLISTED_TOOL,
+            ),
+            (
+                format!(
+                    r#"{{"tools":[{{"type":"web_search{}"}}],"messages":[]}}"#,
+                    "x".repeat(70_000)
+                ),
+                UNLISTED_TOOL,
+            ),
+        ] {
+            assert_eq!(
+                refused(&body, "claude-opus-4-8", true),
+                Some(want),
+                "{body:.120}"
+            );
+        }
+        for body in [
+            r#"{"service_tier":1,"messages":[]}"#,
+            r#"{"service_tier":["priority"],"messages":[]}"#,
+            r#"{"service_tier":{"tier":"priority"},"messages":[]}"#,
+            r#"{"service_tier":null,"messages":[]}"#,
+        ] {
+            assert_eq!(refused(body, "claude-opus-4-8", true), None, "{body}");
+        }
+    }
+
     /// Anthropic's client tools carry no `type`: they are the client's to run, so they pass.
     #[test]
     fn a_client_tool_with_no_type_passes() {

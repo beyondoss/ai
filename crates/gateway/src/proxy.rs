@@ -76,7 +76,7 @@ use crate::route::{self, Dialect, Provider, ProviderId};
 use crate::signed_id;
 use crate::state::{GatewayState, RequestId};
 use crate::terminal::TerminalTracker;
-use crate::{control, peek, pin, remedy, translate, unpriced, usage};
+use crate::{body_rules, control, peek, pin, remedy, translate, unpriced, usage};
 use arrayvec::{ArrayString, ArrayVec};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -2018,15 +2018,14 @@ impl AiProxy {
         } else {
             None
         };
-        if let Some(kind) = route::refused_input(route, &body) {
-            let refusal = Refusal::RefusedInput {
-                model: route.model,
-                kind,
-            };
+        let facts = body_rules::Facts {
+            refused_input: route::refused_input(route, &body).map(|kind| (route.model, kind)),
+            background: route::is_responses_path(session.req_header().uri.path())
+                && requests_background(&body),
+            ..body_rules::Facts::default()
+        };
+        if let Some(refusal) = body_rules::refusal(body_rules::Point::Relay, &facts) {
             return self.refuse(session, &request_id, refusal).await;
-        }
-        if route::is_responses_path(session.req_header().uri.path()) && requests_background(&body) {
-            return self.refuse(session, &request_id, Refusal::Background).await;
         }
         let unserved = route::unserved(route.candidates, &body);
         let responses_tools = route::tools_need_responses_arm(
@@ -4534,20 +4533,17 @@ impl ProxyHttp for AiProxy {
             .as_deref()
             .filter(|_| model_route.is_some())
             .map(peek::scan_buffered);
-        if scan.as_ref().is_some_and(|s| s.duplicate_model) {
-            return self
-                .refuse(session, &request_id, Refusal::DuplicateModel)
-                .await;
-        }
-
-        // An output limit that is not a whole number on a row with a published cap: refused here, with
-        // a JSON 400, when the body is in hand (see `request_body_filter` for the streamed case).
-        if model_route.is_some_and(|r| r.card.output_cap().is_some())
-            && scan.as_ref().is_some_and(|s| s.inexact_limit)
-        {
-            return self
-                .refuse(session, &request_id, Refusal::OutputLimit)
-                .await;
+        // The body rules (`body_rules`) that read its shape are checked here, as soon as it is
+        // scanned: a second `model`, and an output limit that is not a whole number on a row with a
+        // published cap. What the row accepts is checked once the walk is shaped, below.
+        let shape = body_rules::Facts {
+            duplicate_model: scan.as_ref().is_some_and(|s| s.duplicate_model),
+            inexact_limit: model_route.is_some_and(|r| r.card.output_cap().is_some())
+                && scan.as_ref().is_some_and(|s| s.inexact_limit),
+            ..body_rules::Facts::default()
+        };
+        if let Some(refusal) = body_rules::refusal(body_rules::Point::Connect, &shape) {
+            return self.refuse(session, &request_id, refusal).await;
         }
 
         // A `FullBody` re-run's body is its parent's, already reserved for both copies.
@@ -4599,18 +4595,19 @@ impl ProxyHttp for AiProxy {
             // another vendor): BYO was refused before a `Walk` could be made.
             Plan::Catalog(w) => {
                 let (row, id) = (w.row, w.id);
-                if let Some(kind) = body_complete
-                    .as_deref()
-                    .and_then(|b| route::refused_input(row, b))
-                {
-                    let refusal = Refusal::RefusedInput {
-                        model: row.model,
-                        kind,
-                    };
+                // The rest of the body rules, after the control surface is parsed (and counted)
+                // above. `shape` passed, so the order is still `body_rules::Rule::ORDER`.
+                let facts = body_rules::Facts {
+                    refused_input: body_complete
+                        .as_deref()
+                        .and_then(|b| route::refused_input(row, b))
+                        .map(|kind| (row.model, kind)),
+                    background: inbound_responses
+                        && body_complete.as_deref().is_some_and(requests_background),
+                    ..shape
+                };
+                if let Some(refusal) = body_rules::refusal(body_rules::Point::Connect, &facts) {
                     return self.refuse(session, &request_id, refusal).await;
-                }
-                if inbound_responses && body_complete.as_deref().is_some_and(requests_background) {
-                    return self.refuse(session, &request_id, Refusal::Background).await;
                 }
                 // A Responses request walks the row's Responses arm whenever the row has one,
                 // `store: false` one-shots included: there it is a byte relay, and translation onto
@@ -5890,32 +5887,11 @@ impl ProxyHttp for AiProxy {
                 }
                 // --- end signed ids ---
                 let mut scan = peek::scan_buffered(&buf);
-                // Two root `model` keys on a catalog walk: the row came from one and the rewrite
-                // below edits one, but the provider's parser picks its own (usually the last). Refused
-                // rather than guessed, before a body byte goes upstream. Checked on the client's
-                // body, ahead of translation, which re-serializes and would hide it.
-                // A managed `/{provider}` body is relayed as sent, so the provider serves whichever
-                // copy its parser keeps while the billing row names the first: refused the same way.
-                if (rc.auto.is_some() || rc.plan.catalog_check) && scan.duplicate_model {
-                    return Err(self.refusal_error(Refusal::DuplicateModelLate).into_down());
-                }
-                // An output limit that is not a whole number (a string, a fraction, a negative) has no
-                // span, so the clamp below cannot hold it to the row's maximum. Refused before a byte
-                // goes upstream, where the provider would otherwise be the one to read it.
-                if scan.inexact_limit
-                    && rc
-                        .auto
-                        .as_ref()
-                        .is_some_and(|a| a.route.card.output_cap().is_some())
-                {
-                    return Err(self.refusal_error(Refusal::OutputLimit).into_down());
-                }
-                // A feature billed outside the usage a row can meter (a container, the image
-                // generation tool, an OpenRouter plugin, Anthropic Priority Tier): refused before a
-                // byte of the body goes upstream, so nothing runs unpriced (D268). Read on the
-                // client's body, ahead of any rewrite and of the catalog check (an `:online` model is named
-                // for what it is). Every body buffered here is managed.
-                if rc.managed() {
+                // The body rules (`body_rules`), on the client's body: ahead of translation, which
+                // re-serializes it and would hide a second `model`, and of every rewrite, so an
+                // `:online` model is named for what it is. Each refusal ends the request before a
+                // byte of the body goes upstream. Every body buffered here is managed.
+                let inspection = if rc.managed() {
                     let model = rc
                         .auto
                         .as_ref()
@@ -5923,39 +5899,51 @@ impl ProxyHttp for AiProxy {
                         .or(scan.model.as_deref())
                         .unwrap_or(rc.model.as_str());
                     let messages = session.req_header().uri.path().ends_with("/messages");
-                    let found = unpriced::inspect(&buf, model, messages);
-                    if let Some(why) = found.refused {
-                        return Err(self.refusal_error(Refusal::Unpriced(why)).into_down());
-                    }
-                    if found.web_search_preview
-                        && let Some(taps) = rc.billing.tap()
-                    {
-                        taps.web_search_preview = true;
-                    }
-                }
-                // Managed `/{provider}/…` billable call naming no catalog row (D267): its billing
-                // row would carry no `price_model`. The client's id is kept for the error and the
-                // row, then the request ends before a byte of the body goes upstream.
-                if rc.plan.catalog_check && scan.model.as_deref().and_then(price_row).is_none() {
-                    if rc.model.is_empty()
-                        && let Some(m) = scan.model.take()
-                    {
-                        rc.model = sanitize_model(m).into_owned();
-                    }
-                    let refusal = Refusal::CatalogMiss {
-                        name: Some(rc.model.as_str().into()),
-                        header: false,
+                    unpriced::inspect(&buf, model, messages)
+                } else {
+                    unpriced::Inspection::default()
+                };
+                let refused = {
+                    // A managed `/{provider}/…` billable call naming no catalog row (D267): its
+                    // billing row would carry no `price_model`. Told by the client's id.
+                    let miss = (rc.plan.catalog_check
+                        && scan.model.as_deref().and_then(price_row).is_none())
+                    .then(|| match rc.model.is_empty() {
+                        true => scan.model.take().map_or(Cow::Borrowed(""), sanitize_model),
+                        false => Cow::Borrowed(rc.model.as_str()),
+                    });
+                    let facts = body_rules::Facts {
+                        // A catalog walk routed on one `model` and re-spells one, and a managed
+                        // `/{provider}` body is billed by the first: the provider's parser picks
+                        // its own (usually the last).
+                        duplicate_model: (rc.auto.is_some() || rc.plan.catalog_check)
+                            && scan.duplicate_model,
+                        // A limit with no span (a string, a fraction, a negative): the clamp below
+                        // cannot hold it to the row's maximum.
+                        inexact_limit: scan.inexact_limit
+                            && rc
+                                .auto
+                                .as_ref()
+                                .is_some_and(|a| a.route.card.output_cap().is_some()),
+                        refused_input: None,
+                        unpriced: inspection.refused,
+                        catalog_miss: miss.as_deref(),
+                        // Managed `/{provider}/…/responses` asking for `background: true` (D202).
+                        background: rc.plan.catalog_check
+                            && rc.forward_path.as_str().is_some_and(|p| {
+                                route::forward_is_responses(p.split_once('?').map_or(p, |(p, _)| p))
+                            })
+                            && requests_background(&buf),
                     };
+                    body_rules::refusal(body_rules::Point::Buffered, &facts)
+                };
+                if let Some(refusal) = refused {
                     return Err(self.refusal_error(refusal).into_down());
                 }
-                // Managed `/{provider}/…/responses` asking for `background: true` (D202).
-                if rc.plan.catalog_check
-                    && rc.forward_path.as_str().is_some_and(|p| {
-                        route::forward_is_responses(p.split_once('?').map_or(p, |(p, _)| p))
-                    })
-                    && requests_background(&buf)
+                if inspection.web_search_preview
+                    && let Some(taps) = rc.billing.tap()
                 {
-                    return Err(self.refusal_error(Refusal::Background).into_down());
+                    taps.web_search_preview = true;
                 }
                 // Wire mismatch on this *candidate*: map the inbound JSON onto this path's
                 // endpoint *before* the model splice. Keep the original client body in `req_buf`

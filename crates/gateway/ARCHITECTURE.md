@@ -2827,6 +2827,38 @@ headers already went upstream: a duplicate root `model` is named before connecti
 its field before connecting (`ForeignId`) and not after (`ForeignIdLate`). `IdSigningUnset` is a 503
 without `Retry-After`, unlike every other gateway 503; kept as it was.
 
+### Body rules (`body_rules.rs`)
+
+The refusals a request body earns are one ordered list of rules, `Rule::ORDER`, which is refusal
+precedence: a body that breaks two is told the first. A body is checked at three points, and each
+rule says where it applies:
+
+| Rule             | Refusal                                    | `Connect` | `Relay` | `Buffered` |
+| ---------------- | ------------------------------------------ | --------- | ------- | ---------- |
+| `DuplicateModel` | `DuplicateModel` (`…Late` once `Buffered`) | ✓         |         | ✓          |
+| `OutputLimit`    | `OutputLimit`                              | ✓         |         | ✓          |
+| `RefusedInput`   | `RefusedInput` (image input, tools)        | ✓         | ✓       |            |
+| `Unpriced`       | `Unpriced` (`unpriced::inspect`)           |           |         | ✓          |
+| `CatalogMiss`    | `CatalogMiss` (managed `/{provider}`)      |           |         | ✓          |
+| `Background`     | `Background`                               | ✓         | ✓       | ✓          |
+
+`Connect` is `request_filter` with a small catalog body in hand, before connecting; `Relay` a large
+catalog body before its `FullBody` re-run; `Buffered` the end of a body `request_body_filter`
+buffered whole (a managed `/{provider}` relay, or that re-run). So a small body with two `model`
+keys and an image is told about the `model`, and a large one about the image: the re-run sees the
+duplicate only once buffered.
+
+A rule reads `Facts`, never the bytes: each point fills in what applies there, from the scan it
+already made, for the requests a rule is for (a catalog walk, a managed key, a Responses path). At
+`Connect` the facts about the body's shape are checked as soon as it is scanned, and the row's
+(input, `background`) once the walk is shaped, after the control surface is parsed and counted, as
+before; the second check runs the whole list again on all the facts. The body rewrites (the
+output-limit clamp, translation, the strips, the model re-spelling, `stream_options`) stay a
+separate step after the rules pass, on a buffered body only. Signed ids are checked apart:
+verifying them also rewrites the body, and a store relay checks them where it holds the signer
+(first on `Relay` and `Buffered`, after the walk on `Connect`). `tests/refusal_precedence.rs` pins
+which refusal answers each pair at each point, end to end.
+
 ---
 
 ## Why It Behaves This Way
@@ -3347,7 +3379,9 @@ to serve.
   `tool_search_tool_*` is refused: the gateway neither meters it nor carries its result blocks. A
   tool with no `type` (Anthropic's `{name, input_schema}` client tool) passes; a non-string `type`,
   or any other type, is refused with a 400 (`UNLISTED_TOOL`), so a new billed tool fails closed until
-  it is listed. Breaking change (PR 0): an unlisted type that was passed before is now refused, for
+  it is listed. Every copy of a duplicated root key is read (the provider's parser may keep any
+  one), a tool type that does not decode is refused like an unknown one, and a `service_tier` that
+  is not a string asks for no tier. Breaking change (PR 0): an unlisted type that was passed before is now refused, for
   example other `openrouter:*` types and dated `tool_search_tool_*`.
 - Request body size ≤ `MAX_REQUEST_BODY` (declared `Content-Length` + streaming running total)
 - One root `model` key on a catalog walk. The walk routes on one and rewrites one, while most JSON
@@ -3746,6 +3780,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `usage`           | Token extraction (OpenAI / Anthropic, body + SSE)                                                                                                                              | unit ✓         |
 | `usage/vendor`    | Billing facts beyond tokens: `ServerTools` (server-side tool use by kind), served speed and geography, `Upstream` (the vendor's own ids and price); lenient per value          | unit ✓ + e2e ✓ |
 | `usage/tools`     | `ToolTally`: hosted-tool calls in an OpenAI Responses answer, counted chunk by chunk (`memmem` for `_call"` + structural check, bounded carry), since `usage` has none         | unit ✓ + e2e ✓ |
+| `body_rules`      | The body refusal rules in one precedence order (`Rule::ORDER`), each declaring the points it applies at; read extracted `Facts`, never bytes                                   | unit ✓ + e2e ✓ |
 | `refusal`         | `Refusal`: every gateway-made refusal as one closed type (status, type, message, compile-time body, metric label, `Retry-After`), carried through pingora as an error's cause  | unit ✓ + e2e ✓ |
 | `unpriced`        | Managed-request refusal (400, before the body goes upstream) of features a provider bills outside metered usage (`code_interpreter`, `image_generation`, …); BYO never checked | unit ✓ + e2e ✓ |
 | `terminal`        | Whether the bytes sent to a client end with the stream's terminal event (`[DONE]`, `message_stop`, `response.completed`)                                                       | unit ✓ + e2e ✓ |
