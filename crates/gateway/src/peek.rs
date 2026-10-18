@@ -1152,7 +1152,7 @@ pub fn remove_element_members(body: &mut Vec<u8>, open: usize, key: &str) -> boo
 }
 
 /// The spans [`remove_items`] cuts for one container's items, appended to `cuts` in order.
-fn item_cuts(
+pub(crate) fn item_cuts(
     items: &[(usize, usize)],
     drop: impl Fn(usize) -> bool,
     cuts: &mut Vec<(usize, usize)>,
