@@ -1,0 +1,612 @@
+{
+  "spec": "exec protocol v1.4 sandbox job notify (crates/agent/src/exec_endpoint.rs, \"Sandbox job notify (v1.4)\"), and crates/agent/FLEET.md \"Job-end callbacks\"",
+  "notes": [
+    "Every requirement tag in the spec (N…) and in FLEET.md's edge contract (E…), with the checks its text names, in the same order.",
+    "kind: fixture (a v1.4-*.json file in this directory, one of whose cases lists the tag in covers), conformance (a conformance::verify check, by its name), test (a test in this repo, module::name), fleet-sim (a fleet-sim scenario). task: the tracker task that writes the check, or exists."
+  ],
+  "requirements": [
+    {
+      "id": "N1",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "notify offered (v1.4)",
+          "task": "C3"
+        },
+        {
+          "kind": "fixture",
+          "name": "v1.4-probe.json"
+        }
+      ]
+    },
+    {
+      "id": "N2",
+      "checks": [
+        {
+          "kind": "fixture",
+          "name": "v1.4-probe.json"
+        }
+      ]
+    },
+    {
+      "id": "N3",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "sandbox_jobs_notify::baseline_offers_notify_only_with_a_safe_notifier",
+          "task": "C1"
+        }
+      ]
+    },
+    {
+      "id": "N4",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "keep refuses an invalid notify",
+          "task": "C3"
+        },
+        {
+          "kind": "fixture",
+          "name": "v1.4-keep.json"
+        }
+      ]
+    },
+    {
+      "id": "N5",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "keep refuses an invalid notify",
+          "task": "C3"
+        },
+        {
+          "kind": "fixture",
+          "name": "v1.4-keep.json"
+        }
+      ]
+    },
+    {
+      "id": "N6",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "notify follows the latest keep",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N7",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "callback request shape",
+          "task": "C3"
+        },
+        {
+          "kind": "fixture",
+          "name": "v1.4-callback.json"
+        }
+      ]
+    },
+    {
+      "id": "N8",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "first callback at keep",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N9",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "callback after the job ends",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N10",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "callback after the job ends",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N11",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "no callback after remove",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N12",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "no callback without notify",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N13",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "callback request shape",
+          "task": "C3"
+        },
+        {
+          "kind": "fixture",
+          "name": "v1.4-callback.json"
+        }
+      ]
+    },
+    {
+      "id": "N14",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "callback does not follow redirects",
+          "task": "C3"
+        },
+        {
+          "kind": "fixture",
+          "name": "v1.4-retry.json"
+        }
+      ]
+    },
+    {
+      "id": "N15",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "callback verifies TLS",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N16",
+      "checks": [
+        {
+          "kind": "fixture",
+          "name": "v1.4-retry.json"
+        },
+        {
+          "kind": "conformance",
+          "name": "callback retry and stop",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N17",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "callback retry and stop",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N18",
+      "checks": [
+        {
+          "kind": "fixture",
+          "name": "v1.4-retry.json"
+        },
+        {
+          "kind": "conformance",
+          "name": "callback retry and stop",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N19",
+      "checks": [
+        {
+          "kind": "fixture",
+          "name": "v1.4-retry.json"
+        },
+        {
+          "kind": "conformance",
+          "name": "callback retry and stop",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N20",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "the token never reaches argv, environment or answers",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N21",
+      "checks": [
+        {
+          "kind": "conformance",
+          "name": "the token never reaches argv, environment or answers",
+          "task": "C3"
+        }
+      ]
+    },
+    {
+      "id": "N22",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "sandbox_jobs_notify::the_token_is_never_logged",
+          "task": "C1"
+        }
+      ]
+    },
+    {
+      "id": "N23",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "serve_job_ended::a_token_authorises_nothing_else",
+          "task": "B2"
+        }
+      ]
+    },
+    {
+      "id": "N24",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "serve_job_ended::a_grant_alone_cannot_end_a_job",
+          "task": "B2"
+        }
+      ]
+    },
+    {
+      "id": "N25",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "serve_job_ended::a_forged_callback_opens_nothing",
+          "task": "B2"
+        },
+        {
+          "kind": "fixture",
+          "name": "v1.4-callback.json"
+        }
+      ]
+    },
+    {
+      "id": "N26",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "serve_job_ended::never_creates_a_session",
+          "task": "B2"
+        }
+      ]
+    },
+    {
+      "id": "N27",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "serve_job_ended::the_callback_is_not_a_client",
+          "task": "B2"
+        }
+      ]
+    },
+    {
+      "id": "N28",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "serve_job_ended::refusals_say_nothing",
+          "task": "B2"
+        }
+      ]
+    },
+    {
+      "id": "N29",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "serve_job_ended::answers_after_the_reconcile",
+          "task": "B2"
+        },
+        {
+          "kind": "fixture",
+          "name": "v1.4-callback.json"
+        }
+      ]
+    },
+    {
+      "id": "N30",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "serve_job_ended::one_reconcile_at_a_time",
+          "task": "B2"
+        }
+      ]
+    },
+    {
+      "id": "N31",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "serve_job_ended::repeats_are_free",
+          "task": "B2"
+        }
+      ]
+    },
+    {
+      "id": "N32",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "serve_job_ended::a_callback_is_only_a_hint",
+          "task": "B2"
+        }
+      ]
+    },
+    {
+      "id": "N33",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "serve_job_ended::no_turn_without_a_client",
+          "task": "B3"
+        }
+      ]
+    },
+    {
+      "id": "N34",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "serve_job_ended::one_report_per_end",
+          "task": "B6"
+        },
+        {
+          "kind": "fleet-sim",
+          "name": "sandbox-job-exit-noticed-once",
+          "task": "exists"
+        }
+      ]
+    },
+    {
+      "id": "N35",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "serve_job_ended::a_callback_open_reconciles_now",
+          "task": "B2"
+        }
+      ]
+    },
+    {
+      "id": "N36",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "serve_job_ended::the_notice_is_persisted_before_the_record_goes",
+          "task": "B3"
+        }
+      ]
+    },
+    {
+      "id": "N37",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "job_notify::release_waits_for_the_first_callback",
+          "task": "B4"
+        }
+      ]
+    },
+    {
+      "id": "N38",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "job_notify::keep_without_notify_when_unavailable",
+          "task": "B5"
+        }
+      ]
+    },
+    {
+      "id": "N39",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "job_notify::proof_window_opens_before_keep",
+          "task": "B4"
+        }
+      ]
+    },
+    {
+      "id": "N40",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "job_notify::no_callback_keeps_the_stream",
+          "task": "B4"
+        },
+        {
+          "kind": "test",
+          "name": "job_notify::a_refused_notify_falls_back",
+          "task": "B5"
+        }
+      ]
+    },
+    {
+      "id": "N41",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "job_notify::silent_after_release",
+          "task": "B4"
+        },
+        {
+          "kind": "test",
+          "name": "job_notify::a_wait_lets_go_again",
+          "task": "B4"
+        }
+      ]
+    },
+    {
+      "id": "N42",
+      "checks": [
+        {
+          "kind": "fixture",
+          "name": "v1.4-token.json"
+        }
+      ]
+    },
+    {
+      "id": "N43",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "job_notify::takeover_proves_again",
+          "task": "B4"
+        }
+      ]
+    },
+    {
+      "id": "N44",
+      "checks": [
+        {
+          "kind": "fixture",
+          "name": "v1.4-token.json"
+        }
+      ]
+    },
+    {
+      "id": "N45",
+      "checks": [
+        {
+          "kind": "fixture",
+          "name": "v1.4-token.json"
+        }
+      ]
+    },
+    {
+      "id": "N46",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "notify_token::the_tag_is_compared_in_constant_time",
+          "task": "B1"
+        },
+        {
+          "kind": "fixture",
+          "name": "v1.4-token.json"
+        }
+      ]
+    },
+    {
+      "id": "N47",
+      "checks": [
+        {
+          "kind": "fixture",
+          "name": "v1.4-token.json"
+        },
+        {
+          "kind": "test",
+          "name": "notify_token::mints_only_under_the_current_key",
+          "task": "B1"
+        }
+      ]
+    },
+    {
+      "id": "N48",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "notify_token::mints_only_its_own_scope",
+          "task": "B1"
+        }
+      ]
+    },
+    {
+      "id": "E1",
+      "checks": [
+        {
+          "kind": "fleet-sim",
+          "name": "job-ended-token-reaches-only-job-ended",
+          "task": "D2"
+        }
+      ]
+    },
+    {
+      "id": "E2",
+      "checks": [
+        {
+          "kind": "fleet-sim",
+          "name": "job-ended-reaches-the-owner",
+          "task": "D2"
+        }
+      ]
+    },
+    {
+      "id": "E3",
+      "checks": [
+        {
+          "kind": "fleet-sim",
+          "name": "job-ended-unknown-session-is-404",
+          "task": "D2"
+        }
+      ]
+    },
+    {
+      "id": "E4",
+      "checks": [
+        {
+          "kind": "fleet-sim",
+          "name": "job-ended-opens-an-unowned-session",
+          "task": "D2"
+        }
+      ]
+    },
+    {
+      "id": "E5",
+      "checks": [
+        {
+          "kind": "fleet-sim",
+          "name": "job-ended-answers-within-25s",
+          "task": "D2"
+        }
+      ]
+    },
+    {
+      "id": "E6",
+      "checks": [
+        {
+          "kind": "fleet-sim",
+          "name": "job-ended-status-passes-through",
+          "task": "D2"
+        }
+      ]
+    }
+  ]
+}

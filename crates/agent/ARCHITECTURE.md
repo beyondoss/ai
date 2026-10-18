@@ -2564,7 +2564,11 @@ doc's "Sandbox job notify (v1.4)" specifies the fix: `keep` gains an optional `n
 opaque `bjn_v1` token), the sandbox POSTs a `job_ended` hint to the session's own address when a kept
 job changes state, the replica reconciles through `list`/`read`, and it releases the stream only
 after the first callback arrives. FLEET.md's "Job-end callbacks" is the edge's half. Nothing in
-the code implements it yet: every replica holds its streams as described above.
+the code implements it yet: every replica holds its streams as described above. The vectors
+are `tests/fixtures/exec/v1.4-*.json`, and `tests/exec_notify_vectors.rs` loads each into a strict
+schema, recomputes what follows from its inputs (the token vectors under a reference verifier, the
+retry timelines), and fails when a tagged requirement names no check (`v1.4-checks.json` lists
+each one, with the task that writes it).
 
 Tests: `tests/sandbox_jobs.rs` runs every operation over this host's `sh`, the v1.2 mock, the v1.1
 mock, a template transport whose far side lives in its own session, and the v1.3 mock natively
