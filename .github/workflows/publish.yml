@@ -47,6 +47,10 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # The image compiler is the one CI tests with: mise.toml's pin, passed as RUST_VERSION.
+      - name: Read the Rust toolchain
+        id: rust
+        run: echo "version=$(sed -nE 's/^rust = \{ version = "([^"]+)".*/\1/p' mise.toml)" >> "$GITHUB_OUTPUT"
       - name: Build & push by digest
         id: build
         uses: docker/build-push-action@v7
@@ -54,6 +58,7 @@ jobs:
           context: .
           file: ${{ matrix.file }}
           platforms: linux/${{ matrix.arch }}
+          build-args: RUST_VERSION=${{ steps.rust.outputs.version }}
           # Push untagged, by digest; the merge job tags the manifest list. On a PR: build only.
           outputs: type=image,name=ghcr.io/beyondoss/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
           cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}
