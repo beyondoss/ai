@@ -38,6 +38,7 @@ pub mod proxy;
 pub mod ratelimit;
 pub mod refusal;
 pub mod remedy;
+mod retry;
 pub mod route;
 pub mod secret;
 pub mod signed_id;
