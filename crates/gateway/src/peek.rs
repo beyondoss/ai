@@ -14,6 +14,8 @@
 //! bound is its own condition) says why it cannot fail.
 #![deny(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
+use crate::lex::{self, Flow, Lexer, Visit, string_end};
+
 /// Most bytes of a root-level key or `model` value we will hold. Real model ids are well under
 /// 128 bytes (`proxy::sanitize_model` records anything longer as `unknown`), and the only keys we
 /// compare against are `model` and `message`, so anything past this is junk — and without a bound a
@@ -40,11 +42,7 @@ fn capture_text(raw: Vec<u8>, escaped: bool) -> Option<String> {
     if raw.len() >= MAX_CAPTURE {
         return None;
     }
-    let mut quoted = Vec::with_capacity(raw.len().saturating_add(2));
-    quoted.push(b'"');
-    quoted.extend(raw);
-    quoted.push(b'"');
-    serde_json::from_slice::<String>(&quoted).ok()
+    lex::unescape(&raw)
 }
 
 /// A captured key's text as [`capture_text`] decodes it. Unescaped keys are compared as captured, so
@@ -992,10 +990,10 @@ pub fn remove_root_members(body: &mut Vec<u8>, key: &str) -> bool {
 /// Whether a quoted JSON key containing escapes decodes to `want`. Only reached for a root key with a
 /// backslash in it, which real clients never send, so the allocation is off every ordinary path.
 fn escaped_key_is(quoted: &[u8], want: &str) -> bool {
-    // A decoded byte takes at most six raw ones (`\u00XX`), plus the two quotes: a longer string
-    // cannot decode to `want`, and is not decoded (it may be a whole prompt).
-    let most = want.len().saturating_mul(6).saturating_add(2);
-    quoted.len() <= most && serde_json::from_slice::<String>(quoted).is_ok_and(|k| k == want)
+    quoted
+        .strip_prefix(b"\"")
+        .and_then(|q| q.strip_suffix(b"\""))
+        .is_some_and(|raw| lex::unescapes_to(raw, want))
 }
 
 // ---- Span edits ------------------------------------------------------------------------------------
@@ -1041,45 +1039,25 @@ fn skip_ws(b: &[u8], i: usize) -> usize {
     i.saturating_add(n)
 }
 
-/// The end (exclusive) of the string whose opening quote is at `open`.
-fn string_end(b: &[u8], open: usize) -> Option<usize> {
-    let mut i = open.saturating_add(1);
-    loop {
-        let at = i.saturating_add(memchr::memchr2(b'"', b'\\', b.get(i..)?)?);
-        if b.get(at) == Some(&b'\\') {
-            i = at.saturating_add(2);
-        } else {
-            return Some(at.saturating_add(1));
-        }
-    }
-}
-
 /// The end (exclusive) of the JSON value starting at `i` (no leading whitespace).
 pub fn value_end(b: &[u8], i: usize) -> Option<usize> {
     match *b.get(i)? {
         b'"' => string_end(b, i),
         b'{' | b'[' => {
-            let mut depth = 0u32;
-            let mut j = i;
-            while let Some(&c) = b.get(j) {
-                match c {
-                    b'"' => {
-                        j = string_end(b, j)?;
-                        continue;
+            /// Stops at the bracket that closes the first one.
+            struct Close;
+            impl Visit for Close {
+                #[inline(always)]
+                fn byte(&mut self, _: usize, c: u8, depth: u32) -> Flow {
+                    if matches!(c, b'}' | b']') && depth == 1 {
+                        Flow::Break(())
+                    } else {
+                        Flow::Continue(())
                     }
-                    b'{' | b'[' => depth = depth.saturating_add(1),
-                    b'}' | b']' => {
-                        // The first byte opened a container, so `depth` is at least 1 here.
-                        depth = depth.saturating_sub(1);
-                        if depth == 0 {
-                            return Some(j.saturating_add(1));
-                        }
-                    }
-                    _ => {}
                 }
-                j = j.saturating_add(1);
             }
-            None
+            let end = Lexer::new().feed(b.get(i..)?, &mut Close)?;
+            i.checked_add(end)
         }
         _ => {
             let n = b
@@ -1387,9 +1365,7 @@ pub fn str_value(b: &[u8], span: (usize, usize)) -> Option<std::borrow::Cow<'_, 
         [b'"', inner @ .., b'"'] if !inner.contains(&b'\\') => std::str::from_utf8(inner)
             .ok()
             .map(std::borrow::Cow::Borrowed),
-        quoted @ [b'"', .., b'"'] => serde_json::from_slice::<String>(quoted)
-            .ok()
-            .map(std::borrow::Cow::Owned),
+        [b'"', inner @ .., b'"'] => lex::unescape(inner).map(std::borrow::Cow::Owned),
         _ => None,
     }
 }
@@ -1486,27 +1462,31 @@ pub struct Structure {
 
 /// [`Structure`] of `b`, in one pass: string contents are skipped with `memchr`.
 pub fn structure(b: &[u8]) -> Structure {
-    let mut s = Structure::default();
-    let mut i = 0usize;
-    while let Some(rest) = b.get(i..) {
-        let q = memchr::memchr(b'"', rest).map_or(b.len(), |q| i.saturating_add(q));
-        for (at, &c) in b.get(i..q).unwrap_or_default().iter().enumerate() {
-            if !matches!(c, b'{' | b'[' | b',' | b':') {
-                continue;
+    struct Count<'a> {
+        b: &'a [u8],
+        s: Structure,
+    }
+    impl Visit for Count<'_> {
+        #[inline(always)]
+        fn byte(&mut self, at: usize, c: u8, _: u32) -> Flow {
+            if matches!(c, b'{' | b'[' | b',' | b':') {
+                self.s.tokens = self.s.tokens.saturating_add(1);
+                // An object is empty when only whitespace stands between its braces.
+                let next = skip_ws(self.b, at.saturating_add(1));
+                if c == b'{' && self.b.get(next) != Some(&b'}') {
+                    self.s.objects = self.s.objects.saturating_add(1);
+                }
             }
-            s.tokens = s.tokens.saturating_add(1);
-            // An object is empty when only whitespace stands between its braces.
-            let next = skip_ws(b, i.saturating_add(at).saturating_add(1));
-            if c == b'{' && b.get(next) != Some(&b'}') {
-                s.objects = s.objects.saturating_add(1);
-            }
-        }
-        match string_end(b, q) {
-            Some(end) => i = end,
-            None => break,
+            Flow::Continue(())
         }
     }
-    s
+    // An unterminated string ends the count: nothing after it is outside a string.
+    let mut count = Count {
+        b,
+        s: Structure::default(),
+    };
+    Lexer::new().feed(b, &mut count);
+    count.s
 }
 
 #[cfg(test)]

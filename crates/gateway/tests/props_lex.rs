@@ -889,3 +889,52 @@ fn prop_span_reads_match_serde() {
         Ok(())
     });
 }
+
+// --- string decoding --------------------------------------------------------------------------
+
+/// String content a lexer can hand the decoder: escapes good and bad, `\u` with every kind of
+/// code unit (surrogates paired, lone, reversed), raw control bytes and quotes, bytes that are
+/// not UTF-8.
+fn raw_string() -> impl Strategy<Value = Vec<u8>> {
+    let piece = prop_oneof![
+        4 => "[a-zA-Z0-9 é😀]{1,4}".prop_map(String::into_bytes),
+        2 => prop::sample::select(vec![
+            "\\\"", "\\\\", "\\/", "\\b", "\\f", "\\n", "\\r", "\\t", "\\x", "\\U", "\\",
+            "\\u", "\\u0", "\\u004", "\\u0041", "\\u00e9", "\\u00E9", "\\u20ac", "\\uffff",
+            "\\u0000", "\\u001f", "\\ud83d", "\\ude00", "\\ud83d\\ude00", "\\uDBFF\\uDFFF",
+            "\\ud83d\\u0041", "\\ude00\\ud83d", "\\u12g4", "\"", "\u{1}", "\t", "\u{7f}",
+        ])
+        .prop_map(|s| s.as_bytes().to_vec()),
+        1 => (0xd800u32..0xe000).prop_map(|u| format!("\\u{u:04x}").into_bytes()),
+        1 => any::<u8>().prop_map(|b| vec![b]),
+    ];
+    prop::collection::vec(piece, 0..12).prop_map(|p| p.concat())
+}
+
+/// `lex::unescape` decodes what serde decodes into a `String` and refuses what it refuses, and
+/// `lex::unescapes_to` agrees with both, never matching anything else.
+#[test]
+fn prop_unescape_matches_serde() {
+    check(
+        "prop_unescape_matches_serde",
+        (raw_string(), "[a-zé😀]{0,3}"),
+        |(raw, other)| {
+            let mut quoted = vec![b'"'];
+            quoted.extend_from_slice(&raw);
+            quoted.push(b'"');
+            let want = serde_json::from_slice::<String>(&quoted).ok();
+            let got = beyond_ai::lex::unescape(&raw);
+            prop_assert_eq!(&got, &want, "{}", shown(&raw));
+            if let Some(w) = &want {
+                prop_assert!(beyond_ai::lex::unescapes_to(&raw, w), "{}", shown(&raw));
+            }
+            prop_assert_eq!(
+                beyond_ai::lex::unescapes_to(&raw, &other),
+                want.as_deref() == Some(other.as_str()),
+                "{}",
+                shown(&raw)
+            );
+            Ok(())
+        },
+    );
+}
