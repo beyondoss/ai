@@ -19,6 +19,8 @@ toml = "0.8"
 [dev-dependencies]
 # Port read-back for test subprocesses (`ports`): no port is picked free, released and rebound.
 base64.workspace = true
+# `pin_matches_the_gateway` (tenancy_live.rs) holds the live cells' pin prediction to `pin::order`.
+beyond-ai = { path = "../gateway" }
 beyond-ai-providers = { path = "../providers" }
 beyond-ai-test-support = { path = "../test-support" }
 ed25519-dalek = "2.2"
