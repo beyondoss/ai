@@ -93,6 +93,49 @@ fn run_binary_performs_tool_round_trip() {
 }
 
 #[test]
+fn run_binary_starts_the_answer_on_its_own_line_after_a_tool_call() {
+    // The tool marker and its streamed arguments are written without a trailing newline, so the
+    // next step's text used to be glued onto the end of the arguments JSON.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("hello.txt"), "secret-marker-42\n").unwrap();
+    let abs = dir.path().join("hello.txt").to_string_lossy().into_owned();
+
+    let turn1 = turn_tool_use("toolu_1", "read", &json!({ "path": abs }).to_string());
+    let turn2 = turn_text("I read the file.");
+    let (base, _bodies) = spawn_model_server(vec![turn1, turn2]);
+
+    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let output = run_cmd(bin)
+        .args([
+            "run",
+            "read hello.txt and report it",
+            "--gateway-url",
+            &base,
+            "--key",
+            "bai_v1.test",
+            "--model",
+            "claude-test",
+            "--max-steps",
+            "4",
+            "--no-session-persistence",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("spawn binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stdout: {stdout}");
+    assert!(
+        stdout.contains("}\nI read the file.\n"),
+        "the answer must start on its own line.\nstdout: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("\n\n"),
+        "no blank lines should be added.\nstdout: {stdout:?}"
+    );
+}
+
+#[test]
 fn run_binary_exits_nonzero_on_a_refusal_in_text_mode() {
     // Track L18: a refusal in text mode previously still exited 0, indistinguishable from a normal
     // completion — a script/CI caller has no other signal to key off of in that mode.

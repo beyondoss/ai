@@ -1362,7 +1362,7 @@ Agent::run[_events] (agent_core loop; see agent-core/ARCHITECTURE.md for the loo
    │  each step, text mode (default) — Agent::run, StreamEvent only:
    │   ├─ POST one model turn → gateway or provider ─── network/4xx/5xx ──► Error::Transport, exit ≠0
    │   ├─ StreamEvent::TextDelta   ───────────────────────────────────────► stdout (via TextOut)
-   │   ├─ StreamEvent::ToolUseStart ──────────────────────────────────────► stdout "\n[tool: name]"
+   │   ├─ StreamEvent::ToolUseStart ──────────────────────────────────────► stdout "\n[tool: name] {args}" (line left open; the next TextDelta starts with "\n")
    │   ├─ TextOut: stdout not a TTY → a step's output is held until its TurnEnd, and a retried
    │   │   attempt's (AgentEvent::Retry, or a whole-run retry) is dropped, so a captured stdout is
    │   │   the answer, never PARTIAL-PARTIAL-ANSWER; stdout a TTY → printed live, and a retry writes
