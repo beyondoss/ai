@@ -65,6 +65,10 @@ fn keys() -> Keys {
 /// `serve --service` with no seal flag; the caller adds the file flag and/or the env. Returns stderr
 /// of a startup that must fail.
 fn refused(k: &Keys, seal_flag: bool, env: Option<&str>) -> String {
+    // Startup must fail before it binds; a held, never-listening port keeps a regression from
+    // ever serving on it.
+    let dead = beyond_ai_test_support::ports::DeadPort::bind();
+    let listen = format!("127.0.0.1:{}", dead.port());
     let mut c = Command::new(BIN);
     c.args([
         "serve",
@@ -74,7 +78,7 @@ fn refused(k: &Keys, seal_flag: bool, env: Option<&str>) -> String {
         "--model",
         "claude-test",
         "--listen",
-        "127.0.0.1:0",
+        &listen,
         "--grant-key",
         &k.flag,
         "--shard",
