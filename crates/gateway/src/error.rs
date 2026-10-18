@@ -12,6 +12,13 @@ use crate::key::Kid;
 use crate::route::AUTO_SEGMENT;
 use crate::signed_id::SignerError;
 
+/// A gateway failure, with its cause.
+///
+/// Each Display is the whole operator-facing message, cause included (`dns resolution error:
+/// {authority}: {cause}`), because that text is what boot output, `--doctor` and log lines show
+/// and what operators grep. `source()` still returns the cause, for code that inspects it. So a
+/// reporter that walks the chain prints the cause twice: print an error's Display alone, and never
+/// format its `source()` chain after it. The same holds for [`ConfigError`].
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayError {
     #[error("configuration error: {0}")]
@@ -31,11 +38,14 @@ pub enum GatewayError {
 }
 
 /// Why a config cannot boot a gateway: one variant per check in `config.rs` and `state.rs`.
+///
+/// Display already includes the cause where there is one, as it does on [`GatewayError`]:
+/// `source()` is there for code, not for printing after the message.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     /// figment could not read the defaults or the environment, or extract the merged config.
     #[error("{0}")]
-    Figment(Box<figment::Error>),
+    Figment(#[source] Box<figment::Error>),
 
     #[error("failed to parse {}: {source}", path.display())]
     ParseFile {
