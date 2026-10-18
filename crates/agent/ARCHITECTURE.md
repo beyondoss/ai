@@ -93,7 +93,10 @@ The harness layers several capabilities over the bare tools + loop:
   the only order a client has. The replay recording is capped (`TURN_REPLAY_MAX_BYTES`, 4 MiB per
   session: one tool-heavy turn can emit megabytes and the daemon multiplexes many sessions); past the cap
   it is dropped and the catch-up reports `turn_truncated: true` rather than handing over a turn with a
-  silent hole in it. For the same borrow reason, `get_messages` is answerable **mid-run** from that
+  silent hole in it. Replies (`response`/`ack` frames) are **not** recorded: they answer the client
+  that sent the command, not the turn, and a `get_messages` reply is a whole transcript — recorded, a
+  client polling it mid-run grew the replay by a transcript per call and handed every later attach
+  answers to questions it never asked (`tests/serve_replay_replies.rs`). For the same borrow reason, `get_messages` is answerable **mid-run** from that
   snapshot rather than from `session` (which `run_events_steered` holds `&mut` for a run's whole duration
   — the same escape hatch `LiveStats` gives `get_state`), so a client can reconcile instead of being told
   to come back later. `serve_ws` owns a `session id → running session`
@@ -4128,6 +4131,10 @@ Each network connection (WebSocket, UDS, HTTP POST) has its own outbound queue b
 broadcast and the task that writes its socket (`serve::ConnTx`/`ConnRx`). That queue has to be bounded
 — a locked phone or a dead tunnel must not make a still-running session buffer without limit — and the
 bound is **bytes of live output not yet written** (`CONN_BACKLOG_MAX_BYTES`, 8 MiB), not frames.
+Every frame is charged its real serialized size: `OutFanout::broadcast` serializes a `Value` frame
+once, and those bytes are what each queue is charged, what the turn replay keeps and what every
+connection is sent (a refcount bump per sink). `Value` frames used to be charged a flat 256 bytes, so
+a run's worth of ~1 MB `get_messages` replies slipped past the cap (fifty were charged 12,800 bytes).
 
 - **Bytes, because a frame count measures the wrong thing.** The queue used to be a 1024-frame
   channel. The daemon's runtime is single-threaded by default, so the session's writer moves everything
