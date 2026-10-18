@@ -420,12 +420,15 @@ fn prop_stream_and_stream_options_match_serde() {
                 serde_json::Deserializer::from_slice(&b.text.as_bytes()[at..]).into_iter::<Value>();
             let first = values.next().map(Result::unwrap);
             prop_assert_eq!(first.as_ref(), root.get("stream_options"));
-            prop_assert_eq!(peek::plan_stream_usage_injection(b.text.as_bytes()), None);
+            prop_assert_eq!(
+                old_peek::plan_stream_usage_injection(b.text.as_bytes()),
+                None
+            );
         } else {
             let at = scan.inject_at.expect("inject point");
             prop_assert_eq!(
                 Some(at),
-                peek::plan_stream_usage_injection(b.text.as_bytes())
+                old_peek::plan_stream_usage_injection(b.text.as_bytes())
             );
             let mut spliced = b.text.clone().into_bytes();
             spliced.splice(
@@ -519,7 +522,7 @@ fn prop_scanners_never_panic_on_any_bytes() {
             for at in scan.inject_at.into_iter().chain(scan.stream_options_at) {
                 prop_assert!(at <= bytes.len());
             }
-            let _ = peek::plan_stream_usage_injection(&bytes);
+            let _ = old_peek::plan_stream_usage_injection(&bytes);
             for mut s in [ModelScanner::new(), ModelScanner::for_response()] {
                 for c in chunk(&bytes, &cuts) {
                     s.feed(&c);

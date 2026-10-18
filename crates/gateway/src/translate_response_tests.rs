@@ -3375,3 +3375,168 @@ fn a_chat_tool_call_opened_with_its_arguments_streams_them_to_responses() {
         .collect();
     assert_eq!(deltas, "{\"city\":\"Paris\"}", "{evs:#?}");
 }
+
+/// `ArgsEnd` as it stood before it was ported onto `lex`, verbatim: the behavioural oracle of
+/// [`args_end_agrees_with_the_old_scan`]. Do not fix anything here.
+#[derive(Default)]
+struct OldArgsEnd {
+    scanned: usize,
+    depth: u32,
+    in_string: bool,
+    escaped: bool,
+    closed: bool,
+    invalid: bool,
+    failed_at: Option<usize>,
+}
+
+impl OldArgsEnd {
+    fn whole(&mut self, args: &str) -> bool {
+        if self.invalid || self.failed_at == Some(args.len()) {
+            return false;
+        }
+        let b = args.as_bytes();
+        let first = b.iter().position(|c| !c.is_ascii_whitespace());
+        match first.and_then(|i| b.get(i)) {
+            None => return false,
+            Some(&c) if !matches!(c, b'{' | b'[' | b'"') => return self.parses(args),
+            Some(_) => {}
+        }
+        while !self.closed
+            && let Some(&c) = b.get(self.scanned)
+        {
+            self.scanned += 1;
+            if self.in_string {
+                match c {
+                    _ if self.escaped => self.escaped = false,
+                    b'\\' => self.escaped = true,
+                    b'"' => {
+                        self.in_string = false;
+                        self.closed = self.depth == 0;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                b'"' => self.in_string = true,
+                b'{' | b'[' => self.depth += 1,
+                b'}' | b']' => {
+                    self.depth = self.depth.saturating_sub(1);
+                    self.closed = self.depth == 0;
+                }
+                _ => {}
+            }
+        }
+        if !self.closed {
+            return false;
+        }
+        let whole = self.parses(args);
+        self.invalid = !whole;
+        whole
+    }
+
+    fn parses(&mut self, args: &str) -> bool {
+        let ok = serde_json::from_str::<serde::de::IgnoredAny>(args).is_ok();
+        if !ok {
+            self.failed_at = Some(args.len());
+        }
+        ok
+    }
+}
+
+/// Argument text as a model streams it: valid JSON of any shape (escapes and surrogate pairs in
+/// its strings, numbers of every form), or a run of the pieces that steer a lexer, malformed and
+/// unterminated included.
+fn args_text() -> impl proptest::strategy::Strategy<Value = String> {
+    use proptest::prelude::*;
+    let leaf = prop_oneof![
+        Just(Value::Null),
+        any::<bool>().prop_map(Value::Bool),
+        any::<i64>().prop_map(Value::from),
+        any::<f64>()
+            .prop_filter("finite", |f| f.is_finite())
+            .prop_map(Value::from),
+        any::<String>().prop_map(Value::String),
+        "[\"\\\\/a-z😀é\u{1}]{0,12}".prop_map(Value::String),
+    ];
+    let valid = leaf
+        .prop_recursive(6, 48, 5, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
+                prop::collection::vec(("[a-z\"\\\\]{0,4}", inner), 0..4)
+                    .prop_map(|kv| Value::Object(kv.into_iter().collect())),
+            ]
+        })
+        .prop_map(|v| serde_json::to_string(&v).unwrap());
+    let pieces = prop::collection::vec(
+        prop::sample::select(vec![
+            "{",
+            "}",
+            "[",
+            "]",
+            "\"",
+            "\\",
+            "\\\"",
+            "\\\\",
+            "\\u00e9",
+            "\\ud83d\\ude00",
+            "a",
+            "1",
+            "-2.5e3",
+            ",",
+            ":",
+            " ",
+            "\n",
+            "true",
+            "nul",
+            "é",
+            "😀",
+        ]),
+        0..24,
+    )
+    .prop_map(|p| p.concat());
+    prop_oneof![3 => valid, 2 => pieces]
+}
+
+/// The live call's end, asked after every delta of the arguments (cut anywhere, a byte at a
+/// time, or whole), answers exactly as the old scan, and never calls arguments whole that a
+/// parser refuses.
+#[test]
+fn args_end_agrees_with_the_old_scan() {
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config, TestRunner};
+    let strategy = (args_text(), prop::collection::vec(any::<usize>(), 0..10));
+    let mut runner = TestRunner::new(Config::default());
+    runner
+        .run(&strategy, |(args, cuts)| {
+            let bounds: Vec<usize> = (1..=args.len())
+                .filter(|&i| args.is_char_boundary(i))
+                .collect();
+            let mut random: Vec<usize> = cuts
+                .iter()
+                .map(|c| bounds.get(c % bounds.len().max(1)).copied().unwrap_or(0))
+                .chain([args.len()])
+                .collect();
+            random.sort_unstable();
+            random.dedup();
+            for steps in [vec![args.len()], bounds.clone(), random] {
+                let (mut new, mut old) = (ArgsEnd::default(), OldArgsEnd::default());
+                for &at in &steps {
+                    let prefix = &args[..at];
+                    let whole = new.whole(prefix);
+                    prop_assert_eq!(whole, old.whole(prefix), "{:?} at {}", args, at);
+                    prop_assert_eq!(new.invalid, old.invalid, "{:?} at {}", args, at);
+                    prop_assert_eq!(new.failed_at, old.failed_at, "{:?} at {}", args, at);
+                    if whole {
+                        prop_assert!(
+                            serde_json::from_str::<serde::de::IgnoredAny>(prefix).is_ok(),
+                            "{:?}",
+                            prefix
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+}

@@ -29,6 +29,7 @@ pub mod doctor;
 pub mod drain;
 pub mod error;
 pub mod key;
+pub mod lex;
 pub mod metrics;
 pub mod peek;
 pub mod pin;

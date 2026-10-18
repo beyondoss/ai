@@ -1726,9 +1726,10 @@ precisely because of this: a forged-key flood is rejected in tens of nanoseconds
 
 ### Model Extraction (`peek.rs:ModelScanner`)
 
-A streaming structural scanner fed body or response chunks as they arrive. Tracks JSON nesting
-depth, string-escape state, and quote boundaries. Captures the **root-level `model` field only**
-(depth 0 in the object), ignoring nested `model` keys in tool calls or message content. A key
+A streaming structural scanner fed body or response chunks as they arrive. Nesting depth, string
+and escape state come from the one JSON lexer (`lex.rs`), which every peek walker and the buffered
+scan share; the scanner keeps only its key-level grammar on top. Captures the **root-level
+`model` field only** (depth 0 in the object), ignoring nested `model` keys in tool calls or message content. A key
 spelled with escapes is decoded before the compare, as the provider decodes it (`"model"` is
 `model`); an unescaped key is compared as it stands. The `model` value is decoded the same way
 (`"gpt-5"` is `gpt-5`), and an escaped value cut at the cap reads as `unknown`.
@@ -3710,6 +3711,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `key`             | `bai_v1` / `bai_v2` (explicit `key_id`) parse + Ed25519 verify + mint; keyring with multi-kid rotation support                                                                 | unit ✓         |
 | `route`           | Data-driven provider table (name / authority / auth) + dialect default + model-route re-exports                                                                                | unit ✓         |
 | `peek`            | `ModelScanner` — streaming structural scan for the root-level `model`; O(1) memory                                                                                             | unit ✓         |
+| `lex`             | The one JSON lexer behind every walker that reads JSON unparsed: resumable string / escape / depth state (`memchr2` in strings), strict string decoding                        | unit ✓         |
 | `usage`           | Token extraction (OpenAI / Anthropic, body + SSE)                                                                                                                              | unit ✓         |
 | `usage/vendor`    | Billing facts beyond tokens: `ServerTools` (server-side tool use by kind), served speed and geography, `Upstream` (the vendor's own ids and price); lenient per value          | unit ✓ + e2e ✓ |
 | `usage/tools`     | `ToolTally`: hosted-tool calls in an OpenAI Responses answer, counted chunk by chunk (`memmem` for `_call"` + structural check, bounded carry), since `usage` has none         | unit ✓ + e2e ✓ |
@@ -3762,8 +3764,12 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   text, tool calls and signed thinking survive every pairing, request and response, and back;
   that the usage a translated client is shown equals what `usage.rs` bills for the same upstream
   bytes, stream and not; that `peek`'s scans agree with serde_json (the provider's reading, last
-  duplicate wins) on `model`, `stream`, `stream_options` and the output limits; that no field that
-  changes the answer is silently dropped; that the route tables classify any path as
+  duplicate wins) on `model`, `stream`, `stream_options` and the output limits, and that every
+  `peek` walker (the streaming and buffered scans, the span reads and edits) answers exactly as
+  the copy of it kept from before it shared one lexer, on valid, broken and truncated bodies fed
+  whole, byte by byte and cut at random (`tests/props_lex.rs`, oracle in
+  `tests/props_support/old_peek.rs`; `ArgsEnd` the same way in `translate_response_tests.rs`);
+  that no field that changes the answer is silently dropped; that the route tables classify any path as
   documented; and that a signed Responses id round-trips for its tenant, never verifies for another
   or after any one-byte change, and is rewritten exactly where it appears in a request body or a
   stream cut anywhere (`tests/props_signed_id.rs`). Each property runs `PROPTEST_CASES` cases (default 2000), stopped after

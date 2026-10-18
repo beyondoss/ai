@@ -14,6 +14,8 @@
 //! bound is its own condition) says why it cannot fail.
 #![deny(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
+use crate::lex::{self, Flow, Lexer, Visit, string_end};
+
 /// Most bytes of a root-level key or `model` value we will hold. Real model ids are well under
 /// 128 bytes (`proxy::sanitize_model` records anything longer as `unknown`), and the only keys we
 /// compare against are `model` and `message`, so anything past this is junk — and without a bound a
@@ -22,11 +24,11 @@
 /// ever miss the catalog or log as `unknown`, never match something it isn't.
 pub const MAX_CAPTURE: usize = 256;
 
+/// Append to a capture, up to [`MAX_CAPTURE`] bytes.
 #[inline]
-fn push_capped(buf: &mut Vec<u8>, b: u8) {
-    if buf.len() < MAX_CAPTURE {
-        buf.push(b);
-    }
+fn push_capped(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let room = MAX_CAPTURE.saturating_sub(buf.len());
+    buf.extend_from_slice(bytes.get(..room.min(bytes.len())).unwrap_or_default());
 }
 
 /// The text of a captured JSON string, with its escapes as sent: decoded the way a provider's parser
@@ -40,11 +42,7 @@ fn capture_text(raw: Vec<u8>, escaped: bool) -> Option<String> {
     if raw.len() >= MAX_CAPTURE {
         return None;
     }
-    let mut quoted = Vec::with_capacity(raw.len().saturating_add(2));
-    quoted.push(b'"');
-    quoted.extend(raw);
-    quoted.push(b'"');
-    serde_json::from_slice::<String>(&quoted).ok()
+    lex::unescape(&raw)
 }
 
 /// A captured key's text as [`capture_text`] decodes it. Unescaped keys are compared as captured, so
@@ -100,11 +98,9 @@ const MAX_EXTRAS: usize = 6;
 pub struct ModelScanner {
     model: Option<String>,
     done: bool,
-    /// Nesting depth: number of currently-open `{`/`[`. Root object contents are at depth 1.
-    depth: u32,
+    /// Strings, escapes and nesting depth (root object contents are at depth 1), across chunks.
+    lex: Lexer,
     root_is_object: bool,
-    in_string: bool,
-    escaped: bool,
     /// Whether the next key-level string is a key (`{`/`,` → key; `:` → value).
     expect_key: bool,
     /// The most recent key-level key was exactly `model`.
@@ -120,8 +116,6 @@ pub struct ModelScanner {
     /// What (if anything) we're accumulating into `cur` for the current string.
     cap: Cap,
     cur: Vec<u8>,
-    /// The capture in `cur` holds a backslash, so it is decoded when it closes.
-    cur_escaped: bool,
 }
 
 /// What a scan keeps beside `model` ([`ModelScanner::feed_keeping`]): the values of a fixed set of
@@ -251,11 +245,11 @@ impl ModelScanner {
         self.done
     }
 
-    /// Whether the current depth is one whose keys we inspect: the root object always, plus the
-    /// object under a root `message` key when [`Self::for_response`] enabled it.
+    /// Whether `depth` is one whose keys we inspect: the root object always, plus the object
+    /// under a root `message` key when [`Self::for_response`] enabled it.
     #[inline]
-    fn at_key_level(&self) -> bool {
-        (self.depth == 1 && self.root_is_object) || (self.depth == 2 && self.in_message)
+    fn at_key_level(&self, depth: u32) -> bool {
+        (depth == 1 && self.root_is_object) || (depth == 2 && self.in_message)
     }
 
     /// Feed the next bytes of the body.
@@ -269,212 +263,215 @@ impl ModelScanner {
         self.feed_inner(bytes, Some(kept));
     }
 
-    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-    fn feed_inner(&mut self, bytes: &[u8], mut kept: Option<&mut Kept>) {
-        // Proof for the allow: every index is `i`/`j` with `i < n` (the loop condition, or a `memchr`
-        // offset inside `bytes[i..]`), or a key span bounded by the closing quote just found; counters
-        // (`i`, `j`, `depth`, `model_keys`) count bytes of a body that fits in memory, so they cannot
-        // overflow. This loop runs on every managed request body, so it keeps the unchecked forms.
+    fn feed_inner(&mut self, bytes: &[u8], kept: Option<&mut Kept>) {
         if self.done {
             return;
         }
-        let mut i = 0;
-        let n = bytes.len();
         // Where the raw capture in progress starts in this chunk.
-        let mut raw_from = kept.as_ref().and_then(|k| k.raw).map(|_| 0);
-        while i < n {
-            if self.in_string {
-                // Fast path: the content of a string we don't accumulate (a big base64 image, a long
-                // prompt, anything nested) — jump straight to the next `"` or `\` with a
-                // SIMD-accelerated search instead of inspecting every byte.
-                if self.cap == Cap::No && !self.escaped {
-                    match memchr::memchr2(b'"', b'\\', &bytes[i..]) {
-                        Some(rel) => i += rel,
-                        // The rest of this chunk is skippable string content.
-                        None => break,
-                    }
-                }
-                let b = bytes[i];
-                i += 1;
-                if self.escaped {
-                    self.escaped = false;
-                    if self.cap != Cap::No {
-                        push_capped(&mut self.cur, b);
-                    }
-                } else if b == b'\\' {
-                    self.escaped = true;
-                    if self.cap != Cap::No {
-                        push_capped(&mut self.cur, b);
-                        self.cur_escaped = true;
-                    }
-                } else if b == b'"' {
-                    self.in_string = false;
-                    match self.cap {
-                        Cap::Key => {
-                            let key = key_bytes(&self.cur, self.cur_escaped);
-                            self.last_key_is_model = key.as_deref() == Some(b"model".as_slice());
-                            if let Some(k) = kept.as_deref_mut() {
-                                let at = key
-                                    .as_deref()
-                                    .and_then(|key| k.keys.iter().position(|want| *want == key));
-                                k.last_key_extra = at.and_then(|i| u8::try_from(i).ok());
-                            }
-                            // Only a *root* `message` opens the nested scan — a `message` key inside
-                            // the message object itself must not re-arm it.
-                            if self.accept_message_nesting && self.depth == 1 {
-                                self.last_key_is_message =
-                                    matches!(key.as_deref(), Some(b"message" | b"response"));
-                            }
-                        }
-                        Cap::ModelValue => {
-                            // A valid JSON string value is UTF-8; if a malformed/adversarial body
-                            // smuggles non-UTF-8 bytes here we record "unknown" rather than emitting
-                            // a `U+FFFD`-corrupted model into the billing log. Either way we're done.
-                            let v = capture_text(std::mem::take(&mut self.cur), self.cur_escaped)
-                                .unwrap_or_else(|| "unknown".to_string());
-                            match kept.as_deref() {
-                                // A knob scan keeps walking; the first `model` is the one kept.
-                                Some(k) if k.past_model => {
-                                    self.model.get_or_insert(v);
-                                    if k.all_found() {
-                                        self.done = true;
-                                        return;
-                                    }
-                                }
-                                _ => {
-                                    self.model = Some(v);
-                                    self.done = true;
-                                    return;
-                                }
-                            }
-                        }
-                        Cap::Extra => {
-                            if let Some(k) = kept.as_deref_mut()
-                                && let Some(idx) = k.last_key_extra
-                            {
-                                // Not UTF-8: dropped, never written to a row as a corrupted value.
-                                if let Some(v) =
-                                    capture_text(std::mem::take(&mut self.cur), self.cur_escaped)
-                                {
-                                    k.keep(idx, v);
-                                }
-                                if k.past_model && k.all_found() {
-                                    self.done = true;
-                                    return;
-                                }
-                            }
-                        }
-                        Cap::No => {}
-                    }
-                    self.cap = Cap::No;
-                    self.cur.clear();
-                } else if self.cap != Cap::No {
-                    push_capped(&mut self.cur, b);
-                }
-                continue;
-            }
-
-            let b = bytes[i];
-            i += 1;
-            let extra = kept.as_ref().and_then(|k| k.last_key_extra);
-            match b {
-                b'"' => {
-                    self.in_string = true;
-                    self.cur.clear();
-                    self.cur_escaped = false;
-                    // Decide whether this string is worth accumulating — only key-level keys and
-                    // the `model` value matter.
-                    self.cap = if self.at_key_level() {
-                        if self.expect_key {
-                            Cap::Key
-                        } else if self.last_key_is_model {
-                            Cap::ModelValue
-                        } else if extra.is_some() {
-                            Cap::Extra
-                        } else {
-                            Cap::No
-                        }
-                    } else {
-                        Cap::No
-                    };
-                }
-                b'{' | b'['
-                    if extra.is_some()
-                        && !self.expect_key
-                        && self.at_key_level()
-                        && kept.as_ref().is_some_and(|k| k.raw.is_none()) =>
-                {
-                    // An object or array value of a kept key: captured raw until its depth closes.
-                    if let Some(k) = kept.as_deref_mut() {
-                        k.raw = extra;
-                        k.raw_depth = self.depth;
-                        k.raw_buf.clear();
-                    }
-                    raw_from = Some(i - 1);
-                    self.depth += 1;
-                }
-                b'{' => {
-                    if self.depth == 0 {
-                        self.root_is_object = true;
-                        self.expect_key = true;
-                    } else if self.depth == 1 && self.last_key_is_message {
-                        // Descending into the root `message` object: its keys become key-level too.
-                        self.in_message = true;
-                        self.expect_key = true;
-                    }
-                    self.depth += 1;
-                }
-                b'[' => {
-                    if self.depth == 0 {
-                        self.root_is_object = false;
-                    }
-                    self.depth += 1;
-                }
-                b'}' | b']' => {
-                    // Leaving the `message` object returns key-level scanning to the root.
-                    if self.depth == 2 && self.in_message {
-                        self.in_message = false;
-                        self.last_key_is_message = false;
-                    }
-                    self.depth = self.depth.saturating_sub(1);
-                    if let Some(k) = kept.as_deref_mut()
-                        && let Some(idx) = k.raw
-                        && self.depth == k.raw_depth
-                    {
-                        push_raw(&mut k.raw_buf, &bytes[raw_from.unwrap_or(0)..i]);
-                        raw_from = None;
-                        k.raw = None;
-                        let v = utf8_prefix(std::mem::take(&mut k.raw_buf));
-                        k.keep(idx, v);
-                        if k.past_model && k.all_found() {
-                            self.done = true;
-                            return;
-                        }
-                    }
-                }
-                // Unguarded by depth: a `:` or `,` inside a nested value is always followed by
-                // the key-level `,` or `}` that closes it before the next key-level string, and
-                // that one sets `expect_key` again.
-                b':' => self.expect_key = false,
-                b',' => {
-                    self.expect_key = true;
-                    self.last_key_is_model = false;
-                    if let Some(k) = kept.as_deref_mut() {
-                        k.last_key_extra = None;
-                    }
-                    if self.depth == 1 {
-                        self.last_key_is_message = false;
-                    }
-                }
-                _ => {}
-            }
-        }
-        if let Some(k) = kept
+        let raw_from = kept.as_ref().and_then(|k| k.raw).map(|_| 0);
+        let mut lex = self.lex;
+        let mut walk = Walk {
+            s: self,
+            kept,
+            bytes,
+            raw_from,
+        };
+        let stopped = lex.feed(bytes, &mut walk);
+        let Walk {
+            s, kept, raw_from, ..
+        } = walk;
+        s.lex = lex;
+        // A stop is the scan finishing, which ends any raw capture first.
+        if stopped.is_none()
+            && let Some(k) = kept
             && k.raw.is_some()
             && let Some(from) = raw_from
         {
-            push_raw(&mut k.raw_buf, &bytes[from..n]);
+            push_raw(&mut k.raw_buf, bytes.get(from..).unwrap_or_default());
         }
+    }
+}
+
+/// One [`ModelScanner::feed_inner`] call: the scanner's key-level grammar over the lexer's events.
+struct Walk<'a, 'k> {
+    s: &'a mut ModelScanner,
+    kept: Option<&'k mut Kept>,
+    bytes: &'a [u8],
+    /// Where the raw capture in progress starts in this chunk.
+    raw_from: Option<usize>,
+}
+
+impl Walk<'_, '_> {
+    /// The scan is over: `feed` is a no-op from here.
+    fn finish(&mut self) -> Flow {
+        self.s.done = true;
+        Flow::Break(())
+    }
+}
+
+impl Visit for Walk<'_, '_> {
+    #[inline(always)]
+    fn open(&mut self, _: usize, depth: u32) {
+        let extra = self.kept.as_ref().and_then(|k| k.last_key_extra);
+        let s = &mut *self.s;
+        s.cur.clear();
+        // Decide whether this string is worth accumulating — only key-level keys and the `model`
+        // value matter.
+        s.cap = if s.at_key_level(depth) {
+            if s.expect_key {
+                Cap::Key
+            } else if s.last_key_is_model {
+                Cap::ModelValue
+            } else if extra.is_some() {
+                Cap::Extra
+            } else {
+                Cap::No
+            }
+        } else {
+            Cap::No
+        };
+    }
+
+    #[inline(always)]
+    fn content(&mut self, raw: &[u8]) {
+        let s = &mut *self.s;
+        if s.cap != Cap::No {
+            push_capped(&mut s.cur, raw);
+        }
+    }
+
+    fn close(&mut self, _: usize, depth: u32, escaped: bool) -> Flow {
+        let s = &mut *self.s;
+        match s.cap {
+            Cap::Key => {
+                let key = key_bytes(&s.cur, escaped);
+                s.last_key_is_model = key.as_deref() == Some(b"model".as_slice());
+                if let Some(k) = self.kept.as_deref_mut() {
+                    let at = key
+                        .as_deref()
+                        .and_then(|key| k.keys.iter().position(|want| *want == key));
+                    k.last_key_extra = at.and_then(|i| u8::try_from(i).ok());
+                }
+                // Only a *root* `message` opens the nested scan — a `message` key inside the
+                // message object itself must not re-arm it.
+                if s.accept_message_nesting && depth == 1 {
+                    s.last_key_is_message =
+                        matches!(key.as_deref(), Some(b"message" | b"response"));
+                }
+            }
+            Cap::ModelValue => {
+                // A valid JSON string value is UTF-8; if a malformed/adversarial body smuggles
+                // non-UTF-8 bytes here we record "unknown" rather than emitting a
+                // `U+FFFD`-corrupted model into the billing log. Either way we're done.
+                let v = capture_text(std::mem::take(&mut s.cur), escaped)
+                    .unwrap_or_else(|| "unknown".to_string());
+                match self.kept.as_deref() {
+                    // A knob scan keeps walking; the first `model` is the one kept.
+                    Some(k) if k.past_model => {
+                        s.model.get_or_insert(v);
+                        if k.all_found() {
+                            return self.finish();
+                        }
+                    }
+                    _ => {
+                        s.model = Some(v);
+                        return self.finish();
+                    }
+                }
+            }
+            Cap::Extra => {
+                if let Some(k) = self.kept.as_deref_mut()
+                    && let Some(idx) = k.last_key_extra
+                {
+                    // Not UTF-8: dropped, never written to a row as a corrupted value.
+                    if let Some(v) = capture_text(std::mem::take(&mut s.cur), escaped) {
+                        k.keep(idx, v);
+                    }
+                    if k.past_model && k.all_found() {
+                        return self.finish();
+                    }
+                }
+            }
+            Cap::No => {}
+        }
+        let s = &mut *self.s;
+        s.cap = Cap::No;
+        s.cur.clear();
+        Flow::Continue(())
+    }
+
+    #[inline(always)]
+    fn byte(&mut self, at: usize, b: u8, depth: u32) -> Flow {
+        let extra = self.kept.as_ref().and_then(|k| k.last_key_extra);
+        let s = &mut *self.s;
+        match b {
+            b'{' | b'['
+                if extra.is_some()
+                    && !s.expect_key
+                    && s.at_key_level(depth)
+                    && self.kept.as_ref().is_some_and(|k| k.raw.is_none()) =>
+            {
+                // An object or array value of a kept key: captured raw until its depth closes.
+                if let Some(k) = self.kept.as_deref_mut() {
+                    k.raw = extra;
+                    k.raw_depth = depth;
+                    k.raw_buf.clear();
+                }
+                self.raw_from = Some(at);
+            }
+            b'{' => {
+                if depth == 0 {
+                    s.root_is_object = true;
+                    s.expect_key = true;
+                } else if depth == 1 && s.last_key_is_message {
+                    // Descending into the root `message` object: its keys become key-level too.
+                    s.in_message = true;
+                    s.expect_key = true;
+                }
+            }
+            b'[' => {
+                if depth == 0 {
+                    s.root_is_object = false;
+                }
+            }
+            b'}' | b']' => {
+                // Leaving the `message` object returns key-level scanning to the root.
+                if depth == 2 && s.in_message {
+                    s.in_message = false;
+                    s.last_key_is_message = false;
+                }
+                if let Some(k) = self.kept.as_deref_mut()
+                    && let Some(idx) = k.raw
+                    && depth.saturating_sub(1) == k.raw_depth
+                {
+                    let from = self.raw_from.take().unwrap_or(0);
+                    let to = at.saturating_add(1);
+                    push_raw(&mut k.raw_buf, self.bytes.get(from..to).unwrap_or_default());
+                    k.raw = None;
+                    let v = utf8_prefix(std::mem::take(&mut k.raw_buf));
+                    k.keep(idx, v);
+                    if k.past_model && k.all_found() {
+                        return self.finish();
+                    }
+                }
+            }
+            // Unguarded by depth: a `:` or `,` inside a nested value is always followed by the
+            // key-level `,` or `}` that closes it before the next key-level string, and that one
+            // sets `expect_key` again.
+            b':' => s.expect_key = false,
+            b',' => {
+                s.expect_key = true;
+                s.last_key_is_model = false;
+                if let Some(k) = self.kept.as_deref_mut() {
+                    k.last_key_extra = None;
+                }
+                if depth == 1 {
+                    s.last_key_is_message = false;
+                }
+            }
+            _ => {}
+        }
+        Flow::Continue(())
     }
 }
 
@@ -492,159 +489,16 @@ fn utf8_prefix(buf: Vec<u8>) -> String {
     }
 }
 
-/// Decide whether an OpenAI **chat** request body needs `stream_options.include_usage` injected,
-/// and where. Returns `Some(offset)` — the byte index just after the root object's opening `{`, where
-/// the caller splices `"stream_options":{"include_usage":true},` — **only** when the body is a JSON
-/// object with a root-level `"stream": true` and **no** root-level `"stream_options"` key. Otherwise
-/// `None` (not a stream, options already set, or not an object) → forward unchanged.
-///
-/// Why this exists: OpenAI only emits a usage chunk on a stream when the request carries
-/// `stream_options.include_usage = true`. A stock client that omits it would stream with no usage,
-/// so managed traffic couldn't be metered. We can't ask for it via a header and can't set it in a
-/// client SDK we don't control, so the gateway injects it — for every OpenAI streaming chat request,
-/// out of the box.
-///
-/// Structural (depth + string + escape aware), so a `"stream"` inside a message object or inside a
-/// string value never triggers injection — only the genuine root-level field. The returned offset is
-/// always inside a non-empty object (a root `"stream"` is present), so the caller always follows the
-/// fragment with a comma.
-#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-pub fn plan_stream_usage_injection(body: &[u8]) -> Option<usize> {
-    // Proof for the allow: every index is `i`/`j` with `i < n` (the loop condition, or a `memchr`
-    // offset inside `bytes[i..]`), or a key span bounded by the closing quote just found; counters
-    // (`i`, `j`, `depth`, `model_keys`) count bytes of a body that fits in memory, so they cannot
-    // overflow. This loop runs on every managed request body, so it keeps the unchecked forms.
-    let n = body.len();
-    // Cheap pre-filter: injection is only ever needed when a root-level `"stream"` key is present.
-    // If the quoted token `"stream"` doesn't occur *anywhere*, the structural answer is
-    // unconditionally `None`, so a single SIMD `memmem` pass lets us skip the whole walk — the
-    // common case, since most requests aren't streaming. (Note `"stream_options"` does NOT contain
-    // the needle: the byte after `stream` is `_`, not a closing quote — so a body carrying only
-    // `stream_options` fails this pre-filter and returns `None` here, which is the correct answer.)
-    // An escaped key (`"str\u0065am"`) decodes to `stream` at the provider without spelling it,
-    // and such a key always carries `\u`; real clients never send one, so the second search runs
-    // only on a body with no `"stream"` at all.
-    if memchr::memmem::find(body, b"\"stream\"").is_none()
-        && memchr::memmem::find(body, b"\\u").is_none()
-    {
-        return None;
-    }
-    // Must be a JSON object; anything else (array, scalar, garbage) we never rewrite.
-    let i = body.iter().position(|b| !b.is_ascii_whitespace())?;
-    if body[i] != b'{' {
-        return None;
-    }
-    let insert_at = i + 1;
-
-    let mut depth = 0u32;
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut expect_key = false;
-    let mut capturing_key = false;
-    // Start index (just past the opening `"`) of the root-level key currently being scanned. The
-    // body is fully in hand, so we slice the key out of it at the closing quote — no accumulation
-    // buffer, zero-copy. A key with an escape in it is decoded, as the provider's parser does.
-    let mut key_start = 0usize;
-    // The current root-level key is exactly `stream` (so the next literal is its value).
-    let mut last_key_is_stream = false;
-    let mut stream_true = false;
-
-    let mut j = i;
-    while j < n {
-        if in_string {
-            // Fast path: jump straight to the next `"`/`\` with a SIMD search instead of
-            // inspecting every byte, a root key included (it is sliced out of the body at its
-            // closing quote). Mirrors the skip in `ModelScanner::feed`.
-            if !escaped {
-                match memchr::memchr2(b'"', b'\\', &body[j..]) {
-                    Some(rel) => j += rel,
-                    None => break, // rest of the body is skippable string content
-                }
-            }
-            let b = body[j];
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                in_string = false;
-                if capturing_key {
-                    capturing_key = false;
-                    // Only root-level (`depth == 1`) keys matter.
-                    if depth == 1 {
-                        let key = &body[key_start..j];
-                        // A root `stream_options` means the client already controls usage — the
-                        // answer is `None` regardless of anything else in the body, so stop now
-                        // rather than walking the remainder for a result we already know.
-                        let escaped_key = key.contains(&b'\\');
-                        if key == b"stream_options"
-                            || (escaped_key
-                                && escaped_key_is(&body[key_start - 1..=j], "stream_options"))
-                        {
-                            return None;
-                        }
-                        // The provider keeps the last of duplicate keys, so each `stream` key
-                        // decides afresh.
-                        last_key_is_stream = key == b"stream"
-                            || (escaped_key && escaped_key_is(&body[key_start - 1..=j], "stream"));
-                        if last_key_is_stream {
-                            stream_true = false;
-                        }
-                    }
-                }
-            }
-            j += 1;
-            continue;
-        }
-        let b = body[j];
-        match b {
-            b'"' => {
-                // A root-level key starts only where one is expected (just after `{` or `,`).
-                if depth == 1 && expect_key {
-                    capturing_key = true;
-                    key_start = j + 1; // first key byte is just past this opening quote
-                } else {
-                    capturing_key = false;
-                }
-                in_string = true;
-            }
-            b'{' => {
-                depth += 1;
-                if depth == 1 {
-                    expect_key = true;
-                }
-            }
-            b'[' => depth += 1,
-            b'}' | b']' => depth = depth.saturating_sub(1),
-            // Unguarded by depth, as in `ModelScanner::feed`: a nested `:` or `,` is always
-            // followed by the root `,` or `}` that closes its value before the next root key.
-            b':' => expect_key = false,
-            b',' => {
-                expect_key = true;
-                last_key_is_stream = false;
-            }
-            // The value of a root-level `stream` key: a bare `true` literal.
-            b't' if depth == 1 && last_key_is_stream => {
-                if body[j..].starts_with(b"true") {
-                    stream_true = true;
-                }
-                last_key_is_stream = false;
-            }
-            _ => {}
-        }
-        j += 1;
-    }
-
-    // `stream_options` would have already returned `None` above, so reaching here means it's absent.
-    if stream_true { Some(insert_at) } else { None }
-}
-
 /// Both answers the injection path needs from a **fully buffered** request body.
 pub struct BufferedScan {
     /// The root-level `model`, as [`ModelScanner`] would have extracted it.
     pub model: Option<String>,
-    /// Where to splice the `stream_options` fragment, as [`plan_stream_usage_injection`] would have
-    /// reported it.
+    /// Where to splice `"stream_options":{"include_usage":true},`: just past the root object's
+    /// opening `{`, **only** when the root has `"stream": true` (the last root `stream` decides, as
+    /// the provider keeps the last duplicate) and **no** root `stream_options`. OpenAI emits a
+    /// usage chunk on a stream only when the request asks for it, and a stock client that omits it
+    /// could not be metered, so the gateway asks on its behalf. The offset is always inside a
+    /// non-empty object, so the fragment is always followed by a comma.
     pub inject_at: Option<usize>,
     /// Where the value of a root `stream_options` begins, when the body streams **and** already
     /// carries one. The client may have turned usage off (`include_usage: false`) or left it out
@@ -693,34 +547,21 @@ pub const OUTPUT_LIMIT_KEYS: [&[u8]; 3] = [
 /// One structural walk producing both answers, for the path that already has the whole body.
 ///
 /// A managed OpenAI chat request is buffered anyway (the injection point is near the front, so the
-/// decision needs the whole body), and it was then walked **twice**: once chunk-by-chunk by
-/// `ModelScanner` looking for a root `model`, then again end-to-end by
-/// [`plan_stream_usage_injection`] looking for root `stream`/`stream_options`. Same traversal, same
-/// bytes, same depth/string/escape bookkeeping — just different needles. Measured 16.3 µs vs 4.4 µs
-/// on a 512 KiB body.
+/// decision needs the whole body), and one walk answers both what `ModelScanner` would find (the
+/// root `model`) and where `stream_options` goes: same bytes, different needles.
 ///
 /// Only for the buffered path. A request that streams through un-buffered still uses
 /// `ModelScanner`, which is incremental and cannot be replaced by this.
 ///
-/// Semantics are exactly the two functions it replaces, including the details that look incidental:
+/// Semantics are exactly the two walks it fused, including the details that look incidental:
 /// `stream_options` anywhere at root wins regardless of `stream`, a key spelled with escapes is
 /// decoded and the last `stream` decides (as the provider's parser does; a duplicate or escaped
 /// `stream_options` is flagged in `stream_options_ambiguous` instead, D88), and the model value
 /// *is* unescaped because `ModelScanner` unescapes it. `fused_scan_matches_the_two_walks_it_replaces` cross-checks a corpus against both.
-#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 pub fn scan_buffered(body: &[u8]) -> BufferedScan {
-    // Proof for the allow: every index is `i`/`j` with `i < n` (the loop condition, or a `memchr`
-    // offset inside `bytes[i..]`), or a key span bounded by the closing quote just found; counters
-    // (`i`, `j`, `depth`, `model_keys`) count bytes of a body that fits in memory, so they cannot
-    // overflow. This loop runs on every managed request body, so it keeps the unchecked forms.
-    let n = body.len();
-    let mut i = 0;
-    while i < n && body[i].is_ascii_whitespace() {
-        i += 1;
-    }
     // Not a JSON object ⇒ nothing to inject into. A non-object root also has no root-level `model`,
     // so both answers are `None` and there is nothing to walk for.
-    if i >= n || body[i] != b'{' {
+    let Some(open) = root_open(body) else {
         return BufferedScan {
             model: None,
             inject_at: None,
@@ -732,231 +573,238 @@ pub fn scan_buffered(body: &[u8]) -> BufferedScan {
             limit_keys: [None; 3],
             stream_options_ambiguous: false,
         };
-    }
-    let insert_at = i + 1;
-
-    let mut depth = 0u32;
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut expect_key = false;
-    let mut capturing_key = false;
-    let mut key_start = 0usize;
-    let mut last_key_is_stream = false;
-    let mut last_key_is_model = false;
-    let mut stream_true = false;
-    let mut saw_stream_options = false;
-    let mut stream_options_ambiguous = false;
-    // The closing quote of the root `stream_options` key; its value follows the next `:`.
-    let mut stream_options_key_end = 0usize;
-    // Accumulated (unescaped) `model` value, and whether we're inside it. A `Vec` rather than a
-    // slice because escapes must be resolved, exactly as `ModelScanner` does.
-    let mut capturing_model = false;
-    let mut model_buf: Vec<u8> = Vec::new();
-    let mut model_escaped = false;
-    let mut model: Option<String> = None;
-    // Where the value's raw bytes begin (just past the opening quote), and the finished span.
-    let mut model_start = 0usize;
-    let mut model_span: Option<(usize, usize)> = None;
-    let mut model_keys = 0u32;
-    // The output limit whose value comes next, as an index into `OUTPUT_LIMIT_KEYS`.
-    let mut limit_key: Option<usize> = None;
-    let mut limit_spans: [Option<(usize, usize)>; 3] = [None; 3];
-    let mut inexact_limit = false;
-    // The byte after a limit key's colon is still to come.
-    let mut limit_value_next = false;
-    let mut limit_keys: [Option<usize>; 3] = [None; 3];
-
-    let mut j = i;
-    while j < n {
-        if in_string {
-            // SIMD skip over any string whose bytes we don't accumulate — message content, system
-            // prompts, base64 images, and keys too, which are sliced out of the body at their
-            // closing quote.
-            if !capturing_model && !escaped {
-                match memchr::memchr2(b'"', b'\\', &body[j..]) {
-                    Some(rel) => j += rel,
-                    None => break, // rest of the body is skippable string content
-                }
-            }
-            let b = body[j];
-            if escaped {
-                escaped = false;
-                if capturing_model {
-                    push_capped(&mut model_buf, b);
-                }
-            } else if b == b'\\' {
-                escaped = true;
-                if capturing_model {
-                    push_capped(&mut model_buf, b);
-                    model_escaped = true;
-                }
-            } else if b == b'"' {
-                in_string = false;
-                if capturing_key {
-                    capturing_key = false;
-                    if depth == 1 {
-                        let key = &body[key_start..j];
-                        // Unlike the planner we cannot return early on `stream_options`: the model
-                        // may still be ahead of us. Record it and keep walking.
-                        if key == b"stream_options" {
-                            stream_options_ambiguous |= saw_stream_options;
-                            if !saw_stream_options {
-                                saw_stream_options = true;
-                                stream_options_key_end = j;
-                            }
-                        } else if key.contains(&b'\\')
-                            && escaped_key_is(&body[key_start - 1..=j], "stream_options")
-                        {
-                            stream_options_ambiguous = true;
-                        }
-                        // The provider decodes an escaped key and keeps the last duplicate,
-                        // so each key that decodes to `stream` decides afresh (D88).
-                        last_key_is_stream = key == b"stream"
-                            || (key.contains(&b'\\')
-                                && escaped_key_is(&body[key_start - 1..=j], "stream"));
-                        if last_key_is_stream {
-                            stream_true = false;
-                        }
-                        last_key_is_model = key == b"model"
-                            || (key.contains(&b'\\')
-                                && escaped_key_is(&body[key_start - 1..=j], "model"));
-                        model_keys += u32::from(last_key_is_model);
-                        // A key spelled with escapes names the limit it decodes to (`"max\u005ftokens"`).
-                        let quoted = &body[key_start - 1..=j];
-                        limit_key = OUTPUT_LIMIT_KEYS.iter().position(|k| {
-                            *k == key
-                                || (key.contains(&b'\\')
-                                    && std::str::from_utf8(k)
-                                        .is_ok_and(|want| escaped_key_is(quoted, want)))
-                        });
-                        if let Some(k) = limit_key {
-                            // A second root spelling of the same limit: a parser keeps one of them, and
-                            // only the first is spanned, so it cannot be capped reliably. Refused.
-                            if limit_keys[k].is_some() {
-                                inexact_limit = true;
-                            }
-                            limit_keys[k].get_or_insert(key_start - 1);
-                            limit_value_next = true;
-                        }
-                    }
-                } else if capturing_model {
-                    capturing_model = false;
-                    last_key_is_model = false;
-                    // `j` is the closing quote, `model_start` the byte after the opening one, so the
-                    // span covers exactly the value and neither quote.
-                    model_span = Some((model_start, j));
-                    // Same non-UTF-8 fallback as `ModelScanner`: record "unknown" rather than emit a
-                    // U+FFFD-corrupted model into the billing log.
-                    model = Some(
-                        capture_text(std::mem::take(&mut model_buf), model_escaped)
-                            .unwrap_or_else(|| "unknown".to_string()),
-                    );
-                }
-            } else if capturing_model {
-                push_capped(&mut model_buf, b);
-            }
-            j += 1;
-            continue;
-        }
-        let b = body[j];
-        // The first byte of a limit's value decides it: a digit starts a plain integer, the literal
-        // `null` is no value, and whitespace or the colon before the value is skipped. Anything else
-        // (an `n` that is not `null`, a string, a fraction) is inexact.
-        if limit_value_next && !(b.is_ascii_whitespace() || b == b':') {
-            limit_value_next = false;
-            if !(b.is_ascii_digit() || body[j..].starts_with(b"null")) {
-                inexact_limit = true;
-            }
-        }
-        match b {
-            b'"' => {
-                capturing_key = false;
-                capturing_model = false;
-                if depth == 1 && expect_key {
-                    capturing_key = true;
-                    key_start = j + 1;
-                } else if depth == 1 && last_key_is_model && model.is_none() {
-                    capturing_model = true;
-                    model_buf.clear();
-                    model_escaped = false;
-                    model_start = j + 1;
-                }
-                in_string = true;
-            }
-            b'{' => {
-                depth += 1;
-                if depth == 1 {
-                    expect_key = true;
-                }
-            }
-            b'[' => depth += 1,
-            b'}' | b']' => depth = depth.saturating_sub(1),
-            // Unguarded by depth, as in both walks this one replaces: a nested `:` is always
-            // followed by the root `,` or `}` that closes its value before the next root key.
-            b':' => expect_key = false,
-            b',' if depth == 1 => {
-                expect_key = true;
-                last_key_is_stream = false;
-                last_key_is_model = false;
-                limit_key = None;
-            }
-            b'0'..=b'9' if depth == 1 && !expect_key && limit_key.is_some() => {
-                let end = body[j..]
-                    .iter()
-                    .position(|c| !c.is_ascii_digit())
-                    .map_or(n, |rel| j + rel);
-                // A plain integer ends its member: `,` or `}`, past any whitespace. A fraction or an
-                // exponent ends in `.`, `e` or `E` instead, and is no integer.
-                let ends_member = body[end..]
-                    .iter()
-                    .find(|c| !c.is_ascii_whitespace())
-                    .is_some_and(|c| matches!(c, b',' | b'}'));
-                if let Some(k) = limit_key.take() {
-                    if !ends_member {
-                        inexact_limit = true;
-                    } else if limit_spans[k].is_none() {
-                        limit_spans[k] = Some((j, end));
-                    }
-                }
-                j = end;
-                continue;
-            }
-            // A negative limit is no limit to cap. (A string or structured value never puts a digit
-            // at depth 1 before the `,` that ends it, so a nested `-` may clear it too.)
-            b'-' => limit_key = None,
-            b't' if depth == 1 && last_key_is_stream => {
-                if body[j..].starts_with(b"true") {
-                    stream_true = true;
-                }
-                last_key_is_stream = false;
-            }
-            _ => {}
-        }
-        j += 1;
-    }
+    };
+    let mut walk = Fused {
+        body,
+        open: Open::None,
+        expect_key: false,
+        last_key_is_stream: false,
+        last_key_is_model: false,
+        stream_true: false,
+        saw_stream_options: false,
+        stream_options_ambiguous: false,
+        stream_options_key_end: 0,
+        model: None,
+        model_span: None,
+        model_keys: 0,
+        limit_key: None,
+        limit_spans: [None; 3],
+        inexact_limit: false,
+        limit_value_next: false,
+        limit_keys: [None; 3],
+    };
+    // Only whitespace precedes `open`, which no rule below reads, so the whole body is lexed.
+    Lexer::new().feed(body, &mut walk);
 
     // The `stream_options` value: past the key's closing quote, whitespace, `:`, whitespace.
-    let stream_options_at = (stream_true && saw_stream_options)
+    let stream_options_at = (walk.stream_true && walk.saw_stream_options)
         .then(|| {
-            let rest = &body[stream_options_key_end + 1..];
-            let colon = rest.iter().position(|b| !b.is_ascii_whitespace())?;
-            (rest[colon] == b':').then_some(())?;
-            let value = rest[colon + 1..]
-                .iter()
-                .position(|b| !b.is_ascii_whitespace())?;
-            Some(stream_options_key_end + 1 + colon + 1 + value)
+            let colon = skip_ws(body, walk.stream_options_key_end.saturating_add(1));
+            (body.get(colon) == Some(&b':')).then_some(())?;
+            let value = skip_ws(body, colon.saturating_add(1));
+            (value < body.len()).then_some(value)
         })
         .flatten();
     BufferedScan {
-        model,
-        inject_at: (stream_true && !saw_stream_options).then_some(insert_at),
+        model: walk.model,
+        inject_at: (walk.stream_true && !walk.saw_stream_options).then_some(open.saturating_add(1)),
         stream_options_at,
-        model_span,
-        duplicate_model: model_keys > 1,
-        limit_spans,
-        inexact_limit,
-        limit_keys,
-        stream_options_ambiguous,
+        model_span: walk.model_span,
+        duplicate_model: walk.model_keys > 1,
+        limit_spans: walk.limit_spans,
+        inexact_limit: walk.inexact_limit,
+        limit_keys: walk.limit_keys,
+        stream_options_ambiguous: walk.stream_options_ambiguous,
+    }
+}
+
+/// The string [`scan_buffered`] is inside, and where its content starts (just past the quote).
+#[derive(Clone, Copy)]
+enum Open {
+    /// One it reads nothing from.
+    None,
+    /// A root key, sliced out of the body at its closing quote.
+    Key(usize),
+    /// The value of the first root `model`.
+    Model(usize),
+}
+
+/// [`scan_buffered`]'s walk: the root members' grammar over the lexer's events.
+struct Fused<'a> {
+    body: &'a [u8],
+    open: Open,
+    expect_key: bool,
+    last_key_is_stream: bool,
+    last_key_is_model: bool,
+    stream_true: bool,
+    saw_stream_options: bool,
+    stream_options_ambiguous: bool,
+    /// The closing quote of the root `stream_options` key; its value follows the next `:`.
+    stream_options_key_end: usize,
+    model: Option<String>,
+    model_span: Option<(usize, usize)>,
+    model_keys: u32,
+    /// The output limit whose value comes next, as an index into `OUTPUT_LIMIT_KEYS`.
+    limit_key: Option<usize>,
+    limit_spans: [Option<(usize, usize)>; 3],
+    inexact_limit: bool,
+    /// The byte after a limit key's colon is still to come.
+    limit_value_next: bool,
+    limit_keys: [Option<usize>; 3],
+}
+
+/// Whether a key's raw bytes name `want`: as sent, or decoded when it held a backslash.
+fn key_names(raw: &[u8], escaped: bool, want: &str) -> bool {
+    if escaped {
+        lex::unescapes_to(raw, want)
+    } else {
+        raw == want.as_bytes()
+    }
+}
+
+impl Fused<'_> {
+    /// The first byte of a limit's value decides it: a digit starts a plain integer, the literal
+    /// `null` is no value, and whitespace or the colon before the value is skipped. Anything else
+    /// (an `n` that is not `null`, a string, a fraction) is inexact.
+    #[inline(always)]
+    fn limit_value(&mut self, at: usize, b: u8) {
+        if self.limit_value_next && !(b.is_ascii_whitespace() || b == b':') {
+            self.limit_value_next = false;
+            let null = self.body.get(at..).is_some_and(|r| r.starts_with(b"null"));
+            if !(b.is_ascii_digit() || null) {
+                self.inexact_limit = true;
+            }
+        }
+    }
+
+    fn root_key(&mut self, start: usize, end: usize, escaped: bool) {
+        let key = self.body.get(start..end).unwrap_or_default();
+        // Unlike a planner that only wants `stream` we cannot stop on `stream_options`: the model
+        // may still be ahead of us. Record it and keep walking.
+        if key == b"stream_options" {
+            self.stream_options_ambiguous |= self.saw_stream_options;
+            if !self.saw_stream_options {
+                self.saw_stream_options = true;
+                self.stream_options_key_end = end;
+            }
+        } else if escaped && lex::unescapes_to(key, "stream_options") {
+            self.stream_options_ambiguous = true;
+        }
+        // The provider decodes an escaped key and keeps the last duplicate, so each key that
+        // decodes to `stream` decides afresh (D88).
+        self.last_key_is_stream = key_names(key, escaped, "stream");
+        if self.last_key_is_stream {
+            self.stream_true = false;
+        }
+        self.last_key_is_model = key_names(key, escaped, "model");
+        self.model_keys = self
+            .model_keys
+            .saturating_add(u32::from(self.last_key_is_model));
+        // A key spelled with escapes names the limit it decodes to (`"max\u005ftokens"`).
+        self.limit_key = OUTPUT_LIMIT_KEYS
+            .iter()
+            .position(|k| std::str::from_utf8(k).is_ok_and(|want| key_names(key, escaped, want)));
+        if let Some(k) = self.limit_key
+            && let Some(seen) = self.limit_keys.get_mut(k)
+        {
+            // A second root spelling of the same limit: a parser keeps one of them, and only the
+            // first is spanned, so it cannot be capped reliably. Refused.
+            if seen.is_some() {
+                self.inexact_limit = true;
+            }
+            seen.get_or_insert(start.saturating_sub(1));
+            self.limit_value_next = true;
+        }
+    }
+
+    /// A root limit's digits at `at`: spanned when they are the whole of a plain integer.
+    fn limit_digits(&mut self, at: usize) {
+        let body = self.body;
+        let end = body
+            .get(at..)
+            .and_then(|r| r.iter().position(|c| !c.is_ascii_digit()))
+            .map_or(body.len(), |rel| at.saturating_add(rel));
+        // A plain integer ends its member: `,` or `}`, past any whitespace. A fraction or an
+        // exponent ends in `.`, `e` or `E` instead, and is no integer.
+        let ends_member = body
+            .get(end..)
+            .and_then(|r| r.iter().find(|c| !c.is_ascii_whitespace()))
+            .is_some_and(|c| matches!(c, b',' | b'}'));
+        if let Some(k) = self.limit_key.take() {
+            if !ends_member {
+                self.inexact_limit = true;
+            } else if let Some(span @ None) = self.limit_spans.get_mut(k) {
+                *span = Some((at, end));
+            }
+        }
+    }
+}
+
+impl Visit for Fused<'_> {
+    #[inline(always)]
+    fn byte(&mut self, at: usize, b: u8, depth: u32) -> Flow {
+        self.limit_value(at, b);
+        match b {
+            b'{' if depth == 0 => self.expect_key = true,
+            // Unguarded by depth, as in the walk this one fused: a nested `:` is always followed
+            // by the root `,` or `}` that closes its value before the next root key.
+            b':' => self.expect_key = false,
+            b',' if depth == 1 => {
+                self.expect_key = true;
+                self.last_key_is_stream = false;
+                self.last_key_is_model = false;
+                self.limit_key = None;
+            }
+            // The digits after it are no limit start: the first one took `limit_key`.
+            b'0'..=b'9' if depth == 1 && !self.expect_key && self.limit_key.is_some() => {
+                self.limit_digits(at);
+            }
+            // A negative limit is no limit to cap. (A string or structured value never puts a
+            // digit at depth 1 before the `,` that ends it, so a nested `-` may clear it too.)
+            b'-' => self.limit_key = None,
+            b't' if depth == 1 && self.last_key_is_stream => {
+                if self.body.get(at..).is_some_and(|r| r.starts_with(b"true")) {
+                    self.stream_true = true;
+                }
+                self.last_key_is_stream = false;
+            }
+            _ => {}
+        }
+        Flow::Continue(())
+    }
+
+    #[inline(always)]
+    fn open(&mut self, at: usize, depth: u32) {
+        self.limit_value(at, b'"');
+        let start = at.saturating_add(1);
+        self.open = if depth == 1 && self.expect_key {
+            Open::Key(start)
+        } else if depth == 1 && self.last_key_is_model && self.model.is_none() {
+            Open::Model(start)
+        } else {
+            Open::None
+        };
+    }
+
+    #[inline(always)]
+    fn close(&mut self, at: usize, depth: u32, escaped: bool) -> Flow {
+        match std::mem::replace(&mut self.open, Open::None) {
+            Open::Key(start) if depth == 1 => self.root_key(start, at, escaped),
+            Open::Model(start) => {
+                self.last_key_is_model = false;
+                // `at` is the closing quote, `start` the byte after the opening one, so the span
+                // covers exactly the value and neither quote.
+                self.model_span = Some((start, at));
+                let kept = at.min(start.saturating_add(MAX_CAPTURE));
+                let raw = self.body.get(start..kept).unwrap_or_default().to_vec();
+                // Same non-UTF-8 fallback as `ModelScanner`: record "unknown" rather than emit a
+                // U+FFFD-corrupted model into the billing log.
+                self.model =
+                    Some(capture_text(raw, escaped).unwrap_or_else(|| "unknown".to_string()));
+            }
+            _ => {}
+        }
+        Flow::Continue(())
     }
 }
 
@@ -992,10 +840,10 @@ pub fn remove_root_members(body: &mut Vec<u8>, key: &str) -> bool {
 /// Whether a quoted JSON key containing escapes decodes to `want`. Only reached for a root key with a
 /// backslash in it, which real clients never send, so the allocation is off every ordinary path.
 fn escaped_key_is(quoted: &[u8], want: &str) -> bool {
-    // A decoded byte takes at most six raw ones (`\u00XX`), plus the two quotes: a longer string
-    // cannot decode to `want`, and is not decoded (it may be a whole prompt).
-    let most = want.len().saturating_mul(6).saturating_add(2);
-    quoted.len() <= most && serde_json::from_slice::<String>(quoted).is_ok_and(|k| k == want)
+    quoted
+        .strip_prefix(b"\"")
+        .and_then(|q| q.strip_suffix(b"\""))
+        .is_some_and(|raw| lex::unescapes_to(raw, want))
 }
 
 // ---- Span edits ------------------------------------------------------------------------------------
@@ -1041,45 +889,25 @@ fn skip_ws(b: &[u8], i: usize) -> usize {
     i.saturating_add(n)
 }
 
-/// The end (exclusive) of the string whose opening quote is at `open`.
-fn string_end(b: &[u8], open: usize) -> Option<usize> {
-    let mut i = open.saturating_add(1);
-    loop {
-        let at = i.saturating_add(memchr::memchr2(b'"', b'\\', b.get(i..)?)?);
-        if b.get(at) == Some(&b'\\') {
-            i = at.saturating_add(2);
-        } else {
-            return Some(at.saturating_add(1));
-        }
-    }
-}
-
 /// The end (exclusive) of the JSON value starting at `i` (no leading whitespace).
 pub fn value_end(b: &[u8], i: usize) -> Option<usize> {
     match *b.get(i)? {
         b'"' => string_end(b, i),
         b'{' | b'[' => {
-            let mut depth = 0u32;
-            let mut j = i;
-            while let Some(&c) = b.get(j) {
-                match c {
-                    b'"' => {
-                        j = string_end(b, j)?;
-                        continue;
+            /// Stops at the bracket that closes the first one.
+            struct Close;
+            impl Visit for Close {
+                #[inline(always)]
+                fn byte(&mut self, _: usize, c: u8, depth: u32) -> Flow {
+                    if matches!(c, b'}' | b']') && depth == 1 {
+                        Flow::Break(())
+                    } else {
+                        Flow::Continue(())
                     }
-                    b'{' | b'[' => depth = depth.saturating_add(1),
-                    b'}' | b']' => {
-                        // The first byte opened a container, so `depth` is at least 1 here.
-                        depth = depth.saturating_sub(1);
-                        if depth == 0 {
-                            return Some(j.saturating_add(1));
-                        }
-                    }
-                    _ => {}
                 }
-                j = j.saturating_add(1);
             }
-            None
+            let end = Lexer::new().feed(b.get(i..)?, &mut Close)?;
+            i.checked_add(end)
         }
         _ => {
             let n = b
@@ -1387,9 +1215,7 @@ pub fn str_value(b: &[u8], span: (usize, usize)) -> Option<std::borrow::Cow<'_, 
         [b'"', inner @ .., b'"'] if !inner.contains(&b'\\') => std::str::from_utf8(inner)
             .ok()
             .map(std::borrow::Cow::Borrowed),
-        quoted @ [b'"', .., b'"'] => serde_json::from_slice::<String>(quoted)
-            .ok()
-            .map(std::borrow::Cow::Owned),
+        [b'"', inner @ .., b'"'] => lex::unescape(inner).map(std::borrow::Cow::Owned),
         _ => None,
     }
 }
@@ -1486,27 +1312,31 @@ pub struct Structure {
 
 /// [`Structure`] of `b`, in one pass: string contents are skipped with `memchr`.
 pub fn structure(b: &[u8]) -> Structure {
-    let mut s = Structure::default();
-    let mut i = 0usize;
-    while let Some(rest) = b.get(i..) {
-        let q = memchr::memchr(b'"', rest).map_or(b.len(), |q| i.saturating_add(q));
-        for (at, &c) in b.get(i..q).unwrap_or_default().iter().enumerate() {
-            if !matches!(c, b'{' | b'[' | b',' | b':') {
-                continue;
+    struct Count<'a> {
+        b: &'a [u8],
+        s: Structure,
+    }
+    impl Visit for Count<'_> {
+        #[inline(always)]
+        fn byte(&mut self, at: usize, c: u8, _: u32) -> Flow {
+            if matches!(c, b'{' | b'[' | b',' | b':') {
+                self.s.tokens = self.s.tokens.saturating_add(1);
+                // An object is empty when only whitespace stands between its braces.
+                let next = skip_ws(self.b, at.saturating_add(1));
+                if c == b'{' && self.b.get(next) != Some(&b'}') {
+                    self.s.objects = self.s.objects.saturating_add(1);
+                }
             }
-            s.tokens = s.tokens.saturating_add(1);
-            // An object is empty when only whitespace stands between its braces.
-            let next = skip_ws(b, i.saturating_add(at).saturating_add(1));
-            if c == b'{' && b.get(next) != Some(&b'}') {
-                s.objects = s.objects.saturating_add(1);
-            }
-        }
-        match string_end(b, q) {
-            Some(end) => i = end,
-            None => break,
+            Flow::Continue(())
         }
     }
-    s
+    // An unterminated string ends the count: nothing after it is outside a string.
+    let mut count = Count {
+        b,
+        s: Structure::default(),
+    };
+    Lexer::new().feed(b, &mut count);
+    count.s
 }
 
 #[cfg(test)]
@@ -1518,6 +1348,145 @@ mod kept_tests;
 #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 mod tests {
     use super::*;
+
+    /// Where `scan_buffered` would splice the `stream_options` fragment.
+    fn inject_at(body: &[u8]) -> Option<usize> {
+        scan_buffered(body).inject_at
+    }
+
+    /// The stand-alone injection planner `scan_buffered` fused, kept as the oracle of
+    /// [`fused_scan_matches_the_two_walks_it_replaces`]. Do not fix anything here.
+    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+    pub(super) fn plan_stream_usage_injection(body: &[u8]) -> Option<usize> {
+        // Proof for the allow: every index is `i`/`j` with `i < n` (the loop condition, or a `memchr`
+        // offset inside `bytes[i..]`), or a key span bounded by the closing quote just found; counters
+        // (`i`, `j`, `depth`, `model_keys`) count bytes of a body that fits in memory, so they cannot
+        // overflow. This loop runs on every managed request body, so it keeps the unchecked forms.
+        let n = body.len();
+        // Cheap pre-filter: injection is only ever needed when a root-level `"stream"` key is present.
+        // If the quoted token `"stream"` doesn't occur *anywhere*, the structural answer is
+        // unconditionally `None`, so a single SIMD `memmem` pass lets us skip the whole walk — the
+        // common case, since most requests aren't streaming. (Note `"stream_options"` does NOT contain
+        // the needle: the byte after `stream` is `_`, not a closing quote — so a body carrying only
+        // `stream_options` fails this pre-filter and returns `None` here, which is the correct answer.)
+        // An escaped key (`"str\u0065am"`) decodes to `stream` at the provider without spelling it,
+        // and such a key always carries `\u`; real clients never send one, so the second search runs
+        // only on a body with no `"stream"` at all.
+        if memchr::memmem::find(body, b"\"stream\"").is_none()
+            && memchr::memmem::find(body, b"\\u").is_none()
+        {
+            return None;
+        }
+        // Must be a JSON object; anything else (array, scalar, garbage) we never rewrite.
+        let i = body.iter().position(|b| !b.is_ascii_whitespace())?;
+        if body[i] != b'{' {
+            return None;
+        }
+        let insert_at = i + 1;
+
+        let mut depth = 0u32;
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut expect_key = false;
+        let mut capturing_key = false;
+        // Start index (just past the opening `"`) of the root-level key currently being scanned. The
+        // body is fully in hand, so we slice the key out of it at the closing quote — no accumulation
+        // buffer, zero-copy. A key with an escape in it is decoded, as the provider's parser does.
+        let mut key_start = 0usize;
+        // The current root-level key is exactly `stream` (so the next literal is its value).
+        let mut last_key_is_stream = false;
+        let mut stream_true = false;
+
+        let mut j = i;
+        while j < n {
+            if in_string {
+                // Fast path: jump straight to the next `"`/`\` with a SIMD search instead of
+                // inspecting every byte, a root key included (it is sliced out of the body at its
+                // closing quote). Mirrors the skip in `ModelScanner::feed`.
+                if !escaped {
+                    match memchr::memchr2(b'"', b'\\', &body[j..]) {
+                        Some(rel) => j += rel,
+                        None => break, // rest of the body is skippable string content
+                    }
+                }
+                let b = body[j];
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    in_string = false;
+                    if capturing_key {
+                        capturing_key = false;
+                        // Only root-level (`depth == 1`) keys matter.
+                        if depth == 1 {
+                            let key = &body[key_start..j];
+                            // A root `stream_options` means the client already controls usage — the
+                            // answer is `None` regardless of anything else in the body, so stop now
+                            // rather than walking the remainder for a result we already know.
+                            let escaped_key = key.contains(&b'\\');
+                            if key == b"stream_options"
+                                || (escaped_key
+                                    && escaped_key_is(&body[key_start - 1..=j], "stream_options"))
+                            {
+                                return None;
+                            }
+                            // The provider keeps the last of duplicate keys, so each `stream` key
+                            // decides afresh.
+                            last_key_is_stream = key == b"stream"
+                                || (escaped_key
+                                    && escaped_key_is(&body[key_start - 1..=j], "stream"));
+                            if last_key_is_stream {
+                                stream_true = false;
+                            }
+                        }
+                    }
+                }
+                j += 1;
+                continue;
+            }
+            let b = body[j];
+            match b {
+                b'"' => {
+                    // A root-level key starts only where one is expected (just after `{` or `,`).
+                    if depth == 1 && expect_key {
+                        capturing_key = true;
+                        key_start = j + 1; // first key byte is just past this opening quote
+                    } else {
+                        capturing_key = false;
+                    }
+                    in_string = true;
+                }
+                b'{' => {
+                    depth += 1;
+                    if depth == 1 {
+                        expect_key = true;
+                    }
+                }
+                b'[' => depth += 1,
+                b'}' | b']' => depth = depth.saturating_sub(1),
+                // Unguarded by depth, as in `ModelScanner::feed`: a nested `:` or `,` is always
+                // followed by the root `,` or `}` that closes its value before the next root key.
+                b':' => expect_key = false,
+                b',' => {
+                    expect_key = true;
+                    last_key_is_stream = false;
+                }
+                // The value of a root-level `stream` key: a bare `true` literal.
+                b't' if depth == 1 && last_key_is_stream => {
+                    if body[j..].starts_with(b"true") {
+                        stream_true = true;
+                    }
+                    last_key_is_stream = false;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+
+        // `stream_options` would have already returned `None` above, so reaching here means it's absent.
+        if stream_true { Some(insert_at) } else { None }
+    }
 
     /// The iterators agree with the collecting walks, end at the closing bracket, and report a
     /// malformed container once.
@@ -2129,10 +2098,10 @@ mod tests {
         assert_eq!(scan(sse).as_deref(), Some("gpt-4o-2024-08-06"));
     }
 
-    /// Apply `plan_stream_usage_injection` and return the rewritten body (or unchanged if no plan),
+    /// Apply the injection `scan_buffered` plans and return the rewritten body (or unchanged if none),
     /// so tests assert the *resulting* JSON — the thing the upstream actually receives.
     fn inject(body: &str) -> String {
-        match plan_stream_usage_injection(body.as_bytes()) {
+        match inject_at(body.as_bytes()) {
             Some(at) => {
                 let frag = br#""stream_options":{"include_usage":true},"#;
                 let mut out = Vec::with_capacity(body.len() + frag.len());
@@ -2162,7 +2131,7 @@ mod tests {
 
     #[test]
     fn stream_can_be_the_only_or_last_key() {
-        assert!(plan_stream_usage_injection(br#"{"stream":true}"#).is_some());
+        assert!(inject_at(br#"{"stream":true}"#).is_some());
         let v: serde_json::Value =
             serde_json::from_str(&inject(r#"{"model":"x","stream":true}"#)).unwrap();
         assert_eq!(
@@ -2175,39 +2144,29 @@ mod tests {
     fn skips_when_options_already_present() {
         // Client already asked for usage (in any form) — never touch it.
         assert_eq!(
-            plan_stream_usage_injection(
-                br#"{"stream":true,"stream_options":{"include_usage":false}}"#
-            ),
+            inject_at(br#"{"stream":true,"stream_options":{"include_usage":false}}"#),
             None
         );
         // Order-independent: options before stream.
-        assert_eq!(
-            plan_stream_usage_injection(br#"{"stream_options":{},"stream":true}"#),
-            None
-        );
+        assert_eq!(inject_at(br#"{"stream_options":{},"stream":true}"#), None);
     }
 
     #[test]
     fn skips_when_not_streaming() {
-        assert_eq!(
-            plan_stream_usage_injection(br#"{"model":"x","stream":false}"#),
-            None
-        );
-        assert_eq!(plan_stream_usage_injection(br#"{"model":"x"}"#), None);
+        assert_eq!(inject_at(br#"{"model":"x","stream":false}"#), None);
+        assert_eq!(inject_at(br#"{"model":"x"}"#), None);
     }
 
     #[test]
     fn ignores_nested_or_in_string_stream() {
         // `stream` inside a message object is not the root field.
         assert_eq!(
-            plan_stream_usage_injection(
-                br#"{"messages":[{"role":"u","stream":true}],"model":"x"}"#
-            ),
+            inject_at(br#"{"messages":[{"role":"u","stream":true}],"model":"x"}"#),
             None
         );
         // `stream` mentioned inside a string value must not trigger.
         assert_eq!(
-            plan_stream_usage_injection(br#"{"system":"set stream:true please","model":"x"}"#),
+            inject_at(br#"{"system":"set stream:true please","model":"x"}"#),
             None
         );
     }
@@ -2231,7 +2190,7 @@ mod tests {
         // memmem pre-filter passes, but the structural walk correctly skips over the string content.
         let big = "x".repeat(64 * 1024);
         let body = format!(r#"{{"system":"{big} \"stream\":true","model":"x"}}"#);
-        assert_eq!(plan_stream_usage_injection(body.as_bytes()), None);
+        assert_eq!(inject_at(body.as_bytes()), None);
     }
 
     #[test]
@@ -2242,14 +2201,14 @@ mod tests {
         let body = format!(
             r#"{{"content":"{big}","stream":true,"stream_options":{{"include_usage":false}}}}"#
         );
-        assert_eq!(plan_stream_usage_injection(body.as_bytes()), None);
+        assert_eq!(inject_at(body.as_bytes()), None);
     }
 
     #[test]
     fn tolerates_whitespace_and_non_objects() {
-        assert!(plan_stream_usage_injection(b"  {  \"stream\" : true }").is_some());
-        assert_eq!(plan_stream_usage_injection(b"[1,2,3]"), None);
-        assert_eq!(plan_stream_usage_injection(b"not json"), None);
+        assert!(inject_at(b"  {  \"stream\" : true }").is_some());
+        assert_eq!(inject_at(b"[1,2,3]"), None);
+        assert_eq!(inject_at(b"not json"), None);
     }
 
     #[test]
@@ -2407,6 +2366,10 @@ mod tests {
 mod mutation_gaps {
     use super::*;
 
+    fn inject_at(body: &[u8]) -> Option<usize> {
+        scan_buffered(body).inject_at
+    }
+
     fn scan(body: &[u8]) -> Option<String> {
         let mut s = ModelScanner::new();
         s.feed(body);
@@ -2454,7 +2417,7 @@ mod mutation_gaps {
             let scan = scan_buffered(streamed);
             assert_eq!(scan.model.as_deref(), Some("gpt-4o"));
             assert_eq!(scan.inject_at, Some(1));
-            assert_eq!(plan_stream_usage_injection(streamed), Some(1));
+            assert_eq!(inject_at(streamed), Some(1));
         }
     }
 
@@ -2474,14 +2437,11 @@ mod mutation_gaps {
     #[test]
     fn only_the_root_stream_literal_decides_streaming() {
         let not_streaming = br#"{"stream":false,"store":true,"model":"m"}"#;
-        assert_eq!(plan_stream_usage_injection(not_streaming), None);
+        assert_eq!(inject_at(not_streaming), None);
         assert_eq!(scan_buffered(not_streaming).inject_at, None);
 
         let value_spelled_like_a_key = br#"{"model":"stream_options","stream":true}"#;
-        assert_eq!(
-            plan_stream_usage_injection(value_spelled_like_a_key),
-            Some(1)
-        );
+        assert_eq!(inject_at(value_spelled_like_a_key), Some(1));
         assert_eq!(scan_buffered(value_spelled_like_a_key).inject_at, Some(1));
     }
 
@@ -2529,9 +2489,9 @@ mod mutation_gaps {
     /// claim: BIL-2
     #[test]
     fn a_body_that_does_not_open_with_an_object_is_never_planned() {
-        assert_eq!(plan_stream_usage_injection(br#"{"stream":true}"#), Some(1));
-        assert_eq!(plan_stream_usage_injection(br#"[]{"stream":true}"#), None);
-        assert_eq!(plan_stream_usage_injection(br#" 0{"stream":true}"#), None);
+        assert_eq!(inject_at(br#"{"stream":true}"#), Some(1));
+        assert_eq!(inject_at(br#"[]{"stream":true}"#), None);
+        assert_eq!(inject_at(br#" 0{"stream":true}"#), None);
     }
 
     /// The response scanner reads raw provider bytes: a root `message` whose value was not an
@@ -2596,12 +2556,17 @@ mod mutation_gaps {
     }
 
     /// A root `stream_options` spelled with an escape decodes to `stream_options` at the provider,
-    /// so the client already controls usage there too: nothing to inject.
+    /// so the client already controls usage there too: nothing to inject. The planner the
+    /// buffered scan fused said so with no offset; the buffered scan says so by flagging the key
+    /// ambiguous, which the caller resolves by removing it and injecting the one that counts.
     /// claim: BIL-2
     #[test]
     fn an_escaped_stream_options_key_means_no_injection() {
+        use super::tests::plan_stream_usage_injection;
         let body = format!(r#"{{"stream":true,"stream{}u005foptions":{{}}}}"#, '\\');
         assert_eq!(plan_stream_usage_injection(body.as_bytes()), None);
         assert_eq!(plan_stream_usage_injection(br#"{"stream":true}"#), Some(1));
+        assert!(scan_buffered(body.as_bytes()).stream_options_ambiguous);
+        assert_eq!(inject_at(br#"{"stream":true}"#), Some(1));
     }
 }

@@ -7047,9 +7047,7 @@ struct OaiToAnt {
 #[derive(Default)]
 struct ArgsEnd {
     scanned: usize,
-    depth: u32,
-    in_string: bool,
-    escaped: bool,
+    lex: crate::lex::Lexer,
     /// The outer object, array or string has closed.
     closed: bool,
     /// It closed and the parse said it is not JSON: no byte after a closed value can fix that.
@@ -7057,6 +7055,31 @@ struct ArgsEnd {
     /// The argument length at which the last full parse failed. Asked again with nothing new (a
     /// queued call's delta asks about the live call), the answer is the same, unparsed.
     failed_at: Option<usize>,
+}
+
+/// Stops the lex where the outer value closes: its last bracket, or a string's closing quote.
+struct OuterClose;
+
+impl crate::lex::Visit for OuterClose {
+    #[inline(always)]
+    fn byte(&mut self, _: usize, c: u8, depth: u32) -> crate::lex::Flow {
+        // The first byte opened the value, so the bracket back at depth 1 is the one closing it.
+        if matches!(c, b'}' | b']') && depth == 1 {
+            crate::lex::Flow::Break(())
+        } else {
+            crate::lex::Flow::Continue(())
+        }
+    }
+
+    #[inline(always)]
+    fn close(&mut self, _: usize, depth: u32, _: bool) -> crate::lex::Flow {
+        // A string argument closes with its quote.
+        if depth == 0 {
+            crate::lex::Flow::Break(())
+        } else {
+            crate::lex::Flow::Continue(())
+        }
+    }
 }
 
 impl ArgsEnd {
@@ -7073,31 +7096,14 @@ impl ArgsEnd {
             Some(&c) if !matches!(c, b'{' | b'[' | b'"') => return self.parses(args),
             Some(_) => {}
         }
-        while !self.closed
-            && let Some(&c) = b.get(self.scanned)
-        {
-            self.scanned += 1;
-            if self.in_string {
-                match c {
-                    _ if self.escaped => self.escaped = false,
-                    b'\\' => self.escaped = true,
-                    b'"' => {
-                        self.in_string = false;
-                        // A string argument closes with its quote.
-                        self.closed = self.depth == 0;
-                    }
-                    _ => {}
+        if !self.closed {
+            let rest = b.get(self.scanned..).unwrap_or_default();
+            match self.lex.feed(rest, &mut OuterClose) {
+                Some(end) => {
+                    self.scanned += end;
+                    self.closed = true;
                 }
-                continue;
-            }
-            match c {
-                b'"' => self.in_string = true,
-                b'{' | b'[' => self.depth += 1,
-                b'}' | b']' => {
-                    self.depth = self.depth.saturating_sub(1);
-                    self.closed = self.depth == 0;
-                }
-                _ => {}
+                None => self.scanned = b.len(),
             }
         }
         if !self.closed {

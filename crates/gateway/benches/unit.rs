@@ -867,10 +867,8 @@ mod peek {
             .bench(|| (scan(black_box(&openai)), scan(black_box(&anthropic))));
     }
 
-    use beyond_ai::peek::plan_stream_usage_injection;
-
     /// A streaming body whose large `content` value precedes the root `stream` field — the worst
-    /// case for the injection planner: it must walk past `padding` bytes of uninteresting string
+    /// case for the buffered scan: it must walk past `padding` bytes of uninteresting string
     /// content (the SIMD fast-skip target) before it can decide.
     fn streaming_body(padding: usize) -> Vec<u8> {
         let content = "x".repeat(padding);
@@ -878,54 +876,10 @@ mod peek {
             .into_bytes()
     }
 
-    /// The common case: a non-streaming body (no `stream` field). The planner must prove absence,
-    /// which today means a full structural walk — the case the `memmem` pre-filter short-circuits.
-    fn non_streaming_body(padding: usize) -> Vec<u8> {
-        let content = "x".repeat(padding);
-        format!(r#"{{"messages":[{{"role":"user","content":"{content}"}}],"model":"gpt-4o"}}"#)
-            .into_bytes()
-    }
-
-    /// Plan injection on a **streaming** body (must walk past the big content value to find `stream`).
-    #[divan::bench(args = [0, 4 * 1024, 256 * 1024])]
-    fn plan_inject_streaming(bencher: Bencher, padding: usize) {
-        let body = streaming_body(padding);
-        bencher
-            .counter(BytesCount::of_slice(&body))
-            .bench(|| plan_stream_usage_injection(black_box(&body)));
-    }
-
-    /// Plan injection on a **non-streaming** body (no `stream` key — the majority case).
-    #[divan::bench(args = [0, 4 * 1024, 256 * 1024])]
-    fn plan_inject_non_streaming(bencher: Bencher, padding: usize) {
-        let body = non_streaming_body(padding);
-        bencher
-            .counter(BytesCount::of_slice(&body))
-            .bench(|| plan_stream_usage_injection(black_box(&body)));
-    }
-
     use beyond_ai::peek::scan_buffered;
 
-    /// What a managed OpenAI chat request used to cost: the body walked once by `ModelScanner`
-    /// chunk-by-chunk for the root `model`, then walked end-to-end *again* by the injection planner
-    /// for root `stream`/`stream_options`. Same traversal, same bytes, different needles.
-    #[divan::bench(args = [4 * 1024, 64 * 1024, 512 * 1024])]
-    fn buffered_two_walks(bencher: Bencher, padding: usize) {
-        let body = streaming_body(padding);
-        bencher.counter(BytesCount::of_slice(&body)).bench(|| {
-            let mut scanner = ModelScanner::new();
-            for chunk in black_box(&body).chunks(8 * 1024) {
-                scanner.feed(chunk);
-            }
-            (
-                scanner.take_model(),
-                plan_stream_usage_injection(black_box(&body)),
-            )
-        });
-    }
-
-    /// The same two answers from one pass. Cross-checked for equivalence against both originals in
-    /// `peek::tests::fused_scan_matches_the_two_walks_it_replaces`.
+    /// Both answers a managed OpenAI chat request needs (the root `model`, and where
+    /// `stream_options` goes) from one pass over the buffered body.
     #[divan::bench(args = [4 * 1024, 64 * 1024, 512 * 1024])]
     fn buffered_fused_walk(bencher: Bencher, padding: usize) {
         let body = streaming_body(padding);
