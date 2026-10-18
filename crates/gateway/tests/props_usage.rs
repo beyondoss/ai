@@ -200,6 +200,42 @@ fn prop_streams_bill_like_their_bodies() {
     );
 }
 
+/// [`usage::body`] and [`usage::stream`], given the endpoint's dialect, bill a generated body and
+/// stream, whole or cut to a tail that still holds the usage event, as its dialect's parser does.
+#[test]
+fn prop_the_dialect_matrix_bills_like_the_dialect_parsers() {
+    check(
+        "prop_the_dialect_matrix_bills_like_the_dialect_parsers",
+        (
+            prop::sample::select(props_support::script::DIALECTS.to_vec()),
+            script(),
+            any::<usize>(),
+        ),
+        |(d, s, a)| {
+            let wire = d.wire();
+            let (body, stream) = (s.body(d), s.stream(d, None, None));
+            let tail = &stream[a % (rfind(&stream, b"\"usage\":{").unwrap() + 1)..];
+            let (b, st, t) = match d {
+                Endpoint::Messages => (
+                    usage::anthropic_body(&body),
+                    usage::anthropic_stream(&stream),
+                    usage::anthropic_stream_parts(&[&stream, tail]),
+                ),
+                _ => (
+                    usage::openai_body(&body),
+                    usage::openai_stream(&stream),
+                    usage::openai_stream(tail),
+                ),
+            };
+            prop_assert!(b.is_some() && st.is_some());
+            prop_assert_eq!(usage::body(wire, &body), b);
+            prop_assert_eq!(usage::stream(wire, &[], &stream), st);
+            prop_assert_eq!(usage::stream(wire, &stream, tail), t);
+            Ok(())
+        },
+    );
+}
+
 /// The proxy keeps a bounded tail (OpenAI wire) or head and tail (Anthropic): any such view that
 /// still holds the events carrying usage bills exactly what the whole stream does.
 #[test]

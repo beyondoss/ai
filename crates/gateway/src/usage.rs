@@ -12,6 +12,8 @@ use tracing_subscriber::filter::{FilterFn, filter_fn};
 
 #[cfg(test)]
 mod charset_tests;
+#[cfg(test)]
+mod dialect_tests;
 mod tools;
 mod vendor;
 #[cfg(test)]
@@ -185,6 +187,19 @@ fn de_service_tier<'de, D: serde::Deserializer<'de>>(
     d.deserialize_any(V)
 }
 
+/// The spelling a `usage` object is written in. Read from its keys, and the one thing the keys
+/// decide: within the OpenAI dialect, which mapping bills it; across dialects, the mismatch guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Spelling {
+    /// `prompt_tokens`/`completion_tokens`: Chat Completions and Embeddings.
+    Chat,
+    /// `input_tokens`/`output_tokens` with `total_tokens`: the Responses API (and OpenAI's images
+    /// and audio endpoints).
+    Responses,
+    /// `input_tokens`/`output_tokens` without `total_tokens`: Anthropic's, never OpenAI's.
+    Anthropic,
+}
+
 // Typed views of just the fields we meter. Deserializing into these (rather than a
 // `serde_json::Value` DOM) lets serde skip every field we don't read without allocating a node for
 // it — no `Map`/`String`/`Number` tree to build and drop per body or per SSE line. Every field is
@@ -199,10 +214,13 @@ vendor_fields! {
 ///
 /// DeepSeek's wire never populates `prompt_tokens_details.cached_tokens` — it reports cache hits via
 /// its own flat, top-level `prompt_cache_hit_tokens` field instead (DeepSeek API docs). Both providers
-/// are OpenAI-dialect and `looks_anthropic_shaped` doesn't catch this (DeepSeek's body has no
+/// are OpenAI-dialect and the mismatch guard doesn't catch this (DeepSeek's body has no
 /// Anthropic-style keys either), so without a fallback every DeepSeek cache hit silently bills as a
 /// full-price cache miss. `prompt_tokens_details.cached_tokens` wins when present (even `Some(0)`);
-/// `prompt_cache_hit_tokens` is only consulted when it's entirely absent — see `From<OpenAiUsage>`.
+/// `prompt_cache_hit_tokens` is only consulted when it's entirely absent — see `Usage::from_chat`.
+///
+/// One struct reads both OpenAI spellings (Chat Completions' and the Responses API's): the endpoint
+/// does not fix which one a body uses (see [`Self::on_openai`]); [`Self::spelling`] says which.
 #[derive(Deserialize, Default)]
 struct OpenAiUsage {
     #[serde(default)]
@@ -219,21 +237,17 @@ struct OpenAiUsage {
     /// `OpenAiPromptDetails::cached_tokens` itself distinguishes the two cases.
     #[serde(default)]
     prompt_cache_hit_tokens: Option<u64>,
-    /// Anthropic's characteristic field names — **never billed from**, only checked by
-    /// [`Self::looks_anthropic_shaped`] to catch a dialect-misconfigured provider (a config-added
-    /// Anthropic-wire vendor left at the default OpenAI dialect): a real OpenAI chat/completions
-    /// `usage` object never carries these keys, so their presence here means this body isn't actually
-    /// OpenAI-shaped.
+    /// The Responses API's counts, under Anthropic's names for them: see [`Self::spelling`].
     #[serde(default)]
     input_tokens: Option<u64>,
     #[serde(default)]
     output_tokens: Option<u64>,
-    /// Present on both OpenAI usage shapes and never on Anthropic's: what tells a non-stream
-    /// Responses body (`/v1/responses`, `/v1/responses/compact`), whose `usage` uses Anthropic's
-    /// `input_tokens`/`output_tokens` names, apart from a dialect-misconfigured Anthropic vendor.
+    /// Present on both OpenAI usage shapes and never on Anthropic's: what tells a Responses
+    /// `usage`, which uses Anthropic's `input_tokens`/`output_tokens` names, apart from a
+    /// dialect-misconfigured Anthropic vendor's.
     #[serde(default)]
     total_tokens: Option<u64>,
-    /// The Responses API's detail blocks, read only when [`Self::is_responses_shaped`].
+    /// The Responses API's detail blocks, read only in [`Spelling::Responses`].
     #[serde(default)]
     input_tokens_details: OpenAiResponsesInputDetails,
     #[serde(default)]
@@ -245,7 +259,7 @@ struct OpenAiUsage {
 struct OpenAiPromptDetails {
     /// `Option` so an absent `prompt_tokens_details` (or an absent `cached_tokens` within it — a
     /// DeepSeek response) is distinguishable from an explicit zero, letting
-    /// `From<OpenAiUsage>` fall back to `prompt_cache_hit_tokens` only when this is truly missing.
+    /// [`Usage::from_chat`] fall back to `prompt_cache_hit_tokens` only when this is truly missing.
     #[serde(default)]
     cached_tokens: Option<u64>,
     /// OpenRouter's Claude cache writes (see [`OpenAiUsage`]). Absent on OpenAI proper.
@@ -273,41 +287,59 @@ impl OpenAiUsage {
             || self.prompt_tokens_details.cached_tokens.is_some()
     }
 
-    /// `input_tokens`/`output_tokens` plus `total_tokens`: a non-stream Responses body.
-    fn is_responses_shaped(&self) -> bool {
-        self.input_tokens.is_some() && self.output_tokens.is_some() && self.total_tokens.is_some()
+    /// The spelling this object is written in; `None` when it names no token count. Chat
+    /// Completions never emits `input_tokens`/`output_tokens` in `usage`; with them, the Responses
+    /// API always adds `total_tokens` and Anthropic never does.
+    fn spelling(&self) -> Option<Spelling> {
+        if !self.counts_tokens() {
+            return None;
+        }
+        Some(
+            match (
+                self.input_tokens.is_some() && self.output_tokens.is_some(),
+                self.total_tokens.is_some(),
+            ) {
+                (false, _) => Spelling::Chat,
+                (true, true) => Spelling::Responses,
+                (true, false) => Spelling::Anthropic,
+            },
+        )
     }
 
-    /// See the doc comment on the `input_tokens`/`output_tokens` fields: both present without
-    /// `total_tokens` is Anthropic's unambiguous fingerprint (chat/completions never emits these key
-    /// names in `usage`, and the Responses API always adds `total_tokens`).
-    fn looks_anthropic_shaped(&self) -> bool {
-        self.input_tokens.is_some() && self.output_tokens.is_some() && self.total_tokens.is_none()
-    }
-}
-
-impl From<OpenAiUsage> for Usage {
-    fn from(mut u: OpenAiUsage) -> Self {
-        let vendor = u.vendor();
-        let mut usage = Usage::from_chat(u);
+    /// What the OpenAI dialect bills from this top-level `usage`. `None` when it names no count, or
+    /// is in Anthropic's spelling (the mismatch guard).
+    ///
+    /// Either OpenAI spelling bills, on any OpenAI path. The endpoint does not fix the spelling:
+    /// OpenAI's images and audio endpoints answer in the Responses spelling, an OpenAI-compatible
+    /// `/responses` mount can answer in Chat's, and a path outside the endpoint table names no
+    /// endpoint at all. Refusing the spelling the endpoint does not promise would turn each of
+    /// those into an estimated row.
+    fn on_openai(mut self) -> Option<Usage> {
+        let spelling = self.spelling()?;
+        if spelling == Spelling::Anthropic {
+            return None;
+        }
+        let vendor = self.vendor();
+        let mut usage = if spelling == Spelling::Responses {
+            Usage::from_responses(OpenAiResponsesUsage {
+                input_tokens: self.input_tokens,
+                output_tokens: self.output_tokens,
+                total_tokens: self.total_tokens,
+                input_tokens_details: self.input_tokens_details,
+                output_tokens_details: self.output_tokens_details,
+                ..OpenAiResponsesUsage::default()
+            })
+        } else {
+            Usage::from_chat(self)
+        };
         vendor.apply(&mut usage);
-        usage
+        Some(usage)
     }
 }
 
 impl Usage {
-    /// The token counts of a Chat Completions `usage` (or of a non-stream Responses one).
+    /// The token counts of a Chat Completions `usage`.
     fn from_chat(u: OpenAiUsage) -> Self {
-        if u.is_responses_shaped() {
-            return Usage::from(OpenAiResponsesUsage {
-                input_tokens: u.input_tokens,
-                output_tokens: u.output_tokens,
-                total_tokens: u.total_tokens,
-                input_tokens_details: u.input_tokens_details,
-                output_tokens_details: u.output_tokens_details,
-                ..OpenAiResponsesUsage::default()
-            });
-        }
         // OpenAI counts reasoning inside `completion_tokens`; xAI reports it beside it
         // (`total_tokens = prompt + completion + reasoning`) and bills it at the output rate. The
         // arithmetic says which convention a body follows, so the output count is right on both
@@ -350,7 +382,7 @@ vendor_fields! {
 /// than `prompt_tokens`/`completion_tokens`. Streamed, it is nested under
 /// `response.completed.response.usage` (see `openai_stream`), an envelope Anthropic's wire never
 /// carries, so it needs no dialect-mismatch guard there. A non-stream body carries it top-level and
-/// reaches it through [`OpenAiUsage::is_responses_shaped`].
+/// reads it through [`OpenAiUsage::on_openai`], which guards.
 #[derive(Deserialize, Default)]
 struct OpenAiResponsesUsage {
     #[serde(default)]
@@ -447,8 +479,8 @@ struct AnthropicUsage {
     #[serde(default, deserialize_with = "de_service_tier")]
     service_tier: Option<ServiceTier>,
     /// OpenAI's characteristic field names — **never billed from**, only checked by
-    /// [`Self::looks_openai_shaped`] (the symmetric case of `OpenAiUsage::looks_anthropic_shaped`): a
-    /// real Anthropic `usage` object never carries these keys.
+    /// [`Self::on_anthropic`] (the symmetric case of `OpenAiUsage::on_openai`'s guard): a real Anthropic
+    /// `usage` object never carries these keys.
     #[serde(default)]
     prompt_tokens: Option<u64>,
     #[serde(default)]
@@ -480,6 +512,12 @@ impl AnthropicUsage {
 
     fn looks_openai_shaped(&self) -> bool {
         self.prompt_tokens.is_some() && self.completion_tokens.is_some()
+    }
+
+    /// The mismatch guard: `None` for a block in OpenAI's spelling, which a dialect-misconfigured
+    /// provider sends on the Anthropic wire.
+    fn on_anthropic(self) -> Option<Self> {
+        (!self.looks_openai_shaped()).then_some(self)
     }
 }
 
@@ -531,8 +569,26 @@ fn recover_trailing_usage<T: serde::de::DeserializeOwned>(body: &[u8]) -> Option
     T::deserialize(&mut de).ok()
 }
 
-/// OpenAI non-streaming: top-level `usage`. `None` (absent/`null`, or a dialect mismatch — see
-/// `OpenAiUsage::looks_anthropic_shaped`) ⇒ no usage to meter.
+/// The usage a non-streaming `body` in `dialect` reports. `None` (absent, `null`, naming no count,
+/// or in the other dialect's spelling) ⇒ no usage to meter.
+pub fn body(dialect: Dialect, body: &[u8]) -> Option<Usage> {
+    match dialect {
+        Dialect::OpenAi => openai_body(body),
+        Dialect::Anthropic => anthropic_body(body),
+    }
+}
+
+/// The usage a stream in `dialect` reports. `tail` is the stream's last bytes; `head` its first,
+/// read only on the Anthropic wire, whose input and cache counts arrive in `message_start` (see
+/// [`anthropic_stream_parts`]). OpenAI reports in one final event, which the tail holds.
+pub fn stream(dialect: Dialect, head: &[u8], tail: &[u8]) -> Option<Usage> {
+    match dialect {
+        Dialect::OpenAi => openai_stream(tail),
+        Dialect::Anthropic => anthropic_stream_parts(&[head, tail]),
+    }
+}
+
+/// OpenAI non-streaming: top-level `usage`, on Chat Completions and Responses bodies alike.
 pub fn openai_body(body: &[u8]) -> Option<Usage> {
     #[derive(Deserialize)]
     struct Body {
@@ -555,12 +611,9 @@ pub fn openai_body(body: &[u8]) -> Option<Usage> {
             None,
         ),
     };
-    if !usage.counts_tokens() || usage.looks_anthropic_shaped() {
-        return None;
-    }
     let mut u = Usage {
         service_tier,
-        ..Usage::from(usage)
+        ..usage.on_openai()?
     };
     u.upstream.generation_id = id;
     u.upstream.served_by = provider;
@@ -568,7 +621,7 @@ pub fn openai_body(body: &[u8]) -> Option<Usage> {
 }
 
 /// Anthropic non-streaming: top-level `usage.{input,output,cache_*}`. `None` on a dialect mismatch —
-/// see `AnthropicUsage::looks_openai_shaped`.
+/// see `AnthropicUsage::on_anthropic`.
 pub fn anthropic_body(body: &[u8]) -> Option<Usage> {
     #[derive(Deserialize)]
     struct Body {
@@ -589,9 +642,7 @@ pub fn anthropic_body(body: &[u8]) -> Option<Usage> {
             None,
         ),
     };
-    if !u.counts_tokens() || u.looks_openai_shaped() {
-        return None;
-    }
+    let u = u.on_anthropic().filter(AnthropicUsage::counts_tokens)?;
     let mut u = Usage::from(u);
     u.upstream.generation_id = id;
     u.upstream.container_id = container.and_then(|c| c.id);
@@ -714,12 +765,12 @@ fn might_carry_usage(finder: &memchr::memmem::Finder<'_>, payload: &[u8]) -> boo
 
 /// OpenAI streaming: chat/completions (requires `stream_options.include_usage`) carries a top-level
 /// `usage` object on the penultimate chunk; the Responses API carries it nested under
-/// `response.completed.response.usage` instead, with no top-level `usage` key at all — so both shapes
-/// are checked per line. Last one with usage wins — which is why this scans the tail **backwards**
-/// and returns at the first hit rather than parsing every line to overwrite a result. A top-level
-/// `usage` that looks Anthropic-shaped (dialect mismatch — see
-/// `OpenAiUsage::looks_anthropic_shaped`) is skipped, not counted: if every line is mismatched the
-/// scan runs off the front and returns `None`.
+/// `response.completed.response.usage` instead, with no top-level `usage` key at all — so both
+/// are read per line (see [`openai_chunk_usage`]). Last one with usage wins — which is why
+/// this scans the tail **backwards** and returns at the first hit rather than parsing every line to
+/// overwrite a result. A top-level `usage` in Anthropic's spelling (the mismatch guard, see
+/// `OpenAiUsage::on_openai`) is skipped, not counted: if every line is mismatched the scan runs off the
+/// front and returns `None`.
 pub fn openai_stream(sse: &[u8]) -> Option<Usage> {
     // Scanned in **reverse**, returning at the first accepted usage. "Last accepted in forward
     // order" and "first accepted in reverse order" select the same line by definition, so this is
@@ -767,14 +818,13 @@ pub fn openai_stream(sse: &[u8]) -> Option<Usage> {
     // tail's first line can be front-truncated (the tail ends where the stream does), and `usage`
     // is the last thing in that event, so recover it the way a front-truncated body is recovered.
     let first = &sse[..memchr::memchr(b'\n', sse).unwrap_or(sse.len())];
-    recover_trailing_usage::<OpenAiUsage>(first)
-        .filter(|u| u.counts_tokens() && !u.looks_anthropic_shaped())
-        .map(Usage::from)
+    recover_trailing_usage::<OpenAiUsage>(first)?.on_openai()
 }
 
 /// One OpenAI stream payload's usage: `None` when it is not JSON, `Some(None)` when it carries no
-/// usage this dialect accepts. Chat Completions carries a top-level `usage`; Responses nests it
-/// under `response.completed.response.usage`.
+/// usage this dialect accepts. A top-level `usage` (Chat Completions') is judged by its spelling
+/// ([`OpenAiUsage::on_openai`]) and, when present, is the payload's only candidate; without one,
+/// the Responses envelope (`response.completed.response.usage`) is read.
 fn openai_chunk_usage(payload: &[u8]) -> Option<Option<Usage>> {
     #[derive(Deserialize)]
     struct ResponsesEnvelope {
@@ -797,18 +847,17 @@ fn openai_chunk_usage(payload: &[u8]) -> Option<Option<Usage>> {
         provider: Option<HostStr>,
     }
     let chunk = serde_json::from_slice::<Chunk>(payload).ok()?;
-    Some(if let Some(u) = chunk.usage {
-        (u.counts_tokens() && !u.looks_anthropic_shaped()).then(|| {
+    Some(match chunk.usage {
+        Some(u) => u.on_openai().map(|u| {
             let mut u = Usage {
                 service_tier: chunk.service_tier,
-                ..Usage::from(u)
+                ..u
             };
             u.upstream.generation_id = chunk.id;
             u.upstream.served_by = chunk.provider;
             u
-        })
-    } else {
-        chunk.response.and_then(|r| {
+        }),
+        None => chunk.response.and_then(|r| {
             r.usage.filter(|u| u.counts_tokens()).map(|u| {
                 let mut u = Usage {
                     service_tier: r.service_tier,
@@ -817,7 +866,7 @@ fn openai_chunk_usage(payload: &[u8]) -> Option<Option<Usage>> {
                 u.upstream.generation_id = r.id;
                 u
             })
-        })
+        }),
     })
 }
 
@@ -876,7 +925,7 @@ pub fn anthropic_stream(sse: &[u8]) -> Option<Usage> {
 /// reasoning/thinking tokens) accumulate in `message_delta.usage` (last delta is the cumulative
 /// total). A `message_delta` that also reports input or cache counts supersedes `message_start`'s.
 /// A `usage` block that looks OpenAI-shaped (dialect mismatch — see
-/// `AnthropicUsage::looks_openai_shaped`) is skipped entirely: if every line is mismatched,
+/// `AnthropicUsage::on_anthropic`) is skipped entirely: if every line is mismatched,
 /// `saw_any` stays `false` and the function returns `None`.
 ///
 /// Takes **parts** because those two facts sit at opposite ends of the stream and the proxy retains
@@ -958,8 +1007,7 @@ fn anthropic_apply(usage: &mut Usage, saw_any: &mut bool, payload: &[u8]) -> boo
         usage.upstream.container_id = Some(c);
     }
     if let Some(mut m) = chunk.message
-        && let Some(mut u) = m.usage.take()
-        && !u.looks_openai_shaped()
+        && let Some(mut u) = m.usage.take().and_then(AnthropicUsage::on_anthropic)
     {
         // Only a block that names a token count is a usage (`saw_any`); the fields and the server
         // tool count are taken from whatever it carries.
@@ -976,9 +1024,7 @@ fn anthropic_apply(usage: &mut Usage, saw_any: &mut bool, payload: &[u8]) -> boo
         usage.server_tool_calls = u64::from(usage.server_tools.web_search);
         *saw_any |= counted;
     }
-    if let Some(mut u) = chunk.usage
-        && !u.looks_openai_shaped()
-    {
+    if let Some(mut u) = chunk.usage.and_then(AnthropicUsage::on_anthropic) {
         // A delta that carries only a server tool count (a search with no token change) still
         // counts that search; only the token-less object is not a usage of its own.
         let counted = u.counts_tokens();

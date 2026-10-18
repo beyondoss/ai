@@ -7015,15 +7015,14 @@ impl ProxyHttp for AiProxy {
                 let status = upstream_status.unwrap_or(0);
                 self.cool_unfunded_key(&rc.request_id, &rc.leg.provider, rc.leg.pool_key, status);
             }
-            // Extract usage facts (shape depends on dialect + streaming). Every case reads the tail;
-            // Anthropic streaming *additionally* reads the head, because that's where `message_start`
-            // put the input and cache token counts. The two buffers may overlap on a short response —
-            // harmless, since every field is assigned rather than accumulated.
-            let parsed = match (rc.dialect, rc.streaming) {
-                (Dialect::OpenAi, true) => usage::openai_stream(tail),
-                (Dialect::OpenAi, false) => usage::openai_body(tail),
-                (Dialect::Anthropic, true) => usage::anthropic_stream_parts(&[&rc.resp_head, tail]),
-                (Dialect::Anthropic, false) => usage::anthropic_body(tail),
+            // Extract usage facts in the dialect this attempt was answered in. Every case reads the
+            // tail; an Anthropic stream *additionally* reads the head, because that's where
+            // `message_start` put the input and cache token counts. The two buffers may overlap on
+            // a short response — harmless, since every field is assigned rather than accumulated.
+            let parsed = if rc.streaming {
+                usage::stream(rc.dialect, &rc.resp_head, tail)
+            } else {
+                usage::body(rc.dialect, tail)
             };
             // A managed 2xx stream that ended before its usage block: the client hung up (a
             // cancelled agent turn) or the upstream died mid-stream. The provider bills us for what
