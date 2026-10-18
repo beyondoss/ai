@@ -411,8 +411,21 @@ impl Drop for Ctx {
     }
 }
 
-/// Per-request context. `None` until `request_filter` admits the request; short-circuited
-/// requests (auth/deny failures) leave it `None`, so later filters no-op.
+/// The request context of a hook pingora runs only for an admitted request: `upstream_peer`,
+/// and every hook after it on the upstream path. `request_filter` sets it on every request it
+/// does not answer itself, so a missing one is a lifecycle bug (a pingora ordering change), and
+/// the request ends on an error rather than passing through unmetered. `logging` and
+/// `fail_to_proxy` also run for refused requests, and read the context as an `Option`.
+fn admitted<'a>(
+    rc: Option<&'a mut RequestCtx>,
+    missing: &'static str,
+) -> Result<&'a mut RequestCtx> {
+    rc.ok_or_else(|| pingora_core::Error::new_str(missing))
+}
+
+/// Per-request context. `None` until `request_filter` admits the request; a request it answers
+/// itself (a refusal, the models list, a `FullBody` relay) never reaches the upstream hooks, and
+/// `logging` and `fail_to_proxy` see `None` (see [`admitted`]).
 pub struct RequestCtx {
     /// Who pays: a verified Beyond identity, or the caller's own provider key.
     billing: Billing,

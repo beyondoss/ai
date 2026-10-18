@@ -77,14 +77,10 @@ impl ProxyHttp for AiProxy {
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        // `ctx` is set by `request_filter` for every admitted request; a missing ctx here means an
-        // unadmitted request reached `upstream_peer` (a Pingora ordering change or future refactor).
-        // Surface it as an error rather than panicking the worker.
-        let Some(rc) = ctx.as_mut() else {
-            return Err(pingora_core::Error::new_str(
-                "upstream_peer reached without request context",
-            ));
-        };
+        let rc = admitted(
+            ctx.as_mut(),
+            "upstream_peer reached without request context",
+        )?;
         self.state.fault_point("upstream_peer");
 
         // Pingora calls this once per attempt, always before a body byte moves, so it is where each
@@ -311,9 +307,10 @@ impl ProxyHttp for AiProxy {
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        let Some(rc) = ctx.as_mut() else {
-            return Ok(());
-        };
+        let rc = admitted(
+            ctx.as_mut(),
+            "upstream_response_filter reached without request context",
+        )?;
         let status = upstream_response.status.as_u16();
         // A 2xx says this key's account pays: forget its unread OpenRouter 402s (D261).
         if rc.managed() && (200..300).contains(&status) {
@@ -464,9 +461,10 @@ impl ProxyHttp for AiProxy {
         upstream_request: &mut pingora::http::RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        let Some(rc) = ctx.as_mut() else {
-            return Ok(());
-        };
+        let rc = admitted(
+            ctx.as_mut(),
+            "upstream_request_filter reached without request context",
+        )?;
         // Pingora runs this once the connection is up, just before the request head goes out.
         rc.upstream_phase = UpstreamPhase::Connected;
         let rc = &*rc;
@@ -649,9 +647,10 @@ impl ProxyHttp for AiProxy {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         let Ctx { rc, held } = ctx;
-        let Some(rc) = rc.as_mut() else {
-            return Ok(());
-        };
+        let rc = admitted(
+            rc.as_mut(),
+            "request_body_filter reached without request context",
+        )?;
         // An upload still trickling in at the request's deadline ends there (see
         // `response_body_filter`).
         if crate::deadline::expired(rc.deadline) {
@@ -972,221 +971,223 @@ impl ProxyHttp for AiProxy {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         let Ctx { rc, held } = ctx;
-        if let Some(rc) = rc.as_mut() {
-            // Headers arrived ≈ time-to-first-byte. Per-provider handle resolved once at boot (see
-            // `ProviderMetrics`) — first-token latency is per-provider, so an unlabeled histogram
-            // can't tell you which one regressed.
-            //
-            // Timed from `attempt_start`, not `start`. They are the same instant for a request that
-            // connects first try; they differ once a candidate has been abandoned, and charging the
-            // dead candidate's `connect_timeout_secs` to the provider that actually answered would
-            // render an outage at A as a latency regression at B — inverting the one thing the
-            // per-provider label is for.
-            // Per-provider response counter, bucketed by status class — the signal that a provider
-            // is degrading (429/5xx) before it shows up only as latency or a missing usage event.
-            let status = upstream_response.status.as_u16();
-            rc.leg
-                .provider
-                .metrics
-                .ttft_seconds
-                .observe(rc.attempt_start().elapsed().as_secs_f64());
-            rc.leg.provider.metrics.record_response(status);
-            rc.upstream_status = held_status(status);
-            // Resolve the breaker permit here, at the head, not at the end of the body: the head
-            // is the provider's answer (a 5xx is broken, anything else is reachable), and a
-            // half-open probe resolved only at end of stream let one long or stalled stream 503
-            // the provider for everyone until it ended. `logging` resolves only the attempts that
-            // never got a head.
-            let answered = if status >= 500 {
-                rc.leg.fail();
-                None
-            } else {
-                rc.leg.succeed()
-            };
-            // A 2xx is not yet known to be healthy: a provider can answer 200 with an error body
-            // (OpenRouter's error-in-200, an SSE stream whose first event is an error), so its
-            // breaker verdict waits for the body's first bytes (`response_body_filter`).
-            if (200..300).contains(&status)
-                && let Some(a) = rc.auto.as_mut()
-            {
-                a.health = Some(PendingHealth {
-                    prefix: Vec::new(),
-                    permit: answered,
-                });
-            }
+        let rc = admitted(
+            rc.as_mut(),
+            "response_filter reached without request context",
+        )?;
+        // Headers arrived ≈ time-to-first-byte. Per-provider handle resolved once at boot (see
+        // `ProviderMetrics`) — first-token latency is per-provider, so an unlabeled histogram
+        // can't tell you which one regressed.
+        //
+        // Timed from `attempt_start`, not `start`. They are the same instant for a request that
+        // connects first try; they differ once a candidate has been abandoned, and charging the
+        // dead candidate's `connect_timeout_secs` to the provider that actually answered would
+        // render an outage at A as a latency regression at B — inverting the one thing the
+        // per-provider label is for.
+        // Per-provider response counter, bucketed by status class — the signal that a provider
+        // is degrading (429/5xx) before it shows up only as latency or a missing usage event.
+        let status = upstream_response.status.as_u16();
+        rc.leg
+            .provider
+            .metrics
+            .ttft_seconds
+            .observe(rc.attempt_start().elapsed().as_secs_f64());
+        rc.leg.provider.metrics.record_response(status);
+        rc.upstream_status = held_status(status);
+        // Resolve the breaker permit here, at the head, not at the end of the body: the head
+        // is the provider's answer (a 5xx is broken, anything else is reachable), and a
+        // half-open probe resolved only at end of stream let one long or stalled stream 503
+        // the provider for everyone until it ended. `logging` resolves only the attempts that
+        // never got a head.
+        let answered = if status >= 500 {
+            rc.leg.fail();
+            None
+        } else {
+            rc.leg.succeed()
+        };
+        // A 2xx is not yet known to be healthy: a provider can answer 200 with an error body
+        // (OpenRouter's error-in-200, an SSE stream whose first event is an error), so its
+        // breaker verdict waits for the body's first bytes (`response_body_filter`).
+        if (200..300).contains(&status)
+            && let Some(a) = rc.auto.as_mut()
+        {
+            a.health = Some(PendingHealth {
+                prefix: Vec::new(),
+                permit: answered,
+            });
+        }
 
-            // Derive streaming from the response, not the request: SSE ⇒ use the streaming usage
-            // parser; otherwise the body is a single JSON object.
-            rc.streaming = upstream_response
-                .headers
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|ct| ct.contains("event-stream"));
-            // Track concurrent SSE streams. Incremented here (response head is in), decremented in
-            // `logging` once the stream completes — so the gauge reflects in-flight streams, not a
-            // counter that only ever climbs. Non-streaming responses don't touch it.
-            if rc.streaming {
-                held.open_stream();
-            }
-            if rc.managed() {
-                tap_response_head(rc, upstream_response);
-            }
-            // Drain-on-cancel, decided per head (a walk's next attempt may be another provider).
-            // A drain already under way is left as it is.
-            if matches!(held.drain, Drain::Off | Drain::Armed) {
-                held.drain = if drains_on_cancel(rc, status) && full_body_ctx(session).is_none() {
-                    if drain::arm(&mut session.cache) {
-                        Drain::Armed
-                    } else {
-                        Drain::Off
-                    }
+        // Derive streaming from the response, not the request: SSE ⇒ use the streaming usage
+        // parser; otherwise the body is a single JSON object.
+        rc.streaming = upstream_response
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.contains("event-stream"));
+        // Track concurrent SSE streams. Incremented here (response head is in), decremented in
+        // `logging` once the stream completes — so the gauge reflects in-flight streams, not a
+        // counter that only ever climbs. Non-streaming responses don't touch it.
+        if rc.streaming {
+            held.open_stream();
+        }
+        if rc.managed() {
+            tap_response_head(rc, upstream_response);
+        }
+        // Drain-on-cancel, decided per head (a walk's next attempt may be another provider).
+        // A drain already under way is left as it is.
+        if matches!(held.drain, Drain::Off | Drain::Armed) {
+            held.drain = if drains_on_cancel(rc, status) && full_body_ctx(session).is_none() {
+                if drain::arm(&mut session.cache) {
+                    Drain::Armed
                 } else {
                     Drain::Off
-                };
-            }
-            self.state.fault_point("response_filter");
+                }
+            } else {
+                Drain::Off
+            };
+        }
+        self.state.fault_point("response_filter");
 
-            // `x-beyond-*` is the gateway's namespace. A provider (or anything between us and it)
-            // that sent its own `x-beyond-provider` or `x-beyond-cache-status` would otherwise reach
-            // the client beside, or instead of, ours. Allocates only when one is present.
-            let spoofed: Vec<http::HeaderName> = upstream_response
+        // `x-beyond-*` is the gateway's namespace. A provider (or anything between us and it)
+        // that sent its own `x-beyond-provider` or `x-beyond-cache-status` would otherwise reach
+        // the client beside, or instead of, ours. Allocates only when one is present.
+        let spoofed: Vec<http::HeaderName> = upstream_response
+            .headers
+            .keys()
+            .filter(|k| k.as_str().starts_with("x-beyond-"))
+            .cloned()
+            .collect();
+        for name in &spoofed {
+            upstream_response.remove_header(name);
+        }
+
+        // The pool key never reaches the client (D66). A provider, or anything between us and
+        // it, that echoes the credential it was sent would otherwise hand Beyond's key to a
+        // tenant: any header carrying it is dropped, and an error body (>= 400, where an echo
+        // lives: "Incorrect API key provided: …") is scrubbed as it streams (`Redact`). A 2xx
+        // body is an answer and is not scanned; a streamed answer would pay for it per chunk.
+        rc.redact = None;
+        if rc.managed()
+            && let Some(finder) = rc
+                .leg
+                .provider
+                .pool_auth
+                .get(usize::from(rc.leg.pool_key))
+                .map(route::PoolAuth::finder)
+                .filter(|f| !f.needle().is_empty())
+        {
+            // Collects nothing (and so allocates nothing) unless a header echoes the key.
+            let echoed: Vec<http::HeaderName> = upstream_response
                 .headers
-                .keys()
-                .filter(|k| k.as_str().starts_with("x-beyond-"))
-                .cloned()
+                .iter()
+                .filter(|(_, v)| finder.find(v.as_bytes()).is_some())
+                .map(|(k, _)| k.clone())
                 .collect();
-            for name in &spoofed {
+            for name in &echoed {
                 upstream_response.remove_header(name);
             }
-
-            // The pool key never reaches the client (D66). A provider, or anything between us and
-            // it, that echoes the credential it was sent would otherwise hand Beyond's key to a
-            // tenant: any header carrying it is dropped, and an error body (>= 400, where an echo
-            // lives: "Incorrect API key provided: …") is scrubbed as it streams (`Redact`). A 2xx
-            // body is an answer and is not scanned; a streamed answer would pay for it per chunk.
-            rc.redact = None;
-            if rc.managed()
-                && let Some(finder) = rc
-                    .leg
-                    .provider
-                    .pool_auth
-                    .get(usize::from(rc.leg.pool_key))
-                    .map(route::PoolAuth::finder)
-                    .filter(|f| !f.needle().is_empty())
-            {
-                // Collects nothing (and so allocates nothing) unless a header echoes the key.
-                let echoed: Vec<http::HeaderName> = upstream_response
-                    .headers
-                    .iter()
-                    .filter(|(_, v)| finder.find(v.as_bytes()).is_some())
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                for name in &echoed {
-                    upstream_response.remove_header(name);
-                }
-            }
-            // A managed JSON error is held whole and checked for a provider-account remedy (D174):
-            // the rewrite changes its length, so it loses its `Content-Length` here, on the error
-            // path only. A BYO error is the caller's own account talking and is relayed as sent.
-            if rc.managed() && status >= 400 {
-                let whole = !rc.streaming
-                    && upstream_response
-                        .headers
-                        .get("content-type")
-                        .and_then(|v| v.to_str().ok())
-                        .is_some_and(|ct| ct.contains("json"));
-                if whole {
-                    upstream_response.remove_header("content-length");
-                    if upstream_response.version != http::Version::HTTP_2 {
-                        upstream_response.insert_header("transfer-encoding", "chunked")?;
-                    }
-                }
-                let keyed = rc
-                    .leg
-                    .provider
-                    .pool_auth
-                    .get(usize::from(rc.leg.pool_key))
-                    .is_some_and(|a| !a.finder().needle().is_empty());
-                if whole || keyed {
-                    rc.redact = Some(Box::new(Redact {
-                        whole,
-                        status,
-                        ..Redact::default()
-                    }));
-                }
-            }
-
-            // Echo the request id so a client (or an oncall reading a captured response) can quote it
-            // and land on this request's log line. `insert_header` only fails on an invalid value;
-            // our id is `[0-9a-f-]`, always valid — but surface a failure rather than silently drop.
-            upstream_response.insert_header(REQUEST_ID_HEADER, rc.request_id.as_str())?;
-            if let Some(hv) = rc.leg.provider.name_header.as_ref() {
-                upstream_response.insert_header(PROVIDER_HEADER, hv.clone())?;
-            }
-            if let Some(c) = rc.auto.as_ref().and_then(|a| a.candidate_at(a.candidate)) {
-                upstream_response.insert_header(UPSTREAM_MODEL_HEADER, c.upstream_model)?;
-            }
-
-            // An assembled answer (D147): the upstream streams, the client gets one JSON body.
-            if rc.streaming && rc.auto.as_ref().is_some_and(|a| catalog_assembling(a)) {
-                upstream_response.insert_header("content-type", "application/json")?;
-            }
-            if let Some(cache::Pending::Fill { content_type, .. }) =
-                rc.auto.as_mut().and_then(|a| a.cache.as_mut())
-            {
-                *content_type = upstream_response
+        }
+        // A managed JSON error is held whole and checked for a provider-account remedy (D174):
+        // the rewrite changes its length, so it loses its `Content-Length` here, on the error
+        // path only. A BYO error is the caller's own account talking and is relayed as sent.
+        if rc.managed() && status >= 400 {
+            let whole = !rc.streaming
+                && upstream_response
                     .headers
                     .get("content-type")
                     .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_owned().into_boxed_str());
-            }
-
-            // Translate changes the body length (and SSE event count). Drop the upstream
-            // Content-Length so the client is not truncated; H1 needs chunked framing.
-            // Same-endpoint candidates stay a byte relay, except a Chat Completions stream from a
-            // vendor other than OpenAI: it relays through `SseBridge`, which drops the identity
-            // fields OpenRouter repeats on every chunk (see `translate::ChatIdentity`).
-            if rc.auto.as_ref().is_some_and(|a| {
-                catalog_translating(a)
-                    || (rc.streaming && (catalog_chat_relay(a) || catalog_assembling(a)))
-                    || catalog_error_relay(a, rc.upstream_status(), rc.streaming)
-            }) {
-                let streaming = rc.streaming;
-                let upstream = rc
-                    .auto
-                    .as_ref()
-                    .and_then(|a| catalog_serving_endpoint(a))
-                    .unwrap_or_else(|| route::Endpoint::of_wire(rc.dialect));
-                if let Some(t) = rc.auto.as_mut().and_then(|a| a.translate.as_mut())
-                    && streaming
-                {
-                    let bridge = if t.assemble {
-                        translate::SseBridge::assembling(upstream)
-                    } else {
-                        translate::SseBridge::new(t.client, upstream)
-                    };
-                    t.sse = Some(
-                        bridge
-                            .with_tools(t.tools.clone())
-                            .with_gateway_cache(t.gateway_cache),
-                    );
-                }
+                    .is_some_and(|ct| ct.contains("json"));
+            if whole {
                 upstream_response.remove_header("content-length");
                 if upstream_response.version != http::Version::HTTP_2 {
                     upstream_response.insert_header("transfer-encoding", "chunked")?;
                 }
             }
-            // --- signed ids (`signed_id`): a 2xx's ids are rewritten, so its length changes ---
-            if let Some(s) = rc.signed.as_mut()
-                && s.begin(status, rc.streaming)
-            {
-                upstream_response.remove_header("content-length");
-                if upstream_response.version != http::Version::HTTP_2 {
-                    upstream_response.insert_header("transfer-encoding", "chunked")?;
-                }
+            let keyed = rc
+                .leg
+                .provider
+                .pool_auth
+                .get(usize::from(rc.leg.pool_key))
+                .is_some_and(|a| !a.finder().needle().is_empty());
+            if whole || keyed {
+                rc.redact = Some(Box::new(Redact {
+                    whole,
+                    status,
+                    ..Redact::default()
+                }));
             }
-            // --- end signed ids ---
         }
+
+        // Echo the request id so a client (or an oncall reading a captured response) can quote it
+        // and land on this request's log line. `insert_header` only fails on an invalid value;
+        // our id is `[0-9a-f-]`, always valid — but surface a failure rather than silently drop.
+        upstream_response.insert_header(REQUEST_ID_HEADER, rc.request_id.as_str())?;
+        if let Some(hv) = rc.leg.provider.name_header.as_ref() {
+            upstream_response.insert_header(PROVIDER_HEADER, hv.clone())?;
+        }
+        if let Some(c) = rc.auto.as_ref().and_then(|a| a.candidate_at(a.candidate)) {
+            upstream_response.insert_header(UPSTREAM_MODEL_HEADER, c.upstream_model)?;
+        }
+
+        // An assembled answer (D147): the upstream streams, the client gets one JSON body.
+        if rc.streaming && rc.auto.as_ref().is_some_and(|a| catalog_assembling(a)) {
+            upstream_response.insert_header("content-type", "application/json")?;
+        }
+        if let Some(cache::Pending::Fill { content_type, .. }) =
+            rc.auto.as_mut().and_then(|a| a.cache.as_mut())
+        {
+            *content_type = upstream_response
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_owned().into_boxed_str());
+        }
+
+        // Translate changes the body length (and SSE event count). Drop the upstream
+        // Content-Length so the client is not truncated; H1 needs chunked framing.
+        // Same-endpoint candidates stay a byte relay, except a Chat Completions stream from a
+        // vendor other than OpenAI: it relays through `SseBridge`, which drops the identity
+        // fields OpenRouter repeats on every chunk (see `translate::ChatIdentity`).
+        if rc.auto.as_ref().is_some_and(|a| {
+            catalog_translating(a)
+                || (rc.streaming && (catalog_chat_relay(a) || catalog_assembling(a)))
+                || catalog_error_relay(a, rc.upstream_status(), rc.streaming)
+        }) {
+            let streaming = rc.streaming;
+            let upstream = rc
+                .auto
+                .as_ref()
+                .and_then(|a| catalog_serving_endpoint(a))
+                .unwrap_or_else(|| route::Endpoint::of_wire(rc.dialect));
+            if let Some(t) = rc.auto.as_mut().and_then(|a| a.translate.as_mut())
+                && streaming
+            {
+                let bridge = if t.assemble {
+                    translate::SseBridge::assembling(upstream)
+                } else {
+                    translate::SseBridge::new(t.client, upstream)
+                };
+                t.sse = Some(
+                    bridge
+                        .with_tools(t.tools.clone())
+                        .with_gateway_cache(t.gateway_cache),
+                );
+            }
+            upstream_response.remove_header("content-length");
+            if upstream_response.version != http::Version::HTTP_2 {
+                upstream_response.insert_header("transfer-encoding", "chunked")?;
+            }
+        }
+        // --- signed ids (`signed_id`): a 2xx's ids are rewritten, so its length changes ---
+        if let Some(s) = rc.signed.as_mut()
+            && s.begin(status, rc.streaming)
+        {
+            upstream_response.remove_header("content-length");
+            if upstream_response.version != http::Version::HTTP_2 {
+                upstream_response.insert_header("transfer-encoding", "chunked")?;
+            }
+        }
+        // --- end signed ids ---
         Ok(())
     }
 
@@ -1204,9 +1205,10 @@ impl ProxyHttp for AiProxy {
         // the client sees — post-translate on a wire-mismatched catalog walk, the relayed
         // chunk otherwise. SSE is converted event-by-event; the full stream is never buffered.
         let Ctx { rc, held } = ctx;
-        let Some(rc) = rc.as_mut() else {
-            return Ok(None);
-        };
+        let rc = admitted(
+            rc.as_mut(),
+            "response_body_filter reached without request context",
+        )?;
         self.state.fault_point("response_body_filter");
         // A response still moving at the request's deadline is cut (a silent one is ended by the
         // capped read timeout instead). One atomic load: see `crate::deadline`.
