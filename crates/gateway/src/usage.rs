@@ -259,7 +259,7 @@ struct OpenAiUsage {
 struct OpenAiPromptDetails {
     /// `Option` so an absent `prompt_tokens_details` (or an absent `cached_tokens` within it — a
     /// DeepSeek response) is distinguishable from an explicit zero, letting
-    /// `From<OpenAiUsage>` fall back to `prompt_cache_hit_tokens` only when this is truly missing.
+    /// [`Usage::from_chat`] fall back to `prompt_cache_hit_tokens` only when this is truly missing.
     #[serde(default)]
     cached_tokens: Option<u64>,
     /// OpenRouter's Claude cache writes (see [`OpenAiUsage`]). Absent on OpenAI proper.

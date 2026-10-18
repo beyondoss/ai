@@ -1,34 +1,67 @@
 //! [`body`] and [`stream`] against the four per-dialect parsers they replaced, frozen in
 //! `legacy` as they were (each reporting which spelling it billed), over a corpus and over
 //! generated input. The contract is exact: on every dialect and both framings, the new path bills
-//! what the old one did, byte for byte, refusals included.
+//! what the old one did, byte for byte, refusals included. And [`OpenAiUsage::spelling`], which
+//! both routes the OpenAI mapping and guards the dialect, reads every `usage` object the old
+//! parser judged as the old rules did (`legacy::spelling`).
 
 use super::*;
 use proptest::prelude::*;
 use serde_json::{Value, json};
 
-/// The parsers as they were, verbatim apart from reporting the spelling each billed usage was in.
+/// The parsers as they were, verbatim apart from reporting the spelling each billed usage was in,
+/// and from logging, at each guard, the old rules' spelling beside the new classifier's.
 mod legacy {
     use super::super::*;
+    use std::cell::RefCell;
 
     type Read = Option<(Usage, Spelling)>;
 
+    thread_local! {
+        /// Every top-level OpenAI `usage` the old parser judged: (old rules, `OpenAiUsage::spelling`).
+        pub static JUDGED: RefCell<Vec<(Option<Spelling>, Option<Spelling>)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    /// The old rules, in the order the old code applied them (the guard, then `from_chat`'s
+    /// routing): the oracle for [`OpenAiUsage::spelling`].
+    pub fn spelling(u: &OpenAiUsage) -> Option<Spelling> {
+        if !u.counts_tokens() {
+            None
+        } else if looks_anthropic_shaped(u) {
+            Some(Spelling::Anthropic)
+        } else if is_responses_shaped(u) {
+            Some(Spelling::Responses)
+        } else {
+            Some(Spelling::Chat)
+        }
+    }
+
+    /// The old guard, logging both classifiers' reading of `u`.
+    fn accepts(u: &OpenAiUsage) -> bool {
+        JUDGED.with(|j| j.borrow_mut().push((spelling(u), u.spelling())));
+        u.counts_tokens() && !looks_anthropic_shaped(u)
+    }
+
+    fn is_responses_shaped(u: &OpenAiUsage) -> bool {
+        u.input_tokens.is_some() && u.output_tokens.is_some() && u.total_tokens.is_some()
+    }
+
     fn from_openai(mut u: OpenAiUsage) -> (Usage, Spelling) {
         let vendor = u.vendor();
-        let (mut usage, wire) =
-            if u.input_tokens.is_some() && u.output_tokens.is_some() && u.total_tokens.is_some() {
-                let r = OpenAiResponsesUsage {
-                    input_tokens: u.input_tokens,
-                    output_tokens: u.output_tokens,
-                    total_tokens: u.total_tokens,
-                    input_tokens_details: u.input_tokens_details,
-                    output_tokens_details: u.output_tokens_details,
-                    ..OpenAiResponsesUsage::default()
-                };
-                (Usage::from(r), Spelling::Responses)
-            } else {
-                (Usage::from_chat(u), Spelling::Chat)
+        let (mut usage, wire) = if is_responses_shaped(&u) {
+            let r = OpenAiResponsesUsage {
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
+                total_tokens: u.total_tokens,
+                input_tokens_details: u.input_tokens_details,
+                output_tokens_details: u.output_tokens_details,
+                ..OpenAiResponsesUsage::default()
             };
+            (Usage::from(r), Spelling::Responses)
+        } else {
+            (Usage::from_chat(u), Spelling::Chat)
+        };
         vendor.apply(&mut usage);
         (usage, wire)
     }
@@ -57,7 +90,7 @@ mod legacy {
                 None,
             ),
         };
-        if !usage.counts_tokens() || looks_anthropic_shaped(&usage) {
+        if !accepts(&usage) {
             return None;
         }
         let (u, wire) = from_openai(usage);
@@ -93,7 +126,7 @@ mod legacy {
         }
         let first = &sse[..memchr::memchr(b'\n', sse).unwrap_or(sse.len())];
         recover_trailing_usage::<OpenAiUsage>(first)
-            .filter(|u| u.counts_tokens() && !looks_anthropic_shaped(u))
+            .filter(accepts)
             .map(from_openai)
     }
 
@@ -119,7 +152,7 @@ mod legacy {
         }
         let chunk = serde_json::from_slice::<Chunk>(payload).ok()?;
         Some(if let Some(u) = chunk.usage {
-            (u.counts_tokens() && !looks_anthropic_shaped(&u)).then(|| {
+            accepts(&u).then(|| {
                 let (u, wire) = from_openai(u);
                 let mut u = Usage {
                     service_tier: chunk.service_tier,
@@ -309,10 +342,23 @@ fn new(dialect: Dialect, framing: Framing, head: &[u8], tail: &[u8]) -> Option<U
     }
 }
 
-/// The contract, on both dialects. Returns what each billed: the OpenAI parser's spelling, and
-/// whether the Anthropic parser billed at all.
-fn check_equivalent(framing: Framing, head: &[u8], tail: &[u8]) -> (Option<Spelling>, bool) {
-    let mut read = (None, false);
+/// What one input read as: the spelling the OpenAI parser billed, whether the Anthropic parser
+/// billed, and the old-rules spellings of every top-level OpenAI `usage` judged on the way.
+struct Read {
+    openai: Option<Spelling>,
+    anthropic: bool,
+    judged: Vec<Option<Spelling>>,
+}
+
+/// The contract, on both dialects: the new path bills what the old one did, and the new
+/// classifier spells every object the old guard judged as the old rules did.
+fn check_equivalent(framing: Framing, head: &[u8], tail: &[u8]) -> Read {
+    legacy::JUDGED.with(|j| j.borrow_mut().clear());
+    let mut read = Read {
+        openai: None,
+        anthropic: false,
+        judged: Vec::new(),
+    };
     for dialect in [Dialect::OpenAi, Dialect::Anthropic] {
         let was = old(dialect, framing, head, tail);
         assert_eq!(
@@ -323,9 +369,18 @@ fn check_equivalent(framing: Framing, head: &[u8], tail: &[u8]) -> (Option<Spell
             String::from_utf8_lossy(tail)
         );
         match dialect {
-            Dialect::OpenAi => read.0 = was.map(|(_, s)| s),
-            Dialect::Anthropic => read.1 = was.is_some(),
+            Dialect::OpenAi => read.openai = was.map(|(_, s)| s),
+            Dialect::Anthropic => read.anthropic = was.is_some(),
         }
+    }
+    for (old, new) in legacy::JUDGED.with(|j| std::mem::take(&mut *j.borrow_mut())) {
+        assert_eq!(
+            new,
+            old,
+            "spelling, {framing:?}: {}",
+            String::from_utf8_lossy(tail)
+        );
+        read.judged.push(old);
     }
     read
 }
@@ -421,19 +476,34 @@ fn the_corpus_bills_as_the_inferring_parsers_did() {
         ("responses stream, envelope without total_tokens", Stream, vec![], sse(&[r#"{"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":2}}}"#]), Some(Responses), false),
         ("responses stream, final event cut at the front", Stream, vec![], responses_cut_stream, Some(Responses), false),
         ("responses stream, empty envelope usage", Stream, vec![], sse(&[r#"{"type":"response.completed","response":{"usage":{}}}"#]), None, false),
-        ("messages stream, head and tail (a bare `output_tokens` delta reads as Chat spelling)", Stream, messages_head.clone(), messages_tail.clone(), Some(Chat), true),
+        // Pins *existing* behaviour, not intended billing (tracked separately as a possible
+        // billing bug): on the OpenAI wire, a `message_delta` whose `usage` names `output_tokens`
+        // without `input_tokens` escapes the Anthropic guard and bills in Chat's spelling.
+        ("messages stream, head and tail (a message_delta with no input_tokens reads as Chat spelling)", Stream, messages_head.clone(), messages_tail.clone(), Some(Chat), true),
         ("messages stream, server-tool-only delta", Stream, vec![], server_tool_only, None, true),
         ("messages stream, whole", Stream, vec![], [messages_head, messages_tail].concat(), Some(Chat), true),
         ("chat stream on the Anthropic wire", Stream, vec![], sse(&[r#"{"type":"message_delta","usage":{"prompt_tokens":1,"completion_tokens":1}}"#]), Some(Chat), false),
         ("empty stream", Stream, vec![], vec![], None, false),
         ("[DONE] only", Stream, vec![], b"data: [DONE]\n\n".to_vec(), None, false),
     ];
+    let mut judged = Vec::new();
     for (name, framing, head, tail, openai, anthropic) in &cases {
+        let read = check_equivalent(*framing, head, tail);
         assert_eq!(
-            check_equivalent(*framing, head, tail),
+            (read.openai, read.anthropic),
             (*openai, *anthropic),
             "{name}: the case reaches the branch it names"
         );
+        judged.extend(read.judged);
+    }
+    // The spelling oracle saw every answer the classifier can give.
+    for s in [
+        None,
+        Some(Spelling::Chat),
+        Some(Spelling::Responses),
+        Some(Spelling::Anthropic),
+    ] {
+        assert!(judged.contains(&s), "the corpus never judged {s:?}");
     }
 }
 
@@ -537,6 +607,10 @@ proptest! {
         at in any::<u8>(),
         cut in any::<usize>(),
     ) {
+        // The classifier against the old rules on the generated object itself, wherever it lands.
+        if let Ok(o) = serde_json::from_value::<OpenAiUsage>(u.clone()) {
+            prop_assert_eq!(o.spelling(), legacy::spelling(&o), "{}", u);
+        }
         let (framing, bytes) = carried(&u, at);
         check_equivalent(framing, &[], &bytes);
         let cut = cut % (bytes.len() + 1);
@@ -547,6 +621,9 @@ proptest! {
     /// Arbitrary bytes, as body and as stream.
     #[test]
     fn arbitrary_bytes_bill_as_the_inferring_parsers_did(bytes in prop::collection::vec(any::<u8>(), 0..256)) {
+        if let Ok(o) = serde_json::from_slice::<OpenAiUsage>(&bytes) {
+            prop_assert_eq!(o.spelling(), legacy::spelling(&o));
+        }
         check_equivalent(Framing::Body, &[], &bytes);
         check_equivalent(Framing::Stream, &[], &bytes);
     }
