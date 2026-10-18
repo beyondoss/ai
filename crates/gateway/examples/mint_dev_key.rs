@@ -19,7 +19,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use beyond_ai::key::{Keyring, VirtualKey, mint};
+use beyond_ai::__test::key::{Keyring, VirtualKey, mint};
 use ed25519_dalek::SigningKey;
 
 fn main() {
@@ -50,8 +50,7 @@ fn main() {
 
     // Sanity check: the token must round-trip through a keyring holding this pubkey,
     // and recover the same identity. If this fails the printed values are useless.
-    let mut ring = Keyring::new();
-    ring.insert(KID, verifying_key);
+    let ring: Keyring = [(KID, verifying_key)].into_iter().collect();
     let recovered = ring.verify(&token).expect("dev token must verify");
     assert_eq!(
         recovered, vk,

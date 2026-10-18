@@ -93,7 +93,7 @@ impl ServerTools {
 
     /// The row's `server_tools` field: `kind=count` pairs joined with `,`, nonzero kinds only, in
     /// [`Self::entries`] order. `None` when every count is zero.
-    pub fn to_row(&self) -> Option<String> {
+    pub fn to_row(self) -> Option<String> {
         use std::fmt::Write;
         let mut out = String::new();
         for (k, n) in self.entries() {

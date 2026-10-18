@@ -363,6 +363,7 @@ dependencies = [
  "arrayvec",
  "async-trait",
  "base64 0.22.1",
+ "beyond-ai",
  "beyond-ai-providers",
  "beyond-ai-test-support",
  "beyond-slipstream",

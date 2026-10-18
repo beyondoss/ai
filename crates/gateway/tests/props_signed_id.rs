@@ -6,7 +6,7 @@
 
 mod props_support;
 
-use beyond_ai::signed_id::{Relay, Signer};
+use beyond_ai::__test::signed_id::{Relay, Signer};
 use props_support::*;
 use proptest::prelude::*;
 use serde_json::{Value, json};

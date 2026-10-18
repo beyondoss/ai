@@ -16,7 +16,7 @@
 
 mod props_support;
 
-use beyond_ai::peek::{self, Kept, ModelScanner};
+use beyond_ai::__test::peek::{self, Kept, ModelScanner};
 use props_support::old_peek as old;
 use props_support::*;
 use proptest::prelude::*;
@@ -923,13 +923,17 @@ fn prop_unescape_matches_serde() {
             quoted.extend_from_slice(&raw);
             quoted.push(b'"');
             let want = serde_json::from_slice::<String>(&quoted).ok();
-            let got = beyond_ai::lex::unescape(&raw);
+            let got = beyond_ai::__test::lex::unescape(&raw);
             prop_assert_eq!(&got, &want, "{}", shown(&raw));
             if let Some(w) = &want {
-                prop_assert!(beyond_ai::lex::unescapes_to(&raw, w), "{}", shown(&raw));
+                prop_assert!(
+                    beyond_ai::__test::lex::unescapes_to(&raw, w),
+                    "{}",
+                    shown(&raw)
+                );
             }
             prop_assert_eq!(
-                beyond_ai::lex::unescapes_to(&raw, &other),
+                beyond_ai::__test::lex::unescapes_to(&raw, &other),
                 want.as_deref() == Some(other.as_str()),
                 "{}",
                 shown(&raw)

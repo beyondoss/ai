@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 /// The shared provider table. `known_providers()` is the gateway-routable subset — the BYO-only
 /// rows (HuggingFace, NVIDIA, Kimi-Coding, OpenCode) have no `/{name}/…` mount and no pool key, so
 /// minting a [`Provider`] for them at boot would only create dead upstreams.
-pub use providers::{AuthScheme, ProviderId, ProviderSpec, gateway_providers as known_providers};
+pub use providers::{AuthScheme, ProviderId, gateway_providers as known_providers};
 
 /// The provider's wire format. Aliased to the shared crate's [`providers::WireFormat`] — same two
 /// variants, and the agent needs the identical fact to pick a request dialect.
@@ -748,7 +748,8 @@ pub struct Provider {
     pub authority: String,
     /// Bare upstream host (SNI / `Host` header) = authority without the port.
     pub host: String,
-    /// The provider's wire format (usage parsing + injection eligibility). See [`ProviderSpec::wire`].
+    /// The provider's wire format (usage parsing + injection eligibility). See
+    /// [`providers::ProviderSpec::wire`].
     pub dialect: Dialect,
     pub auth: AuthScheme,
     /// Precomputed managed auth values, one per configured pool key, in config order. Empty ⇒ no

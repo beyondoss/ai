@@ -12,8 +12,8 @@
 
 mod props_support;
 
-use beyond_ai::route::Endpoint;
-use beyond_ai::translate;
+use beyond_ai::__test::route::Endpoint;
+use beyond_ai::__test::translate;
 use props_support::requests::{chat_request, messages_request, responses_request};
 use props_support::*;
 use proptest::prelude::*;

@@ -3894,7 +3894,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | Module            | Role                                                                                                                                                                           | Tested         |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------- |
 | `proxy`           | `ProxyHttp` impl — request/response pipeline (request_filter through logging)                                                                                                  | e2e ✓          |
-| `key`             | `bai_v1` / `bai_v2` (explicit `key_id`) parse + Ed25519 verify + mint; keyring with multi-kid rotation support                                                                 | unit ✓         |
+| `key`             | `bai_v1` / `bai_v2` (explicit `key_id`) parse + Ed25519 verify; multi-kid keyring, built whole; reference `mint` only under the `mint` feature (dev targets only)              | unit ✓         |
 | `route`           | Data-driven provider table (name / authority / auth) + dialect default + model-route re-exports                                                                                | unit ✓         |
 | `peek`            | `ModelScanner` — streaming structural scan for the root-level `model`; O(1) memory                                                                                             | unit ✓         |
 | `rewrite`         | `ScannedBody`: a buffered body and its scan as one value; every edit moves the scan's offsets, so none outlives the edit it predates                                           | unit ✓ + e2e ✓ |
@@ -3931,7 +3931,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `metrics`         | Prometheus counter/histogram/gauge registration and update helpers                                                                                                             | unit ✓         |
 | `doctor`          | Boot-time diagnostics (`beyond-ai doctor`)                                                                                                                                     | unit ✓         |
 | `error`           | `GatewayError` (`Config` / `Store` / `Dns` with its `io::Error` source) and `ConfigError`, one variant per boot check; each message is operator-facing text, kept verbatim     | unit ✓         |
-| `lib`             | Library root: declares the modules `main` wires into the Pingora service; test-only clippy allowances                                                                          | compile ✓      |
+| `lib`             | Library root: modules crate-private; re-exports what `main` wires, hidden `__test` / `__bench` facades for dev targets; test-only clippy allowances                            | compile ✓      |
 | `main`            | CLI (`run` / `doctor`), rustls init, config load, Pingora server + proxy/watchers/admin bootstrap                                                                              | compile ✓      |
 
 ---

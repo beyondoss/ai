@@ -20,8 +20,10 @@ mod vendor;
 mod vendor_tests;
 
 pub use tools::ToolTally;
+#[cfg(test)]
+use vendor::id_byte;
 use vendor::vendor_fields;
-pub use vendor::{HostStr, IdStr, ServerTools, Upstream, e10_to_usd, host_from, id_byte, id_from};
+pub use vendor::{HostStr, IdStr, ServerTools, Upstream, e10_to_usd, host_from, id_from};
 
 /// The `tracing` target billing rows are written on.
 pub const USAGE_TARGET: &str = "ai.usage";

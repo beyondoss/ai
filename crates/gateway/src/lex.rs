@@ -101,7 +101,8 @@ impl Lexer {
         }
     }
 
-    /// Open `{` and `[` not yet closed.
+    /// Open `{` and `[` not yet closed. Only the unit tests read it; the lex keeps the count.
+    #[cfg(test)]
     pub fn depth(&self) -> u32 {
         self.depth
     }

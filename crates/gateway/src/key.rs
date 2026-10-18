@@ -19,7 +19,9 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+#[cfg(any(test, feature = "mint"))]
+use ed25519_dalek::{Signer, SigningKey};
 use std::collections::HashMap;
 
 /// Wire prefix + version. Inside the signed bytes, so it cannot be downgraded by an attacker.
@@ -27,8 +29,6 @@ use std::collections::HashMap;
 /// `request_filter` fail-closes on a managed prefix: a match that then fails verify is 401, never BYO.
 pub const PREFIX_V1: &str = "bai_v1";
 pub const PREFIX_V2: &str = "bai_v2";
-/// Alias for the original version — existing call sites and benches.
-pub const PREFIX: &str = PREFIX_V1;
 
 /// Whether a presented credential claims to be a managed virtual key (`bai_v1…` or `bai_v2…`).
 ///
@@ -58,6 +58,7 @@ pub struct VirtualKey {
 
 impl VirtualKey {
     /// v1: fixed 16-byte little-endian payload `tenant_id ++ vpc_id`.
+    #[cfg(any(test, feature = "mint"))]
     fn encode_payload_v1(&self) -> [u8; 16] {
         let mut out = [0u8; 16];
         out[..8].copy_from_slice(&self.tenant_id.to_le_bytes());
@@ -68,6 +69,7 @@ impl VirtualKey {
     /// v2: fixed 24-byte little-endian payload `tenant_id ++ vpc_id ++ key_id`.
     /// `key_id` is an argument, not derived from tenant+vpc — two credentials for the
     /// same tenant are distinct tokens and can be denied independently.
+    #[cfg(any(test, feature = "mint"))]
     fn encode_payload_v2(&self, key_id: u64) -> [u8; 24] {
         let mut out = [0u8; 24];
         out[..8].copy_from_slice(&self.tenant_id.to_le_bytes());
@@ -149,21 +151,29 @@ pub struct Keyring {
     keys: HashMap<Kid, VerifyingKey>,
 }
 
+/// A whole ring from its `(kid, key)` pairs: how a caller outside the crate (the dev-key example,
+/// the benches) builds one, since it cannot add to one.
+impl FromIterator<(Kid, VerifyingKey)> for Keyring {
+    fn from_iter<I: IntoIterator<Item = (Kid, VerifyingKey)>>(pairs: I) -> Self {
+        Self {
+            keys: pairs.into_iter().collect(),
+        }
+    }
+}
+
 impl Keyring {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn insert(&mut self, kid: Kid, key: VerifyingKey) {
+    /// Crate-private: the trust store is built from config (`AiConfig::build_keyring`), never
+    /// changed by a caller holding one. Outside the crate a ring is collected whole (`FromIterator`).
+    pub(crate) fn insert(&mut self, kid: Kid, key: VerifyingKey) {
         self.keys.insert(kid, key);
     }
 
     pub fn get(&self, kid: Kid) -> Option<&VerifyingKey> {
         self.keys.get(&kid)
-    }
-
-    pub fn remove(&mut self, kid: Kid) {
-        self.keys.remove(&kid);
     }
 
     pub fn len(&self) -> usize {
@@ -295,6 +305,10 @@ pub fn verifying_key_from_value(bytes: &[u8]) -> Option<VerifyingKey> {
 /// Mint a `bai_v1` virtual key (tenant+vpc only). Lives here for tests + determinism checks
 /// and as the reference implementation; production minting is the Go control plane
 /// (`crypto/ed25519`), which must produce byte-identical output for the same inputs.
+///
+/// Never in the production binary (the gateway holds only public keys and cannot mint): built for
+/// the unit tests, and under the `mint` feature, which only this crate's dev targets enable.
+#[cfg(any(test, feature = "mint"))]
 #[allow(clippy::expect_used)] // payload is a fixed 22-char base64 of 16 bytes; always fits the cap
 pub fn mint(vk: &VirtualKey, kid: Kid, signing_key: &SigningKey) -> String {
     let payload_b64 = URL_SAFE_NO_PAD.encode(vk.encode_payload_v1());
@@ -312,7 +326,9 @@ pub fn mint(vk: &VirtualKey, kid: Kid, signing_key: &SigningKey) -> String {
 /// Byte layout (document this for the Go control plane; do not invent a second encoding):
 /// `bai_v2.{kid}.{payload_b64}.{sig_b64}` where `payload` is 24 bytes little-endian
 /// `tenant_id u64 || vpc_id u64 || key_id u64`, `payload_b64`/`sig_b64` are base64url (no pad),
-/// and the signed bytes are `bai_v2.{kid}.{payload_b64}`. Same Ed25519 keyring as v1.
+/// and the signed bytes are `bai_v2.{kid}.{payload_b64}`. Same Ed25519 keyring as v1. Gated as
+/// [`mint`] is.
+#[cfg(any(test, feature = "mint"))]
 #[allow(clippy::expect_used)] // payload is a fixed 32-char base64 of 24 bytes; always fits the cap
 pub fn mint_v2(vk: &VirtualKey, key_id: u64, kid: Kid, signing_key: &SigningKey) -> String {
     let payload_b64 = URL_SAFE_NO_PAD.encode(vk.encode_payload_v2(key_id));

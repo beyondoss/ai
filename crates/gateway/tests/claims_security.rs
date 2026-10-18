@@ -12,7 +12,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use beyond_ai::key::{VirtualKey, mint, mint_v2};
+use beyond_ai::__test::key::{VirtualKey, mint, mint_v2};
 use bytes::Bytes;
 use common::*;
 use http_body_util::{BodyExt, Full};

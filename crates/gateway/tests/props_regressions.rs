@@ -4,9 +4,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use beyond_ai::route::Endpoint;
-use beyond_ai::translate::{self, SseBridge};
-use beyond_ai::usage::{self, InputTally};
+use beyond_ai::__test::route::Endpoint;
+use beyond_ai::__test::translate::{self, SseBridge};
+use beyond_ai::__test::usage::{self, InputTally};
 use serde_json::Value;
 
 /// An OpenAI-shaped usage block whose `prompt + completion + reasoning` passes `u64::MAX` is a
