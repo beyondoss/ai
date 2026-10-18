@@ -1,0 +1,418 @@
+{
+  "spec": "exec protocol v1.4 sandbox job notify (crates/agent/src/exec_endpoint.rs, \"Sandbox job notify (v1.4)\"), \"The callback request\" and \"The receiver\"",
+  "notes": [
+    "requests: what an endpoint sends for a job kept with notify. body is the exact bytes; headers lists every header the endpoint must send (others the HTTP client adds, such as Host and Content-Length, are not listed, and a Cookie header is forbidden).",
+    "receiver: one POST to /_beyond/agent?session_id=<grant.session_id> carrying a verified session grant for grant.tenant and grant.session_id, plus request.authorization and request.body. state is what the replica holds: notify_key (it holds the verifier keys of v1.4-token.json), session_exists (the session is in storage), job (running: the sandbox still runs it; recorded_ended: the session has already recorded its end; absent: the sandbox has no such job), reconcile (ok, or fails: the sandbox cannot be listed). expect: the HTTP status, whether the session may be opened or started, and whether anything is sent to the sandbox.",
+    "authorization null means no Authorization header."
+  ],
+  "keep": {
+    "scope": "2ff302a37e7401aa95f92ec6c431944a",
+    "id": "0123456789abcdef",
+    "url": "https://edge.example/_beyond/agent?session_id=a07-s3.01J9ZQ4N6V",
+    "token": "bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+  },
+  "requests": [
+    {
+      "name": "every attempt, whatever the job's state",
+      "method": "POST",
+      "url": "https://edge.example/_beyond/agent?session_id=a07-s3.01J9ZQ4N6V",
+      "headers": {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+      },
+      "forbidden_headers": [
+        "Cookie"
+      ],
+      "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}",
+      "max_body_bytes": 512,
+      "covers": [
+        "N7",
+        "N13"
+      ]
+    }
+  ],
+  "grant": {
+    "tenant": "acme",
+    "session_id": "a07-s3.01J9ZQ4N6V"
+  },
+  "receiver": [
+    {
+      "name": "a verified callback for a running job: a reconcile, then 200",
+      "request": {
+        "method": "POST",
+        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "running",
+        "reconcile": "ok"
+      },
+      "expect": {
+        "status": 200,
+        "opens_session": true,
+        "contacts_sandbox": true
+      },
+      "covers": [
+        "N25",
+        "N29",
+        "N32"
+      ]
+    },
+    {
+      "name": "a repeat for a job whose end is recorded",
+      "request": {
+        "method": "POST",
+        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "recorded_ended",
+        "reconcile": "ok"
+      },
+      "expect": {
+        "status": 200,
+        "opens_session": true,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N31"
+      ]
+    },
+    {
+      "name": "the sandbox has no such job after the reconcile",
+      "request": {
+        "method": "POST",
+        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "absent",
+        "reconcile": "ok"
+      },
+      "expect": {
+        "status": 410,
+        "opens_session": true,
+        "contacts_sandbox": true
+      },
+      "covers": [
+        "N29"
+      ]
+    },
+    {
+      "name": "the reconcile cannot list the sandbox",
+      "request": {
+        "method": "POST",
+        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "running",
+        "reconcile": "fails"
+      },
+      "expect": {
+        "status": 503,
+        "opens_session": true,
+        "contacts_sandbox": true
+      },
+      "covers": [
+        "N29"
+      ]
+    },
+    {
+      "name": "no Authorization: a grant alone",
+      "request": {
+        "method": "POST",
+        "authorization": null,
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "running",
+        "reconcile": "ok"
+      },
+      "expect": {
+        "status": 403,
+        "opens_session": false,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N24"
+      ]
+    },
+    {
+      "name": "a replica with no notify key",
+      "request": {
+        "method": "POST",
+        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "notify_key": false,
+        "session_exists": true,
+        "job": "running",
+        "reconcile": "ok"
+      },
+      "expect": {
+        "status": 401,
+        "opens_session": false,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N24"
+      ]
+    },
+    {
+      "name": "a token on another command",
+      "request": {
+        "method": "POST",
+        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "body": "{\"type\":\"prompt\",\"message\":\"hi\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "running",
+        "reconcile": "ok"
+      },
+      "expect": {
+        "status": 403,
+        "opens_session": false,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N23"
+      ]
+    },
+    {
+      "name": "a token on a GET",
+      "request": {
+        "method": "GET",
+        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "body": ""
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "running",
+        "reconcile": "ok"
+      },
+      "expect": {
+        "status": 403,
+        "opens_session": false,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N23"
+      ]
+    },
+    {
+      "name": "a body over 4096 bytes",
+      "request": {
+        "method": "POST",
+        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\",\"pad\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "running",
+        "reconcile": "ok"
+      },
+      "expect": {
+        "status": 413,
+        "opens_session": false,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N25"
+      ]
+    },
+    {
+      "name": "a body with a fourth member",
+      "request": {
+        "method": "POST",
+        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\",\"state\":\"ended\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "running",
+        "reconcile": "ok"
+      },
+      "expect": {
+        "status": 400,
+        "opens_session": false,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N25"
+      ]
+    },
+    {
+      "name": "a body without id",
+      "request": {
+        "method": "POST",
+        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "running",
+        "reconcile": "ok"
+      },
+      "expect": {
+        "status": 400,
+        "opens_session": false,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N25"
+      ]
+    },
+    {
+      "name": "an id that is not a v1.3 job id",
+      "request": {
+        "method": "POST",
+        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789ABCDEF\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "running",
+        "reconcile": "ok"
+      },
+      "expect": {
+        "status": 400,
+        "opens_session": false,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N25"
+      ]
+    },
+    {
+      "name": "a body that is not JSON",
+      "request": {
+        "method": "POST",
+        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "body": "type=job_ended"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "running",
+        "reconcile": "ok"
+      },
+      "expect": {
+        "status": 400,
+        "opens_session": false,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N25"
+      ]
+    },
+    {
+      "name": "a tampered token",
+      "request": {
+        "method": "POST",
+        "authorization": "Bearer bjn_v1.4eba5aa3.BdTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "running",
+        "reconcile": "ok"
+      },
+      "expect": {
+        "status": 401,
+        "opens_session": false,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N25",
+        "N44"
+      ]
+    },
+    {
+      "name": "another job's body under this job's token",
+      "request": {
+        "method": "POST",
+        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"fedcba9876543210\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "running",
+        "reconcile": "ok"
+      },
+      "expect": {
+        "status": 401,
+        "opens_session": false,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N25",
+        "N45"
+      ]
+    },
+    {
+      "name": "a token that verifies for a scope that is not the session's",
+      "request": {
+        "method": "POST",
+        "authorization": "Bearer bjn_v1.4eba5aa3.GlqcqfqPV-eIYD_8hmnN2vkAlIS32fC52N22YsAQp0c",
+        "body": "{\"type\":\"job_ended\",\"scope\":\"fbc971f011ddc0a8be2112840519b253\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": true,
+        "job": "running",
+        "reconcile": "ok"
+      },
+      "expect": {
+        "status": 403,
+        "opens_session": false,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N25"
+      ]
+    },
+    {
+      "name": "a session that does not exist",
+      "request": {
+        "method": "POST",
+        "authorization": "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "notify_key": true,
+        "session_exists": false,
+        "job": "running",
+        "reconcile": "ok"
+      },
+      "expect": {
+        "status": 404,
+        "opens_session": false,
+        "contacts_sandbox": false
+      },
+      "covers": [
+        "N26"
+      ]
+    }
+  ]
+}
