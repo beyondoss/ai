@@ -3,7 +3,7 @@
 //! dialect receives ([`Seen`]).
 
 use super::*;
-use beyond_ai::route::Endpoint;
+use beyond_ai::__test::route::Endpoint;
 
 pub const DIALECTS: [Endpoint; 3] = [
     Endpoint::ChatCompletions,

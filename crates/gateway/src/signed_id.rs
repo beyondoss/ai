@@ -127,34 +127,57 @@ impl std::fmt::Display for Refusal {
     }
 }
 
+/// Why the id signing keys cannot build a [`Signer`]. A boot failure (`config::ConfigError::IdSigner`)
+/// and a `--doctor` line: the messages are operator-facing text.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SignerError {
+    /// A kid byte outside `[0-9A-Za-z]` (it is one character of every id the key signs).
+    #[error("id signing key id {0:?} must be one character [0-9A-Za-z]")]
+    KidCharset(char),
+    /// A configured kid that is not exactly one character.
+    #[error("id signing key id {0:?} must be one character [0-9A-Za-z]")]
+    KidLength(String),
+    #[error(
+        "id signing key {kid} is {len} bytes; at least {MIN_SECRET_LEN} random bytes are required (openssl rand -base64 32)"
+    )]
+    SecretTooShort { kid: char, len: usize },
+    #[error("id signing key {0} is not base64 (generate one with openssl rand -base64 32)")]
+    NotBase64(String),
+    #[error("id signing key {0} is set twice")]
+    DuplicateKid(char),
+    #[error("id_signing_kid {0:?} names no configured id signing key")]
+    UnknownCurrent(char),
+    #[error("id_signing_kid {0:?} must be one character [0-9A-Za-z]")]
+    CurrentLength(String),
+    #[error("id_signing_kid = {0:?} but no id_signing_keys are configured")]
+    CurrentWithoutKeys(String),
+    #[error(
+        "more than one id signing key is configured: set id_signing_kid to the one that signs new ids"
+    )]
+    NoCurrent,
+}
+
 impl Signer {
     /// From raw secrets by kid. `current` signs new ids.
-    pub fn new(keys: &[(u8, &[u8])], current: u8) -> Result<Self, String> {
+    pub fn new(keys: &[(u8, &[u8])], current: u8) -> Result<Self, SignerError> {
         let mut out = Vec::with_capacity(keys.len());
         for &(kid, secret) in keys {
             if !kid.is_ascii_alphanumeric() {
-                return Err(format!(
-                    "id signing key id {:?} must be one character [0-9A-Za-z]",
-                    char::from(kid)
-                ));
+                return Err(SignerError::KidCharset(char::from(kid)));
             }
             if secret.len() < MIN_SECRET_LEN {
-                return Err(format!(
-                    "id signing key {} is {} bytes; at least {MIN_SECRET_LEN} random bytes are required (openssl rand -base64 32)",
-                    char::from(kid),
-                    secret.len()
-                ));
+                return Err(SignerError::SecretTooShort {
+                    kid: char::from(kid),
+                    len: secret.len(),
+                });
             }
             if out.iter().any(|(k, _)| *k == kid) {
-                return Err(format!("id signing key {} is set twice", char::from(kid)));
+                return Err(SignerError::DuplicateKid(char::from(kid)));
             }
             out.push((kid, hmac::Key::new(hmac::HMAC_SHA256, secret)));
         }
         if !out.iter().any(|(k, _)| *k == current) {
-            return Err(format!(
-                "id_signing_kid {:?} names no configured id signing key",
-                char::from(current)
-            ));
+            return Err(SignerError::UnknownCurrent(char::from(current)));
         }
         Ok(Self { current, keys: out })
     }
@@ -164,46 +187,30 @@ impl Signer {
     pub fn from_config(
         keys: &HashMap<String, Secret>,
         current: &str,
-    ) -> Result<Option<Self>, String> {
+    ) -> Result<Option<Self>, SignerError> {
         if keys.is_empty() {
             return if current.is_empty() {
                 Ok(None)
             } else {
-                Err(format!(
-                    "id_signing_kid = {current:?} but no id_signing_keys are configured"
-                ))
+                Err(SignerError::CurrentWithoutKeys(current.to_owned()))
             };
         }
         let mut decoded: Vec<(u8, zeroize::Zeroizing<Vec<u8>>)> = Vec::with_capacity(keys.len());
         for (kid, secret) in keys {
             let &[k] = kid.as_bytes() else {
-                return Err(format!(
-                    "id signing key id {kid:?} must be one character [0-9A-Za-z]"
-                ));
+                return Err(SignerError::KidLength(kid.clone()));
             };
-            let bytes = decode_secret(secret.expose()).ok_or_else(|| {
-                format!(
-                    "id signing key {kid} is not base64 (generate one with openssl rand -base64 32)"
-                )
-            })?;
+            let bytes = decode_secret(secret.expose())
+                .ok_or_else(|| SignerError::NotBase64(kid.clone()))?;
             decoded.push((k, zeroize::Zeroizing::new(bytes)));
         }
         let current = match current.as_bytes() {
             [k] => *k,
             [] => match decoded.as_slice() {
                 [(k, _)] => *k,
-                _ => {
-                    return Err(
-                        "more than one id signing key is configured: set id_signing_kid to the one that signs new ids"
-                            .to_owned(),
-                    );
-                }
+                _ => return Err(SignerError::NoCurrent),
             },
-            _ => {
-                return Err(format!(
-                    "id_signing_kid {current:?} must be one character [0-9A-Za-z]"
-                ));
-            }
+            _ => return Err(SignerError::CurrentLength(current.to_owned())),
         };
         let refs: Vec<(u8, &[u8])> = decoded.iter().map(|(k, s)| (*k, s.as_slice())).collect();
         Self::new(&refs, current).map(Some)
@@ -1112,6 +1119,28 @@ mod tests {
                 .is_some()
         );
         assert!(Signer::from_config(&k(&[("1", good)]), "3").is_err());
+
+        // Each refusal is its own variant, carrying the kid it names.
+        let err = |pairs: &[(&str, &str)], current| Signer::from_config(&k(pairs), current).err();
+        use SignerError as E;
+        assert_eq!(err(&[], "1"), Some(E::CurrentWithoutKeys("1".into())));
+        assert_eq!(err(&[("12", good)], ""), Some(E::KidLength("12".into())));
+        assert_eq!(err(&[("-", good)], ""), Some(E::KidCharset('-')));
+        assert_eq!(
+            err(&[("1", "c2hvcnQ=")], ""),
+            Some(E::SecretTooShort { kid: '1', len: 5 })
+        );
+        assert_eq!(err(&[("1", "!!!")], ""), Some(E::NotBase64("1".into())));
+        assert_eq!(err(&[("1", good), ("2", good)], ""), Some(E::NoCurrent));
+        assert_eq!(
+            err(&[("1", good)], "12"),
+            Some(E::CurrentLength("12".into()))
+        );
+        assert_eq!(err(&[("1", good)], "3"), Some(E::UnknownCurrent('3')));
+        assert_eq!(
+            Signer::new(&[(b'1', &[7u8; 32]), (b'1', &[7u8; 32])], b'1').err(),
+            Some(E::DuplicateKid('1'))
+        );
     }
 
     #[test]

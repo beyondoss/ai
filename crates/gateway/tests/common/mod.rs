@@ -1113,8 +1113,8 @@ pub const DEV_ID_SECRET: [u8; 32] = [7; 32];
 
 /// A signer holding the test gateway's default id signing key, to mint and read the signed ids
 /// a test gateway issues (`signed_id.rs`).
-pub fn dev_id_signer() -> beyond_ai::signed_id::Signer {
-    beyond_ai::signed_id::Signer::new(&[(b'1', &DEV_ID_SECRET)], b'1').unwrap()
+pub fn dev_id_signer() -> beyond_ai::__test::signed_id::Signer {
+    beyond_ai::__test::signed_id::Signer::new(&[(b'1', &DEV_ID_SECRET)], b'1').unwrap()
 }
 
 impl GatewayBuilder {
@@ -1908,8 +1908,8 @@ pub async fn wait_usage_rows(gw: &Gateway, n: usize, secs: u64) -> Vec<serde_jso
 
 /// A `bai_` virtual key for `tenant_id` signed with `sk`.
 pub fn billing_vkey(sk: &ed25519_dalek::SigningKey, tenant_id: u64) -> String {
-    beyond_ai::key::mint(
-        &beyond_ai::key::VirtualKey {
+    beyond_ai::__test::key::mint(
+        &beyond_ai::__test::key::VirtualKey {
             tenant_id,
             vpc_id: 1,
             key_id: None,

@@ -12,7 +12,7 @@
 
 mod common;
 
-use beyond_ai::key::{VirtualKey, mint};
+use beyond_ai::__test::key::{VirtualKey, mint};
 use common::*;
 
 fn managed_key(sk: &ed25519_dalek::SigningKey) -> String {

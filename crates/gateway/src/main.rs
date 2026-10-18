@@ -9,16 +9,11 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use beyond_ai::admin::AdminApp;
-use beyond_ai::capture_sink::{CaptureDrain, CaptureSink};
-use beyond_ai::config::{AiConfig, ValidConfig};
 use beyond_ai::doctor;
-use beyond_ai::metrics::Metrics;
-use beyond_ai::proxy::AiProxy;
-use beyond_ai::state::GatewayState;
-use beyond_ai::store_watch::{Allowance, Capture, Deny, WatcherService};
-use beyond_ai::usage::{USAGE_TARGET, usage_log_filter};
-use beyond_ai::usage_file::{UsageFiles, UsageRow};
+use beyond_ai::{
+    AdminApp, AiConfig, AiProxy, Allowance, Capture, CaptureDrain, CaptureSink, Deny, GatewayState,
+    Metrics, USAGE_TARGET, UsageFiles, UsageRow, ValidConfig, WatcherService, usage_log_filter,
+};
 use clap::{Parser, Subcommand};
 use pingora_core::apps::HttpServerOptions;
 use pingora_core::apps::http_app::HttpServer;

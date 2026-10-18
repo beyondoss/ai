@@ -27,7 +27,7 @@
 
 mod common;
 
-use beyond_ai::key::{VirtualKey, mint};
+use beyond_ai::__test::key::{VirtualKey, mint};
 use common::*;
 
 /// The provider's API key from the environment, or `None` (→ the test logs a skip and returns).

@@ -19,6 +19,12 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# The reference `bai_v1`/`bai_v2` minter (`key::mint`). The gateway holds only public keys and
+# never mints, so the production binary leaves it out; the dev targets (tests, benches, the dev-key
+# example) turn it on through the self dev-dependency below.
+mint = []
+
 [dependencies]
 # slipstream is published — consume it from crates.io, aliased to `store` so the code's
 # `use store::...` is unchanged. No path deps into the `beyond` repo: this crate builds standalone.
@@ -77,6 +83,9 @@ tracing-subscriber.workspace = true
 zeroize = "1"
 
 [dev-dependencies]
+# This crate, with the minter: every dev target mints the keys it presents. A dev-dependency only, so
+# `cargo build` of the binary never unifies the feature in.
+beyond-ai = { path = ".", features = ["mint"] }
 # Port read-back for test subprocesses (`ports`): no port is picked free, released and rebound.
 beyond-ai-test-support = { path = "../test-support" }
 # Bench harnesses. Best tool per job: `divan` for the unit micro-bench (it measures allocations

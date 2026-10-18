@@ -310,8 +310,8 @@ pub struct Billed {
     pub output: u64,
 }
 
-pub fn normalize(u: &beyond_ai::usage::Usage) -> Billed {
-    let anthropic = matches!(u.wire, Some(beyond_ai::route::Dialect::Anthropic));
+pub fn normalize(u: &beyond_ai::__test::usage::Usage) -> Billed {
+    let anthropic = matches!(u.wire, Some(beyond_ai::__test::route::Dialect::Anthropic));
     let prompt = if anthropic {
         u.input_tokens
             .saturating_add(u.cache_read_tokens)
@@ -757,7 +757,7 @@ pub fn edit_plan() -> impl Strategy<Value = EditPlan> {
 /// opaque edits between the clamp and the rename: those re-scan whatever they change, and
 /// `rewrite`'s own tests hold that re-scan to a fresh one.
 pub fn upstream(bytes: Vec<u8>, plan: &EditPlan) -> Vec<u8> {
-    let mut body = beyond_ai::ScannedBody::new(bytes).clamp_output_limits(plan.cap);
+    let mut body = beyond_ai::__test::ScannedBody::new(bytes).clamp_output_limits(plan.cap);
     if plan.rename {
         body = body.rename_max_tokens();
     }

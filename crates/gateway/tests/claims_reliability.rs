@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use beyond_ai::key::{VirtualKey, mint};
+use beyond_ai::__test::key::{VirtualKey, mint};
 use bytes::Bytes;
 use common::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

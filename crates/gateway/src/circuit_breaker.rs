@@ -42,7 +42,7 @@
 //! # Example
 //!
 //! ```rust
-//! use beyond_ai::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, FailurePolicy};
+//! # use beyond_ai::__bench::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 //! use std::time::Duration;
 //!
 //! // Consecutive failures (default)

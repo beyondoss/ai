@@ -9,7 +9,7 @@ mod common;
 
 use std::time::Duration;
 
-use beyond_ai::key::{VirtualKey, mint};
+use beyond_ai::__test::key::{VirtualKey, mint};
 use common::*;
 
 const BODY: &str = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;

@@ -10,7 +10,7 @@ mod common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use beyond_ai::key::{VirtualKey, mint};
+use beyond_ai::__test::key::{VirtualKey, mint};
 use common::*;
 
 const MODEL: &str = "gpt-4o-mini";

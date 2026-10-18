@@ -2878,9 +2878,10 @@ pub fn session_field_refusal(field: &str, model: &str) -> String {
 }
 
 /// Drop Responses-only session/control fields and reshape `input` onto Chat Completions
-/// `messages`. Used when a `store: false` one-shot is allowed to leave the Responses endpoint.
-/// Same-endpoint Responses must not call this — those fields pass through as a byte relay.
-pub fn responses_to_chat(body: &[u8]) -> Vec<u8> {
+/// `messages`: [`request`] for that one pairing, which the unit tests pin. Same-endpoint Responses
+/// must not reshape — those fields pass through as a byte relay.
+#[cfg(test)]
+fn responses_to_chat(body: &[u8]) -> Vec<u8> {
     request(Endpoint::Responses, Endpoint::ChatCompletions, body, "")
 }
 

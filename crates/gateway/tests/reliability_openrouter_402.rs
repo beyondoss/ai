@@ -8,7 +8,7 @@
 
 mod common;
 
-use beyond_ai::route::OPENROUTER_402_STRIKES;
+use beyond_ai::__test::route::OPENROUTER_402_STRIKES;
 use common::*;
 
 /// OpenRouter's answer on an account with no credit left.

@@ -7,7 +7,7 @@
 //! Do not fix anything here. A deliberate change of behaviour changes both sides in one commit.
 #![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
-use beyond_ai::peek;
+use beyond_ai::__test::peek;
 
 /// The old buffered path's edits, in its order, offsets adjusted by hand: the clamp, then (on a
 /// native OpenAI Chat attempt) the `max_tokens` rename, each re-scanning when it changed the body;

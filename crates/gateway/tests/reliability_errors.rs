@@ -9,7 +9,7 @@ mod common;
 
 use std::time::Duration;
 
-use beyond_ai::key::{VirtualKey, mint};
+use beyond_ai::__test::key::{VirtualKey, mint};
 use common::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
