@@ -452,6 +452,11 @@ async fn a_cache_hit_row_replays_the_fill_under_its_own_id() {
     }
     assert_eq!(h["usage_estimated"], false, "{h}");
     assert_ne!(h["request_id"], f["request_id"]);
+    // The hit names the fill's provider but called none, so no endpoint served it.
+    for field in ["upstream_model", "upstream_host", "upstream_path"] {
+        assert!(f.get(field).is_some(), "fill {field}:\n{f}");
+        assert!(h.get(field).is_none(), "hit {field}:\n{h}");
+    }
 }
 
 /// Server-sent text is not a protocol signal. An Anthropic stream cut short after the model wrote

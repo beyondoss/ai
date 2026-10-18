@@ -1369,6 +1369,24 @@ mod tests {
         assert_eq!(p.first_key(), 0, "the cooldown has passed");
     }
 
+    /// `bad_until_ms` is when the key has cooled off: it cools before that millisecond, not at it.
+    #[test]
+    fn a_key_has_cooled_off_at_its_bad_until() {
+        let p = Provider::resolve(
+            "openai",
+            "api.openai.com:443".to_string(),
+            Dialect::OpenAi,
+            AuthScheme::Bearer,
+            &["sk-a"],
+            ProviderMetrics::disconnected(),
+            None,
+        );
+        let key = &p.pool_auth[0];
+        key.bad_until_ms.store(100, Ordering::Relaxed);
+        assert!(key.cooling(99));
+        assert!(!key.cooling(100));
+    }
+
     fn openrouter(keys: &[&str]) -> Provider {
         Provider::resolve(
             "openrouter",

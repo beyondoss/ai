@@ -1995,6 +1995,10 @@ mod tests {
             // as the root's, so neither takes the next root string for a key.
             br#"{"a" {"b":1} "model":"x"}"#.to_vec(),
             br#"{"a" {"b":1} "stream":true}"#.to_vec(),
+            // Not JSON: no `,` after an empty nested object. Only the root `{` expects a key, so
+            // the root string after it is no key in any walk.
+            br#"{"a":{}"model":"x"}"#.to_vec(),
+            br#"{"a":{}"stream":true}"#.to_vec(),
             format!(r#"{{"messages":[{{"content":"{big}"}}],"stream":true,"model":"gpt-4o"}}"#)
                 .into_bytes(),
             format!(r#"{{"system":"{big} \"stream\":true","model":"x"}}"#).into_bytes(),
@@ -2465,6 +2469,13 @@ mod mutation_gaps {
                 body[at..].starts_with(br#"{"include_usage":false}"#),
                 "{at}"
             );
+        }
+        // A body cut off after the colon has no value to rewrite: no offset, not one past its end.
+        for body in [
+            &br#"{"stream":true,"stream_options":"#[..],
+            &br#"{"stream":true,"stream_options": "#[..],
+        ] {
+            assert_eq!(scan_buffered(body).stream_options_at, None);
         }
     }
 
