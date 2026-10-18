@@ -1917,13 +1917,18 @@ zero. The Responses stream envelope (`response.usage`) is not guarded: Anthropic
 carries it.
 
 A `usage` object that names no count in the wire's own spelling is **no usage**, never a zero, and
-never overrides an earlier real one (D287). On the OpenAI wire, `input_tokens` or `output_tokens`
-alone is not a count: Chat has neither and the Responses spelling always sends the pair. An
-Anthropic `message_delta` (`{"output_tokens":42}`) relayed there once read as Chat, billed 0/0, and,
-being newest, hid the real usage chunk before it from the newest-first stream scan. On the Anthropic
-wire, a `message_start` whose `usage` names no Anthropic count (`{}`, or Chat's
-`completion_tokens` alone) is skipped instead of assigning zeros over the input and cache counts a
-real one set. Both checks are `Option` tests on the already-deserialized struct.
+never overrides an earlier real one (D287). On the OpenAI wire a count is `prompt_tokens`,
+`completion_tokens`, or the Responses pair `input_tokens` + `output_tokens` together, top-level or
+in the `response.usage` envelope. Chat has neither half of the pair and Responses always sends
+both, so a lone one is foreign. `total_tokens` and the cache counts qualify a count but name
+neither side, so alone they are no usage either. An Anthropic `message_delta`
+(`{"output_tokens":42}`) relayed there once read as Chat, billed 0/0, and, being newest, hid the
+real usage chunk before it from the newest-first stream scan. On the Anthropic wire, a
+`message_start` that names no `input_tokens` (`{}`, Chat's `completion_tokens`, a lone output or
+cache count) assigns no input or cache count, so it can't zero what a real one set; its server
+tool counts still merge, as a `message_delta`'s do. The rule can let an earlier line win over a
+lone later one: that under-counts, never over-bills. Every check is an `Option` test on the
+already-deserialized struct.
 
 ### Streams cut short (`usage.rs` estimates)
 
