@@ -14,6 +14,11 @@
           "task": "C3"
         },
         {
+          "kind": "conformance",
+          "name": "a kept job survives idling",
+          "task": "C3"
+        },
+        {
           "kind": "fixture",
           "name": "v1.4-probe.json"
         }
@@ -425,43 +430,13 @@
       "checks": [
         {
           "kind": "test",
-          "name": "job_ledger::survives_compaction_and_takeover",
-          "task": "B3"
-        }
-      ]
-    },
-    {
-      "id": "N36",
-      "checks": [
-        {
-          "kind": "test",
-          "name": "job_ledger::reported_with_the_notice",
-          "task": "B3"
-        }
-      ]
-    },
-    {
-      "id": "N37",
-      "checks": [
-        {
-          "kind": "test",
-          "name": "job_ledger::reopen_reports_each_end_once",
-          "task": "B3"
-        }
-      ]
-    },
-    {
-      "id": "N38",
-      "checks": [
-        {
-          "kind": "test",
           "name": "job_notify::release_waits_for_the_first_callback",
           "task": "B4"
         }
       ]
     },
     {
-      "id": "N39",
+      "id": "N36",
       "checks": [
         {
           "kind": "test",
@@ -471,7 +446,7 @@
       ]
     },
     {
-      "id": "N40",
+      "id": "N37",
       "checks": [
         {
           "kind": "test",
@@ -481,7 +456,7 @@
       ]
     },
     {
-      "id": "N41",
+      "id": "N38",
       "checks": [
         {
           "kind": "test",
@@ -496,7 +471,7 @@
       ]
     },
     {
-      "id": "N42",
+      "id": "N39",
       "checks": [
         {
           "kind": "test",
@@ -511,12 +486,45 @@
       ]
     },
     {
-      "id": "N43",
+      "id": "N40",
       "checks": [
         {
           "kind": "test",
           "name": "job_notify::no_idle_connection_to_the_endpoint",
           "task": "B4"
+        }
+      ]
+    },
+    {
+      "id": "N41",
+      "checks": [
+        {
+          "kind": "fixture",
+          "name": "v1.4-token.json"
+        }
+      ]
+    },
+    {
+      "id": "N42",
+      "checks": [
+        {
+          "kind": "test",
+          "name": "job_notify::takeover_proves_again",
+          "task": "B4"
+        },
+        {
+          "kind": "test",
+          "name": "job_notify::a_live_reconcile_never_keeps",
+          "task": "B4"
+        }
+      ]
+    },
+    {
+      "id": "N43",
+      "checks": [
+        {
+          "kind": "fixture",
+          "name": "v1.4-token.json"
         }
       ]
     },
@@ -534,39 +542,6 @@
       "checks": [
         {
           "kind": "test",
-          "name": "job_notify::takeover_proves_again",
-          "task": "B4"
-        },
-        {
-          "kind": "test",
-          "name": "job_notify::a_live_reconcile_never_keeps",
-          "task": "B4"
-        }
-      ]
-    },
-    {
-      "id": "N46",
-      "checks": [
-        {
-          "kind": "fixture",
-          "name": "v1.4-token.json"
-        }
-      ]
-    },
-    {
-      "id": "N47",
-      "checks": [
-        {
-          "kind": "fixture",
-          "name": "v1.4-token.json"
-        }
-      ]
-    },
-    {
-      "id": "N48",
-      "checks": [
-        {
-          "kind": "test",
           "name": "notify_token::the_tag_is_compared_in_constant_time",
           "task": "B1"
         },
@@ -577,7 +552,7 @@
       ]
     },
     {
-      "id": "N49",
+      "id": "N46",
       "checks": [
         {
           "kind": "fixture",
@@ -591,7 +566,7 @@
       ]
     },
     {
-      "id": "N50",
+      "id": "N47",
       "checks": [
         {
           "kind": "fixture",

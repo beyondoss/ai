@@ -1,7 +1,7 @@
 {
   "spec": "exec protocol v1.4 sandbox job notify (crates/agent/src/exec_endpoint.rs, \"Sandbox job notify (v1.4)\"), \"Adoption\"",
   "notes": [
-    "answers: the body an endpoint returns to the v1.3 probe (sh -c 'printf exec-v1.2' carrying \"job\": {\"op\": \"probe\"}), and what a conforming client reads from it: native_jobs (v1.3) and notify (v1.4)."
+    "answers: the body an endpoint returns to the v1.3 probe (sh -c 'printf exec-v1.2' carrying \"job\": {\"op\": \"probe\"}), and what a conforming client reads from it: native_jobs (v1.3), notify (v1.4, natively) and baseline_notify (v1.4 for the baseline, which N3 further requires curl and stdin_base64 for). An endpoint advertises notify only when its deployment says a kept job survives its sandbox going idle (N1)."
   ],
   "answers": [
     {
@@ -12,7 +12,8 @@
       },
       "expect": {
         "native_jobs": true,
-        "notify": true
+        "notify": true,
+        "baseline_notify": false
       },
       "covers": [
         "N1",
@@ -28,7 +29,8 @@
       },
       "expect": {
         "native_jobs": true,
-        "notify": true
+        "notify": true,
+        "baseline_notify": false
       },
       "covers": [
         "N2"
@@ -41,7 +43,8 @@
       },
       "expect": {
         "native_jobs": true,
-        "notify": false
+        "notify": false,
+        "baseline_notify": false
       },
       "covers": [
         "N2"
@@ -55,7 +58,8 @@
       },
       "expect": {
         "native_jobs": false,
-        "notify": false
+        "notify": false,
+        "baseline_notify": false
       },
       "covers": [
         "N1",
@@ -70,7 +74,8 @@
       },
       "expect": {
         "native_jobs": true,
-        "notify": false
+        "notify": false,
+        "baseline_notify": false
       },
       "covers": [
         "N2"
@@ -84,22 +89,25 @@
       },
       "expect": {
         "native_jobs": true,
-        "notify": false
+        "notify": false,
+        "baseline_notify": false
       },
       "covers": [
         "N2"
       ]
     },
     {
-      "name": "notify without native jobs",
+      "name": "notify without native jobs: for the baseline",
       "answer": {
         "notify": "v1.4"
       },
       "expect": {
         "native_jobs": false,
-        "notify": false
+        "notify": false,
+        "baseline_notify": true
       },
       "covers": [
+        "N1",
         "N2"
       ]
     },
@@ -112,7 +120,52 @@
       },
       "expect": {
         "native_jobs": false,
-        "notify": false
+        "notify": false,
+        "baseline_notify": false
+      },
+      "covers": [
+        "N2"
+      ]
+    },
+    {
+      "name": "notify for the baseline with an unknown field",
+      "answer": {
+        "notify": "v1.4",
+        "seq": 1
+      },
+      "expect": {
+        "native_jobs": false,
+        "notify": false,
+        "baseline_notify": true
+      },
+      "covers": [
+        "N2"
+      ]
+    },
+    {
+      "name": "jobs of another version beside notify: neither",
+      "answer": {
+        "jobs": "v1.2",
+        "notify": "v1.4"
+      },
+      "expect": {
+        "native_jobs": false,
+        "notify": false,
+        "baseline_notify": false
+      },
+      "covers": [
+        "N2"
+      ]
+    },
+    {
+      "name": "a later notify version for the baseline",
+      "answer": {
+        "notify": "v1.5"
+      },
+      "expect": {
+        "native_jobs": false,
+        "notify": false,
+        "baseline_notify": false
       },
       "covers": [
         "N2"

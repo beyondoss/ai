@@ -70,7 +70,10 @@ struct ProbeCase {
 #[serde(deny_unknown_fields)]
 struct ProbeExpect {
     native_jobs: bool,
+    /// Notify offered natively.
     notify: bool,
+    /// Notify offered for the baseline.
+    baseline_notify: bool,
 }
 
 #[derive(Deserialize)]
@@ -579,9 +582,11 @@ fn probe_answers_mean_what_the_spec_says() {
     for case in probe().answers {
         let jobs = case.answer.get("jobs").and_then(Value::as_str);
         let native = jobs == Some("v1.3");
-        let notify = native && case.answer.get("notify").and_then(Value::as_str) == Some("v1.4");
+        let v14 = case.answer.get("notify").and_then(Value::as_str) == Some("v1.4");
+        let baseline = case.answer.get("jobs").is_none() && v14;
         assert_eq!(case.expect.native_jobs, native, "{}", case.name);
-        assert_eq!(case.expect.notify, notify, "{}", case.name);
+        assert_eq!(case.expect.notify, native && v14, "{}", case.name);
+        assert_eq!(case.expect.baseline_notify, baseline, "{}", case.name);
     }
 }
 
@@ -814,7 +819,7 @@ fn reference_receiver(keys: &[([u8; 32], String)], case: &ReceiverCase) -> Recei
     match st.job {
         Tracking::Held | Tracking::EndRecorded => answer(true, false, Effect::None),
         Tracking::Untracked => refuse(410),
-        // The release row (N38): it waits for no list; the release starts a live reconcile.
+        // The release row (N35): it waits for no list; the release starts a live reconcile.
         Tracking::Proving if st.in_window && st.keep_succeeded => {
             answer(true, false, Effect::Release)
         }
@@ -960,7 +965,7 @@ fn mac_input(
 }
 
 /// The spec's verifier, written from the spec alone: the reference the vectors are held to.
-/// N46: the kid and the tag of a token that is exactly the grammar, else `None` (malformed).
+/// N43: the kid and the tag of a token that is exactly the grammar, else `None` (malformed).
 fn parse_token(token: &str) -> Option<(&str, Vec<u8>)> {
     let parts: Vec<&str> = token.split('.').collect();
     let [prefix, kid, mac] = parts.as_slice() else {

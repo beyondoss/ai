@@ -2572,13 +2572,24 @@ non-destructive _live reconcile_ (`list` only, acting on released jobs). Any oth
 listener", and a session that is not open learns of its jobs' ends when it next opens, as today.
 After release nothing contacts the sandbox in the background: an end no callback delivers (a dead
 sandbox, a broken path) is noticed at the session's next real use of the sandbox, a `bash_job`
-call or the next open, which is the one accepted difference from today. A _job ledger_, entries in
-the transcript's own fenced segment batch, keeps a crash from reporting an end twice. FLEET.md's "Job-end callbacks" is the edge's half. Nothing in the
+call or the next open, which is the one accepted difference from today. It opens no new window for
+a duplicate or lost report: across a crash it has exactly today's (below). FLEET.md's "Job-end callbacks" is the edge's half. Nothing in the
 code implements it yet: every replica holds its streams as described above. The vectors
 are `tests/fixtures/exec/v1.4-*.json`, and `tests/exec_notify_vectors.rs` loads each into a strict
 schema, recomputes what follows from its inputs (the token vectors under a reference verifier, the
 retry timelines), and fails when a tagged requirement names no check (`v1.4-checks.json` lists
 each one, with the task that writes it).
+
+**Known gap: a crash can report a sandbox job's end twice.** This is today's behaviour for every
+kept job, held stream or not, and not part of v1.4. A job's end is reported in a turn (a wake turn,
+or the run its notice joined), and its record in the sandbox is deleted afterwards, at the top of
+`serve`'s loop (`BashJobs::collect_garbage`), once that turn is persisted. A replica that dies
+between the two leaves the record, and the next owner's open reconcile reports the end again. The
+fix is its own change: a ledger of reported ends kept as entries in the transcript's segment log,
+appended in the same batch as the message that carries the end (the only unit the store commits
+atomically and fences against a superseded owner, so never a side file), carried into every new
+base, dropped by `reset_for_new_session`, and consulted by the open reconcile, which then removes
+the record without reporting it again.
 
 Tests: `tests/sandbox_jobs.rs` runs every operation over this host's `sh`, the v1.2 mock, the v1.1
 mock, a template transport whose far side lives in its own session, and the v1.3 mock natively
