@@ -1,7 +1,8 @@
 {
   "spec": "exec protocol v1.4 sandbox job notify (crates/agent/src/exec_endpoint.rs, \"Sandbox job notify (v1.4)\"), \"keep with notify\"",
   "notes": [
-    "cases: the notify member of one keep request (the rest of the request is template), and whether a conforming endpoint accepts it. Refused: the answer is 400 and nothing is recorded, so a list afterwards reports the job exactly as before (not kept, no notify). refusal names the rule broken, for a human reading a failure."
+    "cases: the notify member of one keep request (the rest of the request is template), and whether a conforming endpoint accepts it. Refused: the answer is 400 and nothing is recorded, so a list afterwards reports the job exactly as before (not kept, no notify). refusal names the rule broken, for a human reading a failure.",
+    "The url's query is the replica's business: the endpoint checks only N4's grammar, and the replica's own url (the first case) names the tenant and carries the keep's generation."
   ],
   "template": {
     "command": "true",
@@ -20,7 +21,7 @@
     {
       "name": "https, as the replica sends it",
       "notify": {
-        "url": "https://edge.example/_beyond/agent?session_id=a07-s3.01J9ZQ4N6V",
+        "url": "https://edge.example/_beyond/agent?session_id=a07-s3.01J9ZQ4N6V&tenant=acme&keep=5be0c2a19f3d7e41",
         "token": "bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
       },
       "expect": {

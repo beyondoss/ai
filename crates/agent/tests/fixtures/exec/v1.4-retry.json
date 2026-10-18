@@ -3,230 +3,259 @@
   "notes": [
     "statuses: the endpoint's action on each answer to an attempt: done and stop end the notification, retry waits per the schedule. connection_error, tls_error and timeout (no complete answer in 30 s) are attempts without a status.",
     "schedule: the wait after failed attempt n is d(n) * (1 - u/2) with d(n) = min(2^(n-1), 60) s and u uniform in [0, 1); waits_max is u = 0, waits_min the limit as u approaches 1.",
-    "timelines: outcomes[i] is attempt i+1's answer and how long it took (the last entry repeats); u[i] is the draw for the wait after attempt i+1. expect lists each attempt's start (seconds after the first began), the result (done, stop, or exhausted after 12 attempts) and when the notification ended."
+    "timelines: outcomes[i] is attempt i+1's answer and how long it took (the last entry repeats); u[i] is the draw for the wait after attempt i+1. expect lists each attempt's start (seconds after the first began), the result (done, stop, or exhausted after 12 attempts) and when the notification ended.",
+    "407, 408 and 425 are retried: a proxy, a slow link or an early-data refusal is a fault of the moment. 401, 403, 404 and 410 stop, and the fleet answers none of them for a fault of its own."
   ],
   "statuses": [
+    {
+      "answer": 100,
+      "action": "stop",
+      "covers": [
+        "N23"
+      ]
+    },
     {
       "answer": 200,
       "action": "done",
       "covers": [
-        "N18"
+        "N23"
       ]
     },
     {
       "answer": 201,
       "action": "done",
       "covers": [
-        "N18"
+        "N23"
       ]
     },
     {
       "answer": 202,
       "action": "done",
       "covers": [
-        "N18"
+        "N23"
       ]
     },
     {
       "answer": 204,
       "action": "done",
       "covers": [
-        "N18"
+        "N23"
       ]
     },
     {
       "answer": 299,
       "action": "done",
       "covers": [
-        "N18"
-      ]
-    },
-    {
-      "answer": 401,
-      "action": "stop",
-      "covers": [
-        "N18"
-      ]
-    },
-    {
-      "answer": 403,
-      "action": "stop",
-      "covers": [
-        "N18"
-      ]
-    },
-    {
-      "answer": 404,
-      "action": "stop",
-      "covers": [
-        "N18"
-      ]
-    },
-    {
-      "answer": 410,
-      "action": "stop",
-      "covers": [
-        "N18"
-      ]
-    },
-    {
-      "answer": 429,
-      "action": "retry",
-      "covers": [
-        "N18"
-      ]
-    },
-    {
-      "answer": 500,
-      "action": "retry",
-      "covers": [
-        "N18"
-      ]
-    },
-    {
-      "answer": 502,
-      "action": "retry",
-      "covers": [
-        "N18"
-      ]
-    },
-    {
-      "answer": 503,
-      "action": "retry",
-      "covers": [
-        "N18"
-      ]
-    },
-    {
-      "answer": 504,
-      "action": "retry",
-      "covers": [
-        "N18"
-      ]
-    },
-    {
-      "answer": 599,
-      "action": "retry",
-      "covers": [
-        "N18"
-      ]
-    },
-    {
-      "answer": 100,
-      "action": "stop",
-      "covers": [
-        "N18"
+        "N23"
       ]
     },
     {
       "answer": 301,
       "action": "stop",
       "covers": [
-        "N18",
-        "N14"
+        "N23",
+        "N19"
       ]
     },
     {
       "answer": 302,
       "action": "stop",
       "covers": [
-        "N18",
-        "N14"
+        "N23",
+        "N19"
       ]
     },
     {
       "answer": 307,
       "action": "stop",
       "covers": [
-        "N18",
-        "N14"
+        "N23",
+        "N19"
       ]
     },
     {
       "answer": 308,
       "action": "stop",
       "covers": [
-        "N18",
-        "N14"
+        "N23",
+        "N19"
       ]
     },
     {
       "answer": 400,
       "action": "stop",
       "covers": [
-        "N18"
+        "N23"
+      ]
+    },
+    {
+      "answer": 401,
+      "action": "stop",
+      "covers": [
+        "N23"
       ]
     },
     {
       "answer": 402,
       "action": "stop",
       "covers": [
-        "N18"
+        "N23"
+      ]
+    },
+    {
+      "answer": 403,
+      "action": "stop",
+      "covers": [
+        "N23"
+      ]
+    },
+    {
+      "answer": 404,
+      "action": "stop",
+      "covers": [
+        "N23"
       ]
     },
     {
       "answer": 405,
       "action": "stop",
       "covers": [
-        "N18"
+        "N23"
+      ]
+    },
+    {
+      "answer": 407,
+      "action": "retry",
+      "covers": [
+        "N23"
+      ]
+    },
+    {
+      "answer": 408,
+      "action": "retry",
+      "covers": [
+        "N23"
       ]
     },
     {
       "answer": 409,
       "action": "stop",
       "covers": [
-        "N18"
+        "N23"
+      ]
+    },
+    {
+      "answer": 410,
+      "action": "stop",
+      "covers": [
+        "N23"
+      ]
+    },
+    {
+      "answer": 411,
+      "action": "stop",
+      "covers": [
+        "N23"
       ]
     },
     {
       "answer": 413,
       "action": "stop",
       "covers": [
-        "N18"
+        "N23"
       ]
     },
     {
       "answer": 415,
       "action": "stop",
       "covers": [
-        "N18"
+        "N23"
       ]
     },
     {
       "answer": 421,
       "action": "stop",
       "covers": [
-        "N18"
+        "N23"
       ]
     },
     {
       "answer": 422,
       "action": "stop",
       "covers": [
-        "N18"
+        "N23"
+      ]
+    },
+    {
+      "answer": 425,
+      "action": "retry",
+      "covers": [
+        "N23"
+      ]
+    },
+    {
+      "answer": 429,
+      "action": "retry",
+      "covers": [
+        "N23"
+      ]
+    },
+    {
+      "answer": 500,
+      "action": "retry",
+      "covers": [
+        "N23"
+      ]
+    },
+    {
+      "answer": 502,
+      "action": "retry",
+      "covers": [
+        "N23"
+      ]
+    },
+    {
+      "answer": 503,
+      "action": "retry",
+      "covers": [
+        "N23"
+      ]
+    },
+    {
+      "answer": 504,
+      "action": "retry",
+      "covers": [
+        "N23"
+      ]
+    },
+    {
+      "answer": 599,
+      "action": "retry",
+      "covers": [
+        "N23"
       ]
     },
     {
       "answer": "connection_error",
       "action": "retry",
       "covers": [
-        "N18"
+        "N23"
       ]
     },
     {
       "answer": "tls_error",
       "action": "retry",
       "covers": [
-        "N18",
-        "N15"
+        "N23",
+        "N20"
       ]
     },
     {
       "answer": "timeout",
       "action": "retry",
       "covers": [
-        "N18",
-        "N16"
+        "N23",
+        "N21"
       ]
     }
   ],
@@ -267,7 +296,7 @@
     },
     "max_total_s": 723,
     "covers": [
-      "N19"
+      "N24"
     ]
   },
   "timelines": [
@@ -322,8 +351,8 @@
         "ends_at_s": 2.8
       },
       "covers": [
-        "N18",
-        "N19"
+        "N23",
+        "N24"
       ]
     },
     {
@@ -359,7 +388,7 @@
         "ends_at_s": 0.05
       },
       "covers": [
-        "N18"
+        "N23"
       ]
     },
     {
@@ -395,8 +424,8 @@
         "ends_at_s": 0.05
       },
       "covers": [
-        "N14",
-        "N18"
+        "N19",
+        "N23"
       ]
     },
     {
@@ -450,8 +479,8 @@
         "ends_at_s": 2.425
       },
       "covers": [
-        "N18",
-        "N19"
+        "N23",
+        "N24"
       ]
     },
     {
@@ -542,7 +571,7 @@
         "ends_at_s": 363.0
       },
       "covers": [
-        "N19"
+        "N24"
       ]
     },
     {
@@ -633,7 +662,7 @@
         "ends_at_s": 181.500182
       },
       "covers": [
-        "N19"
+        "N24"
       ]
     },
     {
@@ -724,8 +753,8 @@
         "ends_at_s": 632.25
       },
       "covers": [
-        "N16",
-        "N19"
+        "N21",
+        "N24"
       ]
     },
     {
@@ -770,8 +799,8 @@
         "ends_at_s": 1.07
       },
       "covers": [
-        "N15",
-        "N18"
+        "N20",
+        "N23"
       ]
     }
   ]

@@ -107,8 +107,9 @@ struct CallbackFile {
     notes: Vec<String>,
     keep: CallbackKeep,
     requests: Vec<CallbackRequest>,
-    grant: Grant,
+    url_session: UrlSession,
     receiver: Vec<ReceiverCase>,
+    edge: Vec<EdgeCase>,
 }
 
 #[derive(Deserialize)]
@@ -135,7 +136,8 @@ struct CallbackRequest {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Grant {
+/// The tenant and session id the callback's url names.
+struct UrlSession {
     tenant: String,
     session_id: String,
 }
@@ -154,25 +156,37 @@ struct ReceiverCase {
 #[serde(deny_unknown_fields)]
 struct ReceiverRequest {
     method: String,
-    authorization: Option<String>,
+    authorization: Vec<String>,
     body: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReceiverState {
+    service_mode: bool,
     notify_key: bool,
-    session_exists: bool,
+    /// A session task in this process holds the URL's session for the URL's tenant.
+    open_here: bool,
     job: JobState,
     reconcile: Reconcile,
+    run_in_flight: bool,
 }
 
 #[derive(Deserialize, PartialEq, Eq, Clone, Copy, Debug)]
 #[serde(rename_all = "snake_case")]
 enum JobState {
-    Running,
-    RecordedEnded,
-    Absent,
+    /// Tracked as released, and still running in the sandbox.
+    Released,
+    /// Ended in the sandbox, its end not yet recorded by the session.
+    EndedUnreported,
+    /// The session holds its stream, and the callback is not its proof.
+    Held,
+    /// The session has recorded its end.
+    EndReported,
+    /// The session's open reconcile has not run yet.
+    OpenReconcilePending,
+    /// The session neither tracks it nor has recorded its end.
+    Untracked,
 }
 
 #[derive(Deserialize, PartialEq, Eq, Clone, Copy, Debug)]
@@ -186,8 +200,35 @@ enum Reconcile {
 #[serde(deny_unknown_fields)]
 struct ReceiverExpect {
     status: u16,
-    opens_session: bool,
+    /// A `200`'s `data.listener`: whether a session task in this process took the callback.
+    listener: Option<bool>,
     contacts_sandbox: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EdgeCase {
+    name: String,
+    method: String,
+    path: String,
+    authorization: Vec<String>,
+    expect: EdgeExpect,
+    covers: Vec<String>,
+}
+
+#[derive(Deserialize, PartialEq, Eq, Debug)]
+#[serde(deny_unknown_fields)]
+struct EdgeExpect {
+    class: EdgeClass,
+    status: Option<u16>,
+}
+
+#[derive(Deserialize, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+enum EdgeClass {
+    Callback,
+    User,
+    Refused,
 }
 
 #[derive(Deserialize)]
@@ -433,7 +474,7 @@ fn every_v14_fixture_loads_into_its_schema() {
             "callback",
             &c.spec,
             &c.notes,
-            c.receiver.len() + c.requests.len(),
+            c.receiver.len() + c.requests.len() + c.edge.len(),
         ),
         ("token", &t.spec, &t.notes, t.vectors.len()),
         (
@@ -456,6 +497,7 @@ fn every_v14_fixture_loads_into_its_schema() {
         .chain(k.cases.iter().map(|x| &x.covers))
         .chain(c.requests.iter().map(|x| &x.covers))
         .chain(c.receiver.iter().map(|x| &x.covers))
+        .chain(c.edge.iter().map(|x| &x.covers))
         .chain(t.vectors.iter().map(|x| &x.covers))
         .chain(r.statuses.iter().map(|x| &x.covers))
         .chain(r.timelines.iter().map(|x| &x.covers));
@@ -553,8 +595,15 @@ fn the_callback_body_is_exactly_type_scope_and_id() {
     );
     assert_eq!(
         c.keep.scope,
-        scope_of(&c.grant.tenant, &c.grant.session_id),
-        "the keep's scope is the grant's session's"
+        scope_of(&c.url_session.tenant, &c.url_session.session_id),
+        "the keep's scope is the url's session's"
+    );
+    assert!(
+        c.keep.url.contains(&format!(
+            "session_id={}&tenant={}&keep=",
+            c.url_session.session_id, c.url_session.tenant
+        )),
+        "the url names the session and the tenant, then the generation"
     );
     for r in &c.requests {
         assert_eq!(r.method, "POST", "{}", r.name);
@@ -571,35 +620,193 @@ fn the_callback_body_is_exactly_type_scope_and_id() {
         );
         assert_eq!(r.forbidden_headers, ["Cookie"]);
     }
-    // A refusal before the session is reached never opens it or contacts the sandbox, and only
-    // 200, 410 and 503 come from past that point.
+}
+
+// ---- the receiver and the edge, from the spec's own rules
+
+/// A header value as N28 reads it: leading and trailing spaces and tabs removed.
+fn ows(v: &str) -> &str {
+    v.trim_matches([' ', '\t'])
+}
+
+/// N28's first rule: exactly one `Authorization` header, `Bearer` in any case, one or more spaces,
+/// then `bjn_v1.`. The token, when the request is a callback.
+fn callback_token(auth: &[String]) -> Option<&str> {
+    let [one] = auth else { return None };
+    let v = ows(one);
+    let scheme = v.get(..6)?;
+    let rest = &v[6..];
+    if !scheme.eq_ignore_ascii_case("bearer") || !rest.starts_with(' ') {
+        return None;
+    }
+    let token = rest.trim_start_matches(' ');
+    token.starts_with("bjn_v1.").then_some(token)
+}
+
+/// N28's second rule: any `Authorization` value that is `bearer` in any case, any run of spaces and
+/// tabs, then `bjn_v1.`.
+fn looks_like_callback(auth: &[String]) -> bool {
+    auth.iter().any(|v| {
+        let v = ows(v);
+        v.get(..6).is_some_and(|s| s.eq_ignore_ascii_case("bearer"))
+            && v[6..]
+                .trim_start_matches([' ', '\t'])
+                .starts_with("bjn_v1.")
+    })
+}
+
+/// A v1.3 job id: lowercase hex, 1 to 32 characters.
+fn is_job_id(id: &str) -> bool {
+    (1..=32).contains(&id.len()) && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The receiver of N30, step by step, then N31, N38 and N40 for a callback that passes them all:
+/// the status, a `200`'s `data.listener`, and whether the sandbox is contacted. Nothing here can
+/// open a session, because a callback never does (N31).
+fn reference_receiver(
+    keys: &[([u8; 32], String)],
+    session: &UrlSession,
+    case: &ReceiverCase,
+) -> (u16, Option<bool>, bool) {
+    let rq = &case.request;
+    let st = &case.state;
+    let refuse = |status| (status, None, false);
+    // N28: what is a callback; a look-alike is refused, and job_ended outside a callback too (N29).
+    let Some(token) = callback_token(&rq.authorization) else {
+        return refuse(if looks_like_callback(&rq.authorization) {
+            400
+        } else {
+            403
+        });
+    };
+    // Step 1.
+    if rq.method != "POST" {
+        return refuse(403);
+    }
+    // Step 3 (the url, step 2, is the fixture's own and well formed).
+    if rq.body.len() > 4096 {
+        return refuse(413);
+    }
+    let Ok(Value::Object(body)) = serde_json::from_str::<Value>(&rq.body) else {
+        return refuse(400);
+    };
+    if body.get("type").and_then(Value::as_str) != Some("job_ended") {
+        return refuse(403);
+    }
+    let (Some(scope), Some(id)) = (
+        body.get("scope").and_then(Value::as_str),
+        body.get("id").and_then(Value::as_str),
+    ) else {
+        return refuse(400);
+    };
+    if body.len() != 3 || !is_job_id(id) || scope.len() > 64 {
+        return refuse(400);
+    }
+    // Step 4.
+    if !st.service_mode {
+        return refuse(403);
+    }
+    if !st.notify_key {
+        return refuse(503);
+    }
+    // Step 5.
+    let cx = Context {
+        tenant: session.tenant.clone(),
+        session_id: session.session_id.clone(),
+        scope: scope.to_string(),
+        id: id.to_string(),
+    };
+    match reference_verify(keys, token, &cx) {
+        Verdict::Valid => {}
+        Verdict::Malformed | Verdict::BadMac => return refuse(401),
+        Verdict::UnknownKid => return refuse(503),
+    }
+    // Step 6.
+    if scope != scope_of(&session.tenant, &session.session_id) {
+        return refuse(403);
+    }
+    // N31: nobody here holds the session, so nothing happens.
+    if !st.open_here {
+        return (200, Some(false), false);
+    }
+    match st.job {
+        JobState::EndReported | JobState::Held | JobState::OpenReconcilePending => {
+            (200, Some(true), false)
+        }
+        JobState::Untracked => (410, None, false),
+        JobState::Released | JobState::EndedUnreported => match st.reconcile {
+            Reconcile::Ok => (200, Some(true), true),
+            Reconcile::Fails => (503, None, true),
+        },
+    }
+}
+
+#[test]
+fn receiver_cases_follow_from_the_spec() {
+    let c = callback();
+    let keys = verifier_keys(&token());
+    let mut statuses = BTreeSet::new();
     for case in &c.receiver {
         let e = &case.expect;
-        let past_checks = matches!(e.status, 200 | 410 | 503);
-        assert_eq!(e.opens_session, past_checks, "{}", case.name);
-        if !past_checks {
-            assert!(!e.contacts_sandbox, "{}", case.name);
+        assert_eq!(
+            reference_receiver(&keys, &c.url_session, case),
+            (e.status, e.listener, e.contacts_sandbox),
+            "{}",
+            case.name
+        );
+        if case.state.run_in_flight {
+            assert_eq!(e.status, 200, "{}: served during a run", case.name);
         }
-        if e.status == 200 && case.state.job == JobState::RecordedEnded {
-            assert!(!e.contacts_sandbox, "{}: a repeat is free", case.name);
-        }
-        assert!(matches!(case.request.method.as_str(), "POST" | "GET"));
-        // Each state that decides the answer by itself does.
-        if !case.state.notify_key {
-            assert_eq!(e.status, 401, "{}: no notify key", case.name);
-        }
-        if !case.state.session_exists {
-            assert_eq!(e.status, 404, "{}: no session", case.name);
-        }
-        if case.state.reconcile == Reconcile::Fails {
-            assert_eq!(e.status, 503, "{}: no reconcile", case.name);
-        }
-        if case.request.authorization.is_none() {
-            assert_eq!(e.status, 403, "{}: a grant alone", case.name);
-        }
-        if case.request.body.len() > 4096 {
-            assert_eq!(e.status, 413, "{}: an oversized body", case.name);
-        }
+        statuses.insert(e.status);
+    }
+    for want in [200, 400, 401, 403, 410, 413, 503] {
+        assert!(statuses.contains(&want), "no receiver case answers {want}");
+    }
+    assert!(
+        c.receiver.iter().any(|x| x.expect.listener == Some(false)),
+        "a case where no session here takes the callback"
+    );
+}
+
+/// E1, with N28's rules: how the edge treats a request by its `Authorization` values. It checks
+/// nothing else about a callback (E2).
+fn reference_edge(case: &EdgeCase) -> EdgeExpect {
+    let refused = |status| EdgeExpect {
+        class: EdgeClass::Refused,
+        status: Some(status),
+    };
+    if !looks_like_callback(&case.authorization) {
+        return EdgeExpect {
+            class: EdgeClass::User,
+            status: None,
+        };
+    }
+    if callback_token(&case.authorization).is_none() {
+        return refused(400);
+    }
+    if case.method != "POST" || case.path != "/_beyond/agent" {
+        return refused(403);
+    }
+    EdgeExpect {
+        class: EdgeClass::Callback,
+        status: None,
+    }
+}
+
+#[test]
+fn edge_cases_follow_from_the_spec() {
+    let c = callback();
+    let mut classes = BTreeSet::new();
+    for case in &c.edge {
+        assert_eq!(reference_edge(case), case.expect, "{}", case.name);
+        classes.insert(case.expect.class);
+    }
+    assert_eq!(classes.len(), 3, "every class has a case");
+    // A callback request the edge would forward is one the replica reads a token from: the two
+    // classify with the same rule, so they never disagree on bytes the edge passed on unchanged.
+    for r in &c.requests {
+        let auth = [r.headers["Authorization"].clone()];
+        assert!(looks_like_callback(&auth) && callback_token(&auth).is_some());
     }
 }
 
@@ -648,10 +855,11 @@ fn mac_input(
 }
 
 /// The spec's verifier, written from the spec alone: the reference the vectors are held to.
-fn reference_verify(keys: &[([u8; 32], String)], token: &str, cx: &Context) -> Verdict {
+/// N58: the kid and the tag of a token that is exactly the grammar, else `None` (malformed).
+fn parse_token(token: &str) -> Option<(&str, Vec<u8>)> {
     let parts: Vec<&str> = token.split('.').collect();
     let [prefix, kid, mac] = parts.as_slice() else {
-        return Verdict::Malformed;
+        return None;
     };
     let hex_kid = kid.len() == 8 && kid.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     let b64url = mac.len() == 43
@@ -659,14 +867,24 @@ fn reference_verify(keys: &[([u8; 32], String)], token: &str, cx: &Context) -> V
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
     if *prefix != "bjn_v1" || !hex_kid || !b64url {
-        return Verdict::Malformed;
+        return None;
     }
-    let Ok(tag) = URL_SAFE_NO_PAD.decode(mac) else {
+    let tag = URL_SAFE_NO_PAD.decode(mac).ok()?;
+    (tag.len() == 32 && URL_SAFE_NO_PAD.encode(&tag) == *mac).then_some((kid, tag))
+}
+
+/// The verifier's keys, as `v1.4-token.json`'s `verifier_keys` names them.
+fn verifier_keys(t: &TokenFile) -> Vec<([u8; 32], String)> {
+    t.verifier_keys
+        .iter()
+        .map(|n| derive(&STANDARD.decode(&t.secrets[n]).unwrap()))
+        .collect()
+}
+
+fn reference_verify(keys: &[([u8; 32], String)], token: &str, cx: &Context) -> Verdict {
+    let Some((kid, tag)) = parse_token(token) else {
         return Verdict::Malformed;
     };
-    if tag.len() != 32 || URL_SAFE_NO_PAD.encode(&tag) != *mac {
-        return Verdict::Malformed;
-    }
     let candidates: Vec<&[u8; 32]> = keys
         .iter()
         .filter(|(_, k)| k == kid)
@@ -759,7 +977,8 @@ fn action(a: Answer) -> Action {
         Answer::Failure(_) => Action::Retry,
         Answer::Status(s) if (200..300).contains(&s) => Action::Done,
         Answer::Status(401 | 403 | 404 | 410) => Action::Stop,
-        Answer::Status(s) if s == 429 || (500..600).contains(&s) => Action::Retry,
+        Answer::Status(407 | 408 | 425 | 429) => Action::Retry,
+        Answer::Status(s) if (500..600).contains(&s) => Action::Retry,
         Answer::Status(_) => Action::Stop,
     }
 }
