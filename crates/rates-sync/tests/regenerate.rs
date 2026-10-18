@@ -141,6 +141,42 @@ fn readers_fail_loudly_on_layout_changes() {
     );
 }
 
+/// Anthropic's fast mode table as served on 2026-10-18: the cells name the currency
+/// (`$10 USD / MTok`), where the model table's cells stay `$10 / MTok`.
+const ANTHROPIC_FAST_USD: &str = "\
+| Model                           | Input          | Output         |
+| ------------------------------- | -------------- | -------------- |
+| Claude Opus 5.5                 | $8 USD / MTok  | $40 USD / MTok |
+| Claude Opus 5 / Claude Opus 4.8 | $10 USD / MTok | $50 USD / MTok |";
+
+/// `$x USD / MTok` reads as `$x / MTok`; any other currency or spacing is still an error.
+#[test]
+fn anthropic_fast_mode_cells_may_name_usd() {
+    let a = snapshot("anthropic/pricing.md");
+    let old = "\
+| Model                           | Input      | Output     |
+| ------------------------------- | ---------- | ---------- |
+| Claude Opus 5.5                 | $8 / MTok  | $40 / MTok |
+| Claude Opus 5 / Claude Opus 4.8 | $10 / MTok | $50 / MTok |";
+    assert_eq!(a.matches(old).count(), 1);
+    let usd = a.replace(old, ANTHROPIC_FAST_USD);
+    let fast = |md: &str, name: &str| vendors::anthropic(md).unwrap().fast(name);
+    for name in ["Claude Opus 5.5", "Claude Opus 5", "Claude Opus 4.8"] {
+        let want = fast(&a, name).unwrap();
+        assert!(want.is_some(), "{name}");
+        assert_eq!(fast(&usd, name).unwrap(), want, "{name}");
+    }
+    for bad in [
+        "$10 EUR / MTok",
+        "$10 USD/MTok",
+        "$10 USD USD / MTok",
+        "10 USD / MTok",
+    ] {
+        let md = usd.replace("$10 USD / MTok", bad);
+        assert!(fast(&md, "Claude Opus 4.8").is_err(), "{bad:?}");
+    }
+}
+
 /// Claude Haiku 5.5 is priced by prompt length. Anthropic's model table splits it into two rows,
 /// "(for prompts up to 100,000 tokens)" and "(for prompts over 100,000 tokens)", and AWS gives it
 /// a second `long_ctx` SKU per token kind in each scope. Both readers keep the tiers apart, and

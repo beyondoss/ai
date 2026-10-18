@@ -76,14 +76,15 @@ pub fn anthropic(md: &str) -> Result<Anthropic> {
     Ok(Anthropic { models, fast })
 }
 
-/// `$10 / MTok`, footnote markers allowed.
+/// `$10 / MTok` or `$10 USD / MTok` (the fast mode table names the currency since 2026-10),
+/// footnote markers allowed.
 fn mtok(cell: &str) -> Result<Rate> {
     let c = strip_sup(cell);
     let n = c
         .trim()
         .strip_suffix(" / MTok")
         .ok_or_else(|| format!("{cell:?} is not `$x / MTok`"))?;
-    dollars(n)
+    dollars(n.strip_suffix(" USD").unwrap_or(n))
 }
 
 /// The model name a row is keyed by: `Claude Opus 4.1 ([retired, …](…))` is `Claude Opus 4.1`.
