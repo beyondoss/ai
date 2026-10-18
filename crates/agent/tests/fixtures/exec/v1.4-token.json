@@ -32,9 +32,9 @@
     "tag_hex": "f9d4dc94fa434ec885267fb29fb363b770386e1689ed36c1379254ec34a5c938",
     "token": "bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
     "covers": [
-      "N44",
-      "N46",
-      "N49"
+      "N41",
+      "N43",
+      "N46"
     ]
   },
   "verifier_keys": [
@@ -52,10 +52,10 @@
       },
       "expect": "valid",
       "covers": [
-        "N46",
-        "N47",
-        "N48",
-        "N44"
+        "N43",
+        "N44",
+        "N45",
+        "N41"
       ]
     },
     {
@@ -69,7 +69,7 @@
       },
       "expect": "bad_mac",
       "covers": [
-        "N47"
+        "N44"
       ]
     },
     {
@@ -83,7 +83,7 @@
       },
       "expect": "bad_mac",
       "covers": [
-        "N47"
+        "N44"
       ]
     },
     {
@@ -97,7 +97,7 @@
       },
       "expect": "bad_mac",
       "covers": [
-        "N47"
+        "N44"
       ]
     },
     {
@@ -111,7 +111,7 @@
       },
       "expect": "bad_mac",
       "covers": [
-        "N47"
+        "N44"
       ]
     },
     {
@@ -125,7 +125,7 @@
       },
       "expect": "bad_mac",
       "covers": [
-        "N47"
+        "N44"
       ]
     },
     {
@@ -139,7 +139,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N46"
+        "N43"
       ]
     },
     {
@@ -153,8 +153,8 @@
       },
       "expect": "malformed",
       "covers": [
-        "N46",
-        "N48"
+        "N43",
+        "N45"
       ]
     },
     {
@@ -168,8 +168,8 @@
       },
       "expect": "unknown_kid",
       "covers": [
-        "N49",
-        "N50"
+        "N46",
+        "N47"
       ]
     },
     {
@@ -183,8 +183,8 @@
       },
       "expect": "unknown_kid",
       "covers": [
-        "N49",
-        "N50"
+        "N46",
+        "N47"
       ]
     },
     {
@@ -198,7 +198,7 @@
       },
       "expect": "bad_mac",
       "covers": [
-        "N48"
+        "N45"
       ]
     },
     {
@@ -212,7 +212,7 @@
       },
       "expect": "bad_mac",
       "covers": [
-        "N48"
+        "N45"
       ]
     },
     {
@@ -226,7 +226,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N46"
+        "N43"
       ]
     },
     {
@@ -240,7 +240,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N46"
+        "N43"
       ]
     },
     {
@@ -254,7 +254,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N46"
+        "N43"
       ]
     },
     {
@@ -268,7 +268,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N46"
+        "N43"
       ]
     },
     {
@@ -282,7 +282,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N46"
+        "N43"
       ]
     },
     {
@@ -296,7 +296,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N46"
+        "N43"
       ]
     },
     {
@@ -310,7 +310,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N46"
+        "N43"
       ]
     },
     {
@@ -324,7 +324,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N46"
+        "N43"
       ]
     },
     {
@@ -338,7 +338,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N46"
+        "N43"
       ]
     },
     {
@@ -352,7 +352,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N46"
+        "N43"
       ]
     }
   ]
