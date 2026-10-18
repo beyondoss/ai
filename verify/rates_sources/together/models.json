@@ -1852,7 +1852,7 @@
     "context_length": 32768,
     "display_name": "Arize AI Qwen 2 1.5B Instruct",
     "id": "arize-ai/qwen-2-1.5b-instruct",
-    "organization": "Arize-ai",
+    "organization": "Togethercomputer",
     "pricing": {
       "base": 0,
       "finetune": 0,
@@ -3404,6 +3404,25 @@
     "type": "chat"
   },
   {
+    "context_length": 1048576,
+    "display_name": "Muse Spark Open 816B A42B",
+    "id": "meta-models/Muse-Spark-Open-816B-A42B",
+    "organization": "Meta",
+    "pricing": {
+      "base": 0,
+      "cached_input": 0.15,
+      "finetune": 0,
+      "hourly": 0,
+      "image": 0,
+      "image_pixel": 0,
+      "input": 1.25,
+      "output": 4.25,
+      "transcribe": 0,
+      "video": 0
+    },
+    "type": "chat"
+  },
+  {
     "display_name": "MiniMax Hailuo 02",
     "id": "minimax/hailuo-02",
     "organization": "MiniMaxAI",
@@ -4020,6 +4039,25 @@
     "type": "chat"
   },
   {
+    "context_length": 262144,
+    "display_name": "NVIDIA Nemotron 3.5 Super VL",
+    "id": "nvidia/NVIDIA-Nemotron-3.5-Super-VL",
+    "organization": "NVIDIA",
+    "pricing": {
+      "base": 0,
+      "cached_input": 0.02,
+      "finetune": 0,
+      "hourly": 0,
+      "image": 0,
+      "image_pixel": 0,
+      "input": 0.15,
+      "output": 0.5,
+      "transcribe": 0,
+      "video": 0
+    },
+    "type": "chat"
+  },
+  {
     "context_length": 131072,
     "display_name": "Nvidia Nemotron Nano 9B V2",
     "id": "nvidia/NVIDIA-Nemotron-Nano-9B-v2",
@@ -4309,6 +4347,25 @@
       "video": 0
     },
     "type": "image"
+  },
+  {
+    "context_length": 1048576,
+    "display_name": "Beam 1.0 501B A23B",
+    "id": "reflection/Beam-1.0-501B-A23B",
+    "organization": "Reflection",
+    "pricing": {
+      "base": 0,
+      "cached_input": 0.04,
+      "finetune": 0,
+      "hourly": 0,
+      "image": 0,
+      "image_pixel": 0,
+      "input": 0.4,
+      "output": 1.2,
+      "transcribe": 0,
+      "video": 0
+    },
+    "type": "chat"
   },
   {
     "context_length": 0,

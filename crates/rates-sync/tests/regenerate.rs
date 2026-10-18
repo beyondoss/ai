@@ -152,17 +152,19 @@ const ANTHROPIC_FAST_USD: &str = "\
 /// `$x USD / MTok` reads as `$x / MTok`; any other currency or spacing is still an error.
 #[test]
 fn anthropic_fast_mode_cells_may_name_usd() {
-    let a = snapshot("anthropic/pricing.md");
-    let old = "\
+    let usd = snapshot("anthropic/pricing.md");
+    assert_eq!(usd.matches(ANTHROPIC_FAST_USD).count(), 1);
+    let plain = usd.replace(
+        ANTHROPIC_FAST_USD,
+        "\
 | Model                           | Input      | Output     |
 | ------------------------------- | ---------- | ---------- |
 | Claude Opus 5.5                 | $8 / MTok  | $40 / MTok |
-| Claude Opus 5 / Claude Opus 4.8 | $10 / MTok | $50 / MTok |";
-    assert_eq!(a.matches(old).count(), 1);
-    let usd = a.replace(old, ANTHROPIC_FAST_USD);
+| Claude Opus 5 / Claude Opus 4.8 | $10 / MTok | $50 / MTok |",
+    );
     let fast = |md: &str, name: &str| vendors::anthropic(md).unwrap().fast(name);
     for name in ["Claude Opus 5.5", "Claude Opus 5", "Claude Opus 4.8"] {
-        let want = fast(&a, name).unwrap();
+        let want = fast(&plain, name).unwrap();
         assert!(want.is_some(), "{name}");
         assert_eq!(fast(&usd, name).unwrap(), want, "{name}");
     }

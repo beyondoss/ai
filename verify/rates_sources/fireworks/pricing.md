@@ -2,16 +2,9 @@
 > Fetch the complete documentation index at: https://docs.fireworks.ai/llms.txt
 > Use this file to discover all available pages before exploring further.
 
-> ## Agent Instructions
-> For Fireworks Nexus, start at https://docs.fireworks.ai/nexus.
-> Use https://docs.fireworks.ai/nexus/quickstart for coding harnesses, custom agents, APIs, SDKs, and LLM gateways.
-> Use https://docs.fireworks.ai/nexus/firerouter for how model routers work, the supported model list, composition, closed-model credentials, and pricing.
-> Prefer canonical short model IDs such as firerouter/opus. In LiteLLM litellm_params.model, use the full path fireworks_ai/accounts/fireworks/routers/firerouter/opus.
-> Family names such as opus track the latest evaluated family version; do not describe them as fixed model versions.
-
 # Serverless Pricing
 
-> Per-token serverless pricing for text, vision, and embedding models, including Priority and Fast serverless modes
+> Per-token serverless pricing for text, vision, and embedding models on Fireworks, including Standard, Priority, and Fast serverless mode rates.
 
 ## Overview
 
@@ -42,6 +35,7 @@ Per-model pricing for headline models. Fast variants appear as adjacent rows. In
 | [Kimi K3 (US)](https://app.fireworks.ai/models/fireworks/kimi-k3) | \$4.50 / \$0.45 / \$22.50 | \$5.625 / \$0.5625 / \$28.125 |
 | [DeepSeek V4.1 Flash](https://app.fireworks.ai/models/fireworks/deepseek-v4p1-flash) | \$0.30 / \$0.006 / \$1.20 | \$0.375 / \$0.0075 / \$1.50 |
 | [DeepSeek V4.1 Flash (US)](https://app.fireworks.ai/models/fireworks/deepseek-v4p1-flash) | \$0.45 / \$0.009 / \$1.80 | \$0.5625 / \$0.01125 / \$2.25 |
+| [DeepSeek V4.1 Flash 1017](https://app.fireworks.ai/models/fireworks/deepseek-v4p1-flash-1017) | \$0.30 / \$0.006 / \$1.20 | \$0.375 / \$0.0075 / \$1.50 |
 | [GLM 5.3 Flash](https://app.fireworks.ai/models/fireworks/glm-5p3-flash) | \$0.15 / \$0.03 / \$0.50 | \$0.1875 / \$0.0375 / \$0.625 |
 | [GLM 5.3 Flash (US)](https://app.fireworks.ai/models/fireworks/glm-5p3-flash) | \$0.225 / \$0.045 / \$0.75 | \$0.28125 / \$0.05625 / \$0.9375 |
 | [GLM 5.3](https://app.fireworks.ai/models/fireworks/glm-5p3) | \$1.40 / \$0.26 / \$4.40 | \$1.75 / \$0.325 / \$5.50 |
