@@ -79,6 +79,19 @@ pub fn bound_reuseport_socket() -> tokio::net::TcpSocket {
 /// Linux only: `127.0.0.2` is loopback there without configuration; see [`require_proc`].
 pub const GATEWAY_LISTENERS: &str = "listen = \"127.0.0.1:0\"\nmetrics_listen = \"127.0.0.2:0\"\n";
 
+/// The line that adds the gateway's TLS listener (with `tls_cert` and `tls_key` alongside), on a
+/// third loopback address so [`gateway_ports`] still tells the three apart; read it back with
+/// [`gateway_tls_port`].
+pub const GATEWAY_TLS_LISTEN: &str = "tls_listen = \"127.0.0.3:0\"\n";
+
+/// The port gateway `pid`'s TLS listener ([`GATEWAY_TLS_LISTEN`]) is on; `None` until it is up.
+pub fn gateway_tls_port(pid: u32) -> Option<u16> {
+    listening_on(pid)
+        .iter()
+        .find(|a| a.ip().octets() == [127, 0, 0, 3])
+        .map(SocketAddrV4::port)
+}
+
 /// Where a gateway configured with [`GATEWAY_LISTENERS`] listens.
 #[derive(Clone, Copy, Debug)]
 pub struct GatewayPorts {

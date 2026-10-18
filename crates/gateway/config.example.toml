@@ -5,6 +5,10 @@
 # are defaults.
 
 listen = "0.0.0.0:8080" # client (app) traffic; internal-only, fronted as ai.internal
+# Optional public TLS listener (all three or none; read once at boot, rotate by restarting):
+# tls_listen = "0.0.0.0:8443"
+# tls_cert = "/etc/tls/fullchain.pem"
+# tls_key = "/etc/tls/privkey.pem"
 metrics_listen = "0.0.0.0:9090" # internal admin: /metrics (Prometheus), /livez, /readyz
 
 # Tokio worker threads for the proxy service. 0 ⇒ one per available core. Pingora's own default is
