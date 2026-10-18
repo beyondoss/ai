@@ -147,6 +147,11 @@
           "kind": "conformance",
           "name": "callback after the job ends",
           "task": "C3"
+        },
+        {
+          "kind": "conformance",
+          "name": "a change during an attempt is called back",
+          "task": "C3"
         }
       ]
     },
@@ -347,7 +352,7 @@
       "checks": [
         {
           "kind": "test",
-          "name": "job_notify::the_live_reconcile_changes_only_released_jobs",
+          "name": "job_notify::the_live_reconcile_changes_only_unheld_jobs",
           "task": "B4"
         }
       ]
@@ -607,7 +612,7 @@
       "checks": [
         {
           "kind": "fleet-sim",
-          "name": "job-ended-goes-only-to-the-hashed-replica",
+          "name": "job-ended-routed-as-any-request",
           "task": "D2"
         }
       ]
@@ -638,6 +643,16 @@
         {
           "kind": "fleet-sim",
           "name": "job-ended-rate-limited-per-session",
+          "task": "D2"
+        }
+      ]
+    },
+    {
+      "id": "E7",
+      "checks": [
+        {
+          "kind": "fleet-sim",
+          "name": "job-ended-token-never-logged",
           "task": "D2"
         }
       ]
