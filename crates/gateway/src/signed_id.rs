@@ -58,6 +58,8 @@
 //! `store: false` (D145). They are not signed and not checked; D175's item_reference rule applies
 //! there unchanged.
 
+#![deny(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -190,13 +192,15 @@ impl Signer {
         }
         let current = match current.as_bytes() {
             [k] => *k,
-            [] if decoded.len() == 1 => decoded[0].0,
-            [] => {
-                return Err(
-                    "more than one id signing key is configured: set id_signing_kid to the one that signs new ids"
-                        .to_owned(),
-                );
-            }
+            [] => match decoded.as_slice() {
+                [(k, _)] => *k,
+                _ => {
+                    return Err(
+                        "more than one id signing key is configured: set id_signing_kid to the one that signs new ids"
+                            .to_owned(),
+                    );
+                }
+            },
             _ => {
                 return Err(format!(
                     "id_signing_kid {current:?} must be one character [0-9A-Za-z]"
@@ -221,8 +225,11 @@ impl Signer {
         ctx.update(&tenant.to_le_bytes());
         ctx.update(raw);
         let full = ctx.sign();
+        // The first `TAG_LEN` bytes of the 32-byte MAC; `zip` stops there.
         let mut tag = [0u8; TAG_LEN];
-        tag.copy_from_slice(&full.as_ref()[..TAG_LEN]);
+        for (dst, &src) in tag.iter_mut().zip(full.as_ref()) {
+            *dst = src;
+        }
         tag
     }
 
@@ -234,30 +241,40 @@ impl Signer {
         let mut data = [0u8; MAX_PACKED + TAG_LEN];
         let mut b64 = [0u8; (MAX_PACKED + TAG_LEN).div_ceil(3) * 4];
         if let Some((prefix, hex)) = packable(raw) {
-            let n = hex.len() / 2;
-            for (i, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
-                data[i] = (nibble(pair[0]) << 4) | nibble(pair[1]);
+            // `packable` caps the hex at MAX_PACKED bytes, so the body and its tag fit `data`.
+            let body = hex.len() / 2;
+            let total = body.saturating_add(TAG_LEN);
+            let Some((head, tail)) = data.split_at_mut_checked(body) else {
+                return;
+            };
+            for (dst, pair) in head.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+                if let &[hi, lo] = pair {
+                    *dst = (nibble(hi) << 4) | nibble(lo);
+                }
             }
-            data[n..n + TAG_LEN].copy_from_slice(&tag);
-            let len = URL_SAFE_NO_PAD
-                .encode_slice(&data[..n + TAG_LEN], &mut b64)
-                .unwrap_or(0);
+            for (dst, &byte) in tail.iter_mut().zip(&tag) {
+                *dst = byte;
+            }
+            let Some(packed) = data.get(..total) else {
+                return;
+            };
+            let len = URL_SAFE_NO_PAD.encode_slice(packed, &mut b64).unwrap_or(0);
             out.extend_from_slice(prefix.as_bytes());
             out.push(PACKED);
             out.push(kid);
-            out.extend_from_slice(&b64[..len]);
+            out.extend_from_slice(b64.get(..len).unwrap_or_default());
         } else {
             let len = URL_SAFE_NO_PAD.encode_slice(tag, &mut b64).unwrap_or(0);
             out.extend_from_slice(raw.as_bytes());
             out.extend_from_slice(VERBATIM);
             out.push(kid);
-            out.extend_from_slice(&b64[..len]);
+            out.extend_from_slice(b64.get(..len).unwrap_or_default());
         }
     }
 
     /// The signed form of provider id `raw` for `tenant`.
     pub fn sign(&self, tenant: u64, raw: &str) -> String {
-        let mut out = Vec::with_capacity(raw.len() + VERBATIM_TAIL);
+        let mut out = Vec::with_capacity(raw.len().saturating_add(VERBATIM_TAIL));
         self.sign_into(tenant, raw, &mut out);
         // Only ASCII and `raw`'s own (UTF-8) bytes were written.
         String::from_utf8(out).unwrap_or_default()
@@ -274,45 +291,47 @@ impl Signer {
     fn verify_packed(&self, tenant: u64, token: &str) -> Option<String> {
         let b = token.as_bytes();
         let us = memchr::memchr(b'_', b)?;
-        let rest = &b[us + 1..];
-        if rest.first() != Some(&PACKED) || rest.len() < 3 {
+        let [PACKED, kid, encoded @ ..] = b.get(us.saturating_add(1)..)? else {
             return None;
-        }
-        let kid = rest[1];
+        };
+        let kid = *kid;
         let key = self.key(kid)?;
         let mut data = [0u8; MAX_PACKED + TAG_LEN + 3];
-        let n = URL_SAFE_NO_PAD.decode_slice(&rest[2..], &mut data).ok()?;
-        if n <= TAG_LEN || n > MAX_PACKED + TAG_LEN {
-            return None;
-        }
-        let body = n - TAG_LEN;
-        let mut raw = String::with_capacity(us + 1 + body * 2);
-        raw.push_str(&token[..=us]);
-        for &byte in &data[..body] {
-            raw.push(char::from(HEX[usize::from(byte >> 4)]));
-            raw.push(char::from(HEX[usize::from(byte & 0xf)]));
+        let n = URL_SAFE_NO_PAD.decode_slice(encoded, &mut data).ok()?;
+        // The decoded bytes are a body of 1..=MAX_PACKED bytes and then the tag.
+        let body = n
+            .checked_sub(TAG_LEN)
+            .filter(|&len| (1..=MAX_PACKED).contains(&len))?;
+        let (bytes, got) = data.get(..n)?.split_at_checked(body)?;
+        let mut raw =
+            String::with_capacity(us.saturating_add(1).saturating_add(body.saturating_mul(2)));
+        raw.push_str(token.get(..=us)?);
+        for &byte in bytes {
+            raw.push(hex_digit(byte >> 4));
+            raw.push(hex_digit(byte & 0xf));
         }
         let want = Self::tag(key, kid, tenant, raw.as_bytes());
-        ct_eq(&want, &data[body..n]).then_some(raw)
+        ct_eq(&want, got).then_some(raw)
     }
 
     fn verify_verbatim(&self, tenant: u64, token: &str) -> Option<String> {
         let b = token.as_bytes();
         let split = b.len().checked_sub(VERBATIM_TAIL).filter(|&s| s > 0)?;
-        let tail = &b[split..];
-        if !tail.starts_with(VERBATIM) || !token.is_char_boundary(split) {
+        // The tail is `"_v"`, the kid, then the base64url tag; `get` also refuses a split inside a
+        // character.
+        let [b'_', b'v', kid, encoded @ ..] = b.get(split..)? else {
             return None;
-        }
-        let kid = tail[2];
+        };
+        let kid = *kid;
         let key = self.key(kid)?;
         let mut tag = [0u8; TAG_LEN + 2];
-        let n = URL_SAFE_NO_PAD.decode_slice(&tail[3..], &mut tag).ok()?;
+        let n = URL_SAFE_NO_PAD.decode_slice(encoded, &mut tag).ok()?;
         if n != TAG_LEN {
             return None;
         }
-        let raw = &token[..split];
+        let raw = token.get(..split)?;
         let want = Self::tag(key, kid, tenant, raw.as_bytes());
-        ct_eq(&want, &tag[..TAG_LEN]).then(|| raw.to_owned())
+        ct_eq(&want, tag.get(..TAG_LEN)?).then(|| raw.to_owned())
     }
 
     /// Check every id in a managed Responses request body and strip each back to its provider id:
@@ -366,20 +385,20 @@ impl Signer {
         let ok = each_member(body, open, |m| {
             let v = m.value;
             if m.key_is(body, "previous_response_id") {
-                if body[v.0] == b'"' && !self.unsign_at(tenant, body, v, &mut edits) {
+                if body.get(v.0) == Some(&b'"') && !self.unsign_at(tenant, body, v, &mut edits) {
                     fail.get_or_insert_with(|| "previous_response_id".to_owned());
                 }
             } else if m.key_is(body, "conversation") {
-                match body[v.0] {
-                    b'"' => {
+                match body.get(v.0).copied() {
+                    Some(b'"') => {
                         if !self.unsign_at(tenant, body, v, &mut edits) {
                             fail.get_or_insert_with(|| "conversation".to_owned());
                         }
                     }
-                    b'{' => {
+                    Some(b'{') => {
                         let ok = each_member(body, v.0, |c| {
                             if c.key_is(body, "id")
-                                && body[c.value.0] == b'"'
+                                && body.get(c.value.0) == Some(&b'"')
                                 && !self.unsign_at(tenant, body, c.value, &mut edits)
                             {
                                 fail.get_or_insert_with(|| "conversation.id".to_owned());
@@ -391,12 +410,13 @@ impl Signer {
                     }
                     _ => {}
                 }
-            } else if m.key_is(body, "input") && body[v.0] == b'[' {
+            } else if m.key_is(body, "input") && body.get(v.0) == Some(&b'[') {
                 let mut n = 0usize;
                 let ok = each_element(body, v.0, |(s, _)| {
                     let i = n;
-                    n += 1;
-                    if body[s] == b'{' && !self.unsign_item(tenant, body, s, &mut edits) {
+                    n = n.saturating_add(1);
+                    if body.get(s) == Some(&b'{') && !self.unsign_item(tenant, body, s, &mut edits)
+                    {
                         fail.get_or_insert_with(|| format!("input[{i}].id"));
                     }
                 });
@@ -426,7 +446,7 @@ impl Signer {
         let mut members: Vec<(Member, bool)> = Vec::new();
         let (mut typ, mut role) = (None, false);
         let ok = each_member(body, open, |m| {
-            let id = m.key_is(body, "id") && body[m.value.0] == b'"';
+            let id = m.key_is(body, "id") && body.get(m.value.0) == Some(&b'"');
             if m.key_is(body, "type") {
                 // The last one is the provider's.
                 typ = json_str(body, m.value).map(Cow::into_owned);
@@ -445,31 +465,39 @@ impl Signer {
             Some(t) => t == "item_reference",
             None => !role,
         };
-        let mut drop = vec![false; members.len()];
-        let mut raws: Vec<Option<String>> = vec![None; members.len()];
-        for (k, m) in members.iter().enumerate().filter(|(_, m)| m.1) {
-            match json_str(body, m.0.value).and_then(|s| self.verify(tenant, &s)) {
-                Some(raw) => raws[k] = Some(raw),
-                None if reference => return false,
-                None => drop[k] = true,
+        let mut fates = Vec::with_capacity(members.len());
+        for &(m, is_id) in &members {
+            fates.push(if !is_id {
+                Fate::Keep
+            } else {
+                match json_str(body, m.value).and_then(|s| self.verify(tenant, &s)) {
+                    Some(raw) => Fate::Replace(raw),
+                    None if reference => return false,
+                    None => Fate::Cut,
+                }
+            });
+        }
+        // The cuts are the ones `peek::remove_items` makes for the same members. Replacements and
+        // cuts go to `edits` in source order, which `Edits::write` requires.
+        let spans: Vec<(usize, usize)> = members.iter().map(|(m, _)| m.span()).collect();
+        let mut cuts = Vec::new();
+        peek::item_cuts(
+            &spans,
+            |k| matches!(fates.get(k), Some(Fate::Cut)),
+            &mut cuts,
+        );
+        let mut all: Vec<((usize, usize), Option<String>)> =
+            cuts.into_iter().map(|span| (span, None)).collect();
+        for (fate, (m, _)) in fates.into_iter().zip(&members) {
+            if let Fate::Replace(raw) = fate {
+                all.push((m.value, Some(raw)));
             }
         }
-        // Replacements and cuts, in source order, as `peek::remove_items` cuts members.
-        let last_kept = (0..members.len()).rev().find(|&k| !drop[k]);
-        for k in 0..members.len() {
-            if let Some(raw) = &raws[k] {
-                edits.push_str(members[k].0.value, raw);
-            } else if drop[k] {
-                let cut = match last_kept {
-                    Some(l) if k < l => (members[k].0.span().0, members[k + 1].0.span().0),
-                    Some(l) => (members[l].0.span().1, members[members.len() - 1].0.span().1),
-                    None => (members[k].0.span().0, members[members.len() - 1].0.span().1),
-                };
-                edits.push_cut(cut);
-                if last_kept.is_none_or(|l| k > l) {
-                    // A trailing run is one cut, from the last kept member to the end.
-                    break;
-                }
+        all.sort_by_key(|(span, _)| span.0);
+        for (span, replacement) in all {
+            match replacement {
+                Some(raw) => edits.push_str(span, &raw),
+                None => edits.push_cut(span),
             }
         }
         true
@@ -487,11 +515,18 @@ impl Signer {
     }
 }
 
+/// What [`Signer::unsign_item`] does with one member of an item.
+enum Fate {
+    Keep,
+    Replace(String),
+    Cut,
+}
+
 /// `(prefix through the first '_', rest)` when the rest is non-empty, even-length lowercase hex of
 /// at most [`MAX_PACKED`] bytes: the shape every OpenAI id has, packed in half the characters.
 fn packable(raw: &str) -> Option<(&str, &str)> {
     let us = raw.find('_')?;
-    let (prefix, hex) = raw.split_at(us + 1);
+    let (prefix, hex) = raw.split_at_checked(us.saturating_add(1))?;
     (!hex.is_empty()
         && hex.len() % 2 == 0
         && hex.len() <= MAX_PACKED * 2
@@ -501,10 +536,16 @@ fn packable(raw: &str) -> Option<(&str, &str)> {
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
+/// The lowercase hex digit of a nibble (`nibble` is at most 15).
+fn hex_digit(nibble: u8) -> char {
+    char::from(HEX.get(usize::from(nibble)).copied().unwrap_or(b'0'))
+}
+
+/// The value of a lowercase hex digit (`packable` admits no other).
 fn nibble(c: u8) -> u8 {
     match c {
-        b'0'..=b'9' => c - b'0',
-        _ => c - b'a' + 10,
+        b'0'..=b'9' => c.saturating_sub(b'0'),
+        _ => c.saturating_sub(b'a').saturating_add(10),
     }
 }
 
@@ -628,16 +669,22 @@ impl Relay {
                 Ok(Some(self.sign_json(signer, body)))
             }
             Mode::Sse => {
-                let mut out = Vec::with_capacity(chunk.len() + self.pending.len() + 64);
+                let mut out = Vec::with_capacity(
+                    chunk
+                        .len()
+                        .saturating_add(self.pending.len())
+                        .saturating_add(64),
+                );
                 if self.pending.is_empty() {
                     let cut = complete_lines(chunk, end_of_stream);
-                    self.sign_lines(signer, &chunk[..cut], &mut out);
-                    self.pending.extend_from_slice(&chunk[cut..]);
+                    self.sign_lines(signer, chunk.get(..cut).unwrap_or_default(), &mut out);
+                    self.pending
+                        .extend_from_slice(chunk.get(cut..).unwrap_or_default());
                 } else {
                     let mut buf = std::mem::take(&mut self.pending);
                     buf.extend_from_slice(chunk);
                     let cut = complete_lines(&buf, end_of_stream);
-                    self.sign_lines(signer, &buf[..cut], &mut out);
+                    self.sign_lines(signer, buf.get(..cut).unwrap_or_default(), &mut out);
                     buf.drain(..cut);
                     self.pending = buf;
                 }
@@ -666,17 +713,19 @@ impl Relay {
     /// Every line of `lines` (each ending in `\n`, or the stream's last), signed where it is a
     /// `data:` line that names an id.
     fn sign_lines(&mut self, signer: &Signer, lines: &[u8], out: &mut Vec<u8>) {
-        let mut at = 0;
-        while at < lines.len() {
-            let end = memchr::memchr(b'\n', &lines[at..]).map_or(lines.len(), |k| at + k + 1);
-            let line = &lines[at..end];
-            at = end;
+        let mut rest = lines;
+        while !rest.is_empty() {
+            let end = memchr::memchr(b'\n', rest).map_or(rest.len(), |k| k.saturating_add(1));
+            // `end` is within `rest`; the fallback relays the rest unsigned, which cannot happen.
+            let (line, after) = rest.split_at_checked(end).unwrap_or((rest, &[]));
+            rest = after;
             let Some(data) = line.strip_prefix(b"data:") else {
                 out.extend_from_slice(line);
                 continue;
             };
-            let start = line.len() - data.len() + usize::from(data.first() == Some(&b' '));
-            let json = &line[start..];
+            let prefix = line.len().saturating_sub(data.len());
+            let start = prefix.saturating_add(usize::from(data.first() == Some(&b' ')));
+            let json = line.get(start..).unwrap_or_default();
             if ID_KEY.find(json).is_none() {
                 out.extend_from_slice(line);
                 continue;
@@ -690,9 +739,9 @@ impl Relay {
             let (tenant, edits, memo) = (self.tenant, &mut self.edits, &mut self.memo);
             each_member(json, open, |m| {
                 let v = m.value;
-                if m.key_is(json, "response") && json[v.0] == b'{' {
+                if m.key_is(json, "response") && json.get(v.0) == Some(&b'{') {
                     sign_response_object(signer, tenant, json, v.0, edits, memo);
-                } else if m.key_is(json, "item") && json[v.0] == b'{' {
+                } else if m.key_is(json, "item") && json.get(v.0) == Some(&b'{') {
                     each_member(json, v.0, |c| {
                         if c.key_is(json, "id") {
                             sign_str(signer, tenant, json, c.value, edits, memo);
@@ -702,7 +751,7 @@ impl Relay {
                     sign_str(signer, tenant, json, v, edits, memo);
                 }
             });
-            out.extend_from_slice(&line[..start]);
+            out.extend_from_slice(line.get(..start).unwrap_or_default());
             edits.write(json, out);
         }
     }
@@ -723,9 +772,9 @@ fn sign_response_object(
         if m.key_is(b, "id") || m.key_is(b, "previous_response_id") {
             sign_str(signer, tenant, b, v, edits, memo);
         } else if m.key_is(b, "conversation") {
-            match b[v.0] {
-                b'"' => sign_str(signer, tenant, b, v, edits, memo),
-                b'{' => {
+            match b.get(v.0).copied() {
+                Some(b'"') => sign_str(signer, tenant, b, v, edits, memo),
+                Some(b'{') => {
                     each_member(b, v.0, |c| {
                         if c.key_is(b, "id") {
                             sign_str(signer, tenant, b, c.value, edits, memo);
@@ -734,9 +783,9 @@ fn sign_response_object(
                 }
                 _ => {}
             }
-        } else if m.key_is(b, "output") && b[v.0] == b'[' {
+        } else if m.key_is(b, "output") && b.get(v.0) == Some(&b'[') {
             each_element(b, v.0, |(s, _)| {
-                if b[s] == b'{' {
+                if b.get(s) == Some(&b'{') {
                     each_member(b, s, |c| {
                         if c.key_is(b, "id") {
                             sign_str(signer, tenant, b, c.value, edits, memo);
@@ -767,12 +816,16 @@ fn sign_str(
     } else {
         let at = edits.arena.len();
         signer.sign_into(tenant, &raw, &mut edits.arena);
-        let token = edits.arena[at..].to_vec();
+        let token = edits.arena.get(at..).unwrap_or_default().to_vec();
         memo.put(&raw, token);
     }
     if raw.bytes().any(|c| c == b'"' || c == b'\\' || c < 0x20) {
         // A provider id that needs escaping is never seen in practice; keep the JSON valid anyway.
-        let token = String::from_utf8_lossy(&edits.arena[start + 1..]).into_owned();
+        let signed = edits
+            .arena
+            .get(start.saturating_add(1)..)
+            .unwrap_or_default();
+        let token = String::from_utf8_lossy(signed).into_owned();
         edits.arena.truncate(start);
         if let Ok(s) = serde_json::to_string(&token) {
             edits.arena.extend_from_slice(s.as_bytes());
@@ -805,9 +858,10 @@ impl Memo {
         let entry = (Box::from(raw), token.into_boxed_slice());
         if self.entries.len() < Self::CAP {
             self.entries.push(entry);
-        } else {
-            self.entries[self.next] = entry;
-            self.next = (self.next + 1) % Self::CAP;
+        } else if let Some(slot) = self.entries.get_mut(self.next) {
+            *slot = entry;
+            // A ring: the oldest entry is the next one overwritten, so the index wraps.
+            self.next = self.next.wrapping_add(1) % Self::CAP;
         }
     }
 }
@@ -849,11 +903,11 @@ impl Edits {
             if s < last {
                 continue;
             }
-            out.extend_from_slice(&src[last..s]);
-            out.extend_from_slice(&self.arena[a..b]);
+            out.extend_from_slice(src.get(last..s).unwrap_or_default());
+            out.extend_from_slice(self.arena.get(a..b).unwrap_or_default());
             last = e;
         }
-        out.extend_from_slice(&src[last..]);
+        out.extend_from_slice(src.get(last..).unwrap_or_default());
     }
 
     /// `src` with every edit applied, or `None` when there are none.
@@ -861,7 +915,7 @@ impl Edits {
         if self.spans.is_empty() {
             return None;
         }
-        let mut out = Vec::with_capacity(src.len() + self.arena.len());
+        let mut out = Vec::with_capacity(src.len().saturating_add(self.arena.len()));
         self.write(src, &mut out);
         Some(out)
     }
@@ -872,22 +926,20 @@ fn complete_lines(buf: &[u8], end_of_stream: bool) -> usize {
     if end_of_stream {
         return buf.len();
     }
-    memchr::memrchr(b'\n', buf).map_or(0, |i| i + 1)
+    memchr::memrchr(b'\n', buf).map_or(0, |i| i.saturating_add(1))
 }
 
 // --- a non-allocating walk over JSON members, on `peek`'s span rules -------------------------------
 
-fn skip_ws(b: &[u8], mut i: usize) -> usize {
-    while i < b.len() && b[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    i
+fn skip_ws(b: &[u8], i: usize) -> usize {
+    let rest = b.get(i..).unwrap_or_default();
+    i.saturating_add(rest.iter().take_while(|c| c.is_ascii_whitespace()).count())
 }
 
 /// Call `f` with each member of the object whose `{` is at `open`, in order. `false` when the
 /// object is malformed (members already visited were still passed to `f`).
 fn each_member(b: &[u8], open: usize, mut f: impl FnMut(Member)) -> bool {
-    let mut i = skip_ws(b, open + 1);
+    let mut i = skip_ws(b, open.saturating_add(1));
     if b.get(i) == Some(&b'}') {
         return true;
     }
@@ -898,12 +950,12 @@ fn each_member(b: &[u8], open: usize, mut f: impl FnMut(Member)) -> bool {
         let Some(key_end) = peek::value_end(b, i) else {
             return false;
         };
-        let key = (i + 1, key_end - 1);
+        let key = (i.saturating_add(1), key_end.saturating_sub(1));
         i = skip_ws(b, key_end);
         if b.get(i) != Some(&b':') {
             return false;
         }
-        let start = skip_ws(b, i + 1);
+        let start = skip_ws(b, i.saturating_add(1));
         let Some(end) = peek::value_end(b, start) else {
             return false;
         };
@@ -913,7 +965,7 @@ fn each_member(b: &[u8], open: usize, mut f: impl FnMut(Member)) -> bool {
         });
         i = skip_ws(b, end);
         match b.get(i) {
-            Some(b',') => i = skip_ws(b, i + 1),
+            Some(b',') => i = skip_ws(b, i.saturating_add(1)),
             Some(b'}') => return true,
             _ => return false,
         }
@@ -922,7 +974,7 @@ fn each_member(b: &[u8], open: usize, mut f: impl FnMut(Member)) -> bool {
 
 /// Call `f` with each element span of the array whose `[` is at `open`. `false` when malformed.
 fn each_element(b: &[u8], open: usize, mut f: impl FnMut((usize, usize))) -> bool {
-    let mut i = skip_ws(b, open + 1);
+    let mut i = skip_ws(b, open.saturating_add(1));
     if b.get(i) == Some(&b']') {
         return true;
     }
@@ -933,7 +985,7 @@ fn each_element(b: &[u8], open: usize, mut f: impl FnMut((usize, usize))) -> boo
         f((i, end));
         i = skip_ws(b, end);
         match b.get(i) {
-            Some(b',') => i = skip_ws(b, i + 1),
+            Some(b',') => i = skip_ws(b, i.saturating_add(1)),
             Some(b']') => return true,
             _ => return false,
         }
@@ -943,10 +995,9 @@ fn each_element(b: &[u8], open: usize, mut f: impl FnMut((usize, usize))) -> boo
 /// The decoded string at `span`, when it is a JSON string.
 fn json_str(b: &[u8], span: (usize, usize)) -> Option<Cow<'_, str>> {
     let s = b.get(span.0..span.1)?;
-    if s.len() < 2 || s[0] != b'"' || s[s.len() - 1] != b'"' {
+    let [b'"', inner @ .., b'"'] = s else {
         return None;
-    }
-    let inner = &s[1..s.len() - 1];
+    };
     if memchr::memchr(b'\\', inner).is_none() {
         return std::str::from_utf8(inner).ok().map(Cow::Borrowed);
     }
@@ -954,6 +1005,9 @@ fn json_str(b: &[u8], span: (usize, usize)) -> Option<Cow<'_, str>> {
 }
 
 #[cfg(test)]
+// Fixtures slice and index the literal ids and bodies they build themselves; a panic there is a
+// failing test.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 mod tests {
     use super::*;
 
