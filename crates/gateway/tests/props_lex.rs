@@ -579,16 +579,17 @@ fn prop_model_scanner_reads_the_model_serde_reads() {
             if members.iter().filter(|(k, _)| k == "model").count() != 1 {
                 return Ok(());
             }
-            // The value as spelled, between its quotes: the cap counts these bytes, not the
-            // decoded ones, so an escaped spelling at the cap reads `unknown` even when its text
-            // would fit (its last escape may be cut).
+            // The value as spelled, between its quotes. The cap counts these bytes, not the
+            // decoded ones: a spelling of MAX_CAPTURE or more that holds an escape reads `unknown`
+            // even when its text would fit, because its last escape may be cut and the scanner
+            // cannot tell a complete one from a cut one.
             let raw: std::collections::HashMap<String, &serde_json::value::RawValue> =
-                serde_json::from_slice(&input.bytes).unwrap();
-            let spelled = raw["model"].get();
-            let spelled = spelled
-                .get(1..spelled.len().saturating_sub(1))
-                .unwrap_or_default();
-            let cut = spelled.contains('\\') && spelled.len() >= peek::MAX_CAPTURE;
+                serde_json::from_slice(&input.bytes).expect("the body parsed as JSON above");
+            let cut = raw.get("model").is_some_and(|v| {
+                let s = v.get();
+                let s = s.get(1..s.len().saturating_sub(1)).unwrap_or_default();
+                s.contains('\\') && s.len() >= peek::MAX_CAPTURE
+            });
             for chunks in chunkings(&input.bytes, &cuts) {
                 let (model, _, _) = scan_new(Scan::Request, &chunks);
                 match root["model"].as_str() {
@@ -613,8 +614,8 @@ fn prop_model_scanner_reads_the_model_serde_reads() {
 }
 
 /// The deep run's counterexample (seed 1792344194988825270): an escaped `model` whose text is 200
-/// bytes but whose spelling is 520 reads `unknown`; the same text spelled at the cap's other side
-/// reads exactly.
+/// bytes but whose spelling is 520 reads `unknown`. A control spelled in 234 bytes, under the cap,
+/// reads its 90 decoded bytes exactly.
 #[test]
 fn an_escaped_model_is_capped_by_its_spelling() {
     // JSON `\u` escapes, built at run time so the body carries the escapes, not the characters.
