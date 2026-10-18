@@ -280,7 +280,7 @@ fn refused(extra: &[String]) -> String {
         BIN,
         "http://127.0.0.1:1",
         &minter.grant_key_flag(),
-        minter.seal_key(),
+        Some(minter.seal_key()),
         &[("a", shard.as_path())],
     );
     cmd.args(extra).stderr(Stdio::piped());

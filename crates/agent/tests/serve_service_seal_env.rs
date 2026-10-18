@@ -8,12 +8,12 @@
 
 mod common;
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use common::service::{Options, Service};
 use common::{
-    BIN, SpawnGuarded, spawn_model_server, turn_text, ws_connect_with_headers,
-    ws_read_until_response, ws_send,
+    SpawnGuarded, spawn_model_server, turn_text, ws_connect_with_headers, ws_read_until_response,
+    ws_send,
 };
 use serde_json::json;
 
@@ -69,7 +69,7 @@ fn refused(k: &Keys, seal_flag: bool, env: Option<&str>) -> String {
     // ever serving on it.
     let dead = beyond_ai_test_support::ports::DeadPort::bind();
     let listen = format!("127.0.0.1:{}", dead.port());
-    let mut c = Command::new(BIN);
+    let mut c = common::agent_cmd();
     c.args([
         "serve",
         "--service",
@@ -90,7 +90,6 @@ fn refused(k: &Keys, seal_flag: bool, env: Option<&str>) -> String {
     if let Some(v) = env {
         c.env("AI_AGENT_SEAL_KEY_B64", v);
     }
-    c.env("HOME", common::ISOLATED_HOME);
     let output = c
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
