@@ -11,10 +11,12 @@ use agent_core::{ContentBlock, Message, Session};
 use beyond_ai_agent::session_store::{SessionMeta, SessionStore};
 use tempfile::TempDir;
 
+/// Message texts are words no id, hash or timestamp can contain: the reset test searches the raw
+/// file for them, and a short marker like `a0` turned up inside a random hex id.
 fn turn(s: &mut Session, i: usize) {
-    s.push(Message::user(format!("u{i}")));
+    s.push(Message::user(format!("old-user-turn-{i}")));
     s.push(Message::assistant(vec![ContentBlock::text(format!(
-        "a{i}"
+        "old-assistant-turn-{i}"
     ))]));
 }
 
@@ -50,7 +52,12 @@ fn new_session_keeps_nothing_of_the_old_conversation() {
     drop(store);
 
     let raw = std::fs::read_to_string(&path).unwrap();
-    for old in ["secret-branch", "u1", "a0", "old conversation"] {
+    for old in [
+        "secret-branch",
+        "old-user-turn-1",
+        "old-assistant-turn-0",
+        "old conversation",
+    ] {
         assert!(!raw.contains(old), "{old:?} survived /new on disk: {raw}");
     }
     let (store, reopened) = SessionStore::open(path).unwrap();
@@ -84,6 +91,6 @@ fn a_narrow_rewrite_still_keeps_other_branches() {
     assert!(
         std::fs::read_to_string(&path)
             .unwrap()
-            .contains(r#""text":"u1""#)
+            .contains(r#""text":"old-user-turn-1""#)
     );
 }
