@@ -9,7 +9,9 @@
 //! job (a reaped or redeployed replica) lets go of the stream and nothing more, and only a kill, the
 //! end of the session, or the sandbox's own end stops it. [`reattach`] is the other half: the next
 //! replica to open the session lists the scope, adopts what still runs under its old number, delivers
-//! the end of what finished meanwhile as an ordinary finish notice, and kills what nobody kept.
+//! the end of what finished meanwhile as an ordinary finish notice, and kills what nobody kept — or,
+//! when its sandbox is not attached yet, defers that to the session's first use of it
+//! ([`reattach_later`], [`reconcile`]), so opening a session does not wake a sleeping sandbox.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -269,15 +271,129 @@ pub struct Reattached {
 /// end of the run that started it would have. Anything else belongs to a turn that is over and is
 /// killed. Never fails: a sandbox that cannot be read is reported and left alone.
 pub async fn reattach(jobs: &Arc<BashJobs>, runner: Arc<dyn CommandRunner>) -> Reattached {
+    read_back(jobs, runner, false).await.unwrap_or_default()
+}
+
+/// How long [`reconcile`] waits for the ends of the jobs it found already ended to be read: one
+/// read each, from a sandbox that just answered.
+const SETTLE_LIMIT: Duration = Duration::from_secs(10);
+
+/// A reattach deferred to the session's first use of its sandbox — see [`reattach_later`].
+pub struct PendingReattach {
+    runner: Arc<dyn CommandRunner>,
+    /// Single flight: whoever needs the jobs first reads them back; the rest wait for it.
+    gate: tokio::sync::Mutex<()>,
+}
+
+/// [`reattach`], deferred: the session is opening without touching its sandbox (a sandbox sleeps
+/// when idle, and reading its jobs back would wake it). The table keeps what the transcript says;
+/// the reopen note calls the jobs the sandbox may still hold "not yet checked"; and [`reconcile`]
+/// reads them back the first time something needs the sandbox or asks about a job.
+pub fn reattach_later(jobs: &Arc<BashJobs>, runner: Arc<dyn CommandRunner>) {
+    jobs.set_pending_reattach(Some(Arc::new(PendingReattach {
+        runner,
+        gate: tokio::sync::Mutex::new(()),
+    })));
+}
+
+/// Run a deferred [`reattach`] now, if one is pending; concurrent callers share it. `Err` when the
+/// sandbox could not be read — its probe failed, or the listing did — in which case it stays
+/// pending, for the next use to try again.
+pub async fn reconcile(jobs: &Arc<BashJobs>) -> Result<(), String> {
+    let Some(pending) = jobs.pending_reattach() else {
+        return Ok(());
+    };
+    let _flight = pending.gate.lock().await;
+    // Settled (or replaced by a transcript switch) while this caller waited.
+    if !jobs
+        .pending_reattach()
+        .is_some_and(|p| Arc::ptr_eq(&p, &pending))
+    {
+        return Ok(());
+    }
+    pending.runner.ready().await.map_err(|e| e.to_string())?;
+    let mut wake = jobs.subscribe();
+    let report = read_back(jobs, pending.runner.clone(), true)
+        .await
+        .ok_or_else(|| "the sandbox's jobs could not be listed".to_string())?;
+    if report != Reattached::default() {
+        tracing::info!(?report, "reattached the session's sandbox jobs");
+    }
+    // A job that ended while nobody was attached is read to its end on its own task. Unlike a
+    // reattach at open, this one answers a caller asking right now (a `bash_job` peek at it), so
+    // it waits — bounded — until those ends are in, rather than report a finished job running.
+    let deadline = tokio::time::Instant::now() + SETTLE_LIMIT;
+    while !report.ended.iter().all(|&id| jobs.ended_or_gone(id)) {
+        if tokio::time::timeout_at(deadline, wake.changed())
+            .await
+            .map_or(true, |r| r.is_err())
+        {
+            break;
+        }
+    }
+    if jobs
+        .pending_reattach()
+        .is_some_and(|p| Arc::ptr_eq(&p, &pending))
+    {
+        jobs.set_pending_reattach(None);
+    }
+    Ok(())
+}
+
+/// The most reads [`read_in`] makes, each of [`crate::exec_endpoint::jobs::READ_MAX`]: what a peek
+/// shows is a tail anyway.
+const READ_IN_READS: usize = 8;
+
+/// Read a job's output from `from` up to what the sandbox holds now into `shared`, returning where
+/// it got to. Best effort: a read that fails leaves the rest to the follow.
+async fn read_in(shared: &JobShared, link: &SandboxLink, from: u64) -> u64 {
+    let mut offset = from;
+    for _ in 0..READ_IN_READS {
+        let Ok(chunk) = link
+            .store
+            .read(
+                &link.scope,
+                &link.id,
+                offset,
+                crate::exec_endpoint::jobs::READ_MAX,
+            )
+            .await
+        else {
+            break;
+        };
+        if chunk.offset > offset {
+            shared.append_gap(chunk.offset - offset);
+            offset = chunk.offset;
+        }
+        if chunk.data.is_empty() {
+            break;
+        }
+        shared.append(&chunk.data);
+        offset += chunk.data.len() as u64;
+        if offset >= chunk.end {
+            break;
+        }
+    }
+    offset
+}
+
+/// [`reattach`]'s body. `None` when the sandbox's jobs could not be listed (as opposed to: there
+/// is no job store to list, which is an answer). `catch_up` reads each running job's new output in
+/// before returning ([`read_in`]).
+async fn read_back(
+    jobs: &Arc<BashJobs>,
+    runner: Arc<dyn CommandRunner>,
+    catch_up: bool,
+) -> Option<Reattached> {
     let mut report = Reattached::default();
     let Some((store, scope)) = store_for(jobs, &runner).await else {
-        return report;
+        return Some(report);
     };
     let listed = match store.list(&scope).await {
         Ok(l) => l,
         Err(e) => {
             tracing::warn!(error = %e, "could not list the session's sandbox jobs");
-            return report;
+            return None;
         }
     };
     let policy = jobs.policy();
@@ -332,10 +448,17 @@ pub async fn reattach(jobs: &Arc<BashJobs>, runner: Arc<dyn CommandRunner>) -> R
                 }
             }
         }
+        // A read-back that answers a caller asking right now reads a running job's new output in
+        // before handing it over, so a peek at it reports what it printed while nobody was
+        // attached rather than whatever the follow below has fetched so far.
+        let from = if catch_up && !shared.ended() && !j.status.ended() {
+            read_in(&shared, &link, j.seen).await
+        } else {
+            j.seen
+        };
         let handle = {
             let shared = shared.clone();
             let link = link.clone();
-            let from = j.seen;
             tokio::spawn(async move {
                 if shared.ended() {
                     return;
@@ -371,13 +494,18 @@ pub async fn reattach(jobs: &Arc<BashJobs>, runner: Arc<dyn CommandRunner>) -> R
     {
         tracing::warn!(error = %e, "could not stop stale sandbox jobs");
     }
-    report
+    Some(report)
 }
 
 /// Kill every job of `scope` in the sandbox `runner` reaches and delete them: the session is
 /// ended (a transcript switch, a delete). Best effort: a sandbox that cannot be reached is gone or
 /// will be torn down with its session.
 pub async fn wipe(runner: Arc<dyn CommandRunner>, scope: &JobScope) {
+    // A sandbox attached lazily and not used yet is connected for this: ending a session is a
+    // reason to reach it, and its jobs are the ones being ended.
+    if runner.ready().await.is_err() {
+        return;
+    }
     let Some(store) = runner.sandbox_jobs() else {
         return;
     };

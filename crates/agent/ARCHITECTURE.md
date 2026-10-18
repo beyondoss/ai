@@ -2570,8 +2570,10 @@ mock whose dropped hold leaves the job running on exactly the hold check.
 
 Resolved once at session start, most specific first:
 
-1. **The grant**, in service mode. It _is_ the sandbox; nothing else is consulted, and a sandbox that
-   fails the probe ends the session rather than leaving its tools with nowhere to go.
+1. **The grant**, in service mode. It _is_ the sandbox; nothing else is consulted. It is attached
+   lazily (see "Exec, strict, and lazy" under "Service mode"): a new session probes it at start and
+   ends if the probe fails; a reopened one probes it at its first use, and a failure is that tool
+   call's error.
 2. **The session's own record** — `meta.exec_endpoint`, written by `set_exec_endpoint` — if it still
    resolves. A session pointed at a sandbox stays pointed at it across a **process restart**, exactly
    as `reset_exec_endpoint!` keeps it across a session switch. Both call the same
@@ -3060,7 +3062,12 @@ separate host `bash` instance (`build_tools` with `bash_waits_for_exit`) over th
     (a `serve` restart and `run --continue`). A remote job the sandbox kept (next item) is not
     gone: it is in the table again by the first run, and the note lists it as "(still running)"
     under its old number, separately from the ones that were stopped; one that ended meanwhile is
-    left to its finish notice.
+    left to its finish notice. While the read-back is still deferred (a reopened service session
+    that has not used its sandbox, next item but one), the note does not guess: an intended job
+    the transcript left running is listed "(not yet checked)", with how to check one now. The
+    read-back reports each of them later — one it found is in the table (running, or ended with its
+    notice due), one it did not gets a `[job N is no longer running: …]` notice, once
+    (`BashJobs::set_pending_reattach`).
   - **A killed process's survivors (`BashJobs::stop_survivors`).** A SIGKILL or an OOM kill runs no
     exit path, so the local jobs that process ran — background, and a foreground command still
     attached — outlive it. Each local job's processes are journaled in the session as they spawn:
@@ -3106,7 +3113,18 @@ separate host `bash` instance (`build_tools` with `bash_waits_for_exit`) over th
     where the stream left off instead of being reported failed.
   - **Reattach (`bash_sandbox::reattach`).** Where a session opens (`serve_session` after its exec
     target is set, again after a transcript switch; `run` before its first turn) the table lists the
-    scope. A kept job with a number is the session's: under `KeepRunning` it is parked again under
+    scope — unless its sandbox is attached lazily and not built yet (`ExecCell::pending`: a
+    reopened service session, see "Sandbox snapshot"), which listing it would wake. Then
+    `bash_sandbox::reattach_later` defers it, and `bash_sandbox::reconcile` runs it, once (single
+    flight), the first time it is needed: at the top of a `bash` call that runs in the sandbox (after
+    `CommandRunner::ready`, before anything new is numbered), at a `bash_job` call (a job asked
+    about is checked first; a probe that fails then is that call's error), or at the top of
+    `serve`'s loop once anything else has woken the sandbox. Because it answers a caller asking right
+    now, it reads each running job's new output in before handing it to its follow (`read_in`, a few
+    `read`s from the `seen` offset) and waits, bounded, for the ends of the jobs it found already
+    ended — so a peek straight after shows what a job printed while nobody was attached, and a job
+    that ended as ended. A read-back that fails stays pending for the next use. Test:
+    `tests/bash_sandbox_jobs.rs`'s deferred reattach, over every transport. A kept job with a number is the session's: under `KeepRunning` it is parked again under
     that number (the id counter is raised past it), released, followed from its `seen` offset — so
     a peek or its notice shows only what is new — with its shell's exit already reported; one that
     ended meanwhile gets an ordinary finish notice timed by the sandbox's `end` epoch (which, in
@@ -3126,9 +3144,10 @@ separate host `bash` instance (`build_tools` with `bash_waits_for_exit`) over th
     is noticed once). Across real replicas, `crates/fleet-sim` grades it on the local-directory and
     NFS substrates, over a v1.3 sandbox and a v1.2-only one: `sandbox-job-survives-its-replica` (a
     dev server started on one replica, that replica killed outright, the session reopened on the
-    other: still running, its output read on from the seen offset, killed from there) and
-    `sandbox-job-exit-noticed-once` (a build that finishes while its replica drains away is noticed
-    exactly once on the next).
+    other: listed "not yet checked" until the model's first look, then still running, its output
+    read on from the seen offset, killed from there) and `sandbox-job-exit-noticed-once` (a build
+    that finishes while its replica drains away is noticed exactly once on the next, at its first
+    `bash`).
 - **`run_in_background` (`Start::Background`, `JobKind::Background`)**. A boolean on `bash`, not a
   tool of its own: in the background-shell probe (1,500 trials on Luna, Sol, Kimi K2.7 Code and Qwen
   3.8 Flash with the real system prompt and tools) it beat a separate start tool on every model, was
@@ -4968,13 +4987,37 @@ skill/template paths, memory backend, session directory, model or gateway URL), 
 - **Persistence** opens a repo at `service.session_dir` with **no fallback** — a `service_mode`
   config that reached a session without a grant is an error, never the per-cwd default repo.
   `SessionMeta.cwd` is the grant's `workspace_root`.
-- **Exec, strict.** `ExecCell::strict()` has no host fallback: an empty cell errors instead of
-  running on `RealRunner`/`LocalFs`. On a replica that fallback is not stale config, it is a tenant's
-  `bash` on the machine every other tenant shares. The target is built from `exec_url` plus the
-  grant's `SecretHeader`s, then **probed**: `sh -c 'printf %s "$HOME"'`. A failure ends the session.
-  Its output becomes the backend's home (`ShellFs::with_home`), so `~` expands inside the sandbox; a
-  second `command -v bash` records which shell the remote `bash` tool should ask for. Exec headers
-  are never persisted — `set_exec_endpoint`, the only writer of that record, is refused.
+- **Exec, strict, and lazy.** `ExecCell::strict()` has no host fallback: an empty cell errors
+  instead of running on `RealRunner`/`LocalFs`. On a replica that fallback is not stale config, it is
+  a tenant's `bash` on the machine every other tenant shares. The target is built from `exec_url`
+  plus the grant's `SecretHeader`s, then **probed**: `sh -c 'printf %s "$HOME"'`. Its output becomes
+  the backend's home (`ShellFs::with_home`), so `~` expands inside the sandbox; a second
+  `command -v bash` records which shell the remote `bash` tool should ask for. Exec headers are never
+  persisted — `set_exec_endpoint`, the only writer of that record, is refused.
+
+  The probe runs **when the sandbox is first needed, not when the session opens**: a sandbox sleeps
+  when idle and any exec request wakes it, and a client reopening a chat to read it is no reason to
+  wake one. `ExecCell::set_lazy` installs `ServiceSession::lazy_exec` as the cell's connector, and
+  `CellRoute::resolve` runs it before the first call is dispatched — `CellRunner` and `CellFs` both
+  wait on it, so no tool can run before the probe, and concurrent first calls share one probe (a
+  `tokio` mutex, single flight). A failed probe is that call's error, worded as a failed start is
+  (`service::UNREACHABLE`: "this session's sandbox is unreachable: …"), and is not remembered: the
+  next call probes again. Until the probe has run, `CellFs::world` answers with the home the session
+  last saw, so a `~` resolves the same way before it as after. `CommandRunner::ready` connects
+  explicitly for the one synchronous question asked of a target (`sandbox_jobs`): `bash` calls it
+  before anything else, so a probe failure is reported once, as the call's error.
+
+  What a probe learned lives on the built target (`ExecTarget`: the runner, its lazily probed v1.2
+  streaming and v1.3 jobs capabilities, the `ShellFs` capability rung) and on the `ServiceSession`
+  (`Sandbox`: home and shell). It is thrown away, and the next call probes again, when the target
+  turns **suspect** — its runner raises a flag shared with the target (`HttpExecRunner::
+  with_suspect_flag`, `ExecTarget::watching`) on a request the endpoint did not answer or refused
+  with a non-2xx status, the signs of a replaced sandbox; a timeout does not count — and on a session
+  switch (`reset_exec_endpoint!` installs a fresh connector). A grant's credentials are fixed for a
+  session task's life, so a refreshed token arrives with a new task, which probes anew; the endpoint
+  cannot be re-pointed (`set_exec_endpoint` is refused). A session with no [snapshot](#sandbox-snapshot)
+  (a new one, or one saved by an older binary) connects at start, because building its prompt needs
+  the sandbox anyway, and a probe that fails then ends the session as before.
 - **Credentials.** `build_gateway_client` uses the grant's sealed `gateway_key` and skips the whole
   host ladder (`--key`, ambient provider env, `models.json` overrides, the OAuth store). The retry,
   shared-client and idle-timeout chain is unchanged.
@@ -5016,7 +5059,8 @@ are allowed now.
   `delete`, not a silent `Ok`).
 - `get_state` reports `cwd = workspace_root` and `cwd_stale = false`; `git_branch` runs in the
   sandbox through the session's runner (see "Sandbox discovery"), never against the replica's own
-  checkout.
+  checkout — and is `null` without asking while the sandbox is not attached yet, so a client's poll
+  never wakes a reopened session's sandbox.
 - Redacted: `session_file` is `null`, and `TrashEntry.original_path` plus every failed response's
   `error` have replica mount paths stripped (`ServiceSession::redact`, applied on the one frame
   funnel).
@@ -5037,9 +5081,10 @@ the search produced them). Oversized
 ### Sandbox discovery
 
 Everything a tenant's prompt is made of comes from the tenant's own box, read through the session's
-exec backend. `ServiceSession::resources` is the single seam that does it — session start and
-`reload` both call it, which is exactly why `reload` is allowed here at all: "re-walk the filesystem"
-now means the tenant's.
+exec backend. `ServiceSession::resources` is the single seam that does it — session start, the
+post-reopen refresh and `reload` all call it, which is exactly why `reload` is allowed here at all:
+"re-walk the filesystem" now means the tenant's. A reopened session starts from its saved set
+instead (see "Sandbox snapshot").
 
 | Resource                            | Sandbox roots (ascending specificity — a later one shadows an earlier)              |
 | ----------------------------------- | ----------------------------------------------------------------------------------- |
@@ -5090,6 +5135,44 @@ root — the one thing the field exists to prevent.
 `get_state.git_branch` runs `git symbolic-ref --short HEAD` through the session's runner, in the
 sandbox, with a 5 s timeout and `null` on anything unexpected — a slow or absent sandbox must make a
 poll answer `null`, never hang it, and must certainly never answer about the replica's own checkout.
+While the sandbox is not attached yet (a reopened session nothing has used) it answers `null`
+without asking.
+
+### Sandbox snapshot
+
+**A reopened session makes no exec request until it needs its sandbox.** What a session learned
+from its sandbox — the probe's `Sandbox` (home, shell) and the discovered `Resources` — is saved
+beside its transcript as a `service::Snapshot`: `sandbox-snapshot.json` inside the session's own
+directory (which moves, trashes and deletes whole), sealed under the tenant's transcript key and bound
+to the session id and kind (`TenantCodec::seal_sidecar`), written atomically
+(`write_private_atomic`). It is written at the top of `serve_session`'s loop whenever it is behind —
+after a start that discovered, a `reload`, a refresh, or a transcript switch (the new id gets its own)
+— and simply retried while the session's directory does not exist yet.
+
+The next task to open the session (a replica restart, the 60 s reap, a deploy) loads it
+(`ServiceSession::load_snapshot`: it must open, be this format, and match the grant's
+`workspace_root` and the process's `--no-context-files`; anything else is ignored and the session
+starts as a new one does). With one, start sends nothing: the cell is attached lazily with the saved
+home, the `ServiceSession` is seeded with the saved `Sandbox` (so tools build with the probed shell),
+discovery is skipped, and the prompt is built from the saved `Resources` — **the same system prompt,
+byte for byte**, so the prompt cache keeps hitting. The bash jobs' read-back is deferred too (see
+"Reattach" under "`bash` jobs").
+
+**Freshness.** Discovery runs again at the first loop iteration after the sandbox has been woken by
+real use (`sandbox_refresh`, checked while `!ExecCell::pending()`), so the refresh never wakes it
+itself. An unchanged set leaves the prompt alone; a changed one goes through `apply_discovered!` —
+the same rebuild `reload` does — so the change costs one prompt-cache miss on the next turn, as an
+explicit `reload` would. `reload` itself always rediscovers (and so wakes the sandbox: it was asked
+to). The first turns of a reopened session therefore use the set it had when it closed; an edit made
+inside the sandbox while nothing was attached shows up after the first real use, or at a `reload`.
+
+Tests: `tests/serve_service_lazy_sandbox.rs` (a reopen with a running job and discovered resources,
+`get_state` and `get_commands`, then a detach: zero exec requests, probe included; the first tool
+after a reopen probes exactly once and before its own request, also with three concurrent tools; a
+probe that fails then reaches the tool call; the reopened session's system prompt equals the one
+before the restart, with zero requests; a job that ended while detached), `exec_endpoint`'s
+`lazy_cell_tests` (single flight, a failure not remembered, a suspect target probed again) and
+`service`'s snapshot round trip.
 
 ### Storage: segmented, sealed sessions
 

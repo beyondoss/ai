@@ -17,7 +17,7 @@ use beyond_ai_agent::exec_endpoint::jobs::JobScope;
 use beyond_ai_agent::exec_endpoint::{HttpExecRunner, TemplateRunner};
 use beyond_ai_agent::tools::bash::{Bash, BashJob};
 use beyond_ai_agent::tools::bash_jobs::{BashJobs, EndPolicy};
-use beyond_ai_agent::tools::bash_sandbox::{Reattached, reattach};
+use beyond_ai_agent::tools::bash_sandbox::{Reattached, reattach, reattach_later};
 use beyond_ai_agent::tools::exec::CommandRunner;
 use beyond_ai_agent::tools::fs::FsBackend;
 use beyond_ai_agent::tools::fs::shell::{Capabilities, ShellFs};
@@ -252,6 +252,49 @@ async fn a_background_job_outlives_its_replica_and_the_next_one_takes_it_over() 
             0,
             "{t:?}: killed jobs leave no directory"
         );
+    }
+}
+
+/// A reattach deferred to the first use (`reattach_later`): nothing is read until a job is asked
+/// about, and then the answer is already the truth — a peek straight away shows what the job
+/// printed while nobody was attached, not an empty follow that has not caught up yet.
+#[tokio::test]
+async fn a_deferred_reattach_reads_the_jobs_back_when_one_is_asked_about() {
+    for t in ALL {
+        let sb = Sandbox::new(t).await;
+        let a = sb.replica(EndPolicy::KeepRunning);
+        let out = call(
+            a.bash.as_ref(),
+            json!({
+                "command": "echo \"pid $$\"; echo before; sleep 2; echo after; sleep 300",
+                "run_in_background": true,
+            }),
+        )
+        .await
+        .unwrap();
+        let pid = printed_pid(&out);
+        a.vanish();
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+
+        let b = sb.replica(EndPolicy::KeepRunning);
+        reattach_later(&b.jobs, sb.runner.clone());
+        assert!(b.jobs.reattach_pending(), "{t:?}");
+        // `after` is printed while the reattach is still deferred.
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        assert!(
+            b.jobs.reattach_pending(),
+            "{t:?}: nothing reads it back unasked"
+        );
+        let peek = call(&b.job, json!({ "job": 1, "timeout_ms": 0 }))
+            .await
+            .unwrap();
+        assert!(!b.jobs.reattach_pending(), "{t:?}: read back by the ask");
+        assert!(peek.contains("after"), "{t:?}: {peek}");
+        assert!(!peek.contains("before"), "{t:?}: already seen: {peek}");
+        let killed = kill_job(&b.job, 1).await.unwrap();
+        assert!(killed.contains("Job 1 (`"), "{t:?}: {killed}");
+        assert!(wait_dead(pid).await, "{t:?}: the kill reached the sandbox");
+        sb.wipe().await;
     }
 }
 

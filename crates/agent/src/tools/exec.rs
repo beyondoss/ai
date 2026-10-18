@@ -288,6 +288,14 @@ pub trait CommandRunner: Send + Sync {
         false
     }
 
+    /// Make sure the target is reachable before a caller asks something synchronous of it
+    /// ([`Self::sandbox_jobs`]): a runner whose target is attached lazily
+    /// ([`crate::exec_endpoint::ExecCell::set_lazy`]) connects here, and its error — the probe's —
+    /// is the caller's to report. Every other runner is ready already.
+    async fn ready(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
     /// The jobs the target this runner reaches can own — [`crate::exec_endpoint::jobs`] — or `None`
     /// when commands run on this host, whose jobs are this process's own.
     fn sandbox_jobs(
