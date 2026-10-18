@@ -5,8 +5,10 @@
 //! the gateway buffered (a `/{provider}` relay, or that re-run). The rules run in one order, and
 //! each point checks only the rules that apply there, so the same two violations can be answered
 //! differently by point. Each case pins the winning refusal's status, its exact body, its
-//! `ai_rejections_total` label, and that the upstream saw nothing. A foreign signed id is checked
-//! apart from the rules, and its place in the order at each point is pinned too.
+//! `ai_rejections_total` label, and what the upstream saw ([`Upstream`]): nothing, for a refusal
+//! before connecting; never the whole body, for one once the request headers went upstream. A
+//! foreign signed id is checked apart from the rules, and its place in the order at each point is
+//! pinned too.
 //!
 //! Run via `mise run test:integration:rs` (needs `nats-server` on PATH).
 
@@ -44,10 +46,29 @@ const PROVIDER_ID: &str = "resp_0750331520328311006abeeacfb62c87d0bdb6cbe1c41eea
 const IMAGE_CHAT: &str = r#"[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}]}]"#;
 const IMAGE_RESPONSES: &str = r#"[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}]"#;
 
-async fn run(cases: Vec<Case>) {
+/// What the upstream may see of a refused request.
+#[derive(Clone, Copy, Debug)]
+enum Upstream {
+    /// Nothing: refused before connecting (a small catalog body, or a large one ahead of its
+    /// re-run). Counted by every request head the upstream receives.
+    Untouched,
+    /// The request head, never the whole body: refused in `request_body_filter`, after the head
+    /// went upstream (which is why the refusal there is `DuplicateModelLate` / `ForeignIdLate`),
+    /// and before a byte of the body it holds. Whether the head arrives first is a race between
+    /// pingora's connect and the body read, so only requests that arrived whole are counted, as
+    /// `managed_unpriced.rs` counts them.
+    NoWholeBody,
+}
+
+async fn run(upstream: Upstream, cases: Vec<Case>) {
     let (pubkey, sk) = test_keypair(93);
-    let mock = MockUpstream::start(Mode::Json).await;
-    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+    let heads = MockUpstream::start(Mode::Json).await;
+    let whole = ScriptedUpstream::reply(200, "application/json", "{}".to_owned()).await;
+    let authority = match upstream {
+        Upstream::Untouched => heads.authority(),
+        Upstream::NoWholeBody => whole.authority(),
+    };
+    let gw = Gateway::builder(unused_nats_port(), &authority, &b64(&pubkey))
         .providers(&["openai", "deepseek"])
         .start()
         .await;
@@ -84,7 +105,15 @@ async fn run(cases: Vec<Case>) {
             failures.push(format!("{path} {short}: {label} went {before} -> {after}"));
         }
     }
-    assert_eq!(mock.hits(), 0, "a refused body reached the upstream");
+    let seen = match upstream {
+        Upstream::Untouched => heads.hits(),
+        Upstream::NoWholeBody => whole.hits(),
+    };
+    if seen != 0 {
+        failures.push(format!(
+            "{upstream:?}: the upstream saw {seen} refused requests"
+        ));
+    }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -94,7 +123,7 @@ async fn run(cases: Vec<Case>) {
 /// claim: SEC-21, TRN-5
 #[tokio::test]
 async fn before_connecting_the_first_rule_in_order_answers() {
-    run(vec![
+    run(Upstream::Untouched, vec![
         (
             "/v1/chat/completions",
             r#"{"model":"gpt-4o-mini","messages":[],"max_tokens":"9","model":"gpt-4o"}"#.into(),
@@ -134,7 +163,7 @@ async fn before_connecting_the_first_rule_in_order_answers() {
 #[tokio::test]
 async fn a_large_catalog_body_is_checked_before_and_in_its_re_run() {
     let pad = filler();
-    run(vec![
+    run(Upstream::Untouched, vec![
         (
             "/v1/chat/completions",
             format!(
@@ -153,6 +182,9 @@ async fn a_large_catalog_body_is_checked_before_and_in_its_re_run() {
             NO_IMAGE,
             "modality",
         ),
+    ])
+    .await;
+    run(Upstream::NoWholeBody, vec![
         (
             "/v1/chat/completions",
             format!(
@@ -180,7 +212,7 @@ async fn a_large_catalog_body_is_checked_before_and_in_its_re_run() {
 /// claim: SEC-21, BIL-23
 #[tokio::test]
 async fn a_buffered_provider_body_is_answered_by_the_first_rule_in_order() {
-    run(vec![
+    run(Upstream::NoWholeBody, vec![
         (
             "/openai/v1/chat/completions",
             r#"{"model":"not-a-model","messages":[],"tools":[{"type":"code_interpreter"}],"model":"gpt-4o"}"#.into(),
@@ -218,13 +250,16 @@ async fn a_buffered_provider_body_is_answered_by_the_first_rule_in_order() {
 /// claim: SEC-21
 #[tokio::test]
 async fn before_connecting_a_duplicate_model_answers_before_background() {
-    run(vec![(
-        "/v1/responses",
-        r#"{"model":"gpt-5","input":"hi","background":true,"model":"gpt-4o"}"#.into(),
-        400,
-        DUPLICATE_MODEL,
-        "duplicate_model",
-    )])
+    run(
+        Upstream::Untouched,
+        vec![(
+            "/v1/responses",
+            r#"{"model":"gpt-5","input":"hi","background":true,"model":"gpt-4o"}"#.into(),
+            400,
+            DUPLICATE_MODEL,
+            "duplicate_model",
+        )],
+    )
     .await;
 }
 
@@ -238,7 +273,7 @@ async fn before_connecting_a_duplicate_model_answers_before_background() {
 #[tokio::test]
 async fn a_foreign_id_answers_in_its_place_in_the_order() {
     let pad = filler();
-    run(vec![
+    run(Upstream::Untouched, vec![
         (
             "/v1/responses",
             format!(
@@ -275,6 +310,9 @@ async fn a_foreign_id_answers_in_its_place_in_the_order() {
             FOREIGN_ID,
             "foreign_id",
         ),
+    ])
+    .await;
+    run(Upstream::NoWholeBody, vec![
         (
             "/openai/v1/responses",
             format!(
