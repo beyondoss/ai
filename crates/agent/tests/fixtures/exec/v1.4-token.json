@@ -1,30 +1,20 @@
 {
   "spec": "exec protocol v1.4 sandbox job notify (crates/agent/src/exec_endpoint.rs, \"Sandbox job notify (v1.4)\"), \"The notify token (bjn_v1)\"",
   "notes": [
-    "secrets: the fleet seal secrets, standard base64 of 32 bytes, as --seal-key holds them. current mints; current, upcoming and retired verify; other belongs to no verifier.",
+    "secrets: fleet seal secrets, standard base64 of 32 bytes, as --seal-key holds them. current is the replica's own, which it mints and verifies under (N49); other is a seal secret the replica does not hold, such as the one before a rotation.",
     "keys: K = HKDF-SHA256(ikm = secret, salt = empty, info = \"bjn_v1 notify\") in hex, and kid = hex(SHA-256(\"bjn_v1 kid\" || K)[0..4]).",
     "minted: the intermediates of minting the first vector: m (the length-prefixed MAC input) and the tag in hex, and the token.",
-    "vectors: each token is verified with the verifier holding current, upcoming and retired, against context (the URL's tenant and session id, the body's scope and id; the purpose is always job_ended). expect is the verdict: valid, malformed, unknown_kid or bad_mac. malformed and bad_mac are answered 401, unknown_kid 503 (N63).",
+    "vectors: each token is verified by a replica holding current alone, against context (the URL's tenant and session id, the body's scope and id; the purpose is always job_ended). expect is the verdict: valid, malformed, unknown_kid or bad_mac. malformed and bad_mac are answered 401, unknown_kid 503 (N50).",
     "covers: the requirement tags of the spec each case exercises."
   ],
   "secrets": {
     "current": "YlK+ch86RvRX77H5h1Df74nrBNmj2dvkLMsEv0/P3vg=",
-    "upcoming": "wj5vlHFK/MFlZpzjmxIefwzslCeafUSj+OkxQtO8f0A=",
-    "retired": "K5VbNSmOaTDcL9mJKG+KM/6i6uuxZafrFaXDYt1Ff8s=",
     "other": "r/mVC5w/ihWq4uDlYuEOivGOshc1K0x83svKpy42oH0="
   },
   "keys": {
     "current": {
       "k_hex": "8da738dfdd13a091a45c75c6b7afbf0eadc4e747498a9b3ed5d2b49eeedf9f76",
       "kid": "4eba5aa3"
-    },
-    "upcoming": {
-      "k_hex": "e7fe20b7912b33090ed875f5fae4b39ace3911f31f99bf9491048fbb70cbf303",
-      "kid": "9f689c6e"
-    },
-    "retired": {
-      "k_hex": "aeb73271ad458434c4ba5d051e73de8af73b86efeadc337c3840718ac4be3183",
-      "kid": "27bf3f3d"
     },
     "other": {
       "k_hex": "7935b17c08e933cfcc0ab037544881272b81133b9e0a2e8b52ea809d6bbec1fc",
@@ -42,15 +32,13 @@
     "tag_hex": "f9d4dc94fa434ec885267fb29fb363b770386e1689ed36c1379254ec34a5c938",
     "token": "bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
     "covers": [
-      "N56",
-      "N58",
-      "N62"
+      "N44",
+      "N46",
+      "N49"
     ]
   },
   "verifier_keys": [
-    "current",
-    "upcoming",
-    "retired"
+    "current"
   ],
   "vectors": [
     {
@@ -64,38 +52,10 @@
       },
       "expect": "valid",
       "covers": [
-        "N58",
-        "N59",
-        "N60",
-        "N56"
-      ]
-    },
-    {
-      "name": "minted under a retired key the verifier still holds",
-      "token": "bjn_v1.27bf3f3d.nJJWN9UHFZUZd4ZH2y7YLNVu_Qx0aM-POQcBNxhNGAw",
-      "context": {
-        "tenant": "acme",
-        "session_id": "a07-s3.01J9ZQ4N6V",
-        "scope": "2ff302a37e7401aa95f92ec6c431944a",
-        "id": "0123456789abcdef"
-      },
-      "expect": "valid",
-      "covers": [
-        "N61"
-      ]
-    },
-    {
-      "name": "minted under an upcoming key the verifier already holds",
-      "token": "bjn_v1.9f689c6e.CwYcjG5yigWaOgDPdijiGp-S7G4Ka-Idg7ENAnzhVGE",
-      "context": {
-        "tenant": "acme",
-        "session_id": "a07-s3.01J9ZQ4N6V",
-        "scope": "2ff302a37e7401aa95f92ec6c431944a",
-        "id": "0123456789abcdef"
-      },
-      "expect": "valid",
-      "covers": [
-        "N61"
+        "N46",
+        "N47",
+        "N48",
+        "N44"
       ]
     },
     {
@@ -109,7 +69,7 @@
       },
       "expect": "bad_mac",
       "covers": [
-        "N59"
+        "N47"
       ]
     },
     {
@@ -123,7 +83,7 @@
       },
       "expect": "bad_mac",
       "covers": [
-        "N59"
+        "N47"
       ]
     },
     {
@@ -137,7 +97,7 @@
       },
       "expect": "bad_mac",
       "covers": [
-        "N59"
+        "N47"
       ]
     },
     {
@@ -151,7 +111,7 @@
       },
       "expect": "bad_mac",
       "covers": [
-        "N59"
+        "N47"
       ]
     },
     {
@@ -165,7 +125,7 @@
       },
       "expect": "bad_mac",
       "covers": [
-        "N59"
+        "N47"
       ]
     },
     {
@@ -179,7 +139,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N58"
+        "N46"
       ]
     },
     {
@@ -193,12 +153,12 @@
       },
       "expect": "malformed",
       "covers": [
-        "N58",
-        "N60"
+        "N46",
+        "N48"
       ]
     },
     {
-      "name": "minted under a key the verifier does not hold",
+      "name": "minted under a seal secret the replica does not hold (before a rotation)",
       "token": "bjn_v1.e4478834.BRCVCT0I1FP9VySNf8TtfSGz7V_2Zb1BFclygpPeFXY",
       "context": {
         "tenant": "acme",
@@ -208,8 +168,8 @@
       },
       "expect": "unknown_kid",
       "covers": [
-        "N61",
-        "N63"
+        "N49",
+        "N50"
       ]
     },
     {
@@ -223,23 +183,8 @@
       },
       "expect": "unknown_kid",
       "covers": [
-        "N61",
-        "N63"
-      ]
-    },
-    {
-      "name": "kid swapped for the retired key's, tag unchanged",
-      "token": "bjn_v1.27bf3f3d.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg",
-      "context": {
-        "tenant": "acme",
-        "session_id": "a07-s3.01J9ZQ4N6V",
-        "scope": "2ff302a37e7401aa95f92ec6c431944a",
-        "id": "0123456789abcdef"
-      },
-      "expect": "bad_mac",
-      "covers": [
-        "N59",
-        "N61"
+        "N49",
+        "N50"
       ]
     },
     {
@@ -253,7 +198,7 @@
       },
       "expect": "bad_mac",
       "covers": [
-        "N60"
+        "N48"
       ]
     },
     {
@@ -267,7 +212,7 @@
       },
       "expect": "bad_mac",
       "covers": [
-        "N60"
+        "N48"
       ]
     },
     {
@@ -281,7 +226,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N58"
+        "N46"
       ]
     },
     {
@@ -295,7 +240,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N58"
+        "N46"
       ]
     },
     {
@@ -309,7 +254,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N58"
+        "N46"
       ]
     },
     {
@@ -323,7 +268,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N58"
+        "N46"
       ]
     },
     {
@@ -337,7 +282,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N58"
+        "N46"
       ]
     },
     {
@@ -351,7 +296,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N58"
+        "N46"
       ]
     },
     {
@@ -365,7 +310,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N58"
+        "N46"
       ]
     },
     {
@@ -379,7 +324,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N58"
+        "N46"
       ]
     },
     {
@@ -393,7 +338,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N58"
+        "N46"
       ]
     },
     {
@@ -407,7 +352,7 @@
       },
       "expect": "malformed",
       "covers": [
-        "N58"
+        "N46"
       ]
     }
   ]
