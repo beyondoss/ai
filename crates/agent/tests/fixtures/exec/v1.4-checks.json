@@ -320,17 +320,7 @@
       "checks": [
         {
           "kind": "test",
-          "name": "grant::a_purpose_claim_limits_the_request",
-          "task": "B2"
-        },
-        {
-          "kind": "test",
-          "name": "serve_job_ended::a_callback_grant_runs_nothing_else",
-          "task": "B2"
-        },
-        {
-          "kind": "test",
-          "name": "serve_job_ended::a_user_grant_cannot_end_a_job",
+          "name": "serve_job_ended::the_token_header_is_read_exactly",
           "task": "B2"
         },
         {
@@ -344,13 +334,8 @@
       "checks": [
         {
           "kind": "test",
-          "name": "grant::verifier_rejects_each_negative_vector_with_its_own_error",
-          "task": "exists"
-        },
-        {
-          "kind": "fleet-sim",
-          "name": "job-ended-waits-for-every-replica",
-          "task": "D2"
+          "name": "serve_job_ended::job_ended_is_only_a_callback",
+          "task": "B2"
         }
       ]
     },
@@ -359,7 +344,7 @@
       "checks": [
         {
           "kind": "test",
-          "name": "serve_job_ended::the_token_header_is_read_exactly",
+          "name": "serve_job_ended::a_forged_callback_reaches_nothing",
           "task": "B2"
         },
         {
@@ -373,17 +358,7 @@
       "checks": [
         {
           "kind": "test",
-          "name": "serve_job_ended::job_ended_is_only_a_callback",
-          "task": "B2"
-        }
-      ]
-    },
-    {
-      "id": "N32",
-      "checks": [
-        {
-          "kind": "test",
-          "name": "serve_job_ended::a_forged_callback_opens_nothing",
+          "name": "serve_job_ended::a_callback_never_opens_a_session",
           "task": "B2"
         },
         {
@@ -393,7 +368,7 @@
       ]
     },
     {
-      "id": "N33",
+      "id": "N32",
       "checks": [
         {
           "kind": "test",
@@ -403,17 +378,7 @@
       ]
     },
     {
-      "id": "N34",
-      "checks": [
-        {
-          "kind": "test",
-          "name": "serve_job_ended::never_creates_a_session",
-          "task": "B2"
-        }
-      ]
-    },
-    {
-      "id": "N35",
+      "id": "N33",
       "checks": [
         {
           "kind": "test",
@@ -423,7 +388,7 @@
       ]
     },
     {
-      "id": "N36",
+      "id": "N34",
       "checks": [
         {
           "kind": "test",
@@ -433,7 +398,7 @@
       ]
     },
     {
-      "id": "N37",
+      "id": "N35",
       "checks": [
         {
           "kind": "test",
@@ -443,7 +408,7 @@
       ]
     },
     {
-      "id": "N38",
+      "id": "N36",
       "checks": [
         {
           "kind": "test",
@@ -453,7 +418,7 @@
       ]
     },
     {
-      "id": "N39",
+      "id": "N37",
       "checks": [
         {
           "kind": "test",
@@ -463,7 +428,7 @@
       ]
     },
     {
-      "id": "N40",
+      "id": "N38",
       "checks": [
         {
           "kind": "test",
@@ -477,7 +442,7 @@
       ]
     },
     {
-      "id": "N41",
+      "id": "N39",
       "checks": [
         {
           "kind": "test",
@@ -487,7 +452,7 @@
       ]
     },
     {
-      "id": "N42",
+      "id": "N40",
       "checks": [
         {
           "kind": "test",
@@ -501,7 +466,7 @@
       ]
     },
     {
-      "id": "N43",
+      "id": "N41",
       "checks": [
         {
           "kind": "test",
@@ -511,7 +476,7 @@
       ]
     },
     {
-      "id": "N44",
+      "id": "N42",
       "checks": [
         {
           "kind": "test",
@@ -521,7 +486,7 @@
       ]
     },
     {
-      "id": "N45",
+      "id": "N43",
       "checks": [
         {
           "kind": "test",
@@ -536,17 +501,17 @@
       ]
     },
     {
-      "id": "N46",
+      "id": "N44",
       "checks": [
         {
           "kind": "test",
-          "name": "serve_job_ended::a_callback_open_reconciles_now",
-          "task": "B2"
+          "name": "job_notify::a_reaped_session_is_as_today",
+          "task": "B6"
         }
       ]
     },
     {
-      "id": "N47",
+      "id": "N45",
       "checks": [
         {
           "kind": "test",
@@ -556,17 +521,7 @@
       ]
     },
     {
-      "id": "N48",
-      "checks": [
-        {
-          "kind": "test",
-          "name": "job_ledger::the_record_precedes_the_keep",
-          "task": "B3"
-        }
-      ]
-    },
-    {
-      "id": "N49",
+      "id": "N46",
       "checks": [
         {
           "kind": "test",
@@ -576,7 +531,7 @@
       ]
     },
     {
-      "id": "N50",
+      "id": "N47",
       "checks": [
         {
           "kind": "test",
@@ -586,17 +541,7 @@
       ]
     },
     {
-      "id": "N51",
-      "checks": [
-        {
-          "kind": "test",
-          "name": "job_ledger::a_new_transcript_wipes_first",
-          "task": "B3"
-        }
-      ]
-    },
-    {
-      "id": "N52",
+      "id": "N48",
       "checks": [
         {
           "kind": "test",
@@ -606,7 +551,7 @@
       ]
     },
     {
-      "id": "N53",
+      "id": "N49",
       "checks": [
         {
           "kind": "test",
@@ -616,7 +561,7 @@
       ]
     },
     {
-      "id": "N54",
+      "id": "N50",
       "checks": [
         {
           "kind": "test",
@@ -626,7 +571,7 @@
       ]
     },
     {
-      "id": "N55",
+      "id": "N51",
       "checks": [
         {
           "kind": "test",
@@ -641,7 +586,7 @@
       ]
     },
     {
-      "id": "N56",
+      "id": "N52",
       "checks": [
         {
           "kind": "test",
@@ -651,7 +596,7 @@
       ]
     },
     {
-      "id": "N57",
+      "id": "N53",
       "checks": [
         {
           "kind": "test",
@@ -666,7 +611,7 @@
       ]
     },
     {
-      "id": "N58",
+      "id": "N54",
       "checks": [
         {
           "kind": "test",
@@ -676,7 +621,7 @@
       ]
     },
     {
-      "id": "N59",
+      "id": "N55",
       "checks": [
         {
           "kind": "test",
@@ -686,7 +631,7 @@
       ]
     },
     {
-      "id": "N60",
+      "id": "N56",
       "checks": [
         {
           "kind": "fixture",
@@ -695,7 +640,7 @@
       ]
     },
     {
-      "id": "N61",
+      "id": "N57",
       "checks": [
         {
           "kind": "test",
@@ -710,7 +655,7 @@
       ]
     },
     {
-      "id": "N62",
+      "id": "N58",
       "checks": [
         {
           "kind": "fixture",
@@ -719,7 +664,7 @@
       ]
     },
     {
-      "id": "N63",
+      "id": "N59",
       "checks": [
         {
           "kind": "fixture",
@@ -728,7 +673,7 @@
       ]
     },
     {
-      "id": "N64",
+      "id": "N60",
       "checks": [
         {
           "kind": "test",
@@ -742,7 +687,7 @@
       ]
     },
     {
-      "id": "N65",
+      "id": "N61",
       "checks": [
         {
           "kind": "fixture",
@@ -761,7 +706,7 @@
       ]
     },
     {
-      "id": "N66",
+      "id": "N62",
       "checks": [
         {
           "kind": "test",
@@ -771,7 +716,7 @@
       ]
     },
     {
-      "id": "N67",
+      "id": "N63",
       "checks": [
         {
           "kind": "fixture",
@@ -784,7 +729,7 @@
       ]
     },
     {
-      "id": "N68",
+      "id": "N64",
       "checks": [
         {
           "kind": "fleet-sim",
@@ -812,7 +757,7 @@
       "checks": [
         {
           "kind": "fleet-sim",
-          "name": "job-ended-reaches-the-owner",
+          "name": "job-ended-forwarded-unchanged",
           "task": "D2"
         }
       ]
@@ -822,7 +767,7 @@
       "checks": [
         {
           "kind": "fleet-sim",
-          "name": "job-ended-unknown-session-is-401",
+          "name": "job-ended-goes-only-to-the-hashed-replica",
           "task": "D2"
         }
       ]
@@ -832,7 +777,7 @@
       "checks": [
         {
           "kind": "fleet-sim",
-          "name": "job-ended-opens-an-unowned-session",
+          "name": "job-ended-answers-within-25s",
           "task": "D2"
         }
       ]
@@ -842,33 +787,13 @@
       "checks": [
         {
           "kind": "fleet-sim",
-          "name": "job-ended-answers-within-25s",
-          "task": "D2"
-        }
-      ]
-    },
-    {
-      "id": "E6",
-      "checks": [
-        {
-          "kind": "fleet-sim",
           "name": "job-ended-status-passes-through",
           "task": "D2"
         }
       ]
     },
     {
-      "id": "E7",
-      "checks": [
-        {
-          "kind": "fleet-sim",
-          "name": "job-ended-waits-for-every-replica",
-          "task": "D2"
-        }
-      ]
-    },
-    {
-      "id": "E8",
+      "id": "E6",
       "checks": [
         {
           "kind": "fleet-sim",

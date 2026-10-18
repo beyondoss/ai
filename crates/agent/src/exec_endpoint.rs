@@ -264,7 +264,7 @@
 //! an end, or with leftover processes, is exactly what it does today when a held stream tells it:
 //! the same notice, through the same path, starting or joining a turn exactly as today, whether or
 //! not a client is attached, in every mode (the daemon, service mode, stdio, sessions driven by
-//! POSTs). Notify is only ever available in service mode (N53), so everywhere else nothing changes
+//! POSTs). Notify is only ever available in service mode (N49), so everywhere else nothing changes
 //! at all, except that the baseline stops showing a job that left nothing running as `exited` for
 //! the moment before its end is recorded (N14), which only a `read` or `list` could see.
 //!
@@ -292,7 +292,7 @@
 //! `ended`, `lost`, `gone`). A *state change* is `running` → `exited`, or any state → `ended` or
 //! `lost`. *Observable* means that a `read` or `list` of the job that starts after that moment
 //! reports it. A *generation* is the value of the `keep` query parameter of a notify `url`: the
-//! replica draws a fresh one for every `keep` it sends with `notify` (N53). A job is *proving*,
+//! replica draws a fresh one for every `keep` it sends with `notify` (N49). A job is *proving*,
 //! *held* or *released* as the release table says ("Release"). The *ledger*, the *open reconcile*,
 //! the *live reconcile* and the *sweep* are defined below.
 //!
@@ -315,7 +315,7 @@
 //!
 //! An endpoint SHOULD NOT advertise notify when it knows it has no outbound network. No client
 //! relies on the advertisement alone: nothing is released until a callback has actually arrived
-//! (N52).
+//! (N48).
 //!
 //! ### `keep` with `notify`
 //!
@@ -373,7 +373,7 @@
 //!   `list` made then reports the job kept) and no later than 2 s after the `keep` is answered. The
 //!   job may well be running; the receiver checks, finds that, and does nothing else. The
 //!   callback's arrival is what tells the replica that the path from this sandbox to its session
-//!   works (N52). (check: conformance `first callback at keep`)
+//!   works (N48). (check: conformance `first callback at keep`)
 //! - **N12** State changes. When a job whose latest `keep` carries `notify` makes a state change,
 //!   the endpoint MUST start a notification whose first attempt begins after the new state is
 //!   observable and no later than 2 s after it became observable. An end is reported only once the
@@ -408,7 +408,7 @@
 //!   `id` byte for byte as the `keep` named them, at most 512 bytes. The endpoint MUST NOT send
 //!   anything else in the body, whatever the job's state. `type` names the `serve` command the body
 //!   is (see "The receiver"). The body carries no correlation id, and the receiver needs none
-//!   (N36). (check: conformance `callback request shape`; fixture `v1.4-callback.json`)
+//!   (N34). (check: conformance `callback request shape`; fixture `v1.4-callback.json`)
 //! - **N19** The endpoint MUST NOT follow a redirect. A `3xx` answer ends the notification, since a
 //!   redirect would carry the token to an origin `keep` did not name. (check: conformance `callback
 //!   does not follow redirects`; fixture `v1.4-retry.json`)
@@ -430,7 +430,7 @@
 //! | answer | meaning | the endpoint |
 //! |---|---|---|
 //! | `2xx` | the receiver has looked at the job | ends the notification: done |
-//! | `401`, `403`, `404`, `410` | the token, the session or the job is refused, and always will be. The fleet never answers these for a fault of its own: a missing key, a skewed clock, a rotation or a rollout is a `503` (N32) | ends the notification: stop |
+//! | `401`, `403`, `404`, `410` | the token, the session or the job is refused, and always will be. A v1.4 replica never answers these for a fault of the fleet's: a missing key or a key not yet rolled out is a `503` (N30) | ends the notification: stop |
 //! | `407`, `408`, `425`, `429`, `5xx`, a connection error, a TLS failure, no answer in 30 s | not now | retries, per N24 |
 //! | anything else (`1xx`, `3xx`, `400`, `411`, `413`, `421`, other `4xx`) | the request itself is wrong; sending it again cannot help | ends the notification: stop |
 //!
@@ -448,9 +448,9 @@
 //! the first, and the whole notification is over within 723 s. A storage-lease takeover after a
 //! hard kill took at most 120 s in the fleet's measurements (FLEET.md, Requirement 3), so a
 //! notification whose attempts fail instantly is still trying after one: its tenth attempt begins
-//! at 121.5 s at the earliest. A notification that runs out of attempts loses nothing: a live
-//! session finds the end within 5 minutes (N58), and any other session at its next open reconcile
-//! (N50).
+//! at 121.5 s at the earliest. A notification that runs out of attempts, or is stopped, loses
+//! nothing: a live session finds the end within 5 minutes (N54), and any other session when it next
+//! opens, as today (N44).
 //!
 //! ### The token stays secret
 //!
@@ -469,216 +469,167 @@
 //! looks: the baseline runs the model's commands as the same user as the supervisor, so they can
 //! read the `notify` file, and rewrite its `url`. What such a program gains is small by
 //! construction. It can start a live reconcile of one job of one session, at most one a second
-//! (N41). It can fake its own job's proof, so the stream is released over a path it then breaks,
-//! which only delays that one job's report to the sweep (N58). It cannot open a session it has no
-//! token for, run a command, read anything, or reach another session or tenant (N28, N63).
+//! (N39). It can fake its own job's proof, so the stream is released over a path it then breaks,
+//! which only delays that one job's report to the sweep (N54). It cannot open any session, run a
+//! command, read anything, or reach another session or tenant (N31, N59).
 //!
 //! ### The receiver
 //!
 //! A callback is a `serve` command, `job_ended`, POSTed to the session's own address,
-//! `/_beyond/agent?session_id=<id>&keep=<generation>`. The edge (FLEET.md, E1–E8) recognises a
-//! callback by its `Authorization` header, routes it like any request for that session, to the
-//! replica that owns it or to one that opens it, and attaches a **callback grant**: the session
-//! grant it would attach to a connection to that session, plus one claim, `"purpose": "job_ended"`.
-//! The claim is what limits the request, at every replica, whatever any of them makes of its
-//! headers. The token is what authorises it.
+//! `/_beyond/agent?session_id=<id>&tenant=<tenant>&keep=<generation>`. The edge (FLEET.md, E1–E5)
+//! routes it on the session hash ring like any request for that session id, and attaches, mints and
+//! verifies nothing: the replica verifies the token itself.
+//!
+//! **A callback never opens a session.** Today a session that is closed, reaped or moved learns of
+//! a job's end only when it next opens and reads its sandbox's jobs back, and v1.4 changes nothing
+//! about that. So a callback matters only to a session open in some replica's process right now.
+//! The replica the edge reaches either has the session open, and reconciles, or answers that no one
+//! is listening, and does nothing at all.
 //!
 //! No requirement here relies on a session id being secret: some are predictable (a fork's id is
 //! derived from a per-process salt and a counter). A request without a valid token for the job it
-//! names opens nothing and reads nothing, whatever session id it names, and the edge answers an
-//! unknown session as it answers a bad token (E3).
+//! names is refused before the replica looks for the session, so it reaches nothing and learns
+//! nothing, not even whether the session exists.
 //!
-//! - **N28** The purpose claim. A grant's payload MAY carry `purpose`, whose only value is
-//!   `"job_ended"`; a grant without it is an ordinary grant, and a grant with any other value fails
-//!   as a malformed claim does. Under a grant with the claim, a replica MUST refuse with `403`
-//!   every request but a `POST` whose body is a `job_ended` command (a WebSocket upgrade, or any
-//!   other command), and decides that from the verified grant alone, never from a header. Under a
-//!   grant without the claim, a replica MUST refuse `job_ended` with `403`. The claim limits only
-//!   the request that carries it: a session the request opens or reaches is the same session,
-//!   holding the same secrets, as any grant for it would give. (check:
-//!   `grant::a_purpose_claim_limits_the_request`;
-//!   `serve_job_ended::a_callback_grant_runs_nothing_else`;
-//!   `serve_job_ended::a_user_grant_cannot_end_a_job`; fixture `v1.4-callback.json`)
-//! - **N29** Fail closed. A replica that predates the claim refuses every grant carrying it: its
-//!   payload is `deny_unknown_fields`, so the claim is an unknown field and the grant fails `401`,
-//!   and the callback grant opens nothing there. The rollout order MUST therefore be: every replica
-//!   the edge can route to accepts the claim before the edge mints one (FLEET.md, E7); and while
-//!   the edge mints them, no replica is rolled back to a version without it. (check:
-//!   `grant::verifier_rejects_each_negative_vector_with_its_own_error`; fleet-sim
-//!   `job-ended-waits-for-every-replica`)
-//! - **N30** The token's header. A request's value of a header is its field value with leading and
-//!   trailing spaces and tabs removed. A request is a *callback* when it has exactly one
-//!   `Authorization` header and that value is `Bearer` (compared without regard to ASCII case), one
-//!   or more spaces, and then `bjn_v1.`; the token is everything after the spaces. A request *looks
-//!   like* a callback when any of its `Authorization` values is `bearer` (any case), any run of
-//!   spaces and tabs (none included), and then `bjn_v1.`. The edge classifies with these same two
-//!   rules (E1). Under a callback grant, a replica MUST read the token by the first rule, and MUST
-//!   answer `503` a request that is not a callback by it: the edge sent it as one, so the two
-//!   disagree, which is the fleet's fault. (check:
-//!   `serve_job_ended::the_token_header_is_read_exactly`; fixture `v1.4-callback.json`)
-//! - **N31** `job_ended` MUST be accepted only as an HTTP `POST` under a callback grant. Sent any
-//!   other way (a WebSocket frame, stdio, a `POST` outside service mode) it is refused: `403` over
-//!   HTTP, a failed `response` otherwise. A replica in service mode that holds no notify key
-//!   answers every callback `503`, as a misconfiguration the fleet can mend. (check:
-//!   `serve_job_ended::job_ended_is_only_a_callback`)
-//! - **N32** The receiver MUST check a request, in this order, and answer at the first failure.
-//!   Steps 1 to 3 are the front door's own, in its own order, for every request. (1) The URL's
-//!   session id is well formed (`400`). (2) The grant verifies (`401`). (3) The grant is for that
-//!   session (`403`), its claims are well formed (`400`), and it is for a shard this replica mounts
-//!   (`421`). At steps 2 and 3 a request that looks like a callback (N30) is answered `503` instead
-//!   of `401`, `403` or `400`: the edge minted its grant, so a grant that fails there is a skewed
-//!   clock, a signing key not yet rolled out, or another fault of the fleet's, and the sandbox must
-//!   try again rather than stop. (4) A callback grant is on a `POST` (`403`, N28). (5) The body: a
-//!   `Content-Length` (`411`), at most 4096 bytes (`413`), a JSON object (`400`) whose `type` is
-//!   `job_ended` under a callback grant and only there (`403`, N28), with exactly the members
-//!   `type`, `scope` and `id`, `id` a v1.3 job id and `scope` a string of at most 64 bytes (`400`).
-//!   (6) The token's header (`503`, N30). (7) The replica holds a notify key (`503`, N31). (8) The
-//!   token (N63): `401` when it is `malformed` or `bad_mac`, `503` when its kid is unknown (N67).
-//!   (9) `scope` against the session's own scope, [`jobs::JobScope::for_session`] of the grant's
-//!   tenant and session (`403`). Only a request that passes all of them may open, create or start a
-//!   session, or send anything to the sandbox. (check:
-//!   `serve_job_ended::a_forged_callback_opens_nothing`; fixture `v1.4-callback.json`)
-//! - **N33** The refusals of steps 4 to 9 MUST each have a fixed body for their status that says
-//!   nothing about which check failed beyond the status. Steps 1 to 3 answer as the front door does
-//!   for every request. (check: `serve_job_ended::refusals_say_nothing`)
-//! - **N34** A `job_ended` MUST NOT create a session. One for a session that does not exist is
-//!   answered `404`. (check: `serve_job_ended::never_creates_a_session`)
-//! - **N35** A replica MUST serve `job_ended` whether or not a run is in flight in the session, and
+//! - **N28** A request's value of a header is its field value with leading and trailing spaces and
+//!   tabs removed. A request is a *callback* when it has exactly one `Authorization` header and
+//!   that value is `Bearer` (compared without regard to ASCII case), one or more spaces, and then
+//!   `bjn_v1.`; the token is everything after the spaces. A request *looks like* a callback when
+//!   any of its `Authorization` values is `bearer` (any case), any run of spaces and tabs (none
+//!   included), and then `bjn_v1.`. A replica MUST handle a callback only as this section says,
+//!   before and instead of the front door's grant check, ignoring any session grant it carries, and
+//!   MUST answer `400` a request that looks like a callback but is not one. The edge classifies
+//!   with these same two rules (E1). (check: `serve_job_ended::the_token_header_is_read_exactly`;
+//!   fixture `v1.4-callback.json`)
+//! - **N29** `job_ended` MUST be accepted only in a callback. Sent any other way (under a session
+//!   grant, over a WebSocket, on stdio) it is refused: `403` over HTTP, a failed `response`
+//!   otherwise. Outside service mode every callback is answered `403`, and a replica in service
+//!   mode that holds no notify key answers every callback `503`, as a misconfiguration the fleet
+//!   can mend. (check: `serve_job_ended::job_ended_is_only_a_callback`)
+//! - **N30** The receiver MUST check a callback in this order, and answer at the first failure. (1)
+//!   It is a `POST` (`403`). (2) The URL names a well-formed session id and tenant (`400`). (3) The
+//!   body: a `Content-Length` (`411`), at most 4096 bytes (`413`), a JSON object (`400`) whose
+//!   `type` is `job_ended` (`403`), with exactly the members `type`, `scope` and `id`, `id` a v1.3
+//!   job id and `scope` a string of at most 64 bytes (`400`). (4) The replica is in service mode
+//!   (`403`) and holds a notify key (`503`, N29). (5) The token (N59): `401` when it is `malformed`
+//!   or `bad_mac`, `503` when its kid is unknown (N63). (6) `scope` is the session's own,
+//!   [`jobs::JobScope::for_session`] of the URL's tenant and session (`403`). Only a callback that
+//!   passes all of them may look for the session, or send anything to the sandbox. (check:
+//!   `serve_job_ended::a_forged_callback_reaches_nothing`; fixture `v1.4-callback.json`)
+//! - **N31** A callback MUST NOT open, create, start or load a session, and MUST NOT write to
+//!   storage. When no session task in this process holds the URL's session for the URL's tenant, a
+//!   callback that passes N30 MUST be answered `200` with a `job_ended` `response` whose `data` is
+//!   `{"listener": false}`, and nothing else happens: that session reads the job back when it next
+//!   opens, exactly as today. (check: `serve_job_ended::a_callback_never_opens_a_session`; fixture
+//!   `v1.4-callback.json`)
+//! - **N32** Each refusal of N30 MUST have a fixed body for its status that says nothing about
+//!   which check failed beyond the status. (check: `serve_job_ended::refusals_say_nothing`)
+//! - **N33** A replica MUST serve `job_ended` whether or not a run is in flight in the session, and
 //!   MUST answer it only with a status this section names: never with the `200` and failed
 //!   `response` with which a busy session answers other commands. A callback *arrives* when the
 //!   replica has read its request head. (check: `serve_job_ended::served_during_a_run`)
-//! - **N36** A replica MUST answer each callback from the reconcile that callback itself waited
+//! - **N34** A replica MUST answer each callback from the reconcile that callback itself waited
 //!   for, through a reply path that belongs to that request alone. It MUST NOT pick the answer out
 //!   of the session's output by id, command or any other value that another request or client can
 //!   carry, and it MUST NOT send the callback's answer to the session's clients. A callback whose
 //!   connection closes before it is answered MUST stop waiting. (check:
 //!   `serve_job_ended::each_callback_gets_its_own_answer`)
-//! - **N37** A `job_ended` request MUST NOT count as an attached client at any moment. A session it
-//!   opens starts detached, with its idle clock started when it opened, and is reapable under the
-//!   ordinary rule. A session MUST NOT be reaped while a callback's reconcile runs in it, and a
-//!   callback MUST NOT restart or extend the idle clock of a detached session. (check:
-//!   `serve_job_ended::the_callback_is_not_a_client`)
+//! - **N35** A callback MUST NOT count as an attached client at any moment, and MUST NOT restart or
+//!   extend the idle clock of a detached session. A session MUST NOT be reaped while a callback's
+//!   reconcile runs in it. (check: `serve_job_ended::the_callback_is_not_a_client`)
 //!
 //! **Reconciles.** A reconcile reads one session's jobs back from its sandbox. There are two, and
 //! they differ in what they may change.
 //!
-//! - **N38** The *open reconcile* is the read-back a transcript runs when it opens
+//! - **N36** The *open reconcile* is the read-back a transcript runs when it opens
 //!   (`tools::bash_sandbox`'s reattach): `list` the scope, adopt each kept job with a number, read
-//!   what ended up to its end, and kill what nobody kept. It runs once per opening of a transcript:
-//!   at once when a callback opened the session (N46), otherwise at the session's first use of its
-//!   sandbox, as today. It MUST NOT kill, replace or re-follow a job the session already tracks.
-//!   (check: `job_notify::the_open_reconcile_spares_tracked_jobs`)
-//! - **N39** The *live reconcile* is what a callback, or the sweep (N58), runs in a session whose
-//!   open reconcile has finished; a callback that arrives while the open reconcile is still pending
-//!   runs that instead. In the sandbox it MUST `list` the scope and MAY `read` a job, and MUST do
-//!   nothing else: no `kill`, `remove`, `keep`, `start`, `attach` or `wipe`. In the session it acts
-//!   on two kinds of job only: one it tracks as released (the release table's `released` row), and
-//!   one in `proving` whose callback carries its current generation (the table's proof rows). Every
-//!   other job (held, followed, proving without its proof, unkept, foreground, yielded, or not
-//!   tracked at all) it MUST leave exactly as it was: never adopted, replaced, re-followed, re-kept
-//!   or killed. (check: `job_notify::the_live_reconcile_changes_only_released_jobs`)
-//! - **N40** A verified callback MUST be answered `200` (with a `job_ended` `response` frame) only
-//!   once its job's state is recorded in the session: a reconcile that began after the callback
-//!   arrived has finished, and what it found to report has been handed to the session as a held
-//!   stream hands over an end or leftovers (N44); or N42 applies. It is answered `410` when, after
-//!   any pending scope wipe (N51), the transcript's ledger has no record of the job, and `503` when
-//!   the reconcile could not finish (the session could not open, or the sandbox could not be
-//!   listed). The endpoint retries a `503`, so its schedule is what carries the report across a
-//!   replica that fails mid-reconcile. (check: `serve_job_ended::answers_after_the_reconcile`;
-//!   fixture `v1.4-callback.json`)
-//! - **N41** A session runs at most one reconcile at a time. A callback that arrives while one runs
+//!   what ended up to its end, and kill what nobody kept. It runs at the session's first use of its
+//!   sandbox, as today, never because of a callback, and MUST NOT kill, replace or re-follow a job
+//!   the session already tracks. (check: `job_notify::the_open_reconcile_spares_tracked_jobs`)
+//! - **N37** The *live reconcile* is what a callback, or the sweep (N54), runs in an open session
+//!   whose open reconcile has finished. In the sandbox it MUST `list` the scope and MAY `read` a
+//!   job, and MUST do nothing else: no `kill`, `remove`, `keep`, `start`, `attach` or `wipe`. In
+//!   the session it acts on two kinds of job only: one it tracks as released (the release table's
+//!   `released` row), and one in `proving` whose callback carries its current generation (the
+//!   table's proof rows). Every other job (held, followed, proving without its proof, unkept,
+//!   foreground, yielded, or not tracked at all) it MUST leave exactly as it was: never adopted,
+//!   replaced, re-followed, re-kept or killed. (check:
+//!   `job_notify::the_live_reconcile_changes_only_released_jobs`)
+//! - **N38** A callback for an open session MUST be answered `200` (with a `job_ended` `response`
+//!   whose `data` is `{"listener": true}`) only once its job's state is recorded in the session: a
+//!   live reconcile that began after the callback arrived has finished, and what it found to report
+//!   has been handed to the session as a held stream hands over an end or leftovers (N42); or N40
+//!   applies. It is answered `410` when the session neither tracks the job nor has recorded its
+//!   end, and `503` when the reconcile could not finish (the sandbox could not be listed). The
+//!   endpoint retries a `503`. (check: `serve_job_ended::answers_after_the_reconcile`; fixture
+//!   `v1.4-callback.json`)
+//! - **N39** A session runs at most one reconcile at a time. A callback that arrives while one runs
 //!   waits for the next, and every callback that arrives during the same reconcile shares that next
 //!   one: callbacks in a burst cost at most two reconciles. A reconcile that callbacks started MUST
 //!   NOT begin less than 1 s after the session's previous reconcile ended, so a program in the
 //!   sandbox that sends a real token in a loop costs at most one reconcile a second. (check:
 //!   `serve_job_ended::one_reconcile_at_a_time`)
-//! - **N42** A callback MUST be answered `200` without contacting the sandbox when the ledger marks
-//!   its job's end reported, and when the session holds the job's stream or follow and the callback
-//!   is not that job's proof: the stream reports the job. (check:
-//!   `serve_job_ended::repeats_are_free`; fixture `v1.4-callback.json`)
-//! - **N43** A callback MUST change nothing by itself: only what a reconcile reads changes a job's
+//! - **N40** A callback for an open session MUST be answered `200` without contacting the sandbox
+//!   when the session has recorded the job's end; when the session holds the job's stream or follow
+//!   and the callback is not that job's proof, since the stream reports the job; and when the
+//!   session's open reconcile has not run yet, since nothing of it is released before then and that
+//!   reconcile reads the job back, as today. (check: `serve_job_ended::repeats_are_free`; fixture
+//!   `v1.4-callback.json`)
+//! - **N41** A callback MUST change nothing by itself: only what a reconcile reads changes a job's
 //!   state or produces a notice. A callback for a job that is still running leaves it running and
 //!   produces no notice. (check: `serve_job_ended::a_callback_is_only_a_hint`)
 //!
 //! **What the session does with what it learns.**
 //!
-//! - **N44** A job's end, or its leftovers, that a live reconcile finds MUST be handed to the
+//! - **N42** A job's end, or its leftovers, that a live reconcile finds MUST be handed to the
 //!   session exactly as the same end or leftovers arriving over a held stream: the same notice (the
 //!   output read up to the job's end, then its status), through the same path, with the same
 //!   consequences: a turn started when the session is idle, the notice joined to a run in flight
-//!   otherwise, whether or not a client is attached. What an open reconcile finds is handled
-//!   exactly as a reattach handles it today. (check:
+//!   otherwise, whether or not a client is attached. (check:
 //!   `job_notify::a_notified_end_behaves_as_a_streamed_one`)
-//! - **N45** A job's end, and its leftover processes, MUST each be reported at most once per
+//! - **N43** A job's end, and its leftover processes, MUST each be reported at most once per
 //!   session, across every source: a held stream, a follow, a live reconcile, the sweep, an open
-//!   reconcile, a `bash_job` wait, and the reopen note. The reopen note is not an end report for a
-//!   job the ledger holds: it MUST NOT call such a job gone, since the ledger's rules report its
-//!   end (N50). (check: `serve_job_ended::one_report_per_end`; fleet-sim
+//!   reconcile, and a `bash_job` wait. (check: `serve_job_ended::one_report_per_end`; fleet-sim
 //!   `sandbox-job-exit-noticed-once`)
-//! - **N46** A session that a `job_ended` request opens MUST run its open reconcile at once, rather
-//!   than defer it to its first use of the sandbox: the sandbox just called, so it is awake. The
-//!   exception is a callback answered by the ledger alone (N42, or `410` under N40), which leaves
-//!   the open reconcile deferred, as any open does. (check:
-//!   `serve_job_ended::a_callback_open_reconciles_now`)
+//! - **N44** A session that no replica holds open (closed, or reaped) MUST behave exactly as today:
+//!   no callback reaches it, and it learns of its jobs' ends when it next opens, from its open
+//!   reconcile and reopen note. The ledger changes only what a crash would have reported twice
+//!   (N47). (check: `job_notify::a_reaped_session_is_as_today`)
 //!
 //! ### The job ledger
 //!
-//! The release state lives in the session task, which a crash or a reap ends. What has to outlive
-//! it is in the session's job ledger.
+//! Today a replica that dies after the transcript carries a job's end, and before it removes the
+//! job's record from the sandbox, leaves that record for the next owner's open reconcile to report
+//! again. v1.4 makes a released job's end arrive at any moment of a live session, so it closes that
+//! window.
 //!
-//! - **N47** While notify is available (N53), a session MUST keep a job ledger: one per session id,
+//! - **N45** While notify is available (N49), a session MUST keep a job ledger: one per session id,
 //!   in the session's own storage beside its transcripts, sealed as its other files are, and
 //!   changed only by the session store's atomic, epoch-fenced commits, so a change lands whole or
-//!   not at all, and a superseded owner's never lands. It is not part of the transcript:
-//!   compaction, a branch switch and every other rewrite carry it unchanged, and no summary can
-//!   drop it. It holds the transcript that owns the session's job scope (N51), and one record per
-//!   job of that transcript: its id, number and kind, and whether its end has been reported.
-//!   (check: `job_ledger::survives_compaction_and_takeover`)
-//! - **N48** A session MUST commit a job's record before it sends the job's first `keep` carrying
-//!   `notify`, and before it re-keeps an adopted job (N61). When that commit fails, it sends `keep`
-//!   without `notify`, and the job is held as today. (check:
-//!   `job_ledger::the_record_precedes_the_keep`)
-//! - **N49** The commit that persists the transcript message carrying a job's end (a wake turn's
+//!   not at all and a superseded owner's never lands. It is not part of the transcript: compaction,
+//!   a branch switch and every other rewrite carry it unchanged, and no summary can drop it. It
+//!   holds the ids of the active transcript's jobs whose end has been reported and whose record may
+//!   still be in the sandbox; a transcript switch empties it. (check:
+//!   `job_ledger::survives_compaction_and_takeover`)
+//! - **N46** The commit that persists the transcript message carrying a job's end (a wake turn's
 //!   prompt, the results of the run the notice joined, or a `bash_job` result that reported the
-//!   end) MUST mark the job's end reported in that same commit. The job's record in the sandbox
-//!   MUST NOT be removed before that commit has landed, and the ledger's record is deleted only
-//!   once the removal has succeeded. (check: `job_ledger::reported_with_the_notice`)
-//! - **N50** An open reconcile MUST, for each ledger record whose end is not marked reported,
-//!   report the job's end: its status and its output read up to the end when the listing returns it
-//!   ended; `lost` (the notice a reattach gives a `lost` job) when the listing returns it unkept
-//!   and running, once the reconcile has killed it, or when a listing that succeeded does not
-//!   return it at all. A job listed kept and running is adopted, as any is. For a record marked
-//!   reported it MUST report nothing, and remove the job's record from the sandbox if it is still
-//!   there. A listing that failed concludes nothing. (check:
-//!   `job_ledger::reopen_reports_each_end_once`)
-//! - **N51** The scope's owner. Before a transcript's first job operation, the ledger MUST name it
-//!   as the owner of the session's job scope. When the ledger names another transcript (after
-//!   `new_session` or `switch_session`), or names none and the session has no transcript (a new
-//!   session, or an id created again after a delete), the session MUST first `wipe` the scope,
-//!   since every job in it belongs to a conversation that is over, and then commit the transcript
-//!   as the owner, dropping every record of the old one in that commit. Until the wipe succeeds, no
-//!   job operation of the transcript runs (each fails as an unreachable sandbox does), and a
-//!   callback's reconcile runs the wipe first, answering `503` while it fails. A session whose
-//!   transcript predates the ledger (the ledger names no owner, but a transcript exists) commits
-//!   that transcript as the owner without a wipe, so deploying v1.4 kills no job. So a scope never
-//!   outlives its conversation, and no tombstone is needed: an id created again starts with no
-//!   ledger. (check: `job_ledger::a_new_transcript_wipes_first`)
+//!   end) MUST add the job to the ledger in that same commit. The job's record in the sandbox MUST
+//!   NOT be removed before that commit has landed, and the job leaves the ledger only once the
+//!   removal has succeeded. (check: `job_ledger::reported_with_the_notice`)
+//! - **N47** An open reconcile MUST NOT report the end of a job the ledger holds, and MUST remove
+//!   that job's record from the sandbox if it is still there. Every other job it treats exactly as
+//!   today. (check: `job_ledger::reopen_reports_each_end_once`)
 //!
 //! Why each crash is safe, for a job kept with `notify`:
 //!
 //! | a replica dies | so | and the next owner |
 //! |---|---|---|
-//! | before the job's record is committed | no `keep` was sent; the job was held, unkept | finds it killed by its dropped stream, as today |
-//! | after the record, before `keep` landed | the job was never kept, so its dropped stream killed it | reports its end from the ledger: what `list` says, or `lost` (N50) |
-//! | while `proving` | the job is kept and running | adopts and re-keeps it with a fresh generation (N61); a proof under the old generation counts for nothing (N56) |
-//! | while `released` | the job runs on, kept | is opened by the job's end callback (E4), whose open reconcile reports the end (N46) |
-//! | after the end notice was handed over, before its commit | the notice is not in the transcript, the sandbox record is still there | reports the end again from the sandbox record: the first report never landed |
-//! | after that commit, before the sandbox record was removed | the ledger marks the end reported | reports nothing, and removes the record (N50) |
-//! | after the removal, before the ledger record was deleted | `list` no longer returns the job | reports nothing: the record is marked reported |
-//!
-//! A sandbox that restarts loses its jobs and their pending notifications, so nothing calls back.
-//! The session's next open reconcile, or the sweep while it is live, finds the ledger's records
-//! missing from a listing that succeeded and reports each of those jobs ended `lost`.
+//! | before `keep` landed | the job was held and unkept, so its dropped stream killed it | finds it as today |
+//! | while `proving` | the job is kept and running | adopts it at its open reconcile and re-keeps it with a fresh generation (N57); a proof under the old generation counts for nothing (N52) |
+//! | while `released` | the job runs on, kept; its callbacks reach no listener | reads its end back at its open reconcile, exactly as today |
+//! | after the end notice was handed over, before its commit | the notice is not in the transcript, and the sandbox record is still there | reports the end from the sandbox record: the first report never landed |
+//! | after that commit, before the sandbox record was removed | the ledger holds the job | reports nothing, and removes the record (N47) |
+//! | after the removal, before the job left the ledger | `list` no longer returns the job | reports nothing |
 //!
 //! ### Release (normative)
 //!
@@ -686,20 +637,20 @@
 //!
 //! | state | what the replica holds | event | action | next |
 //! |---|---|---|---|---|
-//! | (parking) | the start's stream | notify is available (N53) | commit the job's ledger record (N48), draw a fresh generation, arm a 30 s proof window, then send `keep` with `notify` | proving |
+//! | (parking) | the start's stream | notify is available (N49) | draw a fresh generation, arm a 30 s proof window, then send `keep` with `notify` | proving |
 //! | (parking) | the start's stream | notify is not available | send `keep` without `notify`, as today | held |
 //! | proving | the stream | `keep` is answered `400` | send `keep` again without `notify` | held |
 //! | proving | the stream | a verified callback that carries the job's current generation arrives inside the window | live reconcile; if the job is `running` or `exited`, close the stream, and report its leftovers if it is `exited` and they are not reported yet | released |
 //! | proving | the stream | the same, and the reconcile finds it `ended` or `lost` | nothing: the stream reports it | proving |
-//! | proving, held | the stream | any other callback for the job | answer `200` at once (N42) | unchanged |
+//! | proving, held | the stream | any other callback for the job | answer `200` at once (N40) | unchanged |
 //! | proving | the stream | the window closes with no proof | nothing | held |
 //! | proving, held | the stream | the stream's final frame | report the end, as today | ended |
 //! | proving, held | the stream | the stream breaks | follow the job, as today | unchanged |
 //! | released | nothing | a verified callback, or the sweep | live reconcile: `running` changes nothing; `exited` reports the leftovers once; `ended` reads the output up to the end and reports the end; `lost`, or missing from the listing, reports the end `lost` | released, or ended |
 //! | released | nothing | a tool call or command about the job (`bash_job` peek, wait or kill) | do it; a wait that attaches lets go again when it returns | released, or ended |
-//! | ended | nothing | a verified callback | answer `200`, contact nothing (N42) | ended |
+//! | ended | nothing | a verified callback | answer `200`, contact nothing (N40) | ended |
 //!
-//! - **N52** The replica MUST release a job's stream only on the proof row: a verified callback for
+//! - **N48** The replica MUST release a job's stream only on the proof row: a verified callback for
 //!   that job, whose `url` carries the job's current generation, arrived inside its proof window,
 //!   and the live reconcile it waited for began after it arrived and found the job `running` or
 //!   `exited`. Arrival inside the window is what counts, however late the reconcile finishes; a
@@ -707,38 +658,38 @@
 //!   too arrives inside the window. Nothing else releases a stream: not the probe's answer, not an
 //!   accepted `keep`, not a callback after the window. (check:
 //!   `job_notify::release_waits_for_the_first_callback`)
-//! - **N53** The replica MUST treat notify as available only when all of these hold: it is in
-//!   service mode and holds a notify key (N65), the operator has configured the origin the fleet's
-//!   edge serves sessions at, the session has storage for its ledger (N47), and the endpoint offers
+//! - **N49** The replica MUST treat notify as available only when all of these hold: it is in
+//!   service mode and holds a notify key (N61), the operator has configured the origin the fleet's
+//!   edge serves sessions at, the session has storage for its ledger (N45), and the endpoint offers
 //!   notify (N2) or the baseline does (N3). Outside service mode it is never available. The `url`
-//!   the replica sends is that origin's `/_beyond/agent?session_id=<session id>&keep=<generation>`,
-//!   the generation 16 lowercase hex digits drawn at random for this `keep`, and the `token` is
-//!   minted for this session and job (N66). (check:
+//!   the replica sends is that origin's `/_beyond/agent?session_id=<session
+//!   id>&tenant=<tenant>&keep=<generation>`, the generation 16 lowercase hex digits drawn at random
+//!   for this `keep`, and the `token` is minted for this session and job (N62). (check:
 //!   `job_notify::keep_without_notify_when_unavailable`)
-//! - **N54** The proof window MUST open before `keep` is sent, so a callback that overtakes
+//! - **N50** The proof window MUST open before `keep` is sent, so a callback that overtakes
 //!   `keep`'s answer still counts, and MUST close 30 s later. With instant failures, the first five
 //!   attempts of the proof notification all begin within 17 s of `keep`'s answer (2 s, N11, then 15
 //!   s, N24), which leaves time for the fifth one's answer. (check:
 //!   `job_notify::proof_window_opens_before_keep`)
-//! - **N55** When the window closes with no proof, or `keep` with `notify` is refused, the job MUST
+//! - **N51** When the window closes with no proof, or `keep` with `notify` is refused, the job MUST
 //!   stay held for good, exactly as today. A later callback never releases it. (check:
 //!   `job_notify::no_callback_keeps_the_stream`; `job_notify::a_refused_notify_falls_back`)
-//! - **N56** A proof counts only for the keep that asked for it. The replica MUST draw a fresh
+//! - **N52** A proof counts only for the keep that asked for it. The replica MUST draw a fresh
 //!   generation for every `keep` it sends with `notify`, and MUST count as a job's proof only a
 //!   callback whose `url` carries the generation of the job's latest such `keep`. A callback under
 //!   an older generation is still a hint. (check: `job_notify::a_stale_proof_counts_for_nothing`)
-//! - **N57** Once a job is released, the replica MUST send nothing concerning it (no request,
+//! - **N53** Once a job is released, the replica MUST send nothing concerning it (no request,
 //!   stream, attach or poll) except: a reconcile that a callback, the sweep or a session's open
 //!   started; the operations a tool call or client command asks for (a `bash_job` peek, wait or
-//!   kill); the `seen` that records output the model was just shown; and the `wipe` of N51 or of
-//!   `delete_session`. A wait that attaches to the job MUST close the attach when it returns with
-//!   the job still running. (check: `job_notify::silent_after_release`;
+//!   kill); the `seen` that records output the model was just shown; and the `wipe` of a transcript
+//!   switch or of `delete_session`. A wait that attaches to the job MUST close the attach when it
+//!   returns with the job still running. (check: `job_notify::silent_after_release`;
 //!   `job_notify::a_wait_lets_go_again`)
-//! - **N58** The sweep. While a session is live and holds at least one released job, it MUST run a
+//! - **N54** The sweep. While a session is live and holds at least one released job, it MUST run a
 //!   live reconcile every 5 minutes: each between 4.5 and 5.5 minutes after the end of the
 //!   session's previous reconcile, of any kind. It MUST NOT reconcile its released jobs on any
 //!   other timer. (check: `job_notify::the_sweep_bounds_a_lost_end`)
-//! - **N59** A replica with notify available MUST close a connection to the endpoint that has
+//! - **N55** A replica with notify available MUST close a connection to the endpoint that has
 //!   carried nothing for 30 s, and MUST NOT send TCP keepalives on one that is idle. (check:
 //!   `job_notify::no_idle_connection_to_the_endpoint`)
 //!
@@ -746,8 +697,10 @@
 //! of it (N12). It is late only when the callback path breaks after the proof: an egress policy
 //! changed mid-job, or an edge outage longer than the twelve attempts. Then a live session finds
 //! the end at its next sweep, within 5 minutes, or sooner at the next callback or `bash_job` call;
-//! a session that is not live finds it at its next open reconcile, which is exactly when today's
-//! held stream, which closes when the session does, would have let it. So the worst case is
+//! a session that is not open finds it when it next opens, which is exactly when today's held
+//! stream, which closes when the session does, would have let it. The same sweep covers a callback
+//! the edge delivered to a replica that no longer holds the session (Takeover, below), and one a
+//! replica that predates v1.4 refused `401` like any request without a grant. So the worst case is
 //! bounded, and it needs a double fault. A slow tail of attempts from the sandbox instead would
 //! keep an abandoned sandbox sending forever and still not help a path that stays broken. A sweep
 //! every 5 minutes is one `list` where a held stream is a heartbeat every 5 s, sixty times less
@@ -757,26 +710,34 @@
 //! ### Crash, takeover and rotation
 //!
 //! The release state lives only in the session task. A replica that dies loses it, and so does a
-//! session that is reaped: the jobs run on in the sandbox, kept, and the ledger (N47) says which of
+//! session that is reaped: the jobs run on in the sandbox, kept, and the ledger (N45) says which of
 //! their ends are still to report.
 //!
-//! - **N60** A token MUST be a function of the fleet key and of (tenant, session, scope, job id)
-//!   alone, with no time, nonce, generation or replica in it (N63), so every replica mints the same
+//! - **N56** A token MUST be a function of the fleet key and of (tenant, session, scope, job id)
+//!   alone, with no time, nonce, generation or replica in it (N59), so every replica mints the same
 //!   token for the same job. A callback minted by one replica is verified by any other, and a
 //!   session that moves has nothing to hand over. The generation is in the `url`, not the token.
 //!   (check: fixture `v1.4-token.json`)
-//! - **N61** A replica MUST re-keep a job only when its open reconcile adopts it, running and kept,
-//!   while notify is available: it commits the job's ledger record if it has none (N48), then sends
-//!   `keep` again, with the `num`, `kind` and `seen` its listing reported, `notify` with a fresh
-//!   generation, and a token under its current key, and treats the job as `proving`, holding a
-//!   follow until the proof arrives. It MUST NOT re-keep in a live reconcile, so a proof's
-//!   reconcile never leads to another keep, and it MUST NOT go on following a job it has released.
-//!   (check: `job_notify::takeover_proves_again`; `job_notify::a_live_reconcile_never_keeps`)
+//! - **N57** A replica MUST re-keep a job only when its open reconcile adopts it, running and kept,
+//!   while notify is available: it sends `keep` again, with the `num`, `kind` and `seen` its
+//!   listing reported, `notify` with a fresh generation, and a token under its current key, and
+//!   treats the job as `proving`, holding a follow until the proof arrives. It MUST NOT re-keep in
+//!   a live reconcile, so a proof's reconcile never leads to another keep, and it MUST NOT go on
+//!   following a job it has released. (check: `job_notify::takeover_proves_again`;
+//!   `job_notify::a_live_reconcile_never_keeps`)
 //!
-//! So a replica killed in `proving` leaves the job kept and running, and the proof callback, or the
-//! next client request, opens the session elsewhere, which adopts and proves again. One killed in
-//! `released` leaves nothing to hold, and the job's end callback opens the session wherever the
-//! edge places it (N46).
+//! **Takeover.** A session that moves to another replica while open (a deploy, a kill, a failover)
+//! is opened there as any session is: its open reconcile, at its first use of the sandbox, adopts
+//! each kept job that still runs and re-keeps it with a fresh generation (N57), so the job is
+//! `proving` on its new owner until a proof reaches it, and held meanwhile. A callback that lands
+//! on the old owner after it lost the session gets `{"listener": false}` (N31), and one under the
+//! old generation that lands on the new owner proves nothing (N52). Between the two, the new
+//! owner's re-keep and its open reconcile cover every end: one that happened while no one held the
+//! session is read back by that open reconcile, exactly as today, and one after it reaches the new
+//! owner over its follow or its proven callback path. A session open on a replica that is not the
+//! target of its hash (one the edge walked to, Requirement 2 in FLEET.md) never receives its proof,
+//! so its jobs stay held, exactly as today; one released on its target that then stops being the
+//! target (a replica joined) has its end found by the sweep (N54).
 //!
 //! ### The notify token (`bjn_v1`)
 //!
@@ -797,34 +758,34 @@
 //! purpose   "job_ended"
 //! ```
 //!
-//! - **N62** A token that is not exactly that grammar MUST be refused as malformed: another prefix
+//! - **N58** A token that is not exactly that grammar MUST be refused as malformed: another prefix
 //!   or version, a field count other than three, a kid that is not eight lowercase hex digits, a
 //!   `mac` that is not 43 characters of the base64url alphabet, or one whose final character
 //!   carries non-zero padding bits (it would not re-encode to itself). (check: fixture
 //!   `v1.4-token.json`)
-//! - **N63** The verifier MUST compute `m` from the grant's tenant, the URL's session id (which N32
-//!   has already checked against the grant), the body's `scope` and `id`, and the constant purpose,
-//!   and MUST take none of them from the token. So a token verifies only for the tenant, session,
-//!   scope, job and purpose it was minted for. (check: fixture `v1.4-token.json`)
-//! - **N64** The tag MUST be compared in constant time (`hmac::Mac::verify_slice`), and in full: no
+//! - **N59** The verifier MUST compute `m` from the URL's tenant and session id, the body's `scope`
+//!   and `id`, and the constant purpose, and MUST take none of them from the token. So a token
+//!   verifies only for the tenant, session, scope, job and purpose it was minted for. (check:
+//!   fixture `v1.4-token.json`)
+//! - **N60** The tag MUST be compared in constant time (`hmac::Mac::verify_slice`), and in full: no
 //!   truncated tags. (check: `notify_token::the_tag_is_compared_in_constant_time`; fixture
 //!   `v1.4-token.json`)
-//! - **N65** The verifier MUST hold the key derived from its current seal secret, and the key
+//! - **N61** The verifier MUST hold the key derived from its current seal secret, and the key
 //!   derived from each seal secret it is given as *upcoming* or *retired* for this purpose (never
 //!   used to open a grant), and select among them by kid. The minter MUST mint only under the
 //!   current key. A replica MUST refuse to start when two of its keys share a kid, so a kid always
 //!   names one key. (check: fixture `v1.4-token.json`;
 //!   `notify_token::mints_only_under_the_current_key`;
 //!   `notify_token::refuses_keys_that_share_a_kid`)
-//! - **N66** The minter MUST mint only for the session's own scope ([`jobs::JobScope::for_session`]
+//! - **N62** The minter MUST mint only for the session's own scope ([`jobs::JobScope::for_session`]
 //!   of its tenant and session) and for a job of that session. (check:
 //!   `notify_token::mints_only_its_own_scope`)
-//! - **N67** The verdicts are `valid`, `malformed`, `unknown_kid` and `bad_mac`. A replica MUST
+//! - **N63** The verdicts are `valid`, `malformed`, `unknown_kid` and `bad_mac`. A replica MUST
 //!   answer `malformed` and `bad_mac` with `401`, and `unknown_kid` with `503`. A kid names one key
-//!   (N65), so `bad_mac` under a kid the replica holds is final; but a kid it does not hold may be
+//!   (N61), so `bad_mac` under a kid the replica holds is final; but a kid it does not hold may be
 //!   one the fleet is still rolling out to it. (check: fixture `v1.4-token.json`; fixture
 //!   `v1.4-callback.json`)
-//! - **N68** Rotating the seal key MUST follow this order. (1) Every replica is given the new
+//! - **N64** Rotating the seal key MUST follow this order. (1) Every replica is given the new
 //!   secret S1 as an upcoming notify key. (2) Only once all hold it, S1 becomes the current seal
 //!   key everywhere (the grant seal's own rotation, whose procedure is not this section's), and S0
 //!   is given to every replica as a retired notify key. (3) S0 stays retired for at least 7 days.
@@ -844,29 +805,29 @@
 //! token that expired first would lose exactly those reports. Expiry would buy nothing, because the
 //! token's power is already bounded: it can start a reconcile of one named job of one session, and
 //! that is all. It reads nothing, runs nothing and returns nothing, and once the job's end is
-//! recorded a repeat costs no sandbox request at all (N42).
+//! recorded a repeat costs no sandbox request at all (N40).
 //!
-//! **What binds tenant and session.** The control plane signs both into the session grant, and the
-//! replica checks the URL's session id against the grant before it checks the token (N32). The
-//! token's tag covers both (N63), so a token minted for one session fails on every other, in every
-//! tenant.
+//! **What binds tenant and session.** The callback carries no grant: the URL names the tenant and
+//! the session, and the token's tag covers both (N59), so a token minted for one session fails on
+//! every other, in every tenant. A token that verifies for a tenant and session reaches only a
+//! session task holding that session for that tenant (N31).
 //!
 //! **After a rotation.** Tokens never expire, and a running job's token is re-minted under the
-//! current key only when an open reconcile adopts the job (N61). So a job kept under S0 that is
-//! still running when S0 is dropped gets `503` for its callbacks (N67), and its end is reported by
+//! current key only when an open reconcile adopts the job (N57). So a job kept under S0 that is
+//! still running when S0 is dropped gets `503` for its callbacks (N63), and its end is reported by
 //! the sweep or by its session's next open reconcile: later, never lost.
 //!
 //! ### What each invariant rests on
 //!
 //! | invariant | requirements |
 //! |---|---|
-//! | I1: every end of a job in a session's ledger is reported exactly once, at worst at the session's next open reconcile | N12, N15, N24, N40, N45, N46, N47, N48, N49, N50, N51, N58 |
-//! | I2: a job end learned by notify behaves exactly as the same end learned by the held stream | N13, N14, N39, N44, N45 |
-//! | I3: a callback is a hint | N18, N36, N39, N40, N41, N42, N43 |
-//! | I4: a stream is released only after a proof that took the end's path, for the current keep | N8, N9, N11, N52, N54, N55, N56 |
-//! | I5: after release, nothing crosses the replica-to-endpoint connection for that job but what N57 lists, and no idle connection stays open | N57, N58, N59 |
-//! | I6: the token is narrow, and a callback grant runs nothing but `job_ended` | N28, N29, N30, N31, N32, N62, N63, N64, N65, N66, N67 |
-//! | I7: never worse than today. Where notify is not available, behaviour is exactly today's; where it is, every report today's code makes is still made, at worst 5 minutes later while live, and the ledger only removes duplicates and adds the `lost` reports today's code misses | N2, N5, N44, N53, N55, N58, N23, and "What release costs" |
+//! | I1: every job end is reported at most once per session, and at least once: while the session is open by its stream, its callbacks or the sweep, and otherwise when it next opens, as today | N12, N15, N24, N38, N43, N44, N45, N46, N47, N54 |
+//! | I2: a job end learned by notify behaves exactly as the same end learned by the held stream | N13, N14, N37, N42, N43 |
+//! | I3: a callback is a hint, and never opens a session | N18, N31, N34, N37, N38, N39, N40, N41 |
+//! | I4: a stream is released only after a proof that took the end's path, for the current keep | N8, N9, N11, N48, N50, N51, N52 |
+//! | I5: after release, nothing crosses the replica-to-endpoint connection for that job but what N53 lists, and no idle connection stays open | N53, N54, N55 |
+//! | I6: the token is narrow: a callback can only start a live reconcile of the one job it names, in a session open in that process | N28, N29, N30, N31, N58, N59, N60, N61, N62, N63 |
+//! | I7: never worse than today. Where notify is not available, behaviour is exactly today's; a session that is not open behaves exactly as today; in an open one every report today's code makes is still made, at worst 5 minutes later, and the ledger only removes a duplicate after a crash | N2, N5, N42, N44, N49, N51, N54, N23, and "What release costs" |
 
 use std::process::Stdio;
 use std::sync::Arc;

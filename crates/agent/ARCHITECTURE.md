@@ -2565,12 +2565,13 @@ opaque `bjn_v1` token), the sandbox's job supervisor POSTs a `job_ended` hint to
 address when a kept job changes state, and the replica releases the stream only after a first
 callback (the proof, sent by the same supervisor that will send the end, for the current keep's
 generation) arrives. It changes how a replica learns of an end and nothing else: a notified end is
-handed to the session exactly as a streamed one, wake turns included. The edge attaches a callback
-grant whose `purpose: "job_ended"` claim lets the request do nothing else, at any replica; a
-callback runs a non-destructive _live reconcile_ (`list`/`read` only, acting on released jobs);
-a durable per-session _job ledger_, committed with the transcript, makes each end reported once
-across crashes, compaction and takeovers; and a 5-minute sweep bounds the delay when the callback
-path breaks after the proof. FLEET.md's "Job-end callbacks" is the edge's half. Nothing in the
+handed to the session exactly as a streamed one, wake turns included. A callback never opens a
+session: the edge routes it to the session's hashed replica and attaches nothing, the replica
+verifies the token itself, and only a replica holding the session open runs a non-destructive
+_live reconcile_ (`list`/`read` only, acting on released jobs). Any other answers "no listener",
+and a session that is not open learns of its jobs' ends when it next opens, as today. A durable
+per-session _job ledger_, committed with the transcript, keeps a crash from reporting an end
+twice, and a 5-minute sweep bounds the delay when the callback path breaks after the proof. FLEET.md's "Job-end callbacks" is the edge's half. Nothing in the
 code implements it yet: every replica holds its streams as described above. The vectors
 are `tests/fixtures/exec/v1.4-*.json`, and `tests/exec_notify_vectors.rs` loads each into a strict
 schema, recomputes what follows from its inputs (the token vectors under a reference verifier, the

@@ -107,7 +107,7 @@ struct CallbackFile {
     notes: Vec<String>,
     keep: CallbackKeep,
     requests: Vec<CallbackRequest>,
-    grant: Grant,
+    url_session: UrlSession,
     receiver: Vec<ReceiverCase>,
     edge: Vec<EdgeCase>,
 }
@@ -136,7 +136,8 @@ struct CallbackRequest {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Grant {
+/// The tenant and session id the callback's url names.
+struct UrlSession {
     tenant: String,
     session_id: String,
 }
@@ -155,28 +156,17 @@ struct ReceiverCase {
 #[serde(deny_unknown_fields)]
 struct ReceiverRequest {
     method: String,
-    grant: GrantKind,
     authorization: Vec<String>,
     body: String,
-}
-
-/// The session grant the edge attached to a request.
-#[derive(Deserialize, PartialEq, Eq, Clone, Copy, Debug)]
-#[serde(rename_all = "snake_case")]
-enum GrantKind {
-    /// Carries `"purpose": "job_ended"`.
-    Callback,
-    /// An ordinary grant.
-    User,
-    /// One that does not verify at this replica.
-    Failing,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReceiverState {
+    service_mode: bool,
     notify_key: bool,
-    session_exists: bool,
+    /// A session task in this process holds the URL's session for the URL's tenant.
+    open_here: bool,
     job: JobState,
     reconcile: Reconcile,
     run_in_flight: bool,
@@ -187,14 +177,16 @@ struct ReceiverState {
 enum JobState {
     /// Tracked as released, and still running in the sandbox.
     Released,
-    /// Ended in the sandbox, its end not yet marked reported in the ledger.
+    /// Ended in the sandbox, its end not yet recorded by the session.
     EndedUnreported,
     /// The session holds its stream, and the callback is not its proof.
     Held,
-    /// The ledger marks its end reported.
+    /// The session has recorded its end.
     EndReported,
-    /// The transcript's ledger has no record of it.
-    NoRecord,
+    /// The session's open reconcile has not run yet.
+    OpenReconcilePending,
+    /// The session neither tracks it nor has recorded its end.
+    Untracked,
 }
 
 #[derive(Deserialize, PartialEq, Eq, Clone, Copy, Debug)]
@@ -208,7 +200,8 @@ enum Reconcile {
 #[serde(deny_unknown_fields)]
 struct ReceiverExpect {
     status: u16,
-    opens_session: bool,
+    /// A `200`'s `data.listener`: whether a session task in this process took the callback.
+    listener: Option<bool>,
     contacts_sandbox: bool,
 }
 
@@ -602,8 +595,15 @@ fn the_callback_body_is_exactly_type_scope_and_id() {
     );
     assert_eq!(
         c.keep.scope,
-        scope_of(&c.grant.tenant, &c.grant.session_id),
-        "the keep's scope is the grant's session's"
+        scope_of(&c.url_session.tenant, &c.url_session.session_id),
+        "the keep's scope is the url's session's"
+    );
+    assert!(
+        c.keep.url.contains(&format!(
+            "session_id={}&tenant={}&keep=",
+            c.url_session.session_id, c.url_session.tenant
+        )),
+        "the url names the session and the tenant, then the generation"
     );
     for r in &c.requests {
         assert_eq!(r.method, "POST", "{}", r.name);
@@ -624,12 +624,12 @@ fn the_callback_body_is_exactly_type_scope_and_id() {
 
 // ---- the receiver and the edge, from the spec's own rules
 
-/// A header value as N30 reads it: leading and trailing spaces and tabs removed.
+/// A header value as N28 reads it: leading and trailing spaces and tabs removed.
 fn ows(v: &str) -> &str {
     v.trim_matches([' ', '\t'])
 }
 
-/// N30's first rule: exactly one `Authorization` header, `Bearer` in any case, one or more spaces,
+/// N28's first rule: exactly one `Authorization` header, `Bearer` in any case, one or more spaces,
 /// then `bjn_v1.`. The token, when the request is a callback.
 fn callback_token(auth: &[String]) -> Option<&str> {
     let [one] = auth else { return None };
@@ -643,7 +643,7 @@ fn callback_token(auth: &[String]) -> Option<&str> {
     token.starts_with("bjn_v1.").then_some(token)
 }
 
-/// N30's second rule: any `Authorization` value that is `bearer` in any case, any run of spaces and
+/// N28's second rule: any `Authorization` value that is `bearer` in any case, any run of spaces and
 /// tabs, then `bjn_v1.`.
 fn looks_like_callback(auth: &[String]) -> bool {
     auth.iter().any(|v| {
@@ -660,49 +660,37 @@ fn is_job_id(id: &str) -> bool {
     (1..=32).contains(&id.len()) && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// The receiver of N32, step by step, then N34, N40 and N42 for a request that passes them all:
-/// the status, whether the session is opened or reached, and whether the sandbox is contacted.
+/// The receiver of N30, step by step, then N31, N38 and N40 for a callback that passes them all:
+/// the status, a `200`'s `data.listener`, and whether the sandbox is contacted. Nothing here can
+/// open a session, because a callback never does (N31).
 fn reference_receiver(
     keys: &[([u8; 32], String)],
-    grant: &Grant,
+    session: &UrlSession,
     case: &ReceiverCase,
-) -> (u16, bool, bool) {
+) -> (u16, Option<bool>, bool) {
     let rq = &case.request;
     let st = &case.state;
-    let refuse = |status| (status, false, false);
-    // Steps 2 and 3: a grant that fails is the fleet's fault when the edge sent it as a callback.
-    if rq.grant == GrantKind::Failing {
+    let refuse = |status| (status, None, false);
+    // N28: what is a callback; a look-alike is refused, and job_ended outside a callback too (N29).
+    let Some(token) = callback_token(&rq.authorization) else {
         return refuse(if looks_like_callback(&rq.authorization) {
-            503
+            400
         } else {
-            401
+            403
         });
-    }
-    // Step 4.
-    if rq.grant == GrantKind::Callback && rq.method != "POST" {
+    };
+    // Step 1.
+    if rq.method != "POST" {
         return refuse(403);
     }
-    assert_eq!(
-        rq.method, "POST",
-        "{}: a user grant's case POSTs",
-        case.name
-    );
-    // Step 5.
+    // Step 3 (the url, step 2, is the fixture's own and well formed).
     if rq.body.len() > 4096 {
         return refuse(413);
     }
     let Ok(Value::Object(body)) = serde_json::from_str::<Value>(&rq.body) else {
         return refuse(400);
     };
-    // `job_ended` under a callback grant, and only there. (A user grant's other commands are not
-    // this file's business.)
-    let is_job_ended = body.get("type").and_then(Value::as_str) == Some("job_ended");
-    assert!(
-        is_job_ended || rq.grant == GrantKind::Callback,
-        "{}: a user grant's case sends job_ended",
-        case.name
-    );
-    if is_job_ended != (rq.grant == GrantKind::Callback) {
+    if body.get("type").and_then(Value::as_str) != Some("job_ended") {
         return refuse(403);
     }
     let (Some(scope), Some(id)) = (
@@ -714,18 +702,17 @@ fn reference_receiver(
     if body.len() != 3 || !is_job_id(id) || scope.len() > 64 {
         return refuse(400);
     }
-    // Step 6.
-    let Some(token) = callback_token(&rq.authorization) else {
-        return refuse(503);
-    };
-    // Step 7.
+    // Step 4.
+    if !st.service_mode {
+        return refuse(403);
+    }
     if !st.notify_key {
         return refuse(503);
     }
-    // Step 8.
+    // Step 5.
     let cx = Context {
-        tenant: grant.tenant.clone(),
-        session_id: grant.session_id.clone(),
+        tenant: session.tenant.clone(),
+        session_id: session.session_id.clone(),
         scope: scope.to_string(),
         id: id.to_string(),
     };
@@ -734,19 +721,22 @@ fn reference_receiver(
         Verdict::Malformed | Verdict::BadMac => return refuse(401),
         Verdict::UnknownKid => return refuse(503),
     }
-    // Step 9.
-    if scope != scope_of(&grant.tenant, &grant.session_id) {
+    // Step 6.
+    if scope != scope_of(&session.tenant, &session.session_id) {
         return refuse(403);
     }
-    if !st.session_exists {
-        return refuse(404);
+    // N31: nobody here holds the session, so nothing happens.
+    if !st.open_here {
+        return (200, Some(false), false);
     }
     match st.job {
-        JobState::EndReported | JobState::Held => (200, true, false),
-        JobState::NoRecord => (410, true, false),
+        JobState::EndReported | JobState::Held | JobState::OpenReconcilePending => {
+            (200, Some(true), false)
+        }
+        JobState::Untracked => (410, None, false),
         JobState::Released | JobState::EndedUnreported => match st.reconcile {
-            Reconcile::Ok => (200, true, true),
-            Reconcile::Fails => (503, true, true),
+            Reconcile::Ok => (200, Some(true), true),
+            Reconcile::Fails => (503, None, true),
         },
     }
 }
@@ -759,8 +749,8 @@ fn receiver_cases_follow_from_the_spec() {
     for case in &c.receiver {
         let e = &case.expect;
         assert_eq!(
-            reference_receiver(&keys, &c.grant, case),
-            (e.status, e.opens_session, e.contacts_sandbox),
+            reference_receiver(&keys, &c.url_session, case),
+            (e.status, e.listener, e.contacts_sandbox),
             "{}",
             case.name
         );
@@ -769,12 +759,17 @@ fn receiver_cases_follow_from_the_spec() {
         }
         statuses.insert(e.status);
     }
-    for want in [200, 400, 401, 403, 404, 410, 413, 503] {
+    for want in [200, 400, 401, 403, 410, 413, 503] {
         assert!(statuses.contains(&want), "no receiver case answers {want}");
     }
+    assert!(
+        c.receiver.iter().any(|x| x.expect.listener == Some(false)),
+        "a case where no session here takes the callback"
+    );
 }
 
-/// E1, with N30's rules: how the edge treats a request by its `Authorization` values.
+/// E1, with N28's rules: how the edge treats a request by its `Authorization` values. It checks
+/// nothing else about a callback (E2).
 fn reference_edge(case: &EdgeCase) -> EdgeExpect {
     let refused = |status| EdgeExpect {
         class: EdgeClass::Refused,
@@ -786,14 +781,11 @@ fn reference_edge(case: &EdgeCase) -> EdgeExpect {
             status: None,
         };
     }
-    let Some(token) = callback_token(&case.authorization) else {
+    if callback_token(&case.authorization).is_none() {
         return refused(400);
-    };
+    }
     if case.method != "POST" || case.path != "/_beyond/agent" {
         return refused(403);
-    }
-    if parse_token(token).is_none() {
-        return refused(401);
     }
     EdgeExpect {
         class: EdgeClass::Callback,
@@ -863,7 +855,7 @@ fn mac_input(
 }
 
 /// The spec's verifier, written from the spec alone: the reference the vectors are held to.
-/// N62: the kid and the tag of a token that is exactly the grammar, else `None` (malformed).
+/// N58: the kid and the tag of a token that is exactly the grammar, else `None` (malformed).
 fn parse_token(token: &str) -> Option<(&str, Vec<u8>)> {
     let parts: Vec<&str> = token.split('.').collect();
     let [prefix, kid, mac] = parts.as_slice() else {
