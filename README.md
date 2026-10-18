@@ -389,7 +389,11 @@ docker run --rm -p 8080:8080 \
   --shard a07-s2=/mnt/efs/a07-s2
 ```
 
-- **Required:** the grant verifier (`--grant-key`, repeatable, plus `--seal-key`), at least one
+- **Seal key without a file:** on ECS and similar, inject the key as the secret
+  `AI_AGENT_SEAL_KEY_B64` (base64 of the 32-byte X25519 secret) and omit `--seal-key`. Not both: giving
+  both forms is a startup error.
+- **Required:** the grant verifier (`--grant-key`, repeatable, plus `--seal-key` or
+  `AI_AGENT_SEAL_KEY_B64`), at least one
   `--shard <name>=</abs/path>`, and a listener (`--listen`, `--listen-uds`, or systemd activation).
   Stdio `--service` is refused, as are `--key`, `--session-dir`, `--exec-url` and the other flags
   that would make one tenant's setting everybody's — see ARCHITECTURE.md for the list.

@@ -880,7 +880,7 @@ pub fn serve_service_cmd(
     bin: &str,
     base: &str,
     grant_key_flag: &str,
-    seal_key: &std::path::Path,
+    seal_key: Option<&std::path::Path>,
     shards: &[(&str, &std::path::Path)],
 ) -> Command {
     let mut c = isolated_cmd(bin);
@@ -894,9 +894,10 @@ pub fn serve_service_cmd(
         "claude-test",
         "--grant-key",
         grant_key_flag,
-        "--seal-key",
-        &seal_key.to_string_lossy(),
     ]);
+    if let Some(seal_key) = seal_key {
+        c.arg("--seal-key").arg(seal_key);
+    }
     for (name, path) in shards {
         c.arg("--shard").arg(format!("{name}={}", path.display()));
     }

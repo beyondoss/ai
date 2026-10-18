@@ -597,7 +597,8 @@ enum Command {
         /// Repeatable.
         #[usage(long, env = "AI_AGENT_GRANT_KEY", delimiter = ',')]
         grant_key: Vec<String>,
-        /// File with this fleet's X25519 secret key (base64), used to open grant secrets.
+        /// File with this fleet's X25519 secret key (base64), used to open grant secrets. The key
+        /// itself may instead be given as base64 in `AI_AGENT_SEAL_KEY_B64`; not both.
         #[usage(long, env = "AI_AGENT_SEAL_KEY")]
         seal_key: Option<std::path::PathBuf>,
         /// Run as a multi-tenant service: every connection must carry a signed session grant.
@@ -1919,9 +1920,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             // Session-grant trust: a bad key or seal-key file fails the process here, not on the first
             // connection. Neither flag ⇒ `None`, and `serve` behaves exactly as before.
+            //
+            // The inline seal key is read straight from the environment, not declared as a flag: a
+            // flag would put the secret in argv, readable by every process on the host.
+            let seal_b64 = match std::env::var_os(beyond_ai_agent::grant::SEAL_KEY_B64_ENV) {
+                None => None,
+                Some(v) => match v.into_string() {
+                    Ok(v) if v.is_empty() => None,
+                    Ok(v) => Some(zeroize::Zeroizing::new(v)),
+                    Err(_) => {
+                        return Err(format!(
+                            "{}: not valid UTF-8",
+                            beyond_ai_agent::grant::SEAL_KEY_B64_ENV
+                        )
+                        .into());
+                    }
+                },
+            };
+            let seal_source = beyond_ai_agent::grant::SealKeySource::pick(
+                seal_key.as_deref(),
+                seal_b64.as_deref().map(String::as_str),
+            )?;
             let grant_verifier =
-                beyond_ai_agent::grant::GrantVerifier::from_flags(&grant_key, seal_key.as_deref())?
+                beyond_ai_agent::grant::GrantVerifier::from_flags(&grant_key, seal_source)?
                     .map(Arc::new);
+            drop(seal_b64);
             // Service mode: validated here, before anything is bound or opened, because every one
             // of these is a way for the replica to reach a tenant (or the reverse). A refusal names
             // the flag, so an operator fixes the deployment rather than discovering at runtime that
@@ -1973,7 +1996,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             if service {
                 if grant_verifier.is_none() {
                     return Err(
-                        "--service requires --grant-key and --seal-key: every connection must \
+                        "--service requires --grant-key and --seal-key (or AI_AGENT_SEAL_KEY_B64): every connection must \
                          present a verified session grant"
                             .into(),
                     );

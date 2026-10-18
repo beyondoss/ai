@@ -245,11 +245,11 @@ impl GrantVerifier {
     /// a duplicated kid, which is refused rather than resolved last-wins.
     pub fn from_flags(
         grant_keys: &[String],
-        seal_key: Option<&Path>,
+        seal_key: Option<SealKeySource<'_>>,
     ) -> Result<Option<Self>, String> {
         let seal_key = match (grant_keys.is_empty(), seal_key) {
             (true, None) => return Ok(None),
-            (false, Some(path)) => path,
+            (false, Some(source)) => source,
             (true, Some(_)) => return Err("--seal-key needs at least one --grant-key".into()),
             (false, None) => return Err("--grant-key needs --seal-key".into()),
         };
@@ -260,7 +260,7 @@ impl GrantVerifier {
                 return Err(format!("--grant-key: kid {kid} is given more than once"));
             }
         }
-        Ok(Some(Self::new(keys, read_seal_key(seal_key)?)))
+        Ok(Some(Self::new(keys, seal_key.load()?)))
     }
 
     /// Verify `token` and open its secrets. `now` is unix seconds (a parameter so tests pin it).
@@ -408,6 +408,59 @@ pub fn parse_grant_key(arg: &str) -> Result<(Kid, VerifyingKey), String> {
     Ok((kid, key))
 }
 
+/// The environment variable that carries the seal key itself (base64), for a platform that injects a
+/// secret as an env var and would otherwise have to write it to a file first.
+pub const SEAL_KEY_B64_ENV: &str = "AI_AGENT_SEAL_KEY_B64";
+
+/// Where the fleet's X25519 secret comes from. Exactly one: [`SealKeySource::pick`] refuses both.
+#[derive(Clone, Copy)]
+pub enum SealKeySource<'a> {
+    /// `--seal-key <path>` / `AI_AGENT_SEAL_KEY`.
+    File(&'a Path),
+    /// `AI_AGENT_SEAL_KEY_B64`: the key itself.
+    Base64(&'a str),
+}
+
+impl<'a> SealKeySource<'a> {
+    /// Choose between the file form and the inline form. Giving both is an error rather than a
+    /// precedence rule: two keys that disagree would silently pick which fleet secret this replica
+    /// opens grants with, and a stale file left beside a rotated secret is exactly how that happens.
+    pub fn pick(file: Option<&'a Path>, b64: Option<&'a str>) -> Result<Option<Self>, String> {
+        match (file, b64) {
+            (Some(_), Some(_)) => Err(format!(
+                "--seal-key (or AI_AGENT_SEAL_KEY) and {SEAL_KEY_B64_ENV} are both set: \
+                 give the seal key one way"
+            )),
+            (Some(p), None) => Ok(Some(Self::File(p))),
+            (None, Some(b)) => Ok(Some(Self::Base64(b))),
+            (None, None) => Ok(None),
+        }
+    }
+
+    fn load(self) -> Result<StaticSecret, String> {
+        match self {
+            Self::File(path) => read_seal_key(path),
+            Self::Base64(b64) => parse_seal_key_b64(b64),
+        }
+    }
+}
+
+/// Parse `AI_AGENT_SEAL_KEY_B64`: base64 of the 32-byte X25519 secret, standard or url-safe. The
+/// error names the variable and never the value.
+pub fn parse_seal_key_b64(value: &str) -> Result<StaticSecret, String> {
+    secret_from(value)
+        .ok_or_else(|| format!("{SEAL_KEY_B64_ENV}: expected base64 of a 32-byte X25519 secret"))
+}
+
+/// Decode into a `StaticSecret`, wiping the intermediate bytes (the secret itself zeroizes on drop).
+fn secret_from(encoded: &str) -> Option<StaticSecret> {
+    decode_key(encoded).map(|mut bytes| {
+        let secret = StaticSecret::from(bytes);
+        bytes.zeroize();
+        secret
+    })
+}
+
 /// Read `--seal-key`: a file holding the fleet's X25519 secret as base64 of 32 bytes (standard or
 /// url-safe; surrounding whitespace ignored — `wg genkey` writes exactly this). Errors name the path,
 /// never the contents.
@@ -415,18 +468,12 @@ pub fn read_seal_key(path: &Path) -> Result<StaticSecret, String> {
     let contents = Zeroizing::new(
         std::fs::read_to_string(path).map_err(|e| format!("--seal-key {}: {e}", path.display()))?,
     );
-    decode_key(&contents)
-        .map(|mut bytes| {
-            let secret = StaticSecret::from(bytes);
-            bytes.zeroize();
-            secret
-        })
-        .ok_or_else(|| {
-            format!(
-                "--seal-key {}: expected base64 of a 32-byte X25519 secret",
-                path.display()
-            )
-        })
+    secret_from(&contents).ok_or_else(|| {
+        format!(
+            "--seal-key {}: expected base64 of a 32-byte X25519 secret",
+            path.display()
+        )
+    })
 }
 
 #[cfg(test)]
@@ -752,9 +799,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let seal_key = dir.path().join("seal.key");
         std::fs::write(&seal_key, &fx.seal_key_file).unwrap();
-        GrantVerifier::from_flags(std::slice::from_ref(&fx.grant_key_flag), Some(&seal_key))
-            .unwrap()
-            .unwrap()
+        GrantVerifier::from_flags(
+            std::slice::from_ref(&fx.grant_key_flag),
+            Some(SealKeySource::File(&seal_key)),
+        )
+        .unwrap()
+        .unwrap()
     }
 
     fn variant(e: &GrantError) -> &'static str {
@@ -1003,10 +1053,16 @@ mod tests {
         );
 
         assert!(GrantVerifier::from_flags(&[], None).unwrap().is_none());
-        assert!(GrantVerifier::from_flags(&[], Some(&seal_key)).is_err());
+        assert!(GrantVerifier::from_flags(&[], Some(SealKeySource::File(&seal_key))).is_err());
         assert!(GrantVerifier::from_flags(std::slice::from_ref(&key), None).is_err());
-        assert!(GrantVerifier::from_flags(&[key.clone(), key.clone()], Some(&seal_key)).is_err());
-        let verifier = GrantVerifier::from_flags(&[key], Some(&seal_key))
+        assert!(
+            GrantVerifier::from_flags(
+                &[key.clone(), key.clone()],
+                Some(SealKeySource::File(&seal_key))
+            )
+            .is_err()
+        );
+        let verifier = GrantVerifier::from_flags(&[key], Some(SealKeySource::File(&seal_key)))
             .unwrap()
             .unwrap();
         assert_eq!(verifier.keys.len(), 1);

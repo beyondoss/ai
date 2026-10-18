@@ -65,6 +65,8 @@ pub struct Options {
     pub host_home: Option<PathBuf>,
     /// Extra environment for the replica — an ambient `ANTHROPIC_API_KEY`, say.
     pub env: Vec<(String, String)>,
+    /// Pass the seal key as `AI_AGENT_SEAL_KEY_B64` (the key itself) instead of `--seal-key`.
+    pub seal_key_from_env: bool,
 }
 
 impl Service {
@@ -97,7 +99,7 @@ impl Service {
             super::BIN,
             model_base,
             &minter.grant_key_flag(),
-            minter.seal_key(),
+            (!opts.seal_key_from_env).then(|| minter.seal_key()),
             &flag_shards,
         );
         cmd.args(&opts.extra_args);
@@ -106,6 +108,10 @@ impl Service {
         }
         for (k, v) in &opts.env {
             cmd.env(k, v);
+        }
+        if opts.seal_key_from_env {
+            let b64 = std::fs::read_to_string(minter.seal_key()).unwrap();
+            cmd.env("AI_AGENT_SEAL_KEY_B64", b64.trim());
         }
         let stderr_log = dir.path().join("replica.stderr");
         let log = std::fs::File::create(&stderr_log).unwrap();
@@ -136,7 +142,7 @@ impl Service {
             super::BIN,
             &self.model_base,
             &self.minter.grant_key_flag(),
-            self.minter.seal_key(),
+            Some(self.minter.seal_key()),
             &flag_shards,
         );
         cmd.args(extra_args);
