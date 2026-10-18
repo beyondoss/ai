@@ -5781,6 +5781,13 @@ has to be dropped by a parent, because this crate forbids `unsafe` and so cannot
 one). Shards mount at `/mnt/efs/<shard>`, writable by uid 10001; everything else the container reads
 is read-only, and a tenant's workspace is never on this filesystem at all.
 
+**Publishing.** `.github/workflows/publish.yml` pushes the image to `ghcr.io/beyondoss/ai-agent`
+(`latest` and the commit SHA) from `main` and `v*` tags, alongside the gateway's
+`ghcr.io/beyondoss/ai`. Both are manifest lists covering `linux/amd64` and `linux/arm64` (ECS
+Graviton): each arch builds on a native runner (`ubuntu-latest`, `ubuntu-24.04-arm`) and pushes by
+digest, then a merge job runs `docker buildx imagetools create` to tag the pair. A pull request that
+touches a Dockerfile or the workflow runs the same four builds without pushing.
+
 ---
 
 ## Trust Boundaries
