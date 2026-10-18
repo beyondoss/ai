@@ -579,9 +579,28 @@ fn prop_model_scanner_reads_the_model_serde_reads() {
             if members.iter().filter(|(k, _)| k == "model").count() != 1 {
                 return Ok(());
             }
+            // The value as spelled, between its quotes. The cap counts these bytes, not the
+            // decoded ones: a spelling of MAX_CAPTURE or more that holds an escape reads `unknown`
+            // even when its text would fit, because its last escape may be cut and the scanner
+            // cannot tell a complete one from a cut one.
+            let raw: std::collections::HashMap<String, &serde_json::value::RawValue> =
+                serde_json::from_slice(&input.bytes).expect("the body parsed as JSON above");
+            let cut = raw.get("model").is_some_and(|v| {
+                let s = v.get();
+                let s = s.get(1..s.len().saturating_sub(1)).unwrap_or_default();
+                s.contains('\\') && s.len() >= peek::MAX_CAPTURE
+            });
             for chunks in chunkings(&input.bytes, &cuts) {
                 let (model, _, _) = scan_new(Scan::Request, &chunks);
                 match root["model"].as_str() {
+                    Some(_) if cut => {
+                        prop_assert_eq!(
+                            model.as_deref(),
+                            Some("unknown"),
+                            "{}",
+                            shown(&input.bytes)
+                        )
+                    }
                     Some(id) if id.len() < peek::MAX_CAPTURE => {
                         prop_assert_eq!(model.as_deref(), Some(id), "{}", shown(&input.bytes))
                     }
@@ -592,6 +611,32 @@ fn prop_model_scanner_reads_the_model_serde_reads() {
             Ok(())
         },
     );
+}
+
+/// The deep run's counterexample (seed 1792344194988825270): an escaped `model` whose text is 200
+/// bytes but whose spelling is 520 reads `unknown`. A control spelled in 234 bytes, under the cap,
+/// reads its 90 decoded bytes exactly.
+#[test]
+fn an_escaped_model_is_capped_by_its_spelling() {
+    // JSON `\u` escapes, built at run time so the body carries the escapes, not the characters.
+    let u = |c: char| format!("\\u{:04X}", u32::from(c));
+    let utf16 = |c: char| {
+        c.encode_utf16(&mut [0; 2])
+            .iter()
+            .map(|&w| format!("\\u{w:04X}"))
+            .collect::<String>()
+    };
+    let key: String = "model".chars().map(u).collect();
+    let at = |unit: &str, n: usize| {
+        let body = format!(r#"{{"{key}":"{}"}}"#, unit.repeat(n));
+        scan_new(Scan::Request, &[body.into_bytes()]).0
+    };
+    let unit = format!(r#"\"\\{}{}\/\n"#, u('\u{e9}'), utf16('\u{1f600}'));
+    assert_eq!(unit.len(), 26);
+    assert_eq!(at(&unit, 20).as_deref(), Some("unknown"));
+    let text = "\"\\\u{e9}\u{1f600}/\n";
+    assert_eq!(text.len(), 10);
+    assert_eq!(at(&unit, 9).as_deref(), Some(text.repeat(9).as_str()));
 }
 
 // --- the buffered scan ------------------------------------------------------------------------
