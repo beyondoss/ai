@@ -7011,6 +7011,19 @@ enum Phase {
     Closed,
 }
 
+impl Phase {
+    /// `Unstarted` → `Open` only: a closed stream never reopens, whoever calls `start`.
+    fn open(&mut self) {
+        debug_assert!(
+            *self != Self::Closed,
+            "start after the client's terminal event"
+        );
+        if *self == Self::Unstarted {
+            *self = Self::Open;
+        }
+    }
+}
+
 /// Chat Completions items → Anthropic Messages events.
 #[derive(Default)]
 struct OaiToAnt {
@@ -7215,7 +7228,7 @@ impl OaiToAnt {
     }
 
     fn start(&mut self, out: &mut Vec<u8>) {
-        self.phase = Phase::Open;
+        self.phase.open();
         if self.id.is_empty() {
             self.id = fresh_id("msg");
         }
@@ -7652,7 +7665,7 @@ impl OaiToResp {
     }
 
     fn start(&mut self, out: &mut Vec<u8>) {
-        self.phase = Phase::Open;
+        self.phase.open();
         if self.id.is_empty() {
             self.id = fresh_id("resp");
         }
