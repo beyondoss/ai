@@ -5685,16 +5685,34 @@ pub struct SseBridge {
     resp_to_oai: RespToOai,
     oai_to_ant: OaiToAnt,
     oai_to_resp: OaiToResp,
-    /// An error already went to the client. Nothing after it is forwarded, and flush must not
-    /// invent a success close (`message_stop`, `response.completed`); a Chat client still gets its
-    /// `[DONE]`.
-    errored: bool,
-    /// A Chat client's `[DONE]` went out.
+    lifecycle: Lifecycle,
+    /// A Chat client's `[DONE]` went out. Apart from `lifecycle` because it follows both of its
+    /// ends: the upstream's own `[DONE]` after a clean end, and flush's after an error.
     done: bool,
-    /// The upstream said how the response ended: a finish reason, its own end marker, or an error.
-    /// A stream that ends without one was cut short, and flush reports that instead of inventing a
-    /// clean `end_turn` / `completed`.
-    ended: bool,
+}
+
+/// How far the upstream's account of the response has got. The order is one-way: an error is
+/// itself an end, so nothing returns to `Open` and nothing leaves `Errored`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lifecycle {
+    Open,
+    /// The upstream said how the response ended: a finish reason or its own end marker (or an error
+    /// that came after the client's terminal event, so never reached it). A stream that ends while
+    /// `Open` was cut short, and flush reports that instead of inventing a clean `end_turn` /
+    /// `completed`.
+    Ended,
+    /// An error went to the client. Nothing after it is forwarded, and flush must not invent a
+    /// success close (`message_stop`, `response.completed`); a Chat client still gets its `[DONE]`.
+    Errored,
+}
+
+impl Lifecycle {
+    /// The upstream said how the response ends; an error already sent stays the outcome.
+    fn end(&mut self) {
+        if *self == Self::Open {
+            *self = Self::Ended;
+        }
+    }
 }
 
 /// One Chat Completions stream item, the dialect every pairing meets in.
@@ -5853,9 +5871,8 @@ impl SseBridge {
             resp_to_oai: RespToOai::default(),
             oai_to_ant: OaiToAnt::default(),
             oai_to_resp: OaiToResp::default(),
-            errored: false,
+            lifecycle: Lifecycle::Open,
             done: false,
-            ended: false,
         }
     }
 
@@ -5980,7 +5997,7 @@ impl SseBridge {
     fn keeps_alive(&self) -> bool {
         self.upstream != self.client
             && !self.oai_to_resp.quiet
-            && !self.errored
+            && self.lifecycle != Lifecycle::Errored
             && !self.client_ended()
     }
 
@@ -6001,7 +6018,9 @@ impl SseBridge {
             Endpoint::Embeddings => {}
         }
         for item in items {
-            self.ended |= item.ends();
+            if item.ends() {
+                self.lifecycle.end();
+            }
             self.deliver(item, out);
         }
     }
@@ -6145,12 +6164,12 @@ impl SseBridge {
     }
 
     fn deliver(&mut self, item: ChatItem, out: &mut Vec<u8>) {
-        if self.errored || self.client_ended() {
+        if self.lifecycle == Lifecycle::Errored || self.client_ended() {
             return;
         }
         match (self.client, item) {
             (client, ChatItem::Error(v)) => {
-                self.errored = true;
+                self.lifecycle = Lifecycle::Errored;
                 match client {
                     Endpoint::ChatCompletions => out.extend(sse_data(&value_string(&map_error(
                         &v,
@@ -6168,12 +6187,7 @@ impl SseBridge {
             (Endpoint::ChatCompletions, ChatItem::Chunk(v)) => {
                 out.extend(sse_data(&value_string(&v)));
             }
-            (Endpoint::ChatCompletions, ChatItem::Done) => {
-                if !self.done {
-                    self.done = true;
-                    out.extend(sse_data("[DONE]"));
-                }
-            }
+            (Endpoint::ChatCompletions, ChatItem::Done) => self.chat_done(out),
             (Endpoint::Messages, ChatItem::Chunk(v)) => self.oai_to_ant.chunk(&v, out),
             (Endpoint::Messages, ChatItem::Done) => self.oai_to_ant.finish(out),
             (Endpoint::Responses, ChatItem::Chunk(v)) => self.oai_to_resp.chunk(&v, out),
@@ -6190,9 +6204,17 @@ impl SseBridge {
     fn client_ended(&self) -> bool {
         match self.client {
             Endpoint::ChatCompletions => self.done,
-            Endpoint::Messages => self.oai_to_ant.finished,
-            Endpoint::Responses => self.oai_to_resp.completed,
+            Endpoint::Messages => self.oai_to_ant.phase == Phase::Closed,
+            Endpoint::Responses => self.oai_to_resp.phase == Phase::Closed,
             Endpoint::Embeddings => false,
+        }
+    }
+
+    /// A Chat client's `[DONE]`, sent once.
+    fn chat_done(&mut self, out: &mut Vec<u8>) {
+        if !self.done {
+            self.done = true;
+            out.extend(sse_data("[DONE]"));
         }
     }
 
@@ -6206,19 +6228,17 @@ impl SseBridge {
         if self.upstream == self.client {
             return out;
         }
-        if !self.ended && !self.errored {
-            self.ended = true;
+        if self.lifecycle == Lifecycle::Open {
+            // `Ended` stands if the client already had its terminal event and the error is dropped.
+            self.lifecycle.end();
             self.deliver(ChatItem::Error(truncated_stream_error()), &mut out);
         }
         match self.client {
-            Endpoint::ChatCompletions => {
-                if !self.done {
-                    self.done = true;
-                    out.extend(sse_data("[DONE]"));
-                }
+            Endpoint::ChatCompletions => self.chat_done(&mut out),
+            Endpoint::Messages if self.lifecycle != Lifecycle::Errored => {
+                self.oai_to_ant.finish(&mut out);
             }
-            Endpoint::Messages if !self.errored => self.oai_to_ant.finish(&mut out),
-            // After an error this is a no-op: `OaiToResp::error` marked the response completed.
+            // After an error this is a no-op: `OaiToResp::error` closed its phase.
             Endpoint::Responses => self.oai_to_resp.finish(&mut out),
             // Embeddings never stream and never translate.
             Endpoint::Messages | Endpoint::Embeddings => {}
@@ -6979,10 +6999,22 @@ impl ToolCalls {
     }
 }
 
+/// How far a translator has written its client's stream. `start` opens it (`message_start`,
+/// `response.created`); the terminal event or an error closes it, and nothing follows a close.
+/// A Responses client assembled into one body can close straight from `Unstarted`: its error
+/// writes no event, so there is nothing to open.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Phase {
+    #[default]
+    Unstarted,
+    Open,
+    Closed,
+}
+
 /// Chat Completions items → Anthropic Messages events.
 #[derive(Default)]
 struct OaiToAnt {
-    started: bool,
+    phase: Phase,
     id: String,
     model: String,
     next_block: usize,
@@ -7002,10 +7034,10 @@ struct OaiToAnt {
     /// Thinking held back until its signature arrives. See [`is_replayable_thinking`].
     thinking: Gather,
     stop: Option<&'static str>,
-    /// The model refused in words (`refusal`), which Anthropic reports as a stop reason.
+    /// The model refused in words (`refusal`), which Anthropic reports as a stop reason. Not a
+    /// `phase`: it is a fact about the answer, read when the stream closes.
     refused: bool,
     usage: Option<Usage>,
-    finished: bool,
 }
 
 /// Where a streamed call's JSON arguments end, found incrementally: each step scans only the bytes
@@ -7092,10 +7124,10 @@ fn ant_event(out: &mut Vec<u8>, typ: &str, body: &Value) {
 
 impl OaiToAnt {
     fn chunk(&mut self, v: &Value, out: &mut Vec<u8>) {
-        if self.finished {
+        if self.phase == Phase::Closed {
             return;
         }
-        if !self.started {
+        if self.phase == Phase::Unstarted {
             if let Some(id) = non_empty_str(v, "id") {
                 id.clone_into(&mut self.id);
             }
@@ -7177,7 +7209,7 @@ impl OaiToAnt {
     }
 
     fn start(&mut self, out: &mut Vec<u8>) {
-        self.started = true;
+        self.phase = Phase::Open;
         if self.id.is_empty() {
             self.id = fresh_id("msg");
         }
@@ -7363,15 +7395,15 @@ impl OaiToAnt {
     }
 
     fn finish(&mut self, out: &mut Vec<u8>) {
-        if self.finished {
+        if self.phase == Phase::Closed {
             return;
         }
         // A usage-only / `[DONE]`-only upstream stream never opened a block; the client still
         // needs `message_start` before `message_delta` / `message_stop`.
-        if !self.started {
+        if self.phase == Phase::Unstarted {
             self.start(out);
         }
-        self.finished = true;
+        self.phase = Phase::Closed;
         self.thinking.discard();
         let mut steps = Vec::new();
         self.calls.open_rest(&mut steps);
@@ -7455,7 +7487,7 @@ struct OaiToResp {
     model: String,
     created_at: u64,
     seq: u64,
-    started: bool,
+    phase: Phase,
     /// Items by `output_index`; `Null` until the item is done.
     output: Vec<Value>,
     message: Option<OpenMessage>,
@@ -7463,7 +7495,6 @@ struct OaiToResp {
     calls: ToolCalls,
     finish: Option<&'static str>,
     usage: Option<Usage>,
-    completed: bool,
     /// How the request's tools were reshaped, to name each call the way the client offered it.
     tools: ToolNames,
     /// Assembling (see [`SseBridge::assembling`]): no event is written, and the end is kept in
@@ -7496,10 +7527,10 @@ impl OaiToResp {
     }
 
     fn chunk(&mut self, v: &Value, out: &mut Vec<u8>) {
-        if self.completed {
+        if self.phase == Phase::Closed {
             return;
         }
-        if !self.started {
+        if self.phase == Phase::Unstarted {
             if let Some(id) = non_empty_str(v, "id") {
                 id.clone_into(&mut self.id);
             }
@@ -7510,7 +7541,7 @@ impl OaiToResp {
         {
             model.clone_into(&mut self.model);
         }
-        if !self.started {
+        if self.phase == Phase::Unstarted {
             self.start(out);
         }
         let choice = v
@@ -7615,7 +7646,7 @@ impl OaiToResp {
     }
 
     fn start(&mut self, out: &mut Vec<u8>) {
-        self.started = true;
+        self.phase = Phase::Open;
         if self.id.is_empty() {
             self.id = fresh_id("resp");
         }
@@ -8082,10 +8113,10 @@ impl OaiToResp {
     }
 
     fn complete(&mut self, out: &mut Vec<u8>) {
-        if self.completed {
+        if self.phase == Phase::Closed {
             return;
         }
-        if !self.started {
+        if self.phase == Phase::Unstarted {
             self.start(out);
         }
         let mut steps = Vec::new();
@@ -8111,7 +8142,7 @@ impl OaiToResp {
         } else {
             self.emit(out, terminal, json!({ "response": resp }));
         }
-        self.completed = true;
+        self.phase = Phase::Closed;
     }
 
     fn finish(&mut self, out: &mut Vec<u8>) {
@@ -8122,18 +8153,18 @@ impl OaiToResp {
     /// carries the error under `error`, so an OpenAI SDK raises it as an `APIError` with the
     /// upstream's message instead of ending on a missing `response.completed`.
     fn error(&mut self, v: &Value, out: &mut Vec<u8>) {
-        if self.completed {
+        if self.phase == Phase::Closed {
             return;
         }
         if self.quiet {
-            self.completed = true;
+            self.phase = Phase::Closed;
             self.whole = Some(Whole::Failed(v.clone()));
             return;
         }
-        if !self.started {
+        if self.phase == Phase::Unstarted {
             self.start(out);
         }
-        self.completed = true;
+        self.phase = Phase::Closed;
         let envelope = map_error(v, Endpoint::Responses, 200);
         let err = envelope.get("error").cloned().unwrap_or(Value::Null);
         let field = |k: &str| err.get(k).cloned().unwrap_or(Value::Null);

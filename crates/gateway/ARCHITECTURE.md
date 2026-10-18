@@ -1125,6 +1125,12 @@ Responses-only models the catalog routes to `/v1/responses`, and is held to the 
   dropped, where it used to hand the client a second ending on a turn that had completed (D124).
   The stream the client was sent then ends on its terminal event, which is what
   `terminal::TerminalTracker` reads to bill a close after the answer as `ok` (D120).
+- **Stream lifecycles are states, not flags.** The bridge tracks the upstream's account as one
+  one-way `Lifecycle` (`Open` → `Ended` | `Errored`; an error is itself an end), plus a Chat client's
+  `[DONE]`, which follows either end. The Messages and Responses writers each track their client's
+  stream as a `Phase` (`Unstarted` → `Open` → `Closed`), closed by the terminal event or an error.
+  A combination no stream reaches, such as an error that never ended the response, cannot be
+  written down.
 - **Tool-call deltas** are keyed by `index`, else by `id`: an id repeated on every delta is one call,
   a reused `index` with a new id is a new call, interleaved deltas land on their own call, and a call
   opens only once its name is known. A `tool_use` block that closes with no argument bytes still
