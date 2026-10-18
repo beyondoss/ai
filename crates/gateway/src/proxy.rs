@@ -6849,6 +6849,10 @@ impl ProxyHttp for AiProxy {
         // as its own error responses do, so a pooled client does not send its next request into a
         // socket about to close.
         session.as_downstream_mut().set_keepalive(None);
+        // One of the two sources of a gateway `Retry-After`: this one answers every 503 raised past
+        // `request_filter` (a refusal there included, such as `BodyMemory`), with the soonest open
+        // breaker of the walk, else 1. A refusal written in `request_filter` carries
+        // `Refusal::retry_after` instead.
         let retry_after = (status == 503).then(|| {
             ctx.rc
                 .as_ref()

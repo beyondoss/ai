@@ -266,9 +266,42 @@ impl Refusal {
         }
     }
 
-    /// The error `type` in the body and the `request rejected` log line.
+    /// The error `type` in the body and the `request rejected` log line. Every variant is named,
+    /// with no default, so a new one does not compile until its type is chosen; a fixed one's must
+    /// be the type its compile-time body spells (the variant test checks each).
     pub fn kind(&self) -> &'static str {
-        self.fixed().map_or("invalid_request_error", |f| f.kind)
+        match self {
+            Self::MissingKey | Self::InvalidKey => "authentication_error",
+            Self::RateLimited(_) | Self::TenantBusy => "rate_limit_error",
+            Self::Denied(_) => "access_denied",
+            Self::QuotaExhausted => "insufficient_quota",
+            Self::AllowanceUnavailable
+            | Self::NoPoolKey
+            | Self::NoCandidate
+            | Self::BodyMemory
+            | Self::IdSigningUnset
+            | Self::CircuitOpen { .. }
+            | Self::RequestDeadline => "api_error",
+            Self::UnknownProvider
+            | Self::AmbiguousCredential
+            | Self::BodyTooLarge
+            | Self::ByoOnModelRoute
+            | Self::ProtocolUpgrade
+            | Self::ManagedEndpoint { .. }
+            | Self::Background
+            | Self::CatalogMiss { .. }
+            | Self::DuplicateModel
+            | Self::DuplicateModelLate
+            | Self::OutputLimit
+            | Self::RefusedInput { .. }
+            | Self::Unpriced(_)
+            | Self::SessionField { .. }
+            | Self::NoSubResource { .. }
+            | Self::WrongWire { .. }
+            | Self::ForeignId(_)
+            | Self::ForeignIdLate
+            | Self::TranslateTooLarge => "invalid_request_error",
+        }
     }
 
     pub fn message(&self) -> Cow<'static, str> {
@@ -337,11 +370,14 @@ impl Refusal {
 
     /// The `Retry-After` (seconds) a refusal written before any upstream carries: every 429 and
     /// 503 has one ([`default_retry_after`]), the open breaker's is the time until it half-opens.
-    /// `fail_to_proxy` gives a later 503 its own (the soonest open breaker of the walk).
+    ///
+    /// One of the two sources of a gateway `Retry-After`: this one answers a refusal in
+    /// `request_filter` (`proxy::write_refusal`). A 503 raised past `request_filter` is answered by
+    /// `fail_to_proxy`, which sets its own: the soonest open breaker of the walk, else 1.
     pub fn retry_after(&self) -> Option<u64> {
         match self {
             Self::CircuitOpen { retry_after } => Some(*retry_after),
-            // Always answered without one; kept so the wire does not change under this type.
+            // A deployment with no signing key: no retry fixes that, so none is invited.
             Self::IdSigningUnset => None,
             r => r
                 .fixed()
@@ -561,8 +597,9 @@ mod tests {
         assert_eq!(seen.len(), VARIANTS, "a variant has no sample in `every`");
     }
 
-    /// `(status, metric label, body, Retry-After)` the gateway answered `r` with before the type
-    /// existed: the static table's literals, and what `serde_json` built for the rest.
+    /// `(status, metric label, body, Retry-After)` each refusal answers with, spelled out as the
+    /// client sees them: literals written apart from the code, so a change to any refusal's wire
+    /// fails here rather than passing with the code that changed it.
     fn before(r: &Refusal) -> (u16, &'static str, &'static str, Option<u64>) {
         use crate::deny::DenyReason as D;
         match r {
@@ -802,11 +839,18 @@ mod tests {
         }
     }
 
-    /// Each refusal's whole answer is the one the gateway gave it before the type existed.
+    /// Each refusal's whole answer is the one spelled out for it, its error type included: every
+    /// variant's `kind` is read against the type in its literal body, and a fixed one's against its
+    /// compile-time body too.
     #[test]
-    fn every_refusal_answers_exactly_as_before() {
+    fn every_refusal_answers_exactly_as_spelled_out() {
         for r in every() {
             let (status, label, body, retry_after) = before(&r);
+            let wire: serde_json::Value = serde_json::from_str(body).expect("a JSON body");
+            assert_eq!(wire["error"]["type"], r.kind(), "{r:?}");
+            if let Some(f) = r.fixed() {
+                assert_eq!(f.kind, r.kind(), "{r:?}");
+            }
             assert_eq!(r.status(), status, "{r:?}");
             assert_eq!(r.metric().label(), label, "{r:?}");
             assert_eq!(r.body(), Bytes::from_static(body.as_bytes()), "{r:?}");

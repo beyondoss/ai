@@ -2825,7 +2825,7 @@ Two refusals have a second variant because what the client is told depends on wh
 headers already went upstream: a duplicate root `model` is named before connecting
 (`DuplicateModel`) and the generic `bad request` after (`DuplicateModelLate`), and a foreign id names
 its field before connecting (`ForeignId`) and not after (`ForeignIdLate`). `IdSigningUnset` is a 503
-without `Retry-After`, unlike every other gateway 503; kept as it was.
+without `Retry-After`, unlike every other gateway 503: no retry fixes a deployment with no signing key.
 
 ### Body rules (`body_rules.rs`)
 
@@ -2851,8 +2851,8 @@ duplicate only once buffered.
 A rule reads `Facts`, never the bytes: each point fills in what applies there, from the scan it
 already made, for the requests a rule is for (a catalog walk, a managed key, a Responses path). At
 `Connect` the facts about the body's shape are checked as soon as it is scanned, and the row's
-(input, `background`) once the walk is shaped, after the control surface is parsed and counted, as
-before; the second check runs the whole list again on all the facts. The body rewrites (the
+(input, `background`) once the walk is shaped, after the control surface is parsed and counted;
+the second check runs the whole list again on all the facts. The body rewrites (the
 output-limit clamp, translation, the strips, the model re-spelling, `stream_options`) stay a
 separate step after the rules pass, on a buffered body only. Signed ids are checked apart:
 verifying them also rewrites the body, and a store relay checks them where it holds the signer

@@ -156,10 +156,13 @@ mod tests {
         }
     }
 
-    /// The rules each point checked, in the order it checked them, before they were one list: the
-    /// order of the inline checks in `request_filter` (a duplicate `model` and an inexact limit
-    /// after the scan, then the row's input and `background` in the catalog walk), in
-    /// `relay_full_body`, and in `request_body_filter` after the signed ids.
+    /// The rules each point checks, in precedence order, written apart from [`Rule::ORDER`] and
+    /// [`Rule::applies_at`] so a change to either fails here. At `Connect` the request headers are
+    /// still held, so a refusal there can name what is wrong; at `Buffered` they already went
+    /// upstream, and the same broken rule answers differently: a duplicate `model` with the generic
+    /// 400 the gateway gives an error with no message of its own there
+    /// ([`Refusal::DuplicateModelLate`]), as a foreign signed id is answered without naming its
+    /// field ([`Refusal::ForeignIdLate`]). That is why those two variants exist.
     const BEFORE: [(Point, &[Rule]); 3] = [
         (
             Point::Connect,
@@ -184,7 +187,7 @@ mod tests {
     ];
 
     #[test]
-    fn each_point_checks_the_rules_it_did_in_the_order_it_did() {
+    fn each_point_checks_its_rules_in_precedence_order() {
         for (point, before) in BEFORE {
             let now: Vec<Rule> = Rule::ORDER
                 .into_iter()
@@ -197,7 +200,7 @@ mod tests {
     /// For every two rules a point checks, a body breaking both is told the one that point
     /// checked first; a rule that does not apply there is never told.
     #[test]
-    fn two_broken_rules_are_answered_as_before_at_every_point() {
+    fn two_broken_rules_are_answered_by_the_first_at_every_point() {
         for (point, before) in BEFORE {
             for (i, &first) in before.iter().enumerate() {
                 let alone = refusal(point, breaking(first)).expect("a broken rule refuses");
