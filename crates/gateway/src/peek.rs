@@ -24,11 +24,11 @@ use crate::lex::{self, Flow, Lexer, Visit, string_end};
 /// ever miss the catalog or log as `unknown`, never match something it isn't.
 pub const MAX_CAPTURE: usize = 256;
 
+/// Append to a capture, up to [`MAX_CAPTURE`] bytes.
 #[inline]
-fn push_capped(buf: &mut Vec<u8>, b: u8) {
-    if buf.len() < MAX_CAPTURE {
-        buf.push(b);
-    }
+fn push_capped(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let room = MAX_CAPTURE.saturating_sub(buf.len());
+    buf.extend_from_slice(bytes.get(..room.min(bytes.len())).unwrap_or_default());
 }
 
 /// The text of a captured JSON string, with its escapes as sent: decoded the way a provider's parser
@@ -98,11 +98,9 @@ const MAX_EXTRAS: usize = 6;
 pub struct ModelScanner {
     model: Option<String>,
     done: bool,
-    /// Nesting depth: number of currently-open `{`/`[`. Root object contents are at depth 1.
-    depth: u32,
+    /// Strings, escapes and nesting depth (root object contents are at depth 1), across chunks.
+    lex: Lexer,
     root_is_object: bool,
-    in_string: bool,
-    escaped: bool,
     /// Whether the next key-level string is a key (`{`/`,` → key; `:` → value).
     expect_key: bool,
     /// The most recent key-level key was exactly `model`.
@@ -118,8 +116,6 @@ pub struct ModelScanner {
     /// What (if anything) we're accumulating into `cur` for the current string.
     cap: Cap,
     cur: Vec<u8>,
-    /// The capture in `cur` holds a backslash, so it is decoded when it closes.
-    cur_escaped: bool,
 }
 
 /// What a scan keeps beside `model` ([`ModelScanner::feed_keeping`]): the values of a fixed set of
@@ -249,11 +245,11 @@ impl ModelScanner {
         self.done
     }
 
-    /// Whether the current depth is one whose keys we inspect: the root object always, plus the
-    /// object under a root `message` key when [`Self::for_response`] enabled it.
+    /// Whether `depth` is one whose keys we inspect: the root object always, plus the object
+    /// under a root `message` key when [`Self::for_response`] enabled it.
     #[inline]
-    fn at_key_level(&self) -> bool {
-        (self.depth == 1 && self.root_is_object) || (self.depth == 2 && self.in_message)
+    fn at_key_level(&self, depth: u32) -> bool {
+        (depth == 1 && self.root_is_object) || (depth == 2 && self.in_message)
     }
 
     /// Feed the next bytes of the body.
@@ -267,212 +263,215 @@ impl ModelScanner {
         self.feed_inner(bytes, Some(kept));
     }
 
-    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-    fn feed_inner(&mut self, bytes: &[u8], mut kept: Option<&mut Kept>) {
-        // Proof for the allow: every index is `i`/`j` with `i < n` (the loop condition, or a `memchr`
-        // offset inside `bytes[i..]`), or a key span bounded by the closing quote just found; counters
-        // (`i`, `j`, `depth`, `model_keys`) count bytes of a body that fits in memory, so they cannot
-        // overflow. This loop runs on every managed request body, so it keeps the unchecked forms.
+    fn feed_inner(&mut self, bytes: &[u8], kept: Option<&mut Kept>) {
         if self.done {
             return;
         }
-        let mut i = 0;
-        let n = bytes.len();
         // Where the raw capture in progress starts in this chunk.
-        let mut raw_from = kept.as_ref().and_then(|k| k.raw).map(|_| 0);
-        while i < n {
-            if self.in_string {
-                // Fast path: the content of a string we don't accumulate (a big base64 image, a long
-                // prompt, anything nested) — jump straight to the next `"` or `\` with a
-                // SIMD-accelerated search instead of inspecting every byte.
-                if self.cap == Cap::No && !self.escaped {
-                    match memchr::memchr2(b'"', b'\\', &bytes[i..]) {
-                        Some(rel) => i += rel,
-                        // The rest of this chunk is skippable string content.
-                        None => break,
-                    }
-                }
-                let b = bytes[i];
-                i += 1;
-                if self.escaped {
-                    self.escaped = false;
-                    if self.cap != Cap::No {
-                        push_capped(&mut self.cur, b);
-                    }
-                } else if b == b'\\' {
-                    self.escaped = true;
-                    if self.cap != Cap::No {
-                        push_capped(&mut self.cur, b);
-                        self.cur_escaped = true;
-                    }
-                } else if b == b'"' {
-                    self.in_string = false;
-                    match self.cap {
-                        Cap::Key => {
-                            let key = key_bytes(&self.cur, self.cur_escaped);
-                            self.last_key_is_model = key.as_deref() == Some(b"model".as_slice());
-                            if let Some(k) = kept.as_deref_mut() {
-                                let at = key
-                                    .as_deref()
-                                    .and_then(|key| k.keys.iter().position(|want| *want == key));
-                                k.last_key_extra = at.and_then(|i| u8::try_from(i).ok());
-                            }
-                            // Only a *root* `message` opens the nested scan — a `message` key inside
-                            // the message object itself must not re-arm it.
-                            if self.accept_message_nesting && self.depth == 1 {
-                                self.last_key_is_message =
-                                    matches!(key.as_deref(), Some(b"message" | b"response"));
-                            }
-                        }
-                        Cap::ModelValue => {
-                            // A valid JSON string value is UTF-8; if a malformed/adversarial body
-                            // smuggles non-UTF-8 bytes here we record "unknown" rather than emitting
-                            // a `U+FFFD`-corrupted model into the billing log. Either way we're done.
-                            let v = capture_text(std::mem::take(&mut self.cur), self.cur_escaped)
-                                .unwrap_or_else(|| "unknown".to_string());
-                            match kept.as_deref() {
-                                // A knob scan keeps walking; the first `model` is the one kept.
-                                Some(k) if k.past_model => {
-                                    self.model.get_or_insert(v);
-                                    if k.all_found() {
-                                        self.done = true;
-                                        return;
-                                    }
-                                }
-                                _ => {
-                                    self.model = Some(v);
-                                    self.done = true;
-                                    return;
-                                }
-                            }
-                        }
-                        Cap::Extra => {
-                            if let Some(k) = kept.as_deref_mut()
-                                && let Some(idx) = k.last_key_extra
-                            {
-                                // Not UTF-8: dropped, never written to a row as a corrupted value.
-                                if let Some(v) =
-                                    capture_text(std::mem::take(&mut self.cur), self.cur_escaped)
-                                {
-                                    k.keep(idx, v);
-                                }
-                                if k.past_model && k.all_found() {
-                                    self.done = true;
-                                    return;
-                                }
-                            }
-                        }
-                        Cap::No => {}
-                    }
-                    self.cap = Cap::No;
-                    self.cur.clear();
-                } else if self.cap != Cap::No {
-                    push_capped(&mut self.cur, b);
-                }
-                continue;
-            }
-
-            let b = bytes[i];
-            i += 1;
-            let extra = kept.as_ref().and_then(|k| k.last_key_extra);
-            match b {
-                b'"' => {
-                    self.in_string = true;
-                    self.cur.clear();
-                    self.cur_escaped = false;
-                    // Decide whether this string is worth accumulating — only key-level keys and
-                    // the `model` value matter.
-                    self.cap = if self.at_key_level() {
-                        if self.expect_key {
-                            Cap::Key
-                        } else if self.last_key_is_model {
-                            Cap::ModelValue
-                        } else if extra.is_some() {
-                            Cap::Extra
-                        } else {
-                            Cap::No
-                        }
-                    } else {
-                        Cap::No
-                    };
-                }
-                b'{' | b'['
-                    if extra.is_some()
-                        && !self.expect_key
-                        && self.at_key_level()
-                        && kept.as_ref().is_some_and(|k| k.raw.is_none()) =>
-                {
-                    // An object or array value of a kept key: captured raw until its depth closes.
-                    if let Some(k) = kept.as_deref_mut() {
-                        k.raw = extra;
-                        k.raw_depth = self.depth;
-                        k.raw_buf.clear();
-                    }
-                    raw_from = Some(i - 1);
-                    self.depth += 1;
-                }
-                b'{' => {
-                    if self.depth == 0 {
-                        self.root_is_object = true;
-                        self.expect_key = true;
-                    } else if self.depth == 1 && self.last_key_is_message {
-                        // Descending into the root `message` object: its keys become key-level too.
-                        self.in_message = true;
-                        self.expect_key = true;
-                    }
-                    self.depth += 1;
-                }
-                b'[' => {
-                    if self.depth == 0 {
-                        self.root_is_object = false;
-                    }
-                    self.depth += 1;
-                }
-                b'}' | b']' => {
-                    // Leaving the `message` object returns key-level scanning to the root.
-                    if self.depth == 2 && self.in_message {
-                        self.in_message = false;
-                        self.last_key_is_message = false;
-                    }
-                    self.depth = self.depth.saturating_sub(1);
-                    if let Some(k) = kept.as_deref_mut()
-                        && let Some(idx) = k.raw
-                        && self.depth == k.raw_depth
-                    {
-                        push_raw(&mut k.raw_buf, &bytes[raw_from.unwrap_or(0)..i]);
-                        raw_from = None;
-                        k.raw = None;
-                        let v = utf8_prefix(std::mem::take(&mut k.raw_buf));
-                        k.keep(idx, v);
-                        if k.past_model && k.all_found() {
-                            self.done = true;
-                            return;
-                        }
-                    }
-                }
-                // Unguarded by depth: a `:` or `,` inside a nested value is always followed by
-                // the key-level `,` or `}` that closes it before the next key-level string, and
-                // that one sets `expect_key` again.
-                b':' => self.expect_key = false,
-                b',' => {
-                    self.expect_key = true;
-                    self.last_key_is_model = false;
-                    if let Some(k) = kept.as_deref_mut() {
-                        k.last_key_extra = None;
-                    }
-                    if self.depth == 1 {
-                        self.last_key_is_message = false;
-                    }
-                }
-                _ => {}
-            }
-        }
-        if let Some(k) = kept
+        let raw_from = kept.as_ref().and_then(|k| k.raw).map(|_| 0);
+        let mut lex = self.lex;
+        let mut walk = Walk {
+            s: self,
+            kept,
+            bytes,
+            raw_from,
+        };
+        let stopped = lex.feed(bytes, &mut walk);
+        let Walk {
+            s, kept, raw_from, ..
+        } = walk;
+        s.lex = lex;
+        // A stop is the scan finishing, which ends any raw capture first.
+        if stopped.is_none()
+            && let Some(k) = kept
             && k.raw.is_some()
             && let Some(from) = raw_from
         {
-            push_raw(&mut k.raw_buf, &bytes[from..n]);
+            push_raw(&mut k.raw_buf, bytes.get(from..).unwrap_or_default());
         }
+    }
+}
+
+/// One [`ModelScanner::feed_inner`] call: the scanner's key-level grammar over the lexer's events.
+struct Walk<'a, 'k> {
+    s: &'a mut ModelScanner,
+    kept: Option<&'k mut Kept>,
+    bytes: &'a [u8],
+    /// Where the raw capture in progress starts in this chunk.
+    raw_from: Option<usize>,
+}
+
+impl Walk<'_, '_> {
+    /// The scan is over: `feed` is a no-op from here.
+    fn finish(&mut self) -> Flow {
+        self.s.done = true;
+        Flow::Break(())
+    }
+}
+
+impl Visit for Walk<'_, '_> {
+    #[inline(always)]
+    fn open(&mut self, _: usize, depth: u32) {
+        let extra = self.kept.as_ref().and_then(|k| k.last_key_extra);
+        let s = &mut *self.s;
+        s.cur.clear();
+        // Decide whether this string is worth accumulating — only key-level keys and the `model`
+        // value matter.
+        s.cap = if s.at_key_level(depth) {
+            if s.expect_key {
+                Cap::Key
+            } else if s.last_key_is_model {
+                Cap::ModelValue
+            } else if extra.is_some() {
+                Cap::Extra
+            } else {
+                Cap::No
+            }
+        } else {
+            Cap::No
+        };
+    }
+
+    #[inline(always)]
+    fn content(&mut self, raw: &[u8]) {
+        let s = &mut *self.s;
+        if s.cap != Cap::No {
+            push_capped(&mut s.cur, raw);
+        }
+    }
+
+    fn close(&mut self, _: usize, depth: u32, escaped: bool) -> Flow {
+        let s = &mut *self.s;
+        match s.cap {
+            Cap::Key => {
+                let key = key_bytes(&s.cur, escaped);
+                s.last_key_is_model = key.as_deref() == Some(b"model".as_slice());
+                if let Some(k) = self.kept.as_deref_mut() {
+                    let at = key
+                        .as_deref()
+                        .and_then(|key| k.keys.iter().position(|want| *want == key));
+                    k.last_key_extra = at.and_then(|i| u8::try_from(i).ok());
+                }
+                // Only a *root* `message` opens the nested scan — a `message` key inside the
+                // message object itself must not re-arm it.
+                if s.accept_message_nesting && depth == 1 {
+                    s.last_key_is_message =
+                        matches!(key.as_deref(), Some(b"message" | b"response"));
+                }
+            }
+            Cap::ModelValue => {
+                // A valid JSON string value is UTF-8; if a malformed/adversarial body smuggles
+                // non-UTF-8 bytes here we record "unknown" rather than emitting a
+                // `U+FFFD`-corrupted model into the billing log. Either way we're done.
+                let v = capture_text(std::mem::take(&mut s.cur), escaped)
+                    .unwrap_or_else(|| "unknown".to_string());
+                match self.kept.as_deref() {
+                    // A knob scan keeps walking; the first `model` is the one kept.
+                    Some(k) if k.past_model => {
+                        s.model.get_or_insert(v);
+                        if k.all_found() {
+                            return self.finish();
+                        }
+                    }
+                    _ => {
+                        s.model = Some(v);
+                        return self.finish();
+                    }
+                }
+            }
+            Cap::Extra => {
+                if let Some(k) = self.kept.as_deref_mut()
+                    && let Some(idx) = k.last_key_extra
+                {
+                    // Not UTF-8: dropped, never written to a row as a corrupted value.
+                    if let Some(v) = capture_text(std::mem::take(&mut s.cur), escaped) {
+                        k.keep(idx, v);
+                    }
+                    if k.past_model && k.all_found() {
+                        return self.finish();
+                    }
+                }
+            }
+            Cap::No => {}
+        }
+        let s = &mut *self.s;
+        s.cap = Cap::No;
+        s.cur.clear();
+        Flow::Continue(())
+    }
+
+    #[inline(always)]
+    fn byte(&mut self, at: usize, b: u8, depth: u32) -> Flow {
+        let extra = self.kept.as_ref().and_then(|k| k.last_key_extra);
+        let s = &mut *self.s;
+        match b {
+            b'{' | b'['
+                if extra.is_some()
+                    && !s.expect_key
+                    && s.at_key_level(depth)
+                    && self.kept.as_ref().is_some_and(|k| k.raw.is_none()) =>
+            {
+                // An object or array value of a kept key: captured raw until its depth closes.
+                if let Some(k) = self.kept.as_deref_mut() {
+                    k.raw = extra;
+                    k.raw_depth = depth;
+                    k.raw_buf.clear();
+                }
+                self.raw_from = Some(at);
+            }
+            b'{' => {
+                if depth == 0 {
+                    s.root_is_object = true;
+                    s.expect_key = true;
+                } else if depth == 1 && s.last_key_is_message {
+                    // Descending into the root `message` object: its keys become key-level too.
+                    s.in_message = true;
+                    s.expect_key = true;
+                }
+            }
+            b'[' => {
+                if depth == 0 {
+                    s.root_is_object = false;
+                }
+            }
+            b'}' | b']' => {
+                // Leaving the `message` object returns key-level scanning to the root.
+                if depth == 2 && s.in_message {
+                    s.in_message = false;
+                    s.last_key_is_message = false;
+                }
+                if let Some(k) = self.kept.as_deref_mut()
+                    && let Some(idx) = k.raw
+                    && depth.saturating_sub(1) == k.raw_depth
+                {
+                    let from = self.raw_from.take().unwrap_or(0);
+                    let to = at.saturating_add(1);
+                    push_raw(&mut k.raw_buf, self.bytes.get(from..to).unwrap_or_default());
+                    k.raw = None;
+                    let v = utf8_prefix(std::mem::take(&mut k.raw_buf));
+                    k.keep(idx, v);
+                    if k.past_model && k.all_found() {
+                        return self.finish();
+                    }
+                }
+            }
+            // Unguarded by depth: a `:` or `,` inside a nested value is always followed by the
+            // key-level `,` or `}` that closes it before the next key-level string, and that one
+            // sets `expect_key` again.
+            b':' => s.expect_key = false,
+            b',' => {
+                s.expect_key = true;
+                s.last_key_is_model = false;
+                if let Some(k) = self.kept.as_deref_mut() {
+                    k.last_key_extra = None;
+                }
+                if depth == 1 {
+                    s.last_key_is_message = false;
+                }
+            }
+            _ => {}
+        }
+        Flow::Continue(())
     }
 }
 

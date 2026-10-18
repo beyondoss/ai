@@ -1696,9 +1696,10 @@ precisely because of this: a forged-key flood is rejected in tens of nanoseconds
 
 ### Model Extraction (`peek.rs:ModelScanner`)
 
-A streaming structural scanner fed body or response chunks as they arrive. Tracks JSON nesting
-depth, string-escape state, and quote boundaries. Captures the **root-level `model` field only**
-(depth 0 in the object), ignoring nested `model` keys in tool calls or message content. A key
+A streaming structural scanner fed body or response chunks as they arrive. Nesting depth, string
+and escape state come from the one JSON lexer (`lex.rs`), which every peek walker and the buffered
+scan share; the scanner keeps only its key-level grammar on top. Captures the **root-level
+`model` field only** (depth 0 in the object), ignoring nested `model` keys in tool calls or message content. A key
 spelled with escapes is decoded before the compare, as the provider decodes it (`"model"` is
 `model`); an unescaped key is compared as it stands. The `model` value is decoded the same way
 (`"gpt-5"` is `gpt-5`), and an escaped value cut at the cap reads as `unknown`.
