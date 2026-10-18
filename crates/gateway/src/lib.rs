@@ -16,6 +16,7 @@
 
 pub mod admin;
 pub mod allowance;
+pub mod body_rules;
 pub mod cache;
 pub mod capture;
 pub mod capture_sink;
@@ -35,6 +36,7 @@ pub mod peek;
 pub mod pin;
 pub mod proxy;
 pub mod ratelimit;
+pub mod refusal;
 pub mod remedy;
 pub mod route;
 pub mod secret;

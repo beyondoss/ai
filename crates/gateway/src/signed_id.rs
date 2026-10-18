@@ -92,11 +92,6 @@ const MAX_PACKED: usize = 32;
 static ID_KEY: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
     std::sync::LazyLock::new(|| memchr::memmem::Finder::new(b"id\""));
 
-/// What a refused request is told when the refusal happens after the request headers left (a
-/// `/{provider}` body that streamed in). A catalog walk is refused before connecting, naming the
-/// field ([`Refusal`]).
-pub const REFUSED: &str = "an id in this request does not belong to this tenant: send back only ids from responses this gateway returned to the same tenant";
-
 /// The keys that sign and verify tenant-bound ids.
 pub struct Signer {
     current: u8,
@@ -113,7 +108,10 @@ impl std::fmt::Debug for Signer {
     }
 }
 
-/// An id the caller sent that does not verify for it. `field` names where it was.
+/// An id the caller sent that does not verify for it. `field` names where it was: the message a
+/// request refused before connecting is told (`refusal::Refusal::ForeignId`). One refused after
+/// its headers left (a `/{provider}` body that streamed in) is told without the field
+/// (`refusal::Refusal::ForeignIdLate`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
     pub field: String,

@@ -130,7 +130,7 @@ mod admin {
 mod reject {
     use super::*;
     use beyond_ai::metrics::Rejection;
-    use beyond_ai::proxy::{REJECT_BODIES, error_body};
+    use beyond_ai::refusal::Refusal;
 
     fn metrics() -> &'static std::sync::Arc<beyond_ai::metrics::Metrics> {
         bench_metrics()
@@ -138,19 +138,18 @@ mod reject {
 
     /// The rejection response body. This is the flood path: `ratelimit`'s whole reason for existing
     /// is that a leaked or forged credential can be shed cheaply, so it runs at full request rate
-    /// exactly when the gateway can least afford it. Must be **0 allocs** — the body is one of a
-    /// closed set of constants, returned as `Bytes::from_static`.
+    /// exactly when the gateway can least afford it. Must be **0 allocs**: a fixed refusal's body
+    /// is a compile-time constant, returned as `Bytes::from_static`.
     #[divan::bench]
     fn body_precomputed() -> bytes::Bytes {
-        let (typ, msg, _) = REJECT_BODIES[2];
-        error_body(black_box(typ), black_box(msg))
+        black_box(&Refusal::InvalidKey).body()
     }
 
     /// What it replaced: a `serde_json` DOM (a `Map` plus an owned `String` per key and per string
     /// value) serialized into a fresh `String`, for output that was always one of eight constants.
     #[divan::bench]
     fn body_via_serde_json() -> bytes::Bytes {
-        let (typ, msg, _) = REJECT_BODIES[2];
+        let (typ, msg) = ("authentication_error", "invalid API key");
         bytes::Bytes::from(
             serde_json::json!({ "error": { "type": black_box(typ), "message": black_box(msg) } })
                 .to_string(),

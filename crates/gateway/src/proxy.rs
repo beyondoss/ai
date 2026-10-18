@@ -71,11 +71,12 @@ use crate::concurrency::TenantSlot;
 use crate::drain::{self, Drain};
 use crate::key::{self, Identity};
 use crate::metrics::{DrainEnd, KeyCooled, Rejection};
+use crate::refusal::{self, Refusal, clip_catalog_name};
 use crate::route::{self, Dialect, Provider, ProviderId};
 use crate::signed_id;
 use crate::state::{GatewayState, RequestId};
 use crate::terminal::TerminalTracker;
-use crate::{control, peek, pin, remedy, translate, unpriced, usage};
+use crate::{body_rules, control, peek, pin, remedy, translate, unpriced, usage};
 use arrayvec::{ArrayString, ArrayVec};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -92,6 +93,7 @@ use providers::catalog::strip_snapshot_date;
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::num::NonZeroU16;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1749,106 +1751,44 @@ impl RequestCtx {
     }
 }
 
-/// Every flood-path `(error_type, message)` pair, paired with its wire body.
-///
-/// `reject` is only ever called with these literals, so the body is a compile-time constant.
-/// Catalog-walk errors that echo a caller-supplied name go through `reject_message` and allocate.
-/// Kept as a table so `reject_bodies_are_valid_json` can walk it and assert each entry parses,
-/// carries the `type` and `message` it claims, and is reachable — a hand-written JSON literal is
-/// exactly the thing that rots silently otherwise.
-pub static REJECT_BODIES: [(&str, &str, &str); 15] = [
-    (
-        "invalid_request_error",
-        "unknown provider",
-        r#"{"error":{"message":"unknown provider","type":"invalid_request_error"}}"#,
-    ),
-    (
-        "authentication_error",
-        "missing API key",
-        r#"{"error":{"message":"missing API key","type":"authentication_error"}}"#,
-    ),
-    (
-        "authentication_error",
-        "invalid API key",
-        r#"{"error":{"message":"invalid API key","type":"authentication_error"}}"#,
-    ),
-    (
-        "rate_limit_error",
-        "rate limit exceeded",
-        r#"{"error":{"message":"rate limit exceeded","type":"rate_limit_error"}}"#,
-    ),
-    (
-        "invalid_request_error",
-        "request body too large",
-        r#"{"error":{"message":"request body too large","type":"invalid_request_error"}}"#,
-    ),
-    (
-        "access_denied",
-        "tenant is over limit or suspended",
-        r#"{"error":{"message":"tenant is over limit or suspended","type":"access_denied"}}"#,
-    ),
-    (
+/// Every answer `fail_to_proxy` gives an error that is not a [`Refusal`] (a connect failure, an
+/// upstream that failed after it had the whole request, every candidate's breaker open), with its
+/// body spelled out at compile time: `(type, message)` as [`failure_response`] and `fail_to_proxy`
+/// pair them, so a burst of provider failures is answered without building JSON.
+static FAILURES: [refusal::Fixed; 17] = [
+    refusal::fixed!("invalid_request_error", "bad request"),
+    refusal::fixed!("invalid_request_error", "request body too large"),
+    refusal::fixed!("rate_limit_error", "rate limit exceeded"),
+    refusal::fixed!("api_error", "upstream unavailable"),
+    refusal::fixed!("api_error", "provider temporarily unavailable"),
+    refusal::fixed!("api_error", "upstream timed out"),
+    refusal::fixed!("invalid_request_error", "request rejected"),
+    refusal::fixed!("api_error", "upstream error"),
+    refusal::fixed!("invalid_request_error", "request body timed out"),
+    refusal::fixed!("api_error", "could not connect to the provider"),
+    refusal::fixed!("api_error", "upstream connection failed"),
+    refusal::fixed!("api_error", "internal error"),
+    refusal::fixed!("api_error", "no provider could be reached"),
+    refusal::fixed!("api_error", "no candidate provider available"),
+    refusal::fixed!(
         "api_error",
-        "no provider key available",
-        r#"{"error":{"message":"no provider key available","type":"api_error"}}"#,
+        "the provider refused the stream; it was not processed"
     ),
-    (
+    refusal::fixed!(
         "api_error",
-        "provider temporarily unavailable",
-        r#"{"error":{"message":"provider temporarily unavailable","type":"api_error"}}"#,
+        "upstream timed out after receiving the request"
     ),
-    (
-        "invalid_request_error",
-        "model routing requires a managed key",
-        r#"{"error":{"message":"model routing requires a managed key","type":"invalid_request_error"}}"#,
-    ),
-    (
-        "insufficient_quota",
-        "quota exhausted",
-        r#"{"error":{"message":"quota exhausted","type":"insufficient_quota"}}"#,
-    ),
-    (
-        "api_error",
-        "allowance unavailable",
-        r#"{"error":{"message":"allowance unavailable","type":"api_error"}}"#,
-    ),
-    (
-        "rate_limit_error",
-        "too many concurrent requests",
-        r#"{"error":{"message":"too many concurrent requests","type":"rate_limit_error"}}"#,
-    ),
-    (
-        "api_error",
-        "too many large request bodies in flight",
-        r#"{"error":{"message":"too many large request bodies in flight","type":"api_error"}}"#,
-    ),
-    (
-        "api_error",
-        "upstream timed out after receiving the request",
-        r#"{"error":{"message":"upstream timed out after receiving the request","type":"api_error"}}"#,
-    ),
-    (
-        "api_error",
-        "upstream failed after receiving the request",
-        r#"{"error":{"message":"upstream failed after receiving the request","type":"api_error"}}"#,
-    ),
+    refusal::fixed!("api_error", "upstream failed after receiving the request"),
 ];
 
-/// The precomputed body for a `(typ, msg)` pair.
-///
-/// Falls back to building one with `serde_json` for a pair not in [`REJECT_BODIES`]. That branch is
-/// unreachable today (a test asserts every call site is covered) and exists so adding a rejection
-/// without its table entry degrades to the old allocating behaviour rather than serving a body that
-/// contradicts the `error_type` in the log line.
-/// `pub` for the bench target (`benches/unit.rs`), which measures it against the `serde_json`
-/// construction it replaced. Not part of the crate's intended surface.
+/// The wire body for a failure's `(typ, msg)`: the static one from [`FAILURES`], else built with
+/// `serde_json` (unreachable for any pair the gateway writes: a test walks every one).
+/// `pub` for the bench target (`benches/unit.rs`). Not part of the crate's intended surface.
 pub fn error_body(typ: &str, msg: &str) -> Bytes {
-    for &(t, m, body) in &REJECT_BODIES {
-        if t == typ && m == msg {
-            return Bytes::from_static(body.as_bytes());
-        }
+    match FAILURES.iter().find(|f| f.kind == typ && f.message == msg) {
+        Some(f) => Bytes::from_static(f.body.as_bytes()),
+        None => refusal::json_body(typ, msg),
     }
-    Bytes::from(serde_json::json!({ "error": { "type": typ, "message": msg } }).to_string())
 }
 
 impl AiProxy {
@@ -1864,16 +1804,20 @@ impl AiProxy {
     /// End a request at its deadline (`request_max_secs`): counted, logged, and answered 504 if no
     /// response has started (after one has, pingora cuts the stream as any mid-stream error does).
     fn deadline_cut(&self, request_id: &str) -> Box<pingora_core::Error> {
-        self.state
-            .metrics
-            .rejection(Rejection::RequestDeadline)
-            .inc();
+        let cut = self.refusal_error(Refusal::RequestDeadline);
         warn!(
             request_id,
             limit_secs = self.state.config.request_max_secs(),
             "request reached request_max_secs; ending it",
         );
-        gateway_error(504, REQUEST_DEADLINE)
+        cut
+    }
+
+    /// Count `refusal` and raise it as pingora's error, for a hook past `request_filter` that
+    /// cannot write the answer itself: `fail_to_proxy` answers it, if no response has started.
+    fn refusal_error(&self, refusal: Refusal) -> Box<pingora_core::Error> {
+        self.state.metrics.rejection(refusal.metric()).inc();
+        refusal.into_error()
     }
 
     /// Cap this attempt's upstream read timeout at the time left before the request's deadline,
@@ -1967,93 +1911,33 @@ impl AiProxy {
         peer
     }
 
-    /// Write a small JSON error and signal `request_filter` to short-circuit. The body is built with
-    /// `serde_json` (not `format!`) so a `typ`/`msg` containing `"` or `\` can never break out of the
-    /// JSON structure — keeps this safe if a future caller passes a non-literal message.
+    /// Count `refusal`, log it, and answer it before any upstream, signalling `request_filter`
+    /// to short-circuit.
     ///
-    /// Every rejection logs one structured `warn` line (the rejection counter only says *how many*,
-    /// not *which request* — this is what an oncall greps when a `deny_fraud`/`rate_limit` spike
+    /// Every refusal logs one structured `warn` line (the rejection counter only says *how many*,
+    /// not *which request*: this is what an oncall greps when a `deny_fraud`/`rate_limit` spike
     /// shows on the dashboard) and echoes the `request_id` in a response header so a client report
     /// quoting that id lands on this line.
     ///
-    /// **Call it through [`Self::reject_boxed`], never `.await` it directly.** `#[async_trait]`
-    /// heap-boxes `request_filter`'s future once per request, and this future — 1 136 bytes of it,
-    /// measured with `-Zprint-type-sizes` — gets inlined into that state machine at every call site.
-    /// Awaiting it inline therefore made *every* request, including every successful one, allocate
-    /// room for a rejection it was never going to take.
-    async fn reject(
-        session: &mut Session,
-        request_id: &str,
-        status: u16,
-        typ: &str,
-        msg: &str,
-    ) -> Result<bool> {
-        Self::reject_retry_after(
-            session,
-            request_id,
-            status,
-            typ,
-            msg,
-            default_retry_after(status, msg),
-        )
-        .await
-    }
-
-    /// [`Self::reject`] with an explicit `Retry-After` (seconds). `reject` derives one for every
-    /// 429 and 503 (see [`default_retry_after`]); the open-breaker 503 knows better, the seconds
-    /// left until it half-opens.
-    async fn reject_retry_after(
-        session: &mut Session,
-        request_id: &str,
-        status: u16,
-        typ: &str,
-        msg: &str,
-        retry_after: Option<u64>,
-    ) -> Result<bool> {
-        log_rejection(request_id, status, typ);
-        // `typ` and `msg` are always a pair of literals from `RejectBody`, so the body is one of a
-        // handful of compile-time constants and `error_body` hands back a `Bytes::from_static` —
-        // no JSON DOM, no `String`, no copy. Building it with `serde_json::json!` cost 13
-        // allocations and 1 565 bytes per rejected request (measured), which is a poor trade on the
-        // one path that a flood drives at full rate. The `json!` was there so a non-literal message
-        // couldn't break out of the JSON structure; a closed set of constants gives that for free,
-        // and `reject_bodies_are_valid_json` keeps them honest.
-        let body = error_body(typ, msg);
-        // Content-length formatted into a stack buffer rather than `body.len().to_string()`: still
-        // one `HeaderValue` allocation inside pingora, but no `String` of our own.
-        let mut len_buf = ArrayString::<20>::new();
-        let _ = write!(len_buf, "{}", body.len());
-        let mut resp = ResponseHeader::build(status, Some(4))?;
-        resp.insert_header("content-type", "application/json")?;
-        resp.insert_header("content-length", len_buf.as_str())?;
-        resp.insert_header(REQUEST_ID_HEADER, request_id)?;
-        if let Some(secs) = retry_after {
-            let mut ra = ArrayString::<20>::new();
-            let _ = write!(ra, "{secs}");
-            resp.insert_header(http::header::RETRY_AFTER, ra.as_str())?;
-        }
-        session.write_response_header(Box::new(resp), false).await?;
-        session.write_response_body(Some(body), true).await?;
-        Ok(true)
-    }
-
-    /// [`Self::reject`] behind its own allocation, so its state machine is *not* inlined into
-    /// `request_filter`'s.
+    /// Not an `async fn`: the refusal moves straight into a boxed write, so the await in
+    /// `request_filter` holds one pointer. `#[async_trait]` heap-boxes `request_filter`'s future
+    /// once per request, and the box must be big enough for its widest await: with the write
+    /// awaited inline at eight call sites it dominated that future (1 264 bytes total, 1 136 of them
+    /// the write, `-Zprint-type-sizes`), so a request that is never refused paid for room it never
+    /// used.
     ///
-    /// `request_filter` returns an `#[async_trait]` future that pingora heap-boxes once per request.
-    /// With `reject` awaited inline at eight call sites, the largest of them dominated that future:
-    /// 1 264 bytes total, of which 1 136 was the reject state machine (`-Zprint-type-sizes`) — for
-    /// comparison every other filter's future is 32 bytes and `upstream_peer`'s is 152. A request
-    /// that is never rejected still paid for it, because the box has to be big enough for the widest
-    /// variant. Boxing here moves that cost onto the requests that actually reject.
-    async fn reject_boxed(
-        session: &mut Session,
-        request_id: &str,
-        status: u16,
-        typ: &str,
-        msg: &str,
-    ) -> Result<bool> {
-        Box::pin(Self::reject(session, request_id, status, typ, msg)).await
+    /// For a refusal that may not happen, call this inside the `if let` scrutinee
+    /// (`check().map(|r| self.refuse(..))`) and await the write in the block: an `Option<Refusal>`
+    /// scrutinee is a temporary the `if let` keeps through its block, and moving the refusal out of
+    /// it does not end that, so it would be saved across the await (56 bytes in every request's box).
+    fn refuse<'a>(
+        &self,
+        session: &'a mut Session,
+        request_id: &'a str,
+        refusal: Refusal,
+    ) -> Pin<Box<impl Future<Output = Result<bool>> + Send + 'a>> {
+        self.state.metrics.rejection(refusal.metric()).inc();
+        Box::pin(write_refusal(session, request_id, refusal))
     }
 
     /// This tenant's concurrency slot. `Ok(None)` when no cap is configured; `Err` when the tenant
@@ -2063,129 +1947,6 @@ impl AiProxy {
             None => Ok(None),
             Some(slots) => slots.take(id).map(Some).ok_or(()),
         }
-    }
-
-    async fn reject_tenant_busy(&self, session: &mut Session, request_id: &str) -> Result<bool> {
-        self.state
-            .metrics
-            .rejection(Rejection::TenantConcurrency)
-            .inc();
-        Self::reject_boxed(
-            session,
-            request_id,
-            429,
-            "rate_limit_error",
-            "too many concurrent requests",
-        )
-        .await
-    }
-
-    /// The body asks for what the row's card says it does not accept (`route::refused_input`: image
-    /// input, tools): a 400 naming the row and the kind, before any upstream sees it.
-    async fn reject_refused_input(
-        &self,
-        session: &mut Session,
-        request_id: &str,
-        row: &route::ModelRoute,
-        kind: &str,
-    ) -> Result<bool> {
-        self.state.metrics.rejection(Rejection::Modality).inc();
-        Self::reject_message_boxed(
-            session,
-            request_id,
-            400,
-            "invalid_request_error",
-            format!("{} does not accept {kind}", row.model),
-        )
-        .await
-    }
-
-    /// Holding this request's body would cross `max_buffered_body_bytes`: a retryable 503, since
-    /// the memory frees as the bodies in flight finish.
-    async fn reject_body_memory(&self, session: &mut Session, request_id: &str) -> Result<bool> {
-        self.state.metrics.rejection(Rejection::BodyMemory).inc();
-        Self::reject_boxed(
-            session,
-            request_id,
-            503,
-            "api_error",
-            "too many large request bodies in flight",
-        )
-        .await
-    }
-
-    /// A body that reached [`MAX_REQUEST_BODY`] while the gateway was reading it to choose a row.
-    async fn reject_too_large(&self, session: &mut Session, request_id: &str) -> Result<bool> {
-        self.state.metrics.rejection(Rejection::BodyTooLarge).inc();
-        Self::reject_boxed(
-            session,
-            request_id,
-            413,
-            "invalid_request_error",
-            "request body too large",
-        )
-        .await
-    }
-
-    /// Catalog-walk errors that must echo a caller-supplied name (unknown model, wire mismatch).
-    /// Allocating is fine: this is not the flood path the static [`REJECT_BODIES`] table exists for.
-    async fn reject_message(
-        session: &mut Session,
-        request_id: &str,
-        status: u16,
-        typ: &'static str,
-        msg: String,
-    ) -> Result<bool> {
-        log_rejection(request_id, status, typ);
-        let body = Bytes::from(
-            serde_json::json!({ "error": { "type": typ, "message": msg } }).to_string(),
-        );
-        let mut len_buf = ArrayString::<20>::new();
-        let _ = write!(len_buf, "{}", body.len());
-        let mut resp = ResponseHeader::build(status, Some(3))?;
-        resp.insert_header("content-type", "application/json")?;
-        resp.insert_header("content-length", len_buf.as_str())?;
-        resp.insert_header(REQUEST_ID_HEADER, request_id)?;
-        session.write_response_header(Box::new(resp), false).await?;
-        session.write_response_body(Some(body), true).await?;
-        Ok(true)
-    }
-
-    /// A managed Responses `background: true` request (D202): the provider answers `queued` with
-    /// no usage and generates after the request ends, so nothing the gateway relays could meter
-    /// it, and a managed key cannot poll for the result (GET is refused).
-    async fn reject_background(&self, session: &mut Session, request_id: &str) -> Result<bool> {
-        self.state
-            .metrics
-            .rejection(Rejection::ManagedEndpoint)
-            .inc();
-        Self::reject_message_boxed(
-            session,
-            request_id,
-            400,
-            "invalid_request_error",
-            BACKGROUND_REFUSED.to_owned(),
-        )
-        .await
-    }
-
-    async fn reject_message_boxed(
-        session: &mut Session,
-        request_id: &str,
-        status: u16,
-        typ: &'static str,
-        msg: String,
-    ) -> Result<bool> {
-        Box::pin(Self::reject_message(session, request_id, status, typ, msg)).await
-    }
-
-    async fn reject_catalog_miss(
-        session: &mut Session,
-        request_id: &str,
-        name: Option<&str>,
-    ) -> Result<bool> {
-        let msg = catalog_miss_message(name, true);
-        Self::reject_message_boxed(session, request_id, 404, "invalid_request_error", msg).await
     }
 
     /// `body` is [`GatewayState::models_list`], rendered at boot; serving it is a refcount bump.
@@ -2219,39 +1980,24 @@ impl AiProxy {
     }
 
     /// `signed_id`: a large catalog body's ids, checked before its first attempt connects (its
-    /// `FullBody` re-runs see the body only as it streams in). `Some` when the request was refused
-    /// and the reply is written.
-    async fn refuse_foreign_ids(
+    /// `FullBody` re-runs see the body only as it streams in). `Some` when the request is refused.
+    fn foreign_ids(
         &self,
-        session: &mut Session,
-        request_id: &str,
+        path: &str,
         route: &'static route::ModelRoute,
         body: &[u8],
         tenant_id: u64,
-    ) -> Option<Result<bool>> {
-        if !signed_id::catalog_applies(session.req_header().uri.path(), route) {
+    ) -> Option<Refusal> {
+        if !signed_id::catalog_applies(path, route) {
             return None;
         }
-        let (reason, status, typ, msg) = match self.state.id_signer.as_ref() {
-            None => (
-                Rejection::IdSigningUnset,
-                503,
-                "api_error",
-                "managed Responses ids cannot be issued: the gateway has no id signing key configured"
-                    .to_owned(),
-            ),
-            Some(signer) => {
-                let refusal = signer.unsign_request(tenant_id, body, true).err()?;
-                (
-                    Rejection::ForeignId,
-                    400,
-                    "invalid_request_error",
-                    refusal.to_string(),
-                )
-            }
-        };
-        self.state.metrics.rejection(reason).inc();
-        Some(Self::reject_message_boxed(session, request_id, status, typ, msg).await)
+        match self.state.id_signer.as_ref() {
+            None => Some(Refusal::IdSigningUnset),
+            Some(signer) => signer
+                .unsign_request(tenant_id, body, true)
+                .err()
+                .map(Refusal::ForeignId),
+        }
     }
 
     /// Re-run a request whose body the gateway read in full as a pingora subrequest carrying that
@@ -2277,13 +2023,16 @@ impl AiProxy {
         } else {
             None
         };
-        if let Some(kind) = route::refused_input(route, &body) {
-            return self
-                .reject_refused_input(session, &request_id, route, kind)
-                .await;
-        }
-        if route::is_responses_path(session.req_header().uri.path()) && requests_background(&body) {
-            return self.reject_background(session, &request_id).await;
+        let facts = body_rules::Facts {
+            refused_input: route::refused_input(route, &body).map(|kind| (route.model, kind)),
+            background: route::is_responses_path(session.req_header().uri.path())
+                && requests_background(&body),
+            ..body_rules::Facts::default()
+        };
+        if let Some(write) = body_rules::refusal(body_rules::Point::Relay, facts)
+            .map(|refusal| self.refuse(session, &request_id, refusal))
+        {
+            return write.await;
         }
         let unserved = route::unserved(route.candidates, &body);
         let responses_tools = route::tools_need_responses_arm(
@@ -2327,14 +2076,7 @@ impl AiProxy {
             let Some((subrequest, handle)) = create_full_body_subrequest(session, ctx, body.len())
             else {
                 // Unreachable while `allow_spawning_subrequest` returns true; a 500, not a hang.
-                return Self::reject_message_boxed(
-                    session,
-                    &request_id,
-                    500,
-                    "api_error",
-                    "internal error".to_owned(),
-                )
-                .await;
+                return fail_boxed(session, &request_id, 500, "internal error").await;
             };
             let attempt = tokio::spawn(subrequest.run());
             let piped = Box::pin(pipe_full_body(session, handle, body.clone(), &retry)).await;
@@ -2378,14 +2120,7 @@ impl AiProxy {
                 }
             }
         }
-        Self::reject_message_boxed(
-            session,
-            &request_id,
-            502,
-            "api_error",
-            "no candidate provider available".to_owned(),
-        )
-        .await
+        fail_boxed(session, &request_id, 502, "no candidate provider available").await
     }
 
     /// Cool this attempt's pool key because its account is out of credit (D180): later requests
@@ -2520,18 +2255,11 @@ impl AiProxy {
         }
         let heap = translate::translation_heap(body);
         if heap > budget.limit() {
-            self.state
-                .metrics
-                .rejection(Rejection::TranslateTooLarge)
-                .inc();
-            return Err(gateway_error(413, TRANSLATE_TOO_LARGE).into_down());
+            return Err(self.refusal_error(Refusal::TranslateTooLarge).into_down());
         }
         match budget.hold(heap) {
             Some(hold) => Ok(Some(hold)),
-            None => {
-                self.state.metrics.rejection(Rejection::BodyMemory).inc();
-                Err(gateway_error(503, "too many large request bodies in flight").into_down())
-            }
+            None => Err(self.refusal_error(Refusal::BodyMemory).into_down()),
         }
     }
 
@@ -3543,60 +3271,68 @@ fn log_second() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_secs()
 }
 
-/// The `Retry-After` (seconds) on a gateway-made rejection: every 429 and 503 carries one, so a
-/// stock SDK backs off rather than hammering or giving up. A rate limit or a tenant's concurrency
-/// cap frees up within a second; an allowance-set not yet read takes a few; anything else gets 1.
-fn default_retry_after(status: u16, msg: &str) -> Option<u64> {
-    match status {
-        503 if msg == "allowance unavailable" => Some(5),
-        429 | 503 => Some(1),
-        _ => None,
-    }
+/// Write `refusal`: its status, body and `Retry-After`, and `x-beyond-request-id`, after the
+/// `request rejected` line. See [`AiProxy::refuse`], which counts it and boxes this.
+async fn write_refusal(session: &mut Session, request_id: &str, refusal: Refusal) -> Result<bool> {
+    let status = refusal.status();
+    log_rejection(request_id, status, refusal.kind());
+    write_json_body(
+        session,
+        request_id,
+        status,
+        refusal.body(),
+        refusal.retry_after(),
+    )
+    .await?;
+    Ok(true)
 }
 
-/// An error the gateway raises with the status and message the client should see. Carried in
-/// `ErrorType::CustomCode` so [`failure_response`] can answer with exactly this rather than a
-/// generic line for the status.
-/// The 413 for a body whose translation would take more heap than the whole body budget (D216).
-const TRANSLATE_TOO_LARGE: &str = "request body is too large to translate onto this model's API \
-     within the gateway's memory budget; send it on the model's own API, or send less";
+/// Answer a request the gateway could not serve but did not refuse (no metric counts it: it is not
+/// the client's request that is wrong), logged as a refusal is. Boxed, as [`AiProxy::refuse`] is.
+async fn fail_boxed(
+    session: &mut Session,
+    request_id: &str,
+    status: u16,
+    msg: &'static str,
+) -> Result<bool> {
+    log_rejection(request_id, status, "api_error");
+    Box::pin(write_json_body(
+        session,
+        request_id,
+        status,
+        error_body("api_error", msg),
+        None,
+    ))
+    .await?;
+    Ok(true)
+}
 
+/// An error the gateway raises for a failure that is no refusal of the request (every candidate
+/// failed, or every breaker is open), with the status and message the client should see: carried
+/// in `ErrorType::CustomCode` so [`failure_response`] answers with exactly this rather than a
+/// generic line for the status.
 fn gateway_error(status: u16, msg: &'static str) -> Box<pingora_core::Error> {
     pingora_core::Error::new(pingora_core::ErrorType::CustomCode(msg, status))
 }
-
-/// The [`gateway_error`] tag for a managed `/{provider}` body whose model names no catalog row
-/// (D267). Never shown as is: `fail_to_proxy` answers it with [`catalog_miss_message`] for the
-/// model the request carried, the catalog walk's own 404.
-const CATALOG_MISS: &str = "model is not in the catalog";
-
-/// The catalog-miss message, for the catalog walk (`reject_catalog_miss`) and for a managed
-/// `/{provider}` body (D267) alike: the model by name (clipped), or that none was sent, and where
-/// the models a managed key can use are listed.
-/// `header`: whether the route reads `x-beyond-model` (a catalog walk does, `/{provider}` does not).
-fn catalog_miss_message(name: Option<&str>, header: bool) -> String {
-    match name.map(str::trim).filter(|s| !s.is_empty()) {
-        None => format!(
-            "missing model: set the JSON body's model{} to a catalog name; GET /v1/models lists \
-             them",
-            if header { " (or x-beyond-model)" } else { "" }
-        ),
-        Some(n) => format!(
-            "model \"{}\" is not in the catalog; a managed key runs catalog models only (GET \
-             /v1/models lists them)",
-            clip_catalog_name(n)
-        ),
-    }
-}
-
-/// The 504 for a request that outlived `request_max_secs` before its response head.
-const REQUEST_DEADLINE: &str = "request exceeded the gateway's maximum duration";
 
 /// Whether `e` is the request deadline passing ([`AiProxy::deadline_cut`]). A policy limit, never a
 /// provider outcome: [`is_upstream_failure`] is false for it, so no breaker hears of it, and
 /// `error_while_proxy` passes it through as the gateway's own decision (no resend, no failover).
 fn is_deadline(e: &pingora_core::Error) -> bool {
-    matches!(e.etype(), pingora_core::ErrorType::CustomCode(m, 504) if *m == REQUEST_DEADLINE)
+    matches!(Refusal::of(e), Some(Refusal::RequestDeadline))
+}
+
+/// The catalog miss for an `x-beyond-model` header that names no row, naming what it sent.
+fn header_catalog_miss(session: &Session) -> Refusal {
+    let name = session
+        .req_header()
+        .headers
+        .get(route::MODEL_HEADER)
+        .and_then(|v| v.to_str().ok());
+    Refusal::CatalogMiss {
+        name: name.map(Into::into),
+        header: true,
+    }
 }
 
 /// The client-facing `(status, error type, message)` for an error that ended a request, or `None`
@@ -3648,16 +3384,17 @@ fn failure_response(e: &pingora_core::Error) -> Option<(u16, &'static str, &'sta
     })
 }
 
-/// Write a JSON error (see `fail_to_proxy`). `Retry-After` when given.
-async fn write_json_error(
+/// Write a JSON error `body` with `x-beyond-request-id`, and `Retry-After` when given: every
+/// error the gateway itself answers goes out through here, refusals and failures alike.
+async fn write_json_body(
     session: &mut Session,
     request_id: &str,
     status: u16,
-    typ: &str,
-    msg: &str,
+    body: Bytes,
     retry_after: Option<u64>,
 ) -> Result<()> {
-    let body = error_body(typ, msg);
+    // Content-length formatted into a stack buffer rather than `body.len().to_string()`: still one
+    // `HeaderValue` allocation inside pingora, but no `String` of our own.
     let mut len_buf = ArrayString::<20>::new();
     let _ = write!(len_buf, "{}", body.len());
     let mut resp = ResponseHeader::build(status, Some(4))?;
@@ -3702,12 +3439,6 @@ fn summary_line(req: &pingora::http::RequestHeader) -> String {
         .or_else(|| req.uri.host())
         .unwrap_or("");
     format!("{} {}, Host: {host}", req.method, req.uri.path())
-}
-
-/// Cap a caller-supplied model name before echoing it in an error. The peek is 64 KiB; we do not
-/// want that in a JSON error body.
-fn clip_catalog_name(name: &str) -> &str {
-    &name[..name.floor_char_boundary(128)]
 }
 
 /// Resolve the provider name for a request whose first path segment matched no known/config
@@ -3772,11 +3503,6 @@ fn byo_credential_dialect(req: &pingora::http::RequestHeader) -> Result<Option<D
     }
     Ok(vote)
 }
-
-/// What a managed Responses `background: true` request is told (D202).
-const BACKGROUND_REFUSED: &str = "background responses are not available with a managed key: the \
-     provider generates them after the request ends, where they cannot be metered; send the request \
-     without \"background\": true";
 
 /// Whether a Responses body asks for background mode: a root `background` member (escapes in its
 /// name decoded, any copy of it) whose value is `true`. `true` is a literal no escape can spell, so
@@ -4440,47 +4166,13 @@ impl ProxyHttp for AiProxy {
         // kept whole until then, and becomes a [`Plan`] once the key says which it is.
         let route = match route {
             Ok(route) => route,
-            Err(RouteMiss::UnknownModel) => {
-                self.state.metrics.rejection(Rejection::UnknownModel).inc();
-                let name = session
-                    .req_header()
-                    .headers
-                    .get(route::MODEL_HEADER)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_owned);
-                return Self::reject_catalog_miss(session, &request_id, name.as_deref()).await;
-            }
-            Err(RouteMiss::UnknownProvider) => {
-                self.state
-                    .metrics
-                    .rejection(Rejection::UnknownProvider)
-                    .inc();
-                return Self::reject_boxed(
-                    session,
-                    &request_id,
-                    404,
-                    "invalid_request_error",
-                    "unknown provider",
-                )
-                .await;
-            }
-            Err(RouteMiss::AmbiguousCredential) => {
-                self.state
-                    .metrics
-                    .rejection(Rejection::AmbiguousCredential)
-                    .inc();
-                // Rare and never a flood path, so not in `REJECT_BODIES`.
-                return Self::reject_message_boxed(
-                    session,
-                    &request_id,
-                    400,
-                    "invalid_request_error",
-                    "the request carries API keys for different providers (x-api-key and \
-                     Authorization); send only the key for the provider you mean, or name it \
-                     with /{provider}/..."
-                        .to_owned(),
-                )
-                .await;
+            Err(miss) => {
+                let refusal = match miss {
+                    RouteMiss::UnknownModel => header_catalog_miss(session),
+                    RouteMiss::UnknownProvider => Refusal::UnknownProvider,
+                    RouteMiss::AmbiguousCredential => Refusal::AmbiguousCredential,
+                };
+                return self.refuse(session, &request_id, refusal).await;
             }
         };
 
@@ -4490,15 +4182,7 @@ impl ProxyHttp for AiProxy {
             managed: managed_key,
         }) = extract_virtual_key(session.req_header())
         else {
-            self.state.metrics.rejection(Rejection::MissingKey).inc();
-            return Self::reject_boxed(
-                session,
-                &request_id,
-                401,
-                "authentication_error",
-                "missing API key",
-            )
-            .await;
+            return self.refuse(session, &request_id, Refusal::MissingKey).await;
         };
 
         // 3. Rate guardrails (see `ratelimit`), charged on the *raw presented key* **before** any
@@ -4511,17 +4195,10 @@ impl ProxyHttp for AiProxy {
         // over-limit path (where `raw_key` is unused afterward).
         if full_body.is_none()
             && let Some(rl) = &self.state.rate_limit
-            && let Some(reason) = rl.check_at(raw_key, managed_key, start)
+            && let Some(throttled) = rl.check_at(raw_key, managed_key, start)
         {
-            self.state.metrics.rejection(reason.into()).inc();
-            return Self::reject_boxed(
-                session,
-                &request_id,
-                429,
-                "rate_limit_error",
-                "rate limit exceeded",
-            )
-            .await;
+            let refusal = Refusal::RateLimited(throttled);
+            return self.refuse(session, &request_id, refusal).await;
         }
 
         // 4. Reject oversized bodies up front (Content-Length) so we never buffer a huge upload.
@@ -4534,15 +4211,9 @@ impl ProxyHttp for AiProxy {
         if let Some(len) = declared_len
             && len > MAX_REQUEST_BODY
         {
-            self.state.metrics.rejection(Rejection::BodyTooLarge).inc();
-            return Self::reject_boxed(
-                session,
-                &request_id,
-                413,
-                "invalid_request_error",
-                "request body too large",
-            )
-            .await;
+            return self
+                .refuse(session, &request_id, Refusal::BodyTooLarge)
+                .await;
         }
 
         // 5. Identity + key handling. One branch: `bai_v1`/`bai_v2` is fail-closed (prefix match →
@@ -4553,15 +4224,7 @@ impl ProxyHttp for AiProxy {
         // exempted it from the BYO aggregate.
         let identity: Option<Identity> = if managed_key {
             let Ok(identity) = self.state.keyring.verify(raw_key) else {
-                self.state.metrics.rejection(Rejection::Auth).inc();
-                return Self::reject_boxed(
-                    session,
-                    &request_id,
-                    401,
-                    "authentication_error",
-                    "invalid API key",
-                )
-                .await;
+                return self.refuse(session, &request_id, Refusal::InvalidKey).await;
             };
             // Deny-set: O(1), default-allow. Tenant deny OR (v2) key deny. Tenant wins if both.
             if let Some(reason) = self
@@ -4570,25 +4233,12 @@ impl ProxyHttp for AiProxy {
                 .load()
                 .reason_for(identity.tenant_id, identity.key_id)
             {
-                // Distinct label per reason — `Unknown` is *not* folded into `deny_fraud`. An
-                // `Unknown` arises when the control plane writes a reason string this gateway
-                // doesn't recognize (a control-plane deploy ahead of a gateway deploy), which would
-                // otherwise spike the fraud counter and mask the real fraud signal. A `deny_unknown`
-                // label surfaces it as the deployment-coordination issue it is.
-                let label = match reason {
-                    crate::deny::DenyReason::Spend => Rejection::DenySpend,
-                    crate::deny::DenyReason::Fraud => Rejection::DenyFraud,
-                    crate::deny::DenyReason::Unknown => Rejection::DenyUnknown,
-                };
-                self.state.metrics.rejection(label).inc();
-                return Self::reject_boxed(
-                    session,
-                    &request_id,
-                    reason.http_status(),
-                    "access_denied",
-                    "tenant is over limit or suspended",
-                )
-                .await;
+                // Counted per reason (`Refusal::metric`): an `Unknown` is a control plane writing a
+                // reason this build does not know (a deploy ahead of the gateway's), and folded into
+                // `deny_fraud` it would spike the fraud signal and mask real fraud.
+                return self
+                    .refuse(session, &request_id, Refusal::Denied(reason))
+                    .await;
             }
             // Allowance: remaining-ok vs exhausted, same WatchedSet shape as deny. Fail-closed
             // while the set has not been read. 402 before cache and before `upstream_peer`.
@@ -4598,35 +4248,13 @@ impl ProxyHttp for AiProxy {
                 .load()
                 .reason_for(identity.tenant_id, identity.key_id)
             {
-                match reason {
-                    crate::allowance::AllowanceReject::Exhausted => {
-                        self.state.metrics.rejection(Rejection::Quota).inc();
-                        return Self::reject_boxed(
-                            session,
-                            &request_id,
-                            402,
-                            "insufficient_quota",
-                            "quota exhausted",
-                        )
-                        .await;
-                    }
+                let refusal = match reason {
+                    crate::allowance::AllowanceReject::Exhausted => Refusal::QuotaExhausted,
                     // Not seeded yet: transient, so a retryable 503 with `Retry-After`, not the
                     // 402 an SDK treats as final ("quota exhausted" above is the final one).
-                    crate::allowance::AllowanceReject::Unavailable => {
-                        self.state
-                            .metrics
-                            .rejection(Rejection::AllowanceUnavailable)
-                            .inc();
-                        return Self::reject_boxed(
-                            session,
-                            &request_id,
-                            503,
-                            "api_error",
-                            "allowance unavailable",
-                        )
-                        .await;
-                    }
-                }
+                    crate::allowance::AllowanceReject::Unavailable => Refusal::AllowanceUnavailable,
+                };
+                return self.refuse(session, &request_id, refusal).await;
             }
             // The actual `Bearer …`/`x-api-key` value is precomputed in the provider registry and
             // applied in `upstream_request_filter`; here we only confirm a pool key exists.
@@ -4638,15 +4266,7 @@ impl ProxyHttp for AiProxy {
             if let Route::Provider { provider, .. } = &route
                 && !provider.has_pool_key()
             {
-                self.state.metrics.rejection(Rejection::NoPoolKey).inc();
-                return Self::reject_boxed(
-                    session,
-                    &request_id,
-                    503,
-                    "api_error",
-                    "no provider key available",
-                )
-                .await;
+                return self.refuse(session, &request_id, Refusal::NoPoolKey).await;
             }
             Some(identity)
         } else {
@@ -4681,18 +4301,9 @@ impl ProxyHttp for AiProxy {
             // a guess (and a failover would send that key to a different vendor). BYO on `/v1`
             // keeps the dialect-default provider (above) and never consults the catalog.
             (Route::Auto { .. }, None) => {
-                self.state
-                    .metrics
-                    .rejection(Rejection::ByoOnModelRoute)
-                    .inc();
-                return Self::reject_boxed(
-                    session,
-                    &request_id,
-                    400,
-                    "invalid_request_error",
-                    "model routing requires a managed key",
-                )
-                .await;
+                return self
+                    .refuse(session, &request_id, Refusal::ByoOnModelRoute)
+                    .await;
             }
             (Route::Auto { header: Some(row) }, Some(id)) => {
                 Admission::Ready(Plan::Catalog(Walk {
@@ -4726,18 +4337,9 @@ impl ProxyHttp for AiProxy {
             // opaque relay on the pool key that no usage tap can meter. Refused whatever the path,
             // so the allowlist below is not the only thing standing in its way.
             if req.headers.contains_key(http::header::UPGRADE) {
-                self.state
-                    .metrics
-                    .rejection(Rejection::ManagedEndpoint)
-                    .inc();
-                return Self::reject_message_boxed(
-                    session,
-                    &request_id,
-                    400,
-                    "invalid_request_error",
-                    "protocol upgrades (WebSocket) are not available with a managed key".to_owned(),
-                )
-                .await;
+                return self
+                    .refuse(session, &request_id, Refusal::ProtocolUpgrade)
+                    .await;
             }
             let method_ok = req.method == http::Method::POST;
             // Only a request that names its provider is held to the allowlist; a catalog walk's
@@ -4749,26 +4351,14 @@ impl ProxyHttp for AiProxy {
                 Admission::NeedsRow(_) => true,
             };
             if !(method_ok && endpoint_ok) {
-                let msg = format!(
-                    "{} {} is not available with a managed key; managed keys reach POST generation endpoints only (chat/completions, messages, responses, embeddings, count_tokens)",
-                    req.method,
-                    clip_catalog_name(req.uri.path()),
-                );
                 // An endpoint outside the allowlist is 404 whatever the method; a wrong method on an
                 // allowed endpoint (or any catalog path) is 405.
-                let status = if endpoint_ok { 405 } else { 404 };
-                self.state
-                    .metrics
-                    .rejection(Rejection::ManagedEndpoint)
-                    .inc();
-                return Self::reject_message_boxed(
-                    session,
-                    &request_id,
-                    status,
-                    "invalid_request_error",
-                    msg,
-                )
-                .await;
+                let refusal = Refusal::ManagedEndpoint {
+                    method: req.method.clone(),
+                    path: clip_catalog_name(req.uri.path()).into(),
+                    wrong_method: endpoint_ok,
+                };
+                return self.refuse(session, &request_id, refusal).await;
             }
         }
 
@@ -4806,22 +4396,16 @@ impl ProxyHttp for AiProxy {
                 let (row, relay) = match catalog_from_header(session) {
                     CatalogHeader::Known(route) => (route, None),
                     CatalogHeader::Unknown => {
-                        self.state.metrics.rejection(Rejection::UnknownModel).inc();
-                        let name = session
-                            .req_header()
-                            .headers
-                            .get(route::MODEL_HEADER)
-                            .and_then(|v| v.to_str().ok())
-                            .map(str::to_owned);
-                        return Self::reject_catalog_miss(session, &request_id, name.as_deref())
-                            .await;
+                        let refusal = header_catalog_miss(session);
+                        return self.refuse(session, &request_id, refusal).await;
                     }
                     CatalogHeader::Absent => {
                         if full_body.is_none() {
                             match self.take_slot(&id) {
                                 Ok(guard) => early_slot = guard,
                                 Err(()) => {
-                                    return self.reject_tenant_busy(session, &request_id).await;
+                                    let refusal = Refusal::TenantBusy;
+                                    return self.refuse(session, &request_id, refusal).await;
                                 }
                             }
                         }
@@ -4830,7 +4414,7 @@ impl ProxyHttp for AiProxy {
                         if let Some(n) = declared_len.filter(|&n| past_replay_buffer(n))
                             && !ctx.held.reserve_body(n.saturating_mul(2))
                         {
-                            return self.reject_body_memory(session, &request_id).await;
+                            return self.refuse(session, &request_id, Refusal::BodyMemory).await;
                         }
                         let reserve = declared_len.unwrap_or(0).min(MAX_REQUEST_BODY);
                         let peek = Box::pin(peek_body_model(
@@ -4843,19 +4427,26 @@ impl ProxyHttp for AiProxy {
                         .await?;
                         peeked = true;
                         if peek.over_cap {
-                            return self.reject_too_large(session, &request_id).await;
+                            return self
+                                .refuse(session, &request_id, Refusal::BodyTooLarge)
+                                .await;
                         }
                         if peek.over_budget {
-                            return self.reject_body_memory(session, &request_id).await;
+                            return self.refuse(session, &request_id, Refusal::BodyMemory).await;
                         }
                         let Some(name) = peek.model.filter(|n| !n.is_empty()) else {
-                            self.state.metrics.rejection(Rejection::UnknownModel).inc();
-                            return Self::reject_catalog_miss(session, &request_id, None).await;
+                            let refusal = Refusal::CatalogMiss {
+                                name: None,
+                                header: true,
+                            };
+                            return self.refuse(session, &request_id, refusal).await;
                         };
                         let Some(route) = route::model_route(&name) else {
-                            self.state.metrics.rejection(Rejection::UnknownModel).inc();
-                            return Self::reject_catalog_miss(session, &request_id, Some(&name))
-                                .await;
+                            let refusal = Refusal::CatalogMiss {
+                                name: Some(name.into()),
+                                header: true,
+                            };
+                            return self.refuse(session, &request_id, refusal).await;
                         };
                         if peek.relay {
                             (route, Some(peek.complete.unwrap_or_default()))
@@ -4881,12 +4472,12 @@ impl ProxyHttp for AiProxy {
         {
             match self.take_slot(&w.id) {
                 Ok(guard) => early_slot = guard,
-                Err(()) => return self.reject_tenant_busy(session, &request_id).await,
+                Err(()) => return self.refuse(session, &request_id, Refusal::TenantBusy).await,
             }
             if let Some(n) = declared_len.filter(|&n| past_replay_buffer(n))
                 && !ctx.held.reserve_body(n.saturating_mul(2))
             {
-                return self.reject_body_memory(session, &request_id).await;
+                return self.refuse(session, &request_id, Refusal::BodyMemory).await;
             }
             let reserve = declared_len.unwrap_or(0).min(MAX_REQUEST_BODY);
             let peek = Box::pin(peek_body_model(
@@ -4898,10 +4489,12 @@ impl ProxyHttp for AiProxy {
             ))
             .await?;
             if peek.over_cap {
-                return self.reject_too_large(session, &request_id).await;
+                return self
+                    .refuse(session, &request_id, Refusal::BodyTooLarge)
+                    .await;
             }
             if peek.over_budget {
-                return self.reject_body_memory(session, &request_id).await;
+                return self.refuse(session, &request_id, Refusal::BodyMemory).await;
             }
             if peek.relay {
                 w.relay = Some(peek.complete.unwrap_or_default());
@@ -4916,11 +4509,12 @@ impl ProxyHttp for AiProxy {
             && let Some(body) = w.relay.take()
         {
             // --- signed ids (`signed_id`) ---
-            if let Some(done) = self
-                .refuse_foreign_ids(session, &request_id, w.row, &body, w.id.tenant_id)
-                .await
+            let path = session.req_header().uri.path();
+            if let Some(write) = self
+                .foreign_ids(path, w.row, &body, w.id.tenant_id)
+                .map(|refusal| self.refuse(session, &request_id, refusal))
             {
-                return done;
+                return write.await;
             }
             let slot_held = early_slot.is_some();
             let relayed = self
@@ -4949,36 +4543,19 @@ impl ProxyHttp for AiProxy {
             .as_deref()
             .filter(|_| model_route.is_some())
             .map(peek::scan_buffered);
-        if scan.as_ref().is_some_and(|s| s.duplicate_model) {
-            self.state
-                .metrics
-                .rejection(Rejection::DuplicateModel)
-                .inc();
-            return Self::reject_message_boxed(
-                session,
-                &request_id,
-                400,
-                "invalid_request_error",
-                "the request body has more than one root \"model\" key; send exactly one"
-                    .to_owned(),
-            )
-            .await;
-        }
-
-        // An output limit that is not a whole number on a row with a published cap: refused here, with
-        // a JSON 400, when the body is in hand (see `request_body_filter` for the streamed case).
-        if model_route.is_some_and(|r| r.card.output_cap().is_some())
-            && scan.as_ref().is_some_and(|s| s.inexact_limit)
+        // The body rules (`body_rules`) that read its shape are checked here, as soon as it is
+        // scanned: a second `model`, and an output limit that is not a whole number on a row with a
+        // published cap. What the row accepts is checked once the walk is shaped, below.
+        let shape = body_rules::Facts {
+            duplicate_model: scan.as_ref().is_some_and(|s| s.duplicate_model),
+            inexact_limit: model_route.is_some_and(|r| r.card.output_cap().is_some())
+                && scan.as_ref().is_some_and(|s| s.inexact_limit),
+            ..body_rules::Facts::default()
+        };
+        if let Some(write) = body_rules::refusal(body_rules::Point::Connect, shape)
+            .map(|refusal| self.refuse(session, &request_id, refusal))
         {
-            self.state.metrics.rejection(Rejection::OutputLimit).inc();
-            return Self::reject_message_boxed(
-                session,
-                &request_id,
-                400,
-                "invalid_request_error",
-                "an output limit must be a whole number of tokens".to_owned(),
-            )
-            .await;
+            return write.await;
         }
 
         // A `FullBody` re-run's body is its parent's, already reserved for both copies.
@@ -5030,16 +4607,21 @@ impl ProxyHttp for AiProxy {
             // another vendor): BYO was refused before a `Walk` could be made.
             Plan::Catalog(w) => {
                 let (row, id) = (w.row, w.id);
-                if let Some(kind) = body_complete
-                    .as_deref()
-                    .and_then(|b| route::refused_input(row, b))
+                // The rest of the body rules, after the control surface is parsed (and counted)
+                // above. `shape` passed, so the order is still `body_rules::Rule::ORDER`.
+                let facts = body_rules::Facts {
+                    refused_input: body_complete
+                        .as_deref()
+                        .and_then(|b| route::refused_input(row, b))
+                        .map(|kind| (row.model, kind)),
+                    background: inbound_responses
+                        && body_complete.as_deref().is_some_and(requests_background),
+                    ..shape
+                };
+                if let Some(write) = body_rules::refusal(body_rules::Point::Connect, facts)
+                    .map(|refusal| self.refuse(session, &request_id, refusal))
                 {
-                    return self
-                        .reject_refused_input(session, &request_id, row, kind)
-                        .await;
-                }
-                if inbound_responses && body_complete.as_deref().is_some_and(requests_background) {
-                    return self.reject_background(session, &request_id).await;
+                    return write.await;
                 }
                 // A Responses request walks the row's Responses arm whenever the row has one,
                 // `store: false` one-shots included: there it is a byte relay, and translation onto
@@ -5089,15 +4671,11 @@ impl ProxyHttp for AiProxy {
                     && let Some(field) = session_field
                     && arms.is_empty()
                 {
-                    self.state.metrics.rejection(Rejection::WireMismatch).inc();
-                    return Self::reject_message_boxed(
-                        session,
-                        &request_id,
-                        400,
-                        "invalid_request_error",
-                        translate::session_field_refusal(field, row.model),
-                    )
-                    .await;
+                    let refusal = Refusal::SessionField {
+                        field,
+                        model: row.model,
+                    };
+                    return self.refuse(session, &request_id, refusal).await;
                 }
                 walk_arms = arms;
                 // Permute the row before the usable mask / `first_usable`. Failover, breakers, and
@@ -5167,9 +4745,11 @@ impl ProxyHttp for AiProxy {
                         Some(route::SpeedAsk::Fast) => {
                             let slow = route::fast_unserved(arms);
                             if walk.mask() & !slow == 0 {
-                                return self
-                                    .reject_refused_input(session, &request_id, row, "fast mode")
-                                    .await;
+                                let refusal = Refusal::RefusedInput {
+                                    model: row.model,
+                                    kind: "fast mode",
+                                };
+                                return self.refuse(session, &request_id, refusal).await;
                             }
                             dispatchable &= !slow;
                         }
@@ -5206,15 +4786,9 @@ impl ProxyHttp for AiProxy {
                     walk_front(&mut walk, orig);
                 }
                 if walk.len == 0 {
-                    self.state.metrics.rejection(Rejection::NoCandidate).inc();
-                    return Self::reject_boxed(
-                        session,
-                        &request_id,
-                        503,
-                        "api_error",
-                        "no provider key available",
-                    )
-                    .await;
+                    return self
+                        .refuse(session, &request_id, Refusal::NoCandidate)
+                        .await;
                 }
                 // Bit i ⇒ walk slot i is registered here *and* has a pool key. Computed once; every
                 // later attempt reads this instead of re-deriving it.
@@ -5230,20 +4804,12 @@ impl ProxyHttp for AiProxy {
                 if let Some(sub) = sub
                     && !arms.iter().any(|c| sub.serves(c))
                 {
-                    self.state.metrics.rejection(Rejection::WireMismatch).inc();
-                    return Self::reject_message_boxed(
-                        session,
-                        &request_id,
-                        400,
-                        "invalid_request_error",
-                        format!(
-                            "{} has no {} upstream for {}",
-                            row.model,
-                            sub.provider_name(),
-                            session.req_header().uri.path()
-                        ),
-                    )
-                    .await;
+                    let refusal = Refusal::NoSubResource {
+                        model: row.model,
+                        provider: sub.provider_name(),
+                        path: session.req_header().uri.path().into(),
+                    };
+                    return self.refuse(session, &request_id, refusal).await;
                 }
                 // The first usable slot's provider: a usable slot is a dispatchable arm, which
                 // resolved one.
@@ -5255,15 +4821,9 @@ impl ProxyHttp for AiProxy {
                     // means the candidates exist and are being skipped while they recover —
                     // `doctor`'s `model_catalog` check exists to catch this configuration at boot
                     // instead.
-                    self.state.metrics.rejection(Rejection::NoCandidate).inc();
-                    return Self::reject_boxed(
-                        session,
-                        &request_id,
-                        503,
-                        "api_error",
-                        "no provider key available",
-                    )
-                    .await;
+                    return self
+                        .refuse(session, &request_id, Refusal::NoCandidate)
+                        .await;
                 };
                 (Arc::clone(first), usable)
             }
@@ -5282,33 +4842,20 @@ impl ProxyHttp for AiProxy {
                     .is_some_and(signed_id::provider_route_applies),
             } {
             let Some(signer) = self.state.id_signer.as_ref() else {
-                self.state
-                    .metrics
-                    .rejection(Rejection::IdSigningUnset)
-                    .inc();
-                return Self::reject_message_boxed(
-                    session,
-                    &request_id,
-                    503,
-                    "api_error",
-                    "managed Responses ids cannot be issued: the gateway has no id signing key configured"
-                        .to_owned(),
-                )
-                .await;
+                return self
+                    .refuse(session, &request_id, Refusal::IdSigningUnset)
+                    .await;
             };
-            if let Some(Err(refusal)) = body_complete
+            if let Some(write) = body_complete
                 .as_deref()
-                .map(|b| signer.unsign_request(id.tenant_id, b, model_route.is_some()))
+                .and_then(|b| {
+                    signer
+                        .unsign_request(id.tenant_id, b, model_route.is_some())
+                        .err()
+                })
+                .map(|refusal| self.refuse(session, &request_id, Refusal::ForeignId(refusal)))
             {
-                self.state.metrics.rejection(Rejection::ForeignId).inc();
-                return Self::reject_message_boxed(
-                    session,
-                    &request_id,
-                    400,
-                    "invalid_request_error",
-                    refusal.to_string(),
-                )
-                .await;
+                return write.await;
             }
             Some(Box::new(signed_id::Relay::new(id.tenant_id)))
         } else {
@@ -5329,15 +4876,11 @@ impl ProxyHttp for AiProxy {
             let row_endpoint = route::Endpoint::of_row(row);
             match route::catalog_wire_action(path, row_endpoint) {
                 route::WireAction::Reject => {
-                    self.state.metrics.rejection(Rejection::WireMismatch).inc();
-                    return Self::reject_message_boxed(
-                        session,
-                        &request_id,
-                        400,
-                        "invalid_request_error",
-                        format!("{} is {}", row.model, row_endpoint.post_hint()),
-                    )
-                    .await;
+                    let refusal = Refusal::WrongWire {
+                        model: row.model,
+                        hint: row_endpoint.post_hint(),
+                    };
+                    return self.refuse(session, &request_id, refusal).await;
                 }
                 route::WireAction::Relay => {
                     translate_state = Some(translate::TranslateState::new(
@@ -5401,7 +4944,7 @@ impl ProxyHttp for AiProxy {
             && let Some(n) = declared_len.filter(|&n| past_replay_buffer(n))
             && !ctx.held.reserve_body(n)
         {
-            return self.reject_body_memory(session, &request_id).await;
+            return self.refuse(session, &request_id, Refusal::BodyMemory).await;
         }
 
         // Capture decision from the control surface parsed above. The header wins in **both**
@@ -5548,18 +5091,7 @@ impl ProxyHttp for AiProxy {
             (None, Some(id)) => match self.take_slot(&id) {
                 Ok(slot) => slot,
                 Err(()) => {
-                    self.state
-                        .metrics
-                        .rejection(Rejection::TenantConcurrency)
-                        .inc();
-                    return Self::reject_boxed(
-                        session,
-                        &request_id,
-                        429,
-                        "rate_limit_error",
-                        "too many concurrent requests",
-                    )
-                    .await;
+                    return self.refuse(session, &request_id, Refusal::TenantBusy).await;
                 }
             },
             (None, None) => None,
@@ -5584,17 +5116,10 @@ impl ProxyHttp for AiProxy {
         if let Err(breaker) = breaker_permit {
             // Given back before the refusal is written: a slow client must not hold it.
             drop(slot);
-            self.state.metrics.rejection(Rejection::CircuitOpen).inc();
-            let retry_after = Some(breaker.retry_after_secs());
-            return Box::pin(Self::reject_retry_after(
-                session,
-                &request_id,
-                503,
-                "api_error",
-                "provider temporarily unavailable",
-                retry_after,
-            ))
-            .await;
+            let refusal = Refusal::CircuitOpen {
+                retry_after: breaker.retry_after_secs(),
+            };
+            return self.refuse(session, &request_id, refusal).await;
         }
         // The leg owes this permit until an outcome or a release resolves it (see `Leg`). A
         // model-routed request owes none here: it claims each candidate's in `upstream_peer`.
@@ -6321,14 +5846,9 @@ impl ProxyHttp for AiProxy {
             //
             // Tagged `Downstream` because it is the client's fault: an untagged error counted
             // against the provider's breaker, so one caller sending oversized bodies could open it
-            // and 503 every tenant. The status is what pingora answers with.
+            // and 503 every tenant. `fail_to_proxy` answers it with the refusal, if it still can.
             if !rc.take_request_chunk(chunk) {
-                self.state.metrics.rejection(Rejection::BodyTooLarge).inc();
-                return Err(pingora_core::Error::explain(
-                    pingora_core::ErrorType::HTTPStatus(413),
-                    "request body exceeds limit",
-                )
-                .into_down());
+                return Err(self.refusal_error(Refusal::BodyTooLarge).into_down());
             }
             // Eligible requests are buffered so we can splice the root object before any byte reaches
             // the upstream (injection inserts near the front, so we can't have forwarded it already).
@@ -6356,10 +5876,7 @@ impl ProxyHttp for AiProxy {
                 // grows. Tagged downstream: the client's size, not the provider's health.
                 let held_len = rc.attempt.req_buf.len();
                 if past_replay_buffer(held_len) && !held.reserve_body(held_len) {
-                    self.state.metrics.rejection(Rejection::BodyMemory).inc();
-                    return Err(
-                        gateway_error(503, "too many large request bodies in flight").into_down(),
-                    );
+                    return Err(self.refusal_error(Refusal::BodyMemory).into_down());
                 }
             } else if rc.managed() {
                 rc.attempt.model_scanner.feed(chunk);
@@ -6381,52 +5898,17 @@ impl ProxyHttp for AiProxy {
                         Ok(Some(raw)) => buf = raw,
                         Ok(None) => {}
                         Err(_) => {
-                            self.state.metrics.rejection(Rejection::ForeignId).inc();
-                            return Err(gateway_error(400, signed_id::REFUSED).into_down());
+                            return Err(self.refusal_error(Refusal::ForeignIdLate).into_down());
                         }
                     }
                 }
                 // --- end signed ids ---
                 let mut scan = peek::scan_buffered(&buf);
-                // Two root `model` keys on a catalog walk: the row came from one and the rewrite
-                // below edits one, but the provider's parser picks its own (usually the last). Refused
-                // rather than guessed, before a body byte goes upstream. Checked on the client's
-                // body, ahead of translation, which re-serializes and would hide it.
-                // A managed `/{provider}` body is relayed as sent, so the provider serves whichever
-                // copy its parser keeps while the billing row names the first: refused the same way.
-                if (rc.auto.is_some() || rc.plan.catalog_check) && scan.duplicate_model {
-                    self.state
-                        .metrics
-                        .rejection(Rejection::DuplicateModel)
-                        .inc();
-                    return Err(pingora_core::Error::explain(
-                        pingora_core::ErrorType::HTTPStatus(400),
-                        "duplicate root model key",
-                    )
-                    .into_down());
-                }
-                // An output limit that is not a whole number (a string, a fraction, a negative) has no
-                // span, so the clamp below cannot hold it to the row's maximum. Refused before a byte
-                // goes upstream, where the provider would otherwise be the one to read it.
-                if scan.inexact_limit
-                    && rc
-                        .auto
-                        .as_ref()
-                        .is_some_and(|a| a.route.card.output_cap().is_some())
-                {
-                    self.state.metrics.rejection(Rejection::OutputLimit).inc();
-                    return Err(gateway_error(
-                        400,
-                        "an output limit must be a whole number of tokens",
-                    )
-                    .into_down());
-                }
-                // A feature billed outside the usage a row can meter (a container, the image
-                // generation tool, an OpenRouter plugin, Anthropic Priority Tier): refused before a
-                // byte of the body goes upstream, so nothing runs unpriced (D268). Read on the
-                // client's body, ahead of any rewrite and of the catalog check (an `:online` model is named
-                // for what it is). Every body buffered here is managed.
-                if rc.managed() {
+                // The body rules (`body_rules`), on the client's body: ahead of translation, which
+                // re-serializes it and would hide a second `model`, and of every rewrite, so an
+                // `:online` model is named for what it is. Each refusal ends the request before a
+                // byte of the body goes upstream. Every body buffered here is managed.
+                let inspection = if rc.managed() {
                     let model = rc
                         .auto
                         .as_ref()
@@ -6434,44 +5916,51 @@ impl ProxyHttp for AiProxy {
                         .or(scan.model.as_deref())
                         .unwrap_or(rc.model.as_str());
                     let messages = session.req_header().uri.path().ends_with("/messages");
-                    let found = unpriced::inspect(&buf, model, messages);
-                    if let Some(why) = found.refused {
-                        self.state
-                            .metrics
-                            .rejection(Rejection::UnpricedFeature)
-                            .inc();
-                        return Err(gateway_error(400, why).into_down());
-                    }
-                    if found.web_search_preview
-                        && let Some(taps) = rc.billing.tap()
-                    {
-                        taps.web_search_preview = true;
-                    }
+                    unpriced::inspect(&buf, model, messages)
+                } else {
+                    unpriced::Inspection::default()
+                };
+                let refused = {
+                    // A managed `/{provider}/…` billable call naming no catalog row (D267): its
+                    // billing row would carry no `price_model`. Told by the client's id.
+                    let miss = (rc.plan.catalog_check
+                        && scan.model.as_deref().and_then(price_row).is_none())
+                    .then(|| match rc.model.is_empty() {
+                        true => scan.model.take().map_or(Cow::Borrowed(""), sanitize_model),
+                        false => Cow::Borrowed(rc.model.as_str()),
+                    });
+                    let facts = body_rules::Facts {
+                        // A catalog walk routed on one `model` and re-spells one, and a managed
+                        // `/{provider}` body is billed by the first: the provider's parser picks
+                        // its own (usually the last).
+                        duplicate_model: (rc.auto.is_some() || rc.plan.catalog_check)
+                            && scan.duplicate_model,
+                        // A limit with no span (a string, a fraction, a negative): the clamp below
+                        // cannot hold it to the row's maximum.
+                        inexact_limit: scan.inexact_limit
+                            && rc
+                                .auto
+                                .as_ref()
+                                .is_some_and(|a| a.route.card.output_cap().is_some()),
+                        refused_input: None,
+                        unpriced: inspection.refused,
+                        catalog_miss: miss.as_deref(),
+                        // Managed `/{provider}/…/responses` asking for `background: true` (D202).
+                        background: rc.plan.catalog_check
+                            && rc.forward_path.as_str().is_some_and(|p| {
+                                route::forward_is_responses(p.split_once('?').map_or(p, |(p, _)| p))
+                            })
+                            && requests_background(&buf),
+                    };
+                    body_rules::refusal(body_rules::Point::Buffered, facts)
+                };
+                if let Some(refusal) = refused {
+                    return Err(self.refusal_error(refusal).into_down());
                 }
-                // Managed `/{provider}/…` billable call naming no catalog row (D267): its billing
-                // row would carry no `price_model`. The client's id is kept for the error and the
-                // row, then the request ends before a byte of the body goes upstream.
-                if rc.plan.catalog_check && scan.model.as_deref().and_then(price_row).is_none() {
-                    if rc.model.is_empty()
-                        && let Some(m) = scan.model.take()
-                    {
-                        rc.model = sanitize_model(m).into_owned();
-                    }
-                    self.state.metrics.rejection(Rejection::UnknownModel).inc();
-                    return Err(gateway_error(404, CATALOG_MISS).into_down());
-                }
-                // Managed `/{provider}/…/responses` asking for `background: true` (D202).
-                if rc.plan.catalog_check
-                    && rc.forward_path.as_str().is_some_and(|p| {
-                        route::forward_is_responses(p.split_once('?').map_or(p, |(p, _)| p))
-                    })
-                    && requests_background(&buf)
+                if inspection.web_search_preview
+                    && let Some(taps) = rc.billing.tap()
                 {
-                    self.state
-                        .metrics
-                        .rejection(Rejection::ManagedEndpoint)
-                        .inc();
-                    return Err(gateway_error(400, BACKGROUND_REFUSED).into_down());
+                    taps.web_search_preview = true;
                 }
                 // Wire mismatch on this *candidate*: map the inbound JSON onto this path's
                 // endpoint *before* the model splice. Keep the original client body in `req_buf`
@@ -7286,7 +6775,7 @@ impl ProxyHttp for AiProxy {
     }
 
     /// Answer every request the gateway itself ends, after admission or during the proxy loop,
-    /// with the same JSON error envelope the `reject` paths use: `content-type: application/json`,
+    /// with the same JSON error envelope a refusal uses: `content-type: application/json`,
     /// `{"error":{"message","type"}}`, and `x-beyond-request-id`. Pingora's default wrote a bare
     /// status with an empty body (a 500 for "every breaker open", which is a 503), which an SDK
     /// cannot parse and an oncall cannot correlate.
@@ -7349,15 +6838,21 @@ impl ProxyHttp for AiProxy {
             }
             (false, status) => status,
         };
-        // A managed `/{provider}` model outside the catalog (D267) names the model, as the catalog
-        // walk's 404 does. The one error message built per request, on a refusal path.
-        let miss = (msg == CATALOG_MISS)
-            .then(|| catalog_miss_message(ctx.rc.as_ref().map(|rc| rc.model.as_str()), false));
-        let msg = miss.as_deref().unwrap_or(msg);
+        // A refusal raised past `request_filter` (a `CustomCode`, so neither adjustment above
+        // applies to it) is answered with its own body; any other error with the static one for
+        // its class.
+        let body = match Refusal::of(e) {
+            Some(refusal) => refusal.body(),
+            None => error_body(typ, msg),
+        };
         // Pingora closes the client connection after a proxy error; say so (`connection: close`),
         // as its own error responses do, so a pooled client does not send its next request into a
         // socket about to close.
         session.as_downstream_mut().set_keepalive(None);
+        // One of the two sources of a gateway `Retry-After`: this one answers every 503 raised past
+        // `request_filter` (a refusal there included, such as `BodyMemory`), with the soonest open
+        // breaker of the walk, else 1. A refusal written in `request_filter` carries
+        // `Refusal::retry_after` instead.
         let retry_after = (status == 503).then(|| {
             ctx.rc
                 .as_ref()
@@ -7370,12 +6865,11 @@ impl ProxyHttp for AiProxy {
             .request_id
             .or_else(|| ctx.rc.as_ref().map(|rc| rc.request_id))
             .unwrap_or_default();
-        if let Err(write_err) = Box::pin(write_json_error(
+        if let Err(write_err) = Box::pin(write_json_body(
             session,
             &request_id,
             status,
-            typ,
-            msg,
+            body,
             retry_after,
         ))
         .await
@@ -9352,7 +8846,12 @@ mod tests {
         use pingora_core::{Error, ErrorType as T};
         // A body the gateway withheld and refused: the provider never had it, nothing to bill.
         assert!(!gave_up_waiting(
-            &gateway_error(404, CATALOG_MISS).into_down()
+            &Refusal::CatalogMiss {
+                name: None,
+                header: false
+            }
+            .into_error()
+            .into_down()
         ));
         assert!(!gave_up_waiting(
             &Error::new(T::HTTPStatus(400)).into_down()
@@ -9912,52 +9411,96 @@ mod tests {
 
     #[test]
     fn reject_bodies_are_valid_json_and_match_their_type_and_message() {
-        // These are hand-written JSON literals standing in for what `serde_json::json!` used to
-        // build, so the thing to guard is that they still *say* what the `error_type` in the log
-        // line and the metric label claim. A drifting literal would ship a response whose `type`
-        // contradicts the reason we rejected for.
-        for &(typ, msg, body) in &REJECT_BODIES {
-            let v: serde_json::Value =
-                serde_json::from_str(body).unwrap_or_else(|e| panic!("{body} is not JSON: {e}"));
-            assert_eq!(v["error"]["type"], typ, "type mismatch in {body}");
-            assert_eq!(v["error"]["message"], msg, "message mismatch in {body}");
-            // ...and that it is byte-identical to what `json!` would have produced, so switching to
-            // the constant changed nothing on the wire.
-            let built = serde_json::json!({ "error": { "type": typ, "message": msg } }).to_string();
-            assert_eq!(body, built, "constant diverges from the built body");
-            // The lookup must find it rather than falling through to the allocating branch.
-            assert_eq!(error_body(typ, msg), Bytes::from_static(body.as_bytes()));
-            assert_eq!(error_body(typ, msg).as_ptr(), body.as_ptr(), "{typ}: {msg}");
+        // Every static body is a hand-written JSON literal standing in for what `serde_json::json!`
+        // would build, so the thing to guard is that it still *says* what the `error_type` in the
+        // log line and the metric label claim, byte for byte. A drifting literal would ship a
+        // response whose `type` contradicts the reason the request ended.
+        let refusals = crate::refusal::every();
+        let fixed = refusals.iter().filter_map(Refusal::fixed);
+        for f in fixed.chain(FAILURES) {
+            let v: serde_json::Value = serde_json::from_str(f.body)
+                .unwrap_or_else(|e| panic!("{} is not JSON: {e}", f.body));
+            assert_eq!(v["error"]["type"], f.kind, "type mismatch in {}", f.body);
+            assert_eq!(
+                v["error"]["message"], f.message,
+                "message mismatch in {}",
+                f.body
+            );
+            let built = serde_json::json!({ "error": { "type": f.kind, "message": f.message } })
+                .to_string();
+            assert_eq!(f.body, built, "constant diverges from the built body");
+        }
+        // A failure's lookup finds its static body rather than falling through to `serde_json`.
+        for f in FAILURES {
+            assert_eq!(
+                error_body(f.kind, f.message).as_ptr(),
+                f.body.as_ptr(),
+                "{}: {}",
+                f.kind,
+                f.message
+            );
+        }
+        // Every pair the old flat table held is still answered with a static body: a fixed
+        // refusal's, or a failure's.
+        for (typ, msg) in [
+            ("invalid_request_error", "unknown provider"),
+            ("authentication_error", "missing API key"),
+            ("authentication_error", "invalid API key"),
+            ("rate_limit_error", "rate limit exceeded"),
+            ("invalid_request_error", "request body too large"),
+            ("access_denied", "tenant is over limit or suspended"),
+            ("api_error", "no provider key available"),
+            ("api_error", "provider temporarily unavailable"),
+            (
+                "invalid_request_error",
+                "model routing requires a managed key",
+            ),
+            ("insufficient_quota", "quota exhausted"),
+            ("api_error", "allowance unavailable"),
+            ("rate_limit_error", "too many concurrent requests"),
+            ("api_error", "too many large request bodies in flight"),
+            (
+                "api_error",
+                "upstream timed out after receiving the request",
+            ),
+            ("api_error", "upstream failed after receiving the request"),
+        ] {
+            let as_refusal = refusals
+                .iter()
+                .find(|r| r.fixed().is_some_and(|f| f.kind == typ && f.message == msg));
+            let static_body = match as_refusal {
+                Some(r) => {
+                    r.body().as_ptr() == r.fixed().map_or(std::ptr::null(), |f| f.body.as_ptr())
+                }
+                None => FAILURES.iter().any(|f| f.kind == typ && f.message == msg),
+            };
+            assert!(static_body, "({typ:?}, {msg:?}) lost its static body");
         }
     }
 
     #[test]
     fn every_reject_call_site_has_a_precomputed_body() {
-        // One table entry per call site. Adding a rejection without its entry would silently take
-        // `error_body`'s allocating fallback forever — correct on the wire, but quietly undoing the
-        // point of the table on the one path a flood drives at full rate. Counting is enough to
-        // catch it and does not depend on how the arguments happen to be formatted.
-        // Only the production half of the file — this test mentions the call form itself, and a
-        // test module that grepped its own source would count that too.
+        // A refusal is typed, so its body cannot miss its table. What can is a failure: each
+        // message the production half passes to `fail_boxed` or `gateway_error`, or `fail_to_proxy`
+        // assigns, must have its static body in `FAILURES`, under the type it is answered with,
+        // and every entry there must have a producer (no entry left behind after its failure
+        // went). And no body may be written past both tables: every writer is listed by the
+        // function that calls it. Only the production half of the file: this test mentions the call
+        // forms itself.
         let src = include_str!("proxy.rs")
             .split("#[cfg(test)]")
             .next()
             .expect("split always yields at least one part");
-        // Pull each call site's `(type, message)` rather than counting sites. A raw count broke as
-        // soon as one message was rejected from more than one place ("no provider key available"
-        // now has a provider-routed and a model-routed caller), and relaxing it to `>=` would have
-        // stopped catching the thing it exists for: a *new* message with no table entry.
-        //
-        // The two arguments after the numeric status are the only string literals in the call, and
-        // rustfmt keeps them one per line, so scanning forward for the first two quoted literals is
-        // stable.
-        let mut sites = 0usize;
-        let mut called = Vec::new();
-        for (i, _) in src.match_indices("Self::reject_boxed(") {
-            sites += 1;
-            let tail = &src[i..];
+        let typ = |status: u16| match status {
+            429 => "rate_limit_error",
+            400..=499 => "invalid_request_error",
+            _ => "api_error",
+        };
+        // The string literals in the call that starts at `at`, up to its closing `)` line.
+        let literals = |at: usize| -> Vec<&str> {
+            let tail = &src[at..];
             let end = tail.find(")\n").map_or(tail.len(), |e| e + 1);
-            let literals: Vec<&str> = tail[..end]
+            tail[..end]
                 .match_indices('"')
                 .collect::<Vec<_>>()
                 .chunks(2)
@@ -9965,45 +9508,101 @@ mod tests {
                     [(a, _), (b, _)] => Some(&tail[a + 1..*b]),
                     _ => None,
                 })
-                .collect();
-            let (Some(typ), Some(msg)) = (literals.first(), literals.get(1)) else {
-                panic!("could not read (type, message) from a reject_boxed call site");
-            };
-            assert!(
-                REJECT_BODIES.iter().any(|(t, m, _)| t == typ && m == msg),
-                "reject_boxed({typ:?}, {msg:?}) has no REJECT_BODIES entry — it would take \
-                 `error_body`'s allocating fallback on every hit",
-            );
-            called.push((*typ, *msg));
+                .collect()
+        };
+        // The numeric status argument of `gateway_error(status, "…")`.
+        let status_arg = |at: usize| -> u16 {
+            let tail = &src[at + "gateway_error(".len()..];
+            tail[..tail.find(',').expect("a status argument")]
+                .trim()
+                .parse()
+                .expect("a numeric status")
+        };
+        // Every call of `fail_boxed` and `gateway_error` but their definitions passes its message as
+        // a literal: a site whose message could not be read would escape the pairing below.
+        let is_definition = |at: usize| src[..at].ends_with("fn ");
+        let mut produced = Vec::new();
+        let mut sites = (0usize, 0usize);
+        for (i, _) in src.match_indices("fail_boxed(") {
+            if is_definition(i) {
+                continue;
+            }
+            let msg = *literals(i)
+                .first()
+                .expect("a fail_boxed site with a message literal");
+            produced.push(("api_error", msg));
+            sites.0 += 1;
+        }
+        for (i, _) in src.match_indices("gateway_error(") {
+            if is_definition(i) {
+                continue;
+            }
+            let msg = *literals(i)
+                .first()
+                .expect("a gateway_error site with a message literal");
+            produced.push((typ(status_arg(i)), msg));
+            sites.1 += 1;
         }
         assert!(
-            sites >= REJECT_BODIES.len(),
-            "{sites} call sites but {} table entries — an entry has no caller",
-            REJECT_BODIES.len(),
+            sites.0 > 0 && sites.1 > 0,
+            "the scan found no sites: {sites:?}"
         );
-        // Every tabulated pair must also have a caller, catching the reverse drift (a table entry
-        // left behind after its rejection was removed): a `reject_boxed` or `reject_retry_after`
-        // site passing that `(type, message)`, or `fail_to_proxy` answering it.
-        for (i, _) in src.match_indices("Self::reject_retry_after(") {
-            let tail = &src[i..];
-            let end = tail.find(")\n").map_or(tail.len(), |e| e + 1);
-            let literals: Vec<&str> = tail[..end]
-                .match_indices('"')
-                .collect::<Vec<_>>()
-                .chunks(2)
-                .filter_map(|c| match c {
-                    [(a, _), (b, _)] => Some(&tail[a + 1..*b]),
-                    _ => None,
-                })
-                .collect();
-            if let (Some(typ), Some(msg)) = (literals.first(), literals.get(1)) {
-                called.push((*typ, *msg));
+        // Every path that writes a response body, by the function it is written in: a refusal
+        // (`write_refusal`; `fail_to_proxy` for one raised past `request_filter`), a failure
+        // (`fail_boxed`, `fail_to_proxy`), the writers' own definitions, and the two bodies that
+        // are no error (the models list, a cache hit). A body written anywhere else would pass
+        // both tables, so it fails here until it goes through one of these.
+        let mut writers = Vec::new();
+        let mut current_fn = "";
+        for line in src.lines() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            let decl = ["pub(crate) ", "pub ", "const ", "async "]
+                .iter()
+                .fold(code, |c, p| c.strip_prefix(p).unwrap_or(c));
+            if let Some(rest) = decl.strip_prefix("fn ") {
+                current_fn = &rest[..rest.find(['(', '<']).unwrap_or(rest.len())];
+            }
+            for needle in [
+                "write_json_body(",
+                "error_body(",
+                "json_body(",
+                "refusal.body()",
+                "write_response_body(",
+            ] {
+                for (at, _) in line.match_indices(needle) {
+                    if !line[..at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+                        writers.push((needle, current_fn));
+                    }
+                }
             }
         }
-        // `fail_to_proxy` answers an upstream that failed after it had the whole request with its
-        // own message, under the type `failure_response` gives the error class reaching that arm:
-        // the message is read from its source and the type from the mapping, so either drifting
-        // from the table fails here.
+        writers.sort_unstable();
+        let mut want = vec![
+            ("error_body(", "error_body"),
+            ("error_body(", "fail_boxed"),
+            ("error_body(", "fail_to_proxy"),
+            ("json_body(", "error_body"),
+            ("refusal.body()", "fail_to_proxy"),
+            ("refusal.body()", "write_refusal"),
+            ("write_json_body(", "fail_boxed"),
+            ("write_json_body(", "fail_to_proxy"),
+            ("write_json_body(", "write_json_body"),
+            ("write_json_body(", "write_refusal"),
+            ("write_response_body(", "reply_cache_hit"),
+            ("write_response_body(", "reply_models_list"),
+            ("write_response_body(", "write_json_body"),
+        ];
+        want.sort_unstable();
+        assert_eq!(
+            writers, want,
+            "a response body is written outside the tabled paths"
+        );
+        // `fail_to_proxy` names a delivered request's failure and a refused stream itself, under
+        // the type `failure_response` gives the error class reaching that arm: the message is read
+        // from its source and the type from the mapping, so either drifting fails here.
         let ftp = src
             .find("async fn fail_to_proxy(")
             .expect("fail_to_proxy is in the production half");
@@ -10017,6 +9616,10 @@ mod tests {
                 pingora_core::ErrorType::ConnectionClosed,
                 "upstream failed after receiving the request",
             ),
+            (
+                pingora_core::ErrorType::H2Error,
+                "the provider refused the stream; it was not processed",
+            ),
         ] {
             assert!(
                 ftp.contains(&format!("msg = \"{msg}\";")),
@@ -10024,12 +9627,70 @@ mod tests {
             );
             let (_, typ, _) = failure_response(&pingora_core::Error::new_up(class))
                 .expect("an upstream error is answered");
-            called.push((typ, msg));
+            produced.push((typ, msg));
         }
-        for &(typ, msg, _) in &REJECT_BODIES {
+        // Every class `failure_response` maps, by its source and type.
+        {
+            use pingora_core::{Error, ErrorType as T};
+            let mut classes = vec![
+                Error::new_down(T::ReadTimedout),
+                Error::new_down(T::InvalidHTTPHeader),
+                Error::new_up(T::ConnectTimedout),
+                Error::new_up(T::ConnectRefused),
+                Error::new_up(T::H2Error),
+                Error::new(T::InternalError),
+            ];
+            for status in [400, 401, 413, 429, 500, 502, 503, 504] {
+                classes.push(Error::new(T::HTTPStatus(status)));
+            }
+            for e in &classes {
+                let (_, typ, msg) = failure_response(e).expect("answered");
+                produced.push((typ, msg));
+            }
+        }
+        // And the other way: every message `fail_to_proxy` assigns, and every message literal in
+        // `failure_response`, is one produced above, so an arm added to either without a case here
+        // fails rather than going unchecked.
+        let quoted = |s: &'static str| -> Vec<&'static str> {
+            s.match_indices('"')
+                .collect::<Vec<_>>()
+                .chunks(2)
+                .filter_map(|c| match c {
+                    [(a, _), (b, _)] => Some(&s[a + 1..*b]),
+                    _ => None,
+                })
+                .collect()
+        };
+        for (at, _) in ftp.match_indices("msg = \"") {
+            let msg = quoted(&ftp[at..])[0];
             assert!(
-                called.contains(&(typ, msg)),
-                "REJECT_BODIES entry ({typ:?}, {msg:?}) has no caller"
+                produced.iter().any(|&(_, m)| m == msg),
+                "fail_to_proxy answers {msg:?}, which no case here produces"
+            );
+        }
+        let fr = src
+            .find("fn failure_response(")
+            .expect("failure_response is in the production half");
+        let fr = &src[fr..fr + src[fr..].find("\n}\n").expect("failure_response ends")];
+        let types = ["rate_limit_error", "invalid_request_error", "api_error"];
+        for msg in quoted(fr).into_iter().filter(|m| !types.contains(m)) {
+            assert!(
+                produced.iter().any(|&(_, m)| m == msg),
+                "failure_response answers {msg:?}, which no class here produces"
+            );
+        }
+        for &(typ, msg) in &produced {
+            assert!(
+                FAILURES.iter().any(|f| f.kind == typ && f.message == msg),
+                "({typ:?}, {msg:?}) has no FAILURES entry: it would build its body on every hit",
+            );
+        }
+        for f in FAILURES {
+            assert!(
+                produced.contains(&(f.kind, f.message)),
+                "FAILURES entry ({:?}, {:?}) has no producer",
+                f.kind,
+                f.message
             );
         }
     }
@@ -10182,6 +9843,7 @@ mod tests {
 #[cfg(test)]
 mod mutation_gaps {
     use super::*;
+    use crate::refusal::default_retry_after;
     use pingora_core::{Error, ErrorType as T};
 
     /// Each way a request ends maps to its own `outcome` on the billing row, so a zero-token row
