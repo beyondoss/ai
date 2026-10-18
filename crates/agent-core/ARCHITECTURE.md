@@ -1054,7 +1054,9 @@ the turn's last block) in `Turn::not_run` with `CUT_OFF_TOOL_CALL` as its error 
 the response hit the output token limit while this tool call was being written, so its input was cut
 off. Re-issue it with less input per call — for example, split a large write or edit into several
 smaller ones." Running a closed-up truncated input would write the truncated content with
-`is_error: false`, so the model never learns and the file is silently wrong. Whole calls earlier in
+`is_error: false`, so the model never learns and the file is silently wrong. The call's `ToolStart` is flagged `not_run: true` (serialized only when true,
+so `serve`'s `tool_start` frame carries it) and is still followed by its error `ToolEnd`, keeping the
+pairing; a client renders it as refused from the start. Whole calls earlier in
 the same turn still run: a whole input parsed as one JSON value, which needs the model's own closing
 `}`, so nothing the cut drops afterwards can belong to it. pi's `agent-loop.ts` refuses every call on
 a length stop because it can't tell whole from cut; we can, so refusing the whole ones would only throw

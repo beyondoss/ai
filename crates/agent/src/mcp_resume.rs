@@ -670,6 +670,7 @@ pub async fn resume_into_turn<F: FnMut(AgentEvent)>(
     let outstanding = resumer.outstanding();
     for task in &outstanding {
         sink(AgentEvent::ToolStart {
+            not_run: false,
             id: task.tool_use_id.clone(),
             name: task.name.clone(),
             input: input_of(&session.messages, &task.tool_use_id),
@@ -726,6 +727,7 @@ pub async fn resume_into_turn<F: FnMut(AgentEvent)>(
             .any(|t| t.tool_use_id == result.tool_use_id)
         {
             sink(AgentEvent::ToolStart {
+                not_run: false,
                 id: result.tool_use_id.clone(),
                 name: result.name.clone(),
                 input: input_of(&session.messages, &result.tool_use_id),

@@ -874,6 +874,7 @@ mod tests {
         run.aborted(0, None);
         run.heartbeat();
         run.observe(&AgentEvent::ToolStart {
+            not_run: false,
             id: "t1".into(),
             name: "bash".into(),
             input: json!({}),
@@ -907,6 +908,7 @@ mod tests {
         );
 
         run.observe(&AgentEvent::ToolStart {
+            not_run: false,
             id: "t1".into(),
             name: "bash".into(),
             input: json!({}),
@@ -965,11 +967,13 @@ mod tests {
     fn progress_carries_active_tools_and_todos() {
         let (rec, run) = rec_run();
         run.observe(&AgentEvent::ToolStart {
+            not_run: false,
             id: "a".into(),
             name: "bash".into(),
             input: json!({}),
         });
         run.observe(&AgentEvent::ToolStart {
+            not_run: false,
             id: "b".into(),
             name: "grep".into(),
             input: json!({}),
@@ -1310,6 +1314,7 @@ mod tests {
         let run = Run::begin(Arc::clone(&sink), "s", None, None, "m");
         for name in ["read", "edit", "bash"] {
             run.observe(&AgentEvent::ToolStart {
+                not_run: false,
                 id: name.into(),
                 name: name.into(),
                 input: json!({}),
