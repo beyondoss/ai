@@ -115,6 +115,40 @@ fn a_reopened_transcript_lists_what_it_left_running_as_stopped() {
     assert_eq!(jobs.resume(&transcript()), None);
 }
 
+/// A reopen whose sandbox has not been read back yet (`bash_sandbox::reattach_later`) does not
+/// guess: the jobs the sandbox may still hold are "not yet checked". Once the read-back settles,
+/// one it did not find is reported gone, once, by the next notices.
+#[test]
+fn a_reopen_not_yet_read_back_calls_its_jobs_unchecked_and_reports_the_gone_ones_later() {
+    let jobs = Arc::new(BashJobs::default());
+    super::super::bash_sandbox::reattach_later(&jobs, Arc::new(super::super::exec::RealRunner));
+    assert!(jobs.reattach_pending());
+    let note = jobs.resume(&transcript()).expect("jobs were left running");
+    assert!(
+        note.contains("- job 1: `npm run dev` (not yet checked)"),
+        "{note}"
+    );
+    assert!(
+        note.contains("- job 5: `./serve.sh` (not yet checked)"),
+        "{note}"
+    );
+    assert!(
+        !note.contains("(not running)") && !note.contains("(still running)"),
+        "nothing is claimed that nobody checked: {note}"
+    );
+    assert_eq!(jobs.take_notices(), None, "nothing is known yet");
+
+    // The read-back ran and found neither.
+    jobs.set_pending_reattach(None);
+    let notices = jobs.take_notices().expect("the gone jobs are reported");
+    assert!(
+        notices.contains("[job 1 is no longer running: `npm run dev`]"),
+        "{notices}"
+    );
+    assert!(notices.contains("[job 5 is no longer running"), "{notices}");
+    assert_eq!(jobs.take_notices(), None, "once");
+}
+
 #[test]
 fn a_transcript_with_no_job_left_running_gets_no_note_but_still_seeds_the_ids() {
     let jobs = BashJobs::default();

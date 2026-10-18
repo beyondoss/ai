@@ -2683,7 +2683,16 @@ const GIT_BRANCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 /// succeeds by walking up to the *replica's* own checkout and reports that branch as the tenant's.
 /// Same `None`-on-anything-unexpected contract as [`git_branch`], plus a timeout, since this one
 /// crosses a network hop.
+///
+/// `None` without asking while the sandbox is not attached yet ([`ExecCell::pending`]): a reopened
+/// session that has not used its sandbox must not wake it for a poll, so its branch reads `null`
+/// until something does.
+///
+/// [`ExecCell::pending`]: crate::exec_endpoint::ExecCell::pending
 async fn git_branch_in(exec: &crate::exec_endpoint::ExecCell, cwd: &str) -> Option<String> {
+    if exec.pending() {
+        return None;
+    }
     let args = [
         "symbolic-ref".to_string(),
         "--short".to_string(),
@@ -3028,8 +3037,8 @@ pub(crate) async fn serve_session(
     // sandbox** — a path on the other side of the exec endpoint, which this process never stats.
     // Everything below that would otherwise walk it is either skipped (trust resolution, the
     // worktree sweep — the only repo they could see is the replica's) or re-aimed at the sandbox
-    // through the session's own backend (`discover_resources` below). What must never happen is the
-    // third option: walking the replica's cwd and calling the result a tenant's.
+    // through the session's own backend (`ServiceSession::resources` below). What must never
+    // happen is the third option: walking the replica's cwd and calling the result a tenant's.
     let service = cfg.service.clone();
     let cwd = match &service {
         Some(svc) => std::path::PathBuf::from(svc.workspace_root()),
@@ -3185,19 +3194,37 @@ pub(crate) async fn serve_session(
     //   4. nothing — this host.
     //
     // Service mode has neither flag (both are refused at startup) and no "starting point" either:
-    // the grant names the sandbox, and a sandbox that doesn't answer the probe **ends the session**
-    // rather than leaving it running with nowhere for its tools to go. That error propagates out of
+    // the grant names the sandbox, and it is attached **lazily** — probed by the first call that
+    // needs it, once however many ask at the same time (`ExecCell::set_lazy`). A sandbox sleeps when
+    // idle and any exec request wakes it, so a session that reopens with a snapshot of what it last
+    // learned (below) sends nothing at all until it is used, and a probe that fails then is that
+    // tool call's error. A session with no snapshot — a new one — probes now, as it needs the
+    // sandbox for its prompt anyway, and one that doesn't answer **ends the session** rather than
+    // leaving it running with nowhere for its tools to go. That error propagates out of
     // `serve_session`, which the daemon turns into an error frame on every attached connection.
+    let sandbox_snapshot = match (&service, persistence.session_file()) {
+        (Some(svc), Some(file)) => {
+            svc.load_snapshot(file, persistence.session_id(), cfg.context_files)
+        }
+        _ => None,
+    };
     match &service {
         Some(svc) => {
-            let target = svc
-                .connect_exec(cfg.exec_max_response_bytes)
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    format!("service: this session's sandbox is unreachable: {e}").into()
-                })?;
-            exec_cell.set(Some(target));
-            timing.mark("probe sandbox");
+            exec_cell.set_lazy(
+                svc.lazy_exec(cfg.exec_max_response_bytes),
+                sandbox_snapshot.as_ref().map(|s| s.sandbox.home.clone()),
+            );
+            match &sandbox_snapshot {
+                Some(snapshot) => svc.seed_sandbox(snapshot.sandbox.clone()),
+                None => {
+                    exec_cell.connect().await.map_err(
+                        |e| -> Box<dyn std::error::Error + Send + Sync> {
+                            format!("service: {e}").into()
+                        },
+                    )?;
+                    timing.mark("probe sandbox");
+                }
+            }
         }
         None => {
             let restored = match persistence.meta.exec_endpoint.clone() {
@@ -3235,14 +3262,20 @@ pub(crate) async fn serve_session(
     // The jobs this session's sandbox kept running while no replica served it — a reap, a deploy,
     // a failover — are its jobs again, under their old numbers: still running, or ended with their
     // notices due (which wake the idle loop below). What nobody kept is stopped. See
-    // `tools::bash_sandbox`.
+    // `tools::bash_sandbox`. A sandbox not attached yet is not woken for it: its jobs are read back
+    // at its first use (or when one is asked about), and until then the reopen note says they have
+    // not been checked.
     bash_jobs.set_scope(Some(crate::exec_endpoint::jobs::JobScope::for_session(
         service.as_ref().map(|svc| svc.tenant()),
         persistence.session_id(),
     )));
-    let reattached = crate::tools::bash_sandbox::reattach(&bash_jobs, exec_cell.runner()).await;
-    if reattached != Default::default() {
-        tracing::info!(session = %persistence.session_id(), ?reattached, "reattached the session's sandbox jobs");
+    if exec_cell.pending() {
+        crate::tools::bash_sandbox::reattach_later(&bash_jobs, exec_cell.runner());
+    } else {
+        let reattached = crate::tools::bash_sandbox::reattach(&bash_jobs, exec_cell.runner()).await;
+        if reattached != Default::default() {
+            tracing::info!(session = %persistence.session_id(), ?reattached, "reattached the session's sandbox jobs");
+        }
     }
     stop_survivors(&bash_jobs, &persistence).await;
 
@@ -3254,10 +3287,31 @@ pub(crate) async fn serve_session(
     // already-discovered lists instead of re-walking the same directories itself.
     //
     // Deliberately **after** the exec probe: in service mode every one of these lives in the
-    // tenant's sandbox and is read through the backend the probe just set up. See
-    // `discover_resources`.
-    let mut discovered =
-        discover_resources(&cfg, &exec_cell, &cwd, project_trusted, service.as_deref()).await;
+    // tenant's sandbox and is read through the backend the probe just set up
+    // (`ServiceSession::resources`). A reopened service session takes them from its snapshot
+    // instead, so the prompt it builds is the one it had (and the prompt cache still hits) without
+    // waking the sandbox; `sandbox_refresh` re-runs discovery once the sandbox is awake anyway.
+    //
+    // `sandbox_resources` is the set the prompt is built from in service mode, and what the
+    // snapshot saves; `sandbox_snapshot_dirty` says the saved one is behind it (written at the top
+    // of the loop, once the session's directory exists).
+    let mut sandbox_refresh = sandbox_snapshot.is_some();
+    let mut sandbox_snapshot_dirty = service.is_some() && sandbox_snapshot.is_none();
+    let mut sandbox_resources: Option<crate::service::Resources> = None;
+    let mut discovered = match (&service, sandbox_snapshot) {
+        (Some(_), Some(snapshot)) => {
+            sandbox_resources = Some(snapshot.resources.clone());
+            Discovered::from(snapshot.resources)
+        }
+        (Some(svc), None) => {
+            let found = svc
+                .resources(exec_cell.backend().as_ref(), cfg.context_files)
+                .await;
+            sandbox_resources = Some(found.clone());
+            Discovered::from(found)
+        }
+        (None, _) => discover_resources(&cfg, &cwd, project_trusted).await,
+    };
     // Agent definitions are trust-gated exactly like skills (a project-local `.claude/agents/*.md`
     // body is injected verbatim as a child's system prompt), so they're discovered here — after trust
     // is resolved — not by `main.rs` at `ServeConfig`-construction time, where the interactive trust
@@ -3370,13 +3424,13 @@ pub(crate) async fn serve_session(
             exec_cell.set(None);
             // Service mode re-applies the **grant's** target, never a persisted one: the recorded
             // spec belongs to whichever grant last ran this session, and its credentials are not
-            // persisted at all (see below). The probe already ran at startup, so this is a rebuild
-            // of the same target, not a second round trip's worth of discovery.
+            // persisted at all (see below). Lazily, as at startup: the incoming session probes it
+            // again on its first use, and nothing is sent for the switch itself.
             if let Some(svc) = &service {
-                match svc.connect_exec(cfg.exec_max_response_bytes).await {
-                    Ok(t) => exec_cell.set(Some(t)),
-                    Err(e) => eprintln!("serve: failed to re-attach this session's sandbox: {e}"),
-                }
+                exec_cell.set_lazy(
+                    svc.lazy_exec(cfg.exec_max_response_bytes),
+                    svc.sandbox().map(|s| s.home),
+                );
             } else if let Some(spec) = persistence.meta.exec_endpoint.clone() {
                 // A target that no longer resolves leaves the session on the host with the header
                 // still recorded, rather than failing the switch — the sandbox may simply be gone.
@@ -3553,7 +3607,7 @@ pub(crate) async fn serve_session(
     let mut current_output_spec: Option<(Value, Option<String>)> = None;
 
     // `_with_context`, not the walking `build_static_system_prompt`: the project-instruction files
-    // were already read by `discover_resources` — from the sandbox in service mode, where re-walking
+    // were already read by discovery — from the sandbox in service mode, where re-walking
     // here would read the replica's own filesystem instead.
     //
     // `base`/`append` carry a service session's own `SYSTEM.md`/`APPEND_SYSTEM.md`, read from its
@@ -4767,6 +4821,92 @@ pub(crate) async fn serve_session(
         }};
     }
 
+    // Install a freshly discovered resource set: the lists `get_commands` and prompt expansion read,
+    // the subagent context, the static system prompt, and the agent built over them. `reload` and
+    // the post-reopen refresh share it, so the two cannot drift.
+    macro_rules! apply_discovered {
+        ($found:expr) => {{
+            let mut discovered: Discovered = $found;
+            skills = std::mem::take(&mut discovered.skills);
+            skill_collisions = std::mem::take(&mut discovered.skill_collisions);
+            prompt_templates = std::mem::take(&mut discovered.prompt_templates);
+            prompt_collisions = std::mem::take(&mut discovered.prompt_collisions);
+            context_files = std::mem::take(&mut discovered.context_files);
+            sandbox_system = discovered.system.take();
+            sandbox_append = discovered.append_system.take();
+            // Agent definitions are trust-gated like skills, so a `reload` after a trust change (or
+            // an edit to `.claude/agents/`) must re-discover them and rebuild the subagent context —
+            // otherwise `<available_agents>` and the `subagent` tool would advertise a stale set until
+            // restart. The `set_model` arm below then rebuilds the agent with the refreshed ctx.
+            cfg.agents = std::mem::take(&mut discovered.agents);
+            subagent_ctx = if cfg.agents.is_empty() {
+                None
+            } else {
+                Some(build_subagent_ctx(
+                    &exec_cell,
+                    &cfg,
+                    &cwd,
+                    project_trusted,
+                    &current_model,
+                    &write_locks,
+                    &skills,
+                    service.is_some().then_some(context_files.as_slice()),
+                    mounts.clone(),
+                    approval.as_ref(),
+                    &mcp_enabled,
+                ))
+            };
+            memory_sections = crate::memory::mount_sections(&mounts).await;
+            static_system = crate::resources::build_static_system_prompt_with_context(
+                &crate::resources::PromptOptions {
+                    base: sandbox_system.as_deref(),
+                    default_base: &cfg.system,
+                    append: cfg.append_system.as_deref().or(sandbox_append.as_deref()),
+                    cwd: &cwd,
+                    include_context_files: cfg.context_files,
+                    skills: &skills,
+                    context_window: agent_core::capabilities(&cfg.model).context_window,
+                    has_read,
+                    has_todo,
+                    has_structured_output: structured_output.is_some(),
+                    has_memory,
+                    memory_sections: &memory_sections,
+                    project_trusted,
+                    agents: &cfg.agents,
+                    disk_overrides,
+                },
+                &context_files,
+            );
+            // A full rebuild, not just `agent.set_system(...)`: `reload` may have changed the agent
+            // *definitions* (a new `.claude/agents/*.md`, or trust newly granted), and the `subagent`
+            // tool's registration lives in the registry, which only a rebuild refreshes. Without this,
+            // a mid-session-added agent wouldn't become delegable until the next `set_model`. Mirrors
+            // `set_model`'s own rebuild; the session is untouched.
+            agent = build_agent(
+                &exec_cell,
+                client.clone(),
+                &full_system(&static_system, &cwd, &mcp_skills),
+                &cfg,
+                &current_model,
+                current_thinking,
+                current_level,
+                current_auto_compaction,
+                current_auto_retry,
+                current_block_images,
+                current_image_auto_resize,
+                persistence.session_id(),
+                &write_locks,
+                &checkpoint,
+                subagent_ctx.as_ref(),
+                structured_output.as_ref(),
+                memory_tool.as_ref(),
+                approval.as_ref(),
+                &mcp_enabled,
+                &skills,
+            );
+        }};
+    }
+
     loop {
         // Idle: the transcript is whatever the last command left behind (including a run that just
         // finished). Publish it for the next connection to attach — see `sync_history!`. Also seeds the
@@ -4812,14 +4952,60 @@ pub(crate) async fn serve_session(
                 service.as_ref().map(|svc| svc.tenant()),
                 persistence.session_id(),
             )));
-            crate::tools::bash_sandbox::reattach(&bash_jobs, exec_cell.runner()).await;
+            if exec_cell.pending() {
+                crate::tools::bash_sandbox::reattach_later(&bash_jobs, exec_cell.runner());
+            } else {
+                crate::tools::bash_sandbox::reattach(&bash_jobs, exec_cell.runner()).await;
+            }
             stop_survivors(&bash_jobs, &persistence).await;
+            // The snapshot belongs beside the transcript the session is on now.
+            sandbox_snapshot_dirty = service.is_some();
             bash_jobs.set_recorder(Some(procs_recorder(&mcp_task_tx, persistence.session_id())));
             if !stopped_jobs.is_empty() {
                 emit!(OutFrame::Value(json!({
                     "type": "bash_jobs_stopped",
                     "jobs": stopped_jobs,
                 })));
+            }
+        }
+        // Once the sandbox is awake — something used it — what a reopen deferred is due: the jobs
+        // it kept are read back, and discovery runs again. A changed set rebuilds the prompt (the
+        // one cache miss a change costs); an unchanged one leaves it byte for byte as it was. Never
+        // before: a sandbox nobody has used is not woken for either.
+        if !exec_cell.pending() {
+            if bash_jobs.reattach_pending()
+                && let Err(e) = crate::tools::bash_sandbox::reconcile(&bash_jobs).await
+            {
+                tracing::warn!(error = %e, "could not read back the session's sandbox jobs");
+            }
+            if sandbox_refresh && let Some(svc) = service.clone() {
+                sandbox_refresh = false;
+                let found = svc
+                    .resources(exec_cell.backend().as_ref(), cfg.context_files)
+                    .await;
+                if sandbox_resources.as_ref() != Some(&found) {
+                    sandbox_resources = Some(found.clone());
+                    apply_discovered!(Discovered::from(found));
+                }
+                // Re-saved either way: the probe that woke the sandbox may have answered differently.
+                sandbox_snapshot_dirty = true;
+            }
+        }
+        if sandbox_snapshot_dirty
+            && let (Some(svc), Some(resources), Some(file)) =
+                (&service, &sandbox_resources, persistence.session_file())
+            && let Some(sandbox) = svc.sandbox()
+        {
+            match svc.save_snapshot(
+                file,
+                persistence.session_id(),
+                cfg.context_files,
+                &sandbox,
+                resources,
+            ) {
+                Ok(()) => sandbox_snapshot_dirty = false,
+                // Its directory does not exist yet (a session with nothing on disk): next time.
+                Err(e) => tracing::debug!(error = %e, "sandbox snapshot not saved yet"),
             }
         }
         // Checked here because every write path — a run's persist, a mid-run checkpoint, a title, a
@@ -7407,86 +7593,21 @@ pub(crate) async fn serve_session(
                         );
                     }
                 }
-                let mut discovered =
-                    discover_resources(&cfg, &exec_cell, &cwd, project_trusted, service.as_deref())
-                        .await;
-                skills = std::mem::take(&mut discovered.skills);
-                skill_collisions = std::mem::take(&mut discovered.skill_collisions);
-                prompt_templates = std::mem::take(&mut discovered.prompt_templates);
-                prompt_collisions = std::mem::take(&mut discovered.prompt_collisions);
-                context_files = std::mem::take(&mut discovered.context_files);
-                sandbox_system = discovered.system.take();
-                sandbox_append = discovered.append_system.take();
-                // Agent definitions are trust-gated like skills, so a `reload` after a trust change (or
-                // an edit to `.claude/agents/`) must re-discover them and rebuild the subagent context —
-                // otherwise `<available_agents>` and the `subagent` tool would advertise a stale set until
-                // restart. The `set_model` arm below then rebuilds the agent with the refreshed ctx.
-                cfg.agents = std::mem::take(&mut discovered.agents);
-                subagent_ctx = if cfg.agents.is_empty() {
-                    None
-                } else {
-                    Some(build_subagent_ctx(
-                        &exec_cell,
-                        &cfg,
-                        &cwd,
-                        project_trusted,
-                        &current_model,
-                        &write_locks,
-                        &skills,
-                        service.is_some().then_some(context_files.as_slice()),
-                        mounts.clone(),
-                        approval.as_ref(),
-                        &mcp_enabled,
-                    ))
+                let discovered = match &service {
+                    // The tenant's sandbox, through the same seam startup used; what it found is
+                    // what the snapshot saves from now on.
+                    Some(svc) => {
+                        let found = svc
+                            .resources(exec_cell.backend().as_ref(), cfg.context_files)
+                            .await;
+                        sandbox_resources = Some(found.clone());
+                        sandbox_snapshot_dirty = true;
+                        sandbox_refresh = false;
+                        Discovered::from(found)
+                    }
+                    None => discover_resources(&cfg, &cwd, project_trusted).await,
                 };
-                memory_sections = crate::memory::mount_sections(&mounts).await;
-                static_system = crate::resources::build_static_system_prompt_with_context(
-                    &crate::resources::PromptOptions {
-                        base: sandbox_system.as_deref(),
-                        default_base: &cfg.system,
-                        append: cfg.append_system.as_deref().or(sandbox_append.as_deref()),
-                        cwd: &cwd,
-                        include_context_files: cfg.context_files,
-                        skills: &skills,
-                        context_window: agent_core::capabilities(&cfg.model).context_window,
-                        has_read,
-                        has_todo,
-                        has_structured_output: structured_output.is_some(),
-                        has_memory,
-                        memory_sections: &memory_sections,
-                        project_trusted,
-                        agents: &cfg.agents,
-                        disk_overrides,
-                    },
-                    &context_files,
-                );
-                // A full rebuild, not just `agent.set_system(...)`: `reload` may have changed the agent
-                // *definitions* (a new `.claude/agents/*.md`, or trust newly granted), and the `subagent`
-                // tool's registration lives in the registry, which only a rebuild refreshes. Without this,
-                // a mid-session-added agent wouldn't become delegable until the next `set_model`. Mirrors
-                // `set_model`'s own rebuild; the session is untouched.
-                agent = build_agent(
-                    &exec_cell,
-                    client.clone(),
-                    &full_system(&static_system, &cwd, &mcp_skills),
-                    &cfg,
-                    &current_model,
-                    current_thinking,
-                    current_level,
-                    current_auto_compaction,
-                    current_auto_retry,
-                    current_block_images,
-                    current_image_auto_resize,
-                    persistence.session_id(),
-                    &write_locks,
-                    &checkpoint,
-                    subagent_ctx.as_ref(),
-                    structured_output.as_ref(),
-                    memory_tool.as_ref(),
-                    approval.as_ref(),
-                    &mcp_enabled,
-                    &skills,
-                );
+                apply_discovered!(discovered);
                 emit!(response(id, "reload", true, None, None));
             }
             // Rejects an empty/whitespace-only id, and — Fix 10 (pi-parity feature) — resolves a
@@ -9618,6 +9739,21 @@ struct Discovered {
     append_system: Option<String>,
 }
 
+impl From<crate::service::Resources> for Discovered {
+    fn from(r: crate::service::Resources) -> Self {
+        Self {
+            agents: r.agents,
+            skills: r.skills,
+            skill_collisions: r.skill_collisions,
+            prompt_templates: r.prompt_templates,
+            prompt_collisions: r.prompt_collisions,
+            context_files: r.context_files,
+            system: r.system,
+            append_system: r.append_system,
+        }
+    }
+}
+
 /// Find this session's skills, prompt templates, agent definitions and project-instruction files.
 ///
 /// The one seam startup and `reload` share, and the one place the two worlds diverge:
@@ -9630,35 +9766,15 @@ struct Discovered {
 ///   `--no-skills`/`--no-prompt-templates` skip standard-root discovery outright rather than
 ///   discovering and then discarding, while still honoring an explicit `--skill`/`--prompt-template`
 ///   path (pi's own `noSkills`/`noPromptTemplates` do the same — pi-parity fix, M2).
-/// - **In service mode** — every one of them comes from the tenant's sandbox, through the session's
-///   own exec backend ([`crate::service::ServiceSession::resources`]). Nothing here reads the
-///   replica: not its `~/.claude`, not its cwd, not a `--skill` path pointing at either (both flags
-///   are refused at startup).
+/// - **In service mode** — not here. Every one of them comes from the tenant's sandbox, through the
+///   session's own exec backend ([`crate::service::ServiceSession::resources`], or the session's
+///   saved [`crate::service::Snapshot`] of what that last found), which `serve_session` calls
+///   directly; nothing here may read the replica — not its `~/.claude`, not its cwd, not a
+///   `--skill` path pointing at either (both flags are refused at startup).
 ///
 /// Collisions (a skill or `/name` shadowed across roots) come back either way, surfaced through
 /// `get_commands` rather than silently resolved.
-async fn discover_resources(
-    cfg: &ServeConfig,
-    exec: &crate::exec_endpoint::ExecCell,
-    cwd: &Path,
-    project_trusted: bool,
-    service: Option<&crate::service::ServiceSession>,
-) -> Discovered {
-    if let Some(svc) = service {
-        let r = svc
-            .resources(exec.backend().as_ref(), cfg.context_files)
-            .await;
-        return Discovered {
-            agents: r.agents,
-            skills: r.skills,
-            skill_collisions: r.skill_collisions,
-            prompt_templates: r.prompt_templates,
-            prompt_collisions: r.prompt_collisions,
-            context_files: r.context_files,
-            system: r.system,
-            append_system: r.append_system,
-        };
-    }
+async fn discover_resources(cfg: &ServeConfig, cwd: &Path, project_trusted: bool) -> Discovered {
     let (prompt_templates, prompt_collisions) = if cfg.no_prompt_templates {
         crate::prompts::discover_extra_only(&cfg.extra_prompt_template_paths)
     } else {

@@ -28,13 +28,19 @@
 //! the model is one the model's own `read` can open, and no walk ever touches the replica. Session
 //! start and `reload` call that one function, which is why `reload` is allowed here at all.
 //!
+//! **A reopened session leaves its sandbox asleep until it needs it.** Any exec request wakes an
+//! idle sandbox, so what a session learned from its — the probe's [`Sandbox`] and the discovered
+//! [`Resources`] — is saved beside its transcript as a [`Snapshot`]. A session that reopens with one
+//! attaches its exec target lazily ([`ServiceSession::lazy_exec`]), builds its prompt from the saved
+//! set, and sends nothing until a tool needs the sandbox; the probe then runs first, once.
+//!
 //! **Its connectors come from its grant.** [`ServiceSession::mcp`] dials the grant's MCP list with the
 //! sealed per-connector headers, per session, so one tenant's servers — and one tenant's elicitations
 //! — never reach another's.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, RwLock};
 
 use crate::grant::{Grant, GrantVerifier};
 use crate::session_store::{Layout, RepoOptions, TenantCodec};
@@ -56,6 +62,17 @@ const HOME_PROBE: &str = r#"printf %s "$HOME""#;
 /// How long the startup probe gets. Generous for one round trip to a sandbox that has to be awake
 /// anyway, short enough that a dead endpoint fails the session rather than hanging the client.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How a failed probe is reported — to the client, when it ends a session that could not start,
+/// and to the tool call, when it is the first use of a reopened one.
+pub const UNREACHABLE: &str = "this session's sandbox is unreachable";
+
+/// The file beside a session's transcript that holds its [`Snapshot`].
+const SNAPSHOT_FILE: &str = "sandbox-snapshot.json";
+
+/// The kind a [`Snapshot`] is sealed under: part of its associated data, so no other sidecar (nor
+/// another session's snapshot) opens as this one.
+const SNAPSHOT_KIND: &str = "sandbox-snapshot";
 
 // ---------------------------------------------------------------------------------------------
 // Shards
@@ -244,7 +261,7 @@ pub fn authorize(
         session_dir,
         memory_dir,
         codec,
-        sandbox: OnceLock::new(),
+        sandbox: RwLock::new(None),
     })
 }
 
@@ -252,8 +269,9 @@ pub fn authorize(
 // The session
 // ---------------------------------------------------------------------------------------------
 
-/// What the sandbox answered at session start. Recorded once, read by every tool build after it.
-#[derive(Debug, Clone)]
+/// What the sandbox answered to its probe. Recorded by every probe and read by every tool build
+/// after it — and, from the session's [`Snapshot`], before the first probe of a reopened session.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sandbox {
     /// The sandbox's `$HOME`, so a model-supplied `~/notes.md` expands against the tenant's own home
     /// rather than being left alone (or, far worse, resolved against the replica's).
@@ -280,8 +298,9 @@ pub struct ServiceSession {
     /// This tenant's sealing keys, derived from the grant's per-tenant `dek`. Every transcript,
     /// listing cache and memory document this connection writes goes through it.
     codec: Arc<TenantCodec>,
-    /// Filled by [`Self::connect_exec`] at session start; read by the tool builds after it.
-    sandbox: OnceLock<Sandbox>,
+    /// Filled by [`Self::connect_exec`] (or, until it runs, seeded from the session's
+    /// [`Snapshot`]); read by the tool builds after it.
+    sandbox: RwLock<Option<Sandbox>>,
 }
 
 impl ServiceSession {
@@ -312,10 +331,23 @@ impl ServiceSession {
         self.grant.secrets.gateway_key.expose()
     }
 
-    /// The sandbox, once probed. `None` before [`Self::connect_exec`] has run — no tool can run in
-    /// that window, because the session fails to start if the probe fails.
-    pub fn sandbox(&self) -> Option<&Sandbox> {
-        self.sandbox.get()
+    /// The sandbox as last probed — by this process, or, for a reopened session that has not used
+    /// it yet, as its [`Snapshot`] recorded. `None` before either: no tool can run in that window,
+    /// because a tool's first call probes before it is dispatched.
+    pub fn sandbox(&self) -> Option<Sandbox> {
+        self.sandbox
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// What a reopened session's [`Snapshot`] says the sandbox answered last time: in force until
+    /// the session's first probe replaces it.
+    pub fn seed_sandbox(&self, sandbox: Sandbox) {
+        let mut slot = self.sandbox.write().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(sandbox);
+        }
     }
 
     /// This tenant's session directories across **every** mounted shard — what a tenant-scoped
@@ -378,11 +410,13 @@ impl ServiceSession {
     }
 
     /// Build this session's exec target from the grant, **strictly**: the endpoint is probed before
-    /// any tool can reach it, and a failure is returned to the caller, which ends the session.
+    /// any tool can reach it, and a failure is returned to the caller.
     ///
     /// The probe is `sh -c 'printf %s "$HOME"'`. Its output becomes the backend's home (so `~`
     /// expands inside the sandbox, not on the replica), and a second `command -v bash` records which
-    /// shell the remote `bash` tool should ask for. Both are cached on this `ServiceSession`.
+    /// shell the remote `bash` tool should ask for. Both are cached on this `ServiceSession`. The
+    /// target watches a flag its runner raises on a request the endpoint did not answer or refused,
+    /// which is what makes a lazily attached cell ([`Self::lazy_exec`]) probe again.
     pub async fn connect_exec(
         &self,
         max_response_bytes: usize,
@@ -390,8 +424,10 @@ impl ServiceSession {
         use crate::exec_endpoint::{ExecTarget, HttpExecRunner};
         use crate::tools::exec::CommandRunner;
 
+        let suspect = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut runner = HttpExecRunner::new(self.grant.exec_url.as_str())?
-            .with_max_response_bytes(max_response_bytes);
+            .with_max_response_bytes(max_response_bytes)
+            .with_suspect_flag(suspect.clone());
         for header in &self.grant.secrets.exec_headers {
             runner = runner.with_header(header.name.as_str(), header.value.expose());
         }
@@ -424,11 +460,85 @@ impl ServiceSession {
             )
             .await
             .is_ok_and(|r| r.code == Some(0) && !r.stdout.trim().is_empty());
-        let _ = self.sandbox.set(Sandbox {
+        *self.sandbox.write().unwrap_or_else(|e| e.into_inner()) = Some(Sandbox {
             home: home.clone(),
             shell: if shell { "bash" } else { "sh" },
         });
-        Ok(ExecTarget::over_with_home(runner, Some(home)).await)
+        Ok(ExecTarget::over_with_home(runner, Some(home))
+            .await
+            .watching(suspect))
+    }
+
+    /// [`Self::connect_exec`] as a lazy cell's connector
+    /// ([`ExecCell::set_lazy`](crate::exec_endpoint::ExecCell::set_lazy)): it runs on the first call
+    /// that needs the sandbox — and again after its target turns suspect — not when the session
+    /// opens. Its error says what a session that failed to start says, word for word.
+    pub fn lazy_exec(self: &Arc<Self>, max_response_bytes: usize) -> crate::exec_endpoint::Connect {
+        let session = Arc::clone(self);
+        Arc::new(move || {
+            let session = Arc::clone(&session);
+            Box::pin(async move {
+                session
+                    .connect_exec(max_response_bytes)
+                    .await
+                    .map_err(|e| format!("{UNREACHABLE}: {e}"))
+            })
+        })
+    }
+
+    /// Where this session's [`Snapshot`] lives: beside its transcript — inside a segmented
+    /// session's own directory, which moves, trashes and deletes whole.
+    fn snapshot_path(session_file: &Path) -> PathBuf {
+        if session_file.is_dir() {
+            session_file.join(SNAPSHOT_FILE)
+        } else {
+            session_file.with_extension(SNAPSHOT_FILE)
+        }
+    }
+
+    /// The [`Snapshot`] saved beside session `id`'s transcript, if there is one this grant can use:
+    /// it opens under the tenant's key, it is this binary's format, and it was taken of the same
+    /// workspace with the same `context_files` setting. Anything else is ignored (with a warning
+    /// when it did not open): the snapshot is derived state, and without it the session simply
+    /// probes and discovers at start, as a new one does. Reads only the shard, never the sandbox.
+    pub fn load_snapshot(
+        &self,
+        session_file: &Path,
+        id: &str,
+        context_files: bool,
+    ) -> Option<Snapshot> {
+        let path = Self::snapshot_path(session_file);
+        let sealed = std::fs::read(&path).ok()?;
+        let plain = match self.codec.open_sidecar(id, SNAPSHOT_KIND, &sealed) {
+            Ok(plain) => plain,
+            Err(e) => {
+                tracing::warn!(error = %e, "a session's sandbox snapshot did not open; ignoring it");
+                return None;
+            }
+        };
+        let saved: snapshot::Saved = serde_json::from_slice(&plain).ok()?;
+        (saved.version == snapshot::VERSION
+            && saved.workspace_root == self.workspace_root()
+            && saved.context_files == context_files)
+            .then(|| saved.into_snapshot())
+    }
+
+    /// Save a [`Snapshot`] of `sandbox` and `resources` beside session `id`'s transcript, sealed
+    /// with the tenant's key and bound to that session (`TenantCodec::seal_sidecar`), atomically
+    /// (`write_private_atomic`). Fails — harmlessly; the caller retries — when the session's
+    /// directory does not exist yet.
+    pub fn save_snapshot(
+        &self,
+        session_file: &Path,
+        id: &str,
+        context_files: bool,
+        sandbox: &Sandbox,
+        resources: &Resources,
+    ) -> std::io::Result<()> {
+        let saved = snapshot::Saved::of(sandbox, resources, self.workspace_root(), context_files);
+        let plain = serde_json::to_vec(&saved).map_err(std::io::Error::other)?;
+        let sealed = self.codec.seal_sidecar(id, SNAPSHOT_KIND, &plain)?;
+        crate::session_store::write_private_atomic(&Self::snapshot_path(session_file), &sealed)
     }
 
     /// What a tenant's own sandbox contributes to the prompt: its skills, prompt templates, agent
@@ -454,7 +564,8 @@ impl ServiceSession {
         context_files: bool,
     ) -> Resources {
         let root = Path::new(self.workspace_root());
-        let home = self.sandbox().map(|s| Path::new(s.home.as_str()));
+        let sandbox = self.sandbox();
+        let home = sandbox.as_ref().map(|s| Path::new(s.home.as_str()));
         let (skills, skill_collisions) =
             crate::skills::discover_via(backend, &skill_roots(root, home)).await;
         let (prompt_templates, prompt_collisions) =
@@ -614,7 +725,7 @@ fn claude_roots(root: &Path, home: Option<&Path>, leaf: &str) -> Vec<(PathBuf, &
 
 /// Everything sandbox discovery contributes to a session, as one value so the wiring is written
 /// once — and so `reload` refreshes exactly the same set session start built.
-#[derive(Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Resources {
     pub skills: Vec<crate::skills::Skill>,
     /// Shadowed skill names and unreadable manifests, surfaced through `get_commands` exactly as the
@@ -631,6 +742,269 @@ pub struct Resources {
     pub system: Option<String>,
     /// `APPEND_SYSTEM.md`, same lookup. An explicit `--append-system-prompt` outranks it.
     pub append_system: Option<String>,
+}
+
+/// What a session last learned from its sandbox — the probe's answer and what discovery found —
+/// saved beside its transcript so the session can reopen without asking again.
+///
+/// A sandbox sleeps when idle and any exec request wakes it, so a session that reopens (a replica
+/// restart, a reap, a deploy) builds its prompt from this instead of from a fresh walk, and leaves
+/// the sandbox alone until something needs it. The prompt it builds is the one the session had,
+/// byte for byte, so the prompt cache keeps hitting. It is refreshed at the first real use: once
+/// the sandbox is awake anyway, discovery runs again and, only if the set changed, the prompt is
+/// rebuilt and the snapshot rewritten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    pub sandbox: Sandbox,
+    pub resources: Resources,
+}
+
+/// The snapshot's on-disk shape. Mirrors of the discovery types, which hold `&'static str` labels
+/// and so cannot derive `Deserialize`: a label read back is mapped onto the known set.
+mod snapshot {
+    use std::path::PathBuf;
+
+    use serde::{Deserialize, Serialize};
+
+    use super::{Resources, Sandbox, Snapshot};
+
+    /// Bumped whenever the shape changes: an older or newer snapshot is ignored, not misread.
+    pub(super) const VERSION: u32 = 1;
+
+    /// Every `&'static str` label discovery writes (scopes, resource types, collision sources).
+    fn label(s: &str) -> Option<&'static str> {
+        const KNOWN: &[&str] = &[
+            "user",
+            "project",
+            "temporary",
+            "skill",
+            "prompt",
+            "agent",
+            "standard root",
+            "--skill",
+            "--prompt-template",
+        ];
+        KNOWN.iter().copied().find(|k| *k == s)
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub(super) struct Saved {
+        pub version: u32,
+        pub workspace_root: String,
+        pub context_files: bool,
+        home: String,
+        shell: String,
+        skills: Vec<Skill>,
+        skill_collisions: Vec<Collision>,
+        prompt_templates: Vec<Prompt>,
+        prompt_collisions: Vec<Collision>,
+        agents: Vec<Agent>,
+        context: Vec<(String, String)>,
+        system: Option<String>,
+        append_system: Option<String>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Skill {
+        name: String,
+        description: String,
+        path: PathBuf,
+        disable_model_invocation: bool,
+        scope: String,
+        body: Option<String>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Collision {
+        resource_type: String,
+        name: String,
+        winner_path: Option<PathBuf>,
+        loser_path: Option<PathBuf>,
+        winner_source: Option<String>,
+        loser_source: Option<String>,
+        message: String,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Prompt {
+        name: String,
+        argument_hint: Option<String>,
+        description: String,
+        body: String,
+        path: PathBuf,
+        scope: String,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Agent {
+        name: String,
+        description: String,
+        tools: Option<Vec<String>>,
+        model: Option<String>,
+        worktree: bool,
+        skills: Option<Vec<String>>,
+        memory_index: bool,
+        system: String,
+        path: PathBuf,
+        scope: String,
+    }
+
+    impl Collision {
+        fn of(c: &crate::skills::Collision) -> Self {
+            Self {
+                resource_type: c.resource_type.to_owned(),
+                name: c.name.clone(),
+                winner_path: c.winner_path.clone(),
+                loser_path: c.loser_path.clone(),
+                winner_source: c.winner_source.map(str::to_owned),
+                loser_source: c.loser_source.map(str::to_owned),
+                message: c.message.clone(),
+            }
+        }
+
+        fn into_collision(self) -> crate::skills::Collision {
+            crate::skills::Collision {
+                resource_type: label(&self.resource_type).unwrap_or("skill"),
+                name: self.name,
+                winner_path: self.winner_path,
+                loser_path: self.loser_path,
+                winner_source: self.winner_source.as_deref().and_then(label),
+                loser_source: self.loser_source.as_deref().and_then(label),
+                message: self.message,
+            }
+        }
+    }
+
+    impl Saved {
+        pub(super) fn of(
+            sandbox: &Sandbox,
+            r: &Resources,
+            workspace_root: &str,
+            context_files: bool,
+        ) -> Self {
+            Self {
+                version: VERSION,
+                workspace_root: workspace_root.to_owned(),
+                context_files,
+                home: sandbox.home.clone(),
+                shell: sandbox.shell.to_owned(),
+                skills: r
+                    .skills
+                    .iter()
+                    .map(|k| Skill {
+                        name: k.name.clone(),
+                        description: k.description.clone(),
+                        path: k.path.clone(),
+                        disable_model_invocation: k.disable_model_invocation,
+                        scope: k.scope.to_owned(),
+                        body: k.body.clone(),
+                    })
+                    .collect(),
+                skill_collisions: r.skill_collisions.iter().map(Collision::of).collect(),
+                prompt_templates: r
+                    .prompt_templates
+                    .iter()
+                    .map(|p| Prompt {
+                        name: p.name.clone(),
+                        argument_hint: p.argument_hint.clone(),
+                        description: p.description.clone(),
+                        body: p.body.clone(),
+                        path: p.path.clone(),
+                        scope: p.scope.to_owned(),
+                    })
+                    .collect(),
+                prompt_collisions: r.prompt_collisions.iter().map(Collision::of).collect(),
+                agents: r
+                    .agents
+                    .iter()
+                    .map(|a| Agent {
+                        name: a.name.clone(),
+                        description: a.description.clone(),
+                        tools: a.tools.clone(),
+                        model: a.model.clone(),
+                        worktree: a.isolation == crate::agents::Isolation::Worktree,
+                        skills: a.skills.clone(),
+                        memory_index: a.memory_index,
+                        system: a.system.clone(),
+                        path: a.path.clone(),
+                        scope: a.scope.to_owned(),
+                    })
+                    .collect(),
+                context: r.context_files.clone(),
+                system: r.system.clone(),
+                append_system: r.append_system.clone(),
+            }
+        }
+
+        pub(super) fn into_snapshot(self) -> Snapshot {
+            let scope = |s: &str| label(s).unwrap_or("project");
+            Snapshot {
+                sandbox: Sandbox {
+                    home: self.home,
+                    shell: if self.shell == "bash" { "bash" } else { "sh" },
+                },
+                resources: Resources {
+                    skills: self
+                        .skills
+                        .into_iter()
+                        .map(|k| crate::skills::Skill {
+                            scope: scope(&k.scope),
+                            name: k.name,
+                            description: k.description,
+                            path: k.path,
+                            disable_model_invocation: k.disable_model_invocation,
+                            body: k.body,
+                        })
+                        .collect(),
+                    skill_collisions: self
+                        .skill_collisions
+                        .into_iter()
+                        .map(Collision::into_collision)
+                        .collect(),
+                    prompt_templates: self
+                        .prompt_templates
+                        .into_iter()
+                        .map(|p| crate::prompts::PromptTemplate {
+                            scope: scope(&p.scope),
+                            name: p.name,
+                            argument_hint: p.argument_hint,
+                            description: p.description,
+                            body: p.body,
+                            path: p.path,
+                        })
+                        .collect(),
+                    prompt_collisions: self
+                        .prompt_collisions
+                        .into_iter()
+                        .map(Collision::into_collision)
+                        .collect(),
+                    agents: self
+                        .agents
+                        .into_iter()
+                        .map(|a| crate::agents::AgentDef {
+                            scope: scope(&a.scope),
+                            name: a.name,
+                            description: a.description,
+                            tools: a.tools,
+                            model: a.model,
+                            isolation: if a.worktree {
+                                crate::agents::Isolation::Worktree
+                            } else {
+                                crate::agents::Isolation::None
+                            },
+                            skills: a.skills,
+                            memory_index: a.memory_index,
+                            system: a.system,
+                            path: a.path,
+                        })
+                        .collect(),
+                    context_files: self.context,
+                    system: self.system,
+                    append_system: self.append_system,
+                },
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -773,7 +1147,7 @@ mod tests {
             session_dir: PathBuf::from("/mnt/efs/a/t1/sessions"),
             memory_dir: PathBuf::from("/mnt/efs/a/t1/memory"),
             codec,
-            sandbox: OnceLock::new(),
+            sandbox: RwLock::new(None),
         }
     }
 
@@ -808,6 +1182,69 @@ mod tests {
             session.layout(),
             Layout::Segmented { codec: Some(_) }
         ));
+    }
+
+    #[test]
+    fn a_snapshot_round_trips_sealed_and_only_opens_for_its_session_and_settings() {
+        let session = session(&[("a", "/mnt/efs/a")], "a.x");
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox {
+            home: "/home/tenant".into(),
+            shell: "bash",
+        };
+        let resources = Resources {
+            skills: vec![crate::skills::Skill {
+                name: "deploy".into(),
+                description: "SKILL-DESCRIPTION".into(),
+                path: "/w/.claude/skills/deploy/SKILL.md".into(),
+                disable_model_invocation: false,
+                scope: "project",
+                body: Some("body".into()),
+            }],
+            skill_collisions: vec![crate::skills::Collision {
+                resource_type: "skill",
+                name: "deploy".into(),
+                winner_path: Some("/w/a".into()),
+                loser_path: Some("/home/tenant/b".into()),
+                winner_source: Some("standard root"),
+                loser_source: None,
+                message: "shadowed".into(),
+            }],
+            agents: vec![crate::agents::AgentDef {
+                name: "reviewer".into(),
+                description: "reviews".into(),
+                tools: Some(vec!["read".into()]),
+                model: None,
+                isolation: crate::agents::Isolation::Worktree,
+                skills: None,
+                memory_index: true,
+                system: "Review.".into(),
+                path: "/w/.claude/agents/reviewer.md".into(),
+                scope: "user",
+            }],
+            context_files: vec![("/w/AGENTS.md".into(), "CONTEXT-MARKER".into())],
+            system: Some("SYSTEM".into()),
+            ..Resources::default()
+        };
+        session
+            .save_snapshot(dir.path(), "a.x", true, &sandbox, &resources)
+            .unwrap();
+
+        let on_disk = std::fs::read(dir.path().join(SNAPSHOT_FILE)).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&on_disk).contains("CONTEXT-MARKER"),
+            "sealed, never in the clear"
+        );
+        let loaded = session.load_snapshot(dir.path(), "a.x", true).unwrap();
+        assert_eq!(loaded, Snapshot { sandbox, resources });
+        assert!(
+            session.load_snapshot(dir.path(), "a.y", true).is_none(),
+            "bound to its session"
+        );
+        assert!(
+            session.load_snapshot(dir.path(), "a.x", false).is_none(),
+            "taken with context files, so useless without them"
+        );
     }
 
     #[test]
