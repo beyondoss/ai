@@ -493,6 +493,7 @@ fn utf8_prefix(buf: Vec<u8>) -> String {
 ///
 /// Its offsets index exactly the bytes scanned and go stale at the first edit, so what edits a body
 /// holds them inside `rewrite::ScannedBody`, which moves them with each edit.
+#[derive(Debug, PartialEq, Eq)]
 pub struct BufferedScan {
     /// The root-level `model`, as [`ModelScanner`] would have extracted it.
     pub model: Option<String>,

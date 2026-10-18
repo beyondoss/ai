@@ -1,6 +1,8 @@
 //! The body rewrites as they stood before `rewrite::ScannedBody` tied their offsets to the bytes,
-//! kept verbatim with the hand-adjusted sequence `request_body_filter` ran them in, as the oracle
-//! of `prop_scanned_body_edits_match_the_hand_adjusted_ones` (`props_peek.rs`).
+//! as the oracle of the `prop_scanned_body_edits_*` properties (`props_lex.rs`, `props_peek.rs`).
+//! The free functions below `upstream` are verbatim copies of the old `proxy.rs` ones.
+//! `upstream` is not a copy: it re-derives, step for step, the order `request_body_filter` ran
+//! them in, without the opaque edits (translation, the strips) between the clamp and the rename.
 //!
 //! Do not fix anything here. A deliberate change of behaviour changes both sides in one commit.
 #![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
@@ -9,8 +11,9 @@ use beyond_ai::peek;
 
 /// The old buffered path's edits, in its order, offsets adjusted by hand: the clamp, then (on a
 /// native OpenAI Chat attempt) the `max_tokens` rename, each re-scanning when it changed the body;
-/// the ambiguous `stream_options` removal; `force_include_usage` handing back the moved model span;
-/// the model rewrite; the injection at the first scan's `inject_at`.
+/// the ambiguous `stream_options` removal, re-scanning too; `force_include_usage` handing back the
+/// moved model span; the model rewrite; the injection at the latest scan's `inject_at`, which the
+/// two edits after that scan never moved.
 pub fn upstream(
     mut buf: Vec<u8>,
     cap: u32,

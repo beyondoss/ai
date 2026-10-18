@@ -18,7 +18,7 @@ use crate::peek::{self, BufferedScan};
 /// The fragment spliced into a streaming OpenAI chat body. Always followed by a comma, since the
 /// splice point is just inside a root object that is non-empty by construction (a root `"stream"`
 /// key is what made it eligible).
-pub const STREAM_OPTIONS_FRAG: &[u8] = br#""stream_options":{"include_usage":true},"#;
+pub(crate) const STREAM_OPTIONS_FRAG: &[u8] = br#""stream_options":{"include_usage":true},"#;
 
 /// A buffered request body and the scan of exactly these bytes.
 ///
@@ -37,35 +37,34 @@ impl ScannedBody {
         Self { buf, scan }
     }
 
-    pub fn bytes(&self) -> &[u8] {
+    pub(crate) fn bytes(&self) -> &[u8] {
         &self.buf
     }
 
     /// The root `model`, unescaped ([`BufferedScan::model`]).
-    pub fn model(&self) -> Option<&str> {
+    pub(crate) fn model(&self) -> Option<&str> {
         self.scan.model.as_deref()
     }
 
     /// Move the root `model` out; later reads see `None` until a re-scan.
-    pub fn take_model(&mut self) -> Option<String> {
+    pub(crate) fn take_model(&mut self) -> Option<String> {
         self.scan.model.take()
     }
 
     /// [`BufferedScan::duplicate_model`].
-    pub fn duplicate_model(&self) -> bool {
+    pub(crate) fn duplicate_model(&self) -> bool {
         self.scan.duplicate_model
     }
 
     /// [`BufferedScan::inexact_limit`].
-    pub fn inexact_limit(&self) -> bool {
+    pub(crate) fn inexact_limit(&self) -> bool {
         self.scan.inexact_limit
     }
 
     /// Open the bytes to an edit this type cannot see into (translation, the strips). The scan
     /// stays sealed inside [`Edit`] until [`Edit::finish`] says whether the bytes changed.
-    pub fn edit(self) -> Edit {
-        let len = self.buf.len();
-        Edit { body: self, len }
+    pub(crate) fn edit(self) -> Edit {
+        Edit { body: self }
     }
 
     /// Cap each root-level output limit (`peek::OUTPUT_LIMIT_KEYS`) at `max`, the serving row's
@@ -169,26 +168,37 @@ impl ScannedBody {
 
 /// A [`ScannedBody`]'s bytes, open to an edit the scan cannot follow. The scan is sealed until
 /// [`Self::finish`]: there is no way to read an offset while the bytes may be changing.
-pub struct Edit {
+pub(crate) struct Edit {
     body: ScannedBody,
-    /// The length the bytes had when opened: `finish(false)` on a body of another length is a
-    /// caller that changed the bytes and said it did not.
-    len: usize,
 }
 
 impl Edit {
     /// Replace the bytes by a function of them, for the edits that take the body by value.
-    pub fn map(&mut self, f: impl FnOnce(Vec<u8>) -> Vec<u8>) {
+    pub(crate) fn map(&mut self, f: impl FnOnce(Vec<u8>) -> Vec<u8>) {
         self.body.buf = f(std::mem::take(&mut self.body.buf));
     }
 
     /// Close the edit: re-scanned when `changed`, else the scan as it was (the bytes are the
     /// ones it indexes).
-    pub fn finish(self, changed: bool) -> ScannedBody {
+    ///
+    /// `changed` is the edits' own report, and a false `false` would keep offsets into bytes that
+    /// moved. Debug builds re-scan to check it: a held scan that differs from a fresh one is an
+    /// edit that changed what the scan reads and said it did not, same length or not. A taken
+    /// `model` is not compared (`take_model` emptied it on purpose).
+    pub(crate) fn finish(self, changed: bool) -> ScannedBody {
         if changed {
             return ScannedBody::new(self.body.buf);
         }
-        debug_assert_eq!(self.len, self.body.buf.len(), "bytes changed unreported");
+        if cfg!(debug_assertions) {
+            let mut fresh = peek::scan_buffered(&self.body.buf);
+            if self.body.scan.model.is_none() {
+                fresh.model = None;
+            }
+            assert_eq!(
+                self.body.scan, fresh,
+                "an edit changed the body and reported no change"
+            );
+        }
         self.body
     }
 }
@@ -230,19 +240,29 @@ impl Splice {
     }
 
     /// Where the range `(a, b)` is now. The edited range itself is the replacement; a range before
-    /// the edit stays, one past it moves; one the edit cut into is gone (no edit here does that).
+    /// the edit stays, one past it moves.
+    ///
+    /// A range the edit cut into means the scan and the edit read the bytes differently: the only
+    /// edit that can meet one is `force_include_usage`, whose `serde_json` parse ends the
+    /// `stream_options` value, against the scan's `model` span. Debug builds stop there. A release
+    /// build moves it as the hand-adjusted code did (shifted when it starts past the edit's start,
+    /// else kept) so the body sent is the one it always was; a shift below zero is `None`, as the
+    /// old shift's wrapped span missed the buffer and left the model unrewritten.
     fn span(self, (a, b): (usize, usize)) -> Option<(usize, usize)> {
         let end = self.at.checked_add(self.removed)?;
+        let shift = |i: usize| i.checked_add(self.added)?.checked_sub(self.removed);
         if (a, b) == (self.at, end) {
             Some((self.at, self.at.checked_add(self.added)?))
         } else if b <= self.at {
             Some((a, b))
         } else if a >= end {
-            let shift = |i: usize| i.checked_sub(self.removed)?.checked_add(self.added);
             Some((shift(a)?, shift(b)?))
         } else {
             debug_assert!(false, "{self:?} cut into {a}..{b}");
-            None
+            match a > self.at {
+                true => Some((shift(a)?, shift(b)?)),
+                false => Some((a, b)),
+            }
         }
     }
 }
@@ -463,6 +483,7 @@ mod tests {
     fn moved_offsets_match_a_rescan() {
         let offsets = |s: &BufferedScan| {
             (
+                s.inject_at,
                 s.model_span,
                 s.limit_spans,
                 s.limit_keys,
@@ -486,6 +507,14 @@ mod tests {
                 "x",
             ),
             (r#"{"model":"","max_tokens":20}"#, 10, "gpt-4o"),
+            // An insertion (an empty model span) at a member boundary, with an injection point
+            // ahead of it and a limit key right after it.
+            (
+                r#"{"stream":true,"model":"","max_tokens":70000}"#,
+                5,
+                "gpt-4o",
+            ),
+            (r#"{"model":"m","stream":true}"#, 0, "openai/m"),
         ] {
             let mut b = ScannedBody::new(body.as_bytes().to_vec()).clamp_output_limits(max);
             assert_eq!(
@@ -514,8 +543,58 @@ mod tests {
         }
     }
 
+    /// An opaque edit that moves bytes and says so is re-scanned: the held scan is a fresh one,
+    /// for a splice through `Edit::map` and for a translation onto another wire.
+    #[test]
+    fn a_reported_opaque_edit_is_rescanned() {
+        use crate::route::Endpoint;
+        let body = br#"{"model":"gpt-4o","max_tokens":64000,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+        let fresh = |b: &ScannedBody| peek::scan_buffered(&b.buf);
+
+        let mut e = ScannedBody::new(body.to_vec())
+            .clamp_output_limits(100)
+            .edit();
+        e.map(|b| [&b"{\"user\":\"u\","[..], &b[1..]].concat());
+        let b = e.finish(true);
+        assert_eq!(b.scan, fresh(&b));
+        assert_eq!(b.scan.model_span.map(|(s, _)| s), Some(21));
+
+        let mut e = ScannedBody::new(body.to_vec()).edit();
+        let (translated, ..) = crate::translate::request_with_tools(
+            Endpoint::ChatCompletions,
+            Endpoint::Messages,
+            &e,
+            "claude-sonnet-4-5",
+            false,
+        );
+        *e = translated;
+        let b = e.finish(true);
+        assert_eq!(b.scan, fresh(&b));
+        assert_ne!(b.buf, body, "the translation changed the bytes");
+    }
+
+    /// An edit that changes what the scan reads and reports no change is caught in a debug build,
+    /// even at the same length.
+    #[test]
+    #[should_panic(expected = "reported no change")]
+    fn an_unreported_same_length_edit_is_caught() {
+        let mut e = ScannedBody::new(br#"{"model":"gpt-4o"}"#.to_vec()).edit();
+        e[10] = b'G';
+        let _ = e.finish(false);
+    }
+
+    /// An unchanged body keeps its scan, a taken `model` included.
+    #[test]
+    fn an_unchanged_edit_keeps_the_scan() {
+        let mut b = ScannedBody::new(br#"{"model":"gpt-4o","stream":true}"#.to_vec());
+        assert_eq!(b.take_model().as_deref(), Some("gpt-4o"));
+        let b = b.edit().finish(false);
+        assert_eq!(b.model(), None);
+        assert_eq!(b.scan.inject_at, Some(1));
+    }
+
     /// An insertion moves the byte at its point; a replacement keeps its start; a byte it replaced
-    /// is gone; a span it cut into is a bug, and in a release build dropped rather than misplaced.
+    /// is gone. A span it cut into is a bug (`span`'s debug assert).
     #[test]
     fn splice_moves_points_and_spans() {
         let ins = Splice {

@@ -5940,7 +5940,9 @@ impl ProxyHttp for AiProxy {
                     // translation, so what it derives (a thinking budget) fits under the cap too.
                     // Only a vendor-published maximum: an unpublished one is a placeholder (D85).
                     // The edits below are opaque to the scan, so they open the body and close it
-                    // re-scanned when one changed it.
+                    // re-scanned when one changed it. A clamp alone no longer re-scans, so a
+                    // `model` the miss path took stays taken: unreachable, as every miss refuses at
+                    // `Point::Buffered` (`Rule::CatalogMiss`) before this.
                     let mut buf = scanned
                         .clamp_output_limits(a.route.card.output_cap().unwrap_or(0))
                         .edit();

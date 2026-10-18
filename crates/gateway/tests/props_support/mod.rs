@@ -753,13 +753,11 @@ pub fn edit_plan() -> impl Strategy<Value = EditPlan> {
     })
 }
 
-/// `plan` applied through `rewrite::ScannedBody`, as `request_body_filter` applies it (the opaque
-/// edits between the clamp and the rename change nothing here).
+/// `plan` applied through `rewrite::ScannedBody`, as `request_body_filter` applies it, less the
+/// opaque edits between the clamp and the rename: those re-scan whatever they change, and
+/// `rewrite`'s own tests hold that re-scan to a fresh one.
 pub fn upstream(bytes: Vec<u8>, plan: &EditPlan) -> Vec<u8> {
-    let mut body = beyond_ai::rewrite::ScannedBody::new(bytes)
-        .clamp_output_limits(plan.cap)
-        .edit()
-        .finish(false);
+    let mut body = beyond_ai::ScannedBody::new(bytes).clamp_output_limits(plan.cap);
     if plan.rename {
         body = body.rename_max_tokens();
     }

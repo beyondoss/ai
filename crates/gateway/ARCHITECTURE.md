@@ -2902,11 +2902,18 @@ private:
   splice re-derive nothing: no second walk.
 - An edit it cannot follow (translation, the strips, the null and `developer` rewrites) goes through
   `ScannedBody::edit`: the scan is sealed in the `Edit` while the bytes may change, and
-  `Edit::finish(changed)` re-scans when they did. The `max_tokens` rename and the ambiguous
-  `stream_options` removal re-scan too; both are rare.
+  `Edit::finish(changed)` re-scans when they did. `changed` is the edits' own report, so debug
+  builds check a `finish(false)` against a fresh scan and panic when they differ (an unreported
+  edit, same length or not). The `max_tokens` rename and the ambiguous `stream_options` removal
+  re-scan too; both are rare.
+- A range an edit cuts into would mean the scan and the edit read the bytes differently (only
+  `force_include_usage`'s `serde_json` parse against the scan's `model` span could). Debug builds
+  stop there; a release build moves it as the hand-adjusted code did, so the bytes sent are
+  unchanged. The properties never reach it.
 - What reads the bytes outside borrows them (`ScannedBody::bytes`), so no offset or slice can be
   held across an edit. `peek::BufferedScan` still reports raw offsets, for tests and the
-  connect-time body rules, but nothing that ships edits with them.
+  connect-time body rules, but nothing that ships edits with them. `rewrite` is crate-private;
+  benches and property tests reach `ScannedBody` through a `#[doc(hidden)]` root re-export.
 
 Order. `request_body_filter` runs the clamp, then the opaque edits, then (native OpenAI Chat) the
 rename, then `ScannedBody::into_upstream`: drop an ambiguous `stream_options`, force

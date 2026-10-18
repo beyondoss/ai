@@ -941,7 +941,7 @@ mod peek {
             let b = black_box(&body);
             let mut buf = Vec::with_capacity(b.len() + FRAG.len());
             buf.extend_from_slice(b);
-            beyond_ai::rewrite::ScannedBody::new(buf)
+            beyond_ai::ScannedBody::new(buf)
                 .clamp_output_limits(16_384)
                 .into_upstream(true, Some(b"gpt-4o"))
         });
