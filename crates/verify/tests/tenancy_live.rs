@@ -228,6 +228,10 @@ fn main() {
     }
     // Live traffic: no reconciliation window may be open while it runs (see common::live_traffic).
     let _traffic = (!trials.is_empty() && !args.list).then(common::live_traffic);
+    trials.push(Trial::test(
+        "pin_matches_the_gateway",
+        pin_matches_the_gateway,
+    ));
     libtest_mimic::run(&args, trials).exit();
 }
 
@@ -256,11 +260,12 @@ fn mint_kid(kid: u8, seed: &[u8; 32], tenant: u64, vpc: u64, key_id: u64) -> Str
 /// The provider the gateway's computed session pin (D253) puts first for a caller on `model`, with
 /// every candidate of the row keyed and no breaker open: the row's leading run of first-party hosts
 /// (a provider with its own model-id prefix) ordered by rendezvous hash of the pin key and the
-/// provider name, highest first. A reimplementation of `affinity`, `pin_key`, `provider_hash` and
-/// `preferred` in `crates/gateway/src/smart.rs` over the published inputs only: the caller's
-/// `(tenant, vpc, key_id)` from its token, the row's index in the sorted `MODEL_ROUTES`, and the
-/// providers' names. If the two ever disagree, `pin_isolation` fails on the first key.
-fn pinned_provider(tenant: u64, vpc: u64, key_id: u64, model: &str) -> &'static str {
+/// provider name, highest first. A reimplementation of `affinity`, `pin_key`, `name_hash` and
+/// `preferred` in `crates/gateway/src/pin.rs` over the published inputs only: the caller's
+/// `(tenant, vpc, key_id)` from its token, the row's model name, and the providers' names. The
+/// hermetic `pin_matches_the_gateway` holds it to the gateway's own `pin::order`, so a change there
+/// fails this binary before a live `pin_isolation` cell spends a call on a stale prediction.
+fn pinned_provider(tenant: u64, vpc: u64, key_id: Option<u64>, model: &str) -> &'static str {
     fn mix(mut z: u64) -> u64 {
         z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -272,13 +277,12 @@ fn pinned_provider(tenant: u64, vpc: u64, key_id: u64, model: &str) -> &'static 
             (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3)
         })
     }
-    let affinity =
-        mix(mix(mix(tenant ^ 0x243F_6A88_85A3_08D3) ^ vpc) ^ (key_id ^ 0x1319_8A2E_0370_7344));
-    let row_i = MODEL_ROUTES
-        .binary_search_by(|r| r.model.cmp(model))
-        .expect("the cell's model is a catalog row");
-    let key = mix(affinity ^ (row_i as u64).wrapping_mul(0xA076_1D64_78BD_642F));
-    let row = &MODEL_ROUTES[row_i];
+    let affinity = mix(mix(mix(tenant ^ 0x243F_6A88_85A3_08D3) ^ vpc)
+        ^ key_id.map_or(0, |k| k ^ 0x1319_8A2E_0370_7344));
+    // The row enters by its name, never its index in `MODEL_ROUTES`: a catalog edit elsewhere must
+    // not move this row's pins.
+    let key = mix(affinity ^ fnv(model).wrapping_mul(0xA076_1D64_78BD_642F));
+    let row = providers::for_model(model).expect("the cell's model is a catalog row");
     row.candidates
         .iter()
         .take_while(|c| !by_id(c.provider).model_id_match.is_empty())
@@ -286,6 +290,53 @@ fn pinned_provider(tenant: u64, vpc: u64, key_id: u64, model: &str) -> &'static 
         .max_by_key(|name| mix(key ^ fnv(name)))
         // No first-party lead: catalog order.
         .unwrap_or_else(|| by_id(row.candidates[0].provider).name)
+}
+
+/// [`pinned_provider`] agrees with the gateway's `pin::order` on every pooled catalog row (two or
+/// more leading first-party hosts, where the hash decides) across tenants, vpcs and key ids, with
+/// and without a key id. Hermetic: its trial is named after the function, with no `::`, so `verify`
+/// reads it as this tagged test, not as a live cell.
+/// claim: TEN-2
+fn pin_matches_the_gateway() -> Result<(), Failed> {
+    use beyond_ai::__test::control::Walk;
+    use beyond_ai::__test::pin::{affinity, order};
+    let pooled = MODEL_ROUTES.iter().filter(|r| {
+        r.candidates
+            .iter()
+            .take_while(|c| !by_id(c.provider).model_id_match.is_empty())
+            .count()
+            >= 2
+    });
+    let mut rows = 0;
+    for row in pooled {
+        rows += 1;
+        for tenant in [0, 1, TENANT_A, TENANT_B, u64::MAX] {
+            for vpc in [0, 1, 0xDEAD_BEEF] {
+                for key_id in [None, Some(0), Some(101), Some(201), Some(u64::MAX)]
+                    .into_iter()
+                    .chain((301..=320).map(Some))
+                {
+                    let walk = Walk::identity(row.candidates.len());
+                    let walk = order(walk, row, affinity(tenant, vpc, key_id), u8::MAX)
+                        .ok_or_else(|| format!("{} is a catalog row", row.model))?;
+                    let want = by_id(row.candidates[usize::from(walk.indices[0])].provider).name;
+                    let got = pinned_provider(tenant, vpc, key_id, row.model);
+                    if got != want {
+                        return Err(format!(
+                            "{} (tenant {tenant}, vpc {vpc}, key {key_id:?}): pinned_provider says \
+                             {got}, the gateway pins {want}",
+                            row.model
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+    }
+    if rows == 0 {
+        return Err("no pooled catalog row to check".into());
+    }
+    Ok(())
 }
 
 /// Tenant A's `a1`, `a2` and tenant B's `b1` (distinct key ids, since the deny-set's key grain is
@@ -297,7 +348,7 @@ fn session_keys(model: &str) -> Value {
         m.insert(
             name,
             json!({"token": mint_v2(tenant, 1, key_id), "tenant": tenant, "key_id": key_id,
-                   "pin": pinned_provider(tenant, 1, key_id, model)}),
+                   "pin": pinned_provider(tenant, 1, Some(key_id), model)}),
         );
     };
     add("a1".into(), TENANT_A, 101);

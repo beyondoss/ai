@@ -551,6 +551,7 @@ name = "beyond-ai-verify"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "beyond-ai",
  "beyond-ai-providers",
  "beyond-ai-test-support",
  "ed25519-dalek",

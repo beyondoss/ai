@@ -70,6 +70,9 @@ pub use usage_file::{UsageFiles, UsageRow};
 /// module. Not an API: hidden from docs, and changed with the tests that use it.
 #[doc(hidden)]
 pub mod __test {
+    pub mod control {
+        pub use crate::control::Walk;
+    }
     pub mod key {
         pub use crate::key::{Keyring, VirtualKey};
         #[cfg(feature = "mint")]
@@ -77,6 +80,9 @@ pub mod __test {
     }
     pub mod lex {
         pub use crate::lex::{unescape, unescapes_to};
+    }
+    pub mod pin {
+        pub use crate::pin::{affinity, order};
     }
     pub mod peek {
         pub use crate::peek::{
