@@ -15,8 +15,6 @@ use common::{
 };
 use serde_json::{Value, json};
 
-const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
-
 fn mem_turn(id: &str, args: Value) -> String {
     turn_tool_use(id, "memory", &args.to_string())
 }
@@ -40,7 +38,7 @@ fn serve_mem_cmd(
     work: &Path,
     extra: &[&str],
 ) -> Command {
-    let mut c = Command::new(BIN);
+    let mut c = crate::common::agent_cmd();
     c.args([
         "serve",
         "--gateway-url",

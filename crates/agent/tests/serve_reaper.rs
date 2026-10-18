@@ -7,7 +7,7 @@
 
 mod common;
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use common::{
@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 /// Spawn a `serve --listen` child with the idle reaper armed at `idle_secs` (`0` disables reaping).
 fn serve_reaper_child(base: &str, session_dir: &str, idle_secs: u64) -> (ChildGuard, u16) {
     spawn_listening(
-        Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+        crate::common::agent_cmd()
             .args([
                 "serve",
                 "--gateway-url",

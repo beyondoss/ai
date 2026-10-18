@@ -18,7 +18,7 @@ use serde_json::json;
 
 fn daemon(base: &str, dir: &str, idle_secs: u64) -> (ChildGuard, u16) {
     spawn_listening(
-        Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+        crate::common::agent_cmd()
             .args([
                 "serve",
                 "--gateway-url",

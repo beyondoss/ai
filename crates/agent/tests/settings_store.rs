@@ -4,7 +4,7 @@
 mod common;
 
 use std::io::{Read, Write};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use common::{ISOLATED_HOME, SpawnGuarded, run_cmd, spawn_model_server, turn_text};
 use serde_json::json;
@@ -12,8 +12,7 @@ use serde_json::json;
 #[test]
 fn settings_with_no_flags_shows_every_default_as_not_set() {
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .arg("settings")
         .env("HOME", home.path())
         .output()
@@ -34,9 +33,8 @@ fn settings_with_no_flags_shows_every_default_as_not_set() {
 #[test]
 fn settings_set_and_show_round_trips_across_invocations() {
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let set = Command::new(bin)
+    let set = crate::common::agent_cmd()
         .args(["settings", "--model", "claude-opus-4-8"])
         .env("HOME", home.path())
         .output()
@@ -50,7 +48,7 @@ fn settings_set_and_show_round_trips_across_invocations() {
     );
 
     // A fresh invocation (a different process) must see the same persisted value.
-    let show = Command::new(bin)
+    let show = crate::common::agent_cmd()
         .arg("settings")
         .env("HOME", home.path())
         .output()
@@ -66,9 +64,8 @@ fn settings_set_and_show_round_trips_across_invocations() {
 #[test]
 fn settings_clear_removes_a_field_without_touching_others() {
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    Command::new(bin)
+    crate::common::agent_cmd()
         .args([
             "settings",
             "--model",
@@ -80,7 +77,7 @@ fn settings_clear_removes_a_field_without_touching_others() {
         .output()
         .unwrap();
 
-    let cleared = Command::new(bin)
+    let cleared = crate::common::agent_cmd()
         .args(["settings", "--clear-model"])
         .env("HOME", home.path())
         .output()
@@ -99,16 +96,15 @@ fn run_binary_uses_the_stored_default_model_when_no_flag_or_env_var_is_given() {
     // Pi-parity fix: no stored-settings layer existed at all — an operator had to retype `--model` (or
     // export `AI_AGENT_MODEL`) on every invocation.
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    Command::new(bin)
+    crate::common::agent_cmd()
         .args(["settings", "--model", "claude-test"])
         .env("HOME", home.path())
         .output()
         .unwrap();
 
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .args(["run", "hi", "--gateway-url", &base, "--key", "bai_v1.test"])
         .env("HOME", home.path())
         .stdin(Stdio::null())
@@ -130,16 +126,15 @@ fn run_binary_uses_the_stored_default_model_when_no_flag_or_env_var_is_given() {
 #[test]
 fn run_binary_explicit_model_flag_wins_over_a_stored_default() {
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    Command::new(bin)
+    crate::common::agent_cmd()
         .args(["settings", "--model", "claude-stored-default"])
         .env("HOME", home.path())
         .output()
         .unwrap();
 
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .args([
             "run",
             "hi",
@@ -196,9 +191,8 @@ fn run_binary_with_no_settings_file_at_all_falls_back_to_the_built_in_default() 
 #[test]
 fn serve_binary_uses_the_stored_default_model_when_no_flag_or_env_var_is_given() {
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    Command::new(bin)
+    crate::common::agent_cmd()
         .args(["settings", "--model", "claude-test"])
         .env("HOME", home.path())
         .output()
@@ -207,7 +201,7 @@ fn serve_binary_uses_the_stored_default_model_when_no_flag_or_env_var_is_given()
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let mut child = Command::new(bin)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",
@@ -245,10 +239,9 @@ fn serve_binary_stored_session_dir_default_does_not_override_an_explicit_session
     // explicitly passed `--session-file` would silently switch them into repo mode instead of the file
     // mode they actually asked for.
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let unrelated_dir = home.path().join("unrelated-repo-dir");
 
-    Command::new(bin)
+    crate::common::agent_cmd()
         .args(["settings", "--session-dir", unrelated_dir.to_str().unwrap()])
         .env("HOME", home.path())
         .output()
@@ -257,7 +250,7 @@ fn serve_binary_stored_session_dir_default_does_not_override_an_explicit_session
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let mut child = Command::new(bin)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",
@@ -300,9 +293,8 @@ fn serve_no_session_persistence_wins_over_a_stored_session_dir() {
     // `run` already lets `--no-session-persistence` beat a stored `default_session_dir`; `serve` must
     // too, or an operator who asked for nothing on disk still gets a transcript there.
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let stored_dir = home.path().join("stored-repo-dir");
-    let set = Command::new(bin)
+    let set = crate::common::agent_cmd()
         .args(["settings", "--session-dir", stored_dir.to_str().unwrap()])
         .env("HOME", home.path())
         .env_remove("AI_AGENT_CONFIG_DIR")
@@ -312,7 +304,7 @@ fn serve_no_session_persistence_wins_over_a_stored_session_dir() {
 
     let cwd = tempfile::tempdir().unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let mut child = Command::new(bin)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",
@@ -383,9 +375,8 @@ fn settings_default_project_trust_round_trips_across_invocations() {
     // pi-parity fix: no persisted global default-trust policy existed at all — `always`/`never`/`ask`,
     // consulted only when neither `--trust-project` nor `--force-untrusted` is explicitly given.
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let set = Command::new(bin)
+    let set = crate::common::agent_cmd()
         .args(["settings", "--default-project-trust", "always"])
         .env("HOME", home.path())
         .output()
@@ -398,7 +389,7 @@ fn settings_default_project_trust_round_trips_across_invocations() {
     let stdout = String::from_utf8_lossy(&set.stdout);
     assert!(stdout.contains("default_project_trust: always"), "{stdout}");
 
-    let show = Command::new(bin)
+    let show = crate::common::agent_cmd()
         .arg("settings")
         .env("HOME", home.path())
         .output()
@@ -410,7 +401,7 @@ fn settings_default_project_trust_round_trips_across_invocations() {
         "a fresh invocation must see the persisted policy: {stdout}"
     );
 
-    let cleared = Command::new(bin)
+    let cleared = crate::common::agent_cmd()
         .args(["settings", "--clear-default-project-trust"])
         .env("HOME", home.path())
         .output()
@@ -431,9 +422,8 @@ fn run_binary_stored_default_project_trust_always_enables_a_project_system_md_wi
     // would.
     let home = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let set = Command::new(bin)
+    let set = crate::common::agent_cmd()
         .args(["settings", "--default-project-trust", "always"])
         .env("HOME", home.path())
         .output()
@@ -445,7 +435,7 @@ fn run_binary_stored_default_project_trust_always_enables_a_project_system_md_wi
     std::fs::write(claude_dir.join("SYSTEM.md"), "STORED-ALWAYS-TRUST-MARKER").unwrap();
 
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .env("HOME", home.path())
         .args([
             "run",
@@ -483,9 +473,8 @@ fn run_binary_explicit_force_untrusted_wins_over_a_stored_default_project_trust_
     // `default_model`/`default_gateway_url` already have relative to their own explicit flags.
     let home = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let set = Command::new(bin)
+    let set = crate::common::agent_cmd()
         .args(["settings", "--default-project-trust", "always"])
         .env("HOME", home.path())
         .output()
@@ -497,7 +486,7 @@ fn run_binary_explicit_force_untrusted_wins_over_a_stored_default_project_trust_
     std::fs::write(claude_dir.join("SYSTEM.md"), "SHOULD-NOT-APPLY-MARKER").unwrap();
 
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .env("HOME", home.path())
         .args([
             "run",
@@ -536,9 +525,8 @@ fn ai_agent_config_dir_env_var_redirects_settings_and_trust_store_off_of_home() 
     // moves every other HOME-relative thing this binary or the wider shell environment reads).
     let home = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let set = Command::new(bin)
+    let set = crate::common::agent_cmd()
         .args(["settings", "--model", "claude-opus-4-8"])
         .env("HOME", home.path())
         .env("AI_AGENT_CONFIG_DIR", config_dir.path())
@@ -558,7 +546,7 @@ fn ai_agent_config_dir_env_var_redirects_settings_and_trust_store_off_of_home() 
         "settings.json must not also land under $HOME/.beyond when AI_AGENT_CONFIG_DIR overrides it"
     );
 
-    let trust = Command::new(bin)
+    let trust = crate::common::agent_cmd()
         .args(["trust", "."])
         .env("HOME", home.path())
         .env("AI_AGENT_CONFIG_DIR", config_dir.path())
@@ -581,9 +569,8 @@ fn ai_agent_config_dir_env_var_redirects_settings_and_trust_store_off_of_home() 
 #[test]
 fn settings_shows_round_3_defaults_as_not_set_and_round_trips_set_show_clear() {
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let show = Command::new(bin)
+    let show = crate::common::agent_cmd()
         .arg("settings")
         .env("HOME", home.path())
         .output()
@@ -608,7 +595,7 @@ fn settings_shows_round_3_defaults_as_not_set_and_round_trips_set_show_clear() {
         );
     }
 
-    let set = Command::new(bin)
+    let set = crate::common::agent_cmd()
         .args([
             "settings",
             "--default-bash-shell-path",
@@ -680,7 +667,7 @@ fn settings_shows_round_3_defaults_as_not_set_and_round_trips_set_show_clear() {
     );
 
     // A fresh invocation must see the same persisted values.
-    let show = Command::new(bin)
+    let show = crate::common::agent_cmd()
         .arg("settings")
         .env("HOME", home.path())
         .output()
@@ -695,7 +682,7 @@ fn settings_shows_round_3_defaults_as_not_set_and_round_trips_set_show_clear() {
         "{stdout}"
     );
 
-    let cleared = Command::new(bin)
+    let cleared = crate::common::agent_cmd()
         .args([
             "settings",
             "--clear-default-bash-shell-path",
@@ -732,9 +719,8 @@ fn serve_binary_stored_default_bash_shell_path_fails_fast_like_an_explicit_flag_
     // came from a stored default, not just an explicit flag — the check was moved to run *after* the
     // whole fallback chain resolves, precisely so this keeps working.
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    Command::new(bin)
+    crate::common::agent_cmd()
         .args([
             "settings",
             "--default-bash-shell-path",
@@ -747,7 +733,7 @@ fn serve_binary_stored_default_bash_shell_path_fails_fast_like_an_explicit_flag_
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
-    let mut child = Command::new(bin)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",
@@ -781,10 +767,9 @@ fn serve_binary_explicit_bash_shell_path_flag_wins_over_a_stored_default() {
         return; // no alternate shell on this host to prove the override actually took effect
     }
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
     // A stored default that, left alone, would fail startup outright.
-    Command::new(bin)
+    crate::common::agent_cmd()
         .args([
             "settings",
             "--default-bash-shell-path",
@@ -797,7 +782,7 @@ fn serve_binary_explicit_bash_shell_path_flag_wins_over_a_stored_default() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let mut child = Command::new(bin)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",
@@ -837,9 +822,8 @@ fn run_binary_stored_default_compaction_tokens_force_compaction_with_no_explicit
     use beyond_ai_agent::session_store::{SessionMeta, SessionRepo};
 
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    Command::new(bin)
+    crate::common::agent_cmd()
         .args([
             "settings",
             "--default-compaction-reserve-tokens",
@@ -870,7 +854,7 @@ fn run_binary_stored_default_compaction_tokens_force_compaction_with_no_explicit
 
     let (base, bodies) = spawn_model_server(vec![turn_text("SUMMARY"), turn_text("answered")]);
 
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .args([
             "run",
             "continue please",
@@ -914,9 +898,8 @@ fn run_binary_stored_default_compaction_tokens_force_compaction_with_no_explicit
 #[test]
 fn serve_binary_stored_default_models_list_scopes_cycle_model_with_no_explicit_flag() {
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    Command::new(bin)
+    crate::common::agent_cmd()
         .args(["settings", "--default-models", "claude-opus-4-8,gpt-4o"])
         .env("HOME", home.path())
         .output()
@@ -925,7 +908,7 @@ fn serve_binary_stored_default_models_list_scopes_cycle_model_with_no_explicit_f
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
-    let mut child = Command::new(bin)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",
@@ -961,10 +944,9 @@ fn serve_binary_stored_default_models_list_scopes_cycle_model_with_no_explicit_f
 #[test]
 fn serve_binary_explicit_models_flag_wins_over_a_stored_default_models_list() {
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
     // A stored default scope that does NOT include `claude-opus-4-8` at all.
-    Command::new(bin)
+    crate::common::agent_cmd()
         .args(["settings", "--default-models", "gpt-4o,claude-sonnet-4-5"])
         .env("HOME", home.path())
         .output()
@@ -973,7 +955,7 @@ fn serve_binary_explicit_models_flag_wins_over_a_stored_default_models_list() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
-    let mut child = Command::new(bin)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",
@@ -1016,14 +998,13 @@ fn serve_binary_explicit_models_flag_wins_over_a_stored_default_models_list() {
 fn run_binary_project_settings_json_overrides_the_global_default_when_trusted() {
     let home = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    Command::new(bin)
+    crate::common::agent_cmd()
         .args(["settings", "--model", "claude-global-model"])
         .env("HOME", home.path())
         .output()
         .unwrap();
-    let trust = Command::new(bin)
+    let trust = crate::common::agent_cmd()
         .args(["trust", project_dir.path().to_str().unwrap()])
         .env("HOME", home.path())
         .output()
@@ -1039,7 +1020,7 @@ fn run_binary_project_settings_json_overrides_the_global_default_when_trusted() 
     .unwrap();
 
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .env("HOME", home.path())
         .args([
             "run",
@@ -1076,14 +1057,13 @@ fn run_binary_project_settings_json_overrides_the_global_default_when_trusted() 
 fn run_binary_global_value_survives_when_project_settings_json_leaves_it_unset() {
     let home = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    Command::new(bin)
+    crate::common::agent_cmd()
         .args(["settings", "--model", "claude-global-model"])
         .env("HOME", home.path())
         .output()
         .unwrap();
-    let trust = Command::new(bin)
+    let trust = crate::common::agent_cmd()
         .args(["trust", project_dir.path().to_str().unwrap()])
         .env("HOME", home.path())
         .output()
@@ -1100,7 +1080,7 @@ fn run_binary_global_value_survives_when_project_settings_json_leaves_it_unset()
     .unwrap();
 
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .env("HOME", home.path())
         .args([
             "run",
@@ -1133,9 +1113,8 @@ fn run_binary_global_value_survives_when_project_settings_json_leaves_it_unset()
 fn run_binary_untrusted_project_settings_json_is_completely_ignored() {
     let home = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    Command::new(bin)
+    crate::common::agent_cmd()
         .args(["settings", "--model", "claude-global-model"])
         .env("HOME", home.path())
         .output()
@@ -1151,7 +1130,7 @@ fn run_binary_untrusted_project_settings_json_is_completely_ignored() {
     .unwrap();
 
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .env("HOME", home.path())
         .args([
             "run",
@@ -1188,9 +1167,8 @@ fn run_binary_untrusted_project_settings_json_is_completely_ignored() {
 #[test]
 fn run_binary_project_settings_missing_or_malformed_degrades_to_global_only() {
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    Command::new(bin)
+    crate::common::agent_cmd()
         .args(["settings", "--model", "claude-global-model"])
         .env("HOME", home.path())
         .output()
@@ -1198,7 +1176,7 @@ fn run_binary_project_settings_missing_or_malformed_degrades_to_global_only() {
 
     // Case 1: a trusted project directory with no `.claude/settings.json` at all.
     let project_dir_missing = tempfile::tempdir().unwrap();
-    let trust = Command::new(bin)
+    let trust = crate::common::agent_cmd()
         .args(["trust", project_dir_missing.path().to_str().unwrap()])
         .env("HOME", home.path())
         .output()
@@ -1206,7 +1184,7 @@ fn run_binary_project_settings_missing_or_malformed_degrades_to_global_only() {
     assert!(trust.status.success());
 
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .env("HOME", home.path())
         .args([
             "run",
@@ -1235,7 +1213,7 @@ fn run_binary_project_settings_missing_or_malformed_degrades_to_global_only() {
 
     // Case 2: a trusted project directory with a malformed `.claude/settings.json`.
     let project_dir_malformed = tempfile::tempdir().unwrap();
-    let trust = Command::new(bin)
+    let trust = crate::common::agent_cmd()
         .args(["trust", project_dir_malformed.path().to_str().unwrap()])
         .env("HOME", home.path())
         .output()
@@ -1250,7 +1228,7 @@ fn run_binary_project_settings_missing_or_malformed_degrades_to_global_only() {
     .unwrap();
 
     let (base2, bodies2) = spawn_model_server(vec![turn_text("ok")]);
-    let output2 = Command::new(bin)
+    let output2 = crate::common::agent_cmd()
         .env("HOME", home.path())
         .args([
             "run",
@@ -1290,13 +1268,12 @@ fn serve_binary_stored_steering_mode_and_follow_up_mode_seed_a_fresh_processs_in
     // non-default modes for both lanes via the RPC commands; the second, started with neither
     // `--steering-mode` nor `--follow-up-mode`, must start already reflecting them.
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
     {
         let dir = tempfile::tempdir().unwrap();
         let session_file = dir.path().join("s1.jsonl").to_string_lossy().into_owned();
         let (base, _bodies) = spawn_model_server(vec![]);
-        let mut child = Command::new(bin)
+        let mut child = crate::common::agent_cmd()
             .args([
                 "serve",
                 "--gateway-url",
@@ -1341,7 +1318,7 @@ fn serve_binary_stored_steering_mode_and_follow_up_mode_seed_a_fresh_processs_in
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s2.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
-    let mut child = Command::new(bin)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",
@@ -1389,9 +1366,8 @@ fn one_wrongly_typed_field_is_reported_and_every_valid_field_still_applies() {
         r#"{"default_model": "claude-from-settings", "block_images": "yes"}"#,
     )
     .unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .args(["run", "hi", "--gateway-url", &base, "--key", "bai_v1.test"])
         .args(["--no-session-persistence"])
         .env("HOME", home.path())

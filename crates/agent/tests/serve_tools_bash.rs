@@ -279,7 +279,7 @@ fn serve_bash_exclude_from_context_is_recorded_but_hidden_from_the_model() {
 
     // 4. Present in export.rs's rendered output.
     let export_path = dir.path().join("transcript.html");
-    let output = std::process::Command::new(bin)
+    let output = crate::common::agent_cmd()
         .args(["export", &session_file, export_path.to_str().unwrap()])
         .env("HOME", dir.path())
         .output()

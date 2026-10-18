@@ -20,7 +20,6 @@
 mod common;
 
 use std::path::Path;
-use std::process::Command;
 
 use common::{run_cmd, spawn_model_server, turn_text, turn_tool_use};
 use serde_json::{Value, json};
@@ -283,7 +282,7 @@ fn live_grok(code_mode: bool) -> (bool, String, String) {
             stdio_server_config("linear"),
         ],
     );
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"));
+    let mut cmd = crate::common::agent_cmd();
     cmd.env("HOME", home.path())
         .env("AI_PROVIDER", "openrouter")
         .env("AI_DIRECT", "1")

@@ -13,7 +13,7 @@
 mod common;
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use common::{ChildGuard, ISOLATED_HOME, WS_PATH, spawn_listening};
@@ -26,7 +26,7 @@ use tokio::net::TcpStream;
 fn daemon(dir: &Path) -> (ChildGuard, u16) {
     let sock = dir.join("agent.sock");
     spawn_listening(
-        Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+        crate::common::agent_cmd()
             .args([
                 "serve",
                 "--gateway-url",

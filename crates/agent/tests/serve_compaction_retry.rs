@@ -4,7 +4,7 @@
 mod common;
 
 use std::io::{BufRead, Write};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use common::{
     ISOLATED_HOME, SpawnGuarded, read_until_response, serve_cmd, spawn_model_server, turn_text,
@@ -155,8 +155,7 @@ fn serve_compact_forwards_custom_instructions_to_the_summarization_call() {
         turn_text("## Goal\nSUMMARY"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = Command::new(bin)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",
@@ -359,8 +358,7 @@ fn serve_proactively_compacts_a_resumed_large_session_on_its_very_next_prompt() 
     let (base, bodies) =
         spawn_model_server(vec![turn_text("## Goal\nSUMMARY"), turn_text("answered")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = Command::new(bin)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",
@@ -439,8 +437,7 @@ fn serve_compact_preserves_pre_compaction_entries_in_get_tree() {
         turn_text("## Goal\nSUMMARY"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = Command::new(bin)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",
@@ -522,8 +519,7 @@ fn serve_compact_reports_first_kept_entry_id_naming_a_real_pre_compaction_entry(
         turn_text("## Goal\nSUMMARY"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = Command::new(bin)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",
