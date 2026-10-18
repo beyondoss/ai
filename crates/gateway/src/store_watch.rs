@@ -159,14 +159,14 @@ pub trait WatchedSet: Send + Sync + 'static {
     ///
     /// Every writer puts the cursor *after* the data it covers (a rebuild after it has written every
     /// entry, a batch after its deltas), so a snapshot that carries a cursor — even the revision 0
-    /// of an empty scan — reflects a complete read. One without a cursor does not: the old in-place
-    /// rebuild crashed midway left some `Put`s and no cursor. Which way that cuts depends on the
+    /// of an empty scan — reflects a complete read. One without a cursor does not: an in-place
+    /// rebuild crashed midway would leave some `Put`s and no cursor. Which way that cuts depends on the
     /// set's fail direction:
     ///
     /// - **Fail-open** (deny): any surviving entry is strictly better than the empty set it would
     ///   otherwise boot with, so `true`.
     /// - **Fail-closed** (allowance): installing it would flip the set *ready* holding only part of
-    ///   the exhausted tenants, serving the rest and turning `/readyz` 200 (D257). So `false`: the
+    ///   the exhausted tenants, serving the rest and turning `/readyz` 200. So `false`: the
     ///   set stays unseeded (503) until a snapshot with a cursor or a NATS scan.
     ///
     /// This is about *seeding*, not resuming: only an [`is_resumable`] cursor (revision > 0) skips
@@ -358,11 +358,11 @@ impl WatchedSet for Allowance {
 ///
 /// The rule that matters is *when* the delay resets. It resets only after a connection that proved
 /// **productive** — one whose watch survived at least [`RECONNECT_BACKOFF_MAX`]. Resetting on a
-/// successful `connect()` instead (which is what this used to do) is a trap: NATS happily accepts
+/// successful `connect()` instead is a trap: NATS happily accepts
 /// connections while the *watch* fails every single time — bucket missing, scan permission denied,
-/// store hands back no watcher, consumer-create refused. Each iteration then reset the delay to the
-/// base before `watch_deny` failed, undoing the doubling that follows, and the "backoff" pinned
-/// itself at 1s: ~86k connects (TLS handshake + JetStream KV lookup + scan) and ~86k `warn!` lines a
+/// store hands back no watcher, consumer-create refused. Each iteration would reset the delay to
+/// the base before `watch_deny` failed, undoing the doubling that follows, and the "backoff" would
+/// pin itself at 1s: ~86k connects (TLS handshake + JetStream KV lookup + scan) and ~86k `warn!` lines a
 /// day — exactly the log flood the backoff exists to prevent.
 ///
 /// Kept as a tiny state machine so that rule is testable without a NATS server.
@@ -436,7 +436,7 @@ impl<W: WatchedSet> BackgroundService for WatcherService<W> {
                     // resume from.
                     //
                     // Separately, a fail-closed set must not go live from a snapshot that isn't
-                    // proof of a complete read, i.e. one with no cursor record at all (D257, see
+                    // proof of a complete read, i.e. one with no cursor record at all (see
                     // `SEED_FROM_CURSORLESS_SNAPSHOT`). Decide before installing anything:
                     // `record_size` is the allowance ready flip, so it is skipped too.
                     let resumable = is_resumable(&snap.cursor);
@@ -680,8 +680,8 @@ fn snapshot_tmp_path(path: &Path) -> PathBuf {
 
 /// First half of a rebuild: write the complete new snapshot (every entry, then the cursor) to
 /// `{path}.tmp` and fsync it. `path` itself is untouched, so a crash anywhere in here leaves the
-/// previous complete snapshot in place. (D257: the old in-place rebuild removed `path` first, so a
-/// crash left some `Put`s and no cursor.)
+/// previous complete snapshot in place. (An in-place rebuild would remove `path` first, so a
+/// crash would leave some `Put`s and no cursor.)
 fn write_snapshot_tmp(
     path: &Path,
     entries: Vec<KvEntry>,
@@ -959,8 +959,8 @@ mod tests {
         }
     }
 
-    /// The deny-set's prefix is what the control plane writes to; it used to be a module-level
-    /// `const` and now lives in a trait impl, one of several `WatchedSet` implementations. A typo
+    /// The deny-set's prefix is what the control plane writes to; it lives in a trait impl, one of
+    /// several `WatchedSet` implementations. A typo
     /// there fails **silently and completely**: the gateway boots, scans a prefix nothing is written
     /// to, seeds an empty set, and cheerfully serves every denied tenant forever. Nothing else in
     /// this file would notice. Pin the literal.
@@ -1250,8 +1250,8 @@ mod tests {
     }
 
     /// A crash after the new snapshot is staged but before the rename must leave the previous
-    /// complete snapshot, cursor included, not a partial one (the old in-place rebuild removed the
-    /// file first, so a crash left some `Put`s and no cursor).
+    /// complete snapshot, cursor included, not a partial one (an in-place rebuild would remove the
+    /// file first, so a crash would leave some `Put`s and no cursor).
     /// claim: REL-13
     /// defect: D257
     #[test]

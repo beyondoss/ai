@@ -202,7 +202,7 @@ async fn a_stream_accepted_then_silent_before_its_first_byte_is_billed_an_estima
 
 /// The provider has the whole request and keeps the connection alive, but no head comes before
 /// `read_timeout_secs`: a long non-stream generation. The gateway gives up and answers 504, the
-/// same moment a client giving up would be billed the prompt (D07): the provider cannot tell who
+/// same moment a client giving up would be billed the prompt: the provider cannot tell who
 /// hung up, and bills it either way. The row was 0/0, so the SDK's retry of that 504 hid a billed
 /// prompt (BIL-14).
 /// claim: BIL-3, BIL-14, BIL-20
@@ -244,7 +244,7 @@ async fn a_read_timeout_before_the_head_bills_the_delivered_prompt() {
     assert_eq!(row["output_tokens"], 0, "{row}");
 }
 
-/// The other half of D130's rule: a peer that closes the connection before any head, after it had
+/// The other half of the gave-up-waiting rule: a peer that closes the connection before any head, after it had
 /// the request, told the gateway it is not answering. Real edges answer a failure they forwarded
 /// with an HTTP error (Cloudflare 52x, Envoy's 503 local reply), so a bare close is a refusal and
 /// is billed nothing, the side an unverifiable bill errs on (BIL-20).
@@ -300,7 +300,7 @@ async fn post_non_stream(gw: &Gateway, key: &str) {
 /// generation failed (`"usage": null` beside an empty message; live 2026-10-01 on
 /// `x-ai/grok-4.20-multi-agent`, an 8-second answer billed 0/0), or a shape change. OpenRouter
 /// documents that the upstream may still bill the prompt, and a stream that finished without usage
-/// was already estimated (D123); the non-stream body wrote a zero row. Now it is estimated: input
+/// was already estimated; the non-stream body wrote a zero row. Now it is estimated: input
 /// from the prompt, under its real count, and the row says it is an estimate.
 /// claim: BIL-20, BIL-12
 /// defect: D195

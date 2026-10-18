@@ -86,7 +86,7 @@ pub enum Refusal {
         path: Box<str>,
         wrong_method: bool,
     },
-    /// A managed Responses `background: true` request (D202): generated after the request ends,
+    /// A managed Responses `background: true` request: generated after the request ends,
     /// where no usage tap can meter it.
     Background,
     /// The tenant already has `tenant_max_in_flight` requests open.
@@ -138,7 +138,7 @@ pub enum Refusal {
     ForeignIdLate,
     /// The provider's circuit breaker is open; `retry_after` is the seconds until it half-opens.
     CircuitOpen { retry_after: u64 },
-    /// Translating this body would take more heap than the whole body budget (D216).
+    /// Translating this body would take more heap than the whole body budget.
     TranslateTooLarge,
     /// The request outlived `request_max_secs` before its response head.
     RequestDeadline,
@@ -440,7 +440,7 @@ pub fn json_body(kind: &str, msg: &str) -> Bytes {
     Bytes::from(serde_json::json!({ "error": { "type": kind, "message": msg } }).to_string())
 }
 
-/// The catalog-miss message, for the catalog walk and a managed `/{provider}` body (D267) alike:
+/// The catalog-miss message, for the catalog walk and a managed `/{provider}` body alike:
 /// the model by name (clipped), or that none was sent, and where the models a managed key can use
 /// are listed. `header`: whether the route reads `x-beyond-model` (a catalog walk does,
 /// `/{provider}` does not).

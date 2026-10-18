@@ -74,7 +74,7 @@ impl BodyBudget {
 
     /// Reserve `n` bytes for as long as the returned hold lives; `None` (nothing reserved) when that
     /// would cross the limit. For memory held across one synchronous step, such as the `Value`s a
-    /// translation builds (`translate::translation_heap`, D216): the hold releases on drop, a panic
+    /// translation builds (`translate::translation_heap`): the hold releases on drop, a panic
     /// included.
     pub fn hold(&self, n: usize) -> Option<BudgetHold<'_>> {
         self.try_reserve(n)

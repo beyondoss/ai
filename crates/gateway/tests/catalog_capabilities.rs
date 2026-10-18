@@ -221,8 +221,7 @@ async fn a_structured_output_request_skips_a_candidate_that_does_not_enforce_it(
 /// every client dialect and whether or not a header named the row, and no upstream is contacted
 /// (o3-mini answered "I can't view images" and billed it, gpt-4 answered 500). Text on the same
 /// row, and an image on a row that reads images, are served. The text-only row is
-/// deepseek-v4-pro (DeepSeek: "Vision: Not supported"); the gpt-4 and o3-mini rows are gone
-/// (D243).
+/// deepseek-v4-pro (DeepSeek: "Vision: Not supported"); the gpt-4 and o3-mini rows are gone.
 /// claim: CAT-5
 /// defect: D112
 #[tokio::test]
@@ -404,7 +403,7 @@ async fn an_openrouter_candidate_is_asked_not_to_compress_the_prompt() {
     assert_eq!(sent["plugins"][0]["enabled"], false);
 
     // The client's own free plugins are its choice, sent as they are. A billed one (web search)
-    // is refused on a managed key: no row could price it (D268).
+    // is refused on a managed key: no row could price it.
     let own = json!({"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}],
                      "plugins": [{"id": "response-healing"}]});
     let resp = post(&gw, &key, "/v1/chat/completions", &only("openrouter"), &own).await;

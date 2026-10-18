@@ -447,7 +447,7 @@ async fn max_tokens_reaches_a_reasoning_model_as_max_completion_tokens() {
         .start()
         .await;
     let mut wrong = Vec::new();
-    // Not gpt-5.4 and later: those reach OpenAI over Responses (D114).
+    // Not gpt-5.4 and later: those reach OpenAI over Responses.
     for model in ["gpt-5.1", "gpt-5.2"] {
         let resp = test_client()
             .post(format!("{}/v1/chat/completions", gw.url()))

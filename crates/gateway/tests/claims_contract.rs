@@ -1134,7 +1134,7 @@ fn doc_above(src: &str, item: &str) -> String {
 
 /// Doc comments sit on the item they describe, and the docs do not contradict the code: the
 /// parallel merges left `proxy.rs` doc blocks fused onto the wrong functions, ARCHITECTURE.md
-/// saying BYO forwards every header untouched (D67 sweeps `x-beyond-*`) and is pure passthrough,
+/// saying BYO forwards every header untouched (`x-beyond-*` is swept) and is pure passthrough,
 /// and `config.rs` naming a Codex pool key that `providers` says cannot exist.
 /// claim: CAT-15
 /// defect: D98

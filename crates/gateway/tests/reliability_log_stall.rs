@@ -1,4 +1,4 @@
-//! Reliability: a log pipeline that stops draining stdout must not stall request handling (D263).
+//! Reliability: a log pipeline that stops draining stdout must not stall request handling.
 //!
 //! Run via `mise run test:integration:rs`.
 

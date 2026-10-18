@@ -1,4 +1,4 @@
-//! End-to-end: `item_reference` input items on `/v1/responses` (D175).
+//! End-to-end: `item_reference` input items on `/v1/responses`.
 //!
 //! The Vercel AI SDK's default Responses model sends each earlier assistant text or reasoning item
 //! as `{"type":"item_reference","id":…}` and each tool call in full. A row with no Responses arm

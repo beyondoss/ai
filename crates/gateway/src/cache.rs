@@ -191,9 +191,9 @@ struct Inner {
 impl Inner {
     /// Drop `key` from the map and, only when it was present, from the insertion order.
     ///
-    /// A fill of a key the table has never seen — the common miss — used to walk the whole
-    /// order deque to confirm the absence the map already reports. The scan stays for a
-    /// refresh, which has to move that one entry to the back.
+    /// A fill of a key the table has never seen — the common miss — does not walk the order
+    /// deque to confirm the absence the map already reports. The scan is for a refresh, which has
+    /// to move that one entry to the back.
     fn remove_key(&mut self, key: &CacheKey) {
         if self.map.remove(key).is_none() {
             return;

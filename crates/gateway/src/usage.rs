@@ -807,7 +807,7 @@ pub fn openai_stream(sse: &[u8]) -> Option<Usage> {
         }
     }
     // SSE lets one event carry its data on several `data:` lines, joined with `\n` (JSON
-    // whitespace), and a spec-following client joins them (D126). Only when some usage line did
+    // whitespace), and a spec-following client joins them. Only when some usage line did
     // not parse alone are the events read whole, so a stream written one line per event (OpenAI's,
     // every one measured) never pays for it.
     if broken {
@@ -969,8 +969,8 @@ pub fn anthropic_stream_parts(parts: &[&[u8]]) -> Option<Usage> {
             broken |= !anthropic_apply(&mut usage, &mut saw_any, line);
         }
     }
-    // The slow path re-reads every event in order, since each field is assigned in stream order
-    // (D126). A head or tail cut mid-event also lands here, and bills what the fast path did.
+    // The slow path re-reads every event in order, since each field is assigned in stream order.
+    // A head or tail cut mid-event also lands here, and bills what the fast path did.
     if broken {
         usage = Usage::default();
         saw_any = false;
@@ -1180,7 +1180,7 @@ static KEY_TRIE: ([[u8; 26]; KEY_NODES], [bool; KEY_NODES]) = {
 ///
 /// Only the string **values** of [`TEXT_KEYS`] are text. Keys, numbers, the JSON structure, the
 /// model id and every other parameter are envelope. Counting them is what put a 24-token prompt's
-/// estimate at 40 (D99): on a short prompt the envelope outweighs the prompt. Binary payloads (an
+/// estimate at 40: on a short prompt the envelope outweighs the prompt. Binary payloads (an
 /// inline image's base64, ~1 MB for ~1–2K tokens) are skipped the same way, as values of keys that
 /// are not text.
 ///
@@ -1840,7 +1840,7 @@ mod tests {
         }
     }
 
-    /// The fault trials' prompt (D99): gpt-4o-mini reports 24 prompt tokens for it, Claude 25. The
+    /// The fault trials' prompt: gpt-4o-mini reports 24 prompt tokens for it, Claude 25. The
     /// estimate counts the prompt and the role on every wire, never the envelope around them.
     #[test]
     fn input_estimate_ignores_the_envelope() {
@@ -2302,7 +2302,7 @@ mod tests {
             assert_eq!(anthropic_stream(&sse).unwrap(), expected);
         }
 
-        // ...and the tail *alone* is exactly what used to be wrong, which is what makes the head
+        // ...and the tail *alone* is exactly what would be wrong, which is what makes the head
         // load-bearing rather than belt-and-braces.
         let big = anthropic_sse(5000);
         let tail_only = anthropic_stream(&big[big.len() - TAIL..]).unwrap();
@@ -2703,7 +2703,7 @@ mod tests {
 
     #[test]
     fn anthropic_shaped_body_via_openai_parser_returns_none() {
-        // Task #30: a config-added provider left at the default OpenAI dialect (e.g. MiniMax,
+        // A config-added provider left at the default OpenAI dialect (e.g. MiniMax,
         // Kimi-Coding — real Anthropic-wire vendors) feeds an Anthropic-shaped `usage` object into
         // `openai_body`/`openai_stream`. Before this fix, `OpenAiUsage`'s `#[serde(default)]` fields
         // all silently defaulted to zero and the parser returned `Some(Usage::default())` — a
@@ -2745,7 +2745,7 @@ mod tests {
 
     #[test]
     fn openai_completions_reasoning_tokens_captured() {
-        // Task #33: `completion_tokens_details.reasoning_tokens` on the chat/completions wire.
+        // `completion_tokens_details.reasoning_tokens` on the chat/completions wire.
         let body = br#"{"usage":{"prompt_tokens":12,"completion_tokens":34,
             "completion_tokens_details":{"reasoning_tokens":21}}}"#;
         assert_eq!(openai_body(body).unwrap().reasoning_tokens, Some(21));
@@ -2757,7 +2757,7 @@ mod tests {
 
     #[test]
     fn openai_responses_reasoning_tokens_captured() {
-        // Task #33: `output_tokens_details.reasoning_tokens` on the Responses wire (nested envelope).
+        // `output_tokens_details.reasoning_tokens` on the Responses wire (nested envelope).
         let sse = b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\
                     \"usage\":{\"input_tokens\":50,\"output_tokens\":20,\
                     \"output_tokens_details\":{\"reasoning_tokens\":15}}}}\n\n";
@@ -2809,7 +2809,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":4,\"server_tool_u
 
     #[test]
     fn anthropic_reasoning_tokens_captured() {
-        // Task #33: Anthropic reports thinking tokens in `output_tokens_details.thinking_tokens` on
+        // Anthropic reports thinking tokens in `output_tokens_details.thinking_tokens` on
         // the final `message_delta` usage update (the SDK's own `Usage` type omits this field —
         // pi reads it via a narrow cast; the gateway parses the wire JSON directly, so no cast needed).
         let body = br#"{"usage":{"input_tokens":100,"output_tokens":50,
@@ -3250,7 +3250,7 @@ data: [DONE]\n\n";
     }
 
     /// OpenRouter's cache writes on its Responses mount are metered from a non-stream body, as
-    /// they are on its Chat mount (D21).
+    /// they are on its Chat mount.
     /// claim: BIL-8
     #[test]
     fn a_responses_body_reads_cache_write_tokens() {
@@ -3390,7 +3390,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":40}}\n\n";
     }
 
     /// A stream's last event is read even when no blank line ends it, on the slow path that reads
-    /// an event's `data:` lines joined (D126).
+    /// an event's `data:` lines joined.
     /// claim: BIL-1
     #[test]
     fn a_final_multi_line_event_without_a_blank_line_still_bills() {

@@ -420,8 +420,8 @@ async fn reject_roundtrip(s: &Stack) {
 fn bench_e2e(c: &mut Criterion) {
     let rt = Runtime::new().expect("tokio runtime");
     let stack = rt.block_on(start_stack());
-    // A second stack whose mock streams SSE. `Mode::Sse` is a *three-line* canned stream, so despite
-    // what this comment used to claim it does not exercise the response tap's bounded window at all
+    // A second stack whose mock streams SSE. `Mode::Sse` is a *three-line* canned stream, so it
+    // does not exercise the response tap's bounded window at all
     // — the tail never fills, nothing is ever evicted, and the usage parser sees two `data:` lines.
     // It is kept as the cheap "is a stream slower than a body" datapoint; the two `*_large_sse_*`
     // stacks below are what actually cover the tap.

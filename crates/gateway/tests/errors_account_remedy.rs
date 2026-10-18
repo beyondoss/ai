@@ -11,7 +11,7 @@ mod common;
 use common::*;
 use serde_json::Value;
 
-/// OpenRouter's shared-pool 429 (D156): the upstream host's limit on OpenRouter's own key is
+/// OpenRouter's shared-pool 429: the upstream host's limit on OpenRouter's own key is
 /// spent, and OpenRouter tells the caller to bring its own key.
 const OPENROUTER_SHARED_POOL_429: &str = r#"{"error":{"message":"mistralai/mistral-large-2512 is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations","code":429,"metadata":{"raw":"mistralai/mistral-large-2512 is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations","provider_name":"Mistral","is_byok":false,"limit_source":"upstream_provider_shared_pool","remedy_hint":"Add your own key at https://openrouter.ai/settings/integrations"}},"user_id":"user_mock"}"#;
 

@@ -381,7 +381,7 @@ fn prop_stream_and_stream_options_match_serde() {
             return Ok(());
         }
         if scan.stream_options_ambiguous {
-            // A duplicate or escaped `stream_options` (D88): the gateway removes every member that
+            // A duplicate or escaped `stream_options`: the gateway removes every member that
             // decodes to it and injects the one that counts. What the provider then reads is the
             // client's body with usage on.
             let mut buf = b.text.clone().into_bytes();

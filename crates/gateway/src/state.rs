@@ -62,7 +62,7 @@ type DnsAnswer = Option<LookupResult<Arc<[SocketAddr]>>>;
 
 type LookupResult<T> = std::result::Result<T, Arc<std::io::Error>>;
 
-/// The DNS cache, and the lookups in flight for it (D89).
+/// The DNS cache, and the lookups in flight for it.
 #[derive(Default)]
 struct DnsCache {
     entries: ArcSwap<HashMap<String, DnsEntry>>,
@@ -357,7 +357,7 @@ fn index_by_id(
 /// is unkeyed but whose fallback is keyed stays listed: a managed request for it is served by the
 /// fallback. A row none of whose candidates is keyed would only 503 a managed caller, so it is not
 /// advertised (a deployment with no pool keys lists none). Only managed callers get this body: a BYO
-/// caller never uses the catalog, and its listing relays to its own provider (D254).
+/// caller never uses the catalog, and its listing relays to its own provider.
 pub(crate) fn models_list_body(
     by_id: &[Option<Arc<Provider>>; providers::ProviderId::COUNT],
 ) -> bytes::Bytes {
@@ -690,7 +690,7 @@ impl GatewayState {
     /// test can fail or hang the resolver.
     ///
     /// A due refresh never makes a caller wait: the cached answer is served while one background
-    /// lookup runs (D89). Only a caller with nothing servable (cold, or past `DNS_STALE_MAX`) waits,
+    /// lookup runs. Only a caller with nothing servable (cold, or past `DNS_STALE_MAX`) waits,
     /// and concurrent ones share that one lookup and its answer, bounded by `DNS_TIMEOUT`.
     async fn resolve_all<F, Fut>(&self, authority: &str, lookup: F) -> Result<Arc<[SocketAddr]>>
     where
@@ -873,7 +873,7 @@ mod tests {
 
     #[test]
     fn config_added_provider_honors_dialect_and_auth_scheme_overrides() {
-        // Task #30: a config-added Anthropic-wire vendor (MiniMax, MiniMax-CN, Kimi-Coding in the
+        // A config-added Anthropic-wire vendor (MiniMax, MiniMax-CN, Kimi-Coding in the
         // real pi fleet) must be reachable with the correct dialect + auth scheme from config alone —
         // no code change. Before this fix every config-added provider was hardcoded OpenAI+Bearer.
         let config = AiConfig {

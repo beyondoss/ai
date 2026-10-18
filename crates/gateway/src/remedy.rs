@@ -1,16 +1,16 @@
-//! Provider-account remedies in an upstream error (D174), and the out-of-credit answers among
-//! them (D180).
+//! Provider-account remedies in an upstream error, and the out-of-credit answers among
+//! them.
 //!
 //! A provider error reaches the client verbatim — status, type, code, `Retry-After`, message —
 //! except advice about Beyond's own account with that provider: "add your own key", a billing or
 //! settings page, "your credit balance is too low". A gateway client holds no account there and
 //! cannot follow it, and the text names the upstream behind a row and describes Beyond's account
 //! state. Such a message becomes [`RATE_LIMITED`] or [`UNAVAILABLE`] (or [`TOO_LARGE`], for a 429
-//! that says the request alone is over the limit, D196); what a client can act on (a
+//! that says the request alone is over the limit); what a client can act on (a
 //! context overflow, a bad parameter, a content-policy refusal) never carries one of these phrases
 //! and is left alone.
 //!
-//! Two decisions, kept apart because only one of them is shared (D200). Whether the account is
+//! Two decisions, kept apart because only one of them is shared. Whether the account is
 //! **out of credit** ([`Neutralized::unfunded`]) cools Beyond's pool key for every tenant, so it is
 //! read only from what the provider sets and the request cannot: the status, a `code` or `type`,
 //! or a provider's whole sentence ([`unfunded`]). The **message rewrite** is cosmetic and matches
@@ -18,7 +18,7 @@
 //! quote the tenant's own model name or parameter back.
 //!
 //! Run only on a managed error body (status >= 400, JSON, at most [`MAX_BODY`]) by the pool-key
-//! scrub in `proxy.rs`, once, at end of body. A 2xx is never parsed here. A BYO error is the
+//! scrub in `proxy/relay.rs`, once, at end of body. A 2xx is never parsed here. A BYO error is the
 //! caller's own account talking, so it is relayed as sent.
 
 use serde_json::{Map, Value};
@@ -29,7 +29,7 @@ pub const RATE_LIMITED: &str = "The provider is rate-limited upstream; retry lat
 
 /// What an out-of-credit answer, or an account remedy on any other status, reads as. True from
 /// the client's side without describing the account: this provider cannot take the request now,
-/// and the walk sends later requests to the row's next candidate (D180).
+/// and the walk sends later requests to the row's next candidate.
 pub const UNAVAILABLE: &str =
     "The provider cannot serve this request right now; retry later or use another model.";
 
@@ -37,7 +37,7 @@ pub const UNAVAILABLE: &str =
 /// wait admits it (OpenAI's "Request too large for gpt-4.1 ... on tokens per min (TPM): Limit
 /// 1000000, Requested 1101959. The input or output tokens must be reduced in order to run
 /// successfully."): the client must shrink the request, and [`RATE_LIMITED`]'s "retry later"
-/// would send it round the same 429 forever (D196).
+/// would send it round the same 429 forever.
 pub const TOO_LARGE: &str = "The request is larger than the provider's per-minute token limit admits; \
      reduce the input or output tokens. Retrying it unchanged will not succeed.";
 
@@ -56,7 +56,7 @@ pub const MAX_BODY: usize = 64 * 1024;
 /// case-insensitively in the error's strings. **Cosmetic only**: they choose what a message is
 /// rewritten to, and only on an account status ([`account_status`]). They never decide that a key
 /// is out of credit ([`unfunded`] reads structured fields): a provider quotes the request in its
-/// errors, so any of these can arrive in a tenant's own text (D200).
+/// errors, so any of these can arrive in a tenant's own text.
 const REMEDIES: &[&str] = &[
     // OpenAI (Gemini uses the same words): insufficient_quota, and its billing page.
     "check your plan and billing details",
@@ -108,7 +108,7 @@ const OPENROUTER_TOO_COSTLY: &str = "This request requires more credits";
 /// Whether a `402` from `provider` says the account is out of credit by its status alone, as
 /// [`unfunded`] decides from the body: every provider's but OpenRouter's, whose `402` may instead
 /// be one request too large for the balance ([`OPENROUTER_TOO_COSTLY`]). For a catalog walk that
-/// fails over on the response head and so never reads the body (D258).
+/// fails over on the response head and so never reads the body.
 pub fn unfunded_402(provider: providers::ProviderId) -> bool {
     provider != providers::ProviderId::OpenRouter
 }
@@ -120,7 +120,7 @@ const ACCOUNT_METADATA: &[&str] = &["is_byok", "limit_source", "remedy_hint"];
 #[derive(Debug, PartialEq, Eq)]
 pub struct Neutralized {
     pub body: Vec<u8>,
-    /// The provider said the account is out of credit or quota: cool the key (D180). Read from
+    /// The provider said the account is out of credit or quota: cool the key. Read from
     /// structured fields only ([`unfunded`]), never from a phrase.
     pub unfunded: bool,
 }
@@ -152,7 +152,7 @@ pub fn neutralize(body: &[u8], status: u16) -> Option<Neutralized> {
 }
 
 /// Whether a provider error says the account behind the key is out of credit or quota, read from
-/// what the provider sets and the request cannot (D200):
+/// what the provider sets and the request cannot:
 ///
 /// - a `402` (Payment Required: OpenRouter's insufficient credits, DeepSeek's insufficient balance,
 ///   Anthropic's `billing_error`), except OpenRouter's one-request-too-costly answer
@@ -189,7 +189,7 @@ fn unfunded(err: &Map<String, Value>, status: u16) -> bool {
 /// Whether `status` is one on which a provider talks about the account rather than the request: a
 /// refused (401), unfunded (402) or forbidden (403) credential, or a rate limit (429). A remedy
 /// phrase is rewritten only on these. A 400 or 404 is about the request and may quote it ("The
-/// model `X` does not exist"), so a phrase there may be the tenant's own words (D200).
+/// model `X` does not exist"), so a phrase there may be the tenant's own words.
 fn account_status(status: u16) -> bool {
     matches!(status, 401..=403 | 429)
 }
@@ -383,7 +383,7 @@ mod tests {
     }
 
     /// A provider quoting the request: every out-of-credit phrase in a tenant's model name,
-    /// unknown parameter or extra field. Never unfunded (that would cool the shared key, D200), and
+    /// unknown parameter or extra field. Never unfunded (that would cool the shared key), and
     /// on a 400 or 404 never rewritten either. On an account status the phrase still reads as a
     /// remedy (the cosmetic rewrite), but it is not unfunded there either.
     #[test]
@@ -466,7 +466,7 @@ mod tests {
         }
     }
 
-    /// A walk that fails over on a 402 judges it by status and provider (D258): out of credit
+    /// A walk that fails over on a 402 judges it by status and provider: out of credit
     /// everywhere except OpenRouter, the one provider whose 402 can be one request too costly.
     #[test]
     fn only_openrouter_needs_the_body_of_a_402() {

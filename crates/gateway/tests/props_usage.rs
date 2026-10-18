@@ -366,7 +366,7 @@ fn prop_input_tally_ignores_chunking() {
             let body = serde_json::to_vec(&r.body).unwrap();
             let mut whole = InputTally::default();
             whole.feed(&body);
-            // Any chunking, down to a byte at a time (D125).
+            // Any chunking, down to a byte at a time.
             let mut small = InputTally::default();
             for c in chunk(&body, &cuts) {
                 small.feed(&c);

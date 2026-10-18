@@ -181,7 +181,7 @@ async fn a_chunked_body_over_the_cap_is_a_json_413() {
     );
 }
 
-/// Control for D16: a chunked over-cap body on the catalog path (read in full to pick a row) is
+/// Control: a chunked over-cap body on the catalog path (read in full to pick a row) is
 /// already a clean 413.
 /// claim: REL-2, CAT-11
 /// defect: D16

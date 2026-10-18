@@ -280,7 +280,7 @@ fn parse_name_list(raw: &str) -> Option<Vec<String>> {
 
 /// The largest `x-beyond-split` weight: the walk sums at most [`MAX_CANDIDATES`] weights (one per
 /// row slot) into a `u32`, so any header that parses has a sum that fits. A larger weight makes
-/// the header malformed (counted, default order) rather than overflowing the pick (D201). The
+/// the header malformed (counted, default order) rather than overflowing the pick. The
 /// bound is ~536 million, far past any ratio a caller means.
 pub const MAX_SPLIT_WEIGHT: u32 = u32::MAX / MAX_CANDIDATES as u32;
 
@@ -403,7 +403,7 @@ fn permute(
             let mut pick_slot = arms[0].0;
             for &(slot, w) in &arms[..nw as usize] {
                 // Saturating, like `total`: weights handed in past `MAX_SPLIT_WEIGHT` must not
-                // panic the request (D201).
+                // panic the request.
                 acc = acc.saturating_add(w);
                 if r < acc {
                     pick_slot = slot;
@@ -856,7 +856,7 @@ mod tests {
         );
     }
 
-    /// Weights whose sum does not fit a `u32` used to overflow the cumulative pick (`acc += w`),
+    /// Weights whose sum does not fit a `u32` would overflow the cumulative pick (`acc += w`),
     /// which panics in request_filter with overflow checks on (they are, in release). The header
     /// refuses a weight past [`MAX_SPLIT_WEIGHT`] (counted as malformed, the default walk serves),
     /// and the pick itself saturates, so neither the header nor any weights handed to the walk

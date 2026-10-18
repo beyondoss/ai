@@ -1,7 +1,7 @@
-//! End-to-end: `GET`/`HEAD /v1/models` for a BYO caller (D254). A BYO caller never uses the
+//! End-to-end: `GET`/`HEAD /v1/models` for a BYO caller. A BYO caller never uses the
 //! catalog, so its listing is not Beyond's: it relays to the provider its key belongs to (key shape,
 //! then the path's default dialect for an opaque key), with the caller's key, and writes no
-//! `ai.usage` row. A managed caller keeps the boot-built keyed catalog (D250).
+//! `ai.usage` row. A managed caller keeps the boot-built keyed catalog.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

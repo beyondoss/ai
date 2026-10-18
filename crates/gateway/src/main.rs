@@ -80,7 +80,7 @@ fn load_config(path: Option<&Path>) -> ValidConfig {
 /// before.
 ///
 /// Before it exits, the drain writes out the `ai.payload` and diagnostic lines still queued
-/// ([`LogDrains`], D208, D263): `exit` does not wait for the sinks' threads, so a capture of the last
+/// ([`LogDrains`]): `exit` does not wait for the sinks' threads, so a capture of the last
 /// requests was lost silently. `ai.usage` rows need no such step: they are written synchronously.
 struct DrainOnTerm {
     state: Arc<GatewayState>,
@@ -151,7 +151,7 @@ const DRAIN_SETTLE: Duration = Duration::from_millis(200);
 /// queued then is lost, and a warn line says so.
 const LOG_FLUSH: Duration = Duration::from_secs(5);
 
-/// The diagnostic sink's queue, in lines and in bytes (D263). A diagnostic line is a few hundred
+/// The diagnostic sink's queue, in lines and in bytes. A diagnostic line is a few hundred
 /// bytes, so the line bound binds first in practice: ~8 k lines absorb a multi-second stdout stall
 /// at a heavy log rate, and the byte bound caps the odd outsized error string.
 const DIAG_QUEUE_DEPTH: usize = 8192;
@@ -274,7 +274,7 @@ fn init_tracing(
     //  * Everything else — diagnostics, filtered by `AI_LOG`, on a **bounded, lossy** queue drained
     //    by its own thread (the `capture_sink` writer, second instance): a stalled stdout pipe
     //    drops diagnostics (counted on `ai_log_dropped_total`) instead of parking every Tokio
-    //    worker that emits a `warn!` with its request — and its tenant slot — in hand (D263).
+    //    worker that emits a `warn!` with its request — and its tenant slot — in hand.
     //  * `ai.payload` gets a **bounded, lossy** queue drained by its own thread, under `AI_LOG` as
     //    before. A captured payload is orders of magnitude larger and exists only to explain
     //    incidents, so if the log pipeline stalls we drop payloads (counted on

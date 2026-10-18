@@ -3,8 +3,8 @@
 //! A body may be up to `MAX_REQUEST_BODY`, and a catalog walk reads it whole. Each test sends a
 //! body of the shape that costs a `serde_json::Value` the most per byte (many tiny objects) and
 //! reads the gateway's peak resident set (`VmHWM`) before and after: the admission checks must read
-//! such a body by span (D215), and translation, which does build a `Value`, must refuse one it
-//! cannot hold within the memory budget rather than take gigabytes (D216).
+//! such a body by span, and translation, which does build a `Value`, must refuse one it
+//! cannot hold within the memory budget rather than take gigabytes.
 //!
 //! Run via `mise run test:integration:rs` (needs `nats-server` on PATH).
 
@@ -103,7 +103,7 @@ async fn a_huge_responses_history_is_admitted_without_a_dom() {
 
 /// The same for the image gate: an 8 MiB Chat body on a row without image input (deepseek-v4-pro)
 /// whose text says `"image"`. It carries no image part, so it is relayed, and reading it took no
-/// `Value`. (It was o3-mini until that row left the catalog: D243.)
+/// `Value`.
 /// claim: SEC-19
 /// defect: D215
 #[tokio::test]
@@ -156,7 +156,7 @@ async fn a_body_too_costly_to_translate_is_a_413_naming_translation() {
     );
 }
 
-/// The response half of D216: a non-streaming Claude answer whose tool input is 4 MiB of tiny
+/// The response half: a non-streaming Claude answer whose tool input is 4 MiB of tiny
 /// objects, translated for a Chat client, takes the same ~1 GiB of `Value`s. Its heap is held in the
 /// budget like a request's, and it does not fit: the status line is already downstream, so the
 /// response is aborted rather than translated, and the gateway's memory stays where it was.

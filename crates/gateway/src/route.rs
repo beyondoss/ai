@@ -159,8 +159,8 @@ pub fn dialect_default(d: Dialect) -> &'static str {
 ///
 /// Exact, not a prefix: `/v1/messages` is Messages, but `/v1/messages/count_tokens`,
 /// `/v1/responses/{id}` and `/v1/responses/input_tokens` are endpoints the catalog does not serve.
-/// Treating them as their parent used to forward a token count or a retrieve to the candidate's
-/// generation path, where it ran (and billed) as a generation. Under `/auto` the `/v1` is optional
+/// Treated as their parent, a token count or a retrieve would go to the candidate's generation
+/// path, where it runs (and bills) as a generation. Under `/auto` the `/v1` is optional
 /// (`/auto/chat/completions`), and a trailing slash is ignored everywhere.
 pub fn implied_endpoint(path: &str) -> Option<Endpoint> {
     catalog_endpoint(path)
@@ -179,7 +179,7 @@ pub struct EndpointPath {
 
 /// Every endpoint a managed key may reach, and so every one the gateway meters: the one table the
 /// managed allowlist (`proxy::is_managed_provider_endpoint`, a security boundary), the forwarded
-/// wire, the sub-resources and the catalog's endpoint names all read (D209). Read with
+/// wire, the sub-resources and the catalog's endpoint names all read. Read with
 /// [`forward_endpoint`] (a `/{provider}/…` path, by suffix) or [`catalog_endpoint`] (a `/v1` or
 /// `/auto` path, exact), each with one normalisation for its kind of path ([`normalize_endpoint_path`]).
 pub const ENDPOINT_PATHS: [EndpointPath; 7] = [
@@ -416,7 +416,7 @@ pub const CHAT_TOOL_CAP: usize = 128;
 /// Whether a translated (Messages) request on `row` walks the row's Responses arm instead of its
 /// candidates: a row whose primary is Chat Completions and that has a Responses arm (the GPT rows
 /// before 5.4), and a body offering more than [`CHAT_TOOL_CAP`] tools. Chat Completions would refuse
-/// them; the arm is translated onto and takes them (D131). A Chat Completions client keeps its
+/// them; the arm is translated onto and takes them. A Chat Completions client keeps its
 /// own endpoint (a byte relay, OpenAI's own limit and error), and a Responses client already walks
 /// the arm.
 pub fn tools_need_responses_arm(row: &ModelRoute, client: Option<Endpoint>, body: &[u8]) -> bool {
@@ -461,7 +461,7 @@ fn tool_count(body: &[u8]) -> usize {
 /// row whose card lists no tools. The walk answers 400 before any upstream sees it. An image would
 /// otherwise be ignored and an answer about nothing billed (Together's gpt-oss-120b, and o3-mini
 /// before its row left), or fail with a 500 (gpt-4, likewise). Tools would be called with junk arguments by a model the card dropped
-/// them from for that (GLM 5.3 Flash, D197), or refused upstream in each provider's own words. A
+/// them from for that (GLM 5.3 Flash), or refused upstream in each provider's own words. A
 /// PDF on a row without file input is left to the candidate, because OpenRouter extracts a PDF's
 /// text for any model.
 pub fn refused_input(row: &ModelRoute, body: &[u8]) -> Option<&'static str> {
@@ -491,7 +491,7 @@ fn carries_image(body: &[u8]) -> bool {
 /// Whether a content part whose `type` is one of `types` sits anywhere under one of the root
 /// `keys` (the last of each, as a provider's parser keeps it).
 ///
-/// Read by span, never into a `Value` (D215): this runs on catalog-walk bodies up to
+/// Read by span, never into a `Value`: this runs on catalog-walk bodies up to
 /// `MAX_REQUEST_BODY` before any upstream, and a `Value` costs 10-250 bytes of heap per byte of
 /// JSON. The gate is each type name as a quoted string (`quoted`, the same names in quotes): prose
 /// that mentions an image or a file never spells one, since a quote inside a JSON string is
@@ -552,7 +552,7 @@ pub fn unserved(arms: &[Candidate], body: &[u8]) -> u8 {
     out
 }
 
-/// How a request asks for Anthropic fast mode, in its client's own API (D266).
+/// How a request asks for Anthropic fast mode, in its client's own API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpeedAsk {
     /// Nothing asked, or the default speed.
@@ -636,8 +636,8 @@ fn carries_file(body: &[u8]) -> bool {
 ///
 /// Hygiene note: a `HeaderValue` is not zeroized on drop, so this is one long-lived plaintext copy
 /// of the pool key. That is a net *improvement* — `secret.rs` already concedes the key is "copied
-/// into Pingora's request headers we don't own", and previously that copy was made and freed
-/// thousands of times a second, scattering key bytes across the heap. The `Secret` is kept for the
+/// into Pingora's request headers we don't own", and made per request that copy would be made
+/// and freed thousands of times a second, scattering key bytes across the heap. The `Secret` is kept for the
 /// redacting `Debug`.
 pub struct PoolAuth {
     pub value: Secret,
@@ -647,10 +647,10 @@ pub struct PoolAuth {
     /// Searchers for [`Self::key`] ([`key_finders`]: the key itself first, then the spellings a JSON
     /// encoder may give it), built once at boot: every managed error response is scanned for an
     /// echo of the key (`proxy::Redact`), and building a searcher per response repeated the key's
-    /// preprocessing on each one (D92). Each holds a copy of the key, like `header`.
+    /// preprocessing on each one. Each holds a copy of the key, like `header`.
     finders: Box<[memchr::memmem::Finder<'static>]>,
-    /// When this key's last refusal (a 401, a 403 naming the key, or an out-of-credit answer:
-    /// D180) cools off, in ms since [`clock_ms`]'s epoch; 0 when it has none. A cooling key is
+    /// When this key's last refusal (a 401, a 403 naming the key, or an out-of-credit answer)
+    /// cools off, in ms since [`clock_ms`]'s epoch; 0 when it has none. A cooling key is
     /// skipped as a request's *first* key, and a provider whose keys all cool is skipped by a
     /// catalog walk that has another candidate ([`Provider::cooling`]), so traffic stops paying a
     /// round trip to a revoked or unfunded key on every request. Shared across requests; relaxed
@@ -658,7 +658,7 @@ pub struct PoolAuth {
     bad_until_ms: AtomicU64,
     /// OpenRouter `402`s on this key whose cause went unread (a catalog walk failed over on the
     /// head, so the body never said whether the account is empty or one request was too costly)
-    /// since its last 2xx or cooldown: [`OPENROUTER_402_STRIKES`] in a row cool it (D261). Zero
+    /// since its last 2xx or cooldown: [`OPENROUTER_402_STRIKES`] in a row cool it. Zero
     /// on every other provider's keys. Relaxed, like `bad_until_ms`.
     unread_402s: AtomicU32,
 }
@@ -688,7 +688,7 @@ impl PoolAuth {
 /// Searchers for every spelling of `key` an upstream echo may use: the key as sent first, then, for
 /// a key holding `/` or `+` (a Bedrock `ABSK…` key is base64), the spellings a JSON encoder writes
 /// them in: `\/` for `/`, and `+` or `+` for `+` (one encoder writes every occurrence
-/// the same way). A JSON client decodes each of those to the key, so each is scrubbed (D203). Never
+/// the same way). A JSON client decodes each of those to the key, so each is scrubbed. Never
 /// empty: an empty key yields one empty searcher, which the scrub skips.
 pub fn key_finders(key: &str) -> Box<[memchr::memmem::Finder<'static>]> {
     let slashes: &[&str] = if key.contains('/') {
@@ -721,7 +721,7 @@ pub fn key_finders(key: &str) -> Box<[memchr::memmem::Finder<'static>]> {
 pub const KEY_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// How many OpenRouter `402`s in a row, unread and with no 2xx from the key between them, cool the
-/// key as out of credit (D261). A `402` that is one request too costly for a funded account is
+/// key as out of credit. A `402` that is one request too costly for a funded account is
 /// that request's, so a success soon resets the count; an empty account answers every request so.
 pub const OPENROUTER_402_STRIKES: u32 = 3;
 
@@ -800,7 +800,7 @@ impl Provider {
     }
 
     /// Whether every pool key is cooling off from a refusal (see [`Self::mark_key_bad`]). A catalog
-    /// walk leaves such a provider out while another candidate can take the request (D180).
+    /// walk leaves such a provider out while another candidate can take the request.
     pub fn cooling(&self) -> bool {
         let now = clock_ms();
         !self.pool_auth.is_empty() && self.pool_auth.iter().all(|k| k.cooling(now))
@@ -818,7 +818,7 @@ impl Provider {
         }
     }
 
-    /// Count an OpenRouter `402` on pool key `i` whose body went unread (D261): whether it is the
+    /// Count an OpenRouter `402` on pool key `i` whose body went unread: whether it is the
     /// [`OPENROUTER_402_STRIKES`]th in a row, which cools the key (the caller does, through the
     /// usual out-of-credit path). Exactly one of any concurrent strikes past the threshold
     /// answers `true`, and a key already cooling does not count the `402`s of requests sent
@@ -833,7 +833,7 @@ impl Provider {
         })
     }
 
-    /// Pool key `i` answered a 2xx: its account pays, so forget its unread `402`s (D261). A load
+    /// Pool key `i` answered a 2xx: its account pays, so forget its unread `402`s. A load
     /// and nothing else on the common path, where the count is already zero.
     pub fn key_served(&self, i: u8) {
         if let Some(k) = self.pool_auth.get(usize::from(i))
@@ -975,9 +975,9 @@ mod tests {
         assert!(is_default_prefix("/v1/"));
         assert!(is_default_prefix("/v1/messages"));
         assert!(is_default_prefix("/v1/chat/completions"));
-        // Task #7 (pi-parity): Google Gemini's real path shape must NOT be absorbed by a raw
-        // `starts_with("/v1")` — before this fix it fell into the bare-default branch, which
-        // routes anything that isn't `/v1/messages*` to OpenAI, silently misrouting Gemini.
+        // Google Gemini's real path shape must NOT be absorbed by a raw `starts_with("/v1")`:
+        // the bare-default branch routes anything that isn't `/v1/messages*` to OpenAI, which
+        // would silently misroute Gemini.
         assert!(!is_default_prefix(
             "/v1beta/models/gemini-2.5-pro:generateContent"
         ));
@@ -1125,13 +1125,13 @@ mod tests {
                 "{path}"
             );
         }
-        // A named path the catalog does not serve is a 400 even on a same-wire row. It used to
-        // relay, which sent the body to the row's chat path.
+        // A named path the catalog does not serve is a 400 even on a same-wire row: a relay
+        // would send the body to the row's chat path.
         assert_eq!(
             catalog_wire_action("/v1/moderations", Endpoint::ChatCompletions),
             WireAction::Reject
         );
-        // `/auto` without `/v1` used to slip past the check (and `/auto/responses` too).
+        // `/auto` without `/v1` is held to the check (and `/auto/responses` too).
         assert_eq!(
             catalog_wire_action("/auto/embeddings", Endpoint::ChatCompletions),
             WireAction::Reject
@@ -1394,7 +1394,7 @@ mod tests {
     }
 
     /// The [`OPENROUTER_402_STRIKES`]th unread 402 in a row cools the key, a 2xx between them
-    /// starts the count over, and the count is per key (D261).
+    /// starts the count over, and the count is per key.
     #[test]
     fn unread_402s_in_a_row_cool_only_their_own_key() {
         let p = openrouter(&["sk-a", "sk-b"]);
@@ -1419,7 +1419,7 @@ mod tests {
     }
 
     /// A cooling key does not count the 402s of requests sent before it cooled; once its cooldown
-    /// passes it needs a full run again (D261).
+    /// passes it needs a full run again.
     #[test]
     fn a_cooled_key_counts_afresh_once_its_cooldown_has_passed() {
         let p = openrouter(&["sk-a", "sk-b"]);
@@ -1511,7 +1511,7 @@ mod tests {
 
     #[test]
     fn resolve_azure_config_added_provider_uses_bare_api_key_header() {
-        // Task #8 (pi-parity): a config-added Azure provider (`provider_auth_schemes.azure =
+        // A config-added Azure provider (`provider_auth_schemes.azure =
         // "api-key"`) must produce a bare key (no `Bearer`) as the managed auth value, sent in
         // `api-key` — matching Azure's real wire (see `AuthScheme::ApiKey`'s doc comment).
         let azure = Provider::resolve(
@@ -1609,7 +1609,7 @@ mod tests {
     }
 
     /// A row with a fast-mode candidate reads the body on a header-won walk, which may ask for
-    /// fast mode; one with none does not on that account (D266).
+    /// fast mode; one with none does not on that account.
     /// claim: CAT-6
     /// defect: D266
     #[test]
@@ -1621,7 +1621,7 @@ mod tests {
 
     /// Each client asks for fast mode in its own API's words: Messages `speed: "fast"`, Chat
     /// Completions and Responses `service_tier: "priority"`, the last root member of each, escaped
-    /// or not. A nested one, another value, or the other API's field asks nothing (D266).
+    /// or not. A nested one, another value, or the other API's field asks nothing.
     /// claim: CAT-6
     /// defect: D266
     #[test]
@@ -1663,7 +1663,7 @@ mod tests {
     }
 
     /// Only direct Anthropic serves fast mode: on Opus 4.8 the Bedrock and OpenRouter candidates
-    /// are left out of a fast request's walk, and on Sonnet 5.5 every candidate is (D266).
+    /// are left out of a fast request's walk, and on Sonnet 5.5 every candidate is.
     /// claim: CAT-6
     /// defect: D266
     #[test]

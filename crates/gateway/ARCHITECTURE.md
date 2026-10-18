@@ -47,7 +47,7 @@ published `beyond-slipstream` — clones, CI-builds, and publishes anywhere.
 ```
 Client (stock OpenAI/Anthropic SDK)
   │
-  ▼  request_filter (proxy.rs)
+  ▼  request_filter (proxy/hooks.rs → the phases in proxy/phases.rs)
   │  ├─ Route: first segment → provider row (authority, dialect, auth scheme)
   │  │    `/{provider}/…` is the escape hatch (no walk; a managed key: catalog models only, D267)
   │  │    …or `/auto` / managed `/v1` → x-beyond-model if present, else body's root `model`
@@ -99,7 +99,7 @@ Client (stock OpenAI/Anthropic SDK)
   │  └─ Circuit breaker (per provider, all traffic): if OPEN ─────► 503
   │       (claims a half-open probe permit only on an actual attempt)
   │
-  ▼  upstream_peer (proxy.rs)   — runs once per attempt, before any body byte
+  ▼  upstream_peer (proxy/hooks.rs)   — runs once per attempt, before any body byte
   │  Start a fresh `Attempt` (a retry replays bytes through the body filter)
   │  The retry the triggering hook declared: `SameLeg` stays on this provider, keeping its
   │    permit; `NextCandidate` resolves the outgoing candidate's permit as a failure
@@ -112,7 +112,7 @@ Client (stock OpenAI/Anthropic SDK)
   │  DNS fail ──────────────────────────────────────────────────── 502
   │  TCP connect fail (retry 2× same peer, or next candidate) ──── 502
   │
-  ▼  upstream_request_filter (proxy.rs)
+  ▼  upstream_request_filter (proxy/hooks.rs)
   │  Managed: remove every static-key header (authorization, x-api-key, api-key,
   │    x-goog-api-key; every repeat) UNCONDITIONALLY → inject the pool key in the
   │    provider's own scheme (never provider A's key on provider B); every `key` query
@@ -128,7 +128,7 @@ Client (stock OpenAI/Anthropic SDK)
   │    own catalog path for a catalog walk (`/auto`, managed `/v1`)
   │  OpenRouter + managed only: dashboard-attribution headers (HTTP-Referer, X-OpenRouter-*)
   │
-  ▼  request_body_filter (proxy.rs)  — streamed through, except where a rewrite or a refusal check
+  ▼  request_body_filter (proxy/hooks.rs)  — streamed through, except where a rewrite or a refusal check
   │    needs the whole body
   │  Enforce running size cap (chunked-safe) ──────────────────── 413
   │  Capturing: copy chunk into the head-bounded request buffer — PRE-rewrite, so the
@@ -161,7 +161,7 @@ Client (stock OpenAI/Anthropic SDK)
   │
   ▼  Provider upstream  (OpenAI / Anthropic / Groq / DeepSeek / …)
   │
-  ▼  response_filter (proxy.rs)
+  ▼  response_filter (proxy/hooks.rs)
   │  Record TTFT; detect streaming (Content-Type: text/event-stream)
   │  Count upstream response by provider + status class
   │  Drop any upstream x-beyond-* header, then set x-beyond-request-id, x-beyond-provider,
@@ -172,7 +172,7 @@ Client (stock OpenAI/Anthropic SDK)
   │  Translate walk, or a same-endpoint catalog error (re-encoded into the client's
   │    envelope when it is another vendor's shape): drop Content-Length (body length will change)
   │
-  ▼  response_body_filter (proxy.rs)  — response relayed chunk-by-chunk; SSE is never fully buffered
+  ▼  response_body_filter (proxy/hooks.rs)  — response relayed chunk-by-chunk; SSE is never fully buffered
   │  Managed >= 400, first (`Redact`): overwrite the pool key with `[redacted]***` (same
   │    length), holding back a key-sized tail per chunk to catch a split key. A JSON error
   │    (<= 64 KiB) is held whole instead and, once masked, has any provider-account remedy
@@ -202,12 +202,12 @@ Client (stock OpenAI/Anthropic SDK)
   │    only on a complete 2xx; client abort, 4xx/5xx, truncation → do not store.
   │    On a translate walk the tap is the *client* bytes (post-translate).
   │
-  ▼  logging (proxy.rs)
+  ▼  logging (proxy/hooks.rs)
      Parse usage from tail: usage::body / usage::stream on (dialect, framing)
      Managed 2xx stream cut short before its usage block (client cancel / upstream death), or a
        non-stream 2xx without usage that is not an error object (D195):
        estimate the missing side from the request tally + relayed events → usage_estimated
-     Emit ai.usage fact: tenant, vpc, key_id, model, requested_model, routed_model, price_model,
+     Emit ai.usage fact (`billing::emit`, from the finished `Ending`): tenant, vpc, key_id, model, requested_model, routed_model, price_model,
        token counts + usage_wire + reasoning / 1h-cache-write / server-tool / service-tier
        breakouts, requested vs served tier / speed / geo, server tools by kind, the serving
        endpoint and its price variant, the vendor's ids and own cost, estimate parts,
@@ -2085,7 +2085,7 @@ target `ai.usage`, written as one JSON line whose fields are under `fields`. A f
 value is **absent**, never `null`. Types below are JSON types. Token counts are integers.
 
 The pricer reads the same facts as typed values at emission (`usage::Usage::pricer_row`, and the
-locals `logging` names), so a pricer called in the gateway gets the numbers, not their log text:
+locals `billing::emit` names), so a pricer called in the gateway gets the numbers, not their log text:
 `server_tools` as counts (`ToolCounts` from `ServerTools`), the reported costs as exact
 attodollars from their 1e-10 USD integers, and `service_tier`, `speed` and `inference_geo` read
 once into `pricing::Tier`, `Speed` and `Geo`. The logged fields are written from the same values,
@@ -3585,7 +3585,7 @@ long-context pricing, `mcp-client-*`, `code-execution-*` and `files-api-*` reach
 and storage on Beyond's account, and `oauth-*` means nothing beside a pool API key. The gateway's
 own beta for a translated walk (block binding, or fast mode for a priority request) is merged in
 after the filter, so it is never dropped. Adding a token is a one-line change to
-`MANAGED_ANTHROPIC_BETAS` in `proxy.rs`.
+`MANAGED_ANTHROPIC_BETAS` in `proxy/headers.rs`.
 
 Dropped, among others: `openai-organization` and `openai-project` (they switch the org or project the
 pool key bills to, and an SDK user with `OPENAI_ORG_ID` set got a 401), `cookie`,
@@ -3905,48 +3905,57 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 
 ## Modules
 
-| Module            | Role                                                                                                                                                                           | Tested         |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------- |
-| `proxy`           | `ProxyHttp` impl — request/response pipeline (request_filter through logging)                                                                                                  | e2e ✓          |
-| `key`             | `bai_v1` / `bai_v2` (explicit `key_id`) parse + Ed25519 verify; multi-kid keyring, built whole; reference `mint` only under the `mint` feature (dev targets only)              | unit ✓         |
-| `route`           | Data-driven provider table (name / authority / auth) + dialect default + model-route re-exports                                                                                | unit ✓         |
-| `peek`            | `ModelScanner` — streaming structural scan for the root-level `model`; O(1) memory                                                                                             | unit ✓         |
-| `rewrite`         | `ScannedBody`: a buffered body and its scan as one value; every edit moves the scan's offsets, so none outlives the edit it predates                                           | unit ✓ + e2e ✓ |
-| `lex`             | The one JSON lexer behind every walker that reads JSON unparsed: resumable string / escape / depth state (`memchr2` in strings), strict string decoding                        | unit ✓         |
-| `usage`           | Token extraction (OpenAI / Anthropic, body + SSE)                                                                                                                              | unit ✓         |
-| `usage/vendor`    | Billing facts beyond tokens: `ServerTools` (server-side tool use by kind), served speed and geography, `Upstream` (the vendor's own ids and price); lenient per value          | unit ✓ + e2e ✓ |
-| `usage/tools`     | `ToolTally`: hosted-tool calls in an OpenAI Responses answer, counted chunk by chunk (`memmem` for `_call"` + structural check, bounded carry), since `usage` has none         | unit ✓ + e2e ✓ |
-| `body_rules`      | The body refusal rules in one precedence order (`Rule::ORDER`), each declaring the points it applies at; read extracted `Facts`, never bytes                                   | unit ✓ + e2e ✓ |
-| `refusal`         | `Refusal`: every gateway-made refusal as one closed type (status, type, message, compile-time body, metric label, `Retry-After`), carried through pingora as an error's cause  | unit ✓ + e2e ✓ |
-| `unpriced`        | Managed-request refusal (400, before the body goes upstream) of features a provider bills outside metered usage (`code_interpreter`, `image_generation`, …); BYO never checked | unit ✓ + e2e ✓ |
-| `terminal`        | Whether the bytes sent to a client end with the stream's terminal event (`[DONE]`, `message_stop`, `response.completed`)                                                       | unit ✓ + e2e ✓ |
-| `deny`            | Sparse deny-set, default-allow, reason → HTTP status                                                                                                                           | unit ✓         |
-| `allowance`       | Sparse remaining-ok / exhausted set; fail-closed until seeded (503); 402 when exhausted                                                                                        | unit ✓ + e2e ✓ |
-| `capture`         | Sparse capture-set (default-off) + head-bounded `CaptureBufs` and 1-in-N sampling                                                                                              | unit ✓ + e2e ✓ |
-| `retry`           | `retry::decide`: whether a failed attempt is retried and how (`Retry`, `RelayRetry`); never resends a body the provider may have unless it proved it unprocessed               | unit ✓ + e2e ✓ |
-| `remedy`          | Provider-account remedies in a managed error: the neutral rewrite (D174, D196) and the structured out-of-credit verdict that cools a key (D180, D200)                          | unit ✓ + e2e ✓ |
-| `capture_sink`    | Bounded (lines and bytes), lossy writer for `ai.payload` and diagnostics — drops on a full queue so a stalled log sink can't backpressure                                      | unit ✓, e2e ✓  |
-| `usage_file`      | Blocking, lossless `ai.usage` writer to hourly `.jsonl` files (`AI_USAGE_DIR`): rotation, 48 h retention, 1 s fdatasync, one writer per file                                   | unit ✓, e2e ✓  |
-| `control`         | `x-beyond-*` header parse/validate; metadata canonicalized and re-serialized; catalog walk permute (`order` / `only` / `split`)                                                | unit ✓ + e2e ✓ |
-| `translate`       | Chat Completions ↔ Messages ↔ Responses mapping for a catalog endpoint mismatch; SSE event-by-event                                                                            | unit ✓ + e2e ✓ |
-| `pin`             | Computed session pin: the order of a managed default walk; a pure function of the caller and the row                                                                           | unit ✓ + e2e ✓ |
-| `cache`           | Per-pod exact-match response store (TTL + max entries + max bytes/entry); tap, never a buffer; miss does not consult Redis                                                     | unit ✓ + e2e ✓ |
-| `concurrency`     | Per-tenant in-flight cap (`tenant_max_in_flight`): sharded, sparse, exact counters; the overspend bound                                                                        | unit ✓ + e2e ✓ |
-| `deadline`        | Request deadline clock (`request_max_secs`): a coarse clock a ticker thread advances each second; a per-chunk check is one atomic load                                         | unit ✓ + e2e ✓ |
-| `drain`           | Drain-on-cancel: arms pingora's keep-reading-after-a-downstream-error path (cache `Bypass` on a no-op storage) so a cancelled stream settles to the vendor's usage             | unit ✓ + e2e ✓ |
-| `ratelimit`       | Two-tier guardrail: per-credential (count-min sketch, fixed memory, no GC) + global BYO (one atomic)                                                                           | unit ✓         |
-| `circuit_breaker` | Per-provider lock-free breaker (packed `AtomicU64`, windowed policy) — trips on 5xx/connect, not 429                                                                           | unit ✓ + e2e ✓ |
-| `state`           | Keyring + provider registry + watched deny-/allowance-/capture-sets (ArcSwap) + TTL DNS cache (all addresses, serve-stale)                                                     | unit ✓         |
-| `store_watch`     | Generic `WatchedSet` driver — gap-free seeding + delta watch, instantiated per set                                                                                             | unit ✓ + e2e ✓ |
-| `config`          | Figment config; build keyring; pool keys / authorities by provider name                                                                                                        | unit ✓         |
-| `secret`          | Redacting, zeroize-on-drop `Secret<T>` newtype for pool keys and NATS creds                                                                                                    | unit ✓         |
-| `signed_id`       | Tenant-bound Responses ids: provider ids HMAC-signed for the tenant out, verified and stripped in; no state; `SignerError` for bad id signing keys                             | unit ✓ + e2e ✓ |
-| `admin`           | `ServeHttp` on the metrics listener: `/livez`, `/readyz`, `/metrics`                                                                                                           | unit ✓ + e2e ✓ |
-| `metrics`         | Prometheus counter/histogram/gauge registration and update helpers                                                                                                             | unit ✓         |
-| `doctor`          | Boot-time diagnostics (`beyond-ai doctor`)                                                                                                                                     | unit ✓         |
-| `error`           | `GatewayError` (`Config` / `Store` / `Dns` with its `io::Error` source) and `ConfigError`, one variant per boot check; each message is operator-facing text, kept verbatim     | unit ✓         |
-| `lib`             | Library root: modules crate-private; re-exports what `main` wires, hidden `__test` / `__bench` facades for dev targets; test-only clippy allowances                            | compile ✓      |
-| `main`            | CLI (`run` / `doctor`), rustls init, config load, Pingora server + proxy/watchers/admin bootstrap                                                                              | compile ✓      |
+| Module            | Role                                                                                                                                                                                                                                                         | Tested         |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------- |
+| `proxy`           | Module root: the request context (`RequestCtx`, `Ctx`/`Held`, `Leg`, `Attempt`, `ModelRouting`) the path helpers every phase reads, and `admitted`: a hook past admission errors, never no-ops, without its context                                          | e2e ✓          |
+| `proxy/hooks`     | `ProxyHttp` impl: the pipeline from `request_filter` through `logging`, in pingora's call order                                                                                                                                                              | e2e ✓          |
+| `proxy/phases`    | `request_filter` as named phases in precedence order (`route` → `authenticate` → `admit` → `managed_endpoint` → `read_body` → `dispatch`), each returning its decision (`Route`, `Admission`, `Plan`/`Walk`, `Admitted`) or a `Refusal` that one site writes | unit ✓ + e2e ✓ |
+| `proxy/billing`   | Who pays (`Billing`), the facts a row is built from (`EndFacts` → `Ending`), its model names (`Models`), and `emit`: prices and writes the `ai.usage` row `logging` hands it                                                                                 | unit ✓ + e2e ✓ |
+| `proxy/full_body` | The up-front body read (`peek_body_model`) and the `FullBody` subrequest that re-runs a body past pingora's retry buffer                                                                                                                                     | unit ✓ + e2e ✓ |
+| `proxy/headers`   | Credential extraction (`extract_virtual_key`, `?key=`), BYO credential dialect, and the managed header allowlists                                                                                                                                            | unit ✓ + e2e ✓ |
+| `proxy/relay`     | Response relay helpers: the pool-key scrub (`Redact`) and drain-on-cancel bookkeeping                                                                                                                                                                        | unit ✓ + e2e ✓ |
+| `proxy/replies`   | Bodies the gateway writes itself: refusals (`refuse`, rate-capped log line), failures (`FAILURES`), the models list, a cache hit                                                                                                                             | unit ✓ + e2e ✓ |
+| `proxy/serving`   | What a catalog walk's serving candidate changes: dialect, `stream_options` eligibility, translation and relay predicates                                                                                                                                     | unit ✓ + e2e ✓ |
+| `proxy/upstream`  | The upstream attempt: peer build, deadline cap, how an attempt failed, a pool key's health and cooling                                                                                                                                                       | unit ✓ + e2e ✓ |
+| `key`             | `bai_v1` / `bai_v2` (explicit `key_id`) parse + Ed25519 verify; multi-kid keyring, built whole; reference `mint` only under the `mint` feature (dev targets only)                                                                                            | unit ✓         |
+| `route`           | Data-driven provider table (name / authority / auth) + dialect default + model-route re-exports                                                                                                                                                              | unit ✓         |
+| `peek`            | `ModelScanner` — streaming structural scan for the root-level `model`; O(1) memory                                                                                                                                                                           | unit ✓         |
+| `rewrite`         | `ScannedBody`: a buffered body and its scan as one value; every edit moves the scan's offsets, so none outlives the edit it predates                                                                                                                         | unit ✓ + e2e ✓ |
+| `lex`             | The one JSON lexer behind every walker that reads JSON unparsed: resumable string / escape / depth state (`memchr2` in strings), strict string decoding                                                                                                      | unit ✓         |
+| `usage`           | Token extraction (OpenAI / Anthropic, body + SSE)                                                                                                                                                                                                            | unit ✓         |
+| `usage/vendor`    | Billing facts beyond tokens: `ServerTools` (server-side tool use by kind), served speed and geography, `Upstream` (the vendor's own ids and price); lenient per value                                                                                        | unit ✓ + e2e ✓ |
+| `usage/tools`     | `ToolTally`: hosted-tool calls in an OpenAI Responses answer, counted chunk by chunk (`memmem` for `_call"` + structural check, bounded carry), since `usage` has none                                                                                       | unit ✓ + e2e ✓ |
+| `body_rules`      | The body refusal rules in one precedence order (`Rule::ORDER`), each declaring the points it applies at; read extracted `Facts`, never bytes                                                                                                                 | unit ✓ + e2e ✓ |
+| `refusal`         | `Refusal`: every gateway-made refusal as one closed type (status, type, message, compile-time body, metric label, `Retry-After`), carried through pingora as an error's cause                                                                                | unit ✓ + e2e ✓ |
+| `unpriced`        | Managed-request refusal (400, before the body goes upstream) of features a provider bills outside metered usage (`code_interpreter`, `image_generation`, …); BYO never checked                                                                               | unit ✓ + e2e ✓ |
+| `terminal`        | Whether the bytes sent to a client end with the stream's terminal event (`[DONE]`, `message_stop`, `response.completed`)                                                                                                                                     | unit ✓ + e2e ✓ |
+| `deny`            | Sparse deny-set, default-allow, reason → HTTP status                                                                                                                                                                                                         | unit ✓         |
+| `allowance`       | Sparse remaining-ok / exhausted set; fail-closed until seeded (503); 402 when exhausted                                                                                                                                                                      | unit ✓ + e2e ✓ |
+| `capture`         | Sparse capture-set (default-off) + head-bounded `CaptureBufs` and 1-in-N sampling                                                                                                                                                                            | unit ✓ + e2e ✓ |
+| `retry`           | `retry::decide`: whether a failed attempt is retried and how (`Retry`, `RelayRetry`); never resends a body the provider may have unless it proved it unprocessed                                                                                             | unit ✓ + e2e ✓ |
+| `remedy`          | Provider-account remedies in a managed error: the neutral rewrite (D174, D196) and the structured out-of-credit verdict that cools a key (D180, D200)                                                                                                        | unit ✓ + e2e ✓ |
+| `capture_sink`    | Bounded (lines and bytes), lossy writer for `ai.payload` and diagnostics — drops on a full queue so a stalled log sink can't backpressure                                                                                                                    | unit ✓, e2e ✓  |
+| `usage_file`      | Blocking, lossless `ai.usage` writer to hourly `.jsonl` files (`AI_USAGE_DIR`): rotation, 48 h retention, 1 s fdatasync, one writer per file                                                                                                                 | unit ✓, e2e ✓  |
+| `control`         | `x-beyond-*` header parse/validate; metadata canonicalized and re-serialized; catalog walk permute (`order` / `only` / `split`)                                                                                                                              | unit ✓ + e2e ✓ |
+| `translate`       | Chat Completions ↔ Messages ↔ Responses mapping for a catalog endpoint mismatch; SSE event-by-event                                                                                                                                                          | unit ✓ + e2e ✓ |
+| `pin`             | Computed session pin: the order of a managed default walk; a pure function of the caller and the row                                                                                                                                                         | unit ✓ + e2e ✓ |
+| `cache`           | Per-pod exact-match response store (TTL + max entries + max bytes/entry); tap, never a buffer; miss does not consult Redis                                                                                                                                   | unit ✓ + e2e ✓ |
+| `concurrency`     | Per-tenant in-flight cap (`tenant_max_in_flight`): sharded, sparse, exact counters; the overspend bound                                                                                                                                                      | unit ✓ + e2e ✓ |
+| `deadline`        | Request deadline clock (`request_max_secs`): a coarse clock a ticker thread advances each second; a per-chunk check is one atomic load                                                                                                                       | unit ✓ + e2e ✓ |
+| `drain`           | Drain-on-cancel: arms pingora's keep-reading-after-a-downstream-error path (cache `Bypass` on a no-op storage) so a cancelled stream settles to the vendor's usage                                                                                           | unit ✓ + e2e ✓ |
+| `ratelimit`       | Two-tier guardrail: per-credential (count-min sketch, fixed memory, no GC) + global BYO (one atomic)                                                                                                                                                         | unit ✓         |
+| `circuit_breaker` | Per-provider lock-free breaker (packed `AtomicU64`, windowed policy) — trips on 5xx/connect, not 429                                                                                                                                                         | unit ✓ + e2e ✓ |
+| `state`           | Keyring + provider registry + watched deny-/allowance-/capture-sets (ArcSwap) + TTL DNS cache (all addresses, serve-stale)                                                                                                                                   | unit ✓         |
+| `store_watch`     | Generic `WatchedSet` driver — gap-free seeding + delta watch, instantiated per set                                                                                                                                                                           | unit ✓ + e2e ✓ |
+| `config`          | Figment config; build keyring; pool keys / authorities by provider name                                                                                                                                                                                      | unit ✓         |
+| `secret`          | Redacting, zeroize-on-drop `Secret<T>` newtype for pool keys and NATS creds                                                                                                                                                                                  | unit ✓         |
+| `signed_id`       | Tenant-bound Responses ids: provider ids HMAC-signed for the tenant out, verified and stripped in; no state; `SignerError` for bad id signing keys                                                                                                           | unit ✓ + e2e ✓ |
+| `admin`           | `ServeHttp` on the metrics listener: `/livez`, `/readyz`, `/metrics`                                                                                                                                                                                         | unit ✓ + e2e ✓ |
+| `metrics`         | Prometheus counter/histogram/gauge registration and update helpers                                                                                                                                                                                           | unit ✓         |
+| `doctor`          | Boot-time diagnostics (`beyond-ai doctor`)                                                                                                                                                                                                                   | unit ✓         |
+| `error`           | `GatewayError` (`Config` / `Store` / `Dns` with its `io::Error` source) and `ConfigError`, one variant per boot check; each message is operator-facing text, kept verbatim                                                                                   | unit ✓         |
+| `lib`             | Library root: modules crate-private; re-exports what `main` wires, hidden `__test` / `__bench` facades for dev targets; test-only clippy allowances                                                                                                          | compile ✓      |
+| `main`            | CLI (`run` / `doctor`), rustls init, config load, Pingora server + proxy/watchers/admin bootstrap                                                                                                                                                            | compile ✓      |
 
 ---
 

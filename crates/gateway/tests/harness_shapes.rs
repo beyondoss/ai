@@ -81,7 +81,7 @@ fn codex_body(model: &str, input: Value) -> Value {
 /// Completions first (gpt-5.1, then gpt-5.5), that used to count as "no session state, so translate
 /// onto Chat Completions", where Codex's `namespace` tools and `custom` grammars have no shape and
 /// OpenAI 400s. The row's own Responses arm takes the body as it came (less the reasoning items the
-/// gateway minted, D50).
+/// gateway minted).
 /// claim: W2, E3, CAT-9
 /// defect: D74
 #[tokio::test]
@@ -277,7 +277,7 @@ fn weather_tool() -> Value {
 /// call comes back, its reasoning as a plain unsigned `reasoning` string, and no
 /// `reasoning_details`. OpenRouter forwards `reasoning_effort` to Anthropic as enabled thinking,
 /// and Anthropic 400s a final assistant turn that does not open on a signed thinking block. The
-/// request goes without reasoning instead, as D14 does on Anthropic itself; a turn that does carry
+/// request goes without reasoning instead, as on Anthropic itself; a turn that does carry
 /// signed `reasoning_details` keeps it.
 /// claim: TRN-7, W4
 /// defect: D77
@@ -467,7 +467,7 @@ async fn a_replayed_thinking_turn_without_thinking_on_reaches_openrouter_without
     assert_eq!(a["tool_calls"][0]["id"], "toolu_01", "{got}");
 
     // Control: one round with reasoning on keeps its signed thinking. (With the second round, whose
-    // call carries none, D77 drops the reasoning and the rule applies again.)
+    // call carries none, the reasoning is dropped and the rule applies again.)
     let mut on = turn2(Some(json!({"effort": "medium"})));
     on["input"].as_array_mut().unwrap().truncate(4);
     post(&gw, &sk, "/v1/responses", &on).await;

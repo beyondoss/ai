@@ -248,7 +248,7 @@ pub fn split_at(s: &str, cuts: &[u16]) -> Vec<String> {
 /// A token count as a provider reports it: mostly ordinary, sometimes zero, sometimes huge.
 ///
 /// Huge stays at or below `u64::MAX / 8`, so no sum of a usage block's five counts passes
-/// `u64::MAX`. That is not a D87 exclusion: these properties compare the usage a client is shown
+/// `u64::MAX`. That is not an exclusion: these properties compare the usage a client is shown
 /// with the usage billed, and a saturated sum loses the information either side would need (an
 /// OpenAI-shaped block whose `prompt + completion` and `prompt + completion + reasoning` both
 /// saturate reads as xAI's reasoning-outside convention). Counts at `u64::MAX` are covered for
@@ -424,7 +424,7 @@ pub fn parse_events(bytes: &[u8]) -> Result<Vec<Event>, String> {
         .strip_suffix("\n\n")
         .ok_or_else(|| format!("client SSE does not end with a blank line: {text:?}"))?;
     for raw in body.split("\n\n") {
-        // A comment-only event (the bridge's keep-alive, D251) is no event to any SSE parser.
+        // A comment-only event (the bridge's keep-alive) is no event to any SSE parser.
         if raw.split('\n').all(|l| l.starts_with(':')) {
             continue;
         }
@@ -455,7 +455,7 @@ pub fn normalize_minted(bytes: &[u8]) -> String {
     let mut ids: Vec<String> = Vec::new();
     let mut out = String::new();
     for chunk in text.split_inclusive("\n\n") {
-        // Keep-alive comments (D251) follow the feed's chunking, not the stream: no parser sees
+        // Keep-alive comments follow the feed's chunking, not the stream: no parser sees
         // them, so two feeds of one stream compare without them.
         if chunk
             .trim_end_matches('\n')

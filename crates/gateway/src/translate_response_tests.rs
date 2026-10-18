@@ -22,7 +22,7 @@ fn json_status(up: Endpoint, client: Endpoint, status: u16, v: &Value) -> Value 
 /// One SSE event: its `event:` name (empty when unnamed) and its data (`"[DONE]"` as a string).
 type Event = (String, Value);
 
-/// Comment-only events (the bridge's keep-alives, D251) are skipped, as every SSE parser skips them.
+/// Comment-only events (the bridge's keep-alives) are skipped, as every SSE parser skips them.
 fn events(out: &str) -> Vec<Event> {
     out.split("\n\n")
         .filter(|e| !e.trim().is_empty() && !e.lines().all(|l| l.starts_with(':')))
@@ -1190,7 +1190,7 @@ fn a_non_2xx_body_is_an_error_whatever_its_shape() {
     );
 }
 
-/// D100: the same endpoint on another vendor still owes the client its API's envelope. xAI's flat
+/// The same endpoint on another vendor still owes the client its API's envelope. xAI's flat
 /// `{"code", "error": "<string>"}` and Bedrock's `{"message"}` are re-encoded, typed from the
 /// status; a body already in the envelope is relayed byte for byte.
 #[test]
@@ -2074,7 +2074,7 @@ fn an_openrouter_mid_stream_error_is_an_error() {
 }
 
 /// An upstream stream that ends cleanly without saying how the response ended (no stop reason, no
-/// end marker) was cut short. The bridge used to close it as a success — `end_turn`,
+/// end marker) was cut short. The bridge must not close it as a success — `end_turn`,
 /// `response.completed`, a bare `[DONE]` — on a half-written answer.
 /// claim: T7
 #[test]
@@ -2239,7 +2239,7 @@ const ANT_PING: &str = "event: ping\ndata: {\"type\": \"ping\"}\n\n";
 
 #[test]
 fn a_translated_stream_answers_a_ping_with_a_keep_alive_comment() {
-    // D251: a ping maps to no client event, so the client gets a comment in its place; one per
+    // A ping maps to no client event, so the client gets a comment in its place; one per
     // feed that consumed an event and wrote nothing, never alongside real output.
     for client in [Chat, Responses] {
         let mut b = SseBridge::new(client, Messages);
@@ -2502,7 +2502,7 @@ fn a_streamed_zero_argument_call_has_json_arguments() {
     );
 }
 
-// ---- verification phase 0: translation detail (D44-D50) ----------------------------------------
+// ---- translation detail ------------------------------------------------------------------------
 
 /// Anthropic streams one content block at a time: each `content_block_start` follows the previous
 /// block's `content_block_stop`, and deltas land only on the open block. Returns the first breach.

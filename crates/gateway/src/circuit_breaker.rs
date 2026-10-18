@@ -155,7 +155,7 @@ impl CircuitBreakerConfig {
 /// - Bits 48-61: Failure count (14 bits, max 16383) in CLOSED. In OPEN and HALF_OPEN, the probe
 ///   **generation**: bumped on every OPEN → HALF_OPEN and every stalled-probe reclaim, and carried
 ///   in each [`Permit`] `allow()` hands out, so a permit that was reclaimed (or issued before the
-///   breaker half-opened) can no longer release a probe permit or decide the probe (D256).
+///   breaker half-opened) can no longer release a probe permit or decide the probe.
 /// - Bits 32-47: Half-open permits remaining (16 bits) in HALF_OPEN. In CLOSED windowed mode, the
 ///   successes recorded since the current window's first failure (saturating at the failure count's
 ///   14-bit cap, so failures can always catch up), which is what makes
@@ -333,7 +333,7 @@ impl CircuitBreaker {
                         // provider's traffic for as long as that one attempt lives. Every permit
                         // out is that old (the timestamp is the newest handout), so all of them
                         // are reclaimed at once by bumping the generation: the stalled attempts'
-                        // later `release` or outcome is then a no-op, never a second probe (D256).
+                        // later `release` or outcome is then a no-op, never a second probe.
                         let now = self.now_secs();
                         let reset = self.config.reset_timeout.as_secs();
                         if reset > 0 && now.saturating_sub(timestamp) >= reset {
@@ -411,7 +411,7 @@ impl CircuitBreaker {
 
     /// Count an answer [`record_success_for`](Self::record_success_for) took as a success as the
     /// failure its body showed it to be, in the generation it was claimed in: a late verdict cannot
-    /// reopen a breaker another request's probe owns by then (D286).
+    /// reopen a breaker another request's probe owns by then.
     pub fn record_late_failure(&self, answered: Answered) {
         self.record_failure_for(answered.0);
     }
@@ -535,7 +535,7 @@ impl CircuitBreaker {
     /// The current window's start lives in the packed timestamp (CLOSED state), so the
     /// reset-the-window-and-set-to-1 decision and the within-window increment are made from the
     /// **same** `packed` value and committed in the **same** CAS. That single-CAS atomicity is what
-    /// fixes the old two-atomic race: when many failures land at a window boundary, they retry the
+    /// keeps the count exact: when many failures land at a window boundary, they retry the
     /// CAS and each sees the latest count, so they linearize into a correct running total instead of
     /// each independently resetting to 1 and dropping the others (which could pin the count at 1 and
     /// keep a genuinely-broken provider's breaker stuck closed).
@@ -616,7 +616,7 @@ impl CircuitBreaker {
     /// returns the probe permit so another request can probe; in any other state a permit costs
     /// nothing, so this is a no-op. So is a permit from another generation (reclaimed from a
     /// stalled probe, or handed out before the breaker half-opened): it no longer holds a probe
-    /// permit, and returning one would admit a probe beside the live one (D256).
+    /// permit, and returning one would admit a probe beside the live one.
     pub fn release(&self, permit: Permit) {
         loop {
             let packed = self.state.load(Ordering::Acquire);
@@ -704,7 +704,7 @@ impl Permit {
 
     /// Whether this permit decides nothing in a HALF_OPEN word of `generation`: one claimed while
     /// CLOSED, or in another generation (reclaimed from a stalled probe, or from before the breaker
-    /// half-opened, D256).
+    /// half-opened).
     #[inline]
     fn stale(&self, generation: u64) -> bool {
         match self.0 {
@@ -1112,7 +1112,7 @@ mod tests {
         );
     }
 
-    /// D256: a permit claimed in an earlier half-open, or while CLOSED, is not this half-open's
+    /// A permit claimed in an earlier half-open, or while CLOSED, is not this half-open's
     /// probe: it can neither release a probe permit nor decide the probe.
     /// claim: REL-6
     /// defect: D256
@@ -1229,7 +1229,7 @@ mod tests {
         );
     }
 
-    /// D256: a stalled probe's permit is reclaimed for a new probe. When the stalled attempt later
+    /// A stalled probe's permit is reclaimed for a new probe. When the stalled attempt later
     /// ends with no provider outcome, its `release` must not hand back a permit it no longer holds:
     /// with `half_open_permits = 1` that would admit a second probe beside the live one.
     /// claim: REL-6
@@ -1261,7 +1261,7 @@ mod tests {
         );
     }
 
-    /// D256: a reclaim moves the generation *forward*, past every generation already handed out.
+    /// A reclaim moves the generation *forward*, past every generation already handed out.
     /// The reclaimed probe's permit must stay stale through the live probe failing, the breaker
     /// reopening and half-opening again: if the reclaim stepped the generation back, the next
     /// half-open's bump would land on the stalled permit's generation, and its late success would
@@ -1428,7 +1428,7 @@ mod tests {
     }
 
     /// A fixed clock pins every failure into the same window, so this isolates concurrent *counting*
-    /// from window timing — the exact condition the old two-atomic design dropped increments under.
+    /// from window timing — the condition a reset-then-increment split would drop increments under.
     fn fixed_clock() -> u64 {
         1000
     }
@@ -1592,8 +1592,8 @@ mod tests {
         );
     }
 
-    /// A threshold past the 14-bit count used to wrap the count to 0 on `pack`, so the breaker
-    /// could never open. It is clamped to the largest count the word can hold instead.
+    /// A threshold past the 14-bit count would wrap the count to 0 on `pack`, so the breaker could
+    /// never open. It is clamped to the largest count the word can hold.
     #[test]
     fn a_threshold_past_the_packed_count_still_opens() {
         for config in [

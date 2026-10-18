@@ -8,7 +8,7 @@
 //! only because a rule does not apply there, never because the order differs.
 //!
 //! A rule reads [`Facts`], never the bytes: each point extracts what applies there in one place
-//! (`proxy.rs`), from the scan it already made. Rewriting the body (the output-limit clamp, the
+//! (`proxy`), from the scan it already made. Rewriting the body (the output-limit clamp, the
 //! translation, the strips, the model re-spelling, `stream_options`) is a separate step after the
 //! rules pass, on a buffered body only. Signed ids are checked apart too: verifying them also
 //! rewrites the body, and a store relay checks them where it has the signer, not here. A foreign
@@ -54,17 +54,17 @@ pub struct Facts<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rule {
     /// Two root `model` keys: the row came from one, and the provider would serve whichever its
-    /// parser keeps (D34).
+    /// parser keeps.
     DuplicateModel,
-    /// A limit the clamp cannot hold to the row's maximum (D275).
+    /// A limit the clamp cannot hold to the row's maximum.
     OutputLimit,
     /// Input the row does not take (an image, tools).
     RefusedInput,
-    /// Something no row could price (D268).
+    /// Something no row could price.
     Unpriced,
-    /// A managed key runs only what its billing row can price (D267).
+    /// A managed key runs only what its billing row can price.
     CatalogMiss,
-    /// A generation run after the request ends, which no usage tap can meter (D202).
+    /// A generation run after the request ends, which no usage tap can meter.
     Background,
 }
 

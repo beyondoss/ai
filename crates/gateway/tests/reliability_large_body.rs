@@ -131,7 +131,7 @@ async fn a_5xx_after_a_key_walk_fails_over_for_small_and_large_bodies() {
     }
 }
 
-/// A revoked first pool key cools off (D71), so later requests start on the next key. A large body
+/// A revoked first pool key cools off, so later requests start on the next key. A large body
 /// re-run as a `FullBody` subrequest must honor that too, rather than paying a 401 and a second
 /// upload of the whole body on every request.
 /// claim: REL-14, R5

@@ -240,12 +240,12 @@ async fn a_byo_key_still_reaches_any_provider_endpoint() {
 const QUEUED: &str = r#"{"id":"resp_bg","object":"response","created_at":1,"status":"queued","background":true,"model":"gpt-4.1","output":[],"usage":null}"#;
 
 /// A Responses `background: true` request is answered `200 {"status":"queued","usage":null}` and
-/// generated asynchronously, so a managed key would run it on the pool key unmetered (D195 would
+/// generated asynchronously, so a managed key would run it on the pool key unmetered (the clean-2xx estimate would
 /// even bill an estimate of the envelope), and a managed key cannot poll for it (GET is refused).
 /// So a managed key gets a named 400 and no provider receives the request whole: on a catalog walk
 /// (small body, and a body past 64 KiB that goes through the full-body re-run) the refusal comes
 /// before any upstream; on the `/openai` provider route (small and large) the body is held and the
-/// request aborted before its last byte, as a duplicate `model` is (D34). `background: false` is
+/// request aborted before its last byte, as a duplicate `model` is. `background: false` is
 /// served, and a BYO key is relayed as sent: the caller's own account can poll.
 /// claim: BIL-2, SEC-1
 /// defect: D202

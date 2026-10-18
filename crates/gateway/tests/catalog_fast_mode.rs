@@ -1,4 +1,4 @@
-//! End-to-end: Anthropic fast mode on managed traffic (D266).
+//! End-to-end: Anthropic fast mode on managed traffic.
 //!
 //! - A Messages client's `speed: "fast"` and its `fast-mode-2026-02-01` beta reach direct
 //!   Anthropic for a model with fast mode (Opus 5.5, Opus 5, Opus 4.8), on a catalog walk and on

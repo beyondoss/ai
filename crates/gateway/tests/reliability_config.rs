@@ -102,7 +102,7 @@ async fn a_mixed_case_config_provider_routes_at_its_name_in_any_case() {
     );
 }
 
-/// Control for D52: the same env path works for a provider name without a hyphen.
+/// Control for the hyphenated name: the same env path works for a provider name without a hyphen.
 /// claim: REL-15
 /// defect: D52
 #[tokio::test]
