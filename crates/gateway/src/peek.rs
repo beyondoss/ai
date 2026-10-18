@@ -489,159 +489,16 @@ fn utf8_prefix(buf: Vec<u8>) -> String {
     }
 }
 
-/// Decide whether an OpenAI **chat** request body needs `stream_options.include_usage` injected,
-/// and where. Returns `Some(offset)` — the byte index just after the root object's opening `{`, where
-/// the caller splices `"stream_options":{"include_usage":true},` — **only** when the body is a JSON
-/// object with a root-level `"stream": true` and **no** root-level `"stream_options"` key. Otherwise
-/// `None` (not a stream, options already set, or not an object) → forward unchanged.
-///
-/// Why this exists: OpenAI only emits a usage chunk on a stream when the request carries
-/// `stream_options.include_usage = true`. A stock client that omits it would stream with no usage,
-/// so managed traffic couldn't be metered. We can't ask for it via a header and can't set it in a
-/// client SDK we don't control, so the gateway injects it — for every OpenAI streaming chat request,
-/// out of the box.
-///
-/// Structural (depth + string + escape aware), so a `"stream"` inside a message object or inside a
-/// string value never triggers injection — only the genuine root-level field. The returned offset is
-/// always inside a non-empty object (a root `"stream"` is present), so the caller always follows the
-/// fragment with a comma.
-#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-pub fn plan_stream_usage_injection(body: &[u8]) -> Option<usize> {
-    // Proof for the allow: every index is `i`/`j` with `i < n` (the loop condition, or a `memchr`
-    // offset inside `bytes[i..]`), or a key span bounded by the closing quote just found; counters
-    // (`i`, `j`, `depth`, `model_keys`) count bytes of a body that fits in memory, so they cannot
-    // overflow. This loop runs on every managed request body, so it keeps the unchecked forms.
-    let n = body.len();
-    // Cheap pre-filter: injection is only ever needed when a root-level `"stream"` key is present.
-    // If the quoted token `"stream"` doesn't occur *anywhere*, the structural answer is
-    // unconditionally `None`, so a single SIMD `memmem` pass lets us skip the whole walk — the
-    // common case, since most requests aren't streaming. (Note `"stream_options"` does NOT contain
-    // the needle: the byte after `stream` is `_`, not a closing quote — so a body carrying only
-    // `stream_options` fails this pre-filter and returns `None` here, which is the correct answer.)
-    // An escaped key (`"str\u0065am"`) decodes to `stream` at the provider without spelling it,
-    // and such a key always carries `\u`; real clients never send one, so the second search runs
-    // only on a body with no `"stream"` at all.
-    if memchr::memmem::find(body, b"\"stream\"").is_none()
-        && memchr::memmem::find(body, b"\\u").is_none()
-    {
-        return None;
-    }
-    // Must be a JSON object; anything else (array, scalar, garbage) we never rewrite.
-    let i = body.iter().position(|b| !b.is_ascii_whitespace())?;
-    if body[i] != b'{' {
-        return None;
-    }
-    let insert_at = i + 1;
-
-    let mut depth = 0u32;
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut expect_key = false;
-    let mut capturing_key = false;
-    // Start index (just past the opening `"`) of the root-level key currently being scanned. The
-    // body is fully in hand, so we slice the key out of it at the closing quote — no accumulation
-    // buffer, zero-copy. A key with an escape in it is decoded, as the provider's parser does.
-    let mut key_start = 0usize;
-    // The current root-level key is exactly `stream` (so the next literal is its value).
-    let mut last_key_is_stream = false;
-    let mut stream_true = false;
-
-    let mut j = i;
-    while j < n {
-        if in_string {
-            // Fast path: jump straight to the next `"`/`\` with a SIMD search instead of
-            // inspecting every byte, a root key included (it is sliced out of the body at its
-            // closing quote). Mirrors the skip in `ModelScanner::feed`.
-            if !escaped {
-                match memchr::memchr2(b'"', b'\\', &body[j..]) {
-                    Some(rel) => j += rel,
-                    None => break, // rest of the body is skippable string content
-                }
-            }
-            let b = body[j];
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                in_string = false;
-                if capturing_key {
-                    capturing_key = false;
-                    // Only root-level (`depth == 1`) keys matter.
-                    if depth == 1 {
-                        let key = &body[key_start..j];
-                        // A root `stream_options` means the client already controls usage — the
-                        // answer is `None` regardless of anything else in the body, so stop now
-                        // rather than walking the remainder for a result we already know.
-                        let escaped_key = key.contains(&b'\\');
-                        if key == b"stream_options"
-                            || (escaped_key
-                                && escaped_key_is(&body[key_start - 1..=j], "stream_options"))
-                        {
-                            return None;
-                        }
-                        // The provider keeps the last of duplicate keys, so each `stream` key
-                        // decides afresh.
-                        last_key_is_stream = key == b"stream"
-                            || (escaped_key && escaped_key_is(&body[key_start - 1..=j], "stream"));
-                        if last_key_is_stream {
-                            stream_true = false;
-                        }
-                    }
-                }
-            }
-            j += 1;
-            continue;
-        }
-        let b = body[j];
-        match b {
-            b'"' => {
-                // A root-level key starts only where one is expected (just after `{` or `,`).
-                if depth == 1 && expect_key {
-                    capturing_key = true;
-                    key_start = j + 1; // first key byte is just past this opening quote
-                } else {
-                    capturing_key = false;
-                }
-                in_string = true;
-            }
-            b'{' => {
-                depth += 1;
-                if depth == 1 {
-                    expect_key = true;
-                }
-            }
-            b'[' => depth += 1,
-            b'}' | b']' => depth = depth.saturating_sub(1),
-            // Unguarded by depth, as in `ModelScanner::feed`: a nested `:` or `,` is always
-            // followed by the root `,` or `}` that closes its value before the next root key.
-            b':' => expect_key = false,
-            b',' => {
-                expect_key = true;
-                last_key_is_stream = false;
-            }
-            // The value of a root-level `stream` key: a bare `true` literal.
-            b't' if depth == 1 && last_key_is_stream => {
-                if body[j..].starts_with(b"true") {
-                    stream_true = true;
-                }
-                last_key_is_stream = false;
-            }
-            _ => {}
-        }
-        j += 1;
-    }
-
-    // `stream_options` would have already returned `None` above, so reaching here means it's absent.
-    if stream_true { Some(insert_at) } else { None }
-}
-
 /// Both answers the injection path needs from a **fully buffered** request body.
 pub struct BufferedScan {
     /// The root-level `model`, as [`ModelScanner`] would have extracted it.
     pub model: Option<String>,
-    /// Where to splice the `stream_options` fragment, as [`plan_stream_usage_injection`] would have
-    /// reported it.
+    /// Where to splice `"stream_options":{"include_usage":true},`: just past the root object's
+    /// opening `{`, **only** when the root has `"stream": true` (the last root `stream` decides, as
+    /// the provider keeps the last duplicate) and **no** root `stream_options`. OpenAI emits a
+    /// usage chunk on a stream only when the request asks for it, and a stock client that omits it
+    /// could not be metered, so the gateway asks on its behalf. The offset is always inside a
+    /// non-empty object, so the fragment is always followed by a comma.
     pub inject_at: Option<usize>,
     /// Where the value of a root `stream_options` begins, when the body streams **and** already
     /// carries one. The client may have turned usage off (`include_usage: false`) or left it out
@@ -690,16 +547,13 @@ pub const OUTPUT_LIMIT_KEYS: [&[u8]; 3] = [
 /// One structural walk producing both answers, for the path that already has the whole body.
 ///
 /// A managed OpenAI chat request is buffered anyway (the injection point is near the front, so the
-/// decision needs the whole body), and it was then walked **twice**: once chunk-by-chunk by
-/// `ModelScanner` looking for a root `model`, then again end-to-end by
-/// [`plan_stream_usage_injection`] looking for root `stream`/`stream_options`. Same traversal, same
-/// bytes, same depth/string/escape bookkeeping — just different needles. Measured 16.3 µs vs 4.4 µs
-/// on a 512 KiB body.
+/// decision needs the whole body), and one walk answers both what `ModelScanner` would find (the
+/// root `model`) and where `stream_options` goes: same bytes, different needles.
 ///
 /// Only for the buffered path. A request that streams through un-buffered still uses
 /// `ModelScanner`, which is incremental and cannot be replaced by this.
 ///
-/// Semantics are exactly the two functions it replaces, including the details that look incidental:
+/// Semantics are exactly the two walks it fused, including the details that look incidental:
 /// `stream_options` anywhere at root wins regardless of `stream`, a key spelled with escapes is
 /// decoded and the last `stream` decides (as the provider's parser does; a duplicate or escaped
 /// `stream_options` is flagged in `stream_options_ambiguous` instead, D88), and the model value
@@ -1495,6 +1349,145 @@ mod kept_tests;
 mod tests {
     use super::*;
 
+    /// Where `scan_buffered` would splice the `stream_options` fragment.
+    fn inject_at(body: &[u8]) -> Option<usize> {
+        scan_buffered(body).inject_at
+    }
+
+    /// The stand-alone injection planner `scan_buffered` fused, kept as the oracle of
+    /// [`fused_scan_matches_the_two_walks_it_replaces`]. Do not fix anything here.
+    #[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+    pub(super) fn plan_stream_usage_injection(body: &[u8]) -> Option<usize> {
+        // Proof for the allow: every index is `i`/`j` with `i < n` (the loop condition, or a `memchr`
+        // offset inside `bytes[i..]`), or a key span bounded by the closing quote just found; counters
+        // (`i`, `j`, `depth`, `model_keys`) count bytes of a body that fits in memory, so they cannot
+        // overflow. This loop runs on every managed request body, so it keeps the unchecked forms.
+        let n = body.len();
+        // Cheap pre-filter: injection is only ever needed when a root-level `"stream"` key is present.
+        // If the quoted token `"stream"` doesn't occur *anywhere*, the structural answer is
+        // unconditionally `None`, so a single SIMD `memmem` pass lets us skip the whole walk — the
+        // common case, since most requests aren't streaming. (Note `"stream_options"` does NOT contain
+        // the needle: the byte after `stream` is `_`, not a closing quote — so a body carrying only
+        // `stream_options` fails this pre-filter and returns `None` here, which is the correct answer.)
+        // An escaped key (`"str\u0065am"`) decodes to `stream` at the provider without spelling it,
+        // and such a key always carries `\u`; real clients never send one, so the second search runs
+        // only on a body with no `"stream"` at all.
+        if memchr::memmem::find(body, b"\"stream\"").is_none()
+            && memchr::memmem::find(body, b"\\u").is_none()
+        {
+            return None;
+        }
+        // Must be a JSON object; anything else (array, scalar, garbage) we never rewrite.
+        let i = body.iter().position(|b| !b.is_ascii_whitespace())?;
+        if body[i] != b'{' {
+            return None;
+        }
+        let insert_at = i + 1;
+
+        let mut depth = 0u32;
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut expect_key = false;
+        let mut capturing_key = false;
+        // Start index (just past the opening `"`) of the root-level key currently being scanned. The
+        // body is fully in hand, so we slice the key out of it at the closing quote — no accumulation
+        // buffer, zero-copy. A key with an escape in it is decoded, as the provider's parser does.
+        let mut key_start = 0usize;
+        // The current root-level key is exactly `stream` (so the next literal is its value).
+        let mut last_key_is_stream = false;
+        let mut stream_true = false;
+
+        let mut j = i;
+        while j < n {
+            if in_string {
+                // Fast path: jump straight to the next `"`/`\` with a SIMD search instead of
+                // inspecting every byte, a root key included (it is sliced out of the body at its
+                // closing quote). Mirrors the skip in `ModelScanner::feed`.
+                if !escaped {
+                    match memchr::memchr2(b'"', b'\\', &body[j..]) {
+                        Some(rel) => j += rel,
+                        None => break, // rest of the body is skippable string content
+                    }
+                }
+                let b = body[j];
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    in_string = false;
+                    if capturing_key {
+                        capturing_key = false;
+                        // Only root-level (`depth == 1`) keys matter.
+                        if depth == 1 {
+                            let key = &body[key_start..j];
+                            // A root `stream_options` means the client already controls usage — the
+                            // answer is `None` regardless of anything else in the body, so stop now
+                            // rather than walking the remainder for a result we already know.
+                            let escaped_key = key.contains(&b'\\');
+                            if key == b"stream_options"
+                                || (escaped_key
+                                    && escaped_key_is(&body[key_start - 1..=j], "stream_options"))
+                            {
+                                return None;
+                            }
+                            // The provider keeps the last of duplicate keys, so each `stream` key
+                            // decides afresh.
+                            last_key_is_stream = key == b"stream"
+                                || (escaped_key
+                                    && escaped_key_is(&body[key_start - 1..=j], "stream"));
+                            if last_key_is_stream {
+                                stream_true = false;
+                            }
+                        }
+                    }
+                }
+                j += 1;
+                continue;
+            }
+            let b = body[j];
+            match b {
+                b'"' => {
+                    // A root-level key starts only where one is expected (just after `{` or `,`).
+                    if depth == 1 && expect_key {
+                        capturing_key = true;
+                        key_start = j + 1; // first key byte is just past this opening quote
+                    } else {
+                        capturing_key = false;
+                    }
+                    in_string = true;
+                }
+                b'{' => {
+                    depth += 1;
+                    if depth == 1 {
+                        expect_key = true;
+                    }
+                }
+                b'[' => depth += 1,
+                b'}' | b']' => depth = depth.saturating_sub(1),
+                // Unguarded by depth, as in `ModelScanner::feed`: a nested `:` or `,` is always
+                // followed by the root `,` or `}` that closes its value before the next root key.
+                b':' => expect_key = false,
+                b',' => {
+                    expect_key = true;
+                    last_key_is_stream = false;
+                }
+                // The value of a root-level `stream` key: a bare `true` literal.
+                b't' if depth == 1 && last_key_is_stream => {
+                    if body[j..].starts_with(b"true") {
+                        stream_true = true;
+                    }
+                    last_key_is_stream = false;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+
+        // `stream_options` would have already returned `None` above, so reaching here means it's absent.
+        if stream_true { Some(insert_at) } else { None }
+    }
+
     /// The iterators agree with the collecting walks, end at the closing bracket, and report a
     /// malformed container once.
     #[test]
@@ -2105,10 +2098,10 @@ mod tests {
         assert_eq!(scan(sse).as_deref(), Some("gpt-4o-2024-08-06"));
     }
 
-    /// Apply `plan_stream_usage_injection` and return the rewritten body (or unchanged if no plan),
+    /// Apply the injection `scan_buffered` plans and return the rewritten body (or unchanged if none),
     /// so tests assert the *resulting* JSON — the thing the upstream actually receives.
     fn inject(body: &str) -> String {
-        match plan_stream_usage_injection(body.as_bytes()) {
+        match inject_at(body.as_bytes()) {
             Some(at) => {
                 let frag = br#""stream_options":{"include_usage":true},"#;
                 let mut out = Vec::with_capacity(body.len() + frag.len());
@@ -2138,7 +2131,7 @@ mod tests {
 
     #[test]
     fn stream_can_be_the_only_or_last_key() {
-        assert!(plan_stream_usage_injection(br#"{"stream":true}"#).is_some());
+        assert!(inject_at(br#"{"stream":true}"#).is_some());
         let v: serde_json::Value =
             serde_json::from_str(&inject(r#"{"model":"x","stream":true}"#)).unwrap();
         assert_eq!(
@@ -2151,39 +2144,29 @@ mod tests {
     fn skips_when_options_already_present() {
         // Client already asked for usage (in any form) — never touch it.
         assert_eq!(
-            plan_stream_usage_injection(
-                br#"{"stream":true,"stream_options":{"include_usage":false}}"#
-            ),
+            inject_at(br#"{"stream":true,"stream_options":{"include_usage":false}}"#),
             None
         );
         // Order-independent: options before stream.
-        assert_eq!(
-            plan_stream_usage_injection(br#"{"stream_options":{},"stream":true}"#),
-            None
-        );
+        assert_eq!(inject_at(br#"{"stream_options":{},"stream":true}"#), None);
     }
 
     #[test]
     fn skips_when_not_streaming() {
-        assert_eq!(
-            plan_stream_usage_injection(br#"{"model":"x","stream":false}"#),
-            None
-        );
-        assert_eq!(plan_stream_usage_injection(br#"{"model":"x"}"#), None);
+        assert_eq!(inject_at(br#"{"model":"x","stream":false}"#), None);
+        assert_eq!(inject_at(br#"{"model":"x"}"#), None);
     }
 
     #[test]
     fn ignores_nested_or_in_string_stream() {
         // `stream` inside a message object is not the root field.
         assert_eq!(
-            plan_stream_usage_injection(
-                br#"{"messages":[{"role":"u","stream":true}],"model":"x"}"#
-            ),
+            inject_at(br#"{"messages":[{"role":"u","stream":true}],"model":"x"}"#),
             None
         );
         // `stream` mentioned inside a string value must not trigger.
         assert_eq!(
-            plan_stream_usage_injection(br#"{"system":"set stream:true please","model":"x"}"#),
+            inject_at(br#"{"system":"set stream:true please","model":"x"}"#),
             None
         );
     }
@@ -2207,7 +2190,7 @@ mod tests {
         // memmem pre-filter passes, but the structural walk correctly skips over the string content.
         let big = "x".repeat(64 * 1024);
         let body = format!(r#"{{"system":"{big} \"stream\":true","model":"x"}}"#);
-        assert_eq!(plan_stream_usage_injection(body.as_bytes()), None);
+        assert_eq!(inject_at(body.as_bytes()), None);
     }
 
     #[test]
@@ -2218,14 +2201,14 @@ mod tests {
         let body = format!(
             r#"{{"content":"{big}","stream":true,"stream_options":{{"include_usage":false}}}}"#
         );
-        assert_eq!(plan_stream_usage_injection(body.as_bytes()), None);
+        assert_eq!(inject_at(body.as_bytes()), None);
     }
 
     #[test]
     fn tolerates_whitespace_and_non_objects() {
-        assert!(plan_stream_usage_injection(b"  {  \"stream\" : true }").is_some());
-        assert_eq!(plan_stream_usage_injection(b"[1,2,3]"), None);
-        assert_eq!(plan_stream_usage_injection(b"not json"), None);
+        assert!(inject_at(b"  {  \"stream\" : true }").is_some());
+        assert_eq!(inject_at(b"[1,2,3]"), None);
+        assert_eq!(inject_at(b"not json"), None);
     }
 
     #[test]
@@ -2383,6 +2366,10 @@ mod tests {
 mod mutation_gaps {
     use super::*;
 
+    fn inject_at(body: &[u8]) -> Option<usize> {
+        scan_buffered(body).inject_at
+    }
+
     fn scan(body: &[u8]) -> Option<String> {
         let mut s = ModelScanner::new();
         s.feed(body);
@@ -2430,7 +2417,7 @@ mod mutation_gaps {
             let scan = scan_buffered(streamed);
             assert_eq!(scan.model.as_deref(), Some("gpt-4o"));
             assert_eq!(scan.inject_at, Some(1));
-            assert_eq!(plan_stream_usage_injection(streamed), Some(1));
+            assert_eq!(inject_at(streamed), Some(1));
         }
     }
 
@@ -2450,14 +2437,11 @@ mod mutation_gaps {
     #[test]
     fn only_the_root_stream_literal_decides_streaming() {
         let not_streaming = br#"{"stream":false,"store":true,"model":"m"}"#;
-        assert_eq!(plan_stream_usage_injection(not_streaming), None);
+        assert_eq!(inject_at(not_streaming), None);
         assert_eq!(scan_buffered(not_streaming).inject_at, None);
 
         let value_spelled_like_a_key = br#"{"model":"stream_options","stream":true}"#;
-        assert_eq!(
-            plan_stream_usage_injection(value_spelled_like_a_key),
-            Some(1)
-        );
+        assert_eq!(inject_at(value_spelled_like_a_key), Some(1));
         assert_eq!(scan_buffered(value_spelled_like_a_key).inject_at, Some(1));
     }
 
@@ -2505,9 +2489,9 @@ mod mutation_gaps {
     /// claim: BIL-2
     #[test]
     fn a_body_that_does_not_open_with_an_object_is_never_planned() {
-        assert_eq!(plan_stream_usage_injection(br#"{"stream":true}"#), Some(1));
-        assert_eq!(plan_stream_usage_injection(br#"[]{"stream":true}"#), None);
-        assert_eq!(plan_stream_usage_injection(br#" 0{"stream":true}"#), None);
+        assert_eq!(inject_at(br#"{"stream":true}"#), Some(1));
+        assert_eq!(inject_at(br#"[]{"stream":true}"#), None);
+        assert_eq!(inject_at(br#" 0{"stream":true}"#), None);
     }
 
     /// The response scanner reads raw provider bytes: a root `message` whose value was not an
@@ -2572,12 +2556,17 @@ mod mutation_gaps {
     }
 
     /// A root `stream_options` spelled with an escape decodes to `stream_options` at the provider,
-    /// so the client already controls usage there too: nothing to inject.
+    /// so the client already controls usage there too: nothing to inject. The planner the
+    /// buffered scan fused said so with no offset; the buffered scan says so by flagging the key
+    /// ambiguous, which the caller resolves by removing it and injecting the one that counts.
     /// claim: BIL-2
     #[test]
     fn an_escaped_stream_options_key_means_no_injection() {
+        use super::tests::plan_stream_usage_injection;
         let body = format!(r#"{{"stream":true,"stream{}u005foptions":{{}}}}"#, '\\');
         assert_eq!(plan_stream_usage_injection(body.as_bytes()), None);
         assert_eq!(plan_stream_usage_injection(br#"{"stream":true}"#), Some(1));
+        assert!(scan_buffered(body.as_bytes()).stream_options_ambiguous);
+        assert_eq!(inject_at(br#"{"stream":true}"#), Some(1));
     }
 }
