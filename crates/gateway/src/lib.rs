@@ -44,3 +44,4 @@ pub mod terminal;
 pub mod translate;
 pub mod unpriced;
 pub mod usage;
+pub mod usage_file;

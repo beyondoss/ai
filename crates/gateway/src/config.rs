@@ -410,6 +410,10 @@ pub struct AiConfig {
     /// line that would cross this bound is **dropped** (counted on `ai_capture_dropped_total`),
     /// never waited for (D262).
     pub capture_queue_bytes: usize,
+    /// Directory for `ai.usage` billing rows (`AI_USAGE_DIR`). Set: rows go to hourly
+    /// `ai-usage-YYYYMMDDTHH.jsonl` files here, **only** there, with the same blocking, lossless
+    /// guarantee as stdout (`usage_file`). Unset (the default): rows go to stdout.
+    pub usage_dir: Option<String>,
 
     /// Exact-match response cache TTL (seconds). `0` disables it (the default). Only managed
     /// catalog walks whose client body is already in hand before `upstream_peer` (`/auto`, managed
@@ -519,6 +523,7 @@ impl Default for AiConfig {
             capture_queue_depth: 1024,
             // 64 MiB: dozens of full-size payloads, a small fraction of `max_buffered_body_bytes`.
             capture_queue_bytes: 64 * 1024 * 1024,
+            usage_dir: None,
             // Off. A TTL of 0 is the disable knob; turning it on is an operator choice, not a
             // surprise change in what the gateway talks to.
             cache_ttl_secs: 0,
