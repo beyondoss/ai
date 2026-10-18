@@ -67,7 +67,7 @@
 //! Each is a PR opened after the row passes live; the rest is an issue for a human. See
 //! `crates/providers/ARCHITECTURE.md`, "Catalog maintenance".
 
-use crate::{ProviderId, WireFormat};
+use crate::{ProviderId, WireFormat, str_eq};
 
 /// One upstream that can serve a catalog model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -410,11 +410,9 @@ const REFUSES_STRUCTURED_OUTPUTS: &[(ProviderId, &str)] =
 /// whose card advertises [`STRUCTURED_OUTPUTS`] must not be served there. Nor may one listed in
 /// [`REFUSES_STRUCTURED_OUTPUTS`], which answers without holding the schema. The gateway drops
 /// such a candidate from that request's walk.
-pub fn serves_structured_outputs(c: &Candidate) -> bool {
-    !matches!(c.provider, ProviderId::Bedrock)
-        && !REFUSES_STRUCTURED_OUTPUTS
-            .iter()
-            .any(|&(p, m)| p == c.provider && m == c.upstream_model)
+pub const fn serves_structured_outputs(c: &Candidate) -> bool {
+    !same_id(c.provider, ProviderId::Bedrock)
+        && !listed(REFUSES_STRUCTURED_OUTPUTS, c.provider, c.upstream_model)
 }
 
 /// Anthropic models that run in fast mode (`speed: "fast"` with the `fast-mode-2026-02-01` beta,
@@ -431,10 +429,10 @@ const FAST_MODE_MODELS: [&str; 3] = ["claude-opus-5-5", "claude-opus-5", "claude
 /// other host have no fast mode. The gateway sends a Messages client's `speed: "fast"` only here,
 /// and maps a Chat Completions or Responses client's `service_tier: "priority"` to fast mode only
 /// here.
-pub fn serves_fast_mode(c: &Candidate) -> bool {
-    c.provider == ProviderId::Anthropic
-        && endpoint_of_path(c.path) == "messages"
-        && FAST_MODE_MODELS.contains(&c.upstream_model)
+pub const fn serves_fast_mode(c: &Candidate) -> bool {
+    same_id(c.provider, ProviderId::Anthropic)
+        && ends_with(c.path, "/messages")
+        && any_eq(&FAST_MODE_MODELS, c.upstream_model)
 }
 
 /// Bedrock inference profiles known to accept a tool's `eager_input_streaming` (fine-grained tool
@@ -454,8 +452,9 @@ const BEDROCK_EAGER_INPUT_STREAMING: &[&str] = &["us.anthropic.claude-opus-4-8"]
 /// costs only the streaming granularity (the API buffers each tool parameter instead). A candidate
 /// on another wire never sees either: translation rebuilds each tool from its name, description and
 /// schema.
-pub fn serves_eager_input_streaming(c: &Candidate) -> bool {
-    c.provider != ProviderId::Bedrock || BEDROCK_EAGER_INPUT_STREAMING.contains(&c.upstream_model)
+pub const fn serves_eager_input_streaming(c: &Candidate) -> bool {
+    !same_id(c.provider, ProviderId::Bedrock)
+        || any_eq(BEDROCK_EAGER_INPUT_STREAMING, c.upstream_model)
 }
 
 /// Candidates that refuse file (PDF) input on a row whose card advertises it. OpenRouter routes
@@ -467,10 +466,8 @@ const REFUSES_FILE_INPUT: &[(ProviderId, &str)] =
 
 /// Whether a candidate reads a file (PDF) part: Chat Completions `file`, Messages `document`,
 /// Responses `input_file`. See [`REFUSES_FILE_INPUT`].
-pub fn serves_file_input(c: &Candidate) -> bool {
-    !REFUSES_FILE_INPUT
-        .iter()
-        .any(|&(p, m)| p == c.provider && m == c.upstream_model)
+pub const fn serves_file_input(c: &Candidate) -> bool {
+    !listed(REFUSES_FILE_INPUT, c.provider, c.upstream_model)
 }
 
 /// Candidates that answer only streams. Together serves these Qwen models only with
@@ -501,10 +498,8 @@ pub fn long_running(row: &ModelRoute) -> bool {
 }
 
 /// Whether a candidate answers only streams. See [`STREAM_ONLY`].
-pub fn stream_only(c: &Candidate) -> bool {
-    STREAM_ONLY
-        .iter()
-        .any(|&(p, m)| p == c.provider && m == c.upstream_model)
+pub const fn stream_only(c: &Candidate) -> bool {
+    listed(STREAM_ONLY, c.provider, c.upstream_model)
 }
 
 /// What a candidate's default thinking does to a tool request, and so when the gateway asks it not
@@ -595,11 +590,16 @@ const TOOL_THINKING: &[(ProviderId, &str, ToolThinking)] = &[
 ];
 
 /// See [`ToolThinking`] and [`TOOL_THINKING`].
-pub fn tool_thinking(c: &Candidate) -> ToolThinking {
-    TOOL_THINKING
-        .iter()
-        .find(|&&(p, m, _)| p == c.provider && m == c.upstream_model)
-        .map_or(ToolThinking::Free, |&(_, _, t)| t)
+pub const fn tool_thinking(c: &Candidate) -> ToolThinking {
+    let mut i = 0;
+    while i < TOOL_THINKING.len() {
+        let (p, m, t) = TOOL_THINKING[i];
+        if same_id(p, c.provider) && str_eq(m, c.upstream_model) {
+            return t;
+        }
+        i += 1;
+    }
+    ToolThinking::Free
 }
 
 /// Whether a candidate's Chat Completions reads the `developer` role as OpenAI defines it. OpenAI
@@ -610,7 +610,116 @@ pub fn tool_thinking(c: &Candidate) -> ToolThinking {
 /// 5.2 accept it but did not follow it (2026-10-01, D173). For a model that is not OpenAI's,
 /// `developer` is the system role by another name.
 pub const fn reads_developer_role(c: &Candidate) -> bool {
-    matches!(c.provider, ProviderId::OpenAi | ProviderId::OpenRouter)
+    same_id(c.provider, ProviderId::OpenAi) || same_id(c.provider, ProviderId::OpenRouter)
+}
+
+/// Whether a candidate serves a Claude model, on whatever wire. See [`Caps::CLAUDE`].
+pub const fn serves_claude(c: &Candidate) -> bool {
+    contains(c.upstream_model, "claude")
+}
+
+/// The capabilities the gateway asks of the candidate serving an attempt, several at once, as flags
+/// derived from the tables above ([`Candidate::caps`]). The providers crate takes no dependencies,
+/// so these are hand-rolled bitflags. Every other capability is asked one at a time, of its own
+/// predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Caps(u8);
+
+impl Caps {
+    /// Accepts fine-grained tool input streaming ([`serves_eager_input_streaming`]).
+    pub const EAGER_INPUT_STREAMING: Caps = Caps(1 << 0);
+    /// Answers only streams ([`stream_only`]).
+    pub const STREAM_ONLY: Caps = Caps(1 << 1);
+    /// Reads the `developer` role as OpenAI defines it ([`reads_developer_role`]).
+    pub const DEVELOPER_ROLE: Caps = Caps(1 << 2);
+    /// Serves a Claude model, on whatever wire: its thinking has Claude's replay rules even behind
+    /// Chat Completions (OpenRouter's `anthropic/…`).
+    pub const CLAUDE: Caps = Caps(1 << 3);
+
+    /// Whether every flag in `other` is set.
+    pub const fn contains(self, other: Caps) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    const fn with(self, flag: Caps, on: bool) -> Caps {
+        if on { Caps(self.0 | flag.0) } else { self }
+    }
+}
+
+impl Candidate {
+    /// Every [`Caps`] flag at once, for the gateway's per-attempt body edits, which ask the serving
+    /// candidate all of them. Each flag is its own predicate above, over the table that documents
+    /// it.
+    pub const fn caps(&self) -> Caps {
+        Caps(0)
+            .with(
+                Caps::EAGER_INPUT_STREAMING,
+                serves_eager_input_streaming(self),
+            )
+            .with(Caps::STREAM_ONLY, stream_only(self))
+            .with(Caps::DEVELOPER_ROLE, reads_developer_role(self))
+            .with(Caps::CLAUDE, serves_claude(self))
+    }
+}
+
+// `const` stand-ins for the `str` and slice methods the derivations above need.
+
+const fn same_id(a: ProviderId, b: ProviderId) -> bool {
+    a.index() == b.index()
+}
+
+/// Whether `needle` occurs in `hay` at byte `at`.
+const fn starts_at(hay: &[u8], needle: &[u8], at: usize) -> bool {
+    if at + needle.len() > hay.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < needle.len() {
+        if hay[at + i] != needle[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+const fn ends_with(s: &str, suffix: &str) -> bool {
+    let (s, suffix) = (s.as_bytes(), suffix.as_bytes());
+    s.len() >= suffix.len() && starts_at(s, suffix, s.len() - suffix.len())
+}
+
+const fn contains(s: &str, needle: &str) -> bool {
+    let (s, needle) = (s.as_bytes(), needle.as_bytes());
+    let mut at = 0;
+    while at + needle.len() <= s.len() {
+        if starts_at(s, needle, at) {
+            return true;
+        }
+        at += 1;
+    }
+    false
+}
+
+const fn any_eq(list: &[&str], m: &str) -> bool {
+    let mut i = 0;
+    while i < list.len() {
+        if str_eq(list[i], m) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+const fn listed(table: &[(ProviderId, &str)], p: ProviderId, m: &str) -> bool {
+    let mut i = 0;
+    while i < table.len() {
+        if same_id(table[i].0, p) && str_eq(table[i].1, m) {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Upper bound on candidates per row, so the gateway can track which are usable in a single `u8`
@@ -4723,6 +4832,79 @@ mod tests {
                     r.model
                 );
             }
+        }
+    }
+
+    /// Every candidate's capabilities, derived in `const fn`s, are what the run-time predicates they
+    /// replaced computed: the oracle below is those predicates as they were written, over the same
+    /// tables. A flag or predicate that disagrees for any candidate of any row is a behaviour change.
+    #[test]
+    fn every_candidates_caps_match_the_predicates_they_replaced() {
+        let listed = |table: &[(ProviderId, &str)], c: &Candidate| {
+            table
+                .iter()
+                .any(|&(p, m)| p == c.provider && m == c.upstream_model)
+        };
+        let caps_oracle = |c: &Candidate| {
+            [
+                (
+                    Caps::EAGER_INPUT_STREAMING,
+                    c.provider != ProviderId::Bedrock
+                        || BEDROCK_EAGER_INPUT_STREAMING.contains(&c.upstream_model),
+                ),
+                (Caps::STREAM_ONLY, listed(STREAM_ONLY, c)),
+                (
+                    Caps::DEVELOPER_ROLE,
+                    matches!(c.provider, ProviderId::OpenAi | ProviderId::OpenRouter),
+                ),
+                (Caps::CLAUDE, c.upstream_model.contains("claude")),
+            ]
+            .into_iter()
+            .fold(Caps::default(), |caps, (flag, on)| caps.with(flag, on))
+        };
+        let mut seen = 0;
+        for row in MODEL_ROUTES {
+            for c in row.candidates.iter().chain(row.responses) {
+                let at = format!("{} {:?} {}", row.model, c.provider, c.path);
+                assert_eq!(c.caps(), caps_oracle(c), "{at}");
+                assert_eq!(
+                    serves_structured_outputs(c),
+                    !matches!(c.provider, ProviderId::Bedrock)
+                        && !listed(REFUSES_STRUCTURED_OUTPUTS, c),
+                    "{at}"
+                );
+                assert_eq!(
+                    serves_fast_mode(c),
+                    c.provider == ProviderId::Anthropic
+                        && endpoint_of_path(c.path) == "messages"
+                        && FAST_MODE_MODELS.contains(&c.upstream_model),
+                    "{at}"
+                );
+                assert_eq!(serves_file_input(c), !listed(REFUSES_FILE_INPUT, c), "{at}");
+                assert_eq!(
+                    tool_thinking(c),
+                    TOOL_THINKING
+                        .iter()
+                        .find(|&&(p, m, _)| p == c.provider && m == c.upstream_model)
+                        .map_or(ToolThinking::Free, |&(_, _, t)| t),
+                    "{at}"
+                );
+                seen += 1;
+            }
+        }
+        // Each flag is set on some candidate and clear on another, so none is vacuous.
+        for flag in [
+            Caps::EAGER_INPUT_STREAMING,
+            Caps::STREAM_ONLY,
+            Caps::DEVELOPER_ROLE,
+            Caps::CLAUDE,
+        ] {
+            let on = MODEL_ROUTES
+                .iter()
+                .flat_map(|r| r.candidates.iter().chain(r.responses))
+                .filter(|c| c.caps().contains(flag))
+                .count();
+            assert!(on > 0 && on < seen, "{flag:?} is set on {on} of {seen}");
         }
     }
 

@@ -55,21 +55,18 @@
 //! );
 //!
 //! // Before calling external service
-//! if cb.allow().is_err() {
-//!     // return Err("service temporarily unavailable");
-//! }
+//! let Ok(permit) = cb.allow() else {
+//!     return; // service temporarily unavailable
+//! };
 //!
+//! // Every permit is resolved exactly once: an outcome, or a release when the attempt never
+//! // heard from the service.
 //! // match call_external_service().await {
-//! //     Ok(result) => {
-//! //         cb.record_success();
-//! //         Ok(result)
-//! //     }
-//! //     Err(e) if is_connectivity_error(&e) => {
-//! //         cb.record_failure();
-//! //         Err(e)
-//! //     }
-//! //     Err(e) => Err(e), // Don't count business logic errors
+//! //     Ok(result) => { cb.record_success_for(permit); Ok(result) }
+//! //     Err(e) if is_connectivity_error(&e) => { cb.record_failure_for(permit); Err(e) }
+//! //     Err(e) => { cb.release(permit); Err(e) } // Don't count business logic errors
 //! // }
+//! cb.release(permit);
 //! ```
 
 use std::sync::LazyLock;
@@ -292,7 +289,7 @@ impl CircuitBreaker {
             let (state, failures, permits, timestamp) = Self::unpack(packed);
 
             match state {
-                STATE_CLOSED => return Ok(Permit(NOT_A_PROBE)),
+                STATE_CLOSED => return Ok(Permit(Kind::NotProbe)),
 
                 STATE_OPEN => {
                     let now = self.now_secs();
@@ -392,31 +389,34 @@ impl CircuitBreaker {
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     );
-                    return Ok(Permit(NOT_A_PROBE));
+                    return Ok(Permit(Kind::NotProbe));
                 }
             }
         }
     }
 
-    /// Record a successful request.
+    /// Resolve `permit` as a success.
     ///
-    /// In closed state, resets the failure counter (and window for windowed mode).
-    /// In half-open state, closes the circuit (service is healthy again).
+    /// In closed state, resets the failure counter (and window for windowed mode). In half-open
+    /// state, closes the circuit (service is healthy again), but only the current generation's probe
+    /// decides: a reclaimed probe's late answer, or one admitted before the breaker half-opened, is
+    /// a no-op.
     ///
-    /// An outcome not tied to a permit (an error found in a 200 body after its head resolved the
-    /// permit). An attempt resolving the permit `allow()` gave it uses
-    /// [`record_success_for`](Self::record_success_for).
-    pub fn record_success(&self) {
-        self.success(None);
+    /// The returned [`Answered`] is for an attempt whose answer may still turn out to be an error
+    /// (a 200 whose body is one); every other caller drops it.
+    pub fn record_success_for(&self, permit: Permit) -> Answered {
+        self.success(&permit);
+        Answered(permit)
     }
 
-    /// Resolve `permit` as a success. In HALF_OPEN only the current generation's probe decides:
-    /// a reclaimed probe's late answer, or one admitted before the breaker half-opened, is a no-op.
-    pub fn record_success_for(&self, permit: Permit) {
-        self.success(Some(permit));
+    /// Count an answer [`record_success_for`](Self::record_success_for) took as a success as the
+    /// failure its body showed it to be, in the generation it was claimed in: a late verdict cannot
+    /// reopen a breaker another request's probe owns by then (D286).
+    pub fn record_late_failure(&self, answered: Answered) {
+        self.record_failure_for(answered.0);
     }
 
-    fn success(&self, scope: Option<Permit>) {
+    fn success(&self, scope: &Permit) {
         // Fast path: a healthy CLOSED breaker with no accrued failures is the overwhelmingly common
         // case — every successful response calls this. Bail before any write so high-throughput
         // success traffic to one provider doesn't bounce its breaker cache line across every worker
@@ -447,7 +447,7 @@ impl CircuitBreaker {
                     }
                     Self::pack(STATE_CLOSED, failures, successes + 1, ts)
                 }
-                (STATE_HALF_OPEN, _) if Self::stale(scope, failures) => return,
+                (STATE_HALF_OPEN, _) if scope.stale(failures) => return,
                 // Consecutive, an expired window, or HALF_OPEN (a probe succeeded → close the
                 // circuit): reset the counts and re-anchor the window.
                 (STATE_CLOSED | STATE_HALF_OPEN, _) => Self::pack(STATE_CLOSED, 0, 0, now),
@@ -467,39 +467,20 @@ impl CircuitBreaker {
         }
     }
 
-    /// Record a failed request.
+    /// Resolve `permit` as a failure.
     ///
-    /// In closed state, increments the failure counter and opens the circuit
-    /// if the threshold is reached.
-    /// In half-open state, reopens the circuit immediately.
-    ///
-    /// An outcome not tied to a permit; see [`record_success`](Self::record_success).
-    pub fn record_failure(&self) {
-        self.failure(None);
-    }
-
-    /// Resolve `permit` as a failure. In HALF_OPEN only the current generation's probe decides,
-    /// as for [`record_success_for`](Self::record_success_for).
+    /// In closed state, increments the failure counter and opens the circuit if the threshold is
+    /// reached. In half-open state, reopens the circuit immediately, but only the current
+    /// generation's probe decides, as for [`record_success_for`](Self::record_success_for).
     pub fn record_failure_for(&self, permit: Permit) {
-        self.failure(Some(permit));
-    }
-
-    fn failure(&self, scope: Option<Permit>) {
         match &self.config.failure_policy {
             FailurePolicy::Consecutive { threshold } => {
-                self.record_failure_consecutive(*threshold, scope);
+                self.record_failure_consecutive(*threshold, &permit);
             }
             FailurePolicy::Windowed { threshold, window } => {
-                self.record_failure_windowed(*threshold, window.as_secs(), scope);
+                self.record_failure_windowed(*threshold, window.as_secs(), &permit);
             }
         }
-    }
-
-    /// Whether `scope` is a permit from another generation than the HALF_OPEN word's `generation`.
-    /// An unscoped outcome (`None`) is never stale.
-    #[inline]
-    fn stale(scope: Option<Permit>, generation: u64) -> bool {
-        scope.is_some_and(|p| u64::from(p.0) != generation)
     }
 
     /// The OPEN word for a breaker opening at `now`. Its generation is seeded from the clock, not
@@ -510,7 +491,7 @@ impl CircuitBreaker {
     }
 
     /// Record failure with consecutive failure tracking.
-    fn record_failure_consecutive(&self, threshold: u32, scope: Option<Permit>) {
+    fn record_failure_consecutive(&self, threshold: u32, scope: &Permit) {
         let threshold = threshold.min(MAX_FAILURE_THRESHOLD);
         // Read the clock once, above the retry loop — the timestamp this failure stamps is the time
         // the failure happened, not the time its CAS finally landed, and re-reading a vDSO clock on
@@ -530,7 +511,7 @@ impl CircuitBreaker {
                         Self::pack(STATE_CLOSED, new_failures, 0, now)
                     }
                 }
-                STATE_HALF_OPEN if Self::stale(scope, failures) => return,
+                STATE_HALF_OPEN if scope.stale(failures) => return,
                 // Keep the generation; the next half-open bumps it.
                 STATE_HALF_OPEN => Self::pack(STATE_OPEN, failures, 0, now),
                 // OPEN is already open; any other word is invalid.
@@ -558,7 +539,7 @@ impl CircuitBreaker {
     /// CAS and each sees the latest count, so they linearize into a correct running total instead of
     /// each independently resetting to 1 and dropping the others (which could pin the count at 1 and
     /// keep a genuinely-broken provider's breaker stuck closed).
-    fn record_failure_windowed(&self, threshold: u32, window_secs: u64, scope: Option<Permit>) {
+    fn record_failure_windowed(&self, threshold: u32, window_secs: u64, scope: &Permit) {
         let threshold = threshold.min(MAX_FAILURE_THRESHOLD);
         let now = self.now_secs();
 
@@ -595,7 +576,7 @@ impl CircuitBreaker {
                         Self::pack(STATE_CLOSED, new_failures, successes, anchor)
                     }
                 }
-                STATE_HALF_OPEN if Self::stale(scope, failures) => return,
+                STATE_HALF_OPEN if scope.stale(failures) => return,
                 STATE_HALF_OPEN => Self::pack(STATE_OPEN, failures, 0, now),
                 // OPEN is already open; any other word is invalid.
                 _ => return,
@@ -641,7 +622,7 @@ impl CircuitBreaker {
             let packed = self.state.load(Ordering::Acquire);
             let (state, failures, permits, ts) = Self::unpack(packed);
             if state != STATE_HALF_OPEN
-                || u64::from(permit.0) != failures
+                || permit.stale(failures)
                 || permits >= u64::from(self.config.half_open_permits)
             {
                 return;
@@ -695,22 +676,49 @@ impl CircuitBreaker {
     }
 }
 
-/// What `allow()` hands out: the right to resolve one attempt. In HALF_OPEN it carries the probe
-/// generation it was claimed in; from CLOSED it is no probe at all, so it can never resolve or
-/// release one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Permit(u16);
+/// What `allow()` hands out: the right, and the duty, to resolve one attempt exactly once, with
+/// [`CircuitBreaker::record_success_for`], [`CircuitBreaker::record_failure_for`] or
+/// [`CircuitBreaker::release`], each of which consumes it. Neither `Copy` nor `Clone`, and only
+/// `allow()` makes one, so an outcome cannot be recorded twice, or without an `allow()` before it.
+///
+/// Dropping one resolves nothing: a dropped probe strands its half-open slot until the stalled-probe
+/// reclaim. A holder that can be dropped mid-attempt must release it in its own `Drop`.
+#[must_use = "a permit owes its breaker exactly one outcome or release"]
+#[derive(Debug, PartialEq, Eq)]
+pub struct Permit(Kind);
 
-/// A permit claimed while CLOSED. Outside the 14-bit generation range, so it matches none.
-const NOT_A_PROBE: u16 = u16::MAX;
+#[derive(Debug, PartialEq, Eq)]
+enum Kind {
+    /// Claimed while CLOSED: no probe at all, so it decides no probe and releases none.
+    NotProbe,
+    /// A HALF_OPEN probe, of the generation it was claimed in (a 14-bit field value).
+    Probe(u16),
+}
 
 impl Permit {
-    /// A probe permit of `generation` (a 14-bit field value, so it always fits).
+    /// A probe permit of `generation`.
     #[inline]
     fn probe(generation: u64) -> Self {
-        Self((generation & FAILURE_MASK) as u16)
+        Self(Kind::Probe((generation & FAILURE_MASK) as u16))
+    }
+
+    /// Whether this permit decides nothing in a HALF_OPEN word of `generation`: one claimed while
+    /// CLOSED, or in another generation (reclaimed from a stalled probe, or from before the breaker
+    /// half-opened, D256).
+    #[inline]
+    fn stale(&self, generation: u64) -> bool {
+        match self.0 {
+            Kind::NotProbe => true,
+            Kind::Probe(g) => u64::from(g) != generation,
+        }
     }
 }
+
+/// A permit [`CircuitBreaker::record_success_for`] resolved because a response head arrived, kept
+/// by an attempt whose body may yet show the answer was an error. It can be spent once, on
+/// [`CircuitBreaker::record_late_failure`], and is otherwise dropped with nothing owed.
+#[derive(Debug)]
+pub struct Answered(Permit);
 
 /// Error returned when the circuit is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -742,10 +750,57 @@ pub enum CircuitState {
 }
 
 #[cfg(test)]
+impl Permit {
+    /// A second permit equal to this one: what only a bug could produce, for the tests that show
+    /// the breaker's word still holds against a permit resolved twice.
+    fn forged_copy(&self) -> Self {
+        Self(match self.0 {
+            Kind::NotProbe => Kind::NotProbe,
+            Kind::Probe(g) => Kind::Probe(g),
+        })
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
+
+    /// One attempt that failed: `allow()` and its outcome, which is what the tests written against
+    /// an outcome with no permit meant. The two agree in CLOSED (where any permit counts), in OPEN
+    /// before the reset timeout (no permit is handed out, and an outcome there records nothing),
+    /// and in HALF_OPEN with a permit to claim (the claimed probe decides, as an unscoped outcome
+    /// did). They differ in OPEN past the reset timeout (`allow()` half-opens the breaker first) and
+    /// in HALF_OPEN with every permit out (`allow()` refuses, where an unscoped outcome decided): a
+    /// test in either state resolves its own permit instead. The assertion catches the second. The
+    /// first is unguarded, because it depends on the test's clock: in OPEN past the reset timeout
+    /// this helper half-opens the breaker and records against the probe, so no test may rely on it
+    /// matching an unscoped outcome there.
+    pub(super) fn fail(cb: &CircuitBreaker) {
+        assert_not_out_of_probes(cb);
+        if let Ok(permit) = cb.allow() {
+            cb.record_failure_for(permit);
+        }
+    }
+
+    /// One attempt that succeeded. See [`fail`] for the states this stands in for.
+    pub(super) fn succeed(cb: &CircuitBreaker) {
+        assert_not_out_of_probes(cb);
+        if let Ok(permit) = cb.allow() {
+            cb.record_success_for(permit);
+        }
+    }
+
+    fn assert_not_out_of_probes(cb: &CircuitBreaker) {
+        debug_assert!(
+            cb.state()
+                != CircuitState::HalfOpen {
+                    permits_remaining: 0
+                },
+            "every probe permit is out: resolve the permit you hold instead"
+        );
+    }
 
     // =========================================================================
     // Consecutive mode tests
@@ -767,11 +822,11 @@ mod tests {
     fn test_consecutive_failures_increment() {
         let cb = CircuitBreaker::new(CircuitBreakerConfig::consecutive(5));
 
-        cb.record_failure();
+        fail(&cb);
         assert_eq!(cb.state(), CircuitState::Closed { failure_count: 1 });
 
-        cb.record_failure();
-        cb.record_failure();
+        fail(&cb);
+        fail(&cb);
         assert_eq!(cb.state(), CircuitState::Closed { failure_count: 3 });
     }
 
@@ -779,12 +834,12 @@ mod tests {
     fn test_consecutive_success_resets_failures() {
         let cb = CircuitBreaker::new(CircuitBreakerConfig::consecutive(5));
 
-        cb.record_failure();
-        cb.record_failure();
-        cb.record_failure();
+        fail(&cb);
+        fail(&cb);
+        fail(&cb);
         assert_eq!(cb.state(), CircuitState::Closed { failure_count: 3 });
 
-        cb.record_success();
+        succeed(&cb);
         assert_eq!(cb.state(), CircuitState::Closed { failure_count: 0 });
     }
 
@@ -792,11 +847,11 @@ mod tests {
     fn test_consecutive_opens_at_threshold() {
         let cb = CircuitBreaker::new(CircuitBreakerConfig::consecutive(3));
 
-        cb.record_failure();
-        cb.record_failure();
+        fail(&cb);
+        fail(&cb);
         assert!(matches!(cb.state(), CircuitState::Closed { .. }));
 
-        cb.record_failure();
+        fail(&cb);
         assert_eq!(cb.state(), CircuitState::Open);
     }
 
@@ -806,7 +861,7 @@ mod tests {
             CircuitBreakerConfig::consecutive(1).reset_timeout(Duration::from_secs(3600)),
         );
 
-        cb.record_failure();
+        fail(&cb);
         assert_eq!(cb.state(), CircuitState::Open);
         assert!(cb.allow().is_err());
     }
@@ -819,7 +874,7 @@ mod tests {
                 .half_open_permits(2),
         );
 
-        cb.record_failure();
+        fail(&cb);
         assert_eq!(cb.state(), CircuitState::Open);
 
         thread::sleep(Duration::from_millis(10));
@@ -836,7 +891,7 @@ mod tests {
                 .half_open_permits(3),
         );
 
-        cb.record_failure();
+        fail(&cb);
         thread::sleep(Duration::from_millis(10));
 
         assert!(cb.allow().is_ok());
@@ -875,11 +930,11 @@ mod tests {
                 .half_open_permits(3),
         );
 
-        cb.record_failure();
+        fail(&cb);
         thread::sleep(Duration::from_millis(10));
         let _ = cb.allow();
 
-        cb.record_success();
+        succeed(&cb);
         assert_eq!(cb.state(), CircuitState::Closed { failure_count: 0 });
     }
 
@@ -891,11 +946,11 @@ mod tests {
                 .half_open_permits(3),
         );
 
-        cb.record_failure();
+        fail(&cb);
         thread::sleep(Duration::from_millis(10));
         let _ = cb.allow();
 
-        cb.record_failure();
+        fail(&cb);
         assert_eq!(cb.state(), CircuitState::Open);
     }
 
@@ -907,11 +962,11 @@ mod tests {
     fn test_windowed_opens_at_threshold() {
         let cb = CircuitBreaker::new(CircuitBreakerConfig::windowed(3, Duration::from_secs(10)));
 
-        cb.record_failure();
-        cb.record_failure();
+        fail(&cb);
+        fail(&cb);
         assert!(matches!(cb.state(), CircuitState::Closed { .. }));
 
-        cb.record_failure();
+        fail(&cb);
         assert_eq!(cb.state(), CircuitState::Open);
     }
 
@@ -928,20 +983,20 @@ mod tests {
             clock,
         );
 
-        cb.record_failure();
-        cb.record_failure();
+        fail(&cb);
+        fail(&cb);
         assert_eq!(cb.state(), CircuitState::Closed { failure_count: 2 });
 
         // The window (second-level precision) expires.
         NOW.store(101, Ordering::Relaxed);
 
         // This failure starts a new window
-        cb.record_failure();
+        fail(&cb);
         assert_eq!(cb.state(), CircuitState::Closed { failure_count: 1 });
 
         // Two more to hit threshold
-        cb.record_failure();
-        cb.record_failure();
+        fail(&cb);
+        fail(&cb);
         assert_eq!(cb.state(), CircuitState::Open);
     }
 
@@ -949,16 +1004,16 @@ mod tests {
     fn test_windowed_success_does_not_erase_failures() {
         let cb = CircuitBreaker::new(CircuitBreakerConfig::windowed(3, Duration::from_secs(10)));
 
-        cb.record_failure();
-        cb.record_failure();
+        fail(&cb);
+        fail(&cb);
         assert_eq!(cb.state(), CircuitState::Closed { failure_count: 2 });
 
         // A success is counted against the rate, not a reset.
-        cb.record_success();
+        succeed(&cb);
         assert_eq!(cb.state(), CircuitState::Closed { failure_count: 2 });
 
         // 3 failures to 1 success: past the threshold and at least half the outcomes.
-        cb.record_failure();
+        fail(&cb);
         assert_eq!(cb.state(), CircuitState::Open);
     }
 
@@ -968,8 +1023,8 @@ mod tests {
         // The brownout a success-resets rule missed: every other request fails.
         let cb = CircuitBreaker::new(CircuitBreakerConfig::windowed(4, Duration::from_secs(60)));
         for _ in 0..4 {
-            cb.record_failure();
-            cb.record_success();
+            fail(&cb);
+            succeed(&cb);
         }
         assert_eq!(cb.state(), CircuitState::Open);
     }
@@ -979,9 +1034,9 @@ mod tests {
         // Far more failures than the threshold, but a tenth of the traffic.
         let cb = CircuitBreaker::new(CircuitBreakerConfig::windowed(4, Duration::from_secs(60)));
         for _ in 0..50 {
-            cb.record_failure();
+            fail(&cb);
             for _ in 0..9 {
-                cb.record_success();
+                succeed(&cb);
             }
         }
         assert!(matches!(cb.state(), CircuitState::Closed { .. }));
@@ -999,7 +1054,7 @@ mod tests {
                 .half_open_permits(1),
             clock,
         );
-        cb.record_failure();
+        fail(&cb);
         NOW.store(105, Ordering::Relaxed);
         let stalled = cb.allow().expect("the probe");
         assert!(cb.allow().is_err(), "the only permit is out");
@@ -1010,7 +1065,7 @@ mod tests {
         let live = cb.allow().expect("the stalled probe's permit is reclaimed");
         assert!(cb.allow().is_err());
         // The stalled probe no longer decides: its late answer, either way, is a no-op.
-        cb.record_success_for(stalled);
+        cb.record_success_for(stalled.forged_copy());
         cb.record_failure_for(stalled);
         assert_eq!(
             cb.state(),
@@ -1074,16 +1129,16 @@ mod tests {
             clock,
         );
         let before_trip = cb.allow().expect("closed");
-        cb.record_failure();
+        fail(&cb);
         NOW.store(105, Ordering::Relaxed);
         let first = cb.allow().expect("first half-open's probe");
-        cb.record_failure_for(first);
+        cb.record_failure_for(first.forged_copy());
         assert_eq!(cb.state(), CircuitState::Open);
         NOW.store(110, Ordering::Relaxed);
         let probe = cb.allow().expect("second half-open's probe");
         for stale in [before_trip, first] {
-            cb.release(stale);
-            cb.record_success_for(stale);
+            cb.release(stale.forged_copy());
+            cb.record_success_for(stale.forged_copy());
             cb.record_failure_for(stale);
         }
         assert_eq!(
@@ -1117,7 +1172,7 @@ mod tests {
                 .half_open_permits(1),
             clock,
         ));
-        cb.record_failure();
+        fail(&cb);
         let mut stale = Vec::new();
         for t in 1..=32 {
             NOW.store(100 + 5 * t, Ordering::Relaxed);
@@ -1135,7 +1190,7 @@ mod tests {
             h.join().unwrap();
         }
         assert!(cb.allow().is_err(), "the live probe is the only one");
-        cb.release(live);
+        cb.release(live.forged_copy());
         cb.release(live);
         assert_eq!(
             cb.state(),
@@ -1160,7 +1215,7 @@ mod tests {
                 .half_open_permits(1),
             clock,
         );
-        cb.record_failure();
+        fail(&cb);
         NOW.store(105, Ordering::Relaxed);
         let probe = cb.allow().expect("the probe");
         NOW.store(112, Ordering::Relaxed);
@@ -1191,7 +1246,7 @@ mod tests {
                 .half_open_permits(1),
             clock,
         );
-        cb.record_failure();
+        fail(&cb);
         NOW.store(105, Ordering::Relaxed);
         let stalled = cb.allow().expect("the probe");
         NOW.store(110, Ordering::Relaxed);
@@ -1225,7 +1280,7 @@ mod tests {
                 .half_open_permits(1),
             clock,
         );
-        cb.record_failure();
+        fail(&cb);
         NOW.store(105, Ordering::Relaxed);
         let stalled = cb.allow().expect("the probe");
         NOW.store(110, Ordering::Relaxed);
@@ -1256,7 +1311,7 @@ mod tests {
             clock,
         );
         assert_eq!(cb.retry_after_secs(), 1, "closed");
-        cb.record_failure();
+        fail(&cb);
         assert_eq!(cb.retry_after_secs(), 30);
         NOW.store(120, Ordering::Relaxed);
         assert_eq!(cb.retry_after_secs(), 10);
@@ -1269,13 +1324,13 @@ mod tests {
                 .reset_timeout(Duration::from_millis(1))
                 .half_open_permits(1),
         );
-        cb.record_failure();
+        fail(&cb);
         thread::sleep(Duration::from_millis(10));
         let probe = cb.allow().expect("the probe");
         cb.release(probe);
         let again = cb.allow().expect("the released permit probes again");
         // Releasing more than was handed out cannot mint permits.
-        cb.release(again);
+        cb.release(again.forged_copy());
         cb.release(again);
         assert_eq!(
             cb.state(),
@@ -1292,8 +1347,8 @@ mod tests {
                 .reset_timeout(Duration::from_millis(1)),
         );
 
-        cb.record_failure();
-        cb.record_failure();
+        fail(&cb);
+        fail(&cb);
         assert_eq!(cb.state(), CircuitState::Open);
 
         thread::sleep(Duration::from_millis(10));
@@ -1301,7 +1356,7 @@ mod tests {
         assert!(cb.allow().is_ok());
         assert!(matches!(cb.state(), CircuitState::HalfOpen { .. }));
 
-        cb.record_success();
+        succeed(&cb);
         assert_eq!(cb.state(), CircuitState::Closed { failure_count: 0 });
     }
 
@@ -1320,7 +1375,7 @@ mod tests {
                 .map(|_| {
                     let cb = Arc::clone(&cb);
                     thread::spawn(move || {
-                        cb.record_failure();
+                        fail(&cb);
                     })
                 })
                 .collect();
@@ -1342,7 +1397,7 @@ mod tests {
                     .half_open_permits(5),
             ));
 
-            cb.record_failure();
+            fail(&cb);
             thread::sleep(Duration::from_millis(10));
 
             let allowed = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1395,7 +1450,7 @@ mod tests {
             let handles: Vec<_> = (0..20)
                 .map(|_| {
                     let cb = Arc::clone(&cb);
-                    thread::spawn(move || cb.record_failure())
+                    thread::spawn(move || fail(&cb))
                 })
                 .collect();
 
@@ -1423,7 +1478,7 @@ mod tests {
                 .map(|_| {
                     let cb = Arc::clone(&cb);
                     thread::spawn(move || {
-                        cb.record_failure();
+                        fail(&cb);
                     })
                 })
                 .collect();
@@ -1477,7 +1532,7 @@ mod tests {
             backstep_open_clock,
         );
 
-        cb.record_failure();
+        fail(&cb);
         assert_eq!(cb.state(), CircuitState::Open);
 
         // NTP steps the clock one hour backwards.
@@ -1516,20 +1571,20 @@ mod tests {
             backstep_window_clock,
         );
 
-        cb.record_failure();
+        fail(&cb);
         assert_eq!(cb.state(), CircuitState::Closed { failure_count: 1 });
 
         // NTP steps the clock one hour backwards mid-window.
         BACKSTEP_WINDOW_CLOCK.store(10_000 - 3_600, Ordering::SeqCst);
 
-        cb.record_failure();
+        fail(&cb);
         assert_eq!(
             cb.state(),
             CircuitState::Closed { failure_count: 2 },
             "failures must keep accruing across a backwards clock step"
         );
 
-        cb.record_failure();
+        fail(&cb);
         assert_eq!(
             cb.state(),
             CircuitState::Open,
@@ -1550,10 +1605,10 @@ mod tests {
                 fixed_clock,
             );
             for _ in 0..MAX_FAILURE_THRESHOLD - 1 {
-                cb.record_failure();
+                fail(&cb);
             }
             assert!(matches!(cb.state(), CircuitState::Closed { .. }));
-            cb.record_failure();
+            fail(&cb);
             assert_eq!(
                 cb.state(),
                 CircuitState::Open,
@@ -1574,12 +1629,12 @@ mod tests {
                 .reset_timeout(Duration::from_secs(3600)),
             fixed_clock,
         );
-        cb.record_failure();
+        fail(&cb);
         for _ in 0..20_000 {
-            cb.record_success();
+            succeed(&cb);
         }
         for _ in 0..20_001 {
-            cb.record_failure();
+            fail(&cb);
             if cb.state() == CircuitState::Open {
                 return;
             }
@@ -1652,6 +1707,7 @@ mod tests {
 /// Behaviors a mutation-testing pass found no test constraining.
 #[cfg(test)]
 mod mutation_gaps {
+    use super::tests::{fail, succeed};
     use super::*;
 
     /// `allow()` on a closed breaker is a read: it must not wipe the failures counted so far, or a
@@ -1660,11 +1716,11 @@ mod mutation_gaps {
     #[test]
     fn allow_on_a_closed_breaker_keeps_its_failure_count() {
         let cb = CircuitBreaker::new(CircuitBreakerConfig::consecutive(3));
-        cb.record_failure();
-        cb.record_failure();
+        fail(&cb);
+        fail(&cb);
         assert!(cb.allow().is_ok());
         assert_eq!(cb.state(), CircuitState::Closed { failure_count: 2 });
-        cb.record_failure();
+        fail(&cb);
         assert_eq!(cb.state(), CircuitState::Open);
     }
 
@@ -1681,14 +1737,14 @@ mod mutation_gaps {
             CircuitBreakerConfig::windowed(5, Duration::from_secs(10)),
             clock,
         );
-        cb.record_failure();
-        cb.record_failure();
+        fail(&cb);
+        fail(&cb);
         NOW.store(1_009, Ordering::SeqCst);
-        cb.record_success();
+        succeed(&cb);
         assert_eq!(cb.state(), CircuitState::Closed { failure_count: 2 });
         // Exactly one window after the first failure: expired.
         NOW.store(1_010, Ordering::SeqCst);
-        cb.record_success();
+        succeed(&cb);
         assert_eq!(cb.state(), CircuitState::Closed { failure_count: 0 });
     }
 
@@ -1700,7 +1756,7 @@ mod mutation_gaps {
         cb.force_state(CircuitState::HalfOpen {
             permits_remaining: 1,
         });
-        cb.record_failure();
+        fail(&cb);
         assert_eq!(cb.state(), CircuitState::Open);
     }
 
@@ -1740,7 +1796,7 @@ mod mutation_gaps {
     #[test]
     fn reset_closes_an_open_breaker() {
         let cb = CircuitBreaker::new(CircuitBreakerConfig::consecutive(1));
-        cb.record_failure();
+        fail(&cb);
         assert_eq!(cb.state(), CircuitState::Open);
         cb.reset();
         assert_eq!(cb.state(), CircuitState::Closed { failure_count: 0 });
@@ -1763,7 +1819,7 @@ mod mutation_gaps {
                 .half_open_permits(1),
             clock,
         );
-        cb.record_failure();
+        fail(&cb);
         let probe = cb.allow().expect("half-open probe");
         assert_eq!(probe, Permit::probe(0), "the generation wrapped to 0");
         cb.record_success_for(probe);

@@ -100,8 +100,10 @@ Client (stock OpenAI/Anthropic SDK)
   │       (claims a half-open probe permit only on an actual attempt)
   │
   ▼  upstream_peer (proxy.rs)   — runs once per attempt, before any body byte
-  │  Reset request-body phase state (a retry replays bytes through the body filter)
-  │  Model-routed: resolve the outgoing candidate's breaker permit, then walk candidates —
+  │  Start a fresh `Attempt` (a retry replays bytes through the body filter)
+  │  The retry the triggering hook declared: `SameLeg` stays on this provider, keeping its
+  │    permit; `NextCandidate` resolves the outgoing candidate's permit as a failure
+  │  Model-routed: walk candidates —
   │    skip any whose breaker is OPEN, allow() the one chosen, set forward_path to that
   │    candidate's own catalog path; DNS failure advances rather than ending the request
   │  TTL-cached DNS resolve (60s, every address, 5s lookup bound, serve-stale ≤10 min;
@@ -215,7 +217,7 @@ Client (stock OpenAI/Anthropic SDK)
      Cache hit: same row with `cache_hit` and the stored tokens; no parse, no upstream latency
      Capturing: emit ai.payload (both bodies, truncation + completeness flags), correlated by
        request_id → bounded queue, DROPPED on overflow so a stalled sink can't backpressure
-     Resolve the circuit-breaker permit, only if one is still owed (breaker_pending): 5xx / upstream
+     Resolve the circuit-breaker permit, only if the leg still owes one: 5xx / upstream
        failure → failure; no head and no provider outcome (client abort, stalled upload)
        → permit released (`CircuitBreaker::release`), never a success
      Decrement requests_in_flight gauge; release the tenant slot
@@ -311,6 +313,15 @@ key). A BYO `x-api-key` on a gateway with no Anthropic provider configured is a 
 call. A lookalike like Google Gemini's `/v1beta/…` does **not** qualify and 404s as an
 unknown provider instead of being silently absorbed into the OpenAI default. Unknown segment → 404.
 
+In `request_filter` the first segment resolves to a `Route` (`/{provider}`, the bare default, or
+`/auto`) or a `RouteMiss` (each its own 4xx). Once the key is known the route becomes one `Plan`,
+kept whole through admission: `Plan::Provider` (a named provider, or BYO on the bare default) or
+`Plan::Catalog(Walk)` (a managed walk over a resolved row, holding its `Identity` and, for a body
+past the replay buffer, the body its `FullBody` re-run carries). A managed walk still to read its
+row from `x-beyond-model` or the body is `Admission::NeedsRow` until it does. Which route a request
+is on is never re-derived from which locals happen to be set, so a BYO catalog walk, or a walk with
+no first candidate, cannot arise to need a fallback answer.
+
 ### Model routing (`/auto`, managed `/v1`, `providers::catalog`)
 
 One reserved first segment — and the managed bare `/v1` default — routes by **model** instead of
@@ -358,8 +369,9 @@ A `200` whose body is an error object (OpenRouter's error-in-200: a root `error`
 candidate's breaker (`settle_health`, at most 1 KiB read): the head already resolved the permit as a
 success, so `settle_health` records the failure the body showed. Without that a host that keeps
 answering errors in 200s would never be routed around, since the pin does not learn from failures.
-The verdict is recorded against the permit the head resolved, never unscoped: a probe that another
-request owns by the time the body is read is not reopened by it (D286).
+The verdict is recorded against the permit the head resolved (`record_success_for` hands it back as
+an `Answered`, spendable once on `record_late_failure`): a probe that another request owns by the
+time the body is read is not reopened by it (D286).
 
 A managed request may also permute that list with headers, still on the same wire, without adding a
 provider the row does not already name (`ProviderSpec::name` on that row). Parsed in `control.rs`,
@@ -1277,10 +1289,12 @@ What the parent does for every attempt, so a relayed request behaves like any ot
   attempt (one that recorded a `RelayRetry`) still feeds the breaker but writes no
   `ai.usage` or `ai.payload` row.
 - **One tenant slot, taken before the read.** `tenant_max_in_flight` is checked before the body is
-  read in full (`SlotGuard`), so it bounds the bodies held in memory, not only requests in flight: a
-  tenant at its cap gets its 429 before uploading. The parent holds the slot across every attempt;
-  attempts neither take nor release one. A client that stalls during that read gives it back at
-  `client_read_timeout_secs`, HTTP/2 included (D265).
+  read in full, so it bounds the bodies held in memory, not only requests in flight: a tenant at its
+  cap gets its 429 before uploading. The slot is a move-only guard (`concurrency::TenantSlot`, taken
+  only with an `Identity`) that the request context holds and that releases it when dropped, so
+  every way a request ends gives it back exactly once. The parent holds the slot across every
+  attempt; attempts neither take nor release one. A client that stalls during that read gives it
+  back at `client_read_timeout_secs`, HTTP/2 included (D265).
 - **Abandoned attempts wind down first.** The next attempt starts after the abandoned one finishes
   (bounded at 2s), since it still holds that candidate's breaker permit and a half-open breaker has
   one.
@@ -1313,13 +1327,16 @@ the provider:
 - **The upstream path comes from the catalog, per candidate.** Providers disagree on where an
   endpoint lives and the disagreement is _not_ a prefix: Anthropic serves Messages at `/v1/messages`
   from a base carrying no path, OpenRouter serves Claude at `/api/v1/chat/completions`. No client
-  suffix is correct for both, so each candidate states its path outright and `forward_path` is set
-  from it per attempt. The client points its SDK at `/v1` (or `…/auto`) and the row decides.
+  suffix is correct for both, so each candidate states its path outright and the request's
+  `ForwardPath::Catalog` is set from it per attempt (a `/{provider}` route sends
+  `ForwardPath::Stripped`, its own path less the segment; the bare default
+  `ForwardPath::Inbound`). The client points its SDK at `/v1` (or `…/auto`) and the row decides.
 - **The model id is rewritten per attempt.** Providers essentially never share a string —
   `claude-opus-4-8` at Anthropic is `anthropic/claude-opus-4.8` at OpenRouter — so the body's `model`
   is spliced to whatever the serving candidate calls it (`peek::scan_buffered` reports the value's
   byte span). Because the body may change length, catalog-walk requests are buffered and re-framed
-  exactly as the injection path is; the two are one predicate (`RequestCtx::rewrites_body`).
+  exactly as the injection path is; the two are one predicate (`BodyPlan::rewrites_body`, decided
+  once per attempt).
 - **OpenRouter is asked not to compress.** OpenRouter's context compression is on by default for
   endpoints of 8K context or less: an over-window prompt has its middle dropped and is answered
   (gpt-4 through OpenRouter returned 200 to a 10,601-word prompt). An attempt on an OpenRouter
@@ -1689,6 +1706,13 @@ bucket.
 
 `vpc_id` is still not an access check — decoded and emitted on `ai.usage` only. `key_id` is
 emitted on `ai.usage` (`None` for v1).
+
+`Keyring::verify` returns an `Identity`, which nothing else can construct, and an admitted request
+carries `Billing::Managed` (the identity, beside the billing facts its row reads) or
+`Billing::Byo` (no identity at all, never a zero tenant). Every tenant-scoped step (the deny and
+allowance checks, the concurrency slot, capture, the session pin, signed ids, the cache key, the
+`ai.usage` and `ai.payload` rows) reads its tenant from that identity, so an unverified id cannot
+reach one.
 
 Verification cost ≈ 28µs per request — this is the gateway's only meaningful per-request CPU cost
 (everything else runs in nanoseconds; see Benchmarking). The rate guardrails sit **before** verify
@@ -2319,7 +2343,9 @@ Two `HashMap<u64, DenyReason>`s — tenants (`blackhole.{tenant}`) and credentia
 request is denied if the tenant is in the set **or** (v2) its `key_id` is. Tenant deny wins when
 both match and kills every key for that tenant. v1 tokens have no `key_id`, so only the tenant
 map can deny them. Both key shapes live under the `blackhole.` prefix; one `WatchedSet` watcher
-applies both. Written exclusively via `ArcSwap`; reads on the hot path are lock-free.
+applies both. Published through a `store_watch::Watched` (an `ArcSwap` only `store_watch` can
+write; the deny, allowance and capture sets each sit behind one), so reads on the hot path are
+lock-free and nothing but the watcher can replace a set.
 
 Reasons: `Spend` (→ 402), `Fraud` (→ 403), `Unknown` (→ 403, fail-safe for unrecognized values).
 Restore = explicit delete from NATS KV or TTL expiry — no gateway-side timer.
@@ -2692,9 +2718,10 @@ the rate guardrails (which protect against abusive _inbound_ load):
   (D256), a reclaimed probe that later ended with no outcome released a permit it no longer held,
   so `half_open_permits = 1` ran two probes and the count could drift upward; its late answer also
   closed or reopened the breaker under the live probe. `release` still saturates at
-  `half_open_permits`. Outside HALF_OPEN a permit's outcome counts as any other. An outcome with no
-  permit (`record_success` / `record_failure`, the error found in a 200 body after its head resolved
-  the permit) is never stale.
+  `half_open_permits`. Outside HALF_OPEN a permit's outcome counts as any other. There is no outcome
+  without a permit: a `Permit` is `#[must_use]`, neither `Copy` nor `Clone`, made only by `allow()`,
+  and consumed by `record_success_for`, `record_failure_for` or `release`, so the compiler rules out
+  an attempt resolved twice or never claimed.
 - **A `429` is NOT a failure.** It means the provider is healthy and throttling _that credential_ — a
   velocity/spend signal the rate limiter, the same-provider key walk, and the client's `Retry-After`
   backoff own. Tripping on it would convert a self-healing throttle into a self-inflicted outage. The
@@ -2726,21 +2753,24 @@ the rate guardrails (which protect against abusive _inbound_ load):
   used. One breaker per provider, built at boot, shared lock-free across callers.
 - `circuit_breaker_threshold = 0` disables it.
 
-**The permit ledger.** `RequestCtx::breaker_pending` holds the `Permit` **iff** exactly one
-`allow()` is outstanding against whatever `provider` currently points at. `response_filter` (a
-response head arrived) and `logging` (no head ever did) resolve only when it is set, and `take()` it
-— so one `allow()` yields exactly one `record_*_for` or `release`, and a scarce half-open probe
-permit can neither leak nor be resolved twice.
+**The permit ledger.** A request's `Leg` (`proxy.rs`) is one candidate's share of it: the provider,
+the pool key it sends, its address cursor and refused-stream resend, and the `Permit` it owes, held
+**iff** exactly one `allow()` is outstanding against that provider. `response_filter` (a response
+head arrived) and `logging` (no head ever did) resolve it through the leg, which takes the permit —
+so one `allow()` yields exactly one outcome or release, and a scarce half-open probe permit can
+neither leak nor be resolved twice. A candidate switch builds a new leg, so no key index or permit
+of provider A's reaches provider B; a leg dropped with its permit still out (a panic unwinding the
+request) releases it.
 
 For a provider-routed request that is the old behaviour restated: `allow()` is the last thing in
 `request_filter` (after every other rejection, so a permit corresponds to a real upstream attempt),
-and `breaker_pending` is the permit it returned (`None` when the provider has no breaker).
+and the leg owes the permit it returned (none when the provider has no breaker).
 
 For a **model-routed** request the ledger is owned by `upstream_peer`, which gates each candidate as
 it is chosen and records the outgoing candidate's failure when it moves on. Three reasons it lives
 there and not in `fail_to_connect`:
 
-- `upstream_peer` is the only hook that changes `rc.provider`, which is what makes recording the
+- `upstream_peer` is the only hook that changes `rc.leg`, which is what makes recording the
   wrong candidate structurally impossible.
 - It is the only hook that runs on _every_ attempt. Pingora's default `error_while_proxy` marks a
   reused-connection failure retryable on its own, without consulting `fail_to_connect` at all.
@@ -3428,6 +3458,17 @@ pool key's precomputed `HeaderValue` is marked sensitive, so HPACK never indexes
 prints `Sensitive`. Booting with pool keys and `upstream_tls = false` logs a loud warning: every
 managed request would carry Beyond's provider key in cleartext, which is valid only against the
 local plaintext mock.
+
+The file and env merge into `AiConfig` (`AiConfig::load_with_path`), which `AiConfig::validate`
+checks and parses into a `ValidConfig`, the only input `GatewayState::new` takes (`AiConfig::load`
+does both). `ValidConfig` is read-only, every field behind a getter. The settings code branches on
+become types there: `worker_threads` a `Workers` (`Auto` or `Fixed(NonZeroUsize)`), the two TLS
+bools an `UpstreamTls` (`Verified`, `UnverifiedTest`, `PlaintextTest`; the last two still warn and
+boot), the breaker an `Option<BreakerConfig>` with a non-zero threshold, the TLS listener's three
+settings one `Option<TlsListener>` (all set, and the files proven to load together, or none),
+`usage_dir` a `Path`, and every per-provider table a map keyed by `ProviderName`. The loader
+holds the file's provider names to `[a-z0-9_-]` once, lowercased, before the env fold; a name
+`AI_POOL_KEY_<NAME>` adds is lowercased and nothing more.
 
 | Field                               | Default                           | Runtime Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | ----------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |

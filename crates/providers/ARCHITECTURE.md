@@ -13,6 +13,16 @@ lookups over them:
 The first two are documented in their module docs. This file is the contract for the third, and
 describes how the catalog keeps current ("Catalog maintenance").
 
+Two facts the code relies on hold by construction. `ProviderId`, its `ALL`, `index` and `name` are
+generated from one variant list, and a const assertion checks that `PROVIDERS` holds each id once,
+at its own index, under its own name, so `by_id` is an array index. A candidate's capabilities are
+`const fn`s over the tables that document each one (`serves_structured_outputs` over
+`REFUSES_STRUCTURED_OUTPUTS`, `stream_only` over `STREAM_ONLY`, `tool_thinking` over
+`TOOL_THINKING`, …), and the four the gateway asks of each attempt's candidate together come as one
+`Candidate::caps` (hand-rolled bitflags); the gateway branches on them, or on `ProviderId`, never
+on a provider name or a model-id substring. They are derived rather than stored on `Candidate`
+because `rates-sync` writes candidates as `Candidate { provider, upstream_model, path }` literals.
+
 ## Modules
 
 | Module               | Role                                                                        |

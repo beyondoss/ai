@@ -320,7 +320,7 @@ async fn a_reused_connection_reset_before_reading_is_resent() {
 }
 
 /// A retry pingora *does* make — the managed 429 key walk — replays its buffered request body
-/// through `request_body_filter`, which is what `RequestCtx::reset_request_body_phase` exists to
+/// through `request_body_filter`, which is what `RequestCtx::begin_attempt` exists to
 /// make idempotent. The retried body must be whole and well-formed, not the original with a
 /// replayed prefix concatenated onto it, and carry the usage splice exactly once.
 #[tokio::test]

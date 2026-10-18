@@ -99,6 +99,37 @@ impl VirtualKey {
     }
 }
 
+/// A [`VirtualKey`] whose signature [`Keyring::verify`] checked: the only way to make one, so a
+/// tenant id held as an `Identity` was proven, never parsed from something a client sent. Reads as
+/// the claims it carries (`identity.tenant_id`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Identity(VirtualKey);
+
+impl std::ops::Deref for Identity {
+    type Target = VirtualKey;
+    fn deref(&self) -> &VirtualKey {
+        &self.0
+    }
+}
+
+impl PartialEq<VirtualKey> for Identity {
+    fn eq(&self, other: &VirtualKey) -> bool {
+        self.0 == *other
+    }
+}
+
+impl Identity {
+    /// An identity no key proved, for a unit test that needs a managed request without minting one.
+    #[cfg(test)]
+    pub(crate) fn unverified_for_test(tenant_id: u64, vpc_id: u64, key_id: Option<u64>) -> Self {
+        Self(VirtualKey {
+            tenant_id,
+            vpc_id,
+            key_id,
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum KeyError {
     #[error("malformed virtual key")]
@@ -145,7 +176,7 @@ impl Keyring {
 
     /// Verify a virtual key string and extract its identity. Stateless: the only input besides
     /// the token is the public keyring. Accepts `bai_v1` and `bai_v2`.
-    pub fn verify(&self, token: &str) -> Result<VirtualKey, KeyError> {
+    pub fn verify(&self, token: &str) -> Result<Identity, KeyError> {
         // Split into exactly 4 parts: prefix, kid, payload, sig. `splitn(4, '.')` rejects any
         // token with fewer separators; a payload/sig never contains '.' (base64url has none).
         let mut parts = token.splitn(4, '.');
@@ -201,8 +232,12 @@ impl Keyring {
             .map_err(|_| KeyError::BadSignature)?;
 
         match version {
-            1 => VirtualKey::decode_payload_v1(payload).ok_or(KeyError::Malformed),
-            2 => VirtualKey::decode_payload_v2(payload).ok_or(KeyError::Malformed),
+            1 => VirtualKey::decode_payload_v1(payload)
+                .map(Identity)
+                .ok_or(KeyError::Malformed),
+            2 => VirtualKey::decode_payload_v2(payload)
+                .map(Identity)
+                .ok_or(KeyError::Malformed),
             _ => Err(KeyError::BadVersion),
         }
     }
@@ -499,7 +534,7 @@ mod tests {
             key_id: None,
         };
         let token = mint(&id, 1, &sk);
-        assert_eq!(ring.verify(&token), Ok(id));
+        assert_eq!(ring.verify(&token).as_deref(), Ok(&id));
         let rest = token.strip_prefix("bai_v1.1.").unwrap();
         for kid in ["01", "+1", "001", "1 ", " 1", ""] {
             let respelled = format!("bai_v1.{kid}.{rest}");

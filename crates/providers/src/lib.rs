@@ -29,108 +29,91 @@ pub use catalog::{
     for_model, wire_of_path,
 };
 
-/// Every upstream this codebase can route to, by either path. The gateway's 12 `/{name}/…` routes and
-/// the 5 BYO-only aggregator platforms (reachable only by base-URL override, no gateway-native route)
-/// are one enum because they are one *concept* — "which upstream" — and splitting them is what
-/// produced the two-tables-out-of-sync problem this crate exists to end.
-///
-/// `agent_core::models` re-exports this as `AggregatorHost`, its historical name there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ProviderId {
+/// Generates [`ProviderId`] and the tables derived from its variant list ([`ProviderId::ALL`],
+/// [`ProviderId::index`], [`ProviderId::name`]) from one list, so none of them can be edited apart
+/// from the others. A variant's position is its index.
+macro_rules! provider_ids {
+    ($($(#[$meta:meta])* $variant:ident => $name:literal,)*) => {
+        /// Every upstream this codebase can route to, by either path. The gateway's 12 `/{name}/…`
+        /// routes and the 5 BYO-only aggregator platforms (reachable only by base-URL override, no
+        /// gateway-native route) are one enum because they are one *concept* — "which upstream" —
+        /// and splitting them is what produced the two-tables-out-of-sync problem this crate exists
+        /// to end.
+        ///
+        /// `agent_core::models` re-exports this as `AggregatorHost`, its historical name there.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum ProviderId {
+            $($(#[$meta])* $variant,)*
+        }
+
+        impl ProviderId {
+            /// Every variant, in [`Self::index`] order.
+            ///
+            /// Exists so a consumer can build a fixed-size array keyed by id instead of hashing a
+            /// name — the gateway's model-routed path switches providers between connect attempts
+            /// and wants that lookup to be an index, not a string compare.
+            pub const ALL: [ProviderId; [$($name),*].len()] = [$(ProviderId::$variant),*];
+
+            /// How many variants there are — the width of an id-keyed array.
+            pub const COUNT: usize = Self::ALL.len();
+
+            /// A dense index in `0..COUNT`, for array-keyed lookup: the variant's position in the
+            /// list that generates both this and [`Self::ALL`].
+            pub const fn index(self) -> usize {
+                self as usize
+            }
+
+            /// The provider's [`ProviderSpec::name`]: the gateway's path segment and the value
+            /// `AI_PROVIDER` takes.
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $(ProviderId::$variant => $name,)*
+                }
+            }
+        }
+    };
+}
+
+provider_ids! {
     // --- Gateway-native rows: reachable at `/{name}/…` with a pool key. ---
-    OpenAi,
-    Anthropic,
-    OpenRouter,
-    Fireworks,
-    Groq,
-    DeepSeek,
-    Together,
-    Cerebras,
-    Mistral,
-    XAi,
+    OpenAi => "openai",
+    Anthropic => "anthropic",
+    OpenRouter => "openrouter",
+    Fireworks => "fireworks",
+    Groq => "groq",
+    DeepSeek => "deepseek",
+    Together => "together",
+    Cerebras => "cerebras",
+    Mistral => "mistral",
+    XAi => "xai",
     /// ChatGPT Plus/Pro subscription backend. Gateway-routable, but only ever with a *BYO* OAuth
     /// bearer — there is no `AI_POOL_KEY_OPENAI_CODEX`, hence no [`ProviderSpec::env_var`].
-    OpenAiCodex,
+    OpenAiCodex => "openai-codex",
     /// Amazon Bedrock's Anthropic Messages surface (`/anthropic/v1/messages`), authenticated with a
     /// static Amazon Bedrock API key (`AWS_BEARER_TOKEN_BEDROCK` / `x-api-key`). Not SigV4 and not
     /// the Converse/eventstream APIs — those don't fit a byte-relay-plus-key-swap gateway. The
     /// OpenAI-compat surface at `/openai/v1` is a config-added alias (`bedrock-openai`) because one
     /// row has one auth scheme and one wire.
-    Bedrock,
+    Bedrock => "bedrock",
 
     // --- BYO-only rows: no gateway route, named via a `models.json` `base_url` or `AI_PROVIDER`. ---
-    HuggingFace,
-    Nvidia,
+    HuggingFace => "huggingface",
+    Nvidia => "nvidia",
     /// `api.kimi.com/coding` — disambiguated from moonshotai-native by base URL, not by id shape.
-    KimiCoding,
+    KimiCoding => "kimi-coding",
+    /// `opencode.ai/zen/go`. See [`Self::OpenCodeZen`].
+    OpenCodeGo => "opencode-go",
     /// `opencode.ai/zen`. Distinct from [`Self::OpenCodeGo`] despite sharing a hostname: the two
     /// genuinely disagree on wire dialect and real numbers for several shared bare ids (`minimax-m3`,
     /// `glm-5.1`), so [`for_host`] splits them on the `/zen` vs `/zen/go` path segment.
-    OpenCodeZen,
-    /// `opencode.ai/zen/go`. See [`Self::OpenCodeZen`].
-    OpenCodeGo,
+    OpenCodeZen => "opencode-zen",
 }
 
 impl ProviderId {
-    /// Every variant, in [`Self::index`] order.
-    ///
-    /// Exists so a consumer can build a fixed-size array keyed by id instead of hashing a name — the
-    /// gateway's model-routed path switches providers between connect attempts and wants that lookup
-    /// to be an index, not a string compare. Also spares `every_id_has_exactly_one_row` from
-    /// hand-maintaining its own copy of the variant list.
-    pub const ALL: [ProviderId; 17] = [
-        ProviderId::OpenAi,
-        ProviderId::Anthropic,
-        ProviderId::OpenRouter,
-        ProviderId::Fireworks,
-        ProviderId::Groq,
-        ProviderId::DeepSeek,
-        ProviderId::Together,
-        ProviderId::Cerebras,
-        ProviderId::Mistral,
-        ProviderId::XAi,
-        ProviderId::OpenAiCodex,
-        ProviderId::Bedrock,
-        ProviderId::HuggingFace,
-        ProviderId::Nvidia,
-        ProviderId::KimiCoding,
-        ProviderId::OpenCodeZen,
-        ProviderId::OpenCodeGo,
-    ];
-
-    /// How many variants there are — the width of an id-keyed array.
-    pub const COUNT: usize = Self::ALL.len();
-
     /// Whether a managed pool key can serve this provider. The ChatGPT backend takes only a client's
     /// own OAuth bearer (see [`Self::OpenAiCodex`]), so no pool key is ever attached to it.
     pub fn takes_pool_key(self) -> bool {
         !matches!(self, Self::OpenAiCodex)
-    }
-
-    /// A dense index in `0..COUNT`, for array-keyed lookup.
-    ///
-    /// The exhaustive `match` is the point: adding a variant fails to compile here rather than
-    /// silently landing outside an array built from [`Self::COUNT`].
-    pub fn index(self) -> usize {
-        match self {
-            ProviderId::OpenAi => 0,
-            ProviderId::Anthropic => 1,
-            ProviderId::OpenRouter => 2,
-            ProviderId::Fireworks => 3,
-            ProviderId::Groq => 4,
-            ProviderId::DeepSeek => 5,
-            ProviderId::Together => 6,
-            ProviderId::Cerebras => 7,
-            ProviderId::Mistral => 8,
-            ProviderId::XAi => 9,
-            ProviderId::OpenAiCodex => 10,
-            ProviderId::Bedrock => 11,
-            ProviderId::HuggingFace => 12,
-            ProviderId::Nvidia => 13,
-            ProviderId::KimiCoding => 14,
-            ProviderId::OpenCodeZen => 15,
-            ProviderId::OpenCodeGo => 16,
-        }
     }
 }
 
@@ -304,7 +287,7 @@ pub struct ProviderSpec {
 /// Each row's `authority`/`base_url`/`auth` is verified against the provider's **official** docs (cited
 /// inline) as of 2026-05. The gateway-facing client path is noted alongside as a convenience — the
 /// gateway mounts no path of its own, so it's the provider's native one.
-pub const PROVIDERS: &[ProviderSpec] = &[
+pub const PROVIDERS: &[ProviderSpec; ProviderId::COUNT] = &[
     // docs: https://platform.openai.com/docs/api-reference/authentication — base https://api.openai.com/v1, Bearer.
     // Gateway path: /openai/v1/… (or bare /v1/… as the default).
     ProviderSpec {
@@ -646,16 +629,43 @@ pub fn by_name(name: &str) -> Option<&'static ProviderSpec> {
     PROVIDERS.iter().find(|p| p.name.eq_ignore_ascii_case(name))
 }
 
-/// The row for an id. Infallible: every [`ProviderId`] has exactly one row (asserted in tests).
+/// The row for an id: an array index, total by construction ([`PROVIDERS`] holds one row per id, in
+/// [`ProviderId::index`] order, which the const assertion below checks at compile time).
 pub fn by_id(id: ProviderId) -> &'static ProviderSpec {
-    match PROVIDERS.iter().find(|p| p.id == id) {
-        Some(spec) => spec,
-        // Unreachable: `every_id_has_exactly_one_row` proves the table is total over `ProviderId`.
-        // A `panic!` here would violate the workspace's `clippy::panic = deny`, and there is no
-        // sensible `Option` for callers that already hold a valid id — so fall back to the first row,
-        // which is only reachable if someone adds a variant and forgets its row *and* ignores CI.
-        None => &PROVIDERS[0],
+    &PROVIDERS[id.index()]
+}
+
+/// [`PROVIDERS`] lists every [`ProviderId`] exactly once, at its own index, under its own name: what
+/// makes [`by_id`] an index rather than a search. A row out of place is a build failure.
+const _: () = {
+    let mut i = 0;
+    while i < PROVIDERS.len() {
+        assert!(
+            PROVIDERS[i].id.index() == i,
+            "PROVIDERS must list each ProviderId once, in ProviderId order"
+        );
+        assert!(
+            str_eq(PROVIDERS[i].name, PROVIDERS[i].id.name()),
+            "a PROVIDERS row's name must be its ProviderId's name"
+        );
+        i += 1;
     }
+};
+
+/// `a == b`, in `const` context, where `str`'s `PartialEq` is not available.
+pub(crate) const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Whether `path` sits under `prefix` — boundary-checked, so `/zen` does not match `/zenith`, and

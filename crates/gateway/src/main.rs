@@ -11,7 +11,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use beyond_ai::admin::AdminApp;
 use beyond_ai::capture_sink::{CaptureDrain, CaptureSink};
-use beyond_ai::config::AiConfig;
+use beyond_ai::config::{AiConfig, ValidConfig};
 use beyond_ai::doctor;
 use beyond_ai::metrics::Metrics;
 use beyond_ai::proxy::{AiProxy, LIVE_REQUESTS};
@@ -65,8 +65,8 @@ enum Commands {
     Run,
 }
 
-fn load_config(path: Option<&Path>) -> AiConfig {
-    match AiConfig::load_with_path(path) {
+fn load_config(path: Option<&Path>) -> ValidConfig {
+    match AiConfig::load(path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("failed to load config: {e}");
@@ -259,7 +259,7 @@ fn init_tracing(
     metrics: &Metrics,
     queue_depth: usize,
     queue_bytes: usize,
-    usage_dir: Option<&str>,
+    usage_dir: Option<&Path>,
 ) -> LogDrains {
     // JSON to stdout; the `ai.usage` target carries billing facts that logfwd/OTLP ships to
     // ClickHouse. `AI_LOG` sets the level filter for everything **except** those rows.
@@ -311,14 +311,14 @@ fn init_tracing(
         &metrics.log_dropped_total,
     );
     let usage_out = match usage_dir {
-        Some(dir) => match UsageFiles::open(
-            std::path::Path::new(dir),
-            metrics.usage_write_errors_total.clone(),
-        ) {
+        Some(dir) => match UsageFiles::open(dir, metrics.usage_write_errors_total.clone()) {
             Ok(f) => UsageOut::Files(f),
             // A gateway that cannot record billing must not serve: fail at boot, visibly.
             Err(e) => {
-                eprintln!("failed to open the ai.usage directory {dir}: {e}");
+                eprintln!(
+                    "failed to open the ai.usage directory {}: {e}",
+                    dir.display()
+                );
                 exit(1);
             }
         },
@@ -368,7 +368,16 @@ fn main() {
             .enable_all()
             .build()
             .expect("runtime");
-        let config = load_config(cli.config.as_deref());
+        // The raw config, checked as a boot would check it: doctor reads its provider tables.
+        let config = match AiConfig::load_with_path(cli.config.as_deref())
+            .and_then(|c| c.check().map(|()| c))
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("failed to load config: {e}");
+                exit(1);
+            }
+        };
         let results = rt.block_on(doctor::run_checks(&config));
         doctor::print_results("Beyond AI Gateway Doctor", &results);
         exit(if results.iter().all(|r| r.passed) {
@@ -379,20 +388,17 @@ fn main() {
     }
 
     let config = load_config(cli.config.as_deref());
-    let listen = config.listen.clone();
-    let metrics_listen = config.metrics_listen.clone();
-    let downstream_h2c = config.downstream_h2c;
-    // `0` ⇒ one worker per core. Resolved here, before `config` moves into the gateway state.
-    let worker_threads = match config.worker_threads {
-        0 => std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
-        n => n,
-    };
+    let listen = config.listen().clone();
+    let metrics_listen = config.metrics_listen().clone();
+    let downstream_h2c = config.downstream_h2c();
+    // Resolved here, before `config` moves into the gateway state.
+    let worker_threads = config.worker_threads().threads();
     // Capture the shutdown knobs before `config` is moved into the gateway state below.
-    let grace_period_secs = config.shutdown_grace_period_secs;
-    let runtime_timeout_secs = config.shutdown_runtime_timeout_secs;
-    let capture_queue_depth = config.capture_queue_depth;
-    let capture_queue_bytes = config.capture_queue_bytes;
-    let usage_dir = config.usage_dir.clone();
+    let grace_period_secs = config.shutdown_grace_period_secs();
+    let runtime_timeout_secs = config.shutdown_runtime_timeout_secs();
+    let capture_queue_depth = config.capture_queue_depth();
+    let capture_queue_bytes = config.capture_queue_bytes();
+    let usage_dir = config.usage_dir().map(Path::to_path_buf);
     let metrics = match Metrics::new() {
         Ok(m) => m,
         Err(e) => {
@@ -455,12 +461,8 @@ fn main() {
     // pingora's panicking build cannot fire on a bad file). Same service, so the same filters,
     // metrics and billing rows. ALPN follows the plaintext side: h2 and http/1.1, or http/1.1 alone
     // when `downstream_h2c` is off.
-    if let (Some(addr), Some(cert), Some(key)) = (
-        state.config.tls_listen.as_deref(),
-        state.config.tls_cert.as_deref(),
-        state.config.tls_key.as_deref(),
-    ) {
-        let mut tls = match TlsSettings::intermediate(cert, key) {
+    if let Some(listener) = state.config.tls_listener() {
+        let mut tls = match TlsSettings::intermediate(listener.cert(), listener.key()) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("failed to load the TLS certificate: {e}");
@@ -470,7 +472,7 @@ fn main() {
         tls.set_alpn(if downstream_h2c { ALPN::H2H1 } else { ALPN::H1 });
         let mut tls_sock = TcpSocketOptions::default();
         tls_sock.tcp_keepalive = state.config.downstream_tcp_keepalive();
-        proxy_svc.add_tls_with_settings(addr, Some(tls_sock), tls);
+        proxy_svc.add_tls_with_settings(listener.addr(), Some(tls_sock), tls);
     }
     proxy_svc.add_tcp_with_settings(&listen, sock);
     // Size the proxy's worker pool. Pingora resolves a service's thread count as
@@ -504,7 +506,7 @@ fn main() {
         "ai-admin".to_string(),
         HttpServer::new_app(AdminApp {
             metrics: state.metrics.clone(),
-            managed: !state.config.signing_keys.is_empty(),
+            managed: !state.config.signing_keys().is_empty(),
         }),
     );
     admin.add_tcp(&metrics_listen);
@@ -512,7 +514,7 @@ fn main() {
 
     tracing::info!(
         %listen,
-        tls_listen = state.config.tls_listen.as_deref().unwrap_or(""),
+        tls_listen = state.config.tls_listener().map_or("", |l| l.addr()),
         %metrics_listen,
         worker_threads,
         grace_period_secs,

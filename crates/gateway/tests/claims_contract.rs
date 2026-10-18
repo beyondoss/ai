@@ -1173,11 +1173,11 @@ fn doc_comments_sit_on_their_items_and_the_docs_agree() {
     );
     check(
         !doc_above(&proxy, "fn attempt_start(").contains("Clear the state"),
-        "attempt_start carries reset_request_body_phase's doc",
+        "attempt_start carries begin_attempt's doc",
     );
     check(
-        doc_above(&proxy, "fn reset_request_body_phase(").contains("Clear the state"),
-        "reset_request_body_phase has no doc",
+        doc_above(&proxy, "fn begin_attempt(").contains("Clear the state"),
+        "begin_attempt has no doc",
     );
     check(
         !proxy.contains("Two reasons a body gets rewritten"),
