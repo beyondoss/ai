@@ -2975,7 +2975,8 @@ unless the provider proved it unprocessed** (`Lost::may_resend`: an HTTP/2 refus
 HTTP/1.1 connection it reset with the request unread). An error status is the provider's answer, so
 it may walk to another key or candidate whenever pingora still holds the whole body. A connect
 failure moved no body byte. `retry_tests.rs` holds the function to the rules the hooks ran inline
-over every combination of facts they can report, and names each outcome.
+before it, over every combination of facts the hooks report (a lost connection's after
+`proxy::read_lost` skips the ones `decide` can't read), and names each outcome.
 
 ### What is process-wide
 

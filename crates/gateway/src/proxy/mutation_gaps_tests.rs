@@ -468,3 +468,78 @@ fn the_fine_grained_tool_streaming_beta_reaches_only_a_candidate_that_takes_it()
     );
     assert_eq!(header(FINE_GRAINED_TOOL_STREAMING_BETA, false), None);
 }
+
+/// The first chunk after the client left an armed stream starts the drain and gives the tenant's
+/// slot back there, not at `logging`: the slot bounds what a client has open, and a drain can read
+/// on long after it left.
+/// claim: A3
+#[test]
+fn a_drain_frees_the_tenant_slot_at_its_first_chunk() {
+    let state: &'static Arc<GatewayState> = Box::leak(Box::new(
+        GatewayState::new(
+            crate::config::AiConfig::default().validate().unwrap(),
+            crate::state::test_metrics(),
+        )
+        .unwrap(),
+    ));
+    let slots: &'static crate::concurrency::TenantSlots =
+        Box::leak(Box::new(crate::concurrency::TenantSlots::new(1).unwrap()));
+    let id = Identity::unverified_for_test(42, 7, None);
+    let mut held = Held {
+        state,
+        request_id: None,
+        in_flight: false,
+        active_stream: false,
+        tenant: slots.take(&id),
+        body_bytes: 0,
+        body_exempt: false,
+        client_left: AtomicBool::new(true),
+        drain: Drain::Armed,
+    };
+    assert_eq!(slots.in_flight(42), 1);
+    let mut rc = tests::test_ctx(false);
+    assert!(drain_chunk(&mut rc, &mut held, false), "drained, not sent");
+    assert_eq!(held.drain, Drain::Draining);
+    assert_eq!(slots.in_flight(42), 0, "the slot went with the client");
+}
+
+/// A leg gives a half-open breaker's only probe permit back with no outcome, whether released
+/// (the client left) or dropped with it still out (a panic unwinding the request), so the next
+/// request can probe.
+/// claim: REL-6
+#[test]
+fn a_released_or_dropped_leg_returns_its_probe_permit() {
+    static NOW: AtomicU64 = AtomicU64::new(1_000);
+    fn clock() -> u64 {
+        NOW.load(Ordering::Relaxed)
+    }
+    let breaker = CircuitBreaker::with_clock(
+        crate::circuit_breaker::CircuitBreakerConfig::consecutive(1)
+            .reset_timeout(Duration::from_secs(30))
+            .half_open_permits(1),
+        clock,
+    );
+    let trip = breaker.allow().expect("a closed breaker admits");
+    breaker.record_failure_for(trip);
+    NOW.store(1_030, Ordering::Relaxed);
+    let p = Arc::new(Provider::resolve(
+        "openai",
+        "api.openai.com:443".to_string(),
+        Dialect::OpenAi,
+        route::AuthScheme::Bearer,
+        &["sk-pool"],
+        crate::metrics::ProviderMetrics::disconnected(),
+        Some(breaker),
+    ));
+    let breaker = p.breaker.as_ref().unwrap();
+    let probe = breaker.allow().expect("the reset timeout admits one probe");
+    let mut leg = Leg::new(Arc::clone(&p), Some(probe), 0);
+    assert!(breaker.allow().is_err(), "the probe is out");
+    leg.release();
+    let probe = breaker.allow().expect("a released probe is free again");
+    drop(Leg::new(Arc::clone(&p), Some(probe), 0));
+    assert!(
+        breaker.allow().is_ok(),
+        "a dropped leg's probe is free again"
+    );
+}

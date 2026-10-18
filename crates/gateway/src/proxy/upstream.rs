@@ -52,6 +52,26 @@ pub(super) fn client_body_cut_short(e: &pingora_core::Error) -> bool {
     false
 }
 
+/// `error_while_proxy`'s [`retry::Lost`]: `seen` with the three facts it is cheap to skip read in.
+/// A fact `decide` cannot read past an earlier one is not computed: the delivery check only
+/// matters while the client is there, nothing reached it and nothing proved the body unprocessed;
+/// a GOAWAY only for a refusal; an unsent HTTP/2 body only for one that is not. `retry`'s tests
+/// hold every skip to the decision the full facts make.
+pub(crate) fn read_lost(
+    seen: retry::Lost,
+    delivered: impl FnOnce() -> bool,
+    goaway: impl FnOnce() -> bool,
+    h2_body_unsent: impl FnOnce() -> bool,
+) -> retry::Lost {
+    let open = !seen.downstream && !seen.responded;
+    retry::Lost {
+        delivered: open && !seen.refused && !seen.reset_unread && delivered(),
+        goaway: seen.refused && goaway(),
+        h2_body_unsent: open && !seen.refused && h2_body_unsent(),
+        ..seen
+    }
+}
+
 /// Whether writing the request body to an HTTP/2 stream failed because the stream had already
 /// closed with body bytes still unsent: pingora's `reserve_and_send` found no capacity to get
 /// (`cannot reserve capacity`, `while waiting for capacity`), a write failure it labels `H2Error`

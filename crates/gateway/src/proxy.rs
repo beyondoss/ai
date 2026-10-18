@@ -113,7 +113,7 @@ mod serving;
 mod upstream;
 
 pub use self::replies::error_body;
-pub(crate) use self::upstream::{is_candidate_refusal, is_pool_key_failure};
+pub(crate) use self::upstream::{is_candidate_refusal, is_pool_key_failure, read_lost};
 use self::{
     billing::*, full_body::*, headers::*, phases::*, relay::*, replies::*, serving::*, upstream::*,
 };
