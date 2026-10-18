@@ -174,7 +174,7 @@ struct ReceiverState {
     service_mode: bool,
     /// A session task in this process holds the query's session for the query's tenant.
     open_here: bool,
-    /// That session's open reconcile has run.
+    /// That session's open reconcile has succeeded.
     open_reconcile_done: bool,
     job: Tracking,
     /// For a proving job: its `keep` with `notify` succeeded.
@@ -190,9 +190,12 @@ struct ReceiverState {
 #[serde(rename_all = "snake_case")]
 enum Tracking {
     Proving,
-    /// Its stream, a follow, or a tool call in flight has it.
+    /// Its stream or a follow has it.
     Held,
-    Released,
+    /// v1.4's state: the stream closed after its proof. Not `JobShared::released`.
+    Unheld,
+    /// A `bash_job` call in flight has it.
+    Taken,
     EndRecorded,
     /// The session neither tracks it nor has recorded its end.
     Untracked,
@@ -228,8 +231,6 @@ enum Effect {
 #[serde(deny_unknown_fields)]
 struct ReceiverExpect {
     status: u16,
-    /// A `200`'s `data.listener`: whether a session task in this process took the callback.
-    listener: Option<bool>,
     /// The answer waits for a live reconcile's `list`.
     answer_waits_for_list: bool,
     effect: Effect,
@@ -720,13 +721,12 @@ fn query_session(query: &str) -> Option<UrlSession> {
 
 /// The receiver of N21 and N23, step by step, then N24, N31, N32 and the release row for a
 /// callback that passes them all. Nothing here can open a session, because a callback never does
-/// (N24).
+/// (N24): a replica without it answers `503`, and the edge walks on.
 fn reference_receiver(keys: &[([u8; 32], String)], case: &ReceiverCase) -> ReceiverExpect {
     let rq = &case.request;
     let st = &case.state;
     let refuse = |status| ReceiverExpect {
         status,
-        listener: None,
         answer_waits_for_list: false,
         effect: Effect::None,
     };
@@ -802,36 +802,33 @@ fn reference_receiver(keys: &[([u8; 32], String)], case: &ReceiverCase) -> Recei
     if scope != scope_of(&session.tenant, &session.session_id) {
         return refuse(403);
     }
-    let answer = |listener, waits, effect| ReceiverExpect {
+    let answer = |waits, effect| ReceiverExpect {
         status: 200,
-        listener: Some(listener),
         answer_waits_for_list: waits,
         effect,
     };
-    // N24: nobody here holds the session, so nothing happens.
+    // N24: nobody here holds the session, so nothing happens here.
     if !st.open_here {
-        return answer(false, false, Effect::None);
+        return refuse(503);
     }
     // N32: answered without contacting the sandbox.
     if !st.open_reconcile_done {
-        return answer(true, false, Effect::None);
+        return answer(false, Effect::None);
     }
     match st.job {
-        Tracking::Held | Tracking::EndRecorded => answer(true, false, Effect::None),
+        Tracking::Held | Tracking::EndRecorded => answer(false, Effect::None),
+        Tracking::Taken => refuse(503),
         Tracking::Untracked => refuse(410),
         // The release row (N35): it waits for no list; the release starts a live reconcile.
-        Tracking::Proving if st.in_window && st.keep_succeeded => {
-            answer(true, false, Effect::Release)
-        }
-        Tracking::Proving => answer(true, false, Effect::None),
-        // N31 and the `released` rows.
-        Tracking::Released => match st.sandbox {
-            Listed::Running => answer(true, true, Effect::None),
-            Listed::Exited => answer(true, true, Effect::ShellExit),
-            Listed::Ended | Listed::Lost | Listed::Missing => answer(true, true, Effect::Follow),
+        Tracking::Proving if st.in_window && st.keep_succeeded => answer(false, Effect::Release),
+        Tracking::Proving => answer(false, Effect::None),
+        // N31 and the `unheld` rows.
+        Tracking::Unheld => match st.sandbox {
+            Listed::Running => answer(true, Effect::None),
+            Listed::Exited => answer(true, Effect::ShellExit),
+            Listed::Ended | Listed::Lost | Listed::Missing => answer(true, Effect::Follow),
             Listed::Unreachable => ReceiverExpect {
                 status: 503,
-                listener: None,
                 answer_waits_for_list: true,
                 effect: Effect::Follow,
             },
@@ -867,7 +864,9 @@ fn receiver_cases_follow_from_the_spec() {
     }
     assert_eq!(effects.len(), 4, "a case for every effect");
     assert!(
-        c.receiver.iter().any(|x| x.expect.listener == Some(false)),
+        c.receiver
+            .iter()
+            .any(|x| !x.state.open_here && x.expect.status == 503),
         "a case where no session here takes the callback"
     );
 }

@@ -2566,10 +2566,11 @@ address when a kept job changes state, and the replica releases the stream only 
 `keep` and a first callback (the proof, sent by the same supervisor that will send the end) inside a
 30 s window. It changes how a replica learns of an end and nothing else: every end is still read by
 today's follow and handed to the session exactly as a streamed one, wake turns included. A callback
-never opens a session: the edge routes it to the session's hashed replica and attaches nothing, the
+never opens a session: the edge routes it like any request for the session, attaching nothing, the
 replica verifies the token itself, and only a replica holding the session open runs a
-non-destructive _live reconcile_ (`list` only, acting on released jobs). Any other answers "no
-listener", and a session that is not open learns of its jobs' ends when it next opens, as today.
+non-destructive _live reconcile_ (`list` only, acting on _unheld_ jobs, the spec's own state and not
+`JobShared::released`). Any other answers `503`, so the edge's ring walk finds the owner, and a
+session that is not open learns of its jobs' ends when it next opens, as today.
 After release nothing contacts the sandbox in the background: an end no callback delivers (a dead
 sandbox, a broken path) is noticed at the session's next real use of the sandbox, a `bash_job`
 call or the next open, which is the one accepted difference from today. It opens no new window for

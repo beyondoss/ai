@@ -2,7 +2,7 @@
   "spec": "exec protocol v1.4 sandbox job notify (crates/agent/src/exec_endpoint.rs, \"Sandbox job notify (v1.4)\"), \"The callback request\" and \"The receiver\"",
   "notes": [
     "requests: what an endpoint sends for a job kept with notify. body is the exact bytes; headers lists every header the endpoint must send, Content-Length included (others the HTTP client adds, such as Host, are not listed); forbidden_headers must not be sent.",
-    "receiver: one request to the replica. request: method, path, query (the part after ?), authorization (its Authorization header values, in order; empty: none), content_length and transfer_encoding (the values of those headers, in order) and body. It carries no session grant. state: service_mode; open_here (a session task in this process holds the query's session for its tenant); open_reconcile_done (that session's open reconcile has run); job (proving, held, released, end_recorded or untracked: how the session tracks the job, a job a tool call has counting as held); keep_succeeded and in_window (for a proving job: its keep with notify succeeded, and the callback arrives inside its proof window); sandbox (what a list of the scope would say of the job: running, exited, ended, lost, missing, or unreachable when the sandbox cannot be listed); run_in_flight. expect: the HTTP status, a 200's data.listener, whether the answer waits for a live reconcile's list (answer_waits_for_list), and the effect on the job (none; release: the stream is closed and a live reconcile started; shell_exit: applied as a held stream's; follow: today's follow starts). No case opens a session: a callback never does.",
+    "receiver: one request to the replica. request: method, path, query (the part after ?), authorization (its Authorization header values, in order; empty: none), content_length and transfer_encoding (the values of those headers, in order) and body. It carries no session grant. state: service_mode; open_here (a session task in this process holds the query's session for its tenant); open_reconcile_done (that session's open reconcile has succeeded); job (proving, held, unheld, taken, end_recorded or untracked: how the session tracks the job; unheld is v1.4's state, not JobShared::released; taken: a bash_job call in flight has it); keep_succeeded and in_window (for a proving job: its keep with notify succeeded, and the callback arrives inside its proof window); sandbox (what a list of the scope would say of the job: running, exited, ended, lost, missing, or unreachable when the sandbox cannot be listed); run_in_flight. expect: the HTTP status, whether the answer waits for a live reconcile's list (answer_waits_for_list), and the effect on the job (none; release: the stream is closed and then a live reconcile started; shell_exit: applied as a held stream's; follow: today's follow starts). No case opens a session: a callback never does, and a replica without the session answers 503 so the edge walks on to the one that has it.",
     "edge: how the edge classifies a request by its method, path, query and Authorization values (E1, with the rules of N21): callback (forwarded unchanged to the hashed replica), user (handled as any user request), or refused with status, never forwarded."
   ],
   "keep": {
@@ -35,7 +35,7 @@
   ],
   "receiver": [
     {
-      "name": "a verified callback for a released running job: the answer waits for the list, then 200",
+      "name": "a verified callback for a unheld running job: the answer waits for the list, then 200",
       "request": {
         "method": "POST",
         "path": "/_beyond/agent",
@@ -53,7 +53,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -61,7 +61,6 @@
       },
       "expect": {
         "status": 200,
-        "listener": true,
         "answer_waits_for_list": true,
         "effect": "none"
       },
@@ -90,7 +89,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -98,7 +97,6 @@
       },
       "expect": {
         "status": 200,
-        "listener": true,
         "answer_waits_for_list": true,
         "effect": "none"
       },
@@ -108,7 +106,7 @@
       ]
     },
     {
-      "name": "a released job listed exited: applied as a stream's shell_exit",
+      "name": "a unheld job listed exited: applied as a stream's shell_exit",
       "request": {
         "method": "POST",
         "path": "/_beyond/agent",
@@ -126,7 +124,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "exited",
@@ -134,7 +132,6 @@
       },
       "expect": {
         "status": 200,
-        "listener": true,
         "answer_waits_for_list": true,
         "effect": "shell_exit"
       },
@@ -144,7 +141,7 @@
       ]
     },
     {
-      "name": "a released job listed ended: today's follow reads it to its end",
+      "name": "a unheld job listed ended: today's follow reads it to its end",
       "request": {
         "method": "POST",
         "path": "/_beyond/agent",
@@ -162,7 +159,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "ended",
@@ -170,7 +167,6 @@
       },
       "expect": {
         "status": 200,
-        "listener": true,
         "answer_waits_for_list": true,
         "effect": "follow"
       },
@@ -180,7 +176,7 @@
       ]
     },
     {
-      "name": "a released job listed lost: today's follow",
+      "name": "a unheld job listed lost: today's follow",
       "request": {
         "method": "POST",
         "path": "/_beyond/agent",
@@ -198,7 +194,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "lost",
@@ -206,7 +202,6 @@
       },
       "expect": {
         "status": 200,
-        "listener": true,
         "answer_waits_for_list": true,
         "effect": "follow"
       },
@@ -216,7 +211,7 @@
       ]
     },
     {
-      "name": "a released job missing from the listing: today's follow",
+      "name": "a unheld job missing from the listing: today's follow",
       "request": {
         "method": "POST",
         "path": "/_beyond/agent",
@@ -234,7 +229,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "missing",
@@ -242,7 +237,6 @@
       },
       "expect": {
         "status": 200,
-        "listener": true,
         "answer_waits_for_list": true,
         "effect": "follow"
       },
@@ -252,7 +246,7 @@
       ]
     },
     {
-      "name": "the sandbox cannot be listed: 503, and the released job is followed as today",
+      "name": "the sandbox cannot be listed: 503, and the unheld job is followed as today",
       "request": {
         "method": "POST",
         "path": "/_beyond/agent",
@@ -270,7 +264,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "unreachable",
@@ -278,7 +272,6 @@
       },
       "expect": {
         "status": 503,
-        "listener": null,
         "answer_waits_for_list": true,
         "effect": "follow"
       },
@@ -313,7 +306,6 @@
       },
       "expect": {
         "status": 200,
-        "listener": true,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -322,7 +314,7 @@
       ]
     },
     {
-      "name": "a callback for a held job (its stream, a follow, or a tool call has it)",
+      "name": "a callback for a held job (its stream or a follow has it)",
       "request": {
         "method": "POST",
         "path": "/_beyond/agent",
@@ -348,12 +340,80 @@
       },
       "expect": {
         "status": 200,
-        "listener": true,
         "answer_waits_for_list": false,
         "effect": "none"
       },
       "covers": [
         "N32"
+      ]
+    },
+    {
+      "name": "a callback while a bash_job call has the job: 503, asked again once the call is done",
+      "request": {
+        "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "service_mode": true,
+        "open_here": true,
+        "open_reconcile_done": true,
+        "job": "taken",
+        "keep_succeeded": true,
+        "in_window": false,
+        "sandbox": "running",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 503,
+        "answer_waits_for_list": false,
+        "effect": "none"
+      },
+      "covers": [
+        "N32"
+      ]
+    },
+    {
+      "name": "a proof while a bash_job call has the proving job: 503, so it counts once the call is done",
+      "request": {
+        "method": "POST",
+        "path": "/_beyond/agent",
+        "query": "session_id=a07-s3.01J9ZQ4N6V&tenant=acme",
+        "authorization": [
+          "Bearer bjn_v1.4eba5aa3.-dTclPpDTsiFJn-yn7Njt3A4bhaJ7TbBN5JU7DSlyTg"
+        ],
+        "content_length": [
+          "87"
+        ],
+        "transfer_encoding": [],
+        "body": "{\"type\":\"job_ended\",\"scope\":\"2ff302a37e7401aa95f92ec6c431944a\",\"id\":\"0123456789abcdef\"}"
+      },
+      "state": {
+        "service_mode": true,
+        "open_here": true,
+        "open_reconcile_done": true,
+        "job": "taken",
+        "keep_succeeded": true,
+        "in_window": true,
+        "sandbox": "running",
+        "run_in_flight": false
+      },
+      "expect": {
+        "status": 503,
+        "answer_waits_for_list": false,
+        "effect": "none"
+      },
+      "covers": [
+        "N32",
+        "N35"
       ]
     },
     {
@@ -375,7 +435,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": false,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -383,7 +443,6 @@
       },
       "expect": {
         "status": 200,
-        "listener": true,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -418,7 +477,6 @@
       },
       "expect": {
         "status": 410,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -427,7 +485,7 @@
       ]
     },
     {
-      "name": "the proof: a proving job, keep succeeded, inside the window: released at once, no list waited for",
+      "name": "the proof: a proving job, keep succeeded, inside the window: unheld at once, no list waited for",
       "request": {
         "method": "POST",
         "path": "/_beyond/agent",
@@ -453,7 +511,6 @@
       },
       "expect": {
         "status": 200,
-        "listener": true,
         "answer_waits_for_list": false,
         "effect": "release"
       },
@@ -463,7 +520,7 @@
       ]
     },
     {
-      "name": "a proof that overtakes keep's answer: answered, released only once keep succeeds",
+      "name": "a proof that overtakes keep's answer: answered, unheld only once keep succeeds",
       "request": {
         "method": "POST",
         "path": "/_beyond/agent",
@@ -489,7 +546,6 @@
       },
       "expect": {
         "status": 200,
-        "listener": true,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -526,7 +582,6 @@
       },
       "expect": {
         "status": 200,
-        "listener": true,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -562,7 +617,6 @@
       },
       "expect": {
         "status": 200,
-        "listener": true,
         "answer_waits_for_list": false,
         "effect": "release"
       },
@@ -571,7 +625,7 @@
       ]
     },
     {
-      "name": "the session is not open in this process: no listener, nothing opened",
+      "name": "the session is not open in this process: 503, nothing opened, the edge walks on",
       "request": {
         "method": "POST",
         "path": "/_beyond/agent",
@@ -589,15 +643,14 @@
         "service_mode": true,
         "open_here": false,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
         "run_in_flight": false
       },
       "expect": {
-        "status": 200,
-        "listener": false,
+        "status": 503,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -624,7 +677,7 @@
         "service_mode": true,
         "open_here": false,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -632,7 +685,6 @@
       },
       "expect": {
         "status": 401,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -658,7 +710,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -666,7 +718,6 @@
       },
       "expect": {
         "status": 403,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -693,7 +744,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -701,7 +752,6 @@
       },
       "expect": {
         "status": 403,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -727,7 +777,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -735,7 +785,6 @@
       },
       "expect": {
         "status": 403,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -762,7 +811,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -770,7 +819,6 @@
       },
       "expect": {
         "status": 404,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -797,7 +845,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -805,7 +853,6 @@
       },
       "expect": {
         "status": 400,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -832,7 +879,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -840,7 +887,6 @@
       },
       "expect": {
         "status": 400,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -867,7 +913,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -875,7 +921,6 @@
       },
       "expect": {
         "status": 400,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -902,7 +947,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -910,7 +955,6 @@
       },
       "expect": {
         "status": 200,
-        "listener": true,
         "answer_waits_for_list": true,
         "effect": "none"
       },
@@ -935,7 +979,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -943,7 +987,6 @@
       },
       "expect": {
         "status": 411,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -971,7 +1014,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -979,7 +1022,6 @@
       },
       "expect": {
         "status": 400,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -1006,7 +1048,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -1014,7 +1056,6 @@
       },
       "expect": {
         "status": 400,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -1043,7 +1084,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -1051,7 +1092,6 @@
       },
       "expect": {
         "status": 400,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -1078,7 +1118,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -1086,7 +1126,6 @@
       },
       "expect": {
         "status": 200,
-        "listener": true,
         "answer_waits_for_list": true,
         "effect": "none"
       },
@@ -1113,7 +1152,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -1121,7 +1160,6 @@
       },
       "expect": {
         "status": 200,
-        "listener": true,
         "answer_waits_for_list": true,
         "effect": "none"
       },
@@ -1148,7 +1186,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -1156,7 +1194,6 @@
       },
       "expect": {
         "status": 200,
-        "listener": true,
         "answer_waits_for_list": true,
         "effect": "none"
       },
@@ -1183,7 +1220,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -1191,7 +1228,6 @@
       },
       "expect": {
         "status": 400,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -1218,7 +1254,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -1226,7 +1262,6 @@
       },
       "expect": {
         "status": 400,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -1254,7 +1289,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -1262,7 +1297,6 @@
       },
       "expect": {
         "status": 400,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -1289,7 +1323,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -1297,7 +1331,6 @@
       },
       "expect": {
         "status": 400,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -1325,7 +1358,7 @@
         "service_mode": false,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -1333,7 +1366,6 @@
       },
       "expect": {
         "status": 403,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -1361,7 +1393,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -1369,7 +1401,6 @@
       },
       "expect": {
         "status": 413,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -1396,7 +1427,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -1404,7 +1435,6 @@
       },
       "expect": {
         "status": 400,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -1431,7 +1461,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -1439,7 +1469,6 @@
       },
       "expect": {
         "status": 400,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -1466,7 +1495,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -1474,7 +1503,6 @@
       },
       "expect": {
         "status": 400,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -1501,7 +1529,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -1509,7 +1537,6 @@
       },
       "expect": {
         "status": 400,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -1536,7 +1563,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -1544,7 +1571,6 @@
       },
       "expect": {
         "status": 401,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -1573,7 +1599,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -1581,7 +1607,6 @@
       },
       "expect": {
         "status": 401,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -1610,7 +1635,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -1618,7 +1643,6 @@
       },
       "expect": {
         "status": 503,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },
@@ -1646,7 +1670,7 @@
         "service_mode": true,
         "open_here": true,
         "open_reconcile_done": true,
-        "job": "released",
+        "job": "unheld",
         "keep_succeeded": true,
         "in_window": false,
         "sandbox": "running",
@@ -1654,7 +1678,6 @@
       },
       "expect": {
         "status": 403,
-        "listener": null,
         "answer_waits_for_list": false,
         "effect": "none"
       },

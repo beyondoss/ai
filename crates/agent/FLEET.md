@@ -146,7 +146,8 @@ status it cannot fix by repeating itself, and retries `503`.
 only replicas hold the token's key. A callback never opens a session either: a session that is not
 open learns of its jobs' ends when it next opens, as it does today, so a callback matters only to
 the replica that has the session open now. That replica verifies the token and reconciles; any other
-answers `200` with `{"listener": false}` and does nothing. Each requirement is tagged (E1, E2, …)
+verifies the token and answers `503`, as it answers any request for a session it does not hold, so
+the edge's usual retry and ring walk find the replica that has it. Each requirement is tagged (E1, E2, …)
 and names the check that tests it. A check not written yet is listed, with its task, in
 `tests/fixtures/exec/v1.4-checks.json`.
 
@@ -158,19 +159,19 @@ and names the check that tests it. A check not written yet is listed, with its t
   never forwarded, as a callback or as a user request. The edge MUST NOT authenticate a callback as
   a user, or use any user credential it carries. It MUST forward a callback only when it is a `POST`
   to `/_beyond/agent`, and answer any other request bearing such a token `403` itself. It MUST
-  answer `400` itself a callback whose query names `session_id` more than once, so it never routes
-  by a different value than the replica reads. (check: fleet-sim `job-ended-classified-exactly`;
+  answer `400` itself a callback whose query names `session_id` more than once, keys decoded as
+  `application/x-www-form-urlencoded` as the replica decodes them, so it never routes by a
+  different value than the replica reads. (check: fleet-sim `job-ended-classified-exactly`;
   fixture `v1.4-callback.json`)
 - **E2** The edge MUST forward a callback unchanged, its `Content-Length` and any
   `Transfer-Encoding` included, and MUST NOT attach, mint or check anything for it: no session
   grant, no tenant lookup, no token check. The token is opaque to it. (check: fleet-sim
   `job-ended-forwarded-unchanged`)
-- **E3** The edge MUST send a callback to the replica its session id hashes to, by Requirements 1
-  and 4, and to no other: it MUST NOT walk the ring for a callback (Requirement 2) or retry it on
-  another replica, since any replica but the one holding the session answers `{"listener": false}`,
-  which the sandbox takes as done. A session open on a replica the ring walked to never receives its
-  proof, so its jobs stay held, as today. (check: fleet-sim
-  `job-ended-goes-only-to-the-hashed-replica`)
+- **E3** The edge MUST route a callback exactly as any request for its session id, by Requirements
+  1, 2 and 4: to the hashed target first, retrying it on `503` and then walking the ring in
+  Requirement 2's order, all within E4's 25 s. A replica without the session answers `503`, so the
+  walk ends at the replica that has it, wherever the ring now places the session's hash. (check:
+  fleet-sim `job-ended-routed-as-any-request`)
 - **E4** The edge MUST answer a callback within 25 s, answering `503` when the replica has not
   answered by then, and MUST cancel the request upstream at that point, so the replica stops waiting
   for it. The replica answers within 20 s on its own (N31), and the sandbox abandons an attempt at
@@ -180,9 +181,11 @@ and names the check that tests it. A check not written yet is listed, with its t
   fleet-sim `job-ended-status-passes-through`)
 - **E6** The edge MUST forward at most 20 callbacks a second for any one session id, and answer the
   excess `429` itself. (check: fleet-sim `job-ended-rate-limited-per-session`)
+- **E7** The edge MUST NOT log or otherwise record the `Authorization` header of a callback. A
+  token does not expire, so a copy could keep a session's sandbox from idling for as long as the
+  session is open. (check: fleet-sim `job-ended-token-never-logged`)
 
-The edge SHOULD NOT log the `Authorization` header of a callback, and SHOULD rate-limit callbacks
-per source address. A replica already bounds the work a stream of valid callbacks can cause (one
+The edge SHOULD rate-limit callbacks per source address. A replica already bounds the work a stream of valid callbacks can cause (one
 reconcile at a time per session, at most one a second, at most 16 callbacks waiting), and refuses a
 forged one before it looks for the session.
 
