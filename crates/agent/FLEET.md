@@ -157,7 +157,8 @@ listed, with its task, in `tests/fixtures/exec/v1.4-checks.json`.
   `Authorization` header and the body unchanged. The grant tells the replica which tenant and
   session the request is for and lets it open the session; it does not authorise the callback, and
   a replica refuses `job_ended` on a grant alone. (check: fleet-sim `job-ended-reaches-the-owner`)
-- **E3** A session id the edge's records do not have is answered `404`, and no replica is contacted.
+- **E3** A session id the edge's records do not have MUST be answered `404`, with no replica
+  contacted.
   (check: fleet-sim `job-ended-unknown-session-is-404`)
 - **E4** The edge MUST route a callback exactly as any request for that session: Requirements 1, 2
   and 4 apply unchanged. **When no replica owns the session**, the hashed target opens it, exactly
