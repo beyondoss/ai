@@ -1728,17 +1728,18 @@ fn consecutive_user_messages_keep_their_text_apart() {
 /// block. Each merge used to copy every block gathered so far: 256 KiB of user turns took 4.4 s of
 /// CPU in a release build, 1 MiB over a minute, all on one request.
 ///
-/// Asserted as scaling, in this thread's CPU time, so a loaded host cannot fail it: quadrupling the
-/// run must cost under 8x (linear is ~4x; the quadratic merge was ~16x). Each size keeps the
-/// cheapest of three runs, which drops a run that a cache-cold start or a preemption inflated.
+/// Asserted as allocation volume, not time, so no host load can move it: the bytes this test's
+/// process allocates converting a run, counted by `stats_alloc`. Quadrupling the run must allocate
+/// under 8x (linear is ~4x; the quadratic merge, which copied the gathered blocks on every merge,
+/// was ~16x). The count depends only on the code, so it is the same on every host. nextest runs
+/// each test in its own process, so the count is this test's alone (under a shared `cargo test`
+/// process, other tests' allocations would be counted too).
 /// claim: TRN-3
 /// defect: D217
 #[test]
 fn a_long_run_of_same_role_messages_merges_in_linear_time() {
-    fn thread_cpu() -> std::time::Duration {
-        let t = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
-        std::time::Duration::new(t.tv_sec as u64, t.tv_nsec as u32)
-    }
+    #[global_allocator]
+    static GLOBAL: &stats_alloc::StatsAlloc<std::alloc::System> = &stats_alloc::INSTRUMENTED_SYSTEM;
     // `users` user turns, then half as many assistant messages carrying one tool call each.
     let request = |users: usize| {
         let calls = vec![
@@ -1759,30 +1760,23 @@ fn a_long_run_of_same_role_messages_merges_in_linear_time() {
             .map(|m| m["content"].as_array().map_or(1, Vec::len))
             .sum()
     };
-    let cheapest = |users: usize| {
+    let allocated = |users: usize| {
         let body = request(users);
-        (0..3)
-            .map(|_| {
-                let start = thread_cpu();
-                let v = c2m(&body, "claude-haiku-4-5");
-                let took = thread_cpu() - start;
-                assert_eq!(
-                    (blocks(&v, "user"), blocks(&v, "assistant")),
-                    (users, users / 2)
-                );
-                took
-            })
-            .min()
-            .unwrap()
+        let region = stats_alloc::Region::new(GLOBAL);
+        let v = c2m(&body, "claude-haiku-4-5");
+        let bytes = region.change().bytes_allocated;
+        assert_eq!(
+            (blocks(&v, "user"), blocks(&v, "assistant")),
+            (users, users / 2)
+        );
+        bytes
     };
-    // 1,000 user turns cost ~10 ms of CPU in a debug build (far above the clock's resolution);
-    // the quadratic merge took seconds at 4x that.
-    let small = cheapest(1_000);
-    let large = cheapest(4_000);
-    let ratio = large.as_secs_f64() / small.as_secs_f64();
+    let small = allocated(1_000);
+    let large = allocated(4_000);
+    let ratio = large as f64 / small as f64;
     assert!(
         ratio < 8.0,
-        "4x the messages cost {ratio:.1}x the CPU ({small:?} -> {large:?}): not linear"
+        "4x the messages allocated {ratio:.1}x the bytes ({small} -> {large}): not linear"
     );
 }
 

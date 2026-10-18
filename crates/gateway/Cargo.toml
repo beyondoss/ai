@@ -95,10 +95,11 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 proptest = { version = "1.10", default-features = false, features = ["std"] }
 rcgen = "0.13"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2"] }
-# Thread CPU time (`clock_gettime(CLOCK_THREAD_CPUTIME_ID)`) behind a safe API, for perf assertions
-# that must hold on a loaded host (`unsafe_code` is forbidden, so not raw `libc`). Already in the
-# build graph via `tempfile` and `clap`: this only adds its `time` feature.
-rustix = { version = "1", default-features = false, features = ["std", "time"] }
+# Counts the bytes a test allocates (`Region`), for complexity assertions that must not depend on
+# machine load. No dependencies of its own; the `unsafe` is inside the crate, since `unsafe_code` is
+# forbidden in this workspace. Used by one `#[global_allocator]` in a test (nextest runs each test in
+# its own process, so the count is that test's alone).
+stats_alloc = "0.1"
 tokio-rustls = "0.26"
 
 [[bench]]
