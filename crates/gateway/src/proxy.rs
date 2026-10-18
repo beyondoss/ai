@@ -1925,6 +1925,11 @@ impl AiProxy {
     /// awaited inline at eight call sites it dominated that future (1 264 bytes total, 1 136 of them
     /// the write, `-Zprint-type-sizes`), so a request that is never refused paid for room it never
     /// used.
+    ///
+    /// For a refusal that may not happen, call this inside the `if let` scrutinee
+    /// (`check().map(|r| self.refuse(..))`) and await the write in the block: an `Option<Refusal>`
+    /// scrutinee is a temporary the `if let` keeps through its block, and moving the refusal out of
+    /// it does not end that, so it would be saved across the await (56 bytes in every request's box).
     fn refuse<'a>(
         &self,
         session: &'a mut Session,
@@ -2024,8 +2029,10 @@ impl AiProxy {
                 && requests_background(&body),
             ..body_rules::Facts::default()
         };
-        if let Some(refusal) = body_rules::refusal(body_rules::Point::Relay, &facts) {
-            return self.refuse(session, &request_id, refusal).await;
+        if let Some(write) = body_rules::refusal(body_rules::Point::Relay, facts)
+            .map(|refusal| self.refuse(session, &request_id, refusal))
+        {
+            return write.await;
         }
         let unserved = route::unserved(route.candidates, &body);
         let responses_tools = route::tools_need_responses_arm(
@@ -4503,8 +4510,11 @@ impl ProxyHttp for AiProxy {
         {
             // --- signed ids (`signed_id`) ---
             let path = session.req_header().uri.path();
-            if let Some(refusal) = self.foreign_ids(path, w.row, &body, w.id.tenant_id) {
-                return self.refuse(session, &request_id, refusal).await;
+            if let Some(write) = self
+                .foreign_ids(path, w.row, &body, w.id.tenant_id)
+                .map(|refusal| self.refuse(session, &request_id, refusal))
+            {
+                return write.await;
             }
             let slot_held = early_slot.is_some();
             let relayed = self
@@ -4542,8 +4552,10 @@ impl ProxyHttp for AiProxy {
                 && scan.as_ref().is_some_and(|s| s.inexact_limit),
             ..body_rules::Facts::default()
         };
-        if let Some(refusal) = body_rules::refusal(body_rules::Point::Connect, &shape) {
-            return self.refuse(session, &request_id, refusal).await;
+        if let Some(write) = body_rules::refusal(body_rules::Point::Connect, shape)
+            .map(|refusal| self.refuse(session, &request_id, refusal))
+        {
+            return write.await;
         }
 
         // A `FullBody` re-run's body is its parent's, already reserved for both copies.
@@ -4606,8 +4618,10 @@ impl ProxyHttp for AiProxy {
                         && body_complete.as_deref().is_some_and(requests_background),
                     ..shape
                 };
-                if let Some(refusal) = body_rules::refusal(body_rules::Point::Connect, &facts) {
-                    return self.refuse(session, &request_id, refusal).await;
+                if let Some(write) = body_rules::refusal(body_rules::Point::Connect, facts)
+                    .map(|refusal| self.refuse(session, &request_id, refusal))
+                {
+                    return write.await;
                 }
                 // A Responses request walks the row's Responses arm whenever the row has one,
                 // `store: false` one-shots included: there it is a byte relay, and translation onto
@@ -4832,13 +4846,16 @@ impl ProxyHttp for AiProxy {
                     .refuse(session, &request_id, Refusal::IdSigningUnset)
                     .await;
             };
-            if let Some(Err(refusal)) = body_complete
+            if let Some(write) = body_complete
                 .as_deref()
-                .map(|b| signer.unsign_request(id.tenant_id, b, model_route.is_some()))
+                .and_then(|b| {
+                    signer
+                        .unsign_request(id.tenant_id, b, model_route.is_some())
+                        .err()
+                })
+                .map(|refusal| self.refuse(session, &request_id, Refusal::ForeignId(refusal)))
             {
-                return self
-                    .refuse(session, &request_id, Refusal::ForeignId(refusal))
-                    .await;
+                return write.await;
             }
             Some(Box::new(signed_id::Relay::new(id.tenant_id)))
         } else {
@@ -5935,7 +5952,7 @@ impl ProxyHttp for AiProxy {
                             })
                             && requests_background(&buf),
                     };
-                    body_rules::refusal(body_rules::Point::Buffered, &facts)
+                    body_rules::refusal(body_rules::Point::Buffered, facts)
                 };
                 if let Some(refusal) = refused {
                     return Err(self.refusal_error(refusal).into_down());

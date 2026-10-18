@@ -114,11 +114,14 @@ impl Rule {
 
 /// The refusal a body with `facts` is told at `point`, if any: the first rule in
 /// [`Rule::ORDER`] that applies there and that it breaks.
-pub fn refusal(point: Point, facts: &Facts<'_>) -> Option<Refusal> {
+///
+/// `facts` by value, not by reference: a borrowed local in `request_filter` stays in its future
+/// (boxed once per request) across every later await, where a copied one is dropped at its last use.
+pub fn refusal(point: Point, facts: Facts<'_>) -> Option<Refusal> {
     Rule::ORDER
         .into_iter()
         .filter(|rule| rule.applies_at(point))
-        .find_map(|rule| rule.check(point, facts))
+        .find_map(|rule| rule.check(point, &facts))
 }
 
 #[cfg(test)]
@@ -194,11 +197,11 @@ mod tests {
     fn two_broken_rules_are_answered_as_before_at_every_point() {
         for (point, before) in BEFORE {
             for (i, &first) in before.iter().enumerate() {
-                let alone = refusal(point, &breaking(first)).expect("a broken rule refuses");
+                let alone = refusal(point, breaking(first)).expect("a broken rule refuses");
                 for &second in &before[i + 1..] {
                     let both = merge(breaking(first), breaking(second));
                     assert_eq!(
-                        refusal(point, &both).as_ref(),
+                        refusal(point, both).as_ref(),
                         Some(&alone),
                         "{point:?}: {first:?} + {second:?}"
                     );
@@ -206,7 +209,7 @@ mod tests {
             }
             for rule in Rule::ORDER {
                 if !before.contains(&rule) {
-                    assert_eq!(refusal(point, &breaking(rule)), None, "{point:?}: {rule:?}");
+                    assert_eq!(refusal(point, breaking(rule)), None, "{point:?}: {rule:?}");
                 }
             }
         }
@@ -215,7 +218,7 @@ mod tests {
     /// The refusal each rule answers with, by point.
     #[test]
     fn each_rule_answers_with_its_refusal() {
-        let at = |point, rule| refusal(point, &breaking(rule));
+        let at = |point, rule| refusal(point, breaking(rule));
         assert_eq!(
             at(Point::Connect, Rule::DuplicateModel),
             Some(Refusal::DuplicateModel)
@@ -249,7 +252,7 @@ mod tests {
         );
         for point in [Point::Connect, Point::Relay, Point::Buffered] {
             assert_eq!(at(point, Rule::Background), Some(Refusal::Background));
-            assert_eq!(refusal(point, &Facts::default()), None);
+            assert_eq!(refusal(point, Facts::default()), None);
         }
     }
 }
