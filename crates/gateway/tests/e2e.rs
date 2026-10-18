@@ -604,6 +604,10 @@ async fn allowance_key_exhausts_one_credential_not_its_sibling() {
     probe(key_b, 402).await; // tenant exhaust kills every key, including v1-grain
 }
 
+/// An exhausted allowance is refused with 402 before the upstream is chosen: once the gateway has
+/// answered one 402 for a key, further requests for it do not reach the upstream. The count starts
+/// at that first 402, not at the exhaust write, because requests sent during the NATS propagation
+/// window still pass the allowance and do reach upstream.
 /// claim: A2
 #[tokio::test]
 async fn allowance_exhaust_does_not_connect_upstream() {
@@ -630,8 +634,9 @@ async fn allowance_exhaust_does_not_connect_upstream() {
         }
     })
     .await;
-    let hits_after_warmup = mock.hits();
     put_kv(nats.port, "allowance.key.8100", b"1").await;
+    // Requests sent while the allowance update is still on its way to the gateway are allowed and
+    // do reach the upstream, so the count is taken only once a 402 has been seen.
     wait_for_status(402, {
         let (c, u, k) = (client.clone(), gw.url(), key_a.clone());
         move || {
@@ -640,10 +645,17 @@ async fn allowance_exhaust_does_not_connect_upstream() {
         }
     })
     .await;
+    let hits_after_exhaust = mock.hits();
+    for _ in 0..5 {
+        assert_eq!(
+            post_status(&client, &gw.url(), &key_a, body_for("gpt-4o")).await,
+            402
+        );
+    }
     assert_eq!(
         mock.hits(),
-        hits_after_warmup,
-        "402 must happen before upstream_peer"
+        hits_after_exhaust,
+        "once the gateway answers 402, no request reaches upstream_peer"
     );
     wait_for_metric(&gw, "ai_rejections_total", "quota", 1.0).await;
 }
