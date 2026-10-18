@@ -11,7 +11,10 @@
 //! (`proxy.rs`), from the scan it already made. Rewriting the body (the output-limit clamp, the
 //! translation, the strips, the model re-spelling, `stream_options`) is a separate step after the
 //! rules pass, on a buffered body only. Signed ids are checked apart too: verifying them also
-//! rewrites the body, and a store relay checks them where it has the signer, not here.
+//! rewrites the body, and a store relay checks them where it has the signer, not here. A foreign
+//! id ([`Refusal::ForeignId`], [`Refusal::ForeignIdLate`] once the headers went upstream) is told
+//! after every rule at [`Point::Connect`], and before every rule at [`Point::Relay`] and
+//! [`Point::Buffered`]; `tests/refusal_precedence.rs` pins each.
 
 use crate::refusal::Refusal;
 

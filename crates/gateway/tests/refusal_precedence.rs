@@ -5,7 +5,8 @@
 //! the gateway buffered (a `/{provider}` relay, or that re-run). The rules run in one order, and
 //! each point checks only the rules that apply there, so the same two violations can be answered
 //! differently by point. Each case pins the winning refusal's status, its exact body, its
-//! `ai_rejections_total` label, and that the upstream saw nothing.
+//! `ai_rejections_total` label, and that the upstream saw nothing. A foreign signed id is checked
+//! apart from the rules, and its place in the order at each point is pinned too.
 //!
 //! Run via `mise run test:integration:rs` (needs `nats-server` on PATH).
 
@@ -32,6 +33,13 @@ const NO_IMAGE: &str = r#"{"error":{"message":"deepseek-v4-pro does not accept i
 const BACKGROUND: &str = r#"{"error":{"message":"background responses are not available with a managed key: the provider generates them after the request ends, where they cannot be metered; send the request without \"background\": true","type":"invalid_request_error"}}"#;
 const CONTAINERS: &str = r#"{"error":{"message":"a managed key cannot use OpenAI's code_interpreter or hosted shell tool: container time is billed outside the usage the gateway meters; use your own provider key","type":"invalid_request_error"}}"#;
 const CATALOG_MISS: &str = r#"{"error":{"message":"model \"not-a-model\" is not in the catalog; a managed key runs catalog models only (GET /v1/models lists them)","type":"invalid_request_error"}}"#;
+
+const FOREIGN_ID: &str = r#"{"error":{"message":"previous_response_id does not belong to this tenant: send back only ids from responses this gateway returned to the same tenant (an id from another tenant, from the provider directly, or altered, is refused)","type":"invalid_request_error"}}"#;
+const FOREIGN_ID_STREAMED: &str = r#"{"error":{"message":"an id in this request does not belong to this tenant: send back only ids from responses this gateway returned to the same tenant","type":"invalid_request_error"}}"#;
+
+/// A provider's own response id, as a client that called the provider directly holds it: not
+/// signed for any tenant, so a managed key sending it back is refused.
+const PROVIDER_ID: &str = "resp_0750331520328311006abeeacfb62c87d0bdb6cbe1c41eea26";
 
 const IMAGE_CHAT: &str = r#"[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}]}]"#;
 const IMAGE_RESPONSES: &str = r#"[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}]"#;
@@ -200,6 +208,90 @@ async fn a_buffered_provider_body_is_answered_by_the_first_rule_in_order() {
             400,
             CONTAINERS,
             "unpriced_feature",
+        ),
+    ])
+    .await;
+}
+
+/// A small catalog body breaking two rules before connecting, past the pairs above: a duplicate
+/// `model` before `background`.
+/// claim: SEC-21
+#[tokio::test]
+async fn before_connecting_a_duplicate_model_answers_before_background() {
+    run(vec![(
+        "/v1/responses",
+        r#"{"model":"gpt-5","input":"hi","background":true,"model":"gpt-4o"}"#.into(),
+        400,
+        DUPLICATE_MODEL,
+        "duplicate_model",
+    )])
+    .await;
+}
+
+/// The signed ids are checked apart from the body rules (verifying them rewrites the body), so
+/// where they fall in the order is pinned here: before connecting, after every body rule; on a
+/// large catalog body, before every rule (the ids are checked ahead of the re-run, which checks the
+/// rest); in a buffered `/{provider}` body, before every rule. No row with a Responses arm refuses
+/// an image or tools, so on a large body a foreign id is paired with `background`, the other rule
+/// checked ahead of the re-run, and with the re-run's duplicate `model`.
+/// claim: SEC-21, SEC-25
+#[tokio::test]
+async fn a_foreign_id_answers_in_its_place_in_the_order() {
+    let pad = filler();
+    run(vec![
+        (
+            "/v1/responses",
+            format!(
+                r#"{{"model":"gpt-5","input":"hi","previous_response_id":"{PROVIDER_ID}","model":"gpt-4o"}}"#
+            ),
+            400,
+            DUPLICATE_MODEL,
+            "duplicate_model",
+        ),
+        (
+            "/v1/responses",
+            format!(
+                r#"{{"model":"gpt-5","input":"hi","background":true,"previous_response_id":"{PROVIDER_ID}"}}"#
+            ),
+            400,
+            BACKGROUND,
+            "managed_endpoint",
+        ),
+        (
+            "/v1/responses",
+            format!(
+                r#"{{"model":"gpt-5","pad":"{pad}","input":"hi","background":true,"previous_response_id":"{PROVIDER_ID}"}}"#
+            ),
+            400,
+            FOREIGN_ID,
+            "foreign_id",
+        ),
+        (
+            "/v1/responses",
+            format!(
+                r#"{{"model":"gpt-5","pad":"{pad}","input":"hi","previous_response_id":"{PROVIDER_ID}","model":"gpt-4o"}}"#
+            ),
+            400,
+            FOREIGN_ID,
+            "foreign_id",
+        ),
+        (
+            "/openai/v1/responses",
+            format!(
+                r#"{{"model":"gpt-5","input":"hi","previous_response_id":"{PROVIDER_ID}","model":"gpt-4o"}}"#
+            ),
+            400,
+            FOREIGN_ID_STREAMED,
+            "foreign_id",
+        ),
+        (
+            "/openai/v1/responses",
+            format!(
+                r#"{{"model":"not-a-model","input":"hi","previous_response_id":"{PROVIDER_ID}","tools":[{{"type":"code_interpreter","container":{{"type":"auto"}}}}]}}"#
+            ),
+            400,
+            FOREIGN_ID_STREAMED,
+            "foreign_id",
         ),
     ])
     .await;

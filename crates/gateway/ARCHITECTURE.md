@@ -2857,7 +2857,7 @@ output-limit clamp, translation, the strips, the model re-spelling, `stream_opti
 separate step after the rules pass, on a buffered body only. Signed ids are checked apart:
 verifying them also rewrites the body, and a store relay checks them where it holds the signer
 (first on `Relay` and `Buffered`, after the walk on `Connect`). `tests/refusal_precedence.rs` pins
-which refusal answers each pair at each point, end to end.
+which refusal answers each pair at each point, end to end, a foreign id's place included.
 
 ---
 
