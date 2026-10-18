@@ -9480,7 +9480,9 @@ mod tests {
         // message the production half passes to `fail_boxed` or `gateway_error`, or `fail_to_proxy`
         // assigns, must have its static body in `FAILURES`, under the type it is answered with,
         // and every entry there must have a producer (no entry left behind after its failure
-        // went). Only the production half of the file: this test mentions the call forms itself.
+        // went). And no body may be written past both tables: every writer is listed by the
+        // function that calls it. Only the production half of the file: this test mentions the call
+        // forms itself.
         let src = include_str!("proxy.rs")
             .split("#[cfg(test)]")
             .next()
@@ -9512,18 +9514,88 @@ mod tests {
                 .parse()
                 .expect("a numeric status")
         };
+        // Every call of `fail_boxed` and `gateway_error` but their definitions passes its message as
+        // a literal: a site whose message could not be read would escape the pairing below.
+        let is_definition = |at: usize| src[..at].ends_with("fn ");
         let mut produced = Vec::new();
-        for (i, _) in src.match_indices("fail_boxed(session") {
-            let msg = *literals(i).first().expect("a message literal");
+        let mut sites = (0usize, 0usize);
+        for (i, _) in src.match_indices("fail_boxed(") {
+            if is_definition(i) {
+                continue;
+            }
+            let msg = *literals(i)
+                .first()
+                .expect("a fail_boxed site with a message literal");
             produced.push(("api_error", msg));
+            sites.0 += 1;
         }
         for (i, _) in src.match_indices("gateway_error(") {
-            // The definition itself takes no literal.
-            if let Some(msg) = literals(i).first() {
-                produced.push((typ(status_arg(i)), *msg));
+            if is_definition(i) {
+                continue;
+            }
+            let msg = *literals(i)
+                .first()
+                .expect("a gateway_error site with a message literal");
+            produced.push((typ(status_arg(i)), msg));
+            sites.1 += 1;
+        }
+        assert!(
+            sites.0 > 0 && sites.1 > 0,
+            "the scan found no sites: {sites:?}"
+        );
+        // Every path that writes a response body, by the function it is written in: a refusal
+        // (`write_refusal`; `fail_to_proxy` for one raised past `request_filter`), a failure
+        // (`fail_boxed`, `fail_to_proxy`), the writers' own definitions, and the two bodies that
+        // are no error (the models list, a cache hit). A body written anywhere else would pass
+        // both tables, so it fails here until it goes through one of these.
+        let mut writers = Vec::new();
+        let mut current_fn = "";
+        for line in src.lines() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            let decl = ["pub(crate) ", "pub ", "const ", "async "]
+                .iter()
+                .fold(code, |c, p| c.strip_prefix(p).unwrap_or(c));
+            if let Some(rest) = decl.strip_prefix("fn ") {
+                current_fn = &rest[..rest.find(['(', '<']).unwrap_or(rest.len())];
+            }
+            for needle in [
+                "write_json_body(",
+                "error_body(",
+                "json_body(",
+                "refusal.body()",
+                "write_response_body(",
+            ] {
+                for (at, _) in line.match_indices(needle) {
+                    if !line[..at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+                        writers.push((needle, current_fn));
+                    }
+                }
             }
         }
-        assert!(produced.len() >= 4, "{produced:?}");
+        writers.sort_unstable();
+        let mut want = vec![
+            ("error_body(", "error_body"),
+            ("error_body(", "fail_boxed"),
+            ("error_body(", "fail_to_proxy"),
+            ("json_body(", "error_body"),
+            ("refusal.body()", "fail_to_proxy"),
+            ("refusal.body()", "write_refusal"),
+            ("write_json_body(", "fail_boxed"),
+            ("write_json_body(", "fail_to_proxy"),
+            ("write_json_body(", "write_json_body"),
+            ("write_json_body(", "write_refusal"),
+            ("write_response_body(", "reply_cache_hit"),
+            ("write_response_body(", "reply_models_list"),
+            ("write_response_body(", "write_json_body"),
+        ];
+        want.sort_unstable();
+        assert_eq!(
+            writers, want,
+            "a response body is written outside the tabled paths"
+        );
         // `fail_to_proxy` names a delivered request's failure and a refused stream itself, under
         // the type `failure_response` gives the error class reaching that arm: the message is read
         // from its source and the type from the mapping, so either drifting fails here.
@@ -9571,6 +9643,37 @@ mod tests {
                 let (_, typ, msg) = failure_response(e).expect("answered");
                 produced.push((typ, msg));
             }
+        }
+        // And the other way: every message `fail_to_proxy` assigns, and every message literal in
+        // `failure_response`, is one produced above, so an arm added to either without a case here
+        // fails rather than going unchecked.
+        let quoted = |s: &'static str| -> Vec<&'static str> {
+            s.match_indices('"')
+                .collect::<Vec<_>>()
+                .chunks(2)
+                .filter_map(|c| match c {
+                    [(a, _), (b, _)] => Some(&s[a + 1..*b]),
+                    _ => None,
+                })
+                .collect()
+        };
+        for (at, _) in ftp.match_indices("msg = \"") {
+            let msg = quoted(&ftp[at..])[0];
+            assert!(
+                produced.iter().any(|&(_, m)| m == msg),
+                "fail_to_proxy answers {msg:?}, which no case here produces"
+            );
+        }
+        let fr = src
+            .find("fn failure_response(")
+            .expect("failure_response is in the production half");
+        let fr = &src[fr..fr + src[fr..].find("\n}\n").expect("failure_response ends")];
+        let types = ["rate_limit_error", "invalid_request_error", "api_error"];
+        for msg in quoted(fr).into_iter().filter(|m| !types.contains(m)) {
+            assert!(
+                produced.iter().any(|&(_, m)| m == msg),
+                "failure_response answers {msg:?}, which no class here produces"
+            );
         }
         for &(typ, msg) in &produced {
             assert!(
