@@ -1244,3 +1244,153 @@ async fn read_windows_a_file_past_64_mib_at_any_offset_on_both_backends() {
         );
     }
 }
+
+fn mode_of(p: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+}
+
+/// Content for a write, starting with the line the tests then `edit`: `small` fits one command on
+/// every write path; the other is past the 48 KiB argv chunk, so the chunked path commits over
+/// several commands.
+fn write_content(small: bool) -> String {
+    let mut s = String::from("first line\n");
+    if !small {
+        s.push_str(&"0123456789abcdef\n".repeat(6000));
+    }
+    s
+}
+
+#[tokio::test]
+async fn write_and_edit_keep_the_file_mode_on_every_backend() {
+    // The `FsBackend::write_bytes` contract. The shell backend wrote a temp file and `mv`ed it over
+    // the target, so the file took the temp's default mode: a 0600 secret became 0644, and a 0755
+    // script lost its execute bits.
+    for (name, backend) in all_backends().await {
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [0o600, 0o755, 0o664] {
+            for small in [true, false] {
+                let p = dir.path().join(format!("f-{mode:o}-{small}"));
+                std::fs::write(&p, "old one\n").unwrap();
+                std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(mode))
+                    .unwrap();
+                let path = p.to_str().unwrap();
+                run_tool(
+                    Some(backend.clone()),
+                    "write",
+                    json!({ "path": path, "content": write_content(small) }),
+                )
+                .await;
+                assert_eq!(
+                    mode_of(&p),
+                    mode,
+                    "{name} write (small={small}): mode {mode:o}"
+                );
+                run_tool(
+                    Some(backend.clone()),
+                    "edit",
+                    json!({ "path": path, "old_string": "first line", "new_string": "edited line" }),
+                )
+                .await;
+                assert_eq!(
+                    mode_of(&p),
+                    mode,
+                    "{name} edit (small={small}): mode {mode:o}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn write_and_edit_go_through_a_symlink_on_every_backend() {
+    // The link stays a link and its target gets the bytes. The shell backend's `mv` replaced the
+    // link itself with a regular file and left the target untouched.
+    for (name, backend) in all_backends().await {
+        for small in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let d = dir.path();
+            std::fs::create_dir(d.join("real")).unwrap();
+            std::fs::write(d.join("real/target.txt"), "old one\n").unwrap();
+            std::fs::set_permissions(
+                d.join("real/target.txt"),
+                std::os::unix::fs::PermissionsExt::from_mode(0o600),
+            )
+            .unwrap();
+            // Absolute, relative, a link to a link, and a dangling link whose target is created.
+            std::os::unix::fs::symlink(d.join("real/target.txt"), d.join("abs")).unwrap();
+            std::os::unix::fs::symlink("real/target.txt", d.join("rel")).unwrap();
+            std::os::unix::fs::symlink("rel", d.join("chain")).unwrap();
+            std::os::unix::fs::symlink("real/fresh.txt", d.join("dangling")).unwrap();
+
+            let content = write_content(small);
+            for link in ["abs", "rel", "chain"] {
+                std::fs::write(d.join("real/target.txt"), "old one\n").unwrap();
+                run_tool(
+                    Some(backend.clone()),
+                    "write",
+                    json!({ "path": d.join(link).to_str().unwrap(), "content": content }),
+                )
+                .await;
+                let what = format!("{name} {link} (small={small})");
+                assert!(
+                    std::fs::symlink_metadata(d.join(link))
+                        .unwrap()
+                        .file_type()
+                        .is_symlink(),
+                    "{what}: the link must stay a link"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(d.join("real/target.txt")).unwrap(),
+                    content,
+                    "{what}: the target gets the bytes"
+                );
+                assert_eq!(mode_of(&d.join("real/target.txt")), 0o600, "{what}");
+                run_tool(
+                    Some(backend.clone()),
+                    "edit",
+                    json!({ "path": d.join(link).to_str().unwrap(), "old_string": "first line", "new_string": "edited line" }),
+                )
+                .await;
+                assert!(
+                    std::fs::symlink_metadata(d.join(link))
+                        .unwrap()
+                        .file_type()
+                        .is_symlink(),
+                    "{what}: edit must leave the link a link"
+                );
+                assert!(
+                    std::fs::read_to_string(d.join("real/target.txt"))
+                        .unwrap()
+                        .starts_with("edited line\n"),
+                    "{what}: edit writes the target"
+                );
+            }
+            run_tool(
+                Some(backend.clone()),
+                "write",
+                json!({ "path": d.join("dangling").to_str().unwrap(), "content": content }),
+            )
+            .await;
+            assert!(
+                std::fs::symlink_metadata(d.join("dangling"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{name} dangling (small={small}): the link must stay a link"
+            );
+            assert_eq!(
+                std::fs::read_to_string(d.join("real/fresh.txt")).unwrap(),
+                content,
+                "{name} dangling (small={small}): the target is created"
+            );
+            // No temp file is left anywhere.
+            let mut left: Vec<_> = std::fs::read_dir(d.join("real"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            left.sort();
+            assert_eq!(left, ["fresh.txt", "target.txt"], "{name} (small={small})");
+        }
+    }
+}

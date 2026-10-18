@@ -2604,6 +2604,18 @@ symlink cannot redirect the write. The temp is removed on any failure: by the sc
 sees, and by a best-effort `rm -f` from the host for the ones it cannot see, such as a transport error
 between chunks.
 
+Both paths also keep the rest of `FsBackend::write_bytes`'s contract, which is written down once on
+that trait method and checked on every backend by `tests/fs_backend_parity.rs`. Every write script
+starts by resolving the target the way `LocalFs` does: `readlink -f`, falling back to one `readlink`
+hop for a dangling link. It then names the temp beside the resolved file, so a write through a symlink
+lands in its target and the link stays a link. The temp is created empty and given the existing file's
+mode before any content goes in, with `chmod --reference` or, on busybox, which has no
+`--reference`, `chmod "$(stat -L -c %a ...)"`. A mode that cannot be copied fails the write. Before
+this, the `mv` replaced a symlink with a regular file and gave every rewritten file the temp's default
+mode: a 0600 secret became 0644, and a 0755 script lost its execute bits. `LocalFs` sets the mode on
+the temp's open descriptor as well as in `open`, whose mode passes through the umask, so a 0664 file
+stays 0664 under a 022 umask on both backends.
+
 **The probe is what keeps old endpoints safe.** A v1 endpoint ignores the unknown `stdin_base64` like
 any other extra field and runs the command with empty input. So does `docker exec` without `-i`.
 Trusting stdin there would turn every write into an _empty file_, so `ShellFs::connect` proves it
