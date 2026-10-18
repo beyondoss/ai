@@ -203,10 +203,11 @@ pub enum Tier {
     /// `standard`: Anthropic's own name for its standard tier. Kept apart from [`Tier::Default`]
     /// because Anthropic and Bedrock refuse every other tier ([`price`]).
     Standard,
-    /// `default` (OpenAI), `on_demand` (Groq), `auto`: the standard class under another name.
-    /// `auto` is the request's default echoed back unresolved (Meta, through OpenRouter, reports
-    /// it on every Muse Spark answer and bills the standard rate): no other tier was asked for, so
-    /// none was served.
+    /// `default` (OpenAI), `on_demand` (Groq), `auto`, `asap`: the standard class under another
+    /// name. `auto` is the request's default echoed back unresolved (Meta, through OpenRouter,
+    /// reports it on every Muse Spark answer and bills the standard rate): no other tier was asked
+    /// for, so none was served. `asap` is Sail Research's name for its one serving class (through
+    /// OpenRouter, on DeepSeek V4 Pro, billed at the endpoint's listed rate to the token, D288).
     Default,
     /// `priority` or `fast`: fast mode ([`Class::Fast`]).
     Priority,
@@ -222,7 +223,7 @@ impl Tier {
     pub fn parse(s: &str) -> Tier {
         match s {
             "standard" => Tier::Standard,
-            "default" | "on_demand" | "auto" => Tier::Default,
+            "default" | "on_demand" | "auto" | "asap" => Tier::Default,
             "priority" | "fast" => Tier::Priority,
             "ultrafast" => Tier::Ultrafast,
             "flex" => Tier::Flex,
@@ -1334,7 +1335,9 @@ mod tests {
 
         pub fn served_class(tier: Option<&str>, speed: Option<&str>) -> Result<Class, Unpriced> {
             let tier = match tier {
-                None | Some("default" | "standard" | "on_demand" | "auto") => Class::Standard,
+                None | Some("default" | "standard" | "on_demand" | "auto" | "asap") => {
+                    Class::Standard
+                }
                 Some("priority" | "fast") => Class::Fast,
                 Some("ultrafast") => Class::Ultrafast,
                 Some("flex") => Class::Flex,
@@ -1377,6 +1380,7 @@ mod tests {
             "standard",
             "on_demand",
             "auto",
+            "asap",
             "priority",
             "fast",
             "ultrafast",
@@ -1476,6 +1480,38 @@ mod tests {
         assert_eq!(
             price(&UsageRow {
                 service_tier: Some(Tier::parse("auto")),
+                ..row("claude-opus-4-8", "anthropic")
+            }),
+            Err(Unpriced::UnknownClass)
+        );
+    }
+
+    /// A reported `service_tier: "asap"` (Sail Research through OpenRouter, on DeepSeek V4 Pro) is
+    /// the standard class: OpenRouter billed it at the endpoint's listed rate to the token. From
+    /// Anthropic it is still refused.
+    /// claim: BIL-24
+    /// defect: D288
+    #[test]
+    fn service_tier_asap_is_the_standard_class() {
+        // Measured 2026-10-18: 20 in / 144 out, usage.cost $0.000176576 = 20 x $0.448/M +
+        // 144 x $1.164/M, Sail Research's listed rate.
+        let ds = price(&UsageRow {
+            service_tier: Some(Tier::parse("asap")),
+            usage_wire: WireFormat::OpenAi,
+            upstream_cost_usd: Some(parse_usd_atto("0.000176576")),
+            input_tokens: 20,
+            output_tokens: 144,
+            ..row("deepseek-v4-pro", "openrouter")
+        })
+        .unwrap();
+        assert_eq!(
+            (ds.cost.class, ds.price.class),
+            (Class::Standard, Class::Standard)
+        );
+        assert_eq!(ds.price.micros, 186);
+        assert_eq!(
+            price(&UsageRow {
+                service_tier: Some(Tier::parse("asap")),
                 ..row("claude-opus-4-8", "anthropic")
             }),
             Err(Unpriced::UnknownClass)

@@ -216,6 +216,7 @@ fn pricer_row_prices_as_the_logged_text() {
         "standard",
         "on_demand",
         "auto",
+        "asap",
         "priority",
         "fast",
         "ultrafast",

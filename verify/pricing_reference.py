@@ -66,7 +66,7 @@ def tokens(row):
 
 def served_class(row):
     t = row.get("service_tier")
-    if t in (None, "default", "standard", "on_demand", "auto"):
+    if t in (None, "default", "standard", "on_demand", "auto", "asap"):
         tier = "standard"
     elif t in ("priority", "fast"):
         tier = "fast"

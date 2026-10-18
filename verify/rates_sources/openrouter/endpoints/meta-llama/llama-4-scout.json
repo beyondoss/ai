@@ -14,6 +14,30 @@
         "tag": "deepinfra/fp8"
       },
       {
+        "context_length": 327680,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000024",
+          "discount": 0,
+          "prompt": "0.00000008"
+        },
+        "provider_name": "DeepInfra",
+        "quantization": "fp8",
+        "tag": "deepinfra/fp8/flex"
+      },
+      {
+        "context_length": 327680,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000045",
+          "discount": 0,
+          "prompt": "0.00000015"
+        },
+        "provider_name": "DeepInfra",
+        "quantization": "fp8",
+        "tag": "deepinfra/fp8/priority"
+      },
+      {
         "context_length": 1310720,
         "max_prompt_tokens": null,
         "pricing": {

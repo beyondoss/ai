@@ -5,9 +5,9 @@
         "context_length": 1000000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000012",
+          "completion": "0.0000006",
           "discount": 0,
-          "input_cache_read": "0.00000003",
+          "input_cache_read": "0.000000015",
           "overrides": [
             {
               "completion": "0.0000012",
@@ -24,7 +24,7 @@
               "utc_start": 1400
             }
           ],
-          "prompt": "0.0000003"
+          "prompt": "0.00000015"
         },
         "provider_name": "Alibaba",
         "quantization": "unknown",
@@ -34,10 +34,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000000768",
+          "completion": "0.00000054",
           "discount": 0,
-          "input_cache_read": "0.00000000384",
-          "prompt": "0.000000192"
+          "input_cache_read": "0.0000000135",
+          "prompt": "0.000000135"
         },
         "provider_name": "AtlasCloud",
         "quantization": "fp8",
@@ -47,14 +47,27 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000005988",
-          "discount": 0.501,
-          "input_cache_read": "0.000000002994",
-          "prompt": "0.0000001497"
+          "completion": "0.0000012",
+          "discount": 0,
+          "input_cache_read": "0.000000006",
+          "prompt": "0.0000003"
         },
         "provider_name": "Baidu",
         "quantization": "fp8",
         "tag": "baidu/fp8"
+      },
+      {
+        "context_length": 1048576,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000012",
+          "discount": 0,
+          "input_cache_read": "0.000000007",
+          "prompt": "0.0000003"
+        },
+        "provider_name": "BaseTen",
+        "quantization": "unknown",
+        "tag": "baseten"
       },
       {
         "context_length": 1048576,
@@ -66,7 +79,7 @@
           "prompt": "0.0000006"
         },
         "provider_name": "BaseTen",
-        "quantization": "fp32",
+        "quantization": "unknown",
         "tag": "baseten/fast"
       },
       {
@@ -79,34 +92,8 @@
           "prompt": "0.0000003"
         },
         "provider_name": "BaseTen",
-        "quantization": "fp32",
-        "tag": "baseten/fp32"
-      },
-      {
-        "context_length": 1048576,
-        "max_prompt_tokens": null,
-        "pricing": {
-          "completion": "0.0000012",
-          "discount": 0,
-          "input_cache_read": "0.000000007",
-          "prompt": "0.0000003"
-        },
-        "provider_name": "BaseTen",
-        "quantization": "fp8",
-        "tag": "baseten/fp8"
-      },
-      {
-        "context_length": 1048576,
-        "max_prompt_tokens": null,
-        "pricing": {
-          "completion": "0.0000009",
-          "discount": 0,
-          "input_cache_read": "0.00000003",
-          "prompt": "0.0000001"
-        },
-        "provider_name": "Cloudflare",
         "quantization": "unknown",
-        "tag": "cloudflare"
+        "tag": "baseten/us"
       },
       {
         "context_length": 1048576,
@@ -114,7 +101,7 @@
         "pricing": {
           "completion": "0.00000065",
           "discount": 0,
-          "input_cache_read": "0.000000006",
+          "input_cache_read": "0.000000002",
           "prompt": "0.00000015"
         },
         "provider_name": "CoreWeave",
@@ -164,104 +151,36 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000006",
-          "discount": 0,
-          "input_cache_read": "0.000000003",
-          "overrides": [
-            {
-              "completion": "0.0000006",
-              "input_cache_read": "0.000000003",
-              "prompt": "0.00000015",
-              "utc_days": [
-                "saturday",
-                "sunday"
-              ]
-            },
-            {
-              "completion": "0.0000006",
-              "input_cache_read": "0.000000003",
-              "prompt": "0.00000015",
-              "utc_days": [
-                "monday",
-                "tuesday",
-                "wednesday",
-                "thursday",
-                "friday"
-              ],
-              "utc_end": 100,
-              "utc_start": 0
-            },
-            {
-              "completion": "0.0000012",
-              "input_cache_read": "0.000000006",
-              "prompt": "0.0000003",
-              "utc_days": [
-                "monday",
-                "tuesday",
-                "wednesday",
-                "thursday",
-                "friday"
-              ],
-              "utc_end": 400,
-              "utc_start": 100
-            },
-            {
-              "completion": "0.0000006",
-              "input_cache_read": "0.000000003",
-              "prompt": "0.00000015",
-              "utc_days": [
-                "monday",
-                "tuesday",
-                "wednesday",
-                "thursday",
-                "friday"
-              ],
-              "utc_end": 600,
-              "utc_start": 400
-            },
-            {
-              "completion": "0.0000012",
-              "input_cache_read": "0.000000006",
-              "prompt": "0.0000003",
-              "utc_days": [
-                "monday",
-                "tuesday",
-                "wednesday",
-                "thursday",
-                "friday"
-              ],
-              "utc_end": 1000,
-              "utc_start": 600
-            },
-            {
-              "completion": "0.0000006",
-              "input_cache_read": "0.000000003",
-              "prompt": "0.00000015",
-              "utc_days": [
-                "monday",
-                "tuesday",
-                "wednesday",
-                "thursday",
-                "friday"
-              ],
-              "utc_end": 0,
-              "utc_start": 1000
-            }
-          ],
-          "prompt": "0.00000015"
+          "completion": "0.000000336",
+          "discount": 0.3,
+          "input_cache_read": "0.00000000336",
+          "prompt": "0.000000112"
         },
-        "provider_name": "DeepSeek",
-        "quantization": "unknown",
-        "tag": "deepseek"
+        "provider_name": "DeepInfra",
+        "quantization": "fp8",
+        "tag": "deepinfra/fp8/flex"
       },
       {
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000009",
+          "completion": "0.00000063",
+          "discount": 0.3,
+          "input_cache_read": "0.0000000063",
+          "prompt": "0.00000021"
+        },
+        "provider_name": "DeepInfra",
+        "quantization": "fp8",
+        "tag": "deepinfra/fp8/priority"
+      },
+      {
+        "context_length": 1048576,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000078",
           "discount": 0,
           "input_cache_read": "0.000000006",
-          "prompt": "0.000000225"
+          "prompt": "0.000000195"
         },
         "provider_name": "DigitalOcean",
         "quantization": "unknown",
@@ -310,10 +229,10 @@
         "context_length": 1040000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000066",
+          "completion": "0.000000715",
           "discount": 0,
-          "input_cache_read": "0.00000001",
-          "prompt": "0.0000001"
+          "input_cache_read": "0.000000008",
+          "prompt": "0.000000103"
         },
         "provider_name": "InferenceNet",
         "quantization": "fp8",
@@ -323,9 +242,9 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000011",
+          "completion": "0.00000075",
           "discount": 0,
-          "input_cache_read": "0.000000005",
+          "input_cache_read": "0.000000006",
           "prompt": "0.00000027"
         },
         "provider_name": "Ionstream",
@@ -362,14 +281,26 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000006",
+          "completion": "0.00000055",
           "discount": 0,
-          "input_cache_read": "0.000000009",
-          "prompt": "0.000000033"
+          "input_cache_read": "0.000000007",
+          "prompt": "0.000000077"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
         "tag": "morph/fp8"
+      },
+      {
+        "context_length": 1048000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000012",
+          "discount": 0,
+          "prompt": "0.0000003"
+        },
+        "provider_name": "Nebius",
+        "quantization": "fp8",
+        "tag": "nebius/fp8"
       },
       {
         "context_length": 1048576,
@@ -388,10 +319,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000072",
+          "completion": "0.000000144",
           "discount": 0,
-          "input_cache_read": "0.0000000054",
-          "prompt": "0.00000002376"
+          "input_cache_read": "0.0000000016",
+          "prompt": "0.00000004"
         },
         "provider_name": "OpenInference",
         "quantization": "fp4",
@@ -440,10 +371,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000008",
+          "completion": "0.0000006",
           "discount": 0,
-          "input_cache_read": "0.00000001",
-          "prompt": "0.0000000264"
+          "input_cache_read": "0.000000008",
+          "prompt": "0.00000005"
         },
         "provider_name": "Relace",
         "quantization": "unknown",
@@ -479,10 +410,10 @@
         "context_length": 1024000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000000588",
-          "discount": 0.51,
-          "input_cache_read": "0.00000000294",
-          "prompt": "0.000000147"
+          "completion": "0.0000005988",
+          "discount": 0.501,
+          "input_cache_read": "0.000000002994",
+          "prompt": "0.0000001497"
         },
         "provider_name": "StreamLake",
         "quantization": "fp8",
@@ -520,12 +451,12 @@
         "pricing": {
           "completion": "0.00000065",
           "discount": 0,
-          "input_cache_read": "0.00000002",
+          "input_cache_read": "0.000000006",
           "prompt": "0.0000001"
         },
         "provider_name": "Wafer",
-        "quantization": "unknown",
-        "tag": "wafer"
+        "quantization": "mxfp4",
+        "tag": "wafer/mxfp4"
       }
     ],
     "id": "deepseek/deepseek-v4.1-flash"

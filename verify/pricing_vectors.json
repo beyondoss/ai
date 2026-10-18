@@ -1,6 +1,6 @@
 {
   "about": "Golden vectors for the pricing contract (crates/providers/ARCHITECTURE.md, 'Pricing contract'). Each row is an ai.usage row; expect is what price(row) must return. An implementation must reproduce every one exactly. Absent row fields take their defaults: usage_wire anthropic, counts 0, strings null, booleans false, server_tools {}.",
-  "rate_version": "2026-10-15.3fc8baba1491585d",
+  "rate_version": "2026-10-18.3a848991f87fae06",
   "vectors": [
     {
       "name": "anthropic_basic",
@@ -1721,6 +1721,31 @@
       },
       "expect": {
         "unpriced": "unknown_class"
+      }
+    },
+    {
+      "name": "openrouter_service_tier_asap_reported",
+      "why": "Sail Research, through OpenRouter, answers DeepSeek V4 Pro with service_tier \"asap\" and bills its endpoint's listed rate to the token: asap is the standard class (D288). Counts and cost as measured 2026-10-18 (20 in, 144 out, $0.000176576 = 20 x $0.448/M + 144 x $1.164/M).",
+      "row": {
+        "price_model": "deepseek-v4-pro",
+        "provider": "openrouter",
+        "input_tokens": 20,
+        "output_tokens": 144,
+        "service_tier": "asap",
+        "upstream_cost_usd": "0.000176576",
+        "served_by": "Sail Research",
+        "usage_wire": "openai",
+        "unix_secs": 1792346926
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "reported",
+        "cost_micros": 186,
+        "price_micros": 186,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
       }
     },
     {

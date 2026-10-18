@@ -5,9 +5,9 @@
         "context_length": 1000000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000003366",
+          "completion": "0.0000017424",
           "discount": 0,
-          "input_cache_read": "0.0000001122",
+          "input_cache_read": "0.00000005808",
           "overrides": [
             {
               "completion": "0.000003366",
@@ -24,7 +24,7 @@
               "utc_start": 1400
             }
           ],
-          "prompt": "0.000001122"
+          "prompt": "0.0000005808"
         },
         "provider_name": "Alibaba",
         "quantization": "unknown",
@@ -34,9 +34,9 @@
         "context_length": 1000000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000396",
+          "completion": "0.00000198",
           "discount": 0,
-          "input_cache_read": "0.000000132",
+          "input_cache_read": "0.000000066",
           "overrides": [
             {
               "completion": "0.00000396",
@@ -53,7 +53,7 @@
               "utc_start": 1400
             }
           ],
-          "prompt": "0.00000132"
+          "prompt": "0.00000066"
         },
         "provider_name": "Alibaba",
         "quantization": "unknown",
@@ -76,10 +76,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000060588",
-          "discount": 0.847,
-          "input_cache_read": "0.000000006426",
-          "prompt": "0.00000020196"
+          "completion": "0.00000039996",
+          "discount": 0.899,
+          "input_cache_read": "0.000000004242",
+          "prompt": "0.00000013332"
         },
         "provider_name": "Baidu",
         "quantization": "fp8",
@@ -222,6 +222,19 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
+          "completion": "0.0000038",
+          "discount": 0,
+          "input_cache_read": "0.00000015",
+          "prompt": "0.00000088"
+        },
+        "provider_name": "DekaLLM",
+        "quantization": "unknown",
+        "tag": "dekallm"
+      },
+      {
+        "context_length": 1048576,
+        "max_prompt_tokens": null,
+        "pricing": {
           "completion": "0.00000396",
           "discount": 0,
           "input_cache_read": "0.000000044",
@@ -302,8 +315,8 @@
         "pricing": {
           "completion": "0.000008",
           "discount": 0,
-          "input_cache_read": "0.00000018",
-          "prompt": "0.0000001817"
+          "input_cache_read": "0.00000012",
+          "prompt": "0.00000012"
         },
         "provider_name": "Relace",
         "quantization": "fp4",
@@ -313,10 +326,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000099",
+          "completion": "0.000001164",
           "discount": 0,
-          "input_cache_read": "0.0000001866",
-          "prompt": "0.0000008957"
+          "input_cache_read": "0.0000000935",
+          "prompt": "0.000000448"
         },
         "provider_name": "Sail Research",
         "quantization": "fp4",
@@ -326,10 +339,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000099",
+          "completion": "0.000001164",
           "discount": 0,
-          "input_cache_read": "0.0000001866",
-          "prompt": "0.0000008957"
+          "input_cache_read": "0.0000000935",
+          "prompt": "0.000000448"
         },
         "provider_name": "Sail Research",
         "quantization": "fp4",
@@ -397,8 +410,8 @@
           "prompt": "0.00000025"
         },
         "provider_name": "Wafer",
-        "quantization": "unknown",
-        "tag": "wafer"
+        "quantization": "mxfp4",
+        "tag": "wafer/mxfp4"
       }
     ],
     "id": "deepseek/deepseek-v4-pro-0813"
