@@ -6792,17 +6792,25 @@ impl ProxyHttp for AiProxy {
         // What this failure says about the body (see `retry::decide`): whether the provider may
         // have all of it, or proved it took none (an HTTP/2 refusal, a pooled HTTP/1.1 connection
         // it closed with the request unread).
+        //
+        // A fact `decide` cannot read past an earlier one is not computed: the delivery check
+        // only matters while the client is there, nothing reached it and nothing proved the body
+        // unprocessed; a GOAWAY only for a refusal; an unsent HTTP/2 body only for one that is not.
+        let downstream = *e.esource() == pingora_core::ErrorSource::Downstream;
+        let responded = session.as_downstream().response_written().is_some();
         let refused = upstream_refused_stream(&e);
+        let reset_unread = reset_before_reading(&e, client_reused);
+        let open = !downstream && !responded;
         let lost = retry::Lost {
-            downstream: *e.esource() == pingora_core::ErrorSource::Downstream,
-            responded: session.as_downstream().response_written().is_some(),
-            delivered: body_delivered(session, rc, Some(&*e)),
+            downstream,
+            responded,
+            delivered: open && !refused && !reset_unread && body_delivered(session, rc, Some(&*e)),
             refused,
-            goaway: upstream_goaway(&e),
-            reset_unread: reset_before_reading(&e, client_reused),
+            goaway: refused && upstream_goaway(&e),
+            reset_unread,
             reused: client_reused,
             refused_resent: rc.leg.refused_resent,
-            h2_body_unsent: h2_body_unsent(&e),
+            h2_body_unsent: open && !refused && h2_body_unsent(&e),
             pingora_retries: {
                 let mut verdict = e.retry;
                 verdict.decide_reuse(client_reused);

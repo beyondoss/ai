@@ -479,3 +479,45 @@ fn each_retry_decision_by_name() {
         assert_eq!(decide(&failed), want, "{name}");
     }
 }
+
+/// `error_while_proxy` skips the facts an earlier one makes unreadable (the delivery check once
+/// the client is gone, a response went out, or the body is proved unprocessed; a GOAWAY without a
+/// refusal; an unsent HTTP/2 body on a refusal). Skipping them never changes the decision.
+#[test]
+fn the_facts_a_lost_connection_skips_never_change_its_decision() {
+    for bits in 0u16..1024 {
+        let bit = |i: u16| bits & (1 << i) != 0;
+        let lost = Lost {
+            downstream: bit(0),
+            responded: bit(1),
+            delivered: bit(2),
+            refused: bit(3),
+            goaway: bit(4),
+            reset_unread: bit(5),
+            reused: bit(6),
+            refused_resent: bit(7),
+            h2_body_unsent: bit(8),
+            pingora_retries: bit(9),
+        };
+        let open = !lost.downstream && !lost.responded;
+        let skipped = Lost {
+            delivered: open && !lost.refused && !lost.reset_unread && lost.delivered,
+            goaway: lost.refused && lost.goaway,
+            h2_body_unsent: open && !lost.refused && lost.h2_body_unsent,
+            ..lost
+        };
+        assert_eq!(lost.spends_resend(), skipped.spends_resend(), "{lost:?}");
+        for walk in walks() {
+            for body in bodies() {
+                let decide = |lost| {
+                    decide(&Failed {
+                        failure: Failure::Lost(lost),
+                        walk,
+                        body,
+                    })
+                };
+                assert_eq!(decide(lost), decide(skipped), "{lost:?} {walk:?} {body:?}");
+            }
+        }
+    }
+}
