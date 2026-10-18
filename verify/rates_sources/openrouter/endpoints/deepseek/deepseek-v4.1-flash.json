@@ -284,7 +284,7 @@
           "completion": "0.00000055",
           "discount": 0,
           "input_cache_read": "0.000000007",
-          "prompt": "0.000000077"
+          "prompt": "0.000000076"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -322,7 +322,7 @@
           "completion": "0.000000144",
           "discount": 0,
           "input_cache_read": "0.0000000016",
-          "prompt": "0.00000004"
+          "prompt": "0.0000000616"
         },
         "provider_name": "OpenInference",
         "quantization": "fp4",
@@ -366,19 +366,6 @@
         "provider_name": "PrimeIntellect",
         "quantization": "unknown",
         "tag": "primeintellect"
-      },
-      {
-        "context_length": 1048576,
-        "max_prompt_tokens": null,
-        "pricing": {
-          "completion": "0.0000006",
-          "discount": 0,
-          "input_cache_read": "0.000000008",
-          "prompt": "0.00000005"
-        },
-        "provider_name": "Relace",
-        "quantization": "unknown",
-        "tag": "relace"
       },
       {
         "context_length": 1048576,

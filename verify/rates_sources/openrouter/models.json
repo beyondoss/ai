@@ -1202,7 +1202,7 @@
       "id": "z-ai/glm-5.3",
       "name": "Z.ai: GLM 5.3",
       "pricing": {
-        "completion": "0.0000014",
+        "completion": "0.000001",
         "input_cache_read": "0.000000078",
         "prompt": "0.000000079"
       }
