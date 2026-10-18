@@ -2973,5 +2973,5 @@ evidence = "usage.rs OpenAiUsage::counts_tokens counted output_tokens or input_t
 claims = ["BIL-1"]
 state = "fixed"
 test = "an_output_tokens_only_usage_never_hides_an_earlier_openai_usage"
-fix = ""
+fix = "a8c35ba"
 note = "Fixed in usage.rs: on the OpenAI wire input_tokens and output_tokens count only as a pair (Responses always sends both, Chat neither), so a lone one names no count and spelling() is None: no usage, not zero, and the scan falls through to the earlier real line. On the Anthropic wire a message_start usage that names no Anthropic count is skipped, as a message_delta's already was. Both are Option checks on the deserialized struct; might_carry_usage is unchanged. The dialect_tests corpus case that pinned the old 0/0 (messages stream, head and tail, and its whole-stream twin) now expects None."
