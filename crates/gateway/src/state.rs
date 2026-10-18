@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
@@ -440,6 +440,9 @@ pub struct GatewayState {
     /// Monotonic per-request counter, the low half of `request_id`. A relaxed `fetch_add` — the only
     /// requirement is uniqueness within the process, not cross-request ordering.
     request_seq: AtomicU64,
+    /// Requests that exist right now (see [`Self::live_requests`]). Per gateway, not per process,
+    /// so a test that runs two gateways in one process drains each on its own count.
+    live_requests: AtomicUsize,
 
     /// Debug builds only: a proxy phase to panic in, once (see [`Self::fault_point`]).
     #[cfg(debug_assertions)]
@@ -602,10 +605,28 @@ impl GatewayState {
                 p
             },
             request_seq: AtomicU64::new(0),
+            live_requests: AtomicUsize::new(0),
             #[cfg(debug_assertions)]
             fault: FaultPanic::from_env(),
             config,
         }))
+    }
+
+    /// Requests that exist right now: counted when pingora builds a request's context (once the
+    /// request header has been read) and uncounted when that context drops, after `logging` has
+    /// written its billing row. `main`'s shutdown drain exits once this reaches 0.
+    pub fn live_requests(&self) -> usize {
+        self.live_requests.load(Ordering::Acquire)
+    }
+
+    /// One more request context exists: the only shared write `new_ctx` makes.
+    pub(crate) fn request_began(&self) {
+        self.live_requests.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// A request context dropped, its billing row written.
+    pub(crate) fn request_ended(&self) {
+        self.live_requests.fetch_sub(1, Ordering::AcqRel);
     }
 
     /// A process-unique request id (`{instance}-{seq}`) for log correlation and the

@@ -2910,6 +2910,22 @@ it may walk to another key or candidate whenever pingora still holds the whole b
 failure moved no body byte. `retry_tests.rs` holds the function to the rules the hooks ran inline
 over every combination of facts they can report, and names each outcome.
 
+### What is process-wide
+
+Mutable state belongs to the gateway (`GatewayState`), so two gateways in one process (as the unit
+tests build them) never share it: the count of live requests the shutdown drain waits on
+(`GatewayState::live_requests`) is one. What stays a `static` is process-wide by nature:
+
+| Static                                    | Why                                                                      |
+| ----------------------------------------- | ------------------------------------------------------------------------ |
+| `deadline::{BASE, NOW_MS, TICKER}`        | one coarse clock and its one ticker thread; a per-chunk read is one load |
+| `circuit_breaker::MONOTONIC_BASE`         | every breaker's packed timestamps count from one origin                  |
+| `proxy::REJECT_LOG`, `log_second`         | the rejection-line cap guards the process's one stdout                   |
+| `admin::LAST_SCRAPE`                      | sizes the scrape of the default Prometheus registry, itself process-wide |
+| `cache::KEY_HASHER`                       | a per-process secret, immutable once made                                |
+| `control::*_NAME`, `signed_id::ID_KEY`, … | immutable lookups built once (the header names at compile time)          |
+| `translate::fresh_id`'s counter           | ids unique across the process                                            |
+
 ---
 
 ## Why It Behaves This Way

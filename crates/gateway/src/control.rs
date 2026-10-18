@@ -43,7 +43,6 @@
 use http::header::HeaderName;
 use pingora::http::RequestHeader;
 use providers::{Candidate, MAX_CANDIDATES, by_id};
-use std::sync::LazyLock;
 
 /// Tag set for cost attribution: `{"feature":"summarizer","org":"acme"}`.
 pub const METADATA_HEADER: &str = "x-beyond-metadata";
@@ -71,15 +70,14 @@ pub const SPLIT_HEADER: &str = "x-beyond-split";
 /// majority that sent neither — so the difference is pure overhead on the hot path. Measured on the
 /// dev host (`benches/unit.rs`, `capture::control_parse_absent`): **39.8 ns → 19.8 ns** fastest,
 /// 39.8 → 29.8 ns median. Same reasoning as the boot-built `HeaderValue`s in
-/// `proxy::upstream_request_filter`.
-static METADATA_NAME: LazyLock<HeaderName> =
-    LazyLock::new(|| HeaderName::from_static(METADATA_HEADER));
-static CAPTURE_NAME: LazyLock<HeaderName> =
-    LazyLock::new(|| HeaderName::from_static(CAPTURE_HEADER));
-static CACHE_NAME: LazyLock<HeaderName> = LazyLock::new(|| HeaderName::from_static(CACHE_HEADER));
-static ORDER_NAME: LazyLock<HeaderName> = LazyLock::new(|| HeaderName::from_static(ORDER_HEADER));
-static ONLY_NAME: LazyLock<HeaderName> = LazyLock::new(|| HeaderName::from_static(ONLY_HEADER));
-static SPLIT_NAME: LazyLock<HeaderName> = LazyLock::new(|| HeaderName::from_static(SPLIT_HEADER));
+/// `proxy::upstream_request_filter`. Built at compile time (`from_static` is `const`), so a read
+/// is a plain reference with no lazy-init check.
+static METADATA_NAME: HeaderName = HeaderName::from_static(METADATA_HEADER);
+static CAPTURE_NAME: HeaderName = HeaderName::from_static(CAPTURE_HEADER);
+static CACHE_NAME: HeaderName = HeaderName::from_static(CACHE_HEADER);
+static ORDER_NAME: HeaderName = HeaderName::from_static(ORDER_HEADER);
+static ONLY_NAME: HeaderName = HeaderName::from_static(ONLY_HEADER);
+static SPLIT_NAME: HeaderName = HeaderName::from_static(SPLIT_HEADER);
 
 /// Longest metadata header we'll even attempt to parse. Checked **before** parsing so a caller
 /// can't make us walk a multi-megabyte JSON document on the request path.
@@ -177,42 +175,42 @@ impl Control {
 
         // A header whose bytes aren't UTF-8 is unusable — `to_str` failing is itself a rejection,
         // not an "absent", so it counts toward `malformed`.
-        if let Some(raw) = req.headers.get(&*METADATA_NAME) {
+        if let Some(raw) = req.headers.get(&METADATA_NAME) {
             match raw.to_str().ok().and_then(parse_metadata) {
                 Some(m) => out.metadata = Some(m),
                 None => out.malformed = true,
             }
         }
 
-        if let Some(raw) = req.headers.get(&*CAPTURE_NAME) {
+        if let Some(raw) = req.headers.get(&CAPTURE_NAME) {
             match raw.to_str().ok().and_then(parse_on_off) {
                 Some(c) => out.capture = Some(c),
                 None => out.malformed = true,
             }
         }
 
-        if let Some(raw) = req.headers.get(&*CACHE_NAME) {
+        if let Some(raw) = req.headers.get(&CACHE_NAME) {
             match raw.to_str().ok().and_then(parse_on_off) {
                 Some(c) => out.cache = Some(c),
                 None => out.malformed = true,
             }
         }
 
-        if let Some(raw) = req.headers.get(&*ORDER_NAME) {
+        if let Some(raw) = req.headers.get(&ORDER_NAME) {
             match raw.to_str().ok().and_then(parse_name_list) {
                 Some(v) => out.order = Some(v),
                 None => out.malformed = true,
             }
         }
 
-        if let Some(raw) = req.headers.get(&*ONLY_NAME) {
+        if let Some(raw) = req.headers.get(&ONLY_NAME) {
             match raw.to_str().ok().and_then(parse_name_list) {
                 Some(v) => out.only = Some(v),
                 None => out.malformed = true,
             }
         }
 
-        if let Some(raw) = req.headers.get(&*SPLIT_NAME) {
+        if let Some(raw) = req.headers.get(&SPLIT_NAME) {
             match raw.to_str().ok().and_then(parse_split) {
                 Some(v) => out.split = Some(v),
                 None => out.malformed = true,

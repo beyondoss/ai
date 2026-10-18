@@ -97,7 +97,7 @@ use std::num::NonZeroU16;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -248,13 +248,6 @@ impl AiProxy {
         Self { state }
     }
 }
-
-/// Requests that exist right now: incremented when pingora builds a request's context
-/// (`new_ctx`, once the request header has been read) and decremented when that context drops,
-/// after `logging` has written its billing row. `main`'s shutdown drain exits once this reaches 0.
-/// One atomic add and one sub per request, the only shared write `new_ctx` and the context's drop
-/// make.
-pub static LIVE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Pingora's per-request context: the admitted request's state, plus what it holds that must be
 /// given back however the request ends.
@@ -409,7 +402,7 @@ impl Drop for Ctx {
         self.held.close_drain(DrainEnd::Error);
         // An unresolved breaker permit is given back by its `Leg` as the context goes.
         drop(self.rc.take());
-        LIVE_REQUESTS.fetch_sub(1, Ordering::AcqRel);
+        self.held.state.request_ended();
     }
 }
 
@@ -3378,6 +3371,7 @@ async fn pipe_full_body(
 /// `ai_rejections_total` still counts every one.
 const REJECT_LOG_PER_SEC: u64 = 100;
 
+/// Process-wide, as the log it protects is: every gateway in the process writes the one stdout.
 static REJECT_LOG: LogRate = LogRate::new(REJECT_LOG_PER_SEC);
 
 /// A per-second allowance of log lines shared by every worker: relaxed atomics, no lock. Approximate
@@ -4171,7 +4165,7 @@ impl ProxyHttp for AiProxy {
     type CTX = Ctx;
 
     fn new_ctx(&self) -> Self::CTX {
-        LIVE_REQUESTS.fetch_add(1, Ordering::AcqRel);
+        self.state.request_began();
         Ctx {
             rc: None,
             held: Held {
