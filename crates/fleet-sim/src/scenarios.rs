@@ -2021,7 +2021,13 @@ fn sandbox_job_routes() -> Vec<(String, String)> {
                 }),
             ),
         ),
-        // S2: a build that finishes while no replica serves the session.
+        // S2: a build that finishes while no replica serves the session. The reopened session's
+        // first `bash` is its first use of the sandbox, which reads the jobs back.
+        ("\"tool_use_id\":\"sj-check\"".into(), turn_text("it built")),
+        (
+            "how-did-the-build-go".into(),
+            tool("sj-check", "bash", json!({ "command": "echo checking" })),
+        ),
         ("\"tool_use_id\":\"sj-build\"".into(), turn_text("building")),
         (
             "start-the-build".into(),
@@ -2127,8 +2133,9 @@ fn replica_at(fleet: &Fleet, addr: &Addr) -> Option<usize> {
 
 /// **S1** — a background job outlives the replica that started it. A dev server is started in a
 /// session's sandbox; the owning replica is killed outright; the session reopens on the other
-/// replica, which reports the job **still running** under its number, shows its output from where
-/// the model left off, and kills it. On both kinds of sandbox: one that runs jobs itself (v1.3) and
+/// replica, which lists the job under its number as **not yet checked** (it has not woken the
+/// sandbox to look), and, at the model's first look, finds it still running, shows its output from
+/// where the model left off, and kills it. On both kinds of sandbox: one that runs jobs itself (v1.3) and
 /// one that only runs commands (the baseline). Before, the job lived in the dead replica's exec
 /// stream, and the endpoint killed it with the connection.
 pub async fn sandbox_job_survives_its_replica(
@@ -2228,15 +2235,25 @@ async fn sandbox_job_survives_once(
         .lock()
         .map(|b| b[before..].to_vec())
         .unwrap_or_default();
+    // The new replica has not touched the sandbox when it builds its first request, so it must not
+    // claim the job's state either way: the job is "not yet checked" until the peek reads it back.
     let reopened = sent.iter().find(|b| b.contains("check-the-dev-server"));
     findings.push(Finding {
         claim: "S1",
-        ok: reopened.is_some_and(|b| b.contains("(still running)") && !b.contains("(stopped)")),
-        detail: "the new replica's first request says job 1 is still running".into(),
+        ok: reopened.is_some_and(|b| {
+            b.contains("- job 1: `echo")
+                && b.contains("(not yet checked)")
+                && !b.contains("(not running)")
+                && !b.contains("(stopped)")
+        }),
+        detail: "the new replica's first request lists job 1 as not yet checked, and claims no \
+                 state it has not checked"
+            .into(),
     });
     let messages = workload::transcript(&mut ws).await?;
     let transcript = serde_json::Value::Array(messages.clone()).to_string();
-    // The peek's result: output after what the start reported, not from the beginning.
+    // The peek's result: output after what the start reported, not from the beginning — which also
+    // says the job was found still running once checked.
     let peek = tool_result(&messages, "sj-peek");
     let peek = peek.as_str();
     findings.push(Finding {
@@ -2262,10 +2279,11 @@ async fn sandbox_job_survives_once(
     Ok(findings)
 }
 
-/// **S2** — a job that ends while no replica serves its session is reported once, on the next
-/// attach. A build is started; the owning replica is deployed away (`SIGTERM`, drained); the build
-/// finishes; the session reopens on the other replica, whose model hears its finish notice —
-/// exactly once, however many runs follow. On both kinds of sandbox.
+/// **S2** — a job that ends while no replica serves its session is reported once, when the session
+/// next uses its sandbox. A build is started; the owning replica is deployed away (`SIGTERM`,
+/// drained); the build finishes; the session reopens on the other replica, whose first `bash` reads
+/// the jobs back and whose model then hears the build's finish notice — exactly once, however many
+/// runs follow. On both kinds of sandbox.
 pub async fn sandbox_job_exit_noticed_once(kind: Kind, history_path: &std::path::Path) -> Outcome {
     let (mut fleet, _bodies, sandboxes) = match sandbox_job_fleet(kind, history_path).await {
         Ok(x) => x,
@@ -2334,8 +2352,8 @@ async fn exit_noticed_once(
         return Err(format!("no replica took the session over: {replaced:?}"));
     };
     let mut ws = workload::connect(&new_addr, session, grant).await?;
-    // Two prompts: the notice is delivered by the first run on the new replica (or by the wake
-    // before it), and must not be delivered again by the second.
+    // Two prompts: the notice is delivered by the first run on the new replica, once its `bash`
+    // has read the jobs back, and must not be delivered again by the second.
     workload::prompt(&mut ws, "how-did-the-build-go").await?;
     workload::prompt(&mut ws, "anything-else").await?;
     let transcript = serde_json::Value::Array(workload::transcript(&mut ws).await?).to_string();

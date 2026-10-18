@@ -16,7 +16,6 @@ mod common;
 
 use std::io::Write;
 use std::path::Path;
-use std::process::Command;
 
 use common::mcp_fixture::spawn_http_mcp_fixture;
 use common::{
@@ -73,7 +72,7 @@ fn write_project_settings(project: &Path, mcp_servers: Value) {
 /// `--trust-project` (see `settings::effective_settings_for_cwd`'s doc comment), so tests that need one
 /// must go through this, not just pass `--trust-project` on the `run` invocation itself.
 fn trust(home: &Path, project: &Path) {
-    let output = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let output = crate::common::agent_cmd()
         .args(["trust", project.to_str().unwrap()])
         .env("HOME", home)
         .output()

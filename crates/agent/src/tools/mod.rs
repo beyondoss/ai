@@ -902,6 +902,51 @@ pub fn apply_filter(
     tool_search::refresh(reg);
 }
 
+/// How a registry build places MCP tools — the part of a build [`rebase_mcp`] has to repeat when a
+/// server's tools change under a running loop (see [`mcp::tool_source`]).
+#[derive(Clone, Debug, Default)]
+pub struct McpFilter {
+    pub loading: tool_search::McpLoading,
+    /// `--tools`.
+    pub tools: Option<Vec<String>>,
+    /// `--exclude-tools`.
+    pub exclude: Option<Vec<String>>,
+    /// `--no-tools`.
+    pub no_tools: bool,
+    /// `--code-mode`: MCP tools live inside `execute`, which a rebase does not rebuild.
+    pub code_mode: bool,
+}
+
+/// `current` with its MCP tools (every `mcp__` name, and `tool_search` over them) replaced by
+/// `mcp_tools`, placed the way a fresh build places them — eager or deferred by `filter.loading`, then
+/// filtered by `filter`'s allow/deny lists. Everything else in `current` (built-ins, `subagent`,
+/// `structured_output`, `memory`) is kept as it is: those were registered past the filter on purpose.
+pub fn rebase_mcp(
+    current: &ToolRegistry,
+    mcp_tools: &[Arc<dyn Tool>],
+    filter: &McpFilter,
+) -> ToolRegistry {
+    let mut mcp = ToolRegistry::new();
+    tool_search::register_mcp(&mut mcp, mcp_tools, filter.loading);
+    apply_filter(
+        &mut mcp,
+        filter.tools.as_deref(),
+        filter.exclude.as_deref(),
+        filter.no_tools,
+    );
+    let mut next = current.clone();
+    next.retain(|name| !name.starts_with("mcp__") && name != tool_search::NAME);
+    for name in mcp.names() {
+        let Some(tool) = mcp.get(&name) else { continue };
+        if mcp.is_deferred(&name) {
+            next.register_deferred(tool);
+        } else {
+            next.register(tool);
+        }
+    }
+    next
+}
+
 /// Whether [`apply_filter`] keeps a tool named `name` — the one predicate, so a caller that runs a
 /// tool outside the registry (an MCP App view's `tools/call`) applies exactly the model's filter.
 pub fn filter_allows(
@@ -1603,6 +1648,52 @@ mod tests {
         // … plus the MCP-discovered one, under its already-namespaced name.
         assert!(reg.get("mcp__filesystem__read_file").is_some());
         assert_eq!(reg.len(), default_registry().len() + 1);
+    }
+
+    /// A rebase is the build it replaces: the same registry a fresh build over the new MCP tools
+    /// makes — a deferred catalog updated, an eager tool registered, the filter applied — with what
+    /// was registered past the filter kept.
+    #[test]
+    fn rebase_mcp_matches_a_fresh_build_over_the_new_tools() {
+        let before: Vec<Arc<dyn Tool>> = vec![Arc::new(FakeMcpTool("mcp__s__old"))];
+        let after: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(FakeMcpTool("mcp__s__new")),
+            Arc::new(FakeMcpTool("mcp__s__hidden")),
+        ];
+        let exclude = vec!["mcp__s__hidden".to_string()];
+        for loading in [
+            tool_search::McpLoading::Search,
+            tool_search::McpLoading::Eager,
+        ] {
+            let build = |mcp_tools: &[Arc<dyn Tool>]| {
+                let mut reg = default_registry_with_config(&ToolConfig {
+                    mcp_tools,
+                    mcp_loading: loading,
+                    ..ToolConfig::new()
+                });
+                apply_filter(&mut reg, None, Some(&exclude), false);
+                reg
+            };
+            let mut current = build(&before);
+            current.register(Arc::new(FakeMcpTool("structured_output")));
+            let filter = McpFilter {
+                loading,
+                exclude: Some(exclude.clone()),
+                ..McpFilter::default()
+            };
+            let rebased = rebase_mcp(&current, &after, &filter);
+            let mut fresh = build(&after);
+            fresh.register(Arc::new(FakeMcpTool("structured_output")));
+            assert_eq!(rebased.names(), fresh.names(), "{loading:?}");
+            assert_eq!(rebased.definitions(), fresh.definitions(), "{loading:?}");
+            assert_eq!(
+                rebased.deferred_definitions(),
+                fresh.deferred_definitions(),
+                "{loading:?}"
+            );
+            assert!(rebased.get("mcp__s__old").is_none());
+            assert!(rebased.get("mcp__s__hidden").is_none());
+        }
     }
 
     #[cfg(not(feature = "code-mode"))]

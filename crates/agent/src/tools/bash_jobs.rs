@@ -426,6 +426,13 @@ pub struct BashJobs {
     recorder: Mutex<Option<ProcRecorder>>,
     /// What [`Self::stop_survivors`] found of the jobs a killed process left, for the reopen note.
     survivors: Mutex<Survivors>,
+    /// A reattach not done yet ([`super::bash_sandbox::reattach_later`]): the sandbox's jobs are
+    /// read back at the session's first use of the sandbox, not when it opens.
+    reattach: Mutex<Option<Arc<super::bash_sandbox::PendingReattach>>>,
+    /// The jobs the reopen note called "not yet checked", reported once the reattach has run.
+    unchecked: Mutex<Vec<(u64, String)>>,
+    /// Unchecked jobs the sandbox no longer had when it was checked: reported by the next notices.
+    checked_gone: Mutex<Vec<(u64, String)>>,
 }
 
 impl Default for BashJobs {
@@ -446,7 +453,57 @@ impl BashJobs {
             garbage: Mutex::new(Vec::new()),
             recorder: Mutex::new(None),
             survivors: Mutex::new(Survivors::default()),
+            reattach: Mutex::new(None),
+            unchecked: Mutex::new(Vec::new()),
+            checked_gone: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The reattach still to run, if the session's sandbox has not been read back yet.
+    pub(crate) fn pending_reattach(&self) -> Option<Arc<super::bash_sandbox::PendingReattach>> {
+        lock(&self.reattach).clone()
+    }
+
+    /// Defer (`Some`) or settle (`None`) the reattach. Settling it reports the jobs the reopen note
+    /// left unchecked: one the reattach found is in the table now (running, or ended with its notice
+    /// due); one it did not is gone, and the next notices say so.
+    pub(crate) fn set_pending_reattach(
+        &self,
+        pending: Option<Arc<super::bash_sandbox::PendingReattach>>,
+    ) {
+        let settled = pending.is_none();
+        *lock(&self.reattach) = pending;
+        if !settled {
+            return;
+        }
+        let unchecked = std::mem::take(&mut *lock(&self.unchecked));
+        let table = lock(&self.table);
+        let gone: Vec<(u64, String)> = unchecked
+            .into_iter()
+            .filter(|(id, _)| !table.contains_key(id))
+            .collect();
+        drop(table);
+        lock(&self.checked_gone).extend(gone);
+    }
+
+    /// Whether the sandbox's jobs are still to be read back — a reopened session that has not used
+    /// its sandbox yet.
+    pub fn reattach_pending(&self) -> bool {
+        lock(&self.reattach).is_some()
+    }
+
+    /// Whether job `id` has ended (its result is in), or is not in the table at all.
+    pub(crate) fn ended_or_gone(&self, id: u64) -> bool {
+        lock(&self.table)
+            .get(&id)
+            .is_none_or(|p| p.job.shared.ended())
+    }
+
+    /// Job `id`, if the reattach just found it gone: taken, so it is reported once.
+    pub(crate) fn take_checked_gone(&self, id: u64) -> Option<String> {
+        let mut gone = lock(&self.checked_gone);
+        let at = gone.iter().position(|(j, _)| *j == id)?;
+        Some(gone.remove(at).1)
     }
 
     /// Journal each local job's processes through `recorder` from now on (`None`: stop). Set by the
@@ -720,6 +777,10 @@ impl BashJobs {
     pub fn stop_all(&self) -> Vec<StoppedJob> {
         self.resumed.store(false, Ordering::Relaxed);
         lock(&self.survivors).found.clear();
+        // The transcript's jobs end here, checked or not: nothing of its reopen is owed any more.
+        *lock(&self.reattach) = None;
+        lock(&self.unchecked).clear();
+        lock(&self.checked_gone).clear();
         self.stop(|_| true)
     }
 
@@ -781,8 +842,18 @@ impl BashJobs {
 
     fn notices(&self) -> Option<String> {
         let policy = self.policy();
+        // Jobs the reopen note left unchecked that the sandbox, once checked, no longer had.
+        let mut parts: Vec<String> = std::mem::take(&mut *lock(&self.checked_gone))
+            .into_iter()
+            .map(|(id, command)| {
+                format!(
+                    "{NOTICE_PREFIX}{id} is no longer running: `{command}`] The sandbox, checked \
+                     just now, no longer has it, and how it ended was not recorded. bash_job no \
+                     longer knows it; start it again if you still need it."
+                )
+            })
+            .collect();
         let mut table = lock(&self.table);
-        let mut parts = Vec::new();
         for (&id, p) in table.iter_mut() {
             if !p.notice_due() {
                 continue;
@@ -969,6 +1040,9 @@ impl Background for BashJobs {
         self.next.fetch_max(read.max_id, Ordering::Relaxed);
         // A job the sandbox kept running (reattached when the session opened) is in the table:
         // still running, or ended with its notice on the way. Only the rest were stopped.
+        // A reattach still pending has not read the sandbox back: a job it may still hold is
+        // neither running nor gone as far as anyone knows, and the note says exactly that.
+        let unread = self.reattach_pending();
         let table = lock(&self.table);
         let mut found = std::mem::take(&mut lock(&self.survivors).found);
         let mut note = Reopened::default();
@@ -982,11 +1056,16 @@ impl Background for BashJobs {
                         fate.command = left.command;
                         note.push_found(fate);
                     }
+                    // Only an intended job can outlive its stream in the sandbox.
+                    None if unread && left.intended => note.unchecked.push((id, left.command)),
                     None => note.gone.push((id, left.command)),
                 },
             }
         }
         drop(table);
+        if unread {
+            *lock(&self.unchecked) = note.unchecked.clone();
+        }
         // The rest ran when the process died but the transcript does not show them running: a
         // foreground command still attached, or a yielded job a later prompt would have stopped.
         for fate in found {
@@ -1002,6 +1081,9 @@ impl Background for BashJobs {
 #[derive(Default)]
 struct Reopened {
     running: Vec<(u64, String)>,
+    /// Kept in the sandbox when the session closed, and not read back yet: the session has not
+    /// used its sandbox since it reopened.
+    unchecked: Vec<(u64, String)>,
     stopped_now: Vec<SurvivorFate>,
     unstoppable: Vec<SurvivorFate>,
     gone: Vec<(u64, String)>,
@@ -1035,6 +1117,7 @@ fn found_line(f: &SurvivorFate, state: &str) -> String {
 /// closed, or exited). `None` when there is nothing to say. The one place the note is written.
 fn reopen_note(r: &Reopened, next: u64) -> Option<String> {
     if r.running.is_empty()
+        && r.unchecked.is_empty()
         && r.stopped_now.is_empty()
         && r.unstoppable.is_empty()
         && r.gone.is_empty()
@@ -1061,6 +1144,22 @@ fn reopen_note(r: &Reopened, next: u64) -> Option<String> {
              \"timeout_ms\": 0}} shows what one has printed since, and bash_job {{\"job\": N, \
              \"kill\": true}} stops one you no longer need — or leave {it} running.",
             lines.join("\n")
+        ));
+    }
+    if !r.unchecked.is_empty() {
+        let lines: Vec<String> = r
+            .unchecked
+            .iter()
+            .map(|(id, command)| format!("- job {id}: `{command}` (not yet checked)"))
+            .collect();
+        parts.push(format!(
+            "{} running in the sandbox when it closed, and the sandbox has not been checked since:\n{}\n\
+             It is checked the first time this session uses the sandbox, and bash_job {{\"job\": N, \
+             \"timeout_ms\": 0}} checks one now. You will be told if one has ended or is gone. Do \
+             not start {} again before you know.",
+            plural(r.unchecked.len(), "This job was", "These jobs were"),
+            lines.join("\n"),
+            plural(r.unchecked.len(), "it", "them"),
         ));
     }
     if !r.stopped_now.is_empty() {

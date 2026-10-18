@@ -4,7 +4,7 @@
 mod common;
 
 use std::io::{Read, Write};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use common::{SpawnGuarded, read_until_response, serve_cmd, spawn_model_server, turn_text};
 use serde_json::json;
@@ -213,7 +213,7 @@ fn serve_force_untrusted_overrides_a_persisted_trust_grant() {
 
     // Persist trust for `dir` via the real `trust` subcommand — the same allowlist `serve` itself
     // reads from, not a hand-rolled fixture.
-    let trust_output = Command::new(bin)
+    let trust_output = crate::common::agent_cmd()
         .args(["trust", dir.path().to_str().unwrap()])
         .env("HOME", home.path())
         .output()

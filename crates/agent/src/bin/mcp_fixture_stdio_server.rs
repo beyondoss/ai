@@ -24,7 +24,8 @@
 //!
 //! Env: `MCP_FIXTURE_STARTUP_BARRIER` (`<dir>:<n>`: serve nothing until `n` fixtures have started; see
 //! `main`), `MCP_FIXTURE_STARTUP_BARRIER_SECS`, `MCP_FIXTURE_ORPHAN_PIDFILE` (unchanged),
-//! `MCP_FIXTURE_ODD_NAMES` (see [`odd_names`]), `MCP_FIXTURE_SILENT` (never answers anything).
+//! `MCP_FIXTURE_ODD_NAMES` (see [`odd_names`]), `MCP_FIXTURE_SILENT` (never answers anything),
+//! `MCP_FIXTURE_LIST_CHANGES` (an `unlock` tool that adds a `secret` one; see [`write_unlock`]).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -90,7 +91,7 @@ fn record_cancel_flag(task_id: &str) {
 
 fn capabilities() -> Value {
     json!({
-        "tools": {},
+        "tools": if list_changes() { json!({ "listChanged": true }) } else { json!({}) },
         "resources": {},
         "prompts": {},
         "completions": {},
@@ -173,6 +174,16 @@ async fn main() {
             && params.get("name").and_then(Value::as_str) == Some("slow_progress")
         {
             if write_slow_progress(&mut stdout, id, &params).await.is_err() {
+                break;
+            }
+            continue;
+        }
+
+        if method == "tools/call"
+            && list_changes()
+            && params.get("name").and_then(Value::as_str) == Some("unlock")
+        {
+            if write_unlock(&mut lines, &mut stdout, id).await.is_err() {
                 break;
             }
             continue;
@@ -269,6 +280,56 @@ async fn write_slow_progress(
             "isError": false,
         }
     });
+    write_json_line(stdout, &result).await
+}
+
+/// `MCP_FIXTURE_LIST_CHANGES`: list an `unlock` tool, and once it has been called, a `secret` one.
+fn list_changes() -> bool {
+    std::env::var_os("MCP_FIXTURE_LIST_CHANGES").is_some()
+}
+
+/// Whether `unlock` has been called.
+static UNLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `unlock`: add `secret` to the tool list and say so with `notifications/tools/list_changed`, then
+/// hold the call's own answer until the client has re-listed (or 5 s pass) — the order a server that
+/// enables tools on request produces, made deterministic: the re-listing is under way before the call
+/// that caused it returns.
+async fn write_unlock(
+    lines: &mut Lines<BufReader<Stdin>>,
+    stdout: &mut Stdout,
+    tool_id: Value,
+) -> Result<(), std::io::Error> {
+    UNLOCKED.store(true, std::sync::atomic::Ordering::SeqCst);
+    let changed = json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" });
+    write_json_line(stdout, &changed).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while let Ok(Ok(Some(line))) = tokio::time::timeout_at(deadline, lines.next_line()).await {
+        let Ok(request) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let (Some(method), Some(id)) = (
+            request.get("method").and_then(Value::as_str),
+            request.get("id").cloned(),
+        ) else {
+            continue;
+        };
+        let params = request.get("params").cloned().unwrap_or(Value::Null);
+        let envelope = match handle(method, params) {
+            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+            Err((code, message)) => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": code, "message": message },
+            }),
+        };
+        write_json_line(stdout, &envelope).await?;
+        if method == "tools/list" {
+            break;
+        }
+    }
+    let result =
+        json!({ "jsonrpc": "2.0", "id": tool_id, "result": text_result("unlocked", false) });
     write_json_line(stdout, &result).await
 }
 
@@ -553,6 +614,23 @@ fn tool_defs() -> Value {
             "inputSchema": { "type": "object", "properties": {} },
         },
     ]);
+    if list_changes() {
+        let Value::Array(defs) = &mut defs else {
+            unreachable!()
+        };
+        defs.push(json!({
+            "name": "unlock",
+            "description": "Adds the `secret` tool to this server's tool list.",
+            "inputSchema": { "type": "object", "properties": {} },
+        }));
+        if UNLOCKED.load(std::sync::atomic::Ordering::SeqCst) {
+            defs.push(json!({
+                "name": "secret",
+                "description": "Only listed once `unlock` has been called.",
+                "inputSchema": { "type": "object", "properties": {} },
+            }));
+        }
+    }
     if odd_names() {
         let Value::Array(defs) = &mut defs else {
             unreachable!()
@@ -642,6 +720,9 @@ fn call_tool(params: Value) -> Value {
             text_result(&(a + b).to_string(), false)
         }
         "ping" => text_result("pong", false),
+        "secret" if UNLOCKED.load(std::sync::atomic::Ordering::SeqCst) => {
+            text_result("secret-unlocked", false)
+        }
         "get.file" | "get file" if odd_names() => text_result(&format!("called-as={name}"), false),
         "fail" => text_result("intentional failure from fixture server", true),
         "echo_env" => {

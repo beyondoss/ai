@@ -440,6 +440,15 @@ impl Bash {
         // Off this host, a session's commands run as jobs of the sandbox when it can host them
         // (see `bash_sandbox`): that is what lets an intended job outlive this replica.
         let sandbox = if world.is_remote() {
+            // A reopened session attaches its sandbox lazily. Connect it first — the probe, whose
+            // failure is this call's — and read back the jobs it kept before anything new starts.
+            self.runner
+                .ready()
+                .await
+                .map_err(|e| ToolError::Execution(e.to_string()))?;
+            if let Err(e) = super::bash_sandbox::reconcile(&self.jobs).await {
+                tracing::warn!(error = %e, "could not read back the session's sandbox jobs");
+            }
             super::bash_sandbox::store_for(&self.jobs, &self.runner).await
         } else {
             None
@@ -1004,7 +1013,21 @@ impl Bash {
         // cheap way to see a server's latest output, where on `bash` 0 would return before the
         // command could print anything.
         let timeout_ms = parse_timeout_ms(input, 0)?;
+        // A reopened session reads its sandbox's jobs back the first time one is asked about.
+        let checked = super::bash_sandbox::reconcile(&self.jobs).await;
         let Some(mut job) = self.jobs.take(id) else {
+            if let Err(e) = checked {
+                return Err(ToolError::Execution(format!(
+                    "job {id} could not be checked: {e}"
+                )));
+            }
+            if let Some(command) = self.jobs.take_checked_gone(id) {
+                return Err(ToolError::InvalidInput(format!(
+                    "job {id} (`{command}`) is no longer running: the sandbox, checked just now, no \
+                     longer has it, and how it ended was not recorded. Start it again if you still \
+                     need it."
+                )));
+            }
             return Err(ToolError::InvalidInput(format!(
                 "no job {id}: it was already reported, was stopped, or never existed (jobs do not \
                  survive a restart of the agent)"

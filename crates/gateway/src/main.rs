@@ -18,10 +18,13 @@ use beyond_ai::proxy::{AiProxy, LIVE_REQUESTS};
 use beyond_ai::state::GatewayState;
 use beyond_ai::store_watch::{Allowance, Capture, Deny, WatcherService};
 use beyond_ai::usage::{USAGE_TARGET, usage_log_filter};
+use beyond_ai::usage_file::{UsageFiles, UsageRow};
 use clap::{Parser, Subcommand};
 use pingora_core::apps::HttpServerOptions;
 use pingora_core::apps::http_app::HttpServer;
 use pingora_core::listeners::TcpSocketOptions;
+use pingora_core::listeners::tls::TlsSettings;
+use pingora_core::protocols::ALPN;
 use pingora_core::server::configuration::ServerConf;
 use pingora_core::server::{
     RunArgs, Server, ShutdownSignal, ShutdownSignalWatch, UnixShutdownSignalWatch,
@@ -212,7 +215,52 @@ impl std::io::Write for UsageLine<'_> {
     }
 }
 
-fn init_tracing(metrics: &Metrics, queue_depth: usize, queue_bytes: usize) -> LogDrains {
+/// Where `ai.usage` rows go: stdout, or hourly files when `AI_USAGE_DIR` is set. Never both.
+enum UsageOut {
+    Stdout(UsageStdout),
+    Files(UsageFiles),
+}
+
+enum UsageWriter<'a> {
+    Stdout(UsageLine<'a>),
+    File(UsageRow<'a>),
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for UsageOut {
+    type Writer = UsageWriter<'a>;
+    fn make_writer(&'a self) -> Self::Writer {
+        match self {
+            Self::Stdout(s) => {
+                UsageWriter::Stdout(tracing_subscriber::fmt::MakeWriter::make_writer(s))
+            }
+            Self::Files(f) => {
+                UsageWriter::File(tracing_subscriber::fmt::MakeWriter::make_writer(f))
+            }
+        }
+    }
+}
+
+impl std::io::Write for UsageWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Stdout(w) => w.write(buf),
+            Self::File(w) => w.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Stdout(w) => w.flush(),
+            Self::File(w) => w.flush(),
+        }
+    }
+}
+
+fn init_tracing(
+    metrics: &Metrics,
+    queue_depth: usize,
+    queue_bytes: usize,
+    usage_dir: Option<&Path>,
+) -> LogDrains {
     // JSON to stdout; the `ai.usage` target carries billing facts that logfwd/OTLP ships to
     // ClickHouse. `AI_LOG` sets the level filter for everything **except** those rows.
     let env_filter =
@@ -262,9 +310,23 @@ fn init_tracing(metrics: &Metrics, queue_depth: usize, queue_bytes: usize) -> Lo
         DIAG_QUEUE_BYTES,
         &metrics.log_dropped_total,
     );
+    let usage_out = match usage_dir {
+        Some(dir) => match UsageFiles::open(dir, metrics.usage_write_errors_total.clone()) {
+            Ok(f) => UsageOut::Files(f),
+            // A gateway that cannot record billing must not serve: fail at boot, visibly.
+            Err(e) => {
+                eprintln!(
+                    "failed to open the ai.usage directory {}: {e}",
+                    dir.display()
+                );
+                exit(1);
+            }
+        },
+        None => UsageOut::Stdout(UsageStdout(metrics.usage_write_errors_total.clone())),
+    };
     let usage_layer = tracing_subscriber::fmt::layer()
         .json()
-        .with_writer(UsageStdout(metrics.usage_write_errors_total.clone()))
+        .with_writer(usage_out)
         .with_filter(usage_log_filter());
     let payload_layer = tracing_subscriber::fmt::layer()
         .json()
@@ -336,6 +398,7 @@ fn main() {
     let runtime_timeout_secs = config.shutdown_runtime_timeout_secs();
     let capture_queue_depth = config.capture_queue_depth();
     let capture_queue_bytes = config.capture_queue_bytes();
+    let usage_dir = config.usage_dir().map(Path::to_path_buf);
     let metrics = match Metrics::new() {
         Ok(m) => m,
         Err(e) => {
@@ -352,6 +415,7 @@ fn main() {
         &metrics,
         capture_queue_depth,
         capture_queue_bytes,
+        usage_dir.as_deref(),
     ))));
     let state = match GatewayState::new(config, metrics) {
         Ok(s) => s,
@@ -393,6 +457,23 @@ fn main() {
     // bound rather than when the model next speaks. `TcpSocketOptions` is `#[non_exhaustive]`.
     let mut sock = TcpSocketOptions::default();
     sock.tcp_keepalive = state.config.downstream_tcp_keepalive();
+    // The public TLS listener, when configured (`validate_tls` already proved the files load, so
+    // pingora's panicking build cannot fire on a bad file). Same service, so the same filters,
+    // metrics and billing rows. ALPN follows the plaintext side: h2 and http/1.1, or http/1.1 alone
+    // when `downstream_h2c` is off.
+    if let Some(listener) = state.config.tls_listener() {
+        let mut tls = match TlsSettings::intermediate(listener.cert(), listener.key()) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("failed to load the TLS certificate: {e}");
+                exit(1);
+            }
+        };
+        tls.set_alpn(if downstream_h2c { ALPN::H2H1 } else { ALPN::H1 });
+        let mut tls_sock = TcpSocketOptions::default();
+        tls_sock.tcp_keepalive = state.config.downstream_tcp_keepalive();
+        proxy_svc.add_tls_with_settings(listener.addr(), Some(tls_sock), tls);
+    }
     proxy_svc.add_tcp_with_settings(&listen, sock);
     // Size the proxy's worker pool. Pingora resolves a service's thread count as
     // `service.threads().unwrap_or(conf.threads)` (`server/mod.rs`), and `ServerConf::default()` is
@@ -433,6 +514,7 @@ fn main() {
 
     tracing::info!(
         %listen,
+        tls_listen = state.config.tls_listener().map_or("", |l| l.addr()),
         %metrics_listen,
         worker_threads,
         grace_period_secs,

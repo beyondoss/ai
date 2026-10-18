@@ -84,7 +84,8 @@
 //!
 //! `serve --service` is the exception, and the reason is multi-tenancy rather than a change of heart:
 //! one replica serving many tenants cannot infer from a loopback socket *whose* session a connection
-//! is for. So every connection carries a [session grant](crate::grant) in `x-beyond-grant`, verified
+//! is for. So every connection carries a [session grant](crate::grant) in `x-beyond-grant` (or a browser's
+//! `Sec-WebSocket-Protocol: beyond.grant, <grant>`), verified
 //! here — before the method branch, so WebSocket and POST cannot diverge — and turned into the
 //! [`ServiceSession`](crate::service::ServiceSession) that fixes that session's tenant, storage,
 //! sandbox and credentials. The refusals are HTTP statuses (401/400/403/421), answered *before* the
@@ -122,6 +123,7 @@ use crate::session_store::{
 };
 
 mod browser_guard;
+mod tls;
 
 /// The fixed URL path a WebSocket upgrade must target. The front door maps a service subdomain to this
 /// path on the loopback listener; any other path is rejected at the handshake.
@@ -1594,6 +1596,9 @@ fn resolve_idle_timeout(configured: Option<Duration>, service_mode: bool) -> Opt
 pub struct ServeListeners {
     /// Loopback/internal TCP address to bind, if any. The agent authenticates no caller over TCP.
     pub tcp: Option<SocketAddr>,
+    /// A TLS listener (`--tls-listen`) beside [`Self::tcp`]: the same protocol and the same guards
+    /// over rustls. The certificate chain and key are PEM files, read once at startup.
+    pub tls: Option<TlsListen>,
     /// Unix-domain socket path to bind, if any — kernel-enforced local authz via filesystem perms.
     #[cfg(unix)]
     pub uds: Option<std::path::PathBuf>,
@@ -1608,14 +1613,23 @@ pub struct ServeListeners {
     pub systemd: bool,
 }
 
+/// Where and with what certificate `--tls-listen` serves.
+pub struct TlsListen {
+    pub addr: SocketAddr,
+    /// PEM certificate chain, leaf first.
+    pub cert: std::path::PathBuf,
+    /// PEM private key for [`Self::cert`].
+    pub key: std::path::PathBuf,
+}
+
+pub use tls::load_acceptor as load_tls_acceptor;
+
 /// Await the next TCP connection, or `pending()` forever when there's no TCP listener — so this can
 /// sit in a `select!` arm unconditionally without `select!` needing to branch on the `Option`. Never
-/// gives up on a failed accept: see [`accept_retrying`].
-async fn accept_tcp(listener: &Option<TcpListener>) -> TcpStream {
+/// gives up on a failed accept: see [`accept_retrying`]. `transport` names the listener in the log.
+async fn accept_tcp(transport: &str, listener: &Option<TcpListener>) -> TcpStream {
     match listener {
-        Some(l) => {
-            accept_retrying("websocket", || async { l.accept().await.map(|(s, _)| s) }).await
-        }
+        Some(l) => accept_retrying(transport, || async { l.accept().await.map(|(s, _)| s) }).await,
         None => std::future::pending().await,
     }
 }
@@ -1801,6 +1815,12 @@ pub async fn serve_ws(
     // on stderr (the protocol never uses stderr): `h2c` against an h1-only gateway fails *every*
     // request, so an operator who flipped this on must see the mode they're running.
     cfg.shared_http = build_shared_h2_client(&cfg)?;
+    // Before anything is bound or spawned: a missing file, a bad key or a key that does not match
+    // the certificate stops the daemon here, with the flag and path in the message.
+    let tls_acceptor = match &listeners.tls {
+        Some(t) => Some(tls::load_acceptor(&t.cert, &t.key)?),
+        None => None,
+    };
     if let Some(callback) = &cfg.mcp_events_callback_url {
         crate::tools::mcp_events::enable_receiver_document(callback);
     }
@@ -1843,6 +1863,18 @@ pub async fn serve_ws(
             }
             None => None,
         },
+    };
+
+    let tls_listener = match &listeners.tls {
+        Some(t) => {
+            let listener = TcpListener::bind(t.addr).await?;
+            eprintln!(
+                "serve: websocket tls listening on {} (path {WS_PATH})",
+                listener.local_addr()?
+            );
+            Some(listener)
+        }
+        None => None,
     };
 
     // Only a socket WE bound is ours to unlink on shutdown — never a systemd-owned one.
@@ -2124,11 +2156,29 @@ pub async fn serve_ws(
                     return Ok(Some(sig));
                 }
             }
-            stream = accept_tcp(&tcp_listener) => {
+            stream = accept_tcp("websocket", &tcp_listener) => {
                 let supervisor = supervisor.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(&supervisor, stream, Transport::Tcp).await {
                         eprintln!("serve: websocket connection error: {e}");
+                    }
+                });
+            }
+            stream = accept_tcp("websocket tls", &tls_listener) => {
+                // The handshake runs in the connection's own task, under a deadline, so a slow
+                // client holds that task and not the accept loop. What follows is the same path as
+                // `--listen`: TLS only changes the bytes on the wire, so the browser guard, the
+                // service-mode grant check and the head and body limits all apply unchanged.
+                let (supervisor, acceptor) = (supervisor.clone(), tls_acceptor.clone());
+                tokio::spawn(async move {
+                    let Some(acceptor) = acceptor else { return };
+                    match tls::handshake(&acceptor, stream).await {
+                        Ok(stream) => {
+                            if let Err(e) = handle_connection(&supervisor, stream, Transport::Tcp).await {
+                                eprintln!("serve: websocket tls connection error: {e}");
+                            }
+                        }
+                        Err(e) => eprintln!("serve: websocket tls handshake failed: {e}"),
                     }
                 });
             }
@@ -2269,19 +2319,34 @@ where
     // Before the method branch, so the WebSocket and POST paths cannot diverge on who is allowed in.
     let service = match &supervisor.service {
         None => None,
-        Some(svc) => match crate::service::authorize(
-            &svc.verifier,
-            &svc.shards,
-            grant.as_deref(),
-            requested_id.as_deref(),
-            crate::service::now_unix(),
-        ) {
-            Ok(session) => Some(Arc::new(session)),
-            Err(refusal) => {
-                refuse(&mut stream, &head, &leftover, HttpError::from(refusal)).await;
-                return Ok(());
+        Some(svc) => {
+            let grant = match grant {
+                GrantCarrier::Grant(g) => g,
+                GrantCarrier::Malformed => {
+                    let e = HttpError::BadRequest("malformed Sec-WebSocket-Protocol grant");
+                    refuse(&mut stream, &head, &leftover, e).await;
+                    return Ok(());
+                }
+                GrantCarrier::Ambiguous => {
+                    let e = HttpError::BadRequest("grant given in both header and subprotocol");
+                    refuse(&mut stream, &head, &leftover, e).await;
+                    return Ok(());
+                }
+            };
+            match crate::service::authorize(
+                &svc.verifier,
+                &svc.shards,
+                grant.as_deref(),
+                requested_id.as_deref(),
+                crate::service::now_unix(),
+            ) {
+                Ok(session) => Some(Arc::new(session)),
+                Err(refusal) => {
+                    refuse(&mut stream, &head, &leftover, HttpError::from(refusal)).await;
+                    return Ok(());
+                }
             }
-        },
+        }
     };
 
     match head.method.as_str() {
@@ -2531,7 +2596,17 @@ where
         }
     };
     let response = match create_response(&request) {
-        Ok(r) => r,
+        Ok(mut r) => {
+            // The grant was stripped from `request` by `take_grant`, so nothing can echo it; name
+            // only the marker, which a browser requires back for the handshake to complete.
+            if head.grant_subprotocol {
+                r.headers_mut().insert(
+                    http::header::SEC_WEBSOCKET_PROTOCOL,
+                    http::HeaderValue::from_static(GRANT_SUBPROTOCOL),
+                );
+            }
+            r
+        }
         Err(_) => {
             supervisor.unpin(&pinned.id, pinned.incarnation);
             supervisor
@@ -2811,27 +2886,83 @@ struct HttpHead {
     content_length: Option<usize>,
     transfer_encoding: Option<String>,
     headers: Vec<(String, String)>,
+    /// The grant arrived as a `Sec-WebSocket-Protocol` token; the 101 must answer with the marker.
+    grant_subprotocol: bool,
 }
 
 impl HttpHead {
-    /// Remove and return the `x-beyond-grant` header.
+    /// Remove and return the session grant, from wherever the client put it.
     ///
-    /// **Removing** it is the point. A grant carries sealed credentials, and this head is handed to
-    /// `create_response`, which echoes the request's headers into the handshake — so a grant left in
-    /// place would be reflected straight back to the client, and would sit in the `Debug` of any
-    /// head logged on an error path. Read once, here, and gone.
+    /// Two carriers, because a browser `WebSocket` cannot set custom headers:
+    ///
+    /// - the `x-beyond-grant` header (every non-browser client), or
+    /// - `Sec-WebSocket-Protocol: beyond.grant, <grant>` (the browser workaround Kubernetes uses for
+    ///   bearer tokens). The list is comma-separated per RFC 6455 with optional whitespace. If the
+    ///   `beyond.grant` marker is present the list must be **exactly** the marker followed by one
+    ///   token; anything else is [`GrantCarrier::Malformed`]. A list without the marker is some
+    ///   other subprotocol negotiation and is left alone.
+    ///
+    /// Both carriers at once is [`GrantCarrier::Ambiguous`], even if they agree: a client that sends
+    /// two credentials has a bug, and picking one silently would hide it.
+    ///
+    /// **Removing** is the point. A grant carries sealed credentials, and this head is handed to
+    /// `create_response`, which echoes request headers into the handshake — so a grant left in place
+    /// would be reflected straight back to the client, and would sit in the `Debug` of any head logged
+    /// on an error path. Read once, here, and gone. The 101 then names only the marker
+    /// (`grant_subprotocol`), never the token.
     ///
     /// A value over [`MAX_GRANT_BYTES`](crate::service::MAX_GRANT_BYTES) is dropped rather than
     /// returned: it cannot be a grant this fleet minted, and there is no reason to run crypto over
     /// it. The caller then sees "no grant" — a 401, which is what an unusable token deserves.
-    fn take_grant(&mut self) -> Option<String> {
-        let idx = self
+    fn take_grant(&mut self) -> GrantCarrier {
+        let from_header = self
             .headers
             .iter()
-            .position(|(name, _)| name.eq_ignore_ascii_case(crate::service::GRANT_HEADER))?;
-        let (_, value) = self.headers.remove(idx);
-        (value.len() <= crate::service::MAX_GRANT_BYTES).then_some(value)
+            .position(|(name, _)| name.eq_ignore_ascii_case(crate::service::GRANT_HEADER))
+            .map(|idx| self.headers.remove(idx).1);
+
+        let is_proto = |name: &str| name.eq_ignore_ascii_case("sec-websocket-protocol");
+        let mut tokens: Vec<String> = Vec::new();
+        for (_, v) in self.headers.iter().filter(|(n, _)| is_proto(n)) {
+            tokens.extend(
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_owned),
+            );
+        }
+        let marked = tokens.iter().any(|t| t == GRANT_SUBPROTOCOL);
+        let mut from_proto = None;
+        if marked {
+            self.headers.retain(|(n, _)| !is_proto(n));
+            match tokens.as_slice() {
+                [m, g] if m == GRANT_SUBPROTOCOL && g != GRANT_SUBPROTOCOL => {
+                    from_proto = Some(g.clone());
+                    self.grant_subprotocol = true;
+                }
+                _ => return GrantCarrier::Malformed,
+            }
+        }
+        let fits = |v: String| (v.len() <= crate::service::MAX_GRANT_BYTES).then_some(v);
+        match (from_header, from_proto) {
+            (Some(_), Some(_)) => GrantCarrier::Ambiguous,
+            (Some(v), None) | (None, Some(v)) => GrantCarrier::Grant(fits(v)),
+            (None, None) => GrantCarrier::Grant(None),
+        }
     }
+}
+
+/// The `Sec-WebSocket-Protocol` marker that precedes a grant token. The only subprotocol the 101 names.
+const GRANT_SUBPROTOCOL: &str = "beyond.grant";
+
+/// What [`HttpHead::take_grant`] found.
+enum GrantCarrier {
+    /// At most one grant, from either carrier.
+    Grant(Option<String>),
+    /// The subprotocol list had the marker but not exactly one token after it.
+    Malformed,
+    /// A grant in both the header and the subprotocol list.
+    Ambiguous,
 }
 
 fn session_id_from_query(query: Option<&str>) -> Option<String> {
@@ -2971,6 +3102,7 @@ fn parse_http_head(buf: &[u8]) -> Result<(HttpHead, usize), HttpError> {
             content_length,
             transfer_encoding,
             headers: collected,
+            grant_subprotocol: false,
         },
         header_len,
     ))

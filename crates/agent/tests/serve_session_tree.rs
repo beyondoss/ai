@@ -4,7 +4,7 @@
 mod common;
 
 use std::io::{BufRead, Write};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use common::{
     SpawnGuarded, message_ids, read_until_response, serve_cmd, serve_dir_cmd, spawn_model_server,
@@ -1212,8 +1212,7 @@ fn serve_get_tree_leaf_id_is_null_without_persistence_configured() {
     // Mirrors `serve_get_fork_messages_is_empty_without_persistence_configured`'s reasoning: pure
     // in-memory mode has no `SessionStore` to track an active tip at all.
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = Command::new(bin)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",
@@ -2406,8 +2405,7 @@ fn serve_get_fork_messages_is_empty_without_persistence_configured() {
     // — `get_fork_messages` must degrade to an empty (still successful) list, matching `get_messages`'s
     // own precedent for the same mismatch, rather than erroring.
     let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = Command::new(bin)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",

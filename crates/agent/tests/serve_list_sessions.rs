@@ -7,7 +7,7 @@
 
 mod common;
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use common::{
     ChildGuard, ISOLATED_HOME, spawn_listening, spawn_model_server, turn_text, ws_connect,
@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 /// per-session files under `session_dir`.
 fn serve_ws_child(base: &str, session_dir: &str) -> (ChildGuard, u16) {
     spawn_listening(
-        Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+        crate::common::agent_cmd()
             .args([
                 "serve",
                 "--gateway-url",

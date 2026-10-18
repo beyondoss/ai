@@ -3,7 +3,7 @@
 //! indirectly via `serve`'s own trust-gating tests in `serve_trust_prompts.rs`).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::process::Command;
+mod common;
 
 #[test]
 fn trust_status_reports_unknown_for_a_never_mentioned_directory() {
@@ -11,9 +11,8 @@ fn trust_status_reports_unknown_for_a_never_mentioned_directory() {
     // but had no CLI/RPC surface at all to actually query it.
     let home = tempfile::tempdir().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .args(["trust-status", dir.path().to_str().unwrap()])
         .env("HOME", home.path())
         .output()
@@ -31,11 +30,10 @@ fn trust_status_reports_unknown_for_a_never_mentioned_directory() {
 fn trust_status_reflects_trust_and_untrust_round_trip() {
     let home = tempfile::tempdir().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
     let path = dir.path().to_str().unwrap();
 
     let status = |args: &[&str]| -> String {
-        let output = Command::new(bin)
+        let output = crate::common::agent_cmd()
             .args(args)
             .env("HOME", home.path())
             .output()
@@ -46,7 +44,7 @@ fn trust_status_reflects_trust_and_untrust_round_trip() {
 
     assert!(status(&["trust-status", path]).starts_with("unknown:"));
 
-    let trust_output = Command::new(bin)
+    let trust_output = crate::common::agent_cmd()
         .args(["trust", path])
         .env("HOME", home.path())
         .output()
@@ -54,7 +52,7 @@ fn trust_status_reflects_trust_and_untrust_round_trip() {
     assert!(trust_output.status.success());
     assert!(status(&["trust-status", path]).starts_with("trusted:"));
 
-    let untrust_output = Command::new(bin)
+    let untrust_output = crate::common::agent_cmd()
         .args(["untrust", path])
         .env("HOME", home.path())
         .output()
@@ -62,7 +60,7 @@ fn trust_status_reflects_trust_and_untrust_round_trip() {
     assert!(untrust_output.status.success());
     assert!(status(&["trust-status", path]).starts_with("untrusted:"));
 
-    let clear_output = Command::new(bin)
+    let clear_output = crate::common::agent_cmd()
         .args(["clear-trust", path])
         .env("HOME", home.path())
         .output()
@@ -79,16 +77,15 @@ fn trust_status_inherits_a_trusted_ancestors_grant_for_an_unmentioned_child() {
     let parent = tempfile::tempdir().unwrap();
     let child = parent.path().join("child-project");
     std::fs::create_dir_all(&child).unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let trust_output = Command::new(bin)
+    let trust_output = crate::common::agent_cmd()
         .args(["trust", parent.path().to_str().unwrap()])
         .env("HOME", home.path())
         .output()
         .unwrap();
     assert!(trust_output.status.success());
 
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .args(["trust-status", child.to_str().unwrap()])
         .env("HOME", home.path())
         .output()
@@ -105,9 +102,8 @@ fn trust_status_inherits_a_trusted_ancestors_grant_for_an_unmentioned_child() {
 fn trust_status_defaults_to_the_current_directory_when_no_path_is_given() {
     let home = tempfile::tempdir().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
-    let output = Command::new(bin)
+    let output = crate::common::agent_cmd()
         .arg("trust-status")
         .current_dir(dir.path())
         .env("HOME", home.path())

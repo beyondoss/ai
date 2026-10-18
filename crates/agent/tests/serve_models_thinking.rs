@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 /// Like `serve_cmd`, but with an explicit `--model` instead of the hardcoded `"claude-test"` — for
 /// tests exercising model-specific reasoning-effort clamping, where the test model itself matters.
 fn serve_cmd_with_model(bin: &str, base: &str, session_file: &str, model: &str) -> Command {
-    let mut c = Command::new(bin);
+    let mut c = crate::common::isolated_cmd(bin);
     c.args([
         "serve",
         "--gateway-url",
@@ -284,8 +284,7 @@ fn serve_cycle_model_scoped_by_the_models_flag_cycles_only_the_scope_but_lists_t
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = Command::new(bin)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",
@@ -363,8 +362,7 @@ fn serve_models_flag_expands_a_glob_against_the_known_catalog() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = Command::new(bin)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",
@@ -434,8 +432,7 @@ fn serve_models_flag_pattern_level_suffix_pins_that_models_thinking_level_on_cyc
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = Command::new(bin)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",
@@ -500,8 +497,7 @@ fn serve_models_flag_rejects_an_invalid_thinking_level_suffix_as_part_of_the_lit
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
-    let mut child = Command::new(bin)
+    let mut child = crate::common::agent_cmd()
         .args([
             "serve",
             "--gateway-url",

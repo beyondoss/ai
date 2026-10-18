@@ -10,7 +10,7 @@
 
 mod common;
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use common::{
     ISOLATED_HOME, spawn_listening, spawn_model_server, turn_text, turn_tool_use, ws_connect,
@@ -38,7 +38,7 @@ async fn get_messages_replies_during_a_run_are_not_replayed_to_a_later_attach() 
         turn_text("AFTER_THE_SLEEP"),
     ]);
     let (mut child, port) = spawn_listening(
-        Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+        crate::common::agent_cmd()
             .args([
                 "serve",
                 "--gateway-url",

@@ -5,6 +5,10 @@
 # are defaults.
 
 listen = "0.0.0.0:8080" # client (app) traffic; internal-only, fronted as ai.internal
+# Optional public TLS listener (all three or none; read once at boot, rotate by restarting):
+# tls_listen = "0.0.0.0:8443"
+# tls_cert = "/etc/tls/fullchain.pem"
+# tls_key = "/etc/tls/privkey.pem"
 metrics_listen = "0.0.0.0:9090" # internal admin: /metrics (Prometheus), /livez, /readyz
 
 # Tokio worker threads for the proxy service. 0 ⇒ one per available core. Pingora's own default is
@@ -141,6 +145,11 @@ capture_queue_depth = 1024
 # `capture_max_bytes` bodies (more after JSON escaping), so the line count alone is not a memory
 # bound. A line that would cross it is DROPPED and counted on `ai_capture_dropped_total`.
 capture_queue_bytes = 67108864
+
+# Write `ai.usage` billing rows to hourly files `ai-usage-YYYYMMDDTHH.jsonl` (UTC) in this directory
+# instead of stdout (env: AI_USAGE_DIR). Same blocking, lossless guarantee; files older than 48h are
+# deleted. Rows go ONLY here when set. Production: the directory logfwd tails (`*.jsonl`).
+# usage_dir = "/var/log/ai"
 
 # Exact-match response cache. Off by default (`0`). When set, a managed catalog walk (`/auto`,
 # managed `/v1`) whose client body is already in hand before upstream_peer hashes that pre-rewrite

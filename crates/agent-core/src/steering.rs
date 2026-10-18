@@ -266,11 +266,18 @@ pub struct Steering {
     /// [`set_turn_context`](Self::set_turn_context). A setting, like the queue modes: `clear()`
     /// leaves it installed.
     turn_context: Arc<Mutex<Option<TurnContextSource>>>,
+    /// Where the loop pulls a host's revised tool set at each turn boundary — see
+    /// [`set_tool_source`](Self::set_tool_source). A setting, like `turn_context`.
+    tool_source: Arc<Mutex<Option<ToolSource>>>,
 }
 
 /// Produces the context a host wants the model to see from the next turn on, taking it as it does
 /// (`None` when there is nothing new). See [`Steering::set_turn_context`].
 pub type TurnContextSource = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// Given the run's current tools, a revised set when the host's tools changed since it last said
+/// so (`None` when nothing did). See [`Steering::set_tool_source`].
+pub type ToolSource = Arc<dyn Fn(&ToolRegistry) -> Option<ToolRegistry> + Send + Sync>;
 
 impl Steering {
     /// Install (or with `None`, remove) a source of host-held context the loop pulls at every turn
@@ -288,6 +295,25 @@ impl Steering {
     pub(crate) fn take_turn_context(&self) -> Option<String> {
         let source = self.turn_context.lock().ok().and_then(|g| g.clone())?;
         source()
+    }
+
+    /// Install (or with `None`, remove) a source of tool-set revisions the loop pulls at every turn
+    /// boundary, the first included, just after a [`request_tool_set`](Self::request_tool_set)
+    /// switch would be taken (an explicit switch wins that boundary). It is handed the tools the run
+    /// has now and answers with a replacement only when something changed, so a host whose tools
+    /// change underneath a run (an MCP server re-listing its tools) gets them in front of the model
+    /// from the next request, without pushing anything at the right moment. Called once per turn:
+    /// keep the no-change answer cheap.
+    pub fn set_tool_source(&self, source: Option<ToolSource>) {
+        if let Ok(mut guard) = self.tool_source.lock() {
+            *guard = source;
+        }
+    }
+
+    /// Pull the installed tool source, if any, against `current`.
+    pub(crate) fn pull_tool_source(&self, current: &ToolRegistry) -> Option<ToolRegistry> {
+        let source = self.tool_source.lock().ok().and_then(|g| g.clone())?;
+        source(current)
     }
 
     /// Empty steering queues.
@@ -906,6 +932,23 @@ mod tests {
             reg.register(std::sync::Arc::new(NamedTool(name)));
         }
         reg
+    }
+
+    #[test]
+    fn a_tool_source_sees_the_current_tools_and_survives_clear() {
+        let s = Steering::new();
+        assert!(s.pull_tool_source(&registry_with(&["read"])).is_none());
+        s.set_tool_source(Some(std::sync::Arc::new(|current: &ToolRegistry| {
+            (current.get("read").is_some()).then(|| registry_with(&["read", "added"]))
+        })));
+        s.clear();
+        let revised = s
+            .pull_tool_source(&registry_with(&["read"]))
+            .expect("the source answers for a registry it revises");
+        assert!(revised.get("added").is_some());
+        assert!(s.pull_tool_source(&registry_with(&["bash"])).is_none());
+        s.set_tool_source(None);
+        assert!(s.pull_tool_source(&registry_with(&["read"])).is_none());
     }
 
     #[test]

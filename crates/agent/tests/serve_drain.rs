@@ -27,11 +27,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 
-const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
-
 fn serve_ws(base: &str, session_dir: &str, drain_grace: &str) -> (ChildGuard, u16) {
     spawn_listening(
-        Command::new(BIN)
+        crate::common::agent_cmd()
             .args([
                 "serve",
                 "--gateway-url",

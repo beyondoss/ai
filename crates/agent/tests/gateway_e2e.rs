@@ -63,7 +63,10 @@ fn agent_through_real_gateway_to_mock_upstream() {
     wait_for_allowance_ready(ports.metrics);
 
     // Drive the agent through the gateway.
-    let output = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    // A home of its own: this `run` persists its session, and it must not land in the developer's.
+    let home = tempfile::tempdir().unwrap();
+    let output = crate::common::agent_cmd()
+        .env("HOME", home.path())
         .args([
             "run",
             "read hello.txt and report it",

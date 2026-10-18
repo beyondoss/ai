@@ -267,6 +267,9 @@ struct Cli {
     command: Command,
 }
 
+// One `Command` is parsed per process and matched once; the flag-heavy `Serve` variant outgrowing the
+// small ones costs a few hundred bytes of stack at startup, not worth boxing every field for.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommands)]
 enum Command {
     /// Run one agent task to completion, streaming output to stdout.
@@ -567,6 +570,16 @@ enum Command {
         /// Bind it privately.
         #[usage(long, env = "AI_AGENT_LISTEN")]
         listen: Option<std::net::SocketAddr>,
+        /// Also serve the same protocol over TLS on this address (needs --tls-cert and
+        /// --tls-key). The certificate is read once; rotating it takes a restart.
+        #[usage(long, env = "AI_AGENT_TLS_LISTEN")]
+        tls_listen: Option<std::net::SocketAddr>,
+        /// PEM certificate chain (leaf first) for --tls-listen.
+        #[usage(long, env = "AI_AGENT_TLS_CERT")]
+        tls_cert: Option<std::path::PathBuf>,
+        /// PEM private key for --tls-listen.
+        #[usage(long, env = "AI_AGENT_TLS_KEY")]
+        tls_key: Option<std::path::PathBuf>,
         /// Serve over a Unix socket at this path.
         #[usage(long, env = "AI_AGENT_LISTEN_UDS")]
         listen_uds: Option<std::path::PathBuf>,
@@ -1775,6 +1788,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             session_file,
             session_dir,
             listen,
+            tls_listen,
+            tls_cert,
+            tls_key,
             listen_uds,
             listen_uds_mode,
             session_idle_timeout,
@@ -1920,14 +1936,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Some(_) => Some(beyond_ai_agent::metrics::Metrics::new()?),
                 None => None,
             };
+            // All three or none, before anything is bound; the files themselves are checked by
+            // `serve_ws` ahead of its first bind.
+            let tls = match (tls_listen, tls_cert, tls_key) {
+                (None, None, None) => None,
+                (Some(addr), Some(cert), Some(key)) => {
+                    Some(serve_ws::TlsListen { addr, cert, key })
+                }
+                _ => {
+                    return Err(
+                        "--tls-listen, --tls-cert and --tls-key must be given together".into(),
+                    );
+                }
+            };
             let systemd_activated = cfg!(unix)
                 && listen.is_none()
+                && tls.is_none()
                 && listen_uds.is_none()
                 && std::env::var_os("LISTEN_FDS").is_some();
             // Webhook callbacks arrive on the daemon's HTTP listener; over stdio nothing would
             // receive them, and a server would fail its verification challenge on every subscribe.
             if mcp_events_callback_url.is_some()
                 && listen.is_none()
+                && tls.is_none()
                 && listen_uds.is_none()
                 && !systemd_activated
             {
@@ -1956,7 +1987,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // lease; a mount that keeps them longer (`nocto`, a large `acdirmax`/`actimeo`)
                 // could lose acknowledged writes, so it is refused before anything is served.
                 beyond_ai_agent::shard_mount::check_shards(&shards)?;
-                if listen.is_none() && listen_uds.is_none() && !systemd_activated {
+                if listen.is_none() && tls.is_none() && listen_uds.is_none() && !systemd_activated {
                     return Err(
                         "--service requires --listen, --listen-uds, or systemd socket activation: \
                          stdio has no place to carry a per-connection session grant"
@@ -2208,7 +2239,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // a tenant needs. A tenant's connectors come from its grant, per session (a later PR);
             // until then it has none rather than the replica's.
             let (mcp_tools, mcp_catalog) = if service {
-                (Vec::new(), tools::mcp::McpCatalog::default())
+                (
+                    tools::mcp::McpTools::default(),
+                    tools::mcp::McpCatalog::default(),
+                )
             } else {
                 let (mcp_tools, mcp_catalog, mcp_warnings) = tools::mcp::connect_all(
                     stored_settings.mcp_servers.as_deref().unwrap_or(&[]),
@@ -2419,8 +2453,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // outlives a `systemctl restart` (connections queue in the kernel). Unix/systemd only, and
             // deferred to `--listen`/`--listen-uds` when either is set. Computed once, up with the
             // `--service` validation, since that refuses stdio and so has to know.
-            let use_ws =
-                serve_cfg.listen.is_some() || serve_cfg.listen_uds.is_some() || systemd_activated;
+            let use_ws = serve_cfg.listen.is_some()
+                || tls.is_some()
+                || serve_cfg.listen_uds.is_some()
+                || systemd_activated;
             let shutdown_cause = if use_ws {
                 #[cfg(not(unix))]
                 if listen_uds.is_some() {
@@ -2437,6 +2473,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let listeners = serve_ws::ServeListeners {
                     tcp: serve_cfg.listen,
+                    tls,
                     #[cfg(unix)]
                     uds: serve_cfg.listen_uds.clone(),
                     #[cfg(unix)]
@@ -4526,7 +4563,7 @@ async fn run_task(
     // just above. `stored_settings.mcp_servers` is already trust-gated (a project's own
     // `.beyond/settings.json` — where a project-tier `mcp_servers` entry would live — only merges in at
     // all when `effective_settings_for_cwd` found `cwd` trusted; the global tier always applies).
-    let (mcp_tools, mcp_catalog, mcp_warnings) = tools::mcp::connect_all(
+    let (mcp_live, mcp_catalog, mcp_warnings) = tools::mcp::connect_all(
         stored_settings.mcp_servers.as_deref().unwrap_or(&[]),
         tools::mcp::idle_reap_after_from_env(),
         mcp_manifest_dir().as_ref(),
@@ -4550,7 +4587,10 @@ async fn run_task(
         .set_listing_suppressed(no_skills);
     let mcp_skills = tools::mcp_skills::McpSkills::new(&mcp_catalog, mcp_enabled.clone());
     // Skill-loading tools rebound to this run's skill state (see `filter_by_enabled`).
-    let mcp_tools = tools::mcp::filter_by_enabled(&mcp_tools, &mcp_enabled);
+    // The generation the registry below is built from: a server that re-lists its tools after this
+    // reaches the run through its tool source (installed on `steering` below).
+    let mcp_built_at = mcp_live.generation();
+    let mcp_tools = tools::mcp::filter_by_enabled(&mcp_live.snapshot(), &mcp_enabled);
     for diagnostic in mcp_skills.diagnostics(&skills) {
         eprintln!("warning: {diagnostic}");
     }
@@ -4626,6 +4666,20 @@ async fn run_task(
         tools_exclude.as_deref(),
         no_tools,
     );
+    // A server that changes its tools during the run (`notifications/tools/list_changed`, or a start
+    // that lists something new) has them offered from the next turn.
+    steering.set_tool_source(Some(tools::mcp::tool_source(
+        mcp_live.clone(),
+        mcp_enabled.clone(),
+        mcp_built_at,
+        tools::McpFilter {
+            loading: mcp_loading,
+            tools: tools_allow.clone(),
+            exclude: tools_exclude.clone(),
+            no_tools,
+            code_mode,
+        },
+    )));
     #[cfg(feature = "code-mode")]
     if code_mode {
         let nested =
@@ -4831,7 +4885,7 @@ async fn run_task(
             agents: Arc::new(agent_defs.clone()),
             skills: Arc::new(skills.clone()),
             write_locks: write_locks.clone(),
-            mcp_tools: mcp_tools.clone(),
+            mcp_tools: mcp_live.clone(),
             // `run` has no `set_mcp_enabled` command, so the gate never moves: every configured
             // server stays enabled for the life of the process, which is what the default means.
             // Shared, so a child sees (and is gated by) the skills this run loaded.

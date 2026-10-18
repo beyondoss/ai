@@ -23,7 +23,7 @@ use serde_json::json;
 /// gateway), persisting per-session files under `session_dir`. In listener mode stdio is unused, so
 /// null it.
 fn uds_cmd(base: &str, session_dir: &str, sock: &str) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_beyond-ai-agent"));
+    let mut c = crate::common::agent_cmd();
     c.args([
         "serve",
         "--listen-uds",

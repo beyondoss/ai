@@ -118,6 +118,16 @@ pub struct AiConfig {
     /// Prometheus metrics listener.
     pub metrics_listen: String,
 
+    /// Optional TLS listener for the same proxy service as `listen` (`AI_TLS_LISTEN`), for a public
+    /// endpoint that terminates TLS in the process. Needs `tls_cert` and `tls_key`; set one of the
+    /// three without the others and the gateway refuses to start. `listen` stays as configured. The
+    /// certificate is read once at boot: rotating it takes a restart.
+    pub tls_listen: Option<String>,
+    /// PEM certificate chain (leaf first) served on `tls_listen` (`AI_TLS_CERT`).
+    pub tls_cert: Option<String>,
+    /// PEM private key for `tls_cert` (`AI_TLS_KEY`): PKCS#8, PKCS#1 or SEC1.
+    pub tls_key: Option<String>,
+
     /// Tokio worker threads for the **proxy** service — the threads that run every request filter,
     /// the Ed25519 verify, the body scanners and the usage tap. `0` ⇒ one per available core.
     ///
@@ -411,6 +421,10 @@ pub struct AiConfig {
     /// line that would cross this bound is **dropped** (counted on `ai_capture_dropped_total`),
     /// never waited for (D262).
     pub capture_queue_bytes: usize,
+    /// Directory for `ai.usage` billing rows (`AI_USAGE_DIR`). Set: rows go to hourly
+    /// `ai-usage-YYYYMMDDTHH.jsonl` files here, **only** there, with the same blocking, lossless
+    /// guarantee as stdout (`usage_file`). Unset (the default): rows go to stdout.
+    pub usage_dir: Option<String>,
 
     /// Exact-match response cache TTL (seconds). `0` disables it (the default). Only managed
     /// catalog walks whose client body is already in hand before `upstream_peer` (`/auto`, managed
@@ -445,6 +459,9 @@ impl Default for AiConfig {
         Self {
             listen: "0.0.0.0:8080".to_string(),
             metrics_listen: "0.0.0.0:9090".to_string(),
+            tls_listen: None,
+            tls_cert: None,
+            tls_key: None,
             // One proxy worker per core. Pingora's own default is 1, which silently pins the whole
             // gateway to a single core; scaling with the box is the least surprising default for an
             // L7 proxy. Override under a CPU quota — see the field docs.
@@ -520,6 +537,7 @@ impl Default for AiConfig {
             capture_queue_depth: 1024,
             // 64 MiB: dozens of full-size payloads, a small fraction of `max_buffered_body_bytes`.
             capture_queue_bytes: 64 * 1024 * 1024,
+            usage_dir: None,
             // Off. A TTL of 0 is the disable knob; turning it on is an operator choice, not a
             // surprise change in what the gateway talks to.
             cache_ttl_secs: 0,
@@ -552,6 +570,7 @@ pub struct ValidConfig {
     provider_authorities: HashMap<ProviderName, String>,
     provider_dialects: HashMap<ProviderName, String>,
     provider_auth_schemes: HashMap<ProviderName, String>,
+    tls_listener: Option<TlsListener>,
 }
 
 impl fmt::Debug for ValidConfig {
@@ -565,6 +584,7 @@ impl fmt::Debug for ValidConfig {
             .field("provider_authorities", &self.provider_authorities)
             .field("provider_dialects", &self.provider_dialects)
             .field("provider_auth_schemes", &self.provider_auth_schemes)
+            .field("tls_listener", &self.tls_listener)
             .finish_non_exhaustive()
     }
 }
@@ -665,6 +685,16 @@ impl ValidConfig {
         &self.provider_auth_schemes
     }
 
+    /// The public TLS listener, `None` when `tls_listen`, `tls_cert` and `tls_key` are all unset.
+    pub fn tls_listener(&self) -> Option<&TlsListener> {
+        self.tls_listener.as_ref()
+    }
+
+    /// See [`AiConfig::usage_dir`]: `None` sends `ai.usage` rows to stdout.
+    pub fn usage_dir(&self) -> Option<&Path> {
+        self.raw.usage_dir.as_deref().map(Path::new)
+    }
+
     /// See [`AiConfig::build_keyring`].
     pub fn build_keyring(&self) -> Result<Keyring> {
         self.raw.build_keyring()
@@ -688,6 +718,33 @@ impl ValidConfig {
     /// See [`AiConfig::downstream_tcp_keepalive`].
     pub fn downstream_tcp_keepalive(&self) -> Option<TcpKeepalive> {
         self.raw.downstream_tcp_keepalive()
+    }
+}
+
+/// The public TLS listener ([`AiConfig::tls_listen`], [`AiConfig::tls_cert`],
+/// [`AiConfig::tls_key`]) as [`AiConfig::validate`] accepted it: all three set, and the certificate
+/// chain and key loaded into a server config together, so building the listener cannot fail on them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsListener {
+    addr: String,
+    cert: String,
+    key: String,
+}
+
+impl TlsListener {
+    /// The address it listens on.
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    /// The PEM certificate chain's path.
+    pub fn cert(&self) -> &str {
+        &self.cert
+    }
+
+    /// The PEM private key's path.
+    pub fn key(&self) -> &str {
+        &self.key
     }
 }
 
@@ -928,6 +985,7 @@ impl AiConfig {
                 crate::circuit_breaker::MAX_FAILURE_THRESHOLD,
             )));
         }
+        self.validate_tls()?;
         // A malformed id signing key is a boot failure, not a 503 on every managed Responses turn.
         self.build_id_signer()?;
         Ok(())
@@ -944,6 +1002,15 @@ impl AiConfig {
                 window: Duration::from_secs(self.circuit_breaker_window_secs),
                 reset: Duration::from_secs(self.circuit_breaker_reset_secs),
             });
+        // `check` proved the three are set together or not at all, and that the files load.
+        let tls_listener = match (
+            self.tls_listen.take(),
+            self.tls_cert.take(),
+            self.tls_key.take(),
+        ) {
+            (Some(addr), Some(cert), Some(key)) => Some(TlsListener { addr, cert, key }),
+            _ => None,
+        };
         Ok(ValidConfig {
             worker_threads,
             upstream_tls: UpstreamTls::of(self.upstream_tls, self.upstream_verify_cert),
@@ -952,8 +1019,53 @@ impl AiConfig {
             provider_authorities: keyed(std::mem::take(&mut self.provider_authorities)),
             provider_dialects: keyed(std::mem::take(&mut self.provider_dialects)),
             provider_auth_schemes: keyed(std::mem::take(&mut self.provider_auth_schemes)),
+            tls_listener,
             raw: self,
         })
+    }
+
+    /// The TLS listener's settings are all present and usable: all three or none, and the files
+    /// load into a rustls server config (which also checks that the key signs for the leaf). Pingora
+    /// panics on a bad file when it builds the listener, so the failure is caught here, as a config
+    /// error with the path in it.
+    fn validate_tls(&self) -> Result<()> {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+        let (addr, cert, key) = match (&self.tls_listen, &self.tls_cert, &self.tls_key) {
+            (None, None, None) => return Ok(()),
+            (Some(a), Some(c), Some(k)) => (a, c, k),
+            _ => {
+                return Err(GatewayError::Config(
+                    "tls_listen, tls_cert and tls_key must be set together (set none of them to \
+                     serve plain HTTP only)"
+                        .to_string(),
+                ));
+            }
+        };
+        if addr.trim().is_empty() {
+            return Err(GatewayError::Config("tls_listen is empty".to_string()));
+        }
+        let certs = CertificateDer::pem_file_iter(cert)
+            .and_then(|it| it.collect::<std::result::Result<Vec<_>, _>>())
+            .map_err(|e| GatewayError::Config(format!("tls_cert {cert}: {e}")))?;
+        if certs.is_empty() {
+            return Err(GatewayError::Config(format!(
+                "tls_cert {cert}: no certificate found"
+            )));
+        }
+        let key_der = PrivateKeyDer::from_pem_file(key)
+            .map_err(|e| GatewayError::Config(format!("tls_key {key}: {e}")))?;
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| GatewayError::Config(format!("tls: {e}")))?
+            .with_no_client_auth()
+            .with_single_cert(certs, key_der)
+            .map_err(|e| {
+                GatewayError::Config(format!(
+                    "tls_cert {cert} and tls_key {key} do not work together: {e}"
+                ))
+            })?;
+        Ok(())
     }
 
     /// The signer for tenant-bound Responses ids (`signed_id.rs`), or `None` when no
