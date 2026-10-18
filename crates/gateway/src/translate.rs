@@ -4967,10 +4967,10 @@ pub fn force_stream(body: &mut Vec<u8>, usage: bool) -> bool {
     {
         return false;
     }
-    if usage {
-        peek::set_root_member(body, "stream_options", br#"{"include_usage":true}"#);
-    }
-    peek::set_root_member(body, "stream", b"true")
+    // Each set reports its own change, and neither answer is dropped: the caller re-scans on it.
+    let options =
+        usage && peek::set_root_member(body, "stream_options", br#"{"include_usage":true}"#);
+    peek::set_root_member(body, "stream", b"true") || options
 }
 
 /// A Chat Completions body for a host that does not read the `developer` role
@@ -5102,7 +5102,9 @@ fn forced_as_instruction(body: &mut Vec<u8>, must: &str) -> bool {
             .as_bytes(),
     );
     body.splice(close..close, msg);
-    peek::set_root_member(body, "tool_choice", b"\"auto\"")
+    // The splice above changed the body, whatever the set reports.
+    peek::set_root_member(body, "tool_choice", b"\"auto\"");
+    true
 }
 
 /// A same-wire Responses body, minus the `reasoning` items this gateway minted from Claude's

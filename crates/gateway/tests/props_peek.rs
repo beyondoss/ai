@@ -572,3 +572,58 @@ fn prop_response_scanner_reads_the_echoed_model() {
         },
     );
 }
+
+/// The body rewrites through `rewrite::ScannedBody` write the same bytes as the old free functions
+/// with offsets adjusted by hand, and the result is the JSON the plan asked for: the serving id as
+/// the one `model`, each lone integer limit held to the cap, and usage asked for on a stream.
+#[test]
+fn prop_scanned_body_edits_match_the_hand_adjusted_ones() {
+    check(
+        "prop_scanned_body_edits_match_the_hand_adjusted_ones",
+        (body(), edit_plan()),
+        |(b, plan)| {
+            let root = b.serde();
+            let out = upstream(b.text.as_bytes().to_vec(), &plan);
+            prop_assert_eq!(
+                &out,
+                &upstream_old(b.text.as_bytes().to_vec(), &plan),
+                "{:?} on {}",
+                plan,
+                b.text
+            );
+            let got = match serde_json::from_slice::<Value>(&out) {
+                Ok(Value::Object(m)) => m,
+                other => return Err(TestCaseError::fail(format!("{other:?}: {}", b.text))),
+            };
+            if let Some(id) = &plan.model
+                && b.count("model") == 1
+                && root.get("model").is_some_and(Value::is_string)
+            {
+                prop_assert_eq!(got.get("model"), Some(&json!(id)), "{}", b.text);
+            }
+            if !plan.rename && plan.cap > 0 {
+                for key in OUTPUT_LIMIT_KEYS {
+                    let key = std::str::from_utf8(key).unwrap();
+                    if b.count(key) != 1 {
+                        continue;
+                    }
+                    let want = match root.get(key).and_then(Value::as_u64) {
+                        Some(n) => json!(n.min(u64::from(plan.cap))),
+                        None => root[key].clone(),
+                    };
+                    prop_assert_eq!(got.get(key), Some(&want), "{} in {}", key, b.text);
+                }
+            }
+            if plan.stream_usage && root.get("stream") == Some(&json!(true)) {
+                prop_assert_eq!(
+                    got.get("stream_options")
+                        .and_then(|o| o.get("include_usage")),
+                    Some(&json!(true)),
+                    "{}",
+                    b.text
+                );
+            }
+            Ok(())
+        },
+    );
+}

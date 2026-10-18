@@ -938,3 +938,25 @@ fn prop_unescape_matches_serde() {
         },
     );
 }
+
+// --- the body rewrites ------------------------------------------------------------------------
+
+/// The body rewrites through `rewrite::ScannedBody`, whose offsets move with each edit, write the
+/// same bytes as the old free functions with offsets adjusted by hand, on any bytes.
+#[test]
+fn prop_scanned_body_edits_agree_with_the_hand_adjusted_ones() {
+    check(
+        "prop_scanned_body_edits_agree_with_the_hand_adjusted_ones",
+        (input(), edit_plan()),
+        |(input, plan)| {
+            prop_assert_eq!(
+                upstream(input.bytes.clone(), &plan),
+                upstream_old(input.bytes.clone(), &plan),
+                "{:?} on {}",
+                plan,
+                shown(&input.bytes)
+            );
+            Ok(())
+        },
+    );
+}

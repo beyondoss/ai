@@ -22,6 +22,7 @@ use serde_json::{Map, Value, json};
 use std::time::{Duration, Instant};
 
 pub mod old_peek;
+pub mod old_rewrite;
 pub mod requests;
 pub mod script;
 
@@ -716,4 +717,60 @@ pub fn chunk(bytes: &[u8], cuts: &[usize]) -> Vec<Vec<u8>> {
     }
     out.push(bytes[prev..].to_vec());
     out
+}
+
+/// One attempt's plan for the body rewrites: the row's output cap (`0`: none published), whether
+/// the attempt is onto native OpenAI Chat (the `max_tokens` rename), the OpenAI-upstream gate
+/// (`BodyPlan::stream_options`), and the serving candidate's id on a model-routed request.
+#[derive(Clone, Debug)]
+pub struct EditPlan {
+    pub cap: u32,
+    pub rename: bool,
+    pub stream_usage: bool,
+    pub model: Option<String>,
+}
+
+pub fn edit_plan() -> impl Strategy<Value = EditPlan> {
+    let cap = prop_oneof![
+        2 => Just(0u32),
+        4 => 1u32..200_000,
+        1 => Just(16_384u32),
+        1 => Just(u32::MAX),
+    ];
+    let model = prop::option::of(prop_oneof![
+        Just(String::new()),
+        Just("x".to_owned()),
+        Just("openai/gpt-4o-mini".to_owned()),
+        "[a-z0-9][a-z0-9./:-]{0,40}",
+    ]);
+    (cap, any::<bool>(), any::<bool>(), model).prop_map(|(cap, rename, stream_usage, model)| {
+        EditPlan {
+            cap,
+            rename,
+            stream_usage,
+            model,
+        }
+    })
+}
+
+/// `plan` applied through `rewrite::ScannedBody`, as `request_body_filter` applies it, less the
+/// opaque edits between the clamp and the rename: those re-scan whatever they change, and
+/// `rewrite`'s own tests hold that re-scan to a fresh one.
+pub fn upstream(bytes: Vec<u8>, plan: &EditPlan) -> Vec<u8> {
+    let mut body = beyond_ai::ScannedBody::new(bytes).clamp_output_limits(plan.cap);
+    if plan.rename {
+        body = body.rename_max_tokens();
+    }
+    body.into_upstream(plan.stream_usage, plan.model.as_deref().map(str::as_bytes))
+}
+
+/// The same plan through the old free functions, offsets adjusted by hand.
+pub fn upstream_old(bytes: Vec<u8>, plan: &EditPlan) -> Vec<u8> {
+    old_rewrite::upstream(
+        bytes,
+        plan.cap,
+        plan.rename,
+        plan.stream_usage,
+        plan.model.as_deref().map(str::as_bytes),
+    )
 }

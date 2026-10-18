@@ -929,6 +929,23 @@ mod peek {
             buf
         });
     }
+
+    /// The buffered path's edits end to end, through `rewrite::ScannedBody`: accumulate, the one
+    /// walk, the clamp (nothing over the cap), the model splice (the primary candidate's own id:
+    /// no memmove) and the injection. One allocation for the body, as `splice_in_place`, plus the
+    /// scan's `model`: no edit re-walks or copies the body.
+    #[divan::bench(args = [4 * 1024, 64 * 1024, 1024 * 1024])]
+    fn scanned_body_edits(bencher: Bencher, padding: usize) {
+        let body = streaming_body(padding);
+        bencher.counter(BytesCount::of_slice(&body)).bench(|| {
+            let b = black_box(&body);
+            let mut buf = Vec::with_capacity(b.len() + FRAG.len());
+            buf.extend_from_slice(b);
+            beyond_ai::ScannedBody::new(buf)
+                .clamp_output_limits(16_384)
+                .into_upstream(true, Some(b"gpt-4o"))
+        });
+    }
 }
 
 mod store_watch {

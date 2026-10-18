@@ -39,6 +39,7 @@ pub mod ratelimit;
 pub mod refusal;
 pub mod remedy;
 mod retry;
+mod rewrite;
 pub mod route;
 pub mod secret;
 pub mod signed_id;
@@ -49,3 +50,8 @@ pub mod translate;
 pub mod unpriced;
 pub mod usage;
 pub mod usage_file;
+
+/// The one `rewrite` item the benches and property tests name: the body with its scan, through the
+/// methods `request_body_filter` calls on it. The rest of `rewrite` is crate-private.
+#[doc(hidden)]
+pub use rewrite::ScannedBody;
