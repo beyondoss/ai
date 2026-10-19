@@ -1346,6 +1346,12 @@ impl McpConnection {
         }
     }
 
+    /// Mark the server used now: the idle window counts from here.
+    fn touch(&self) {
+        self.last_used
+            .store(now_secs(), std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The live client, connecting first if the process was reaped — or has died.
     ///
     /// A server that crashed (an OOM kill, an unhandled exception, `kill -9`) leaves its client
@@ -1356,8 +1362,7 @@ impl McpConnection {
     /// per-caller retry. A call already in flight when the server died still fails: whether it
     /// reached the server is unknowable, and re-sending a `tools/call` could do its work twice.
     pub(crate) async fn client(&self) -> Result<Arc<McpClient>, String> {
-        self.last_used
-            .store(now_secs(), std::sync::atomic::Ordering::Relaxed);
+        self.touch();
         let mut guard = self.client.lock().await;
         if let Some(live) = guard.as_ref() {
             if !live.client.is_transport_closed() {
@@ -1528,6 +1533,17 @@ impl McpTool {
     }
 }
 
+/// Marks a connection used again when a call ends, so the idle window counts from the call's end as
+/// well as its start: a call longer than the window must not leave the server idle the moment it
+/// returns, or the next reaper pass kills the process and the state the call built with it.
+struct UsedOnDrop<'a>(&'a McpConnection);
+
+impl Drop for UsedOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.touch();
+    }
+}
+
 /// One `tools/call` on `conn`, returning the server's whole result — `structuredContent` and
 /// `_meta` included, which the model never sees but an MCP App view does.
 async fn call_tool_raw(
@@ -1544,6 +1560,7 @@ async fn call_tool_raw(
     let client = conn.client().await.map_err(|e| {
         ToolError::Execution(format!("mcp server `{server_name}` is not reachable: {e}"))
     })?;
+    let _used = UsedOnDrop(conn);
     // The questions this call raises go to the session that made it (see [`calling_host`]) —
     // tracked per call, so a nested request is attributed to that session or refused.
     let host = calling_host(&client.service().host);
