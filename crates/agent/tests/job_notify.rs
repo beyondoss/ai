@@ -652,8 +652,8 @@ fn the_live_reconcile_changes_only_unheld_jobs() {
     assert!(matches!(k.job(J), Some(JobState::Taken { .. })));
 }
 
-/// N29: a live reconcile starts only for a callback about an unheld job, a release, or a use
-/// with none in the last 30 s; never on a timer.
+/// N29: a live reconcile starts only for a callback about an unheld job, a release, or a use (at
+/// once, or at the 30 s mark when one ended less than 30 s before); never on a timer alone.
 #[test]
 fn reconciles_only_on_a_callback_or_a_use() {
     let mut k = unheld_at(1000);
@@ -661,7 +661,16 @@ fn reconciles_only_on_a_callback_or_a_use() {
     for now in (1000..200_000).step_by(997) {
         assert!(k.step(Event::Tick { now }).is_empty(), "at {now}");
     }
-    // A use within 30 s of the last reconcile's end starts nothing; one after does.
+    // A use 30 s or more after the last reconcile's end starts one at once.
+    let mut k = unheld_at(1000);
+    assert_eq!(
+        k.step(Event::Use {
+            now: 1000 + USE_SPACING
+        }),
+        [Action::StartReconcile { reconcile: 1 }]
+    );
+    // A use inside the 30 s starts nothing now, and asks for one at the 30 s mark; more uses
+    // meanwhile share it.
     let mut k = unheld_at(1000);
     assert!(
         k.step(Event::Use {
@@ -669,8 +678,15 @@ fn reconciles_only_on_a_callback_or_a_use() {
         })
         .is_empty()
     );
-    assert_eq!(
+    assert!(
         k.step(Event::Use {
+            now: 1000 + USE_SPACING - 1
+        })
+        .is_empty()
+    );
+    assert_eq!(k.next_wake(), Some(1000 + USE_SPACING));
+    assert_eq!(
+        k.step(Event::Tick {
             now: 1000 + USE_SPACING
         }),
         [Action::StartReconcile { reconcile: 1 }]

@@ -67,10 +67,9 @@
 //! - **One session.** Sessions share nothing in either kernel (a kernel per session, a notifier
 //!   per job), so one session is the sound unit.
 //! - **One real use per end, and it must be enough.** The session's current owner makes one real
-//!   use after each end, at once (a reconcile running, a callback waiting) or after an idle spell.
-//!   The one moment left out is N29's own exception: a use less than 30 s after a reconcile ended,
-//!   with none running, starts nothing, so an end that reconcile listed too early to see waits for
-//!   the use after it. `a_use_soon_after_a_reconcile_waits_for_the_next` pins that case.
+//!   use after each end, at any moment: at once (a reconcile running, a callback waiting, less
+//!   than 30 s after a reconcile ended) or after an idle spell. A use inside N29's 30 s asks for a
+//!   reconcile at the 30 s mark, which [`Act::Advance`] reaches.
 //! - **A transcript switch waits for the turn**: never during a `bash_job` call.
 //!
 //! ## Bounds, and why they are enough
@@ -86,8 +85,8 @@
 //!   slower than a callback's 20 s ([`SLOW`]). Every protocol step, a restart and a reopen are
 //!   free, so every bounded run settles. CI checks any one move of any class, two of the network,
 //!   two of the sandbox, and one network move with a `bash_job` call (about 6 M states in all,
-//!   seconds). `NOTIFY_MODEL_FULL=1` adds any two moves of any class (about 81 M states), two
-//!   ownership moves (24 M) and two jobs (43 M), each minutes. Every mutation's
+//!   seconds). `NOTIFY_MODEL_FULL=1` adds any two moves of any class (about 85 M states), two
+//!   ownership moves (25 M) and two jobs (46 M), each minutes. Every mutation's
 //!   counterexample needs at most one move, so the default budget reaches every guard.
 //! - **A count of attempts runs to [`RETRY_CAP`] (3), not 12.** The kernel resets a count on
 //!   every answer that settles it, so a success at attempt 5 leaves the state a success at
@@ -315,6 +314,8 @@ enum Mutation {
     HideSwitch,
     /// L1: drop a real use that arrives while a reconcile runs.
     DropUseDuringReconcile,
+    /// L1: drop a real use that arrives less than 30 s after a reconcile ended, none running.
+    DropEarlyUse,
 }
 
 // Adversary classes: which moves the chaos budget may buy.
@@ -337,7 +338,8 @@ struct Notify {
     adversary: u8,
     /// `bash_job` calls the session may make.
     calls: u8,
-    /// Let the one real use come less than 30 s after a reconcile ended (N29 drops it).
+    /// Let the one real use come less than 30 s after a reconcile ended (N29 then asks for one at
+    /// the 30 s mark). On in every faithful config; off only to compare.
     use_in_quiet_window: bool,
     mutation: Mutation,
 }
@@ -349,7 +351,7 @@ impl Notify {
             chaos,
             adversary: ALL,
             calls: 1,
-            use_in_quiet_window: false,
+            use_in_quiet_window: true,
             mutation: Mutation::None,
         }
     }
@@ -968,9 +970,8 @@ impl Model for Notify {
             }
             // The session's current owner makes one real use after each end, and that one use
             // must be enough (L1). It may come at once, whatever runs (a reconcile, a callback's
-            // wait), or after an idle spell. The one exception is N29's: a use less than 30 s
-            // after a reconcile ended, none running, starts nothing, so the model makes it come
-            // only with `use_in_quiet_window` (`a_use_soon_after_a_reconcile_waits_for_the_next`).
+            // wait, or less than 30 s after a reconcile ended, with `use_in_quiet_window`), or
+            // after an idle spell.
             let quiet = t.rk.next_wake().is_none() && !t.rk.reconciling();
             let spaced = t.rk.reconciling()
                 || t.last_reconcile
@@ -1314,9 +1315,15 @@ impl Model for Notify {
                 }
                 t.use_due = false;
                 let now = t.now;
-                // The mutation drops a use that arrives while a reconcile runs, as the kernel did
-                // before a use asked for the next reconcile.
-                if !(self.mutation == Mutation::DropUseDuringReconcile && t.rk.reconciling()) {
+                // The mutations drop a use that arrives while a reconcile runs, or less than 30 s
+                // after one ended, as the kernel did before such a use asked for a reconcile.
+                let early = !t.rk.reconciling()
+                    && t.last_reconcile
+                        .is_some_and(|end| now < end + SPEC_USE_QUIET_MS);
+                let dropped = (self.mutation == Mutation::DropUseDuringReconcile
+                    && t.rk.reconciling())
+                    || (self.mutation == Mutation::DropEarlyUse && early);
+                if !dropped {
                     self.replica(&mut s, r, kernel::Event::Use { now }, false, None);
                 }
             }
@@ -1819,29 +1826,53 @@ fn mutation_drop_use_during_reconcile_misses_an_end() {
     );
 }
 
-/// N29's exception, pinned: a real use less than 30 s after a reconcile ended (none running)
-/// starts nothing, so an end that reconcile listed too early to see (here the sandbox's death)
-/// waits for the use after it. The faithful configs keep that use out; this lets it in.
+/// A real use less than 30 s after a reconcile ended (none running) is enough: it asks for a
+/// reconcile at the 30 s mark, which finds an end the last one listed too early to see (here the
+/// sandbox's death). Strict L1 holds, and the early use is reached.
 #[test]
-fn a_use_soon_after_a_reconcile_waits_for_the_next() {
+fn a_use_soon_after_a_reconcile_is_enough() {
     const L1: &str = "L1: once settled, every end the open session tracks is reported";
     let model = Notify {
         adversary: SBX,
         calls: 0,
-        use_in_quiet_window: true,
         ..Notify::new(1, 1)
     };
+    assert!(model.use_in_quiet_window);
     let checker = run(model, "one job, a use inside N29's 30 s");
-    let Some(path) = checker.discovery(L1) else {
-        panic!("a use inside N29's 30 s after a reconcile starts nothing in today's kernel");
-    };
-    let steps = path.clone().into_vec();
-    let soon = steps.iter().any(|(state, action)| {
+    checker.assert_properties();
+    assert!(checker.discovery(L1).is_none());
+    // Non-vacuous: the mutation that drops exactly that use breaks L1 in the same config.
+    let dropped = run(
+        model.mutated(Mutation::DropEarlyUse),
+        "the same, the early use dropped",
+    );
+    assert!(dropped.discovery(L1).is_some(), "the early use is reached");
+}
+
+/// Dropping a use that arrives less than 30 s after a reconcile ended (that reconcile may have
+/// listed before the end) leaves that end unreported after the one real use: strict L1 breaks,
+/// and nothing else.
+#[test]
+fn mutation_drop_early_use_misses_an_end() {
+    const L1: &str = "L1: once settled, every end the open session tracks is reported";
+    let model = Notify {
+        adversary: SBX,
+        calls: 0,
+        ..Notify::new(1, 1)
+    }
+    .mutated(Mutation::DropEarlyUse);
+    mutant(model, L1, &[]);
+    // For the right reason: the counterexample's use came inside the 30 s, none running.
+    let checker = run(model, "the same, its trace");
+    let path = checker
+        .discovery(L1)
+        .map(|p| p.into_vec())
+        .unwrap_or_default();
+    let soon = path.iter().any(|(state, action)| {
         matches!(action, Some(Act::Use(r, false)) if state.task[*r as usize].as_ref().is_some_and(|t| {
             !t.rk.reconciling()
                 && t.last_reconcile.is_some_and(|end| t.now < end + SPEC_USE_QUIET_MS)
         }))
     });
     assert!(soon, "the counterexample's use must come inside the 30 s");
-    println!("  {L1}:\n    {}", trace_to_violation(&model, L1, path));
 }

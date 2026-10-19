@@ -14,7 +14,7 @@
 //! arrives with the event that needs it ([`Facts`]). It also owns the session's reconcile schedule
 //! (one at a time, the next shared by everyone who asks while one runs, spaced
 //! [`RECONCILE_SPACING`] after the last for a callback or a release, and [`USE_SPACING`] for a
-//! use) and the callbacks waiting for an answer (at most [`MAX_WAITING`], each answered `503` at
+//! use, which inside that spacing asks for one at its end rather than being dropped) and the callbacks waiting for an answer (at most [`MAX_WAITING`], each answered `503` at
 //! [`ANSWER_LIMIT`] after it arrived).
 //!
 //! The release table ("Release (normative)" in [`crate::exec_endpoint`]), row by row:
@@ -268,6 +268,18 @@ pub enum Action {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 struct Batch {
     waiters: Vec<CallId>,
+    /// Asked for only by a use inside [`USE_SPACING`] of the last reconcile's end: it begins no
+    /// sooner than this. Anything else that asks (a callback, a release, a use while one runs)
+    /// clears it, and the batch begins at [`RECONCILE_SPACING`].
+    not_before: Option<Millis>,
+}
+
+impl Batch {
+    /// Asked for by something that gets a callback's spacing.
+    fn urgent(&mut self) -> &mut Self {
+        self.not_before = None;
+        self
+    }
 }
 
 /// The reconcile running now.
@@ -343,7 +355,9 @@ impl Kernel {
             _ => None,
         });
         let start = match (&self.running, &self.next, self.last_end) {
-            (None, Some(_), Some(end)) => Some(end + RECONCILE_SPACING),
+            (None, Some(b), Some(end)) => {
+                Some((end + RECONCILE_SPACING).max(b.not_before.unwrap_or(0)))
+            }
             _ => None,
         };
         waiters.chain(windows).chain(start).min()
@@ -449,7 +463,7 @@ impl Kernel {
                     );
                     // After the stream is closed, and never one that began earlier: the next
                     // batch has not begun.
-                    self.next.get_or_insert_with(Batch::default);
+                    self.next.get_or_insert_with(Batch::default).urgent();
                     self.maybe_start(now, &mut out);
                 }
             }
@@ -519,11 +533,16 @@ impl Kernel {
                 if self.running.is_some() {
                     // The running reconcile may have listed before the end it would have found:
                     // the next one is asked for, as a callback asks, and shared with any.
-                    self.next.get_or_insert_with(Batch::default);
-                } else if self.next.is_none()
-                    && self.last_end.is_none_or(|e| now >= e + USE_SPACING)
-                {
-                    self.next = Some(Batch::default());
+                    self.next.get_or_insert_with(Batch::default).urgent();
+                } else if self.next.is_none() {
+                    // The last reconcile may have listed before the end this use would find, so a
+                    // use is never dropped: inside the 30 s it asks for one at the 30 s mark. It
+                    // never delays the use, and only a use asks.
+                    let not_before = self.last_end.map(|e| e + USE_SPACING).filter(|&t| now < t);
+                    self.next = Some(Batch {
+                        waiters: Vec::new(),
+                        not_before,
+                    });
                     self.maybe_start(now, &mut out);
                 }
             }
@@ -579,6 +598,7 @@ impl Kernel {
                 self.waiting.insert(call, now + ANSWER_LIMIT);
                 self.next
                     .get_or_insert_with(Batch::default)
+                    .urgent()
                     .waiters
                     .push(call);
                 self.maybe_start(now, out);
@@ -637,6 +657,14 @@ impl Kernel {
             return;
         }
         if self.last_end.is_some_and(|e| now < e + RECONCILE_SPACING) {
+            return;
+        }
+        if self
+            .next
+            .as_ref()
+            .and_then(|b| b.not_before)
+            .is_some_and(|t| now < t)
+        {
             return;
         }
         let Some(batch) = self.next.take() else {
@@ -909,6 +937,67 @@ mod tests {
                 end: None
             }]
         );
+    }
+
+    /// The model's second trace, in the kernel's own events: a reconcile ended (it listed the job
+    /// still running), the sandbox dies, and a real use comes less than 30 s later with none
+    /// running. The use must not be dropped: it asks for a reconcile at the 30 s mark, which finds
+    /// the sandbox unlistable, and the unheld job takes today's follow.
+    #[test]
+    fn a_use_soon_after_a_reconcile_asks_for_one_at_the_spacing() {
+        let mut k = unheld();
+        assert_eq!(
+            k.step(Event::Use { now: 0 }),
+            [Action::StartReconcile { reconcile: 0 }]
+        );
+        let running = BTreeMap::from([(J.to_string(), Listed::Running)]);
+        assert!(
+            k.step(Event::Listed {
+                reconcile: 0,
+                jobs: Some(running),
+                now: 1000,
+            })
+            .is_empty()
+        );
+        // The sandbox dies; a use 5 s later starts nothing now, and never waits.
+        assert!(k.step(Event::Use { now: 6000 }).is_empty());
+        assert_eq!(k.next_wake(), Some(1000 + USE_SPACING));
+        assert!(
+            k.step(Event::Tick {
+                now: 1000 + USE_SPACING - 1
+            })
+            .is_empty()
+        );
+        assert_eq!(
+            k.step(Event::Tick {
+                now: 1000 + USE_SPACING
+            }),
+            [Action::StartReconcile { reconcile: 1 }]
+        );
+        let a = k.step(Event::Listed {
+            reconcile: 1,
+            jobs: None,
+            now: 1000 + USE_SPACING + 100,
+        });
+        assert_eq!(
+            a,
+            [Action::Follow {
+                job: J.into(),
+                from: 7,
+                end: None
+            }]
+        );
+        // A callback in the meantime still gets its own 1 s spacing.
+        let mut k = unheld();
+        k.step(Event::Use { now: 0 });
+        k.step(Event::Listed {
+            reconcile: 0,
+            jobs: Some(BTreeMap::from([(J.to_string(), Listed::Running)])),
+            now: 1000,
+        });
+        k.step(Event::Use { now: 1500 });
+        k.step(cb(9, 1600));
+        assert_eq!(k.next_wake(), Some(1000 + RECONCILE_SPACING));
     }
 
     #[test]
