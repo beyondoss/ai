@@ -372,6 +372,14 @@ impl SessionRepo {
         if self.segmented() {
             return self.delete_segmented(&path, id);
         }
+        // A session some process is writing (`lock_session_writer`) is refused, as in the segmented
+        // layout, rather than renamed out from under it. Held until the delete is done.
+        let Some(_lock) = acquire_session_lock(&path)? else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!("session {id} is in use and cannot be deleted"),
+            ));
+        };
         if let Some(file_name) = path.file_name() {
             let trash_dir = self.dir.join(".trash");
             if fs::create_dir_all(&trash_dir).is_ok()
