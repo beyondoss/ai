@@ -872,21 +872,19 @@ pub struct ServeConfig {
     /// into each session is a cheap pointer bump. `None` (the default, and always on the stdio/`run`
     /// path) preserves the per-session-client behavior.
     pub shared_http: Option<reqwest::Client>,
-    /// `serve --service`: this daemon is a **fail-closed multi-tenant service**. Every connection
-    /// must present a verified [`bsg_v1` grant](crate::grant), every session runs against that
-    /// grant's sandbox and tenant-rooted storage, and nothing tenant-specific is read from or
-    /// written to the replica host. See [`crate::service`]. `false` is everything `serve` was
-    /// before.
-    pub service_mode: bool,
+    /// Which world this config lives in. `serve --service` makes the daemon a **fail-closed
+    /// multi-tenant service**: every connection must present a verified [`bsg_v1`
+    /// grant](crate::grant), every session runs against that grant's sandbox and tenant-rooted
+    /// storage, and nothing tenant-specific is read from or written to the replica host (see
+    /// [`crate::service`]). `main.rs` sets it once from the flags (`Local` or `Replica`); the
+    /// connection that spawns a session binds it to that session's verified grant
+    /// (`serve_ws::session_cfg`), since at startup there is no connection and so no tenant. A
+    /// session still `Replica` has no grant, which fails the session rather than silently falling
+    /// back to a host default.
+    pub mode: Mode,
     /// The tenant-data mounts (`--shard <name>=</abs/path>`, repeatable). Empty outside service
     /// mode; `Arc` so every per-session copy of this config shares one map.
     pub shards: Arc<crate::service::Shards>,
-    /// **This** session's verified grant and everything derived from it, handed down by the
-    /// connection that spawned the session (`serve_ws::session_cfg`). `main.rs` never sets it: at
-    /// startup there is no connection and so no tenant. `None` outside service mode — and, if
-    /// [`Self::service_mode`] is set, a `None` here is a bug that fails the session rather than
-    /// silently falling back to a host default.
-    pub service: Option<Arc<crate::service::ServiceSession>>,
     /// Cap on live sessions this replica will hold at once; `0` turns it off. Two open descriptors
     /// per live session (its newest segment and its lock) keeps the default comfortably inside EFS's
     /// documented 65,536 open files and 65,536 locks per instance. Enforced where a session is
@@ -915,7 +913,7 @@ pub struct ServeConfig {
 impl ServeConfig {
     /// Which world this config's session lives in: its grant's, or this host's.
     fn mode(&self) -> Mode {
-        Mode::from(self.service.clone())
+        self.mode.clone()
     }
 }
 
@@ -3179,14 +3177,14 @@ pub(crate) async fn serve_session(
         persistence.session_id(),
         cfg.context_files,
     );
-    match mode.service() {
-        Some(svc) => {
+    match mode.lazy_exec(cfg.exec_max_response_bytes) {
+        Some(connect) => {
             exec_cell.set_lazy(
-                svc.lazy_exec(cfg.exec_max_response_bytes),
+                connect,
                 sandbox_snapshot.as_ref().map(|s| s.sandbox.home.clone()),
             );
             match &sandbox_snapshot {
-                Some(snapshot) => svc.seed_sandbox(snapshot.sandbox.clone()),
+                Some(snapshot) => mode.seed_sandbox(snapshot.sandbox.clone()),
                 None => {
                     exec_cell.connect().await.map_err(
                         |e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -3252,32 +3250,28 @@ pub(crate) async fn serve_session(
     // exec v1.4: a sandbox's `job_ended` callback reaches this session only while this task holds
     // it, registered here for the task's life (dropped, it is unregistered). The job table answers
     // it. Service mode only: `job_notify` is never set anywhere else.
-    let job_notify = match (&cfg.job_notify, mode.service()) {
-        (Some(hub), Some(svc)) => {
-            let reg = crate::tools::job_notify::SessionNotify::register(
-                hub,
-                svc.tenant(),
-                persistence.session_id(),
-            );
-            let tracker: Arc<dyn crate::tools::job_notify::JobTracker> = bash_jobs.clone();
-            reg.set_tracker(Arc::downgrade(&tracker));
-            // Notify is available only with the edge's origin to name (and an endpoint that
-            // offers it, asked at each keep). Without it every job is held, as before.
-            reg.set_origin(cfg.notify_origin.clone());
-            bash_jobs.set_notify(Some(&reg));
-            // A real use of the sandbox may start a live reconcile (never one this section's own
-            // requests cause: those go to the job store, not through the cell).
-            let weak = Arc::downgrade(&reg);
-            exec_cell.set_use_hook(Some(Arc::new(move || {
-                if let Some(n) = weak.upgrade() {
-                    let now = n.now();
-                    n.feed(crate::tools::job_notify::kernel::Event::Use { now });
-                }
-            })));
-            Some(reg)
-        }
-        _ => None,
-    };
+    let job_notify =
+        match mode.register_job_notify(cfg.job_notify.as_ref(), persistence.session_id()) {
+            Some(reg) => {
+                let tracker: Arc<dyn crate::tools::job_notify::JobTracker> = bash_jobs.clone();
+                reg.set_tracker(Arc::downgrade(&tracker));
+                // Notify is available only with the edge's origin to name (and an endpoint that
+                // offers it, asked at each keep). Without it every job is held, as before.
+                reg.set_origin(cfg.notify_origin.clone());
+                bash_jobs.set_notify(Some(&reg));
+                // A real use of the sandbox may start a live reconcile (never one this section's own
+                // requests cause: those go to the job store, not through the cell).
+                let weak = Arc::downgrade(&reg);
+                exec_cell.set_use_hook(Some(Arc::new(move || {
+                    if let Some(n) = weak.upgrade() {
+                        let now = n.now();
+                        n.feed(crate::tools::job_notify::kernel::Event::Use { now });
+                    }
+                })));
+                Some(reg)
+            }
+            None => None,
+        };
 
     // Slash-command prompt templates (`/name args`), discoverable skills, agent definitions and this
     // project's own instruction files — for `get_commands`, for expanding a `/name`/`/skill:name`
@@ -3426,11 +3420,8 @@ pub(crate) async fn serve_session(
             // spec belongs to whichever grant last ran this session, and its credentials are not
             // persisted at all (see below). Lazily, as at startup: the incoming session probes it
             // again on its first use, and nothing is sent for the switch itself.
-            if let Some(svc) = mode.service() {
-                exec_cell.set_lazy(
-                    svc.lazy_exec(cfg.exec_max_response_bytes),
-                    svc.sandbox().map(|s| s.home),
-                );
+            if let Some(connect) = mode.lazy_exec(cfg.exec_max_response_bytes) {
+                exec_cell.set_lazy(connect, mode.sandbox_home());
             } else if let Some(spec) = persistence.meta.exec_endpoint.clone() {
                 // A target that no longer resolves leaves the session on the host with the header
                 // still recorded, rather than failing the switch — the sandbox may simply be gone.

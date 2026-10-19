@@ -453,14 +453,14 @@ fn session_cfg(base: &ServeConfig, id: &str, service: Option<Arc<ServiceSession>
     // This session's verified grant — its tenant, storage, sandbox and gateway credential. The
     // daemon's own config never carries one (at startup there is no connection), so this is the only
     // place it is set, and `Persistence::open` refuses to run in service mode without it.
-    c.service = service;
+    c.mode = c.mode.bound_to(service);
     // Code Mode is a per-process flag everywhere else (`--code-mode`), which service mode refuses for
     // exactly that reason: on a replica one tenant's setting would be every tenant's. Here it is a
     // per-session capability the grant carries. It only means anything in an image built with the
     // `code-mode` feature — without it the interpreter isn't compiled in and the tool is never
     // registered, so the claim is inert rather than wrong.
-    if let Some(svc) = &c.service {
-        c.code_mode = svc.code_mode();
+    if let Some(code_mode) = c.mode.code_mode_claim() {
+        c.code_mode = code_mode;
     }
     c.listen = None;
     // A spawned session must never itself re-bind a transport listener — it's driven purely
@@ -803,6 +803,16 @@ impl From<PinError> for HttpError {
 }
 
 impl Supervisor {
+    /// The mode this daemon runs in: a replica exactly when it holds a [`ServiceSupervisor`].
+    fn mode(&self) -> crate::mode::Mode {
+        crate::mode::Mode::process(self.service.is_some())
+    }
+
+    /// The most live sessions this replica will hold; `None` where there is no cap.
+    fn live_session_cap(&self) -> Option<usize> {
+        self.service.as_ref().and_then(|s| s.max_live_sessions)
+    }
+
     /// Count a refusal, then answer it.
     ///
     /// One function so a refusal path added later cannot quietly skip the counter — the alternative
@@ -948,7 +958,7 @@ impl Supervisor {
 
         // Checked here, under the same lock the insert happens under, so two simultaneous
         // connections can't both see room for the last slot.
-        if let Some(max) = self.service.as_ref().and_then(|s| s.max_live_sessions)
+        if let Some(max) = self.live_session_cap()
             && table.sessions.len() >= max
         {
             return TryPin::AtCapacity;
@@ -1584,11 +1594,11 @@ async fn await_exits_within(exits: Vec<CancellationToken>, grace: Duration) {
 ///
 /// An operator who passes a value still gets exactly it, in either mode. The mode only chooses what
 /// *silence* means.
-fn resolve_idle_timeout(configured: Option<Duration>, service_mode: bool) -> Option<Duration> {
+fn resolve_idle_timeout(configured: Option<Duration>, replica: bool) -> Option<Duration> {
     match configured {
         Some(t) if t.is_zero() => None,
         Some(t) => Some(t),
-        None if service_mode => Some(DEFAULT_SERVICE_SESSION_IDLE_TIMEOUT),
+        None if replica => Some(DEFAULT_SERVICE_SESSION_IDLE_TIMEOUT),
         None => Some(DEFAULT_SESSION_IDLE_TIMEOUT),
     }
 }
@@ -1910,12 +1920,12 @@ pub async fn serve_ws(
 
     // Read before `cfg` is moved into the supervisor: how aggressively to reap idle sessions (and
     // whether the operator opted out of reaping altogether).
-    let idle_timeout = resolve_idle_timeout(cfg.session_idle_timeout, cfg.service_mode);
+    let idle_timeout = resolve_idle_timeout(cfg.session_idle_timeout, cfg.mode.verifies_grants());
 
     // Service mode: every connection is verified against this keyring, and a tenant's sessions live
     // on these mounts. `main.rs` has already refused `--service` without both, so a `None` verifier
     // here would be a wiring bug — and one that fails **open**, so it refuses to serve instead.
-    let service = if cfg.service_mode {
+    let service = if cfg.mode.verifies_grants() {
         let verifier = cfg.grant_verifier.clone().ok_or(
             "--service needs a session-grant verifier (--grant-key and --seal-key)".to_string(),
         )?;
@@ -1948,14 +1958,17 @@ pub async fn serve_ws(
     // The daemon session that owns configured MCP Events subscriptions, started below so its
     // triggers run with no client attached. Only when something is configured, never in service
     // mode.
-    let events_session = (!cfg.service_mode && !cfg.mcp_catalog.event_subscriptions().is_empty())
-        .then(|| cfg.mcp_events_session.clone());
+    let events_session = (cfg.mode.serves_mcp_events()
+        && !cfg.mcp_catalog.event_subscriptions().is_empty())
+    .then(|| cfg.mcp_events_session.clone());
     let cfg_has_callback = cfg.mcp_events_callback_url.is_some();
     let (panicked_tx, mut panicked_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let supervisor = Arc::new(Supervisor {
         table: Arc::default(),
         // Service mode lists per tenant, from the shards, never from one process-wide directory.
-        session_dir: (!cfg.service_mode)
+        session_dir: cfg
+            .mode
+            .has_process_session_dir()
             .then(|| cfg.session_dir.clone())
             .flatten(),
         service,
@@ -2282,7 +2295,7 @@ where
                 headers: &head.headers,
             };
             let rx = job_ended::Receiver {
-                service_mode: supervisor.service.is_some(),
+                service_mode: supervisor.mode().verifies_grants(),
                 hub: supervisor.service.as_ref().map(|s| &*s.notify),
             };
             job_ended::serve(&mut stream, &callback, &token, &leftover, arrived, &rx).await;
@@ -2318,7 +2331,7 @@ where
 
     // MCP Events receiver document (draft endpoint-verification path (d)): a public, static
     // statement of which paths accept deliveries, so a server can verify without a challenge.
-    if supervisor.service.is_none()
+    if supervisor.mode().serves_mcp_events()
         && head.path == crate::tools::mcp_events::RECEIVER_DOCUMENT_PATH
         && let Some(doc) = crate::tools::mcp_events::receiver_document()
     {
@@ -2331,7 +2344,7 @@ where
     // MCP server, not a tenant, and it authenticates with the subscription's HMAC signature, which
     // `mcp_events::receive_webhook` verifies over the raw body. Not routed at all in service mode,
     // which has no MCP Events (and so no subscription a delivery could belong to).
-    if supervisor.service.is_none()
+    if supervisor.mode().serves_mcp_events()
         && let Some(token) = head
             .path
             .strip_prefix(crate::tools::mcp_events::WEBHOOK_PATH_PREFIX)
@@ -2350,7 +2363,7 @@ where
     // foreign `Origin`, a rebinding `Host`, or a non-JSON POST is refused before anything else is read.
     // Unix sockets and service mode are exempt for the reasons `browser_guard` gives.
     if transport == Transport::Tcp
-        && supervisor.service.is_none()
+        && !supervisor.mode().verifies_grants()
         && let Err(why) = browser_guard::check(&head.headers, head.method == "POST")
     {
         let err = match why {
