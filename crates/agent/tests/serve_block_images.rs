@@ -25,7 +25,7 @@ fn serve_rpc_prompt_pushed_image_is_downgraded_at_the_wire_when_block_images_is_
     // `read`-tool/CLI-attachment path, so an RPC client could bypass it completely. Wiring
     // `ModelRequest::block_images` from `Agent.block_images` at every turn build
     // (`agent_core::agent::Agent`'s per-turn `ModelRequest::new` call site) closes this uniformly, with
-    // no special-casing needed in `serve.rs` itself.
+    // no special-casing needed in `serve/` itself.
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
 

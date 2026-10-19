@@ -18,7 +18,7 @@
 //!
 //! Connecting happens exactly once, at startup (`main.rs`'s `run` path, and once before `serve`'s main
 //! loop) — not re-done on a `serve` registry rebuild (`set_model`/`set_thinking` reuse the
-//! already-connected tools; see `serve.rs::ServeConfig::mcp_tools`). A server that fails to connect is
+//! already-connected tools; see `serve/config.rs::ServeConfig::mcp_tools`). A server that fails to connect is
 //! skipped with a warning rather than failing the whole agent's startup (fail-soft).
 //!
 //! **Tool-list changes.** What a server lists is re-read when it says it changed

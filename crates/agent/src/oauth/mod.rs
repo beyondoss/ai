@@ -3,7 +3,7 @@
 //!
 //! This module owns only the three providers' *protocol* flows (PKCE/device-code login, token
 //! refresh) — not where the resulting credential is persisted (`crate::auth_store`), how login is
-//! triggered from the CLI/RPC surface (`main.rs`/`serve.rs`), or how a live token gets attached to an
+//! triggered from the CLI/RPC surface (`main.rs`/`serve/`), or how a live token gets attached to an
 //! actual model request (`agent_core::client::CredentialSource`, `crate::auth_credential_source`).
 //! Lives in `agent`, not `agent_core`: this crate's own doc comment already draws the line —
 //! `agent_core`'s only network surface is `GatewayClient`, which never talks to a provider directly,

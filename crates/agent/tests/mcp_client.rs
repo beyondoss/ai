@@ -767,7 +767,7 @@ fn mcp_http_streamable_a_server_that_refuses_the_connection_is_skipped_fail_soft
 #[test]
 fn mcp_stdio_tool_is_discovered_and_callable_through_serve_too() {
     // Every test above drives `run` — MCP tools are wired into *two* call sites
-    // (`main.rs::run_task`'s `run` path, and `ServeConfig::mcp_tools` before `serve`'s own session
+    // (`commands/run.rs::run_task`'s `run` path, and `ServeConfig::mcp_tools` before `serve`'s own session
     // loop starts), and it's the second one this proves. `serve_cmd` hardcodes `ISOLATED_HOME` (no
     // `.claude/settings.json` at all, by design, for every other serve test); overriding it here is
     // `Command::env`'s documented last-write-wins.

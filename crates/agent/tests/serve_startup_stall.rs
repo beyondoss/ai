@@ -13,7 +13,7 @@
 //! The same shape as `tool_reactor_stall.rs`, one level up: there a tool must not pin the executor
 //! its own session is on; here a session must not pin the executor every other session is on. The
 //! stall is injected (`BEYOND_AI_AGENT_TEST_SLOW_SESSION_OPEN_MS`, a debug-build-only seam — see
-//! `serve.rs`'s `simulated_slow_open`) because what is being pinned is *where* the open runs, not how
+//! `serve/`'s `simulated_slow_open`) because what is being pinned is *where* the open runs, not how
 //! long it takes: a real transcript big enough to cost whole seconds is neither cheap to build nor
 //! stable across machines, and a tight timing threshold is how a suite gets flaky.
 
@@ -122,6 +122,6 @@ async fn one_session_opening_does_not_stall_another_sessions_rpc() {
         "a session's RPC waited {during:?} while a *different* session opened — session start-up is \
          back on the shared runtime thread, so one reconnect stalls every other session on the \
          replica (and the accept loop, and the reaper). `Persistence::open` belongs on \
-         `spawn_blocking`, via `serve.rs`'s `open_persistence_blocking`."
+         `spawn_blocking`, via `serve/persistence.rs`'s `open_persistence_blocking`."
     );
 }

@@ -6,7 +6,7 @@
 //! `serve_ws` runs every session as a task on one **shared** runtime, so a tool that does its work
 //! inline — rather than handing it to `spawn_blocking` — stalls a worker that other sessions also
 //! use. Nothing else on that worker gets polled meanwhile: not the outbound event pump, and not the
-//! stdin/WebSocket command loop that carries `abort` and `steer`. `serve.rs`'s `persist_blocking`
+//! stdin/WebSocket command loop that carries `abort` and `steer`. `serve/persistence.rs`'s `persist_blocking`
 //! already moved `sync_all` off the reactor for exactly this reason, and its doc comment says so.
 //!
 //! Two probes, each on a `current_thread` runtime, check two different things:

@@ -1594,11 +1594,11 @@ async fn await_exits_within(exits: Vec<CancellationToken>, grace: Duration) {
 ///
 /// An operator who passes a value still gets exactly it, in either mode. The mode only chooses what
 /// *silence* means.
-fn resolve_idle_timeout(configured: Option<Duration>, replica: bool) -> Option<Duration> {
+fn resolve_idle_timeout(configured: Option<Duration>, verifies_grants: bool) -> Option<Duration> {
     match configured {
         Some(t) if t.is_zero() => None,
         Some(t) => Some(t),
-        None if replica => Some(DEFAULT_SERVICE_SESSION_IDLE_TIMEOUT),
+        None if verifies_grants => Some(DEFAULT_SERVICE_SESSION_IDLE_TIMEOUT),
         None => Some(DEFAULT_SESSION_IDLE_TIMEOUT),
     }
 }
@@ -2295,7 +2295,6 @@ where
                 headers: &head.headers,
             };
             let rx = job_ended::Receiver {
-                service_mode: supervisor.mode().verifies_grants(),
                 hub: supervisor.service.as_ref().map(|s| &*s.notify),
             };
             job_ended::serve(&mut stream, &callback, &token, &leftover, arrived, &rx).await;

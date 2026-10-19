@@ -360,7 +360,7 @@ fn fork_resolves_the_updated_model_via_the_tree_not_the_sessions_stale_meta() {
     // `fork_from_path` used to copy `src.meta.model` verbatim into the new session's own header —
     // always the *original* creation-time model, regardless of any `set_model` since. Fixed by
     // resolving the model active at the fork point via the same per-branch `model_at` lookup
-    // `Persistence::model_and_level_at` (`serve.rs`) already uses for `switch_branch`/
+    // `Persistence::model_and_level_at` (`serve/persistence.rs`) already uses for `switch_branch`/
     // `switch_session`, rather than by mutating `meta.model` itself (which would have broken that
     // other lookup's own fallback — see `record_model_change`'s doc comment).
     //

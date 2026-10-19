@@ -47,7 +47,7 @@ impl agent_core::client::CredentialSource for OAuthCredentialSource {
         // (including the network call — see that method's doc comment for why), which can block for
         // up to several seconds under contention. That must not run directly on a tokio worker
         // thread — `spawn_blocking` is the same fix this codebase already applies to
-        // `serve.rs`'s `persist_blocking` for an analogous blocking-write concern.
+        // `serve/persistence.rs`'s `persist_blocking` for an analogous blocking-write concern.
         let refreshed = tokio::task::spawn_blocking(move || {
             let mut store = AuthStore::open(store_path);
             store.refreshed(provider.store_key(), |cred| {

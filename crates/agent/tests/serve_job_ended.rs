@@ -621,7 +621,10 @@ async fn serve_one(
     arrived: Instant,
 ) -> (u16, String) {
     let (mut client, mut server) = tokio::io::duplex(64 * 1024);
-    let rx = job_ended::Receiver { service_mode, hub };
+    // Outside service mode a replica has no hub, which is what makes it refuse a callback.
+    let rx = job_ended::Receiver {
+        hub: hub.filter(|_| service_mode),
+    };
     let head = job_ended::Head {
         method,
         path,

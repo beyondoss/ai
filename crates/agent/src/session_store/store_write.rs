@@ -66,7 +66,7 @@ impl SessionStore {
 
     /// The message at tree entry `id`, anywhere in the whole tree (on or off the active path) —
     /// `None` for an unknown id or one naming a non-message node ([`Entry::Custom`]). Used by `fork`'s
-    /// own response (`serve.rs`'s `fork_text`) to echo the forked-from message's
+    /// own response (`serve/`'s `fork_text`) to echo the forked-from message's
     /// text back to the caller without a second `get_fork_messages`-style round trip.
     pub fn message_at(&self, id: &str) -> Option<&Message> {
         self.nodes.get(id).and_then(Node::as_message)

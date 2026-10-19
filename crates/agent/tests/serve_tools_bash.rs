@@ -813,7 +813,7 @@ fn serve_deny_path_flag_blocks_a_model_invoked_write_end_to_end() {
 
 #[test]
 fn serve_block_images_flag_forces_a_read_tool_image_to_a_text_placeholder() {
-    // Task #34 (pi-parity fix): `--block-images` reached `run` (`main.rs::run_task`'s own
+    // Task #34 (pi-parity fix): `--block-images` reached `run` (`commands/run.rs::run_task`'s own
     // `Agent::with_block_images` call site) but had no `serve` counterpart at all — `build_agent` never
     // consulted it. `run`'s identical
     // `run_binary_block_images_flag_forces_a_read_tool_image_to_a_text_placeholder` proves the same

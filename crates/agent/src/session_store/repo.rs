@@ -9,7 +9,7 @@ use agent_core::{Message, Role, Session};
 use super::*;
 
 /// A directory of session files. `Clone` is just a `PathBuf` copy — cheap, and lets a caller move an
-/// owned handle into a `spawn_blocking` closure (see `serve.rs`'s `Persistence::list_with_progress`)
+/// owned handle into a `spawn_blocking` closure (see `serve/persistence.rs`'s `Persistence::list_with_progress`)
 /// without holding a borrow of the original across the `.await`.
 #[derive(Clone)]
 pub struct SessionRepo {
@@ -613,7 +613,7 @@ impl SessionRepo {
         // `record_thinking_level_change`'s usual "wherever the tip currently is" — see that method's
         // own doc comment for why: anchoring at the new chain's own tip would put it exactly where
         // `change_at`'s "anchored-at, not before" exclusion never sees it once queried at that same
-        // tip, the precise query `Persistence::model_and_level_at_active` (`serve.rs`) makes on every
+        // tip, the precise query `Persistence::model_and_level_at_active` (`serve/persistence.rs`) makes on every
         // reopen. Without this, a fresh reopen of the forked file (`run --continue`, a `serve`
         // restart, `switch_session` back to it) finds nothing recorded on the fork's brand-new chain
         // at all — the source's own `ThinkingLevelChange` entries are anchored to the *source*'s old
@@ -774,7 +774,7 @@ impl SessionRepo {
                 format!("no message with id {entry_id} in session {id}"),
             ));
         }
-        // `before` (now the default — see `serve.rs`'s `fork`/`preview_fork` handlers) means "fork
+        // `before` (now the default — see `serve/commands/`'s `fork`/`preview_fork` handlers) means "fork
         // right before this entry", which only makes sense anchored to a user turn: popping a
         // non-user entry (an assistant reply, a materialized branch-summary recap, or a custom entry)
         // would silently land the fork one entry earlier than the caller actually asked for, with no
@@ -850,7 +850,7 @@ impl SessionRepo {
 
     /// Preview what [`fork_at_entry`](Self::fork_at_entry) would produce — the exact message prefix —
     /// without creating a new session file. The read-only counterpart to `fork_at_entry`, for a client
-    /// browsing a fork point before committing to it (see `fork_messages` in `serve.rs`).
+    /// browsing a fork point before committing to it (see `fork_messages` in `serve/persistence.rs`).
     pub fn fork_at_entry_messages(
         &self,
         id: &str,

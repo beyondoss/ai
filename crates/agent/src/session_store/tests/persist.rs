@@ -693,7 +693,7 @@ fn rewrite_cleans_up_the_temp_file_when_the_final_rename_fails() {
 fn reset_for_new_session_clears_model_thinking_label_and_event_state_a_plain_rewrite_leaves_behind()
 {
     // Pass 20 (pi-parity fix): single-file mode's `/new`-equivalent (`Persistence::new_session`,
-    // `serve.rs`) resets an *already-populated* `SessionStore` in place (there's no fresh store to
+    // `serve/`) resets an *already-populated* `SessionStore` in place (there's no fresh store to
     // swap in the way repo mode's `SessionRepo::create` gives it) — it used to call plain
     // `rewrite(&[])`, which only ever clears the message tree itself, never the id-keyed side
     // indexes this test drives into every one of. `reset_for_new_session` must clear all of them.

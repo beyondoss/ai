@@ -75,7 +75,7 @@ pub fn render_html_with_entries(
 /// at all, so every existing caller of the plainer forms above — this module's own test call sites,
 /// plus the standalone `export` subcommand (no live `Agent`/`ToolRegistry` to pull either from,
 /// genuinely not just an oversight — see its own call site's comment) — keeps rendering exactly as
-/// before. `main.rs`'s `run --export` and `serve.rs`'s `export_html` RPC command both now call this
+/// before. `main.rs`'s `run --export` and `serve/commands/export.rs`'s `export_html` RPC command both now call this
 /// directly with a live system prompt and [`agent_core::ToolRegistry::definitions`] (Task #44).
 pub fn render_html_full(
     meta: &SessionMeta,
@@ -779,7 +779,7 @@ fn render_message(out: &mut String, message: &Message, index: &ToolCallIndex<'_>
 fn render_block(out: &mut String, block: &ContentBlock, index: &ToolCallIndex<'_>) {
     match block {
         ContentBlock::Text { text, .. } => {
-            // A host-run bash command (`serve.rs`'s `bash` RPC command, run from the idle loop rather
+            // A host-run bash command (`serve/commands/bash.rs`'s `bash` RPC command, run from the idle loop rather
             // than the model's own turn) materializes as a plain `Role::User` text block carrying a
             // literal bracketed marker line — detect and render it as its own distinct, code-styled
             // block instead of falling through to `render_markdown`, where multi-line output collapsed
@@ -790,7 +790,7 @@ fn render_block(out: &mut String, block: &ContentBlock, index: &ToolCallIndex<'_
             } else if let Some((class, label, tokens_before, body)) = parse_summary_marker(text) {
                 // A compaction or branch-summary recap materializes as a plain `Role::User` text block
                 // carrying a literal bracketed marker line (`agent_core::compaction::apply_summary` /
-                // `session_store.rs::branch_summary_message`) — detect and render it as its own
+                // `session_store/entry.rs::branch_summary_message`) — detect and render it as its own
                 // distinctly labeled block, matching pi's dedicated `.compaction`/`.branch-summary`
                 // blocks (`template.js:1294-1306`), instead of plain markdown text with the marker line
                 // still visible verbatim as if the model had actually written it.
@@ -1674,7 +1674,7 @@ fn render_summary_marker(
     );
 }
 
-/// A parsed host-run bash command marker (`serve.rs`'s `bash` RPC command, invoked from the idle loop
+/// A parsed host-run bash command marker (`serve/commands/bash.rs`'s `bash` RPC command, invoked from the idle loop
 /// rather than the model's own turn) — see [`parse_host_bash_marker`].
 struct HostBashBlock<'a> {
     command: &'a str,
@@ -1682,7 +1682,7 @@ struct HostBashBlock<'a> {
     output: &'a str,
     /// Whether this was recorded with `exclude_from_context: true` (Fix 9, pi-parity gap) — still
     /// rendered here (this crate's own "what's visible in history" path never gates on the flag, only
-    /// the separate "what's sent to the model" transform does — see `serve.rs::ServeHooks`), just
+    /// the separate "what's sent to the model" transform does — see `serve/build.rs::ServeHooks`), just
     /// annotated so the exported transcript doesn't silently look identical to a command the model did
     /// see.
     excluded_from_context: bool,
@@ -1698,22 +1698,22 @@ struct HostBashBlock<'a> {
 /// its `bashExecution` role (`template.js:1285`).
 const HOST_BASH_OUTPUT_LINE_THRESHOLD: usize = 10;
 
-/// The exact literal prefix `serve.rs` tags a host-run bash command with (`~serve.rs:HOST_BASH_LABEL`),
+/// The exact literal prefix `serve/` tags a host-run bash command with (`~serve/mod.rs:HOST_BASH_LABEL`),
 /// immediately followed by the command itself.
 const HOST_BASH_MARKER_PREFIX: &str = "[Host bash command, run outside the model's own turn]\n$ ";
 /// The `exclude_from_context: true` counterpart to [`HOST_BASH_MARKER_PREFIX`]
-/// (`~serve.rs:HOST_BASH_EXCLUDED_LABEL`) — Fix 9, pi-parity gap: previously such a command was never
+/// (`~serve/mod.rs:HOST_BASH_EXCLUDED_LABEL`) — Fix 9, pi-parity gap: previously such a command was never
 /// recorded at all, so there was no marker shape for this case to recognize.
 const HOST_BASH_EXCLUDED_MARKER_PREFIX: &str =
     "[Host bash command, excluded from model context]\n$ ";
-/// This module's copy of `~serve.rs:HOST_BASH_STATUS_LINE_PREFIX` — the line `serve.rs`'s `bash` RPC
+/// This module's copy of `~serve/mod.rs:HOST_BASH_STATUS_LINE_PREFIX` — the line `serve/`'s `bash` RPC
 /// command now writes right after the blank-line separator (before the legacy `"(error)\n"` marker, if
 /// present), carrying the same `exit_code`/`cancelled`/`truncated`/`full_output_path` fields its RPC
 /// response has always reported live but never persisted (Fix 3, pi-parity gap). See
 /// [`parse_host_bash_status`].
 const HOST_BASH_STATUS_LINE_PREFIX: &str = "[Host bash status] ";
 
-/// Detect and split apart `serve.rs`'s host-bash-command marker: the fixed prefix (either shape — see
+/// Detect and split apart `serve/`'s host-bash-command marker: the fixed prefix (either shape — see
 /// [`HOST_BASH_MARKER_PREFIX`]/[`HOST_BASH_EXCLUDED_MARKER_PREFIX`]), the command up to the first
 /// `\n\n`, then an optional structured status line (see [`parse_host_bash_status`]), then either the
 /// result text directly or (if the command errored) a literal `"(error)\n"` immediately before it.
@@ -1742,19 +1742,19 @@ fn parse_host_bash_marker(text: &str) -> Option<HostBashBlock<'_>> {
     })
 }
 
-/// `serve.rs`'s `bash` RPC command's own structured result fields (`exit_code`/`cancelled`/
+/// `serve/commands/bash.rs`'s `bash` RPC command's own structured result fields (`exit_code`/`cancelled`/
 /// `truncated`/`full_output_path`) — Fix 3, pi-parity gap: previously only a bare `is_error` bool ever
 /// reached the persisted message (as the `"(error)\n"` marker text [`parse_host_bash_marker`] already
 /// detected), even though the *live* RPC response for the exact same command already carried a real
 /// provider exit code, whether the run was cancelled outright, and whether its output was truncated —
 /// none of which a later export could show. `agent_core::Message`/`ContentBlock` deliberately carries
-/// no generic per-message side-channel for this (see `serve.rs::HOST_BASH_EXCLUDED_LABEL`'s own doc
+/// no generic per-message side-channel for this (see `serve/mod.rs::HOST_BASH_EXCLUDED_LABEL`'s own doc
 /// comment on why that field stays wire-shaped 1:1), so this rides on the same
 /// self-describing-marker-text approach already used for a host-bash command itself, rather than
 /// widening that shared type for one caller's metadata.
 struct HostBashStatus {
     /// The provider's own exit code, when available — `None` for a cancelled/timed-out run (mirrors
-    /// `serve.rs::bash_exit_code_from_status_line`, which is what actually computes this).
+    /// `serve/stats.rs::bash_exit_code_from_status_line`, which is what actually computes this).
     exit_code: Option<i64>,
     /// Whether the run was cancelled (`abort_bash`/`abort`) or timed out, rather than completing with an
     /// exit code either way.
@@ -1994,7 +1994,7 @@ pub fn export_html_with_usage(
 /// Like [`export_html`], but also renders `events` (see [`render_html_with_entries`]) — for a caller
 /// holding a live [`crate::session_store::SessionStore`] to read
 /// [`crate::session_store::SessionStore::export_events`] from, which a bare `SessionMeta` +
-/// `Vec<Message>` has no access to on its own. Track L36 (pi-parity fix): `main.rs`'s and `serve.rs`'s
+/// `Vec<Message>` has no access to on its own. Track L36 (pi-parity fix): `main.rs`'s and `serve/`'s
 /// `export_html` call sites previously passed none of this through, so a model/thinking-level switch,
 /// a label, or a custom entry never appeared in an exported transcript at all.
 pub fn export_html_with_entries(
@@ -2024,7 +2024,7 @@ pub fn export_html_with_entries(
 /// [`render_html_full`]) and folds in `usage`'s token totals — the one entry point that renders
 /// everything this module knows how to, for a caller holding a live session, its
 /// [`agent_core::ToolRegistry::definitions`], and its running token totals. Task #44: `main.rs`'s
-/// `run --export`/standalone `export` subcommand and `serve.rs`'s `export_html` RPC command all call
+/// `run --export`/standalone `export` subcommand and `serve/commands/export.rs`'s `export_html` RPC command all call
 /// this directly now — the standalone subcommand passes `None` for `system_prompt`/`tools`/`usage`
 /// (no live `Agent`/`ToolRegistry`/`Session` to pull any of them from; see its own call site's comment
 /// for why that's a genuine absence, not an oversight), the other two pass real values.
@@ -2916,7 +2916,7 @@ mod tests {
 
     #[test]
     fn renders_a_host_bash_status_line_as_distinct_badges() {
-        // Fix 3 (pi-parity gap): `serve.rs`'s `bash` RPC command now threads its own
+        // Fix 3 (pi-parity gap): `serve/commands/bash.rs`'s `bash` RPC command now threads its own
         // exit_code/cancelled/truncated/full_output_path fields into the persisted marker as a leading
         // status line — previously only `is_error`'s border color ever reached the exported page.
         let messages = vec![Message::user(
@@ -3162,7 +3162,7 @@ mod tests {
 
     #[test]
     fn export_html_without_usage_omits_the_token_line() {
-        // The plain `export_html` entry point (what `main.rs`/`serve.rs` call today) has no usage data
+        // The plain `export_html` entry point (what `main.rs`/`serve/` call today) has no usage data
         // to show yet — it must still render the rest of the stats section, just without a token line.
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("out.html");
@@ -3448,7 +3448,7 @@ mod tests {
 
     #[test]
     fn render_html_full_with_none_renders_no_system_prompt_or_tools_section() {
-        // Backward compatibility: `main.rs`/`serve.rs` don't thread a live system prompt/tool registry
+        // Backward compatibility: `main.rs`/`serve/` don't thread a live system prompt/tool registry
         // through yet (see `render_html_full`'s own doc comment) — `None` for both must render exactly
         // as the plainer entry points do, no empty sections.
         let html = render_html_full(&meta(), &[Message::user("hi")], &[], None, &[], None, None);

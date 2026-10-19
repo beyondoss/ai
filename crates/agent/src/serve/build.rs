@@ -60,7 +60,7 @@ pub(super) fn build_gateway_client(
         cfg.retry_base_delay_ms
             .unwrap_or(agent_core::client::BASE_BACKOFF),
     )
-    // pi-parity (Task 2, serve pass 19): `main.rs::run_task`'s identical `with_extra_headers` wiring
+    // pi-parity (Task 2, serve pass 19): `commands/run.rs::run_task`'s identical `with_extra_headers` wiring
     // (Task #11) had no `serve` counterpart — every `serve` entrypoint that (re)builds a gateway client
     // (startup, `set_model`, `cycle_model`, `fork`, `clone`, `switch_session`, `switch_branch`) went
     // through this one function, so a `models.json` `ModelOverride.headers` override (and the
@@ -90,7 +90,7 @@ pub(super) fn build_gateway_client(
         Some(h) => client.with_http_client(h.clone()),
         None => client,
     };
-    // Task #38 (pi-parity fix): `run`'s identical `--idle-timeout-ms` wiring (`main.rs::run_task`'s own
+    // Task #38 (pi-parity fix): `run`'s identical `--idle-timeout-ms` wiring (`commands/run.rs::run_task`'s own
     // `with_idle_timeout` call site) previously had no `serve` counterpart — this is called on every
     // model switch (`set_model`/`cycle_model` rebuild the whole client), same as `with_retry` above, so
     // the override survives a mid-run switch rather than only applying at startup.
@@ -328,7 +328,7 @@ pub(super) fn build_agent(
         // instead of only once it fully completes.
         .with_checkpoint_hook(checkpoint.clone());
     // Task #31 (pi-parity feature): `run`'s identical `--branch-summary-reserve-tokens` wiring
-    // (`main.rs::run_task`'s own `with_branch_summary_reserve_tokens` call site) previously had no
+    // (`commands/run.rs::run_task`'s own `with_branch_summary_reserve_tokens` call site) previously had no
     // `serve` counterpart — `Agent::with_branch_summary_reserve_tokens` had zero callers in either
     // binary. Applied on every `build_agent` rebuild, like every other `cfg`-sourced override, so it
     // survives a model switch.
@@ -349,7 +349,7 @@ pub(super) fn build_agent(
     }
     // Task #34 (pi-parity fix): forces every image down the vision-downgrade path regardless of the
     // active model's real `supports_vision` capability — `run`'s identical `--block-images` handling
-    // (`main.rs::run_task`'s own `with_block_images` call site), previously never threaded through here
+    // (`commands/run.rs::run_task`'s own `with_block_images` call site), previously never threaded through here
     // at all. Pass 20 (pi-parity fix): reads the live `block_images` parameter (settable at runtime via
     // `set_block_images`), not `cfg.block_images` — see this function's own doc comment.
     if block_images {

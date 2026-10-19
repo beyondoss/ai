@@ -28,6 +28,7 @@ use beyond_ai_agent::gateway_credential::{
 use beyond_ai_agent::mode::Mode;
 use beyond_ai_agent::session_store::{SessionRepo, SessionStore};
 use beyond_ai_agent::{serve, tools};
+
 mod commands;
 
 use usage::{Cli, Subcommands};
@@ -1344,7 +1345,8 @@ fn agent_main() -> u8 {
     // The ordinary way out (`run` finishing, every subcommand that returns) and a panic unwinding
     // out of `run` both pass through this guard's `Drop`: the same cleanup as `exit_process`.
     let _sweep = tools::mcp_stdio::ExitSweep;
-    let runtime = match build_runtime(is_service_mode()) {
+    let runtime = match build_runtime(Mode::process(is_service_mode()).scales_workers_with_cores())
+    {
         Ok(runtime) => runtime,
         Err(e) => return report_error(e.as_ref()),
     };
@@ -1524,13 +1526,17 @@ fn tokio_worker_threads_from_env() -> Result<Option<usize>, Box<dyn std::error::
 /// both when the variable is unset *and* when it is explicitly `1`, so an operator pinning a replica
 /// back to the single-threaded scheduler looks identical to one who said nothing. `env_set`
 /// distinguishes them.
-fn runtime_workers(configured: Option<usize>, env_set: bool, service: bool) -> Option<usize> {
+fn runtime_workers(
+    configured: Option<usize>,
+    env_set: bool,
+    scales_workers_with_cores: bool,
+) -> Option<usize> {
     match configured {
         Some(n) => Some(n),
         // `Some(0)` is tokio's own default: one worker per core, and `available_parallelism`
         // respects a cgroup CPU quota — so a replica gets workers in proportion to the CPU its task
         // was actually given, which is the thing worth scaling with.
-        None if Mode::process(service).scales_workers_with_cores() && !env_set => Some(0),
+        None if scales_workers_with_cores && !env_set => Some(0),
         None => None,
     }
 }
@@ -1583,11 +1589,13 @@ const _WORKER_TRADEOFF: () = ();
 /// So a replica gets work-stealing and a laptop daemon keeps its one thread, because there the
 /// single-session measurement is the accurate one.
 /// `BEYOND_AI_AGENT_TOKIO_WORKER_THREADS` overrides either direction without a rebuild.
-fn build_runtime(service: bool) -> Result<tokio::runtime::Runtime, Box<dyn std::error::Error>> {
+fn build_runtime(
+    scales_workers_with_cores: bool,
+) -> Result<tokio::runtime::Runtime, Box<dyn std::error::Error>> {
     let choice = runtime_workers(
         tokio_worker_threads_from_env()?,
         std::env::var_os("BEYOND_AI_AGENT_TOKIO_WORKER_THREADS").is_some(),
-        service,
+        scales_workers_with_cores,
     );
     let mut builder = match choice {
         None => tokio::runtime::Builder::new_current_thread(),
@@ -1612,7 +1620,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Always stderr, never stdout: `serve`'s NDJSON control protocol and `run`'s streamed output both
     // live on stdout, and a line-based client reading it can't tell a stray log line from a protocol
     // frame. `RUST_LOG=debug` (or any filter admitting a `warn!`/`info!` already present on a live
-    // path — e.g. `session_store.rs`'s corrupt-line warning, `skills.rs`'s discovery warning) must
+    // path — e.g. `session_store/`'s corrupt-line warning, `skills.rs`'s discovery warning) must
     // never corrupt that stream.
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -1967,7 +1975,7 @@ fn exit_cancelled(shutdown_cause: &std::sync::Mutex<Option<serve::Signal>>) -> !
     exit_process(code);
 }
 
-/// [`run_turn_once`], wrapped with the same whole-run auto-retry `serve.rs`'s `"prompt"` command gets
+/// [`run_turn_once`], wrapped with the same whole-run auto-retry `serve/prompt.rs`'s `"prompt"` command gets
 /// (see `beyond_ai_agent::retry`) — a run that ends in a transient-looking error (one already
 /// exhausted `agent_core`'s own within-turn retries) is re-invoked from scratch against the same
 /// session, up to `retry::MAX_RUN_RETRIES` times with backoff, rather than failing a whole `agent run`
@@ -2160,7 +2168,7 @@ const RETRY_SEPARATOR: &str = "\n[attempt failed; the text above is discarded, r
 /// that closes its end early (`agent run --json "task" | head -1`) previously crashed this process with
 /// "Broken pipe" (exit 101) instead of exiting cleanly, the moment `head` hung up. A closed read end is
 /// the normal, expected way a *nix pipeline ends a producer it's done reading from, not a bug in this
-/// process to report loudly — matches `serve.rs`'s own writer task, which already exits gracefully on a
+/// process to report loudly — matches `serve/`'s own writer task, which already exits gracefully on a
 /// write failure instead of panicking.
 ///
 /// On `BrokenPipe`, sets `broken_pipe` and trips `cancel` rather than calling `process::exit`
@@ -2538,7 +2546,7 @@ fn persist_run(run: &RunStore, session: &Session) -> std::io::Result<()> {
 
 /// Expand an explicit `/skill:name` invocation first (its own prefix, so it can't collide with a
 /// `/name` prompt template), then fall through to prompt-template expansion — a no-op on whichever
-/// message reaches it unmatched. Mirrors `serve`'s own `"prompt"` handler exactly (see `serve.rs`).
+/// message reaches it unmatched. Mirrors `serve`'s own `"prompt"` handler exactly (see `serve/`).
 ///
 /// An MCP-served skill (`/skill:<server>:<name>`) is tried first; its `SKILL.md` is fetched now, at the
 /// invocation, never prefetched (see `tools::mcp_skills`).

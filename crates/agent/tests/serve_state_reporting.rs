@@ -603,7 +603,7 @@ fn serve_switch_session_restores_the_reopened_sessions_own_model() {
 #[test]
 fn serve_get_session_stats_reports_context_usage_after_a_real_turn() {
     // Companion e2e proof for `session_stats`'s `context_usage` field (unit-tested directly in
-    // `serve.rs`'s own test module) — end-to-end through the real RPC surface: null before any turn,
+    // `serve/`'s own test module) — end-to-end through the real RPC surface: null before any turn,
     // populated with a plausible `percent` after one.
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
@@ -727,7 +727,7 @@ fn serve_set_session_name_and_get_last_assistant_text() {
 #[test]
 fn serve_set_session_name_strips_newlines_and_pushes_a_session_info_changed_frame() {
     // F-M4 (pi: 5996-session-name-newlines.test.ts:14-22): newline sanitization was only proven at the
-    // storage-unit level (`session_store.rs`'s `set_title_strips_newlines`), never through the actual
+    // storage-unit level (`session_store/`'s `set_title_strips_newlines`), never through the actual
     // `set_session_name` RPC command + `get_state` readback.
     //
     // F-M1 (pi: 3686-session-name-event.test.ts, `session_info_changed` — `rpc-mode.ts:632-639`): the

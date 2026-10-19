@@ -4,7 +4,7 @@
 //! transport (see that type's own doc comment): this module's HTTP calls are a wholly different
 //! network surface — talking directly to `claude.ai`/`github.com`/`auth.openai.com`, never through
 //! the gateway — so their failure modes don't belong mixed into that type. Converts to this crate's
-//! `main.rs`/`serve.rs` `Box<dyn std::error::Error>` boundary via `?` like any other error here.
+//! `main.rs`/`serve/` `Box<dyn std::error::Error>` boundary via `?` like any other error here.
 
 use thiserror::Error;
 

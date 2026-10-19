@@ -1,6 +1,6 @@
 //! Resolves which credential/routing a given model id should use to reach the gateway (or, for a
 //! `models.json` override/GitHub Copilot/OpenAI Codex, bypass it) — the one seam both `main.rs`'s CLI
-//! startup (`run`/`serve`) and `serve.rs`'s runtime model-switching commands (`set_model`,
+//! startup (`run`/`serve`) and `serve/`'s runtime model-switching commands (`set_model`,
 //! `cycle_model`, and any other command that changes the active model — `switch_session`, `fork`,
 //! `clone`, `switch_branch`) go through.
 //!
@@ -20,7 +20,7 @@
 //! [`resolve_gateway_credential_with_identity`]. A future `build_gateway_client` could keep its
 //! existing `Arc<GatewayClient>` across a model switch whenever the newly-resolved identity equals the
 //! previous one, instead of rebuilding unconditionally — see that type's own doc comment for exactly
-//! what such a caller would need to store and compare. Not yet wired into `serve.rs` (a sibling
+//! what such a caller would need to store and compare. Not yet wired into `serve/` (a sibling
 //! agent's file this round); this module only lands the identity-computation primitive itself, plus a
 //! unit test proving it distinguishes different upstreams and treats equivalent ones as equal.
 

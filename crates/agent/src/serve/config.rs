@@ -81,7 +81,7 @@ pub struct ServeConfig {
     /// "bleed" `switch_session`/`switch_branch` are already hardened against (see their own doc
     /// comments) — previously unguarded at ordinary process restart. A no-op for a genuinely fresh
     /// session, since its own recorded model already equals `model` either way. Matches `run
-    /// --continue`'s own identical `model_explicit` distinction (`main.rs::run_task`).
+    /// --continue`'s own identical `model_explicit` distinction (`commands/run.rs::run_task`).
     pub model_explicit: bool,
     /// Same idea as [`Self::model_explicit`], for `--reasoning-effort`/`starting_level`.
     pub reasoning_effort_explicit: bool,
@@ -371,7 +371,7 @@ pub struct ServeConfig {
     pub models: Vec<String>,
     /// A persisted, blanket project-trust policy (`agent settings --default-project-trust`) — Fix 1
     /// (pi-parity gap): this field didn't exist at all before, so a stored policy had zero effect on
-    /// `serve` sessions even though `run` already partially honored it (`main.rs::run_task`). Consulted
+    /// `serve` sessions even though `run` already partially honored it (`commands/run.rs::run_task`). Consulted
     /// by [`resolve_project_trust`] at both startup and `reload`, with the same precedence `run` now
     /// uses: `trust_project`/`force_untrusted` win outright when set; otherwise an explicit per-path
     /// `TrustStore` entry (`agent trust`/`agent untrust <path>`) wins next; only when neither applies
@@ -478,7 +478,7 @@ impl ServeConfig {
 }
 
 /// Resolve whether a project is trusted for this session, from already-gathered inputs — shared by
-/// `run` (`main.rs::run_task`) and `serve` (both its startup and `reload` paths) so the two binaries
+/// `run` (`commands/run.rs::run_task`) and `serve` (both its startup and `reload` paths) so the two binaries
 /// agree on trust for the same directory under the same settings, matching pi's own
 /// `trust-manager.ts:46-96` precedence:
 ///

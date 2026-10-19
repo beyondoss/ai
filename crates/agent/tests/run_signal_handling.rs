@@ -1,7 +1,7 @@
 //! `run` e2e: SIGTERM/SIGINT signal handling. Pi-parity audit H2: `run` registered no signal
 //! handler at all, so a shutdown request hit Rust's default kill-immediately disposition — no
 //! destructors run, so a `GroupKillGuard` never got to reap a still-running bash child's process
-//! group. Reusing `serve`'s `ShutdownSignal` (see `main.rs::run_task`) must fix both halves: `run`
+//! group. Reusing `serve`'s `ShutdownSignal` (see `commands/run.rs::run_task`) must fix both halves: `run`
 //! exits promptly instead of hanging on its own model/tool timeouts, and it must not orphan any
 //! backgrounded grandchild process the tool call itself spawned.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -124,7 +124,7 @@ fn sigterm_during_a_bash_tool_call_kills_the_whole_process_group_not_just_run_it
 #[test]
 fn sigint_during_a_bash_tool_call_kills_the_whole_process_group_too() {
     // Same fixture as the SIGTERM test, but Ctrl-C (SIGINT) — `ShutdownSignal::wait` races
-    // `tokio::signal::ctrl_c()` alongside `SIGTERM` (see `serve.rs`), so both must behave alike.
+    // `tokio::signal::ctrl_c()` alongside `SIGTERM` (see `serve/`), so both must behave alike.
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("leaked");
     let script = format!("( sleep 1; touch {} ) & sleep 30", marker.display());
@@ -152,7 +152,7 @@ fn sighup_during_a_bash_tool_call_kills_the_whole_process_group_too() {
     // Pi-parity fix: SIGHUP had no handler at all — its default disposition is the same immediate
     // termination as an unhandled SIGTERM, which would skip `GroupKillGuard` and orphan a backgrounded
     // grandchild. Same fixture as the SIGTERM/SIGINT tests above — `ShutdownSignal::wait` now races
-    // `SignalKind::hangup()` alongside them (see `serve.rs`), so all three must behave alike.
+    // `SignalKind::hangup()` alongside them (see `serve/`), so all three must behave alike.
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("leaked");
     let script = format!("( sleep 1; touch {} ) & sleep 30", marker.display());
