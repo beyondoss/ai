@@ -33,7 +33,7 @@
 //! | unheld | a reconcile lists it `exited` | [`Action::ApplyShellExit`], once | unheld |
 //! | unheld | listed `ended`/`lost`, missing, or the list failed | [`Action::Follow`] | held |
 //! | unheld | [`Event::Taken`] | [`Action::ReadInThenFollow`] | taken |
-//! | taken | [`Event::PutBack`] running / ended | none | unheld / held |
+//! | taken | [`Event::PutBack`] running / ended | [`Action::CloseFollow`] / none | unheld / held |
 
 use std::collections::BTreeMap;
 
@@ -218,6 +218,8 @@ pub enum Action {
     /// A `bash_job` call about an unheld job: read in what the sandbox holds from `from`, then
     /// today's follow for the rest of the call.
     ReadInThenFollow { job: String, from: u64 },
+    /// The call put the unheld job back still running: close the follow it had.
+    CloseFollow { job: String },
 }
 
 /// The next reconcile, asked for and not begun: who waits on it.
@@ -426,12 +428,13 @@ impl Kernel {
                 {
                     if running {
                         self.jobs.insert(
-                            job,
+                            job.clone(),
                             JobState::Unheld {
                                 offset,
                                 shell_exit_seen,
                             },
                         );
+                        out.push(Action::CloseFollow { job });
                     } else {
                         self.jobs.remove(&job);
                     }
@@ -748,6 +751,52 @@ mod tests {
             }]
         );
         assert_eq!(k.job(J), None);
+    }
+
+    #[test]
+    fn a_call_takes_an_unheld_job_and_lets_go_again() {
+        let mut k = unheld();
+        assert_eq!(
+            k.step(Event::Taken { job: J.into() }),
+            [Action::ReadInThenFollow {
+                job: J.into(),
+                from: 7
+            }]
+        );
+        // While the call has it, its callback is asked again later.
+        let a = k.step(cb(1, 0));
+        assert_eq!(
+            a,
+            [Action::Answer {
+                call: 1,
+                status: 503
+            }]
+        );
+        assert_eq!(
+            k.step(Event::PutBack {
+                job: J.into(),
+                running: true,
+                offset: 40
+            }),
+            [Action::CloseFollow { job: J.into() }]
+        );
+        assert_eq!(
+            k.job(J),
+            Some(&JobState::Unheld {
+                offset: 40,
+                shell_exit_seen: false
+            })
+        );
+        k.step(Event::Taken { job: J.into() });
+        assert!(
+            k.step(Event::PutBack {
+                job: J.into(),
+                running: false,
+                offset: 50
+            })
+            .is_empty()
+        );
+        assert_eq!(k.job(J), None, "its end is recorded: held, as today");
     }
 
     #[test]

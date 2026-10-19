@@ -1034,12 +1034,17 @@ impl Bash {
                  survive a restart of the agent)"
             )));
         };
+        // exec v1.4: the call has the job now; an unheld one is read in and followed for it.
+        super::bash_sandbox::taken(&job.shared).await;
+        let shared = job.shared.clone();
         if input.get("kill").and_then(Value::as_bool) != Some(true) || job.shared.ended() {
             let hold = Hold::Foreground {
                 ceiling: self.wait_ceiling,
                 timeout_ms,
             };
-            return self.attach(job, progress, hold).await;
+            let result = self.attach(job, progress, hold).await;
+            super::bash_sandbox::put_back(&shared, false);
+            return result;
         }
         // Kill it — every process it started, or its remote stream — and wait for the kill, so a
         // caller that checks side effects right after sees the command gone.
@@ -1056,6 +1061,7 @@ impl Bash {
         // Named, so a kill is never ambiguous about which process it hit.
         let command = std::mem::take(&mut job.command);
         drop(job);
+        super::bash_sandbox::put_back(&shared, true);
         let text = clean(format_output(&snap, ""));
         match survived {
             None => Ok(append_status(

@@ -15,7 +15,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use beyond_ai_agent::tools::job_notify::kernel::{
@@ -23,174 +23,12 @@ use beyond_ai_agent::tools::job_notify::kernel::{
     USE_SPACING,
 };
 use common::exec_mock::{LoseCallbacks, MockOptions, StreamEnd};
+use common::notify_fleet::{
+    Reap, SESSION, TENANT, bash_bg, fleet, fleet_with, post, seal_key, still_held,
+};
 use common::service::{Options, Service};
 use common::{spawn_model_server, turn_text, turn_tool_use, ws_connect_with_headers, ws_send};
 use serde_json::{Value, json};
-
-const TENANT: &str = "00tenant1";
-const SESSION: &str = "s1.alpha";
-
-/// The edge's stand-in: forwards each connection to the replica it currently points at, and can
-/// drop every callback instead (a broken path).
-struct Edge {
-    origin: String,
-    target: Arc<AtomicU16>,
-    drop_all: Arc<AtomicBool>,
-    forwarded: Arc<AtomicUsize>,
-}
-
-impl Edge {
-    async fn bind() -> (Self, tokio::net::TcpListener) {
-        let listener = beyond_ai_test_support::ports::tokio_listener().await;
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        (
-            Self {
-                origin,
-                target: Arc::new(AtomicU16::new(0)),
-                drop_all: Arc::new(AtomicBool::new(false)),
-                forwarded: Arc::new(AtomicUsize::new(0)),
-            },
-            listener,
-        )
-    }
-
-    fn serve(&self, listener: tokio::net::TcpListener) {
-        let (target, drop_all, forwarded) = (
-            self.target.clone(),
-            self.drop_all.clone(),
-            self.forwarded.clone(),
-        );
-        tokio::spawn(async move {
-            while let Ok((mut inbound, _)) = listener.accept().await {
-                if drop_all.load(Ordering::SeqCst) {
-                    drop(inbound);
-                    continue;
-                }
-                forwarded.fetch_add(1, Ordering::SeqCst);
-                let port = target.load(Ordering::SeqCst);
-                tokio::spawn(async move {
-                    if let Ok(mut out) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
-                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut out).await;
-                    }
-                });
-            }
-        });
-    }
-}
-
-/// A replica, its endpoint, and the edge before it.
-struct Fleet {
-    svc: Service,
-    edge: Edge,
-    requests: Arc<std::sync::Mutex<Vec<String>>>,
-}
-
-fn bash_bg(command: &str) -> String {
-    turn_tool_use(
-        "t1",
-        "bash",
-        &json!({"command": command, "run_in_background": true}).to_string(),
-    )
-}
-
-/// A fleet whose model starts `command` in the background on the first prompt, then answers every
-/// later request with text.
-async fn fleet(mock: MockOptions, command: &str, origin: Option<&str>) -> Fleet {
-    let mut turns = vec![bash_bg(command), turn_text("started")];
-    turns.extend((0..8).map(|i| turn_text(&format!("noted {i}"))));
-    let (base, requests) = spawn_model_server(turns);
-    let (edge, listener) = Edge::bind().await;
-    let origin = origin.map_or_else(|| edge.origin.clone(), str::to_string);
-    let svc = Service::start_with(
-        &base,
-        &["s1"],
-        Options {
-            extra_args: vec!["--notify-origin".into(), origin],
-            exec: Some(mock),
-            ..Default::default()
-        },
-    )
-    .await;
-    edge.target.store(svc.port, Ordering::SeqCst);
-    edge.serve(listener);
-    Fleet {
-        svc,
-        edge,
-        requests,
-    }
-}
-
-impl Fleet {
-    /// Open the session and run the prompt that starts the job; the client stays attached.
-    async fn start_job(&self) -> common::TestWs {
-        let token = self.svc.token(TENANT, SESSION);
-        let mut ws =
-            ws_connect_with_headers(self.svc.port, Some(SESSION), &self.svc.header(&token))
-                .await
-                .expect("a valid grant opens its session");
-        ws_send(
-            &mut ws,
-            json!({"type":"prompt","id":"p","message":"start it"}),
-        )
-        .await;
-        let frames = common::ws_read_until_response(&mut ws, "prompt").await;
-        assert_eq!(frames.last().unwrap()["success"], true, "{frames:?}");
-        ws
-    }
-
-    /// The job's held stream, by a needle of its command.
-    async fn stream(&self, needle: &str) -> u32 {
-        self.svc
-            .exec
-            .wait_for_stream(needle, Duration::from_secs(20))
-            .await
-            .expect("the job's stream")
-            .pgid
-    }
-
-    /// Every `keep` the endpoint received.
-    fn keeps(&self) -> Vec<Value> {
-        self.svc
-            .exec
-            .bodies()
-            .into_iter()
-            .filter(|b| b["job"]["op"] == "keep")
-            .map(|b| b["job"].clone())
-            .collect()
-    }
-
-    fn ops(&self, op: &str) -> usize {
-        self.svc
-            .exec
-            .bodies()
-            .iter()
-            .filter(|b| b["job"]["op"] == op)
-            .count()
-    }
-
-    /// Wait (bounded) for a model request that mentions `needle`.
-    async fn model_saw(&self, needle: &str, within: Duration) -> bool {
-        let deadline = std::time::Instant::now() + within;
-        while std::time::Instant::now() < deadline {
-            if self
-                .requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|r| r.contains(needle))
-            {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        false
-    }
-}
-
-/// Whether the endpoint's stream for `pgid` is still open after `within`.
-async fn still_held(f: &Fleet, pgid: u32, within: Duration) -> bool {
-    f.svc.exec.wait_for_end(pgid, within).await.is_none()
-}
 
 /// N35: `keep` with `notify` alone releases nothing; the proof arriving inside the window does,
 /// and the stream is closed with the job still running. The job's end then reaches the model by
@@ -540,6 +378,168 @@ async fn no_idle_connection_to_the_endpoint() {
     );
 }
 
+/// Send `message` as a prompt and wait for its response.
+async fn prompt(ws: &mut common::TestWs, message: &str) {
+    ws_send(ws, json!({"type":"prompt","id":"p2","message":message})).await;
+    let frames = common::ws_read_until_response(ws, "prompt").await;
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:?}");
+}
+
+/// Wait (bounded) until the endpoint's stream for `pgid` was let go of (released).
+async fn released(f: &common::notify_fleet::Fleet, pgid: u32) {
+    let end = f.svc.exec.wait_for_end(pgid, Duration::from_secs(8)).await;
+    assert_eq!(
+        end,
+        Some(StreamEnd::Disconnected { killed: false }),
+        "released"
+    );
+}
+
+/// N39: a `bash_job` call about an unheld job reads in what the sandbox holds (so even a peek
+/// shows what it printed while unheld), follows it for the call, and lets go again when the call
+/// puts it back running.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_lets_go_again() {
+    let mut turns = vec![
+        bash_bg("echo up; sleep 2; echo while-unheld-q7; sleep 300"),
+        turn_text("started"),
+        // The stop reminder (a job still runs) asks once more.
+        turn_text("it keeps running"),
+        turn_tool_use(
+            "t2",
+            "bash_job",
+            &json!({"job": 1, "timeout_ms": 0}).to_string(),
+        ),
+        turn_text("peeked"),
+    ];
+    turns.extend((0..6).map(|i| turn_text(&format!("noted {i}"))));
+    let f = fleet_with(MockOptions::notifying(), turns, None).await;
+    let mut ws = f.start_job().await;
+    let pgid = f.stream("while-unheld-q7").await;
+    let _reap = Reap(pgid);
+    released(&f, pgid).await;
+    // It prints while unheld; nothing reads it.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let reads_before = f.ops("read");
+    prompt(&mut ws, "peek at it").await;
+    assert!(f.ops("read") > reads_before, "the call read it in");
+    assert!(
+        f.model_saw("while-unheld-q7", Duration::from_secs(5)).await,
+        "the peek showed what it printed while unheld"
+    );
+    // The call returned with the job running: the follow is closed, and nothing is sent.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let before = f.svc.exec.requests().len();
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let after = f.svc.exec.requests();
+    assert_eq!(
+        after.len(),
+        before,
+        "sent after the call let go: {:?}",
+        &after[before..]
+    );
+    assert!(common::exec_mock::group_alive(pgid), "and the job runs on");
+}
+
+/// A session reaped while its job is unheld behaves as today: callbacks find no session (`503`)
+/// and nothing opens; the session reads the job's end back when it next uses its sandbox, once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reaped_session_reads_its_jobs_back_on_reopen() {
+    let mut turns = vec![
+        bash_bg("echo up; sleep 5; printf 'fin-%s\\n' r4"),
+        turn_text("started"),
+        // The stop reminder (a job still runs) asks once more.
+        turn_text("it keeps running"),
+        turn_tool_use("t2", "bash", &json!({"command": "true"}).to_string()),
+        turn_text("checked"),
+    ];
+    turns.extend((0..6).map(|i| turn_text(&format!("noted {i}"))));
+    let (base, requests) = spawn_model_server(turns);
+    let (edge, listener) = common::notify_fleet::Edge::bind().await;
+    let svc = Service::start_with(
+        &base,
+        &["s1"],
+        Options {
+            extra_args: vec![
+                "--notify-origin".into(),
+                edge.origin.clone(),
+                "--session-idle-timeout".into(),
+                "1".into(),
+            ],
+            exec: Some(MockOptions::notifying()),
+            ..Default::default()
+        },
+    )
+    .await;
+    edge.target
+        .store(svc.port, std::sync::atomic::Ordering::SeqCst);
+    edge.serve(listener);
+    let f = common::notify_fleet::Fleet {
+        svc,
+        edge,
+        requests,
+    };
+    let ws = f.start_job().await;
+    let pgid = f.stream("fin-%s").await;
+    released(&f, pgid).await;
+    drop(ws);
+    // The job ends with no session open: its callbacks are answered 503.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !f.svc.exec.callbacks().iter().any(|c| c.status == Some(503)) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{:?}",
+            f.svc.exec.callbacks()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Reopen, and use the sandbox: the end is read back and reported once.
+    let token = f.svc.token(TENANT, SESSION);
+    let mut ws = ws_connect_with_headers(f.svc.port, Some(SESSION), &f.svc.header(&token))
+        .await
+        .unwrap();
+    prompt(&mut ws, "check").await;
+    assert!(
+        f.model_saw("fin-r4", Duration::from_secs(10)).await,
+        "the end was reported"
+    );
+    let last = f.requests.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(last.matches("fin-r4").count(), 1, "once: {last}");
+}
+
+/// `new_session` while a job is unheld ends it with its transcript, as it ends any job today; its
+/// callbacks then name a job the session does not know (`410`).
+#[tokio::test(flavor = "multi_thread")]
+async fn new_session_ends_the_unheld_job() {
+    let f = fleet(MockOptions::notifying(), "echo up; sleep 300", None).await;
+    let mut ws = f.start_job().await;
+    let pgid = f.stream("sleep 300").await;
+    let _reap = Reap(pgid);
+    released(&f, pgid).await;
+    let job = f.keeps()[0]["id"].as_str().unwrap().to_string();
+    ws_send(&mut ws, json!({"type":"new_session","id":"n"})).await;
+    common::ws_read_until_response(&mut ws, "new_session").await;
+    assert!(
+        common::exec_mock::wait_group_gone(pgid, Duration::from_secs(15)).await,
+        "the old transcript's job was ended"
+    );
+    let key = seal_key(&f.svc);
+    let id = beyond_ai_agent::exec_endpoint::jobs::JobId::parse(&job).unwrap();
+    let scope = beyond_ai_agent::exec_endpoint::jobs::JobScope::for_session(Some(TENANT), SESSION);
+    let body = format!(
+        r#"{{"type":"job_ended","scope":"{}","id":"{job}"}}"#,
+        scope.name()
+    );
+    let status = post(
+        &f.edge.origin,
+        &format!("/_beyond/agent?session_id={SESSION}&tenant={TENANT}"),
+        &key.mint(TENANT, SESSION, &id),
+        &body,
+    )
+    .await;
+    assert_eq!(status, 410);
+}
+
 // ---- the kernel's rules, which need no fleet
 
 const J: &str = "0123456789abcdef";
@@ -709,47 +709,4 @@ fn reconciles_only_on_a_callback_or_a_use() {
         now: 1000 + RECONCILE_SPACING,
     });
     assert_eq!(a, [Action::StartReconcile { reconcile: 1 }]);
-}
-
-// ---- helpers
-
-/// Kills a job's group a failed assertion would leave running.
-struct Reap(u32);
-
-impl Drop for Reap {
-    fn drop(&mut self) {
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", &format!("-{}", self.0)])
-            .status();
-    }
-}
-
-fn seal_key(svc: &Service) -> beyond_ai_agent::notify_token::NotifyKey {
-    use base64::Engine as _;
-    let b64 = std::fs::read_to_string(svc.minter.seal_key()).unwrap();
-    let bytes: [u8; 32] = base64::engine::general_purpose::STANDARD
-        .decode(b64.trim())
-        .unwrap()
-        .try_into()
-        .unwrap();
-    beyond_ai_agent::notify_token::NotifyKey::from_secret_bytes(&bytes)
-}
-
-/// POST a callback to `origin` + `target`; the status.
-async fn post(origin: &str, target: &str, token: &str, body: &str) -> u16 {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let addr = origin.trim_start_matches("http://");
-    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let req = format!(
-        "POST {target} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    );
-    s.write_all(req.as_bytes()).await.unwrap();
-    let mut out = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(30), s.read_to_end(&mut out)).await;
-    String::from_utf8_lossy(&out)
-        .split(' ')
-        .nth(1)
-        .and_then(|c| c.parse().ok())
-        .unwrap_or(0)
 }
