@@ -67,6 +67,9 @@ const ALLOWED: &[(&str, usize)] = &[
     ("agent/src/bin/mcp_skills_fixture_server.rs", 1),
     // Not a bind: the resolver's lookup takes a port, and only the addresses it returns are used.
     ("agent/src/tools/web/ssrf.rs", 1),
+    // The exec conformance verifier's callback receiver and TLS listener, held for the run.
+    ("agent/src/exec_endpoint/conformance.rs", 1),
+    ("agent/src/exec_endpoint/conformance/notify.rs", 1),
     // Command lines that ask a child `serve` to bind port 0 and report the port it got.
     ("agent/tests/common/mod.rs", 1),
     ("agent/tests/serve_service_mode.rs", 2),
