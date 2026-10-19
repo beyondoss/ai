@@ -1189,7 +1189,7 @@ fn serve_auto_retry_exhausts_all_attempts_and_reports_failure() {
 
 #[test]
 fn serve_idle_timeout_ms_flag_causes_a_stalled_response_to_fail_quickly() {
-    // Task #38 (pi-parity fix): `--idle-timeout-ms` reached `run` (`main.rs::run_task`'s own
+    // Task #38 (pi-parity fix): `--idle-timeout-ms` reached `run` (`commands/run.rs::run_task`'s own
     // `GatewayClient::with_idle_timeout` call site) but `serve`'s `build_gateway_client` never called
     // it at all — `ServeConfig` didn't even have the field. A server that answers headers plus one
     // partial event, then goes silent well past a deliberately shrunk `--idle-timeout-ms`, must fail

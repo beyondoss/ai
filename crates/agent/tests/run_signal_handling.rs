@@ -1,7 +1,7 @@
 //! `run` e2e: SIGTERM/SIGINT signal handling. Pi-parity audit H2: `run` registered no signal
 //! handler at all, so a shutdown request hit Rust's default kill-immediately disposition — no
 //! destructors run, so a `GroupKillGuard` never got to reap a still-running bash child's process
-//! group. Reusing `serve`'s `ShutdownSignal` (see `main.rs::run_task`) must fix both halves: `run`
+//! group. Reusing `serve`'s `ShutdownSignal` (see `commands/run.rs::run_task`) must fix both halves: `run`
 //! exits promptly instead of hanging on its own model/tool timeouts, and it must not orphan any
 //! backgrounded grandchild process the tool call itself spawned.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

@@ -475,7 +475,7 @@ use crate::session_store::{
 use crate::tools;
 
 /// Waits for an OS shutdown request (SIGTERM, SIGHUP, or SIGINT/Ctrl-C) so `serve` (and `run` — see
-/// `main.rs::run_task`, which reuses this same type) can drain in-flight work and persist before
+/// `commands/run.rs::run_task`, which reuses this same type) can drain in-flight work and persist before
 /// exiting — the same graceful-shutdown path stdin closing already takes for `serve` (cancel the run,
 /// persist, break), just with the process's terminate/hangup signals as additional triggers. Without
 /// this, a `systemctl restart`/`docker stop`/pod eviction mid-turn (or a plain Ctrl-C on a `run`) hits
