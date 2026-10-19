@@ -1,0 +1,22 @@
+[package]
+name = "beyond-ai-exec-notify"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The exec protocol v1.4 notification kernel: when a sandbox calls back about a kept job, as a pure function"
+
+[lib]
+name = "exec_notify"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+# Deliberately zero-dependency: a pure function of (state, event, time) that an endpoint on either
+# side of the repo boundary — the reference mock here, a vendor's adapter, the platform's own
+# sandbox service — can link, and that a model checker can call exactly as production does.
+[dependencies]
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -780,6 +780,8 @@ pub mod conformance;
 mod far_kill;
 pub mod jobs;
 pub mod jobs_native;
+/// When an endpoint calls back about a kept job (v1.4), as one pure function every endpoint shares.
+pub use exec_notify as notify_kernel;
 pub mod stream;
 
 use stream::{FRAME_SILENCE_LIMIT, Frame, FrameReader, NDJSON};
@@ -854,8 +856,9 @@ pub struct HttpExecRunner {
     streams: tokio::sync::OnceCell<bool>,
     /// Whether the sandbox can run jobs of its own ([`jobs::ShellJobs`]) — probed once, the same way.
     jobs_probe: Arc<tokio::sync::OnceCell<bool>>,
-    /// Whether the endpoint offers jobs natively (v1.3, [`jobs_native`]) — probed once, the same way.
-    native_jobs: tokio::sync::OnceCell<bool>,
+    /// What the endpoint offers for jobs: natively (v1.3, [`jobs_native`]), and `notify` (v1.4) —
+    /// probed once, the same way.
+    job_offer: tokio::sync::OnceCell<jobs_native::JobOffer>,
     /// Raised when the endpoint could not be reached or refused a request: a sign the sandbox
     /// behind it may have been replaced, so whatever was learned about it (the probe, the
     /// capabilities above) should be learned again. Read by the [`ExecTarget`] that shares it.
@@ -886,7 +889,7 @@ impl HttpExecRunner {
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             streams: tokio::sync::OnceCell::new(),
             jobs_probe: Arc::default(),
-            native_jobs: tokio::sync::OnceCell::new(),
+            job_offer: tokio::sync::OnceCell::new(),
             suspect: None,
         })
     }
@@ -1000,12 +1003,22 @@ impl HttpExecRunner {
             // command running and exiting non-zero, which is an ordinary result.
             self.suspect();
             let (body, _) = self.read_capped(resp).await?;
-            return Err(std::io::Error::other(format!(
-                "exec endpoint {} returned {}: {}",
-                self.url,
-                status.as_u16(),
-                excerpt(&body)
-            )));
+            // A `400` refuses the request as written (v1.4's refused `notify` among others), which
+            // a caller may answer by sending another; anything else is an error of the endpoint's.
+            let kind = if status == reqwest::StatusCode::BAD_REQUEST {
+                std::io::ErrorKind::InvalidInput
+            } else {
+                std::io::ErrorKind::Other
+            };
+            return Err(std::io::Error::new(
+                kind,
+                format!(
+                    "exec endpoint {} returned {}: {}",
+                    self.url,
+                    status.as_u16(),
+                    excerpt(&body)
+                ),
+            ));
         }
         Ok(resp)
     }
@@ -1251,17 +1264,26 @@ impl HttpExecRunner {
     /// Whether the endpoint offers sandbox jobs natively (v1.3), probing it the first time. See the
     /// module doc's "Sandbox jobs (v1.3)".
     pub async fn offers_jobs(&self) -> bool {
-        self.native_jobs
+        self.job_offer().await.native_jobs
+    }
+
+    /// What the endpoint offers for jobs — natively (v1.3), and `notify` (v1.4) natively or for the
+    /// baseline — probing it the first time. A probe that could not reach it offers nothing this
+    /// time and is retried next time.
+    pub async fn job_offer(&self) -> jobs_native::JobOffer {
+        self.job_offer
             .get_or_try_init(|| async {
-                let native = jobs_native::probe(self).await?;
-                if native {
-                    tracing::info!(url = %self.url, "exec endpoint offers sandbox jobs (v1.3)");
+                let offer = jobs_native::probe(self).await?;
+                if offer.native_jobs {
+                    tracing::info!(url = %self.url, notify = offer.notify, "exec endpoint offers sandbox jobs (v1.3)");
+                } else if offer.baseline_notify {
+                    tracing::info!(url = %self.url, "exec endpoint offers job notify (v1.4) for the baseline");
                 }
-                Ok::<bool, std::io::Error>(native)
+                Ok::<_, std::io::Error>(offer)
             })
             .await
             .copied()
-            .unwrap_or(false)
+            .unwrap_or_default()
     }
 }
 

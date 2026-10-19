@@ -1,7 +1,8 @@
-//! Exec protocol **v1.3**: sandbox jobs as an endpoint capability. The normative spec is the parent
-//! module's doc ("Sandbox jobs (v1.3)"); this is the client half — the probe that adopts it, and
-//! [`NativeJobs`], the [`SandboxJobs`] that speaks it — plus [`HttpJobs`], which picks it or the
-//! baseline ([`ShellJobs`]) per endpoint.
+//! Exec protocol **v1.3**: sandbox jobs as an endpoint capability, and **v1.4**'s `notify` on
+//! `keep`. The normative spec is the parent module's doc ("Sandbox jobs (v1.3)", "Sandbox job notify
+//! (v1.4)"); this is the client half — the probe that adopts them, and [`NativeJobs`], the
+//! [`SandboxJobs`] that speaks them — plus [`HttpJobs`], which picks it or the baseline
+//! ([`ShellJobs`]) per endpoint.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,13 +14,16 @@ use serde_json::{Value, json};
 
 use super::HttpExecRunner;
 use super::jobs::{
-    EventSink, JobEvent, JobId, JobInfo, JobScope, JobSpec, JobStatus, ReadChunk, SandboxJobs,
-    ShellJobs,
+    EventSink, JobEvent, JobId, JobInfo, JobNotify, JobScope, JobSpec, JobStatus, ReadChunk,
+    SandboxJobs, ShellJobs,
 };
 use super::stream::{FRAME_SILENCE_LIMIT, FrameReader};
 
 /// What a v1.3 endpoint answers the probe with: `{"jobs": "v1.3"}`.
 pub const CAPABILITY: &str = "v1.3";
+
+/// What an endpoint that offers v1.4 adds to its probe answer: `"notify": "v1.4"`.
+pub const NOTIFY_CAPABILITY: &str = "v1.4";
 
 /// How long a job operation other than a stream may take.
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -31,10 +35,39 @@ const KILL_GRACE_MS: u64 = 300;
 /// `job` runs it.
 const INERT: &str = "true";
 
-/// Whether the endpoint offers v1.3 jobs. The probe is a valid v1.1 request (`printf exec-v1.2`)
+/// What an endpoint's answer to the job probe offers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JobOffer {
+    /// Sandbox jobs natively (v1.3): `jobs` is exactly `"v1.3"`.
+    pub native_jobs: bool,
+    /// `notify` on a native `keep` (v1.4): `jobs` is exactly `"v1.3"` and `notify` exactly `"v1.4"`.
+    pub notify: bool,
+    /// `notify` for the baseline (v1.4): no `jobs`, and `notify` exactly `"v1.4"`. The baseline
+    /// further needs `curl` and `stdin_base64` in the sandbox.
+    pub baseline_notify: bool,
+}
+
+impl JobOffer {
+    /// Read an answer to the probe. Only the spec's exact answers offer anything: a later version,
+    /// a boolean, a `jobs` of another version, or a v1.1 envelope (the endpoint ran the command)
+    /// offers nothing it does not name exactly.
+    pub fn from_answer(answer: &Value) -> Self {
+        let jobs = answer.get("jobs");
+        let notify = answer.get("notify").and_then(Value::as_str) == Some(NOTIFY_CAPABILITY);
+        let native_jobs = jobs.and_then(Value::as_str) == Some(CAPABILITY);
+        Self {
+            native_jobs,
+            notify: native_jobs && notify,
+            baseline_notify: jobs.is_none() && notify,
+        }
+    }
+}
+
+/// What the endpoint offers for jobs. The probe is a valid v1.1 request (`printf exec-v1.2`)
 /// carrying `"job": {"op": "probe"}`: an endpoint without the capability ignores the unknown field
-/// and runs the command, one with it answers `{"jobs": "v1.3"}`.
-pub(crate) async fn probe(runner: &HttpExecRunner) -> std::io::Result<bool> {
+/// and runs the command, one with it answers `{"jobs": "v1.3"}` (plus `"notify": "v1.4"` when it
+/// offers notify), and one that offers notify only for the baseline answers `{"notify": "v1.4"}`.
+pub(crate) async fn probe(runner: &HttpExecRunner) -> std::io::Result<JobOffer> {
     let job = json!({ "op": "probe" });
     let resp = runner
         .send_job(
@@ -49,13 +82,8 @@ pub(crate) async fn probe(runner: &HttpExecRunner) -> std::io::Result<bool> {
         .await?;
     let (body, _) = runner.read_capped(resp).await?;
     Ok(serde_json::from_slice::<Value>(&body)
-        .ok()
-        .and_then(|v| {
-            v.get("jobs")
-                .and_then(Value::as_str)
-                .map(|s| s == CAPABILITY)
-        })
-        .unwrap_or(false))
+        .map(|v| JobOffer::from_answer(&v))
+        .unwrap_or_default())
 }
 
 /// The endpoint's jobs: native when it offers v1.3, the baseline otherwise — decided once, on the
@@ -154,6 +182,22 @@ impl SandboxJobs for HttpJobs {
         seen: u64,
     ) -> std::io::Result<()> {
         dispatch!(self, keep(scope, id, num, kind, seen))
+    }
+
+    async fn offers_notify(&self) -> bool {
+        dispatch!(self, offers_notify())
+    }
+
+    async fn keep_notify(
+        &self,
+        scope: &JobScope,
+        id: &JobId,
+        num: u64,
+        kind: &str,
+        seen: u64,
+        notify: &JobNotify,
+    ) -> std::io::Result<()> {
+        dispatch!(self, keep_notify(scope, id, num, kind, seen, notify))
     }
 
     async fn seen(&self, scope: &JobScope, id: &JobId, offset: u64) -> std::io::Result<()> {
@@ -376,6 +420,31 @@ impl SandboxJobs for NativeJobs<'_> {
             "keep",
             scope,
             json!({ "id": id.as_str(), "num": num, "kind": kind, "seen": seen }),
+        ))
+        .await
+        .map(drop)
+    }
+
+    async fn offers_notify(&self) -> bool {
+        self.runner.job_offer().await.notify
+    }
+
+    async fn keep_notify(
+        &self,
+        scope: &JobScope,
+        id: &JobId,
+        num: u64,
+        kind: &str,
+        seen: u64,
+        notify: &JobNotify,
+    ) -> std::io::Result<()> {
+        self.call(Self::op(
+            "keep",
+            scope,
+            json!({
+                "id": id.as_str(), "num": num, "kind": kind, "seen": seen,
+                "notify": { "url": notify.url, "token": notify.token },
+            }),
         ))
         .await
         .map(drop)
@@ -608,4 +677,33 @@ pub fn parse_survivors(v: &Value) -> Vec<(Option<String>, String)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every probe answer in `v1.4-probe.json` means to this client what the spec says it means.
+    #[test]
+    fn probe_answers_offer_what_the_vectors_say() {
+        let file: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/exec/v1.4-probe.json"))
+                .unwrap();
+        let answers = file["answers"].as_array().unwrap();
+        assert!(!answers.is_empty());
+        for case in answers {
+            let want = &case["expect"];
+            let got = JobOffer::from_answer(&case["answer"]);
+            assert_eq!(
+                got,
+                JobOffer {
+                    native_jobs: want["native_jobs"].as_bool().unwrap(),
+                    notify: want["notify"].as_bool().unwrap(),
+                    baseline_notify: want["baseline_notify"].as_bool().unwrap(),
+                },
+                "{}",
+                case["name"]
+            );
+        }
+    }
 }
