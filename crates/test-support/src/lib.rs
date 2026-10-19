@@ -315,6 +315,38 @@ pub fn spawn_model_server_routed_unrecorded_on(
     spawn_model_server_routed_at(listener, routes, fallback, false).0
 }
 
+/// A model server whose reply is a function of each raw request (session-title requests aside,
+/// which get the scripted title). For suites that drive many sessions at once and decide a reply by
+/// the request's last message, which neither a FIFO script nor a substring route can do: the whole
+/// conversation is in every request. Records every raw request; each connection gets its own
+/// thread.
+pub fn spawn_model_server_fn(
+    answer: impl Fn(&str) -> String + Send + Sync + 'static,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = crate::ports::listener();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorder = requests.clone();
+    let answer = Arc::new(answer);
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut stream) = conn else { break };
+            let (answer, recorder) = (answer.clone(), recorder.clone());
+            thread::spawn(move || {
+                let req = read_http_request(&mut stream);
+                if is_session_title_request(&req) {
+                    reply(&mut stream, &turn_text(SCRIPTED_SESSION_TITLE));
+                    return;
+                }
+                let resp = answer(&req);
+                recorder.lock().unwrap().push(req);
+                reply(&mut stream, &resp);
+            });
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
 fn spawn_model_server_routed_inner(
     routes: Vec<(String, String)>,
     fallback: String,

@@ -2650,7 +2650,15 @@ today's follow runs for the length of the call; a callback meanwhile is answered
 puts the job back still running, the kernel closes that follow and the job is unheld again
 (`put_back`); one whose end the call recorded is held, as today, and one it killed is forgotten.
 `tests/job_notify.rs` runs a real replica against the reference endpoint (`exec_mock`, which makes
-the callbacks) through a stand-in for the edge.
+the callbacks) through a stand-in for the edge. The end-to-end matrix (`tests/notify_e2e_*.rs`, on
+`tests/common/notify_e2e.rs`) runs every case in three endpoint modes, native v1.4, the baseline
+with its `curl` supervisor, and no egress: one or two real replicas on a hash ring behind a front
+that routes clients and callbacks by session id (retrying and walking on `503`, attaching nothing),
+the endpoint behind a proxy that counts every byte at the socket, and a model that answers by each
+request's last message. It proves silence after release in bytes, a notified end's notice and wake
+equal to the held stream's with notify off, forged, looped and duplicate callbacks, a killed
+replica's takeover, lost callbacks found at the next use or open, a reaped session, and a dead
+sandbox taking today's error path.
 
 **Known gap: a crash can report a sandbox job's end twice.** This is today's behaviour for every
 kept job, held stream or not, and not part of v1.4. A job's end is reported in a turn (a wake turn,
