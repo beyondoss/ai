@@ -78,10 +78,12 @@
 //! `keep` with notify takes the URL and token on **standard input**, never in an argument, and
 //! writes them (escaped) into the 0600 `notify` curl config, then bumps `ngen`. It never sends
 //! anything itself: the supervisor's **notifier** does, a loop the keeper starts (in the
-//! supervisor's session, so outside the group v1.1 kills once `keep` has answered) when `ngen`
-//! first appears, or the supervisor starts just before it records the end. The notifier feeds
-//! what it sees (`ngen` changing, `left`, `end`, the directory's removal, an attempt's status) to
-//! the v1.4 kernel's shell twin ([`exec_notify::SH`]) and does what it says. Each attempt is
+//! supervisor's session, so outside the group v1.1 kills once `keep` has answered) whenever `ngen`
+//! exists and no notifier holds `nlock`, or the supervisor starts just before it records the end.
+//! One that dies is started again as a fresh kernel, owing the latest keep's callback anew (a
+//! hint, so harmless). The notifier feeds what it sees (`ngen` changing, `left`, `end`, the
+//! directory's removal, an attempt's status) to the v1.4 kernel's shell twin
+//! ([`exec_notify::SH`]) and does what it says. Each attempt is
 //! exactly `curl -q -sS -K notify -o /dev/null -w '%{http_code}' --max-time 30 --proto
 //! =http,https`, run in the background so a new keep can abandon it, its status read from `n.out`
 //! (`000` is a connection error). The end's status is on disk before the notifier can report it.

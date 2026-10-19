@@ -11,8 +11,8 @@
 //! `Transfer-Encoding`, at most [`MAX_BODY`] bytes, exactly `type`, `scope` and `id`), service mode,
 //! the token ([`crate::notify_token`]), and the scope. Only then does it look for the session, and
 //! only among sessions a task in this process already holds ([`NotifyHub::find`]): a callback never
-//! opens one. A session not held here is answered `503`, which the sender retries (the edge may
-//! reach the owner next time). Every refusal has a fixed body for its status ([`refusal_body`]).
+//! opens one. A session not held here is answered `503`, so the edge walks on to the replica that
+//! holds it. Every refusal has a fixed body for its status ([`refusal_body`]).
 //!
 //! A callback never pins a session, so it is never an attached client and never touches the idle
 //! clock; its answer comes through its own reply path ([`SessionNotify::callback`]), never out of
@@ -315,9 +315,10 @@ where
         Verdict::Valid => {}
         v => return Err(v.refusal_status()),
     }
-    // (6) The session's own scope.
+    // (6) The session's own scope: a replica mints for no other, so a token that verifies for
+    // another is as forged as a bad tag.
     if scope != JobScope::for_session(Some(&tenant), &session_id).name() {
-        return Err(Some(403));
+        return Err(Some(401));
     }
     // Only now: is the session held here? A callback never opens one.
     let Some(session) = hub.find(&tenant, &session_id) else {

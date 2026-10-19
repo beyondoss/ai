@@ -288,6 +288,17 @@ async fn a_forged_callback_reaches_nothing() {
         ),
         (send(other_secret, TENANT, SESSION, scope.name(), JOB), 503),
         (send(other_session, TENANT, SESSION, scope.name(), JOB), 401),
+        // Another session's scope: the token's tag covers the scope, so it is a bad tag.
+        (
+            send(
+                good.clone(),
+                TENANT,
+                SESSION,
+                JobScope::for_session(Some(TENANT), "s1.beta").name(),
+                JOB,
+            ),
+            401,
+        ),
     ];
     for (req, want) in cases {
         let (status, _) = raw(svc.port, &req).await;

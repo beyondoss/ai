@@ -162,17 +162,17 @@ only replicas hold the token's key. A callback never opens a session either: a s
 open learns of its jobs' ends when it next opens, as it does today, so a callback matters only to
 the replica that has the session open now. That replica verifies the token and reconciles; any other
 verifies the token and answers `503`, as it answers any request for a session it does not hold, so
-the edge's usual retry and ring walk find the replica that has it. Each requirement is tagged (E1, E2, …)
-and names the check that tests it. A check not written yet is listed, with its task, in
-`tests/fixtures/exec/v1.4-checks.json`.
+the edge's usual retry and ring walk find the replica that has it. Each requirement is tagged (E1,
+E2, …) and names the check that tests it; `tests/fixtures/exec/v1.4-checks.json` lists them all.
 
 - **E1** The edge MUST classify a request with exactly the two rules of exec v1.4's N21: a request
   is a callback when it has exactly one `Authorization` header and its value is `Bearer` (any case),
   one or more spaces, then `bjn_v1.`; it looks like a callback when any `Authorization` value is
-  `bearer` (any case), any run of spaces and tabs, then `bjn_v1.`. A request that looks like a
-  callback but is not one (two `Authorization` headers, a tab, no space) MUST be answered `400` and
-  never forwarded, as a callback or as a user request. The edge MUST NOT authenticate a callback as
-  a user, or use any user credential it carries. It MUST forward a callback only when it is a `POST`
+  `bearer` (any case), any run of spaces and tabs, then `bjn_v1.`, read on the value's bytes, so a
+  value that is not UTF-8 is never a callback. A request that looks like a callback but is not one
+  (two `Authorization` headers, a tab, no space) MUST be answered `400` and never forwarded, as a
+  callback or as a user request. The edge MUST NOT authenticate a callback as a user, or use any
+  user credential it carries. It MUST forward a callback only when it is a `POST`
   to `/_beyond/agent`, and answer any other request bearing such a token `403` itself. It MUST
   answer `400` itself a callback whose query names `session_id` more than once, keys decoded as
   `application/x-www-form-urlencoded` as the replica decodes them, so it never routes by a
@@ -206,9 +206,9 @@ follow a job's end through a takeover (`job-ended-after-takeover`), a ring chang
 (`job-ended-across-a-ring-change`), and a session reaped before the end
 (`job-ended-after-the-session-closed`).
 
-The edge SHOULD rate-limit callbacks per source address. A replica already bounds the work a stream of valid callbacks can cause (one
-reconcile at a time per session, at most one a second, at most 16 callbacks waiting), and refuses a
-forged one before it looks for the session.
+The edge SHOULD rate-limit callbacks per source address. A replica already bounds the work a stream
+of valid callbacks can cause (one reconcile at a time per session, at most one a second, at most 16
+callbacks waiting), and refuses a forged one before it looks for the session.
 
 A replica that predates v1.4 answers a callback `401`, as it answers any request without a grant,
 and the sandbox stops that notification. That never loses an end: a pre-v1.4 replica holds its own

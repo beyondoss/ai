@@ -14,7 +14,8 @@
 //! arrives with the event that needs it ([`Facts`]). It also owns the session's reconcile schedule
 //! (one at a time, the next shared by everyone who asks while one runs, spaced
 //! [`RECONCILE_SPACING`] after the last for a callback or a release, and [`USE_SPACING`] for a
-//! use, which inside that spacing asks for one at its end rather than being dropped) and the callbacks waiting for an answer (at most [`MAX_WAITING`], each answered `503` at
+//! use, which inside that spacing asks for one at its end rather than being dropped) and the
+//! callbacks waiting for an answer (at most [`MAX_WAITING`], each answered `503` at
 //! [`ANSWER_LIMIT`] after it arrived).
 //!
 //! The release table ("Release (normative)" in [`crate::exec_endpoint`]), row by row:
