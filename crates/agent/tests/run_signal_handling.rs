@@ -15,15 +15,31 @@ use std::time::{Duration, Instant};
 use common::{SpawnGuarded, run_cmd, spawn_model_server, turn_tool_use};
 use serde_json::json;
 
-/// Spawns `run` against a mock model server whose one turn calls `bash` with `script`, sends
-/// `signal` (`"TERM"` or `"INT"`) ~500ms later (enough for the tool call to actually start), and
-/// returns the child's `(exit_status, stderr)` once it exits — or panics if it doesn't within 10s.
-fn run_and_signal(
-    dir: &std::path::Path,
-    script: &str,
-    signal: &str,
-) -> (std::process::ExitStatus, String) {
-    let turn1 = turn_tool_use("toolu_1", "bash", &json!({ "command": script }).to_string());
+/// How long the backgrounded grandchild waits before writing its marker. Long enough that a
+/// signal sent as soon as the grandchild is up (even on a loaded host) lands well before it fires.
+const GRANDCHILD_DELAY_SECS: u64 = 3;
+
+/// Spawns `run` against a mock model server whose one turn calls `bash` with a script that
+/// backgrounds a grandchild which writes `dir/leaked` after [`GRANDCHILD_DELAY_SECS`] while the
+/// foreground shell sleeps. Waits (bounded) until the grandchild has recorded its pid in
+/// `dir/ready`, so the tool call is provably running, then sends `signal` (`"TERM"`, `"INT"` or
+/// `"HUP"`) and returns the child's `(exit_status, stderr)` once it exits — or panics if it
+/// doesn't within 10s.
+fn run_and_signal(dir: &std::path::Path, signal: &str) -> (std::process::ExitStatus, String) {
+    let marker = dir.join("leaked");
+    let ready = dir.join("ready");
+    // The pid is written to a temp name then renamed so a reader never sees a partial file.
+    let script = format!(
+        "( echo $BASHPID > {tmp} && mv {tmp} {ready}; sleep {GRANDCHILD_DELAY_SECS}; touch {marker} ) & sleep 30",
+        tmp = dir.join("ready.tmp").display(),
+        ready = ready.display(),
+        marker = marker.display(),
+    );
+    let turn1 = turn_tool_use(
+        "toolu_1",
+        "bash",
+        &json!({ "command": &script }).to_string(),
+    );
     let (base, _bodies) = spawn_model_server(vec![turn1]);
 
     let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
@@ -47,9 +63,26 @@ fn run_and_signal(
         .stderr(Stdio::piped())
         .spawn_guarded();
 
-    // Give the bash tool time to actually start (model response received, tool dispatched, shell
-    // spawned) before sending the signal — otherwise this would race the tool call's own startup.
-    std::thread::sleep(Duration::from_millis(500));
+    // Wait for the grandchild to exist (model response received, tool dispatched, shell spawned)
+    // before signalling — a fixed sleep can lose that race under load, and then the "grandchild
+    // was killed" check passes without a grandchild ever having been started.
+    let started = Instant::now();
+    let grandchild_pid = loop {
+        if let Ok(text) = std::fs::read_to_string(&ready)
+            && let Ok(pid) = text.trim().parse::<u32>()
+        {
+            break pid;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the bash tool never started its grandchild"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        std::path::Path::new(&format!("/proc/{grandchild_pid}")).exists(),
+        "grandchild {grandchild_pid} was not running when the signal was about to be sent"
+    );
 
     let pid = child.id();
     let status = std::process::Command::new("kill")
@@ -91,12 +124,7 @@ fn run_and_signal(
 fn sigterm_during_a_bash_tool_call_kills_the_whole_process_group_not_just_run_itself() {
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("leaked");
-    // Backgrounds a sleeper that writes `marker` after 1s, then the foreground shell itself sleeps
-    // long enough that — without a working process-group kill — the command would still be running
-    // when the signal arrives, so this test actually exercises the kill path rather than racing a
-    // command that was about to finish anyway.
-    let script = format!("( sleep 1; touch {} ) & sleep 30", marker.display());
-    let (status, stderr) = run_and_signal(dir.path(), &script, "TERM");
+    let (status, stderr) = run_and_signal(dir.path(), "TERM");
 
     // A cancelled turn is a clean, expected stop — printed as `[cancelled]` (matching the
     // `[refused]` precedent elsewhere in `run_task`), not a raw `Error: Cancelled` Debug dump of
@@ -111,10 +139,10 @@ fn sigterm_during_a_bash_tool_call_kills_the_whole_process_group_not_just_run_it
     // get regardless of cause.
     assert_eq!(status.code(), Some(143), "got stderr:\n{stderr}");
 
-    // Wait past when the backgrounded sleeper would have written the marker (started at ~0s, fires
-    // at ~1s) — it must not exist: the whole process group, not just the direct bash child, must
+    // Wait past when the backgrounded sleeper would have written the marker (armed once the grandchild is up, fires
+    // after GRANDCHILD_DELAY_SECS) — it must not exist: the whole process group, not just the direct bash child, must
     // have been killed.
-    std::thread::sleep(Duration::from_millis(1500));
+    std::thread::sleep(Duration::from_secs(GRANDCHILD_DELAY_SECS) + Duration::from_millis(500));
     assert!(
         !marker.exists(),
         "backgrounded grandchild survived SIGTERM to `run` — process group not killed"
@@ -127,8 +155,7 @@ fn sigint_during_a_bash_tool_call_kills_the_whole_process_group_too() {
     // `tokio::signal::ctrl_c()` alongside `SIGTERM` (see `serve/`), so both must behave alike.
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("leaked");
-    let script = format!("( sleep 1; touch {} ) & sleep 30", marker.display());
-    let (status, stderr) = run_and_signal(dir.path(), &script, "INT");
+    let (status, stderr) = run_and_signal(dir.path(), "INT");
 
     assert!(
         stderr.contains("[cancelled]"),
@@ -139,7 +166,7 @@ fn sigint_during_a_bash_tool_call_kills_the_whole_process_group_too() {
     // equal graceful-shutdown trigger.
     assert_eq!(status.code(), Some(130), "got stderr:\n{stderr}");
 
-    std::thread::sleep(Duration::from_millis(1500));
+    std::thread::sleep(Duration::from_secs(GRANDCHILD_DELAY_SECS) + Duration::from_millis(500));
     assert!(
         !marker.exists(),
         "backgrounded grandchild survived SIGINT to `run` — process group not killed"
@@ -155,8 +182,7 @@ fn sighup_during_a_bash_tool_call_kills_the_whole_process_group_too() {
     // `SignalKind::hangup()` alongside them (see `serve/`), so all three must behave alike.
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("leaked");
-    let script = format!("( sleep 1; touch {} ) & sleep 30", marker.display());
-    let (status, stderr) = run_and_signal(dir.path(), &script, "HUP");
+    let (status, stderr) = run_and_signal(dir.path(), "HUP");
 
     assert!(
         stderr.contains("[cancelled]"),
@@ -166,7 +192,7 @@ fn sighup_during_a_bash_tool_call_kills_the_whole_process_group_too() {
     // `print-mode.ts` SIGHUP code exactly.
     assert_eq!(status.code(), Some(129), "got stderr:\n{stderr}");
 
-    std::thread::sleep(Duration::from_millis(1500));
+    std::thread::sleep(Duration::from_secs(GRANDCHILD_DELAY_SECS) + Duration::from_millis(500));
     assert!(
         !marker.exists(),
         "backgrounded grandchild survived SIGHUP to `run` — process group not killed"
