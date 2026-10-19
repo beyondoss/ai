@@ -67,6 +67,9 @@ pub struct Options {
     pub env: Vec<(String, String)>,
     /// Pass the seal key as `AI_AGENT_SEAL_KEY_B64` (the key itself) instead of `--seal-key`.
     pub seal_key_from_env: bool,
+    /// How the sandbox's exec endpoint behaves (its root and `HOME` are set here); the default
+    /// is a conforming v1.3 endpoint that does not advertise notify.
+    pub exec: Option<super::exec_mock::MockOptions>,
 }
 
 impl Service {
@@ -80,7 +83,14 @@ impl Service {
         let sandbox_home = dir.path().join("sandbox/home");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&sandbox_home).unwrap();
-        let exec = ExecMock::start_with_home(&workspace, Some(&sandbox_home), true).await;
+        let exec = match &opts.exec {
+            Some(mock) => {
+                let mut mock = mock.clone();
+                mock.home = Some(sandbox_home.clone());
+                ExecMock::start_with(&workspace, mock).await
+            }
+            None => ExecMock::start_with_home(&workspace, Some(&sandbox_home), true).await,
+        };
 
         let shards: Vec<(String, PathBuf)> = shard_names
             .iter()

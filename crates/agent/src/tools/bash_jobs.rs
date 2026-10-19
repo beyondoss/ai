@@ -158,6 +158,11 @@ pub(crate) struct JobShared {
     table: Weak<BashJobs>,
     /// The model's command, truncated — what a journaled record names it by.
     command: OnceLock<String>,
+    /// exec v1.4: how the session's notify driver steers the task that holds this job's stream
+    /// ([`super::bash_sandbox::Ctl`]). Set by that task while it can be steered.
+    ctl: Mutex<Option<tokio::sync::mpsc::UnboundedSender<super::bash_sandbox::Ctl>>>,
+    /// When the job ended, if a listing said so before its end was read ([`Self::finish`]).
+    end_at: Mutex<Option<Instant>>,
 }
 
 #[derive(Default)]
@@ -197,6 +202,8 @@ impl JobShared {
             state: Mutex::new(JobState::default()),
             table: Arc::downgrade(table),
             command: OnceLock::new(),
+            ctl: Mutex::new(None),
+            end_at: Mutex::new(None),
         }
     }
 
@@ -211,6 +218,11 @@ impl JobShared {
         let _ = shared.sandbox.set(link);
         lock(&shared.out).offset = offset;
         shared
+    }
+
+    /// The job table it belongs to, while there is one.
+    pub(crate) fn table(&self) -> Option<Arc<BashJobs>> {
+        self.table.upgrade()
     }
 
     /// Where the sandbox runs it, if it does.
@@ -304,9 +316,31 @@ impl JobShared {
         }
     }
 
-    /// The runner's task is done: record how, and wake whoever is waiting.
+    /// The runner's task is done: record how, and wake whoever is waiting. At the time a listing
+    /// gave for its end ([`Self::set_end_at`]), if one did; otherwise now.
     pub fn finish(&self, result: Result<ExecResult, String>) {
-        self.finish_at(result, Instant::now());
+        let at = lock(&self.end_at).take().unwrap_or_else(Instant::now);
+        self.finish_at(result, at);
+    }
+
+    /// A listing found the job ended at `at`: its end is recorded then, as a reattach records it.
+    pub fn set_end_at(&self, at: Instant) {
+        *lock(&self.end_at) = Some(at);
+    }
+
+    /// Install the channel the notify driver steers this job's stream-holding task through.
+    pub(crate) fn set_ctl(
+        &self,
+        tx: Option<tokio::sync::mpsc::UnboundedSender<super::bash_sandbox::Ctl>>,
+    ) {
+        *lock(&self.ctl) = tx;
+    }
+
+    /// Steer the job's stream-holding task; `false` when nothing is listening.
+    pub(crate) fn ctl(&self, c: super::bash_sandbox::Ctl) -> bool {
+        lock(&self.ctl)
+            .as_ref()
+            .is_some_and(|tx| tx.send(c).is_ok())
     }
 
     /// As [`Self::finish`], for a job that ended at `at` — earlier, while nobody was following it.
@@ -435,6 +469,8 @@ pub struct BashJobs {
     checked_gone: Mutex<Vec<(u64, String)>>,
     /// Sandbox jobs a tool call has taken out of the table ([`Self::take`]), while it has them.
     in_call: Mutex<Vec<Weak<JobShared>>>,
+    /// exec v1.4: the session's notify driver, where the host registered one (`serve --service`).
+    notify: Mutex<Option<Weak<super::job_notify::SessionNotify>>>,
 }
 
 impl Default for BashJobs {
@@ -459,7 +495,34 @@ impl BashJobs {
             unchecked: Mutex::new(Vec::new()),
             checked_gone: Mutex::new(Vec::new()),
             in_call: Mutex::new(Vec::new()),
+            notify: Mutex::new(None),
         }
+    }
+
+    /// The session's notify driver, if the host registered one and it is still there.
+    pub(crate) fn notify(&self) -> Option<Arc<super::job_notify::SessionNotify>> {
+        lock(&self.notify).as_ref().and_then(Weak::upgrade)
+    }
+
+    /// Register (or clear) the session's notify driver.
+    pub fn set_notify(&self, notify: Option<&Arc<super::job_notify::SessionNotify>>) {
+        *lock(&self.notify) = notify.map(Arc::downgrade);
+    }
+
+    /// The job the sandbox knows as `id`: in the table, or in a tool call's hands.
+    fn sandbox_job(&self, id: &str) -> Option<Arc<JobShared>> {
+        let is_it = |shared: &JobShared| shared.sandbox().is_some_and(|l| l.id.as_str() == id);
+        if let Some(found) = lock(&self.table)
+            .values()
+            .find(|p| is_it(&p.job.shared))
+            .map(|p| p.job.shared.clone())
+        {
+            return Some(found);
+        }
+        lock(&self.in_call)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|s| is_it(s))
     }
 
     /// The reattach still to run, if the session's sandbox has not been read back yet.
@@ -1555,11 +1618,82 @@ impl super::job_notify::JobTracker for BashJobs {
         'static,
         Option<std::collections::BTreeMap<String, super::job_notify::kernel::Listed>>,
     > {
-        // No job is unheld yet (none is kept with notify), so the kernel never asks for a list.
-        Box::pin(async { None })
+        use super::job_notify::kernel::Listed;
+        use crate::exec_endpoint::jobs::JobStatus;
+        // The sandbox of the session's jobs, through any job it runs: an unheld job is one.
+        let link = lock(&self.table)
+            .values()
+            .find_map(|p| p.job.shared.sandbox().cloned())
+            .or_else(|| {
+                lock(&self.in_call)
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .find_map(|s| s.sandbox().cloned())
+            });
+        Box::pin(async move {
+            let link = link?;
+            let listed = match link.store.list(&link.scope).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::info!(error = %e, "a live reconcile could not list the sandbox's jobs");
+                    return None;
+                }
+            };
+            Some(
+                listed
+                    .into_iter()
+                    .filter_map(|j| {
+                        let state = match j.status {
+                            JobStatus::Running => Listed::Running,
+                            JobStatus::ShellExited(code) => Listed::Exited { code },
+                            JobStatus::Ended(code) => Listed::Ended { code, at: j.ended },
+                            JobStatus::Lost => Listed::Lost {
+                                at: j.ended.max(j.started),
+                            },
+                            JobStatus::Gone => return None,
+                        };
+                        Some((j.id.as_str().to_string(), state))
+                    })
+                    .collect(),
+            )
+        })
     }
 
-    fn perform(&self, _action: super::job_notify::kernel::Action) {
-        // No job is kept with notify yet, so the kernel decides nothing about one.
+    fn perform(&self, action: super::job_notify::kernel::Action) {
+        use super::bash_sandbox::Ctl;
+        use super::job_notify::kernel::Action;
+        let job = match &action {
+            Action::CloseStream { job }
+            | Action::ApplyShellExit { job, .. }
+            | Action::Follow { job, .. }
+            | Action::ReadInThenFollow { job, .. } => job.clone(),
+            // A `keep` is the keeping caller's to send; nothing else here concerns a job.
+            Action::SendKeep { .. } | Action::StartReconcile { .. } | Action::Answer { .. } => {
+                return;
+            }
+        };
+        let Some(shared) = self.sandbox_job(&job) else {
+            return;
+        };
+        match action {
+            Action::CloseStream { .. } => {
+                shared.ctl(Ctl::Close);
+            }
+            Action::Follow { end, .. } => {
+                shared.ctl(Ctl::Follow(end));
+            }
+            Action::ReadInThenFollow { .. } => {
+                shared.ctl(Ctl::ReadIn);
+            }
+            // As a held stream's `shell_exit`: whether it is news is today's per-job record's.
+            Action::ApplyShellExit { code, .. } => shared.orphaned(
+                &ExecResult {
+                    code: Some(code),
+                    ..Default::default()
+                },
+                super::bash_sandbox::SANDBOX_LEFTOVERS.to_string(),
+            ),
+            _ => {}
+        }
     }
 }

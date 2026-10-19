@@ -614,6 +614,10 @@ enum Command {
         /// Serve Prometheus metrics on this loopback address.
         #[usage(long, env = "AI_AGENT_METRICS_LISTEN")]
         metrics_listen: Option<String>,
+        /// With --service, the origin the fleet's edge serves sessions at: sandboxes that offer
+        /// job notify (exec v1.4) report a kept job's end to `<origin>/_beyond/agent`.
+        #[usage(long, env = "AI_AGENT_NOTIFY_ORIGIN")]
+        notify_origin: Option<String>,
         /// On shutdown, wait up to this many seconds for running prompts to finish. Default 0.
         #[usage(long, env = "AI_AGENT_DRAIN_GRACE", default = "0")]
         drain_grace: u64,
@@ -1804,6 +1808,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             shard,
             max_live_sessions,
             metrics_listen,
+            notify_origin,
             drain_grace,
             mcp_allow_private,
             mcp_events_callback_url,
@@ -1992,6 +1997,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                      activation: webhook deliveries arrive on serve's HTTP listener"
                         .into(),
                 );
+            }
+            if let Some(origin) = &notify_origin {
+                if !service {
+                    return Err(
+                        "--notify-origin needs --service: job notify is a service-mode \
+                                feature"
+                            .into(),
+                    );
+                }
+                beyond_ai_agent::tools::job_notify::check_origin(origin)?;
             }
             if service {
                 if grant_verifier.is_none() {
@@ -2353,6 +2368,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 listen_uds_mode,
                 grant_verifier,
                 job_notify: None,
+                notify_origin: notify_origin.clone(),
                 session_idle_timeout: session_idle_timeout.map(std::time::Duration::from_secs),
                 upstream_http2,
                 // The daemon path (`serve_ws`) fills this from `upstream_http2` before spawning any

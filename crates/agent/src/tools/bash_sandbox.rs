@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 
 use super::bash_jobs::{BashJobs, EndPolicy, Job, JobKind, JobShared};
 use super::exec::{CommandRunner, ExecResult, Kill};
+use super::job_notify::SessionNotify;
+use super::job_notify::kernel::{Action, Event, KeepOutcome, ListedEnd};
 use crate::exec_endpoint::jobs::{JobEvent, JobId, JobScope, JobSpec, JobStatus, SandboxJobs};
 
 /// What a sandbox job's leftovers are called, when its shell exits leaving them running.
@@ -125,27 +127,46 @@ fn status_result(code: i32) -> ExecResult {
     }
 }
 
+/// How exec v1.4's notify driver steers the task that holds a kept job's stream: the actions of
+/// [`crate::tools::job_notify::kernel`] that concern one job.
+#[derive(Debug)]
+pub(crate) enum Ctl {
+    /// The release row: close the stream, or the follow standing for it. The job is unheld.
+    Close,
+    /// An unheld job's end, or a listing that could not be had: today's follow from where its
+    /// stream got to, recording a listed end at the listing's time (and with its status, if the
+    /// rest cannot be read).
+    Follow(Option<ListedEnd>),
+    /// A `bash_job` call has the unheld job: read in what the sandbox holds, then follow it for
+    /// as long as the call has it.
+    ReadIn,
+}
+
 /// The runner task of a new remote command run as a sandbox job: held when the sandbox can stream
 /// it, kept from the start otherwise. A held stream that breaks after the job was kept does not end
-/// the job; it is followed from where the stream left off.
+/// the job; it is followed from where the stream left off. Under exec v1.4 the notify driver can
+/// close either ([`Ctl`]), and the task then holds nothing until it is told to follow.
 pub(crate) async fn run(
     shared: &Arc<JobShared>,
     link: &SandboxLink,
     spec: &JobSpec,
     held: bool,
 ) -> Result<ExecResult, String> {
+    let mut ctl = Steer::install(shared);
     let events = |e: JobEvent<'_>| on_event(shared, link, e);
     if held {
-        match link
-            .store
-            .run_held(&link.scope, &link.id, spec, &events)
-            .await
-        {
-            Ok(code) => return Ok(status_result(code)),
-            Err(e) if !link.kept() => return Err(e.to_string()),
-            Err(e) => {
+        let held = link.store.run_held(&link.scope, &link.id, spec, &events);
+        let outcome = tokio::select! {
+            r = held => Some(r),
+            () = ctl.until(|c| matches!(c, Ctl::Close)) => None,
+        };
+        match outcome {
+            Some(Ok(code)) => return Ok(status_result(code)),
+            Some(Err(e)) if !link.kept() => return Err(e.to_string()),
+            Some(Err(e)) => {
                 tracing::info!(job = %link.id, error = %e, "a kept job's stream broke; following it by polling");
             }
+            None => return steered(shared, link, &mut ctl, Phase::Released).await,
         }
     } else {
         let pgid = link
@@ -155,7 +176,146 @@ pub(crate) async fn run(
             .map_err(|e| e.to_string())?;
         events(JobEvent::Started(pgid));
     }
-    follow(shared, link, shared.offset()).await
+    steered(shared, link, &mut ctl, Phase::Follow(FollowKind::Holding)).await
+}
+
+/// The steering channel of one job's task, installed on the job for the task's life.
+struct Steer<'a> {
+    shared: &'a JobShared,
+    rx: tokio::sync::mpsc::UnboundedReceiver<Ctl>,
+}
+
+impl<'a> Steer<'a> {
+    fn install(shared: &'a JobShared) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        shared.set_ctl(Some(tx));
+        Self { shared, rx }
+    }
+
+    /// The next instruction `want` accepts; others are not for this phase and are dropped.
+    async fn until(&mut self, want: impl Fn(&Ctl) -> bool) {
+        loop {
+            match self.rx.recv().await {
+                Some(c) if want(&c) => return,
+                Some(_) => {}
+                // Never: the sender lives on the job until this is dropped.
+                None => std::future::pending::<()>().await,
+            }
+        }
+    }
+
+    async fn next(&mut self) -> Ctl {
+        match self.rx.recv().await {
+            Some(c) => c,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+impl Drop for Steer<'_> {
+    fn drop(&mut self) {
+        self.shared.set_ctl(None);
+    }
+}
+
+/// Why a job is being followed, which decides what may close the follow.
+#[derive(Clone, Copy)]
+enum FollowKind {
+    /// Standing for the stream (it broke after the keep, or a reopen adopted the job): the release
+    /// row closes it, as it closes a stream.
+    Holding,
+    /// An unheld job's end, as a reconcile found it: today's follow, to the end.
+    End(Option<ListedEnd>),
+    /// A `bash_job` call has the job: today's follow, after reading in what the sandbox holds.
+    Call,
+}
+
+enum Phase {
+    Follow(FollowKind),
+    /// Just let go of by the release row: tell the session.
+    Released,
+    /// Unheld: nothing is held until the session says to follow.
+    Unheld,
+}
+
+/// A job's task from `phase` on, steered by [`Ctl`] until the job's end is read.
+async fn steered(
+    shared: &Arc<JobShared>,
+    link: &SandboxLink,
+    ctl: &mut Steer<'_>,
+    mut phase: Phase,
+) -> Result<ExecResult, String> {
+    loop {
+        phase = match phase {
+            Phase::Released => {
+                if let Some(n) = shared.table().and_then(|t| t.notify()) {
+                    let now = n.now();
+                    n.feed(Event::StreamClosed {
+                        job: link.id.as_str().to_string(),
+                        offset: shared.offset(),
+                        shell_exit_seen: shared.orphans().is_some(),
+                        now,
+                    });
+                }
+                Phase::Unheld
+            }
+            Phase::Unheld => match ctl.next().await {
+                Ctl::Follow(end) => Phase::Follow(FollowKind::End(end)),
+                Ctl::ReadIn => {
+                    read_in(shared, link, shared.offset()).await;
+                    Phase::Follow(FollowKind::Call)
+                }
+                Ctl::Close => Phase::Unheld,
+            },
+            Phase::Follow(kind) => {
+                let stop = |c: &Ctl| match kind {
+                    FollowKind::Holding => matches!(c, Ctl::Close),
+                    FollowKind::Call | FollowKind::End(_) => false,
+                };
+                let following = follow(shared, link, shared.offset());
+                let outcome = tokio::select! {
+                    r = following => Some(r),
+                    () = ctl.until(stop) => None,
+                };
+                match (outcome, kind) {
+                    (Some(r), FollowKind::End(Some(end))) => {
+                        shared.set_end_at(ago(end.at));
+                        return r.or_else(|e| match end.code {
+                            Some(code) => Ok(status_result(code)),
+                            None => Err(format!("{LOST_END} ({e})")),
+                        });
+                    }
+                    (Some(r), _) => return r,
+                    (None, FollowKind::Holding) => Phase::Released,
+                    (None, _) => Phase::Unheld,
+                }
+            }
+        };
+    }
+}
+
+/// How a job the sandbox lost track of is reported, as a reopen reports it.
+const LOST_END: &str = "its supervisor in the sandbox is gone, so how it ended was not recorded \
+                        (the sandbox may have restarted)";
+
+/// The `Instant` of an epoch second, as best this process can place it.
+fn ago(epoch: u64) -> Instant {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Instant::now()
+        .checked_sub(Duration::from_secs(now.saturating_sub(epoch)))
+        .unwrap_or_else(Instant::now)
+}
+
+/// A reopened job's task: today's follow standing for its stream, which the release row can close.
+pub(crate) async fn follow_held(
+    shared: &Arc<JobShared>,
+    link: &SandboxLink,
+) -> Result<ExecResult, String> {
+    let mut ctl = Steer::install(shared);
+    steered(shared, link, &mut ctl, Phase::Follow(FollowKind::Holding)).await
 }
 
 /// Follow a job from `from` to its end.
@@ -172,6 +332,9 @@ async fn follow(shared: &JobShared, link: &SandboxLink, from: u64) -> Result<Exe
 /// and — on a host that keeps jobs past the session ([`EndPolicy::KeepRunning`]) — this process.
 /// The offset recorded as seen is the output the model has been shown, which is all of it so far:
 /// the call that parks a job reports its output first.
+///
+/// Where exec v1.4's notify is available, the session's kernel decides how: `keep` with `notify`
+/// (its proof window open first), then a plain `keep` if that is refused ([`keep_through`]).
 pub(crate) async fn keep(
     shared: &JobShared,
     num: u64,
@@ -181,15 +344,84 @@ pub(crate) async fn keep(
     let Some(link) = shared.sandbox() else {
         return Ok(());
     };
-    link.store
-        .keep(&link.scope, &link.id, num, kind_name(kind), shared.offset())
-        .await
-        .map_err(|e| e.to_string())?;
+    let notify = (policy == EndPolicy::KeepRunning)
+        .then(|| shared.table().and_then(|t| t.notify()))
+        .flatten();
+    match notify {
+        Some(n) => {
+            keep_through(&n, link, (num, kind_name(kind), shared.offset()), false).await?;
+        }
+        None => link
+            .store
+            .keep(&link.scope, &link.id, num, kind_name(kind), shared.offset())
+            .await
+            .map_err(|e| e.to_string())?,
+    }
     link.kept.store(true, Ordering::Relaxed);
     if policy == EndPolicy::KeepRunning {
         shared.release();
     }
     Ok(())
+}
+
+/// A keep the session's notify kernel decides: whether notify is available for this job (the
+/// endpoint offers it, and the session has the origin to name), then each `keep` it asks for,
+/// feeding back how each was answered. `adopted`: a reopen keeping a job it found running, which
+/// sends nothing when notify is not available (the job is kept already).
+async fn keep_through(
+    n: &Arc<SessionNotify>,
+    link: &SandboxLink,
+    (num, kind, seen): (u64, &str, u64),
+    adopted: bool,
+) -> Result<(), String> {
+    let target = match n.target_for(&link.id) {
+        Some(t) if link.store.offers_notify().await => Some(t),
+        _ => None,
+    };
+    let job = link.id.as_str().to_string();
+    let mut todo: std::collections::VecDeque<Action> = n
+        .feed_collect(Event::Kept {
+            job: job.clone(),
+            notify_available: target.is_some(),
+            adopted,
+        })
+        .into();
+    let mut result = Ok(());
+    while let Some(action) = todo.pop_front() {
+        match action {
+            Action::SendKeep { notify: true, .. } => {
+                let Some(target) = &target else { continue };
+                let answer = link
+                    .store
+                    .keep_notify(&link.scope, &link.id, num, kind, seen, target)
+                    .await;
+                let outcome = match &answer {
+                    Ok(()) => KeepOutcome::Succeeded,
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => KeepOutcome::Refused,
+                    Err(_) => KeepOutcome::Failed,
+                };
+                if outcome == KeepOutcome::Refused {
+                    tracing::info!(job = %link.id, "the sandbox refused notify for a job; keeping it without");
+                }
+                result = answer.map_err(|e| e.to_string());
+                let now = n.now();
+                todo.extend(n.feed_collect(Event::KeepAnswered {
+                    job: job.clone(),
+                    outcome,
+                    now,
+                }));
+            }
+            Action::SendKeep { notify: false, .. } => {
+                result = link
+                    .store
+                    .keep(&link.scope, &link.id, num, kind, seen)
+                    .await
+                    .map_err(|e| e.to_string());
+            }
+            other => n.perform_now(other),
+        }
+    }
+    result
 }
 
 /// [`keep`], from code that cannot wait for it (a notice, under the table's lock).
@@ -463,7 +695,12 @@ async fn read_back(
                 if shared.ended() {
                     return;
                 }
-                let result = follow(&shared, &link, from).await;
+                let result = if ended_at.is_some() {
+                    follow(&shared, &link, from).await
+                } else {
+                    // Standing for the job's stream: a proof can let go of it (exec v1.4).
+                    follow_held(&shared, &link).await
+                };
                 shared.untrack();
                 match ended_at {
                     Some(at) => shared.finish_at(result, at),
@@ -471,6 +708,20 @@ async fn read_back(
                 }
             })
         };
+        // Adopted kept and still running: where notify is available it is kept again with it,
+        // and proves its path like a new one (exec v1.4). Never from a live reconcile: only here.
+        if !j.status.ended()
+            && let Some(n) = jobs.notify()
+        {
+            let (link, kind) = (link.clone(), j.kind.clone());
+            let seen = j.seen;
+            tokio::spawn(async move {
+                let kind = kind.as_deref().unwrap_or("background");
+                if let Err(e) = keep_through(&n, &link, (num, kind, seen), true).await {
+                    tracing::warn!(job = num, error = %e, "could not keep a reopened job again with notify");
+                }
+            });
+        }
         let kind = match j.kind.as_deref() {
             Some("adopted") => JobKind::Adopted,
             _ => JobKind::Background,

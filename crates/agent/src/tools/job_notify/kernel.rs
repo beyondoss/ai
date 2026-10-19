@@ -115,8 +115,10 @@ pub struct Facts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Listed {
     Running,
-    /// The shell exited; processes of its group run on.
-    Exited,
+    /// The shell exited with `code`; processes of its group run on.
+    Exited {
+        code: i32,
+    },
     /// Ended with `code`, at `at` (the listing's `ended`, epoch seconds).
     Ended {
         code: i32,
@@ -206,7 +208,7 @@ pub enum Action {
     /// `list` the scope and report [`Event::Listed`]. Nothing else is sent.
     StartReconcile { reconcile: ReconcileId },
     /// Apply a listed `exited` as a held stream's `shell_exit`.
-    ApplyShellExit { job: String },
+    ApplyShellExit { job: String, code: i32 },
     /// Today's follow, from `from`, recording `end` if it cannot read the rest.
     Follow {
         job: String,
@@ -581,7 +583,7 @@ impl Kernel {
                 let seen = listing.as_ref().map(|l| l.get(&job).copied());
                 let end = match seen {
                     Some(Some(Listed::Running)) => continue,
-                    Some(Some(Listed::Exited)) => {
+                    Some(Some(Listed::Exited { code })) => {
                         if !shell_exit_seen {
                             self.jobs.insert(
                                 job.clone(),
@@ -590,7 +592,7 @@ impl Kernel {
                                     shell_exit_seen: true,
                                 },
                             );
-                            out.push(Action::ApplyShellExit { job });
+                            out.push(Action::ApplyShellExit { job, code });
                         }
                         continue;
                     }

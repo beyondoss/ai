@@ -562,7 +562,7 @@ fn listing(sandbox: &str) -> Option<BTreeMap<String, Listed>> {
     let one = |l| Some(BTreeMap::from([(JOB.to_string(), l)]));
     match sandbox {
         "running" => one(Listed::Running),
-        "exited" => one(Listed::Exited),
+        "exited" => one(Listed::Exited { code: 0 }),
         "ended" => one(Listed::Ended { code: 0, at: 1 }),
         "lost" => one(Listed::Lost { at: 1 }),
         "missing" => Some(BTreeMap::new()),

@@ -850,6 +850,9 @@ pub struct ServeConfig {
     /// service session registers with ([`crate::tools::job_notify`]). Filled by the daemon in
     /// service mode from [`Self::grant_verifier`]'s seal secret; `None` everywhere else.
     pub job_notify: Option<Arc<crate::tools::job_notify::NotifyHub>>,
+    /// `--notify-origin`: the origin the fleet's edge serves sessions at, which a `keep`'s
+    /// `notify.url` names. Service mode only; `None` keeps every job held, as before v1.4.
+    pub notify_origin: Option<String>,
     /// When set (daemon mode only), the supervisor reaps a session that has had **no attached
     /// connection** for at least this long and isn't mid-run — dropping its retained `input_tx` so it
     /// persists and exits, exactly like graceful shutdown does per-session (see [`crate::serve_ws`]).
@@ -3290,7 +3293,7 @@ pub(crate) async fn serve_session(
     // exec v1.4: a sandbox's `job_ended` callback reaches this session only while this task holds
     // it, registered here for the task's life (dropped, it is unregistered). The job table answers
     // it. Service mode only: `job_notify` is never set anywhere else.
-    let _job_notify = match (&cfg.job_notify, &service) {
+    let job_notify = match (&cfg.job_notify, &service) {
         (Some(hub), Some(svc)) => {
             let reg = crate::tools::job_notify::SessionNotify::register(
                 hub,
@@ -3299,6 +3302,19 @@ pub(crate) async fn serve_session(
             );
             let tracker: Arc<dyn crate::tools::job_notify::JobTracker> = bash_jobs.clone();
             reg.set_tracker(Arc::downgrade(&tracker));
+            // Notify is available only with the edge's origin to name (and an endpoint that
+            // offers it, asked at each keep). Without it every job is held, as before.
+            reg.set_origin(cfg.notify_origin.clone());
+            bash_jobs.set_notify(Some(&reg));
+            // A real use of the sandbox may start a live reconcile (never one this section's own
+            // requests cause: those go to the job store, not through the cell).
+            let weak = Arc::downgrade(&reg);
+            exec_cell.set_use_hook(Some(Arc::new(move || {
+                if let Some(n) = weak.upgrade() {
+                    let now = n.now();
+                    n.feed(crate::tools::job_notify::kernel::Event::Use { now });
+                }
+            })));
             Some(reg)
         }
         _ => None,
@@ -4980,6 +4996,11 @@ pub(crate) async fn serve_session(
                     .await
                     .unwrap_or_default()
             };
+            // v1.4's state of the old transcript's jobs goes with them; a reconcile that began on
+            // it hands nothing over.
+            if let Some(n) = &job_notify {
+                n.feed(crate::tools::job_notify::kernel::Event::TranscriptSwitched);
+            }
             // The old transcript is ended, so nothing of it may live on in the sandbox — not even
             // a job this table no longer knew. The new one may have jobs a replica left running.
             if let Some(old) = bash_jobs.scope() {
