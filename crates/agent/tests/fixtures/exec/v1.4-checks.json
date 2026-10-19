@@ -39,7 +39,7 @@
         {
           "kind": "test",
           "name": "sandbox_jobs_notify::baseline_offers_notify_only_with_curl",
-          "task": "C1"
+          "task": "exists"
         }
       ]
     },
@@ -111,12 +111,12 @@
         {
           "kind": "test",
           "name": "sandbox_jobs_notify::the_supervisor_sends_the_proof",
-          "task": "C1"
+          "task": "exists"
         },
         {
           "kind": "test",
           "name": "sandbox_jobs_notify::an_older_supervisor_refuses_notify",
-          "task": "C1"
+          "task": "exists"
         }
       ]
     },
@@ -252,7 +252,7 @@
         {
           "kind": "test",
           "name": "sandbox_jobs_notify::the_token_is_never_logged",
-          "task": "C1"
+          "task": "exists"
         }
       ]
     },

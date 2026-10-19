@@ -37,9 +37,9 @@ fn the_status_table_is_the_vectors() {
         .enumerate()
     {
         let n = i as u32 + 1;
-        assert_eq!(wait_ms(n, 0.0), (max.as_f64().unwrap() * 1000.0) as u64);
+        assert_eq!(wait_ms(n, 0), (max.as_f64().unwrap() * 1000.0) as u64);
         assert_eq!(
-            wait_ms(n, uniform(u32::MAX)),
+            wait_ms(n, u32::MAX),
             (min.as_f64().unwrap() * 1000.0) as u64
         );
     }
@@ -284,4 +284,191 @@ fn the_body_is_the_vector() {
         body("a\"b\\", "x"),
         r#"{"type":"job_ended","scope":"a\"b\\","id":"x"}"#
     );
+}
+
+/// Every `v1.4-keep.json` case whose `url` and `token` are strings: the grammar accepts exactly the
+/// accepted ones. (A member of the wrong type, or missing, is the caller's to refuse.)
+#[test]
+fn the_notify_grammar_is_the_vectors() {
+    let file: Value = serde_json::from_str(include_str!(
+        "../../agent/tests/fixtures/exec/v1.4-keep.json"
+    ))
+    .unwrap();
+    let mut checked = 0;
+    for case in file["cases"].as_array().unwrap() {
+        let n = &case["notify"];
+        let (Some(url), Some(token)) = (n["url"].as_str(), n["token"].as_str()) else {
+            continue;
+        };
+        let want = case["expect"]["accepted"].as_bool().unwrap();
+        assert_eq!(check_notify(url, token).is_ok(), want, "{}", case["name"]);
+        checked += 1;
+    }
+    assert!(checked > 20);
+    for bad in [
+        "https://x:99999/",
+        "https://ex ample/",
+        "https://[::1/",
+        "https://x:8a/",
+    ] {
+        assert!(check_notify(bad, "t").is_err(), "{bad}");
+    }
+}
+
+/// The shell twin ([`SH`]) against [`step`]: every sequence of up to three events, and two thousand
+/// longer random ones, through both, comparing every state and every action. Under each shell
+/// found here: `sh` (dash on Debian) and busybox `sh` (the `ash` of Alpine and most sandboxes).
+#[test]
+fn the_shell_kernel_is_step() {
+    let events: Vec<Event> = {
+        let mut v = vec![
+            Event::Keep { notify: true },
+            Event::Keep { notify: false },
+            Event::Change,
+            Event::Removed,
+            Event::Wake,
+        ];
+        for outcome in [
+            Outcome::Status(200),
+            Outcome::Status(404),
+            Outcome::Status(503),
+            Outcome::Status(302),
+            Outcome::Failed,
+        ] {
+            v.push(Event::AttemptEnded {
+                outcome,
+                draw: 0x9e37_79b9,
+            });
+        }
+        v
+    };
+    let mut seqs: Vec<Vec<(Event, u64)>> = Vec::new();
+    let mut prefix = vec![Vec::new()];
+    for _ in 0..3 {
+        let mut next = Vec::new();
+        for p in &prefix {
+            for e in &events {
+                for gap in [0, 70_000] {
+                    let now = p.last().map_or(0, |(_, t): &(Event, u64)| *t) + gap;
+                    let mut q: Vec<(Event, u64)> = p.clone();
+                    q.push((*e, now));
+                    next.push(q);
+                }
+            }
+        }
+        seqs.extend(next.iter().cloned());
+        prefix = next;
+    }
+    let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut rand = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for _ in 0..2000 {
+        let mut now = 0;
+        let mut q = Vec::new();
+        for _ in 0..30 {
+            now += [0, 250, 1000, 70_000][(rand() % 4) as usize];
+            let mut e = events[(rand() % events.len() as u64) as usize];
+            if let Event::AttemptEnded { outcome, .. } = e {
+                e = Event::AttemptEnded {
+                    outcome,
+                    draw: rand() as u32,
+                };
+            }
+            q.push((e, now));
+        }
+        seqs.push(q);
+    }
+
+    let line = |e: &Event, now: u64| match e {
+        Event::Keep { notify: true } => format!("k1 {now} - -"),
+        Event::Keep { notify: false } => format!("k0 {now} - -"),
+        Event::Change => format!("c {now} - -"),
+        Event::Removed => format!("r {now} - -"),
+        Event::Wake => format!("w {now} - -"),
+        Event::AttemptEnded { outcome, draw } => match outcome {
+            Outcome::Status(s) => format!("e {now} {s} {draw}"),
+            Outcome::Failed => format!("e {now} f {draw}"),
+        },
+    };
+    let state = |j: &Job, acts: &[Action]| {
+        let opt = |v: Option<u64>| v.map_or("-".to_string(), |v| v.to_string());
+        let mut out = format!(
+            "{} {} {} {} {} {} {}|",
+            u8::from(j.notify),
+            u8::from(j.removed),
+            j.owed,
+            j.settled,
+            opt(j.in_flight),
+            j.attempts,
+            opt(j.wake_at)
+        );
+        for a in acts {
+            match a {
+                Action::Begin { attempt } => out.push_str(&format!("b{attempt} ")),
+                Action::Abandon => out.push_str("a "),
+                Action::WakeAt(t) => out.push_str(&format!("t{t} ")),
+            }
+        }
+        out
+    };
+    let mut input = String::new();
+    let mut want = String::new();
+    for q in &seqs {
+        input.push_str("reset 0 - -\n");
+        want.push_str("reset\n");
+        let mut j = Job::default();
+        for (e, now) in q {
+            let (n, acts) = step(j, *e, *now);
+            j = n;
+            input.push_str(&line(e, *now));
+            input.push('\n');
+            want.push_str(&state(&j, &acts));
+            want.push('\n');
+        }
+    }
+    let driver = format!(
+        "{SH}\nreset() {{ KN=0 KR=0 KO=0 KS=0 KI= KA=0 KW=; }}\nreset\n\
+         while read -r ev now st dr; do\n\
+         if [ \"$ev\" = reset ]; then reset; echo reset; continue; fi\n\
+         kstep \"$ev\" \"$now\" \"$st\" \"$dr\"\n\
+         echo \"$KN $KR $KO $KS ${{KI:--}} $KA ${{KW:--}}|$KX\"\n\
+         done\n"
+    );
+    let mut shells = vec![vec!["sh".to_string()]];
+    if std::process::Command::new("busybox")
+        .arg("true")
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        shells.push(vec!["busybox".to_string(), "sh".to_string()]);
+    }
+    for shell in shells {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new(&shell[0])
+            .args(&shell[1..])
+            .args(["-c", &driver])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let feed = input.clone();
+        let writer = std::thread::spawn(move || stdin.write_all(feed.as_bytes()));
+        let out = child.wait_with_output().unwrap();
+        writer.join().unwrap().unwrap();
+        let got = String::from_utf8(out.stdout).unwrap();
+        for (i, (g, w)) in got.lines().zip(want.lines()).enumerate() {
+            assert_eq!(
+                g,
+                w,
+                "{shell:?}: line {i} differs after input {:?}",
+                input.lines().nth(i)
+            );
+        }
+        assert_eq!(got.lines().count(), want.lines().count(), "{shell:?}");
+    }
 }
