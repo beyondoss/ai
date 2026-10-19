@@ -111,12 +111,13 @@ async fn keep_without_notify_when_unavailable() {
     // The endpoint does not advertise (its deployment does not say kept jobs survive idling).
     let f = fleet(
         MockOptions::default(),
-        "echo up; sleep 3; echo done-c1",
+        "echo up; sleep 30; echo done-c1",
         None,
     )
     .await;
     let _ws = f.start_job().await;
     let pgid = f.stream("done-c1").await;
+    let _reap = Reap(pgid);
     assert!(still_held(&f, pgid, Duration::from_secs(1)).await);
     let keeps = f.keeps();
     assert!(!keeps.is_empty());
