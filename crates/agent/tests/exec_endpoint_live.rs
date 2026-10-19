@@ -497,8 +497,10 @@ async fn a_sandbox_job_lives_in_the_target_and_outlives_its_hold_once_kept() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    // Kept, then dropped: it lives, and reads back from where the model left off.
+    // Kept, then dropped: it lives, and reads back from where the model left off. The held job's
+    // group is forgotten, so this one's is the only one the checks below can see.
     output.lock().unwrap().clear();
+    *started.lock().unwrap() = None;
     let kept = JobId::fresh();
     let s = spec("echo one; sleep 1; echo two; sleep 300");
     let mut run = Box::pin(jobs.run_held(&scope, &kept, &s, &events));

@@ -59,7 +59,9 @@
 //! `tee` between the job and the relay copies every byte to the start command's own stdout — so the
 //! stream that started it (v1.2, or a template transport's pipes) carries its output live, and the
 //! supervisor's markers (`\x1ejob-start:<pgid>`, `\x1ejob-shell-exit:<status>`, `\x1ejob-end:<status>`)
-//! arrive on its stderr. If that stream's process dies — the endpoint kills it when the connection
+//! arrive on its stderr. Nothing orders those two streams (and the supervisor writes `start` only
+//! after it spawned the job), so [`ShellJobs`] holds output that arrives before the start marker
+//! until the marker does: `Started` always comes first. If that stream's process dies — the endpoint kills it when the connection
 //! drops — the keeper kills the job: a command someone was waiting on dies with its caller, as over
 //! v1.2. **Keeping** it (`keep`, which records the job number) hands it to the sandbox: from then on
 //! a dropped stream costs only the live copy (`tee` ignores `SIGPIPE` and goes on feeding the relay),
@@ -328,7 +330,7 @@ pub trait SandboxJobs: Send + Sync {
     async fn holds(&self) -> bool;
 
     /// Start a held job and stream it until it ends, returning its status. `events` hears
-    /// [`JobEvent::Started`] once it runs. Dropping the future drops the hold: a job not kept by
+    /// [`JobEvent::Started`] once it runs, before any of its output. Dropping the future drops the hold: a job not kept by
     /// then is killed by the sandbox; a kept one runs on. An error after `Started` means the stream
     /// broke, not that the job ended — a kept job is followed with [`Self::follow`] from there.
     async fn run_held(
@@ -698,14 +700,30 @@ impl SandboxJobs for ShellJobs {
     ) -> std::io::Result<i32> {
         let mut argv = Self::argv(scope, "start", Vec::new());
         argv.extend(self.start_args(id, true, spec));
-        let markers = std::sync::Mutex::new(Markers::default());
+        // The markers come on stderr and the output on stdout, two streams with nothing ordering
+        // them — and the supervisor spawns the job before it writes `start`. Output read before
+        // the start marker waits for it (under the same lock), so `Started` always comes first.
+        let markers = std::sync::Mutex::new((Markers::default(), Vec::<u8>::new()));
         let (shell_tx, mut shell_rx) = tokio::sync::watch::channel(None::<i32>);
-        let on_stdout = |bytes: &[u8]| events(JobEvent::Output(bytes));
-        let on_stderr = |bytes: &[u8]| {
+        let on_stdout = |bytes: &[u8]| {
             let mut m = markers.lock().unwrap_or_else(|e| e.into_inner());
+            if m.0.started {
+                events(JobEvent::Output(bytes));
+            } else {
+                m.1.extend_from_slice(bytes);
+            }
+        };
+        let on_stderr = |bytes: &[u8]| {
+            let mut guard = markers.lock().unwrap_or_else(|e| e.into_inner());
+            let (m, early) = &mut *guard;
             for marker in m.feed(bytes) {
                 match marker {
-                    Marker::Start(pgid) => events(JobEvent::Started(pgid)),
+                    Marker::Start(pgid) => {
+                        events(JobEvent::Started(pgid));
+                        if !early.is_empty() {
+                            events(JobEvent::Output(&std::mem::take(early)));
+                        }
+                    }
                     Marker::ShellExit(code) => {
                         let _ = shell_tx.send(Some(code));
                     }
@@ -737,8 +755,12 @@ impl SandboxJobs for ShellJobs {
             }
         };
         let (result, ()) = tokio::join!(run, shell);
+        let (m, early) = markers.into_inner().unwrap_or_else(|e| e.into_inner());
+        // Never started: whatever came on stdout is still the caller's to see.
+        if !early.is_empty() {
+            events(JobEvent::Output(&early));
+        }
         let result = result?;
-        let m = markers.into_inner().unwrap_or_else(|e| e.into_inner());
         match (m.end, m.started) {
             (Some(code), _) => Ok(code),
             (None, false) => Err(std::io::Error::other(format!(
@@ -1537,6 +1559,73 @@ mod tests {
             "processes 12, 34 in the sandbox"
         );
         assert_eq!(describe_survivors(""), "a process in the sandbox");
+    }
+
+    /// A held start whose stdout chunk is read before the stderr chunk carrying the start marker:
+    /// the supervisor spawns the job before it writes the marker, and the two travel on separate
+    /// streams, so nothing orders them.
+    struct OutputFirst;
+
+    #[async_trait]
+    impl CommandRunner for OutputFirst {
+        async fn run(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<&str>,
+            _: Duration,
+        ) -> std::io::Result<crate::tools::exec::ExecResult> {
+            unreachable!("only the held start runs")
+        }
+
+        async fn run_attached(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<&str>,
+            on_stdout: crate::tools::exec::ChunkSink<'_>,
+            on_stderr: crate::tools::exec::ChunkSink<'_>,
+        ) -> std::io::Result<crate::tools::exec::ExecResult> {
+            on_stdout(b"one\n");
+            on_stderr(b"\x1ejob-start:42\n");
+            on_stdout(b"two\n");
+            on_stderr(b"\x1ejob-end:0\n");
+            Ok(crate::tools::exec::ExecResult {
+                code: Some(0),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_held_job_reports_its_start_before_any_output() {
+        let jobs = ShellJobs::new(Arc::new(OutputFirst));
+        let heard = std::sync::Mutex::new(String::new());
+        let events = |e: JobEvent<'_>| {
+            let mut h = heard.lock().unwrap();
+            match e {
+                JobEvent::Started(g) => h.push_str(&format!("[started {g}]")),
+                JobEvent::Output(b) => h.push_str(&String::from_utf8_lossy(b)),
+                other => h.push_str(&format!("[{other:?}]")),
+            }
+        };
+        let spec = JobSpec {
+            program: "true".into(),
+            args: Vec::new(),
+            cwd: None,
+            label: "true".into(),
+        };
+        let code = jobs
+            .run_held(
+                &JobScope::for_session(None, "s"),
+                &JobId::fresh(),
+                &spec,
+                &events,
+            )
+            .await
+            .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(heard.into_inner().unwrap(), "[started 42]one\ntwo\n");
     }
 
     #[test]
