@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use common::service::Service;
 use common::{
-    SpawnGuarded, spawn_model_server, turn_text, ws_connect_with_headers, ws_read_until_response,
-    ws_send,
+    SpawnGuarded, spawn_model_server, turn_text, turn_tool_use, ws_connect_with_headers,
+    ws_next_frame, ws_read_until_response, ws_send,
 };
 use serde_json::{Value, json};
 
@@ -234,6 +234,45 @@ async fn get_state_reports_the_sandbox_workspace_and_no_host_paths() {
         "the transcript must be named for the session id under {}",
         dir.display()
     );
+}
+
+/// The same holds while a prompt is running: the busy loop answers `get_state` itself, and it must
+/// not judge the tenant's sandbox path against the replica's disk. The workspace here exists only in
+/// the sandbox, so a host-side check would call it stale.
+#[tokio::test]
+async fn get_state_mid_run_is_never_cwd_stale() {
+    const WORKSPACE: &str = "/sandbox/workspace-not-on-the-replica";
+    let turn1 = turn_tool_use(
+        "toolu_gs",
+        "bash",
+        &json!({ "command": "sleep 2" }).to_string(),
+    );
+    let (base, _requests) = spawn_model_server(vec![turn1, turn_text("done")]);
+    let svc = Service::start(&base, &["s1"]).await;
+    let token = svc.token_with("00tenant1", "s1.alpha", |c| {
+        c.workspace_root = WORKSPACE.into()
+    });
+    let mut ws = ws_connect_with_headers(svc.port, Some("s1.alpha"), &svc.header(&token))
+        .await
+        .expect("a valid grant opens its session");
+
+    ws_send(&mut ws, json!({"type":"prompt","id":"p1","message":"go"})).await;
+    // Land mid-run by waiting for the run to say it got there: `tool_start` means the tool is
+    // executing right now.
+    while let Some(f) = ws_next_frame(&mut ws).await {
+        if f["type"] == "event" && f["event"]["kind"] == "tool_start" {
+            break;
+        }
+    }
+    ws_send(&mut ws, json!({"type":"get_state","id":"g1"})).await;
+    let frames = ws_read_until_response(&mut ws, "get_state").await;
+    let state = &frames.last().unwrap()["data"];
+    assert_eq!(
+        state["is_streaming"], true,
+        "must be the busy loop's answer: {state:#?}"
+    );
+    assert_eq!(state["cwd"], WORKSPACE);
+    assert_eq!(state["cwd_stale"], false, "got: {state:#?}");
 }
 
 /// Every command that could reach the replica answers with a refusal rather than doing something

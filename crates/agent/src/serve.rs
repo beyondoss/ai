@@ -5832,7 +5832,7 @@ pub(crate) async fn serve_session(
                                                     m.insert("model".into(), json!(current_model));
                                                     m.insert("message_count".into(), Value::Null);
                                                     m.insert("title".into(), json!(persistence.meta.title));
-                                                    m.insert("cwd_stale".into(), json!(cwd_is_stale(&persistence.meta.cwd, &cwd)));
+                                                    m.insert("cwd_stale".into(), json!(mode.cwd_is_stale(&persistence.meta.cwd, &cwd)));
                                                     // Task #25 (pi-parity fix): same fields, same reasoning, as the idle `get_state` arm below.
                                                     m.insert("cwd".into(), json!(cwd.display().to_string()));
                                                     m.insert("git_branch".into(), json!(branch));
