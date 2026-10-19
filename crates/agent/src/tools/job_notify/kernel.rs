@@ -513,8 +513,16 @@ impl Kernel {
                 self.jobs.remove(&job);
             }
             Event::Use { now } => {
-                let quiet = self.last_end.is_none_or(|e| now >= e + USE_SPACING);
-                if self.has_unheld() && self.running.is_none() && self.next.is_none() && quiet {
+                if !self.has_unheld() {
+                    return out;
+                }
+                if self.running.is_some() {
+                    // The running reconcile may have listed before the end it would have found:
+                    // the next one is asked for, as a callback asks, and shared with any.
+                    self.next.get_or_insert_with(Batch::default);
+                } else if self.next.is_none()
+                    && self.last_end.is_none_or(|e| now >= e + USE_SPACING)
+                {
                     self.next = Some(Batch::default());
                     self.maybe_start(now, &mut out);
                 }
@@ -855,6 +863,52 @@ mod tests {
             ]
         );
         assert_eq!(k.job(J), None);
+    }
+
+    /// The model's trace, in the kernel's own events: a reconcile is running (it lists the job
+    /// still running), the sandbox dies, and a real use arrives while that reconcile runs. The use
+    /// must not be dropped: one more reconcile runs after the current one, finds the sandbox
+    /// unlistable, and the unheld job takes today's follow, so its end is noticed at that use.
+    #[test]
+    fn a_use_during_a_reconcile_asks_for_the_next() {
+        let mut k = unheld();
+        // A use starts a reconcile.
+        assert_eq!(
+            k.step(Event::Use { now: 0 }),
+            [Action::StartReconcile { reconcile: 0 }]
+        );
+        // The sandbox dies, and the session uses it again while the reconcile still runs.
+        assert!(
+            k.step(Event::Use { now: 100 }).is_empty(),
+            "never delays the use"
+        );
+        // The running reconcile listed before the death: the job looked fine.
+        let running = BTreeMap::from([(J.to_string(), Listed::Running)]);
+        let a = k.step(Event::Listed {
+            reconcile: 0,
+            jobs: Some(running),
+            now: 200,
+        });
+        assert!(a.is_empty(), "{a:?}");
+        // One more reconcile follows, a callback's spacing after the last.
+        assert_eq!(k.next_wake(), Some(200 + RECONCILE_SPACING));
+        let a = k.step(Event::Tick {
+            now: 200 + RECONCILE_SPACING,
+        });
+        assert_eq!(a, [Action::StartReconcile { reconcile: 1 }]);
+        let a = k.step(Event::Listed {
+            reconcile: 1,
+            jobs: None,
+            now: 1300,
+        });
+        assert_eq!(
+            a,
+            [Action::Follow {
+                job: J.into(),
+                from: 7,
+                end: None
+            }]
+        );
     }
 
     #[test]

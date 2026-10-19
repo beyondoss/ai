@@ -556,19 +556,21 @@
 //!   transcript switch). A callback changes nothing by itself: only what a reconcile lists changes a
 //!   job's state. (check: `job_notify::the_live_reconcile_changes_only_unheld_jobs`)
 //! - **N29** A live reconcile MUST start only for these: a callback for an unheld job; a release
-//!   (the release table); and a real use of the sandbox while the session has an unheld job. A *real
-//!   use* is any request the session sends its sandbox other than what this section causes: a
-//!   tool's command, a filesystem operation, discovery, a `bash_job` call. A use starts one only when
-//!   no reconcile ended in the last 30 s, and never delays the use. A replica MUST NOT contact a
-//!   sandbox about its unheld jobs on any timer. (check:
-//!   `job_notify::reconciles_only_on_a_callback_or_a_use`)
-//! - **N30** A session runs at most one reconcile at a time. A callback that arrives while one runs
-//!   waits for the next, and every callback that arrives during the same reconcile shares that next
-//!   one. The live reconcile a release starts MUST begin after that job's stream is closed (any frame
-//!   already read taken in first), and never shares one that began earlier. A reconcile that a
-//!   callback or a release started MUST NOT begin less than 1 s after the session's previous
-//!   reconcile ended, so a program in the sandbox that sends a real token in a loop costs at most one
-//!   reconcile a second. (check: `serve_job_ended::one_reconcile_at_a_time`)
+//!   (the release table); and a real use of the sandbox while the session has an unheld job. A
+//!   *real use* is any request the session sends its sandbox other than what this section causes: a
+//!   tool's command, a filesystem operation, discovery, a `bash_job` call. A use starts one only
+//!   when no reconcile ended in the last 30 s, and never delays the use; a use that arrives while
+//!   one runs asks for the next, as a callback does (N30), since the running one may have listed
+//!   before the end it would find. A replica MUST NOT contact a sandbox about its unheld jobs on
+//!   any timer. (check: `job_notify::reconciles_only_on_a_callback_or_a_use`)
+//! - **N30** A session runs at most one reconcile at a time. A callback or a real use that arrives
+//!   while one runs waits for the next, and every callback and use that arrives during the same
+//!   reconcile shares that next one. The live reconcile a release starts MUST begin after that
+//!   job's stream is closed (any frame already read taken in first), and never shares one that
+//!   began earlier. A reconcile that a callback, a release or a use during a reconcile started MUST
+//!   NOT begin less than 1 s after the session's previous reconcile ended, so a program in the
+//!   sandbox that sends a real token in a loop costs at most one reconcile a second. (check:
+//!   `serve_job_ended::one_reconcile_at_a_time`)
 //! - **N31** A callback for an unheld job MUST be answered `200` (with a `job_ended` `response`)
 //!   once a live reconcile that began after it arrived has listed the scope and handed its findings
 //!   to the session; reading the output is left to today's follow and is not waited for. It MUST be

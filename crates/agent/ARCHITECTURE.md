@@ -2640,7 +2640,7 @@ it, or cannot list the sandbox starts today's follow from the offset its stream 
 recorded at the listing's time, as a reopen records it); a listed `exited` is applied as a stream's
 `shell_exit`. The live reconcile's only request is `list`, through the job store, never through the
 exec cell, so it does not count as a use; every command and filesystem call through the cell does
-(`ExecCell::set_use_hook`), and starts one when no reconcile ended in the last 30 s. An open
+(`ExecCell::set_use_hook`), and starts one when no reconcile ended in the last 30 s, or, while one runs, asks for the next (the running one may have listed before the end). An open
 reconcile that adopts a kept, running job keeps it again with `notify` (`adopted`), its follow
 standing for the stream until the path is proved anew. The exec runner's HTTP client keeps an idle
 connection at most 30 s and sends no TCP keepalives, so nothing holds an unheld job's sandbox awake.
