@@ -6,9 +6,6 @@ use serde::Serialize;
 
 use super::*;
 
-/// fsync a path's parent directory so a just-created or just-renamed entry in it is itself durable
-/// (a file `sync_all` persists contents, not the dentry that names them). A best-effort no-op if the
-/// path has no parent.
 /// Parse one session-file line into an [`Entry`], recovering from one specific, narrow corruption
 /// instead of dropping the whole line the way the caller's generic `Err` handling otherwise would
 /// (pi-parity fix, pass 20): a hand-edited or externally corrupted `message` line with its `content`

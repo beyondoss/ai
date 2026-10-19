@@ -157,6 +157,9 @@ pub(super) fn keep_private(file: &File) -> std::io::Result<()> {
     Ok(())
 }
 
+/// fsync a path's parent directory so a just-created or just-renamed entry in it is itself durable
+/// (a file `sync_all` persists contents, not the dentry that names them). A best-effort no-op if the
+/// path has no parent.
 pub(super) fn fsync_dir(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         // Opening the directory read-only and `sync_all`ing it flushes its updated entries. Linux/macOS
