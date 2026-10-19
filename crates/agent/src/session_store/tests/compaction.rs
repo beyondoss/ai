@@ -704,3 +704,57 @@ fn torn_compaction_append_leaves_the_pre_compaction_state_fully_valid() {
         "the tip must still be the pre-compaction tip — an interrupted compaction simply never took effect"
     );
 }
+
+#[test]
+fn a_compaction_batch_torn_inside_the_new_chain_reopens_at_the_pre_compaction_tip() {
+    // The batch is one append: header, compaction record, then the new detached chain. A crash that
+    // keeps the first chain messages but not the last must not leave the tip on that partial chain
+    // (the summary plus some of the kept messages): the round either took effect whole or not at all.
+    let dir = tmpdir();
+    let repo = SessionRepo::open(dir.path()).unwrap();
+    let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+    let mut session = Session::new();
+    for text in ["one", "two", "three", "four", "five", "six"] {
+        session.user(text);
+    }
+    store.append_new(&session.messages).unwrap();
+    let old_ids = store.active_ids().to_vec();
+    let id = store.meta().id.clone();
+    let path = repo.find_path(&id).unwrap().unwrap();
+
+    let compacted = vec![
+        Message::user(format!(
+            "{}\n\nrecap",
+            agent_core::compaction::SUMMARY_MARKER
+        )),
+        session.messages[4].clone(),
+        session.messages[5].clone(),
+    ];
+    store
+        .rewrite_compacted(
+            &compacted,
+            CompactionMeta {
+                tokens_before: 1,
+                provenance: Default::default(),
+            },
+        )
+        .unwrap();
+    drop(store);
+
+    // Tear the file inside the last chain message: everything before it is intact.
+    let raw = fs::read(&path).unwrap();
+    let last_start = raw[..raw.len() - 1]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .unwrap()
+        + 1;
+    fs::write(&path, &raw[..last_start + 10]).unwrap();
+
+    let (reopened, restored) = repo.open_id(&id).unwrap();
+    assert_eq!(
+        reopened.active_ids(),
+        old_ids.as_slice(),
+        "a partially written compaction chain must not become the active path"
+    );
+    assert_eq!(restored.messages.len(), 6);
+}

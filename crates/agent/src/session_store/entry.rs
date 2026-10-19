@@ -123,6 +123,13 @@ pub(super) enum Entry {
         /// before requests were carried.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         user_requests: Vec<String>,
+        /// Ids of the new active path this round writes right after this record, oldest-first. The
+        /// whole batch is one append that a crash can cut short, so `SessionStore::open` moves the tip
+        /// only when the *last* of these is read: a chain cut off before then never becomes the active
+        /// path, and the session reopens at its pre-compaction tip. Empty on a record written before
+        /// this field existed (every chain message then moves the tip as it is read).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        chain_ids: Vec<String>,
     },
     /// A record that the active model changed, anchored to whatever message was the tip at the moment
     /// it did — see [`SessionStore::record_model_change`]/[`SessionStore::model_at`]. `parent_id` here

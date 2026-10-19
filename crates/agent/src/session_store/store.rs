@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -169,6 +169,10 @@ impl SessionStore {
         // what makes this correct when messages are appended *after* a `Leaf` (the tip must move back
         // to that latest message, not stay pinned at the leaf's target).
         let mut tip: Option<String> = None;
+        // Chain nodes of a compaction round before its last one (`Entry::Compaction::chain_ids`):
+        // read into the tree but not yet allowed to move `tip`, so a batch cut short mid-write leaves
+        // the tip where it was.
+        let mut held_tips: HashSet<String> = HashSet::new();
         let mut next_synth: u64 = 0;
         let mut branch_summary_details: HashMap<String, BranchSummaryDetails> = HashMap::new();
         let mut model_changes: HashMap<Option<String>, String> = HashMap::new();
@@ -270,7 +274,9 @@ impl SessionStore {
                             timestamp,
                         },
                     );
-                    tip = Some(id);
+                    if !held_tips.contains(&id) {
+                        tip = Some(id);
+                    }
                 }
                 // A target the tree never got (its line was unreadable) is ignored rather than
                 // followed: a tip naming no node would materialize as an empty session.
@@ -333,7 +339,9 @@ impl SessionStore {
                             timestamp,
                         },
                     );
-                    tip = Some(id);
+                    if !held_tips.contains(&id) {
+                        tip = Some(id);
+                    }
                 }
                 // Rewrites the target's content in place; never moves the tip (see `Entry::MessageEdit`).
                 Ok(Entry::MessageEdit { target_id, message }) => {
@@ -358,8 +366,12 @@ impl SessionStore {
                     todos,
                     memory_notes,
                     user_requests,
+                    chain_ids,
                     ..
                 }) => {
+                    if let Some((_, held)) = chain_ids.split_last() {
+                        held_tips.extend(held.iter().cloned());
+                    }
                     // Each record already carries every earlier round's file-provenance folded in
                     // (via `merge_provenance`, before it was even written — see
                     // `CompactionMeta::provenance`'s doc comment), so it's a complete,
