@@ -5154,7 +5154,7 @@ skill/template paths, memory backend, session directory, model or gateway URL), 
 ### The session
 
 `service.rs` answers each of these, through [`mode.rs`](src/mode.rs)'s `Mode`; `serve_session` delegates rather than branching inline.
-`main.rs` decides the mode once from the flags (`Mode::process`: `Local`, or `Replica` for a `--service` process with no grant yet) and carries it in `ServeConfig.mode`; each connection binds it to its verified grant (`Mode::Service`). Startup, the daemon and the session all ask `Mode`, so no file outside `mode.rs` branches on whether service mode is on.
+`main.rs` decides the mode once from the flags (`Mode::process`: `Local`, or `Replica` for a `--service` process with no grant yet) and carries it in `ServeConfig.mode`; each connection binds it to its verified grant (`Mode::Service`). Startup, the daemon and the session all ask `Mode`, so no file outside `mode.rs` branches on whether service mode is on. `tests/structure_lint.rs` enforces it (and a 300-line budget per function, with a reviewed `OVER_BUDGET` ratchet for the few functions over it): a new inline mode check, or a function that outgrows the budget, fails the test and names the fix.
 
 - **Persistence** opens a repo at `service.session_dir` with **no fallback** — a `Replica`
   mode that reached a session without a grant is an error, never the per-cwd default repo.
