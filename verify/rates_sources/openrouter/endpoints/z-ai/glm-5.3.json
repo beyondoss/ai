@@ -57,10 +57,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000015708",
-          "discount": 0.643,
-          "input_cache_read": "0.00000009282",
-          "prompt": "0.0000004998"
+          "completion": "0.0000044",
+          "discount": 0,
+          "input_cache_read": "0.00000026",
+          "prompt": "0.0000014"
         },
         "provider_name": "Baidu",
         "quantization": "fp8",
@@ -150,7 +150,7 @@
         "pricing": {
           "completion": "0.0000044",
           "discount": 0,
-          "input_cache_read": "0.00000013",
+          "input_cache_read": "0.00000026",
           "prompt": "0.0000014"
         },
         "provider_name": "Crusoe",
@@ -252,10 +252,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000308",
-          "discount": 0.3,
-          "input_cache_read": "0.000000182",
-          "prompt": "0.00000098"
+          "completion": "0.0000044",
+          "discount": 0,
+          "input_cache_read": "0.00000026",
+          "prompt": "0.0000014"
         },
         "provider_name": "GMICloud",
         "quantization": "fp8",
@@ -384,8 +384,8 @@
         "pricing": {
           "completion": "0.000006",
           "discount": 0,
-          "input_cache_read": "0.000000054",
-          "prompt": "0.000000087"
+          "input_cache_read": "0.000000025",
+          "prompt": "0.00000004"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -472,10 +472,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000022",
+          "completion": "0.000001",
           "discount": 0,
-          "input_cache_read": "0.00000007",
-          "prompt": "0.000000075"
+          "input_cache_read": "0.000000075",
+          "prompt": "0.000000079"
         },
         "provider_name": "Relace",
         "quantization": "unknown",
@@ -521,6 +521,19 @@
         "tag": "siliconflow/fp8"
       },
       {
+        "context_length": 1044480,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000025",
+          "discount": 0,
+          "input_cache_read": "0.0000001",
+          "prompt": "0.0000006"
+        },
+        "provider_name": "Tenstorrent",
+        "quantization": "fp8",
+        "tag": "tenstorrent/fp8"
+      },
+      {
         "context_length": 1048575,
         "max_prompt_tokens": null,
         "pricing": {
@@ -563,7 +576,7 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000001",
+          "completion": "0.0000014",
           "discount": 0,
           "input_cache_read": "0.000000078",
           "prompt": "0.000000079"

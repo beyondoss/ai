@@ -5,9 +5,9 @@
         "context_length": 1000000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000006",
+          "completion": "0.0000012",
           "discount": 0,
-          "input_cache_read": "0.000000015",
+          "input_cache_read": "0.00000003",
           "overrides": [
             {
               "completion": "0.0000012",
@@ -24,7 +24,7 @@
               "utc_start": 1400
             }
           ],
-          "prompt": "0.00000015"
+          "prompt": "0.0000003"
         },
         "provider_name": "Alibaba",
         "quantization": "unknown",
@@ -281,10 +281,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000055",
+          "completion": "0.0000006",
           "discount": 0,
           "input_cache_read": "0.000000007",
-          "prompt": "0.000000076"
+          "prompt": "0.000000056"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -319,10 +319,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000000144",
+          "completion": "0.00000008",
           "discount": 0,
           "input_cache_read": "0.0000000016",
-          "prompt": "0.0000000616"
+          "prompt": "0.0000000448"
         },
         "provider_name": "OpenInference",
         "quantization": "fp4",
@@ -371,10 +371,23 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000003",
+          "completion": "0.0000001",
           "discount": 0,
-          "input_cache_read": "0.000000006",
-          "prompt": "0.00000009"
+          "input_cache_read": "0.000000016",
+          "prompt": "0.0000002"
+        },
+        "provider_name": "Relace",
+        "quantization": "unknown",
+        "tag": "relace"
+      },
+      {
+        "context_length": 1048576,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000015",
+          "discount": 0,
+          "input_cache_read": "0.000000006735",
+          "prompt": "0.000000101"
         },
         "provider_name": "Sail Research",
         "quantization": "fp4",

@@ -31,10 +31,10 @@
         "context_length": 202752,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000030316",
-          "discount": 0.311,
-          "input_cache_read": "0.00000017914",
-          "prompt": "0.0000009646"
+          "completion": "0.0000044",
+          "discount": 0,
+          "input_cache_read": "0.00000026",
+          "prompt": "0.0000014"
         },
         "provider_name": "Baidu",
         "quantization": "fp8",

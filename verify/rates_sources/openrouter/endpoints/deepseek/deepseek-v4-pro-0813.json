@@ -5,9 +5,9 @@
         "context_length": 1000000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000017424",
+          "completion": "0.000003366",
           "discount": 0,
-          "input_cache_read": "0.00000005808",
+          "input_cache_read": "0.0000001122",
           "overrides": [
             {
               "completion": "0.000003366",
@@ -24,7 +24,7 @@
               "utc_start": 1400
             }
           ],
-          "prompt": "0.0000005808"
+          "prompt": "0.000001122"
         },
         "provider_name": "Alibaba",
         "quantization": "unknown",
@@ -34,9 +34,9 @@
         "context_length": 1000000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000198",
+          "completion": "0.00000396",
           "discount": 0,
-          "input_cache_read": "0.000000066",
+          "input_cache_read": "0.000000132",
           "overrides": [
             {
               "completion": "0.00000396",
@@ -53,7 +53,7 @@
               "utc_start": 1400
             }
           ],
-          "prompt": "0.00000066"
+          "prompt": "0.00000132"
         },
         "provider_name": "Alibaba",
         "quantization": "unknown",
@@ -76,10 +76,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000039996",
-          "discount": 0.899,
-          "input_cache_read": "0.000000004242",
-          "prompt": "0.00000013332"
+          "completion": "0.00000396",
+          "discount": 0,
+          "input_cache_read": "0.000000042",
+          "prompt": "0.00000132"
         },
         "provider_name": "Baidu",
         "quantization": "fp8",
@@ -128,9 +128,9 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000198",
+          "completion": "0.00000396",
           "discount": 0,
-          "input_cache_read": "0.000000022",
+          "input_cache_read": "0.000000044",
           "overrides": [
             {
               "completion": "0.00000198",
@@ -212,7 +212,7 @@
               "utc_start": 1000
             }
           ],
-          "prompt": "0.00000066"
+          "prompt": "0.00000132"
         },
         "provider_name": "DeepSeek",
         "quantization": "unknown",
@@ -300,10 +300,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000028776",
-          "discount": 0.34,
-          "input_cache_read": "0.000000099",
-          "prompt": "0.000000957"
+          "completion": "0.00000436",
+          "discount": 0,
+          "input_cache_read": "0.00000015",
+          "prompt": "0.00000145"
         },
         "provider_name": "Phala",
         "quantization": "unknown",
@@ -315,8 +315,8 @@
         "pricing": {
           "completion": "0.000008",
           "discount": 0,
-          "input_cache_read": "0.00000012",
-          "prompt": "0.00000012"
+          "input_cache_read": "0.00000023",
+          "prompt": "0.000000225"
         },
         "provider_name": "Relace",
         "quantization": "fp4",
@@ -326,10 +326,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000001164",
+          "completion": "0.000000582",
           "discount": 0,
-          "input_cache_read": "0.0000000935",
-          "prompt": "0.000000448"
+          "input_cache_read": "0.000000187",
+          "prompt": "0.000000896"
         },
         "provider_name": "Sail Research",
         "quantization": "fp4",
@@ -339,10 +339,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000001164",
+          "completion": "0.000000582",
           "discount": 0,
-          "input_cache_read": "0.0000000935",
-          "prompt": "0.000000448"
+          "input_cache_read": "0.000000187",
+          "prompt": "0.000000896"
         },
         "provider_name": "Sail Research",
         "quantization": "fp4",

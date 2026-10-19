@@ -165,7 +165,7 @@
           "completion": "0.000011936",
           "discount": 0,
           "input_cache_read": "0.00000021",
-          "prompt": "0.000000249"
+          "prompt": "0.000000239"
         },
         "provider_name": "InferenceNet",
         "quantization": "fp4",
@@ -216,8 +216,8 @@
         "pricing": {
           "completion": "0.0000149",
           "discount": 0,
-          "input_cache_read": "0.000000238",
-          "prompt": "0.0000003"
+          "input_cache_read": "0.000000212",
+          "prompt": "0.000000243"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -266,10 +266,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000014",
+          "completion": "0.000003",
           "discount": 0,
-          "input_cache_read": "0.00000021",
-          "prompt": "0.00000025"
+          "input_cache_read": "0.0000006",
+          "prompt": "0.0000008"
         },
         "provider_name": "Relace",
         "quantization": "fp4",
@@ -279,10 +279,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000081",
+          "completion": "0.000009",
           "discount": 0,
-          "input_cache_read": "0.00000018",
-          "prompt": "0.000000504"
+          "input_cache_read": "0.0000004",
+          "prompt": "0.0000012"
         },
         "provider_name": "Sail Research",
         "quantization": "fp4",
@@ -292,10 +292,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000135",
+          "completion": "0.000009",
           "discount": 0,
-          "input_cache_read": "0.0000003",
-          "prompt": "0.00000084"
+          "input_cache_read": "0.0000004",
+          "prompt": "0.0000012"
         },
         "provider_name": "Sail Research",
         "quantization": "fp4",
@@ -320,8 +320,8 @@
         "pricing": {
           "completion": "0.000016",
           "discount": 0,
-          "input_cache_read": "0.00000027",
-          "prompt": "0.00000028"
+          "input_cache_read": "0.000000228",
+          "prompt": "0.000000238"
         },
         "provider_name": "Wafer",
         "quantization": "mxfp4",

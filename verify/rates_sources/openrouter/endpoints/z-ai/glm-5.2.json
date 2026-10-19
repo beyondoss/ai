@@ -70,10 +70,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000000594",
-          "discount": 0.865,
-          "input_cache_read": "0.0000000351",
-          "prompt": "0.000000189"
+          "completion": "0.0000044",
+          "discount": 0,
+          "input_cache_read": "0.00000026",
+          "prompt": "0.0000014"
         },
         "provider_name": "Baidu",
         "quantization": "fp8",
@@ -239,7 +239,7 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000010395",
+          "completion": "0.00000252",
           "discount": 0,
           "input_cache_read": "0.00000014",
           "prompt": "0.00000069"
@@ -280,8 +280,8 @@
         "pricing": {
           "completion": "0.000006",
           "discount": 0,
-          "input_cache_read": "0.000000054",
-          "prompt": "0.000000087"
+          "input_cache_read": "0.000000025",
+          "prompt": "0.00000004"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -355,10 +355,10 @@
         "context_length": 1024000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000174592",
-          "discount": 0.6032,
-          "input_cache_read": "0.000000103168",
-          "prompt": "0.00000055552"
+          "completion": "0.00000192676",
+          "discount": 0.5621,
+          "input_cache_read": "0.000000113854",
+          "prompt": "0.00000061306"
         },
         "provider_name": "StreamLake",
         "quantization": "fp8",
@@ -394,7 +394,7 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00001",
+          "completion": "0.000008",
           "discount": 0,
           "input_cache_read": "0.00000018",
           "prompt": "0.00000019"
