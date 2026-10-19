@@ -2226,13 +2226,15 @@ trailing `/` (the walk entry's own cached `file_type()`, not a second `stat`) �
 own default, which pi's `find.ts` relies on as-is; without it the model had no way to tell a hit like
 `src/components` was a directory vs. an extension-less file short of an extra `ls`/`bash` call.
 
-Both tools collect into a `Vec`, **sort by path** (`grep` then by line), and `truncate(limit)` —
-so which results survive a `limit` cutoff is the lexicographically-smallest set, not whatever order
-threads happened to finish in (`grep.rs:Lab — output_is_path_sorted_and_deterministic` and the
-matching `find` test assert this byte-for-byte across repeated runs). A `HARD_CAP` of 10,000
-collected items is an OOM guard for pathological patterns; if it trips, the _output_ still gets
-sorted+truncated deterministically, but which items entered the collected set before the cap tripped
-can vary — the tool flags this in its trailing `"… limit reached"` line either way.
+Both tools collect into a `Vec`, **sort by path** (`grep` then by line), and `truncate(limit)`. An
+**untruncated** result is therefore byte-stable run to run (`grep.rs:Lab —
+output_is_path_sorted_and_deterministic` and the matching `find` test assert this across repeated
+runs). A **truncated** one differs by tool. `find`'s walk is sequential and complete, so it keeps the
+lexicographically-smallest paths unless the `HARD_CAP` of 10,000 collected items (an OOM guard) trips,
+after which which items were collected can vary. `grep`'s parallel walk quits as soon as it has
+enough matches (`fs/local.rs`), so a truncated `grep` returns `limit` matches from wherever the walk
+had reached, sorted but not guaranteed to be the smallest by path. The tool descriptions say exactly
+this, and the trailing `"… limit reached"` line flags truncation either way.
 **Deliberate divergence, awareness-only: this sort is Beyond-specific, not a parity match.** pi's own
 `grep.ts`/`find.ts` relay `rg --json`/`fd`'s raw stdout arrival order verbatim (confirmed: neither file
 contains a `.sort(` call at all) — usually walk order, never a documented contract, and not

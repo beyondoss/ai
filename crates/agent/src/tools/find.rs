@@ -71,8 +71,8 @@ impl Tool for Find {
                 "Find files by glob pattern (e.g. \"*.rs\", \"src/**/*.test.ts\"), honoring \
                  .gitignore and skipping .git (pass a path inside it to search it). A pattern without \"/\" matches the file name; with \"/\" it matches the \
                  full path. Results are sorted by path and truncated to at most {DEFAULT_LIMIT} paths \
-                 or {}, whichever is hit first; when truncated, the lexicographically-smallest paths \
-                 are reported. Paths are relative to the working directory (absolute outside it), \
+                 or {}, whichever is hit first; when truncated, the first paths by sort order \
+                 are reported (the walk gives up after 10000 candidates). Paths are relative to the working directory (absolute outside it), \
                  so `read` opens them as printed.",
                 super::output::format_size(super::output::MAX_LISTING_BYTES as u64)
             )
