@@ -21,6 +21,9 @@ workspace = true
 # The harness core. Depended on by package name; imported as `agent_core` (its lib name).
 async-trait.workspace = true
 beyond-ai-agent-core = { path = "../agent-core" }
+# The exec protocol v1.4 notification kernel (`exec_endpoint::notify_kernel`): zero dependencies,
+# shared with every endpoint that calls back, the reference mock included.
+beyond-ai-exec-notify = { path = "../exec-notify" }
 # `serve`'s `OutFrame::Raw` payload: a serialized event line shared — by refcount bump, not deep copy —
 # across the in-flight-turn recording and every attached connection's sink on the per-event fan-out
 # hot path. Same zero-copy byte buffer `agent-core` frames SSE lines with.

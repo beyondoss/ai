@@ -1,0 +1,236 @@
+//! The exec protocol v1.4 **notification kernel**: when a sandbox calls back about a kept job, as
+//! one pure function, [`step`].
+//!
+//! The normative spec is `crates/agent/src/exec_endpoint.rs` ("Sandbox job notify (v1.4)", "When
+//! the endpoint calls back", "The answer, and retries"). Everything an endpoint must decide about
+//! *when* to call back is here, and nothing else: one notification per job at a time; what is owed,
+//! and an answer settling only what was owed when its attempt began; retry or stop by status; the
+//! schedule; abandoning what is in flight when a new `keep` arrives; and none of it once the job is
+//! removed or its latest `keep` carries no `notify`. Making the request (one `POST`, no redirects, a
+//! verified server, 30 s at most) is the caller's, and so is the clock: time arrives as an input,
+//! a random draw arrives with the event that needs one, and nothing here does I/O or waits.
+//!
+//! An endpoint drives it per job: feed every [`Event`] with the time, keep the [`Job`] it returns,
+//! and carry out the [`Action`]s: begin an attempt (with the job's notify as recorded *now*),
+//! abandon the one in flight, or be woken at a time and feed [`Event::Wake`]. The reference endpoint
+//! (`beyond-ai-test-support`'s `exec_mock`) does exactly that; the baseline's shell supervisor
+//! follows the same rules in `sh`, and a differential test holds the two together. A model checker
+//! calls [`step`] as production does.
+
+/// The most attempts one count makes (N18).
+pub const MAX_ATTEMPTS: u32 = 12;
+
+/// How long one attempt may take before it counts as a connection error, in milliseconds (N16).
+pub const ATTEMPT_TIMEOUT_MS: u64 = 30_000;
+
+/// One job's notification state. `Default` is a job never kept with `notify`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Job {
+    /// The latest `keep` carried `notify`.
+    pub notify: bool,
+    /// The job was removed (`remove`, `kill` with `remove`, `wipe`): nothing more, ever.
+    pub removed: bool,
+    /// How many callbacks the job has been owed: one per accepted `keep` with `notify`, one per
+    /// state change while such a keep governs.
+    pub owed: u64,
+    /// How many of those an answer (or the end of a count) has settled.
+    pub settled: u64,
+    /// The attempt in flight, if any, as the `owed` it carries: what was owed when it began.
+    pub in_flight: Option<u64>,
+    /// Attempts made in the current count.
+    pub attempts: u32,
+    /// When the next attempt of the current count may begin, while it waits.
+    pub wake_at: Option<u64>,
+}
+
+/// What happened to a job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Event {
+    /// An accepted `keep`, with `notify` or without it. With it, the job is owed a callback (the
+    /// proof) and whatever was in flight is abandoned; without it, nothing more is sent.
+    Keep { notify: bool },
+    /// A state change while the job's latest keep carries `notify`: the moment a held stream would
+    /// send `shell_exit`, or the job's end becoming observable.
+    Change,
+    /// The job was removed.
+    Removed,
+    /// The attempt in flight ended so. `draw` is a fresh uniform `u32`; the wait before a retry is
+    /// `d(n) · (1 − u/2)` with `u = draw / 2³²`.
+    AttemptEnded { outcome: Outcome, draw: u32 },
+    /// A time the kernel asked to be woken at ([`Action::WakeAt`]) has come.
+    Wake,
+}
+
+/// How one attempt ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Outcome {
+    /// An answer with this status.
+    Status(u16),
+    /// No status: a connection error, a TLS failure, or no complete answer within 30 s.
+    Failed,
+}
+
+/// What the endpoint does next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Action {
+    /// Begin attempt `attempt` (1 for a count's first) with the job's notify as recorded now.
+    Begin { attempt: u32 },
+    /// Abandon the attempt in flight, its connection included.
+    Abandon,
+    /// Feed [`Event::Wake`] at this time (milliseconds, on the caller's clock).
+    WakeAt(u64),
+}
+
+/// What an attempt's answer means (N17).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Verdict {
+    /// The receiver took the hint: what the attempt carried is settled.
+    Done,
+    /// It never will, or the request itself is wrong: settled, and not sent again.
+    Stop,
+    /// Not now: try again, per the schedule.
+    Retry,
+}
+
+/// The spec's table of answers.
+pub fn verdict(outcome: Outcome) -> Verdict {
+    match outcome {
+        Outcome::Failed => Verdict::Retry,
+        Outcome::Status(200..=299) => Verdict::Done,
+        Outcome::Status(401 | 403 | 404 | 410) => Verdict::Stop,
+        Outcome::Status(407 | 408 | 425 | 429 | 500..=599) => Verdict::Retry,
+        Outcome::Status(_) => Verdict::Stop,
+    }
+}
+
+/// `u` in `[0, 1)` for a draw.
+pub fn uniform(draw: u32) -> f64 {
+    f64::from(draw) / 4_294_967_296.0
+}
+
+/// The wait after failed attempt `n` (1 … 11), in milliseconds: `d(n) · (1 − u/2)` with
+/// `d(n) = min(2^(n−1), 60)` s (N18), rounded to the nearest millisecond.
+pub fn wait_ms(n: u32, u: f64) -> u64 {
+    let d = 2f64.powi(n.saturating_sub(1).min(16) as i32).min(60.0);
+    (d * 1000.0 * (1.0 - u / 2.0)).round() as u64
+}
+
+/// The callback body (N14): exactly `type`, `scope` and `id`, in that order, as JSON strings.
+pub fn body(scope: &str, id: &str) -> String {
+    let mut out = String::with_capacity(40 + scope.len() + id.len());
+    out.push_str("{\"type\":\"job_ended\",\"scope\":");
+    json_string(&mut out, scope);
+    out.push_str(",\"id\":");
+    json_string(&mut out, id);
+    out.push('}');
+    out
+}
+
+fn json_string(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// One step: the job's next state, and what to do. Pure: the same inputs give the same outputs.
+pub fn step(job: Job, event: Event, now: u64) -> (Job, Vec<Action>) {
+    let mut j = job;
+    let mut out = Vec::new();
+    if j.removed {
+        return (j, out);
+    }
+    match event {
+        Event::Keep { notify } => {
+            if j.in_flight.take().is_some() {
+                out.push(Action::Abandon);
+            }
+            j.wake_at = None;
+            j.attempts = 0;
+            j.notify = notify;
+            if notify {
+                j.owed += 1;
+                begin(&mut j, &mut out);
+            } else {
+                j.settled = j.owed;
+            }
+        }
+        Event::Change => {
+            if !j.notify {
+                return (j, out);
+            }
+            j.owed += 1;
+            if j.in_flight.is_none() {
+                // Idle, or waiting out a retry: a new count begins now.
+                j.wake_at = None;
+                j.attempts = 0;
+                begin(&mut j, &mut out);
+            }
+        }
+        Event::Removed => {
+            if j.in_flight.take().is_some() {
+                out.push(Action::Abandon);
+            }
+            j = Job {
+                removed: true,
+                ..Job::default()
+            };
+        }
+        Event::AttemptEnded { outcome, draw } => {
+            let Some(carried) = j.in_flight.take() else {
+                return (j, out);
+            };
+            match verdict(outcome) {
+                Verdict::Done | Verdict::Stop => {
+                    j.settled = j.settled.max(carried);
+                    j.attempts = 0;
+                }
+                Verdict::Retry if j.owed > carried => j.attempts = 0,
+                Verdict::Retry if j.attempts >= MAX_ATTEMPTS => {
+                    j.settled = j.settled.max(carried);
+                    j.attempts = 0;
+                }
+                Verdict::Retry => {
+                    let at = now + wait_ms(j.attempts, uniform(draw));
+                    j.wake_at = Some(at);
+                    out.push(Action::WakeAt(at));
+                    return (j, out);
+                }
+            }
+            if j.notify && j.owed > j.settled {
+                begin(&mut j, &mut out);
+            }
+        }
+        Event::Wake => {
+            if j.in_flight.is_none()
+                && j.notify
+                && j.owed > j.settled
+                && j.wake_at.is_some_and(|at| at <= now)
+            {
+                begin(&mut j, &mut out);
+            }
+        }
+    }
+    (j, out)
+}
+
+fn begin(j: &mut Job, out: &mut Vec<Action>) {
+    j.wake_at = None;
+    j.attempts += 1;
+    j.in_flight = Some(j.owed);
+    out.push(Action::Begin {
+        attempt: j.attempts,
+    });
+}
+
+#[cfg(test)]
+mod tests;

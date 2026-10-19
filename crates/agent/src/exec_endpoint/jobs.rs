@@ -272,6 +272,23 @@ pub enum JobEvent<'a> {
 /// Where a job's events go.
 pub type EventSink<'a> = &'a (dyn Fn(JobEvent<'_>) + Send + Sync);
 
+/// `keep`'s `notify` (v1.4): where the sandbox reports a kept job's state changes, and the token it
+/// sends there. `Debug` never shows the token, so it cannot reach a log by way of a `{:?}`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct JobNotify {
+    pub url: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for JobNotify {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobNotify")
+            .field("url", &self.url)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
 /// The operations a sandbox offers on jobs. Every operation is idempotent where it can be: keeping a
 /// kept job, removing a removed one and killing an ended one are no-ops.
 #[async_trait]
@@ -332,6 +349,31 @@ pub trait SandboxJobs: Send + Sync {
         kind: &str,
         seen: u64,
     ) -> std::io::Result<()>;
+
+    /// Whether `keep` can carry `notify` here (v1.4): the endpoint offers it natively, or for the
+    /// baseline. Probed with the rest of the job capability.
+    async fn offers_notify(&self) -> bool {
+        false
+    }
+
+    /// [`Self::keep`] carrying `notify` (v1.4). A sandbox that refuses the `notify` (`400`: it fails
+    /// the spec's grammar, or this job cannot be notified about) records nothing, and the error's
+    /// kind is [`std::io::ErrorKind::InvalidInput`]; the job is then kept with a plain `keep`, or not
+    /// at all. A plain `keep` afterwards removes the job's `notify`.
+    async fn keep_notify(
+        &self,
+        _scope: &JobScope,
+        _id: &JobId,
+        _num: u64,
+        _kind: &str,
+        _seen: u64,
+        _notify: &JobNotify,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this sandbox does not offer job notify (v1.4)",
+        ))
+    }
 
     /// Record the offset of the output the model has been shown.
     async fn seen(&self, scope: &JobScope, id: &JobId, offset: u64) -> std::io::Result<()>;

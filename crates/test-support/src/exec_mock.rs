@@ -15,6 +15,14 @@
 //! ([`MockOptions::jobs`]): what a real sandbox should be, so every suite that does not ask for
 //! something else exercises the newest path. `jobs: false` is a v1.2-only endpoint, on which the
 //! agent falls back to running jobs with plain exec commands (the baseline).
+//!
+//! It is also the reference **v1.4** endpoint (job notify): `keep` takes `notify`, and its own sender
+//! calls back at `keep` and at each state change, with the spec's retry schedule, status table, no
+//! redirects and a verified server. Like the spec's deployment setting, it advertises notify only
+//! when told its kept jobs survive idling ([`MockOptions::notifying`]); with `jobs: false` the
+//! advertisement is for the baseline. The proof matrix's failure modes are options too: lost
+//! callbacks, a slow `keep`, no egress, and a sandbox that kills idle jobs. [`CallbackReceiver`] is
+//! the fleet's side of a callback, for the suites that watch one arrive.
 
 #![allow(dead_code)]
 
@@ -25,6 +33,9 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// The v1.4 notification kernel, which this endpoint drives, re-exported for the suites.
+pub use exec_notify;
 
 /// One recorded request: its headers (lowercased names) and its JSON body.
 #[derive(Clone, Debug)]
@@ -96,6 +107,39 @@ pub struct MockOptions {
     pub jobs_hold_kills: bool,
     /// How much of a job's output is kept; older bytes are dropped and read back as a gap.
     pub job_output_cap: usize,
+    /// The endpoint implements v1.4: `keep` takes `notify`, and its own sender (in this process)
+    /// calls back. `false` is a v1.3 endpoint, to which `notify` is an unknown field.
+    pub notify: bool,
+    /// The deployment's setting that a kept job survives its sandbox going idle. Notify is
+    /// advertised only when it is on (and there is egress), and like the spec's setting it is off
+    /// unless turned on. With [`Self::jobs`] off the advertisement is for the baseline.
+    pub kept_jobs_survive_idle: bool,
+    /// The sandbox kills every job once no request has been open for this long (a vendor's
+    /// auto-stop). An honest deployment of it leaves [`Self::kept_jobs_survive_idle`] off, and so
+    /// does not advertise notify; turning both on is the misconfigured endpoint a verifier must
+    /// catch.
+    pub idle_kill: Option<Duration>,
+    /// The sandbox can reach the network. Without it the endpoint knows, and does not advertise
+    /// notify; an attempt made anyway is a connection error.
+    pub egress: bool,
+    /// Which callbacks go missing: their notifications are never sent at all.
+    pub lose_callbacks: LoseCallbacks,
+    /// How long `keep` waits to answer once it has recorded the keep and started its proof, so a
+    /// callback can overtake the answer.
+    pub keep_delay: Duration,
+}
+
+/// Which v1.4 notifications a [`MockOptions::lose_callbacks`] endpoint never sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoseCallbacks {
+    /// None: every notification is sent.
+    None,
+    /// The proof at `keep`.
+    Proof,
+    /// The state changes: the shell's exit with leftovers, and the job's end.
+    Changes,
+    /// Every one.
+    All,
 }
 
 impl Default for MockOptions {
@@ -110,7 +154,29 @@ impl Default for MockOptions {
             jobs: true,
             jobs_hold_kills: true,
             job_output_cap: 8 * 1024 * 1024,
+            notify: true,
+            kept_jobs_survive_idle: false,
+            idle_kill: None,
+            egress: true,
+            lose_callbacks: LoseCallbacks::None,
+            keep_delay: Duration::ZERO,
         }
+    }
+}
+
+impl MockOptions {
+    /// A conforming v1.4 endpoint: v1.3 jobs, and notify advertised (its deployment says kept jobs
+    /// survive idling).
+    pub fn notifying() -> Self {
+        Self {
+            kept_jobs_survive_idle: true,
+            ..Self::default()
+        }
+    }
+
+    /// Whether the job probe's answer offers notify (natively, or for the baseline).
+    pub fn advertises_notify(&self) -> bool {
+        self.notify && self.kept_jobs_survive_idle && self.egress
     }
 }
 
@@ -146,6 +212,7 @@ pub struct ExecMock {
     pub url: String,
     requests: Arc<Mutex<Vec<ExecRequest>>>,
     streams: Arc<Mutex<Vec<StreamRecord>>>,
+    callbacks: Arc<Mutex<Vec<CallbackAttempt>>>,
 }
 
 #[derive(Clone)]
@@ -155,6 +222,13 @@ struct Shared {
     requests: Arc<Mutex<Vec<ExecRequest>>>,
     streams: Arc<Mutex<Vec<StreamRecord>>>,
     jobs: Jobs,
+    callbacks: Arc<Mutex<Vec<CallbackAttempt>>>,
+    /// The callback client, built on the first attempt.
+    client: Arc<tokio::sync::OnceCell<reqwest::Client>>,
+    /// Requests open now, and when the last one closed: what [`MockOptions::idle_kill`] watches.
+    activity: Arc<Mutex<(usize, Instant)>>,
+    /// The kernel's clock starts here.
+    epoch: Instant,
 }
 
 impl ExecMock {
@@ -215,12 +289,20 @@ impl ExecMock {
             requests: Arc::default(),
             streams: Arc::default(),
             jobs: Jobs::default(),
+            callbacks: Arc::default(),
+            client: Arc::default(),
+            activity: Arc::new(Mutex::new((0, Instant::now()))),
+            epoch: Instant::now(),
         };
         let mock = Self {
             url,
             requests: shared.requests.clone(),
             streams: shared.streams.clone(),
+            callbacks: shared.callbacks.clone(),
         };
+        if let Some(idle) = shared.opts.idle_kill {
+            tokio::spawn(idle_killer(shared.clone(), idle));
+        }
         tokio::spawn(async move {
             while let Ok((sock, _)) = listener.accept().await {
                 tokio::spawn(serve_one(sock, shared.clone()));
@@ -236,6 +318,11 @@ impl ExecMock {
     /// Every request body, for suites that only care about the protocol.
     pub fn bodies(&self) -> Vec<Value> {
         self.requests().into_iter().map(|r| r.body).collect()
+    }
+
+    /// Every v1.4 callback attempt so far, in the order they ended.
+    pub fn callbacks(&self) -> Vec<CallbackAttempt> {
+        self.callbacks.lock().unwrap().clone()
     }
 
     /// Every streamed command so far, in the order they started.
@@ -348,7 +435,26 @@ async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<(Vec<(String, 
     Some((headers, req))
 }
 
+/// Counts a request as open for as long as it lives — for [`MockOptions::idle_kill`].
+struct Open(Arc<Mutex<(usize, Instant)>>);
+
+impl Open {
+    fn new(activity: &Arc<Mutex<(usize, Instant)>>) -> Self {
+        activity.lock().unwrap().0 += 1;
+        Self(activity.clone())
+    }
+}
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        let mut a = self.0.lock().unwrap();
+        a.0 -= 1;
+        a.1 = Instant::now();
+    }
+}
+
 async fn serve_one(mut sock: tokio::net::TcpStream, shared: Shared) {
+    let _open = Open::new(&shared.activity);
     let Some((headers, req)) = read_request(&mut sock).await else {
         return;
     };
@@ -358,6 +464,12 @@ async fn serve_one(mut sock: tokio::net::TcpStream, shared: Shared) {
     });
     if shared.opts.jobs && req.get("job").is_some_and(Value::is_object) {
         serve_job(sock, req, shared).await;
+        return;
+    }
+    // Without native jobs the field is unknown and the command runs, except that an endpoint
+    // offering notify for the baseline answers the probe (v1.4).
+    if req["job"]["op"] == "probe" && shared.opts.advertises_notify() {
+        respond_json(sock, 200, &json!({ "notify": NOTIFY_VERSION })).await;
         return;
     }
     let wants_stream = req["stream"].as_bool() == Some(true);
@@ -662,6 +774,10 @@ struct MockJob {
     num: Option<u64>,
     kind: Option<String>,
     seen: u64,
+    /// The latest `keep`'s `notify` (v1.4), if it carried one.
+    notify: Option<NotifyTarget>,
+    /// When it calls back: the kernel's state, and the attempt or timer it has going.
+    notifier: Notifier,
 }
 
 /// Every job, by `(scope, id)`, and a counter bumped on every change.
@@ -778,7 +894,13 @@ async fn serve_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
         .unwrap_or_default();
     let jobs = shared.jobs.clone();
     match op {
-        "probe" => respond_json(sock, 200, &json!({ "jobs": "v1.3" })).await,
+        "probe" => {
+            let mut answer = json!({ "jobs": "v1.3" });
+            if shared.opts.advertises_notify() {
+                answer["notify"] = json!(NOTIFY_VERSION);
+            }
+            respond_json(sock, 200, &answer).await
+        }
         "start" => start_job(sock, req.clone(), shared).await,
         "attach" => {
             let id = job["id"].as_str().unwrap_or("").to_string();
@@ -817,6 +939,22 @@ async fn serve_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
         }
         "keep" | "seen" => {
             let id = job["id"].as_str().unwrap_or("");
+            // v1.4: a `notify` that fails the grammar refuses the whole `keep`, before anything is
+            // recorded. The reason never quotes the token.
+            let notify = match job.get("notify") {
+                Some(n) if op == "keep" && shared.opts.notify => match parse_notify(n) {
+                    Ok(t) => Some(t),
+                    Err(why) => {
+                        return respond_json(
+                            sock,
+                            400,
+                            &json!({ "error": format!("refused notify: {why}") }),
+                        )
+                        .await;
+                    }
+                },
+                _ => None,
+            };
             let found = {
                 let mut map = jobs.map.lock().unwrap();
                 match map.get_mut(&key(id)) {
@@ -826,6 +964,13 @@ async fn serve_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
                             j.num = job["num"].as_u64();
                             j.kind = job["kind"].as_str().map(str::to_string);
                             j.seen = job["seen"].as_u64().unwrap_or(j.seen);
+                            // The latest keep governs: with notify it replaces the job's (and its
+                            // proof abandons whatever was in flight), without it removes it.
+                            let event = exec_notify::Event::Keep {
+                                notify: notify.is_some(),
+                            };
+                            j.notify = notify;
+                            feed(&shared, j, &key(id), event);
                         } else {
                             j.seen = job["offset"].as_u64().unwrap_or(j.seen);
                         }
@@ -835,6 +980,9 @@ async fn serve_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
                 }
             };
             if found {
+                if op == "keep" && !shared.opts.keep_delay.is_zero() {
+                    tokio::time::sleep(shared.opts.keep_delay).await;
+                }
                 respond_json(sock, 200, &json!({})).await;
             } else {
                 respond_json(sock, 404, &json!({ "error": "no such job" })).await;
@@ -951,6 +1099,8 @@ async fn start_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
             num: None,
             kind: (!hold).then(|| "background".to_string()),
             seen: 0,
+            notify: None,
+            notifier: Notifier::default(),
         },
     );
     // Both pipes into one buffer, in arrival order.
@@ -982,6 +1132,7 @@ async fn start_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
     {
         let jobs = shared.jobs.clone();
         let key = key.clone();
+        let shared = shared.clone();
         tokio::spawn(async move {
             use std::os::unix::process::ExitStatusExt as _;
             let status = child.wait().await;
@@ -989,8 +1140,10 @@ async fn start_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
                 .map(|s| s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0)))
                 .unwrap_or(-1);
             if !members(pgid).is_empty() {
+                // The moment a held stream would send `shell_exit`: v1.4 calls back.
                 if let Some(j) = jobs.map.lock().unwrap().get_mut(&key) {
                     j.shell_exit = Some(code);
+                    feed(&shared, j, &key, exec_notify::Event::Change);
                 }
                 jobs.bump();
                 while !members(pgid).is_empty() {
@@ -1002,9 +1155,11 @@ async fn start_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
                 let _ = err_task.await;
             };
             let _ = tokio::time::timeout(Duration::from_millis(200), drained).await;
+            // The end is observable from here on: v1.4 calls back.
             if let Some(j) = jobs.map.lock().unwrap().get_mut(&key) {
                 j.end = Some(code);
                 j.ended = epoch();
+                feed(&shared, j, &key, exec_notify::Event::Change);
             }
             jobs.bump();
         });
@@ -1108,6 +1263,481 @@ async fn stream_job(
                 .map(|j| j.pgid)
         };
         if let Some(g) = pgid {
+            signal_group(g, "-KILL");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// v1.4: job notify, natively. The sender is this process, and when it calls back is the kernel's
+// to say (`exec_notify::step`, the function every endpoint shares): this side makes the requests.
+// ---------------------------------------------------------------------------------------------
+
+/// What an endpoint that offers v1.4 adds to its probe answer.
+pub const NOTIFY_VERSION: &str = "v1.4";
+
+/// How long one attempt may take before it is abandoned as a connection error.
+pub const ATTEMPT_TIMEOUT: Duration = Duration::from_millis(exec_notify::ATTEMPT_TIMEOUT_MS);
+
+/// `keep`'s `notify`, as recorded. `Debug` never shows the token.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NotifyTarget {
+    pub url: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for NotifyTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotifyTarget")
+            .field("url", &self.url)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// What an attempt carried: the proof at `keep`, or a state change owed since.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallbackKind {
+    /// At `keep`: the proof of reach.
+    Proof,
+    /// A state change: the shell exited leaving its group alive, or the job's end is observable.
+    Change,
+}
+
+/// One callback attempt, as the endpoint made it.
+#[derive(Clone, Debug)]
+pub struct CallbackAttempt {
+    pub scope: String,
+    pub id: String,
+    pub url: String,
+    pub kind: CallbackKind,
+    /// 1 for a count's first attempt.
+    pub n: u32,
+    pub started: Instant,
+    pub ended: Instant,
+    /// The answer's status; `None` for a connection error, a TLS failure or no answer in 30 s.
+    pub status: Option<u16>,
+}
+
+/// Check `keep`'s `notify` against the spec's grammar; the rule it breaks, if any (never quoting
+/// the token).
+pub fn parse_notify(v: &Value) -> Result<NotifyTarget, &'static str> {
+    let obj = v.as_object().ok_or("notify type")?;
+    let url = match obj.get("url") {
+        None => return Err("url missing"),
+        Some(u) => u.as_str().ok_or("url type")?,
+    };
+    let token = match obj.get("token") {
+        None => return Err("token missing"),
+        Some(t) => t.as_str().ok_or("token type")?,
+    };
+    check_url(url)?;
+    if token.is_empty() || token.len() > 512 {
+        return Err("token length");
+    }
+    let body = token.trim_end_matches('=');
+    if body.is_empty()
+        || !body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._~+/".contains(&b))
+    {
+        return Err("token68");
+    }
+    Ok(NotifyTarget {
+        url: url.to_string(),
+        token: token.to_string(),
+    })
+}
+
+/// The `url` rules: absolute, at most 2048 bytes, a non-empty host, no userinfo, no fragment, and
+/// `https` — or `http` to `localhost`, `127.0.0.0/8` or `[::1]`. Checked on the bytes as given, since
+/// a URL parser forgives what the grammar does not (surrounding spaces, `https:///x`).
+fn check_url(url: &str) -> Result<(), &'static str> {
+    if url.len() > 2048 {
+        return Err("url length");
+    }
+    if url.bytes().any(|b| b <= b' ' || b == 0x7f) {
+        return Err("absolute");
+    }
+    let (scheme, rest) = url.split_once("://").ok_or("absolute")?;
+    if scheme.is_empty()
+        || !scheme.as_bytes()[0].is_ascii_alphabetic()
+        || !scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
+    {
+        return Err("absolute");
+    }
+    if url.contains('#') {
+        return Err("fragment");
+    }
+    let authority = &rest[..rest.find(['/', '?']).unwrap_or(rest.len())];
+    if authority.contains('@') {
+        return Err("userinfo");
+    }
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        let end = v6.find(']').ok_or("host")?;
+        &authority[..end + 2]
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    };
+    if host.is_empty() {
+        return Err("host");
+    }
+    reqwest::Url::parse(url).map_err(|_| "absolute")?;
+    match scheme.to_ascii_lowercase().as_str() {
+        "https" => Ok(()),
+        "http" if loopback(host) => Ok(()),
+        _ => Err("scheme"),
+    }
+}
+
+/// `localhost`, an address in `127.0.0.0/8`, or `[::1]`.
+fn loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return v6.parse::<std::net::Ipv6Addr>() == Ok(std::net::Ipv6Addr::LOCALHOST);
+    }
+    host.parse::<std::net::Ipv4Addr>()
+        .is_ok_and(|a| a.octets()[0] == 127)
+}
+
+/// A task the job owns: dropped (by the kernel's `Abandon`, a new timer, or the job's removal), it
+/// is aborted.
+struct Owned(tokio::task::AbortHandle);
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The job's notification state, driven by the kernel ([`exec_notify::step`]): this side only
+/// carries out its actions — an attempt task, a timer — and feeds back what happened.
+#[derive(Default)]
+struct Notifier {
+    kernel: exec_notify::Job,
+    /// What the latest owed callback is, for the attempt log.
+    kind: Option<CallbackKind>,
+    attempt: Option<Owned>,
+    timer: Option<Owned>,
+    /// Bumped per attempt and timer begun, so one abandoned while it waited for the lock can tell.
+    seq: u64,
+}
+
+/// Feed `event` to job `j`'s kernel (under the jobs lock) and carry out what it says.
+fn feed(shared: &Shared, j: &mut MockJob, key: &(String, String), event: exec_notify::Event) {
+    match event {
+        exec_notify::Event::Keep { notify: true } => j.notifier.kind = Some(CallbackKind::Proof),
+        exec_notify::Event::Change if j.notifier.kernel.notify => {
+            j.notifier.kind = Some(CallbackKind::Change)
+        }
+        _ => {}
+    }
+    let now = shared.epoch.elapsed().as_millis() as u64;
+    let (next, actions) = exec_notify::step(j.notifier.kernel, event, now);
+    j.notifier.kernel = next;
+    for action in actions {
+        match action {
+            exec_notify::Action::Abandon => j.notifier.attempt = None,
+            exec_notify::Action::Begin { attempt: n } => {
+                j.notifier.seq += 1;
+                let kind = j.notifier.kind.unwrap_or(CallbackKind::Proof);
+                let task = tokio::spawn(run_attempt(
+                    shared.clone(),
+                    key.clone(),
+                    j.notify.clone(),
+                    kind,
+                    n,
+                    j.notifier.seq,
+                ));
+                j.notifier.attempt = Some(Owned(task.abort_handle()));
+            }
+            exec_notify::Action::WakeAt(at) => {
+                j.notifier.seq += 1;
+                let (shared2, key2, seq) = (shared.clone(), key.clone(), j.notifier.seq);
+                let task = tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(at.saturating_sub(now))).await;
+                    let mut map = shared2.jobs.map.lock().unwrap();
+                    if let Some(j) = map.get_mut(&key2)
+                        && j.notifier.seq == seq
+                    {
+                        feed(&shared2, j, &key2, exec_notify::Event::Wake);
+                    }
+                });
+                j.notifier.timer = Some(Owned(task.abort_handle()));
+            }
+        }
+    }
+}
+
+/// One attempt, then its outcome fed back. A lost callback is never sent, and looks delivered to
+/// the sandbox (a path that swallows it); without egress every attempt is a connection error.
+async fn run_attempt(
+    shared: Shared,
+    key: (String, String),
+    target: Option<NotifyTarget>,
+    kind: CallbackKind,
+    n: u32,
+    seq: u64,
+) {
+    let lost = match shared.opts.lose_callbacks {
+        LoseCallbacks::None => false,
+        LoseCallbacks::Proof => kind == CallbackKind::Proof,
+        LoseCallbacks::Changes => kind == CallbackKind::Change,
+        LoseCallbacks::All => true,
+    };
+    let outcome = match target {
+        _ if lost => exec_notify::Outcome::Status(202),
+        Some(target) => {
+            let started = Instant::now();
+            let status = if shared.opts.egress {
+                attempt(&shared, &target, &key).await
+            } else {
+                None
+            };
+            shared.callbacks.lock().unwrap().push(CallbackAttempt {
+                scope: key.0.clone(),
+                id: key.1.clone(),
+                url: target.url.clone(),
+                kind,
+                n,
+                started,
+                ended: Instant::now(),
+                status,
+            });
+            status.map_or(exec_notify::Outcome::Failed, exec_notify::Outcome::Status)
+        }
+        None => exec_notify::Outcome::Failed,
+    };
+    let mut draw = [0u8; 4];
+    let _ = getrandom::fill(&mut draw);
+    let mut map = shared.jobs.map.lock().unwrap();
+    if let Some(j) = map.get_mut(&key)
+        && j.notifier.seq == seq
+    {
+        j.notifier.attempt = None;
+        feed(
+            &shared,
+            j,
+            &key,
+            exec_notify::Event::AttemptEnded {
+                outcome,
+                draw: u32::from_le_bytes(draw),
+            },
+        );
+    }
+}
+
+/// One attempt: one `POST`, no redirects, the server verified, 30 s at most. Its status, or `None`.
+async fn attempt(shared: &Shared, target: &NotifyTarget, key: &(String, String)) -> Option<u16> {
+    let client = shared
+        .client
+        .get_or_init(|| async {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(ATTEMPT_TIMEOUT)
+                .http1_only()
+                .build()
+                .expect("the callback client builds")
+        })
+        .await;
+    client
+        .post(&target.url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", target.token))
+        .body(exec_notify::body(&key.0, &key.1))
+        .send()
+        .await
+        .ok()
+        .map(|r| r.status().as_u16())
+}
+
+/// A stand-in for the fleet's side of a callback: an HTTP/1.1 listener on loopback that records
+/// every request it reads and answers each with the next scripted [`Answer`] (`200` once the script
+/// runs out).
+#[derive(Clone)]
+pub struct CallbackReceiver {
+    /// `http://127.0.0.1:<port>/_beyond/agent?session_id=s1&tenant=t1`: a URL `keep` accepts.
+    pub url: String,
+    pub addr: std::net::SocketAddr,
+    log: Arc<Mutex<Vec<ReceivedCallback>>>,
+    script: Arc<Mutex<std::collections::VecDeque<Answer>>>,
+}
+
+/// How the receiver answers one request.
+#[derive(Clone, Debug)]
+pub enum Answer {
+    Status(u16),
+    /// `302` to this location.
+    Redirect(String),
+    /// Read the request and never answer.
+    Hang,
+    /// Answer with this status after this long.
+    Slow(Duration, u16),
+}
+
+/// One request the receiver read.
+#[derive(Clone, Debug)]
+pub struct ReceivedCallback {
+    pub method: String,
+    /// The request target: path and query.
+    pub target: String,
+    /// Every header, in order, its name as sent.
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    /// When its head arrived.
+    pub at: Instant,
+}
+
+impl ReceivedCallback {
+    /// Every value of header `name` (any case).
+    pub fn header_values(&self, name: &str) -> Vec<&str> {
+        self.headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+}
+
+impl CallbackReceiver {
+    pub async fn start() -> Self {
+        let listener = crate::ports::tokio_listener().await;
+        let addr = listener.local_addr().unwrap();
+        let me = Self {
+            url: format!("http://{addr}/_beyond/agent?session_id=s1&tenant=t1"),
+            addr,
+            log: Arc::default(),
+            script: Arc::default(),
+        };
+        let (log, script) = (me.log.clone(), me.script.clone());
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                tokio::spawn(receive_one(sock, log.clone(), script.clone()));
+            }
+        });
+        me
+    }
+
+    /// Answer the next requests so, in order.
+    pub fn script(&self, answers: impl IntoIterator<Item = Answer>) {
+        self.script.lock().unwrap().extend(answers);
+    }
+
+    /// Every request read so far.
+    pub fn received(&self) -> Vec<ReceivedCallback> {
+        self.log.lock().unwrap().clone()
+    }
+
+    /// Wait (bounded) until `n` requests have arrived; all of them so far.
+    pub async fn wait_for(&self, n: usize, within: Duration) -> Vec<ReceivedCallback> {
+        let deadline = Instant::now() + within;
+        loop {
+            let got = self.received();
+            if got.len() >= n || Instant::now() >= deadline {
+                return got;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+async fn receive_one(
+    mut sock: tokio::net::TcpStream,
+    log: Arc<Mutex<Vec<ReceivedCallback>>>,
+    script: Arc<Mutex<std::collections::VecDeque<Answer>>>,
+) {
+    let (mut buf, mut chunk) = (Vec::new(), [0u8; 8192]);
+    let head_end = loop {
+        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break p;
+        }
+        match sock.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    };
+    let at = Instant::now();
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    let mut lines = head.split("\r\n");
+    let mut first = lines.next().unwrap_or("").split(' ');
+    let (method, target) = (
+        first.next().unwrap_or("").to_string(),
+        first.next().unwrap_or("").to_string(),
+    );
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(n, v)| (n.to_string(), v.trim().to_string()))
+        .collect();
+    let len: usize = headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(0);
+    let mut body = buf[head_end + 4..].to_vec();
+    while body.len() < len {
+        match sock.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => body.extend_from_slice(&chunk[..n]),
+        }
+    }
+    log.lock().unwrap().push(ReceivedCallback {
+        method,
+        target,
+        headers,
+        body,
+        at,
+    });
+    let answer = script
+        .lock()
+        .unwrap()
+        .pop_front()
+        .unwrap_or(Answer::Status(200));
+    let resp = match answer {
+        Answer::Slow(after, s) => {
+            tokio::time::sleep(after).await;
+            format!("HTTP/1.1 {s} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        }
+        Answer::Status(s) => {
+            format!("HTTP/1.1 {s} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        }
+        Answer::Redirect(to) => format!(
+            "HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ),
+        Answer::Hang => {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            return;
+        }
+    };
+    let _ = sock.write_all(resp.as_bytes()).await;
+    let _ = sock.shutdown().await;
+}
+
+/// The vendor's auto-stop: once no request has been open for `idle`, every job's group is killed.
+async fn idle_killer(shared: Shared, idle: Duration) {
+    loop {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let quiet = {
+            let a = shared.activity.lock().unwrap();
+            a.0 == 0 && a.1.elapsed() >= idle
+        };
+        if !quiet {
+            continue;
+        }
+        let groups: Vec<u32> = shared
+            .jobs
+            .map
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|j| j.end.is_none())
+            .map(|j| j.pgid)
+            .collect();
+        for g in groups {
             signal_group(g, "-KILL");
         }
     }

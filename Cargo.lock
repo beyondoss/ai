@@ -411,6 +411,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "beyond-ai-agent-core",
+ "beyond-ai-exec-notify",
  "beyond-ai-providers",
  "beyond-ai-test-support",
  "bytes",
@@ -500,6 +501,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "beyond-ai-exec-notify"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "beyond-ai-fleet-sim"
 version = "0.1.0"
 dependencies = [
@@ -535,10 +543,13 @@ name = "beyond-ai-test-support"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "beyond-ai-exec-notify",
  "chacha20poly1305",
  "ed25519-dalek",
  "getrandom 0.3.4",
  "hkdf",
+ "reqwest",
+ "rustls",
  "serde_json",
  "sha2",
  "tempfile",

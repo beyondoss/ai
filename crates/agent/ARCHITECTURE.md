@@ -2574,8 +2574,22 @@ session that is not open learns of its jobs' ends when it next opens, as today.
 After release nothing contacts the sandbox in the background: an end no callback delivers (a dead
 sandbox, a broken path) is noticed at the session's next real use of the sandbox, a `bash_job`
 call or the next open, which is the one accepted difference from today. It opens no new window for
-a duplicate or lost report: across a crash it has exactly today's (below). FLEET.md's "Job-end callbacks" is the edge's half. Nothing in the
-code implements it yet: every replica holds its streams as described above. The vectors
+a duplicate or lost report: across a crash it has exactly today's (below). FLEET.md's "Job-end callbacks" is the edge's half. The replica
+does not use it yet: every replica holds its streams as described above. What is built is the
+endpoint side and the client's half of it. The probe's answer is read as a `JobOffer` (native jobs,
+native notify, notify for the baseline, each only on the spec's exact answer), and
+`SandboxJobs::keep_notify` sends `keep` with `notify` natively; a refused `notify` (`400`) comes back
+as `ErrorKind::InvalidInput`, so a caller can keep without it. When an endpoint calls back is one
+pure function, `exec_endpoint::notify_kernel::step` (the zero-dependency `beyond-ai-exec-notify`
+crate, so an endpoint outside this repo and a model checker can call exactly what production
+calls): one attempt per job at a time, what is owed and an answer settling only what was owed when
+its attempt began (a change during an attempt gets an attempt of its own once that one ends), the
+status table, the schedule, a new `keep` abandoning what is in flight, nothing without `notify` or
+after removal. Time and the random draw are inputs; its tests run every `v1.4-retry.json` timeline
+through it and walk every short event sequence for its invariants. `exec_mock` is the reference
+endpoint: it validates `notify`, drives the kernel per job, and makes the requests (no redirects, a
+verified server, 30 s at most). It advertises notify only when told its kept jobs survive idling, and it can lose callbacks, answer
+`keep` slowly, run without egress or kill idle jobs (`tests/exec_notify_mock.rs`). The vectors
 are `tests/fixtures/exec/v1.4-*.json`, and `tests/exec_notify_vectors.rs` loads each into a strict
 schema, recomputes what follows from its inputs (the token vectors under a reference verifier, the
 retry timelines), and fails when a tagged requirement names no check (`v1.4-checks.json` lists
