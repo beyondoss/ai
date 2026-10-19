@@ -154,7 +154,7 @@ fn is_shard_name(s: &str) -> bool {
 /// A tenant id or connector name: one safe path segment. Same shape a session id must have
 /// ([`is_valid_session_id`](crate::session_store::is_valid_session_id)), for the same reason — it
 /// becomes part of a filesystem path.
-fn is_safe_segment(s: &str) -> bool {
+pub(crate) fn is_safe_segment(s: &str) -> bool {
     s.len() <= 128 && crate::session_store::is_valid_session_id(s)
 }
 
@@ -1042,6 +1042,7 @@ pub fn refused_command(command: &str) -> Option<&'static str> {
         "mcp_events_list" | "mcp_events_subscribe" | "mcp_events_unsubscribe" => {
             "refused in service mode: MCP Events subscriptions are not supported for grant connectors"
         }
+        "job_ended" => "refused: job_ended is accepted only as a sandbox's callback",
         _ => return None,
     })
 }
@@ -1108,6 +1109,7 @@ mod tests {
             "logout",
             "auth_status",
             "switch_session",
+            "job_ended",
         ] {
             assert!(refused_command(command).is_some(), "{command}");
         }

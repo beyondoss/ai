@@ -433,6 +433,8 @@ pub struct BashJobs {
     unchecked: Mutex<Vec<(u64, String)>>,
     /// Unchecked jobs the sandbox no longer had when it was checked: reported by the next notices.
     checked_gone: Mutex<Vec<(u64, String)>>,
+    /// Sandbox jobs a tool call has taken out of the table ([`Self::take`]), while it has them.
+    in_call: Mutex<Vec<Weak<JobShared>>>,
 }
 
 impl Default for BashJobs {
@@ -456,6 +458,7 @@ impl BashJobs {
             reattach: Mutex::new(None),
             unchecked: Mutex::new(Vec::new()),
             checked_gone: Mutex::new(Vec::new()),
+            in_call: Mutex::new(Vec::new()),
         }
     }
 
@@ -754,7 +757,13 @@ impl BashJobs {
     /// Take job `id` out of the table for `bash_job`: it is the caller's now (to wait on, kill, or
     /// report as ended).
     pub(crate) fn take(&self, id: u64) -> Option<Job> {
-        lock(&self.table).remove(&id).map(|p| p.job)
+        let job = lock(&self.table).remove(&id).map(|p| p.job)?;
+        if job.shared.sandbox().is_some() {
+            let mut in_call = lock(&self.in_call);
+            in_call.retain(|w| w.strong_count() > 0);
+            in_call.push(Arc::downgrade(&job.shared));
+        }
+        Some(job)
     }
 
     /// Drop every ended job. For a table whose notices nobody takes (`serve`'s host `bash`): this
@@ -1505,4 +1514,52 @@ pub fn kill_live_jobs() {
 /// Lock a mutex, recovering the data on poison rather than panicking (the crate forbids `unwrap`).
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// How exec v1.4's notify driver sees this table ([`super::job_notify`]).
+impl super::job_notify::JobTracker for BashJobs {
+    fn facts(&self, id: &crate::exec_endpoint::jobs::JobId) -> super::job_notify::kernel::Facts {
+        use super::job_notify::kernel::{Facts, TableJob};
+        let facts = |job| Facts {
+            open_reconcile_done: !self.reattach_pending(),
+            job,
+        };
+        let is_it = |shared: &JobShared| shared.sandbox().is_some_and(|l| &l.id == id);
+        let in_table = lock(&self.table)
+            .values()
+            .find(|p| is_it(&p.job.shared))
+            .map(|p| p.job.shared.ended());
+        if let Some(ended) = in_table {
+            return facts(if ended {
+                TableJob::Ended
+            } else {
+                TableJob::Running
+            });
+        }
+        let in_call = lock(&self.in_call)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|s| is_it(s))
+            .map(|s| s.ended());
+        match in_call {
+            Some(false) => facts(TableJob::Taken),
+            Some(true) => facts(TableJob::Ended),
+            None if lock(&self.garbage).iter().any(|l| &l.id == id) => facts(TableJob::Ended),
+            None => facts(TableJob::Absent),
+        }
+    }
+
+    fn list(
+        &self,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Option<std::collections::BTreeMap<String, super::job_notify::kernel::Listed>>,
+    > {
+        // No job is unheld yet (none is kept with notify), so the kernel never asks for a list.
+        Box::pin(async { None })
+    }
+
+    fn perform(&self, _action: super::job_notify::kernel::Action) {
+        // No job is kept with notify yet, so the kernel decides nothing about one.
+    }
 }

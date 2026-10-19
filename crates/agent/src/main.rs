@@ -2352,6 +2352,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 listen_uds: listen_uds.clone(),
                 listen_uds_mode,
                 grant_verifier,
+                job_notify: None,
                 session_idle_timeout: session_idle_timeout.map(std::time::Duration::from_secs),
                 upstream_http2,
                 // The daemon path (`serve_ws`) fills this from `upstream_http2` before spawning any
