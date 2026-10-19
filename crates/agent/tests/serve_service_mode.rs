@@ -275,6 +275,50 @@ async fn get_state_mid_run_is_never_cwd_stale() {
     assert_eq!(state["cwd_stale"], false, "got: {state:#?}");
 }
 
+/// The same rule as `get_state`, on the other replies that report `cwd_stale`: the `ready` frame a
+/// session sends on opening and the `new_session` answer. `switch_session` is refused in service
+/// mode, and `fork`/`clone` derive a detached session whose reply carries only the new id, so the
+/// last three never report the field there; they are checked so that stays true.
+#[tokio::test]
+async fn every_reply_that_reports_cwd_stale_says_false_in_service_mode() {
+    const WORKSPACE: &str = "/sandbox/workspace-not-on-the-replica";
+    let (base, _requests) = spawn_model_server(vec![turn_text("hi")]);
+    let svc = Service::start(&base, &["s1"]).await;
+    let token = svc.token_with("00tenant1", "s1.alpha", |c| {
+        c.workspace_root = WORKSPACE.into()
+    });
+    let mut ws = ws_connect_with_headers(svc.port, Some("s1.alpha"), &svc.header(&token))
+        .await
+        .expect("a valid grant opens its session");
+
+    // The `ready` frame is the session's first frame; the connect helper leaves it unread.
+    let ready = loop {
+        let f = ws_next_frame(&mut ws).await.expect("a ready frame");
+        if f["type"] == "ready" {
+            break f;
+        }
+    };
+    assert_eq!(ready["cwd_stale"], false, "ready: {ready:#?}");
+
+    // `fork`/`clone` copy what is on disk, so give the session a turn first.
+    ws_send(&mut ws, json!({"type":"prompt","id":"p1","message":"go"})).await;
+    ws_read_until_response(&mut ws, "prompt").await;
+
+    for command in ["fork", "clone", "new_session"] {
+        ws_send(&mut ws, json!({"type": command, "id": command})).await;
+        let frames = ws_read_until_response(&mut ws, command).await;
+        let reply = frames.last().unwrap();
+        assert_eq!(reply["success"], true, "{command}: {reply:#?}");
+        assert_ne!(
+            reply["data"]["cwd_stale"], true,
+            "{command} must not judge the sandbox path against the replica's disk: {reply:#?}"
+        );
+        if command == "new_session" {
+            assert_eq!(reply["data"]["cwd_stale"], false, "{reply:#?}");
+        }
+    }
+}
+
 /// Every command that could reach the replica answers with a refusal rather than doing something
 /// surprising. (`fork`/`clone`/`new_session` are *not* here: they mint ids on the session's own
 /// shard — see `serve_service_derived.rs`.)
