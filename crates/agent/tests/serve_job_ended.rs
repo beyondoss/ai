@@ -900,3 +900,63 @@ async fn each_callback_gets_its_own_answer() {
     }
     assert_eq!(s.kernel().waiting(), 0);
 }
+
+/// N34: a job's end reaches the session once, however many callbacks and reconciles see it.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_report_per_end() {
+    use common::exec_mock::{MockOptions, StreamEnd};
+    use common::notify_fleet::{bash_bg, fleet_with, post};
+    use common::turn_text;
+    let mut turns = vec![
+        bash_bg("echo up; sleep 3; printf 'fin-%s\\n' q9"),
+        turn_text("started"),
+    ];
+    turns.extend((0..8).map(|i| turn_text(&format!("noted {i}"))));
+    let f = fleet_with(MockOptions::notifying(), turns, None).await;
+    let _ws = f.start_job().await;
+    let pgid = f.stream("fin-%s").await;
+    let end = f.svc.exec.wait_for_end(pgid, Duration::from_secs(8)).await;
+    assert_eq!(
+        end,
+        Some(StreamEnd::Disconnected { killed: false }),
+        "released"
+    );
+    assert!(
+        f.model_saw("fin-q9", Duration::from_secs(20)).await,
+        "the end was reported"
+    );
+    // The same end, called back again and again: each answered, none reported again.
+    let job = f.keeps()[0]["id"].as_str().unwrap().to_string();
+    let key = common::notify_fleet::seal_key(&f.svc);
+    let id = JobId::parse(&job).unwrap();
+    let scope = JobScope::for_session(Some(TENANT), SESSION);
+    let body = format!(
+        r#"{{"type":"job_ended","scope":"{}","id":"{job}"}}"#,
+        scope.name()
+    );
+    for _ in 0..5 {
+        let status = post(
+            &f.edge.origin,
+            &target(TENANT, SESSION),
+            &key.mint(TENANT, SESSION, &id),
+            &body,
+        )
+        .await;
+        assert!(status == 200 || status == 410, "{status}");
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let all = f.requests.lock().unwrap().clone();
+    let last = all.last().unwrap();
+    assert_eq!(
+        last.matches("exited with code 0").count(),
+        1,
+        "one notice for one end: {last}"
+    );
+    let wakes = all.iter().filter(|r| r.contains("fin-q9")).count();
+    let first = all.iter().position(|r| r.contains("fin-q9")).unwrap();
+    assert_eq!(
+        wakes,
+        all.len() - first,
+        "no request without it after the first, and no extra turn"
+    );
+}

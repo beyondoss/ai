@@ -2635,6 +2635,11 @@ exec cell, so it does not count as a use; every command and filesystem call thro
 reconcile that adopts a kept, running job keeps it again with `notify` (`adopted`), its follow
 standing for the stream until the path is proved anew. The exec runner's HTTP client keeps an idle
 connection at most 30 s and sends no TCP keepalives, so nothing holds an unheld job's sandbox awake.
+A `bash_job` call takes an unheld job (`bash_sandbox::taken`): the kernel is told, the call reads
+in what the sandbox holds before it looks (so a peek shows what the job printed while unheld), and
+today's follow runs for the length of the call; a callback meanwhile is answered `503`. When the call
+puts the job back still running, the kernel closes that follow and the job is unheld again
+(`put_back`); one whose end the call recorded is held, as today, and one it killed is forgotten.
 `tests/job_notify.rs` runs a real replica against the reference endpoint (`exec_mock`, which makes
 the callbacks) through a stand-in for the edge.
 

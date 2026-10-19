@@ -137,9 +137,11 @@ pub(crate) enum Ctl {
     /// stream got to, recording a listed end at the listing's time (and with its status, if the
     /// rest cannot be read).
     Follow(Option<ListedEnd>),
-    /// A `bash_job` call has the unheld job: read in what the sandbox holds, then follow it for
+    /// A `bash_job` call has the unheld job, and has read in what the sandbox holds: follow it for
     /// as long as the call has it.
-    ReadIn,
+    FollowCall,
+    /// The call put the job back still running: close that follow; the job is unheld again.
+    StopFollow,
 }
 
 /// The runner task of a new remote command run as a sandbox job: held when the sandbox can stream
@@ -226,7 +228,8 @@ enum FollowKind {
     Holding,
     /// An unheld job's end, as a reconcile found it: today's follow, to the end.
     End(Option<ListedEnd>),
-    /// A `bash_job` call has the job: today's follow, after reading in what the sandbox holds.
+    /// A `bash_job` call has the job: today's follow, after reading in what the sandbox holds,
+    /// until the call puts the job back running.
     Call,
 }
 
@@ -261,16 +264,14 @@ async fn steered(
             }
             Phase::Unheld => match ctl.next().await {
                 Ctl::Follow(end) => Phase::Follow(FollowKind::End(end)),
-                Ctl::ReadIn => {
-                    read_in(shared, link, shared.offset()).await;
-                    Phase::Follow(FollowKind::Call)
-                }
-                Ctl::Close => Phase::Unheld,
+                Ctl::FollowCall => Phase::Follow(FollowKind::Call),
+                Ctl::Close | Ctl::StopFollow => Phase::Unheld,
             },
             Phase::Follow(kind) => {
                 let stop = |c: &Ctl| match kind {
                     FollowKind::Holding => matches!(c, Ctl::Close),
-                    FollowKind::Call | FollowKind::End(_) => false,
+                    FollowKind::Call => matches!(c, Ctl::StopFollow),
+                    FollowKind::End(_) => false,
                 };
                 let following = follow(shared, link, shared.offset());
                 let outcome = tokio::select! {
@@ -307,6 +308,42 @@ fn ago(epoch: u64) -> Instant {
     Instant::now()
         .checked_sub(Duration::from_secs(now.saturating_sub(epoch)))
         .unwrap_or_else(Instant::now)
+}
+
+/// A `bash_job` call takes the job (exec v1.4): the kernel is told, and an unheld job is read in
+/// now, before the call looks at it (so a peek shows what it printed), then followed for the call.
+pub(crate) async fn taken(shared: &JobShared) {
+    let (Some(n), Some(link)) = (shared.table().and_then(|t| t.notify()), shared.sandbox()) else {
+        return;
+    };
+    let job = link.id.as_str().to_string();
+    for action in n.feed_collect(Event::Taken { job }) {
+        match action {
+            Action::ReadInThenFollow { from, .. } => {
+                read_in(shared, link, from).await;
+                shared.ctl(Ctl::FollowCall);
+            }
+            other => n.perform_now(other),
+        }
+    }
+}
+
+/// The call is done with the job: back in the table still running, or with its end recorded, or
+/// killed (`gone`).
+pub(crate) fn put_back(shared: &JobShared, gone: bool) {
+    let (Some(n), Some(link)) = (shared.table().and_then(|t| t.notify()), shared.sandbox()) else {
+        return;
+    };
+    let job = link.id.as_str().to_string();
+    n.feed(if gone {
+        Event::Forgotten { job }
+    } else {
+        Event::PutBack {
+            job,
+            running: !shared.ended(),
+            offset: shared.offset(),
+        }
+    });
 }
 
 /// A reopened job's task: today's follow standing for its stream, which the release row can close.

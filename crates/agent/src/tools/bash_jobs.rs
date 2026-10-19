@@ -1666,7 +1666,8 @@ impl super::job_notify::JobTracker for BashJobs {
             Action::CloseStream { job }
             | Action::ApplyShellExit { job, .. }
             | Action::Follow { job, .. }
-            | Action::ReadInThenFollow { job, .. } => job.clone(),
+            | Action::ReadInThenFollow { job, .. }
+            | Action::CloseFollow { job } => job.clone(),
             // A `keep` is the keeping caller's to send; nothing else here concerns a job.
             Action::SendKeep { .. } | Action::StartReconcile { .. } | Action::Answer { .. } => {
                 return;
@@ -1682,8 +1683,12 @@ impl super::job_notify::JobTracker for BashJobs {
             Action::Follow { end, .. } => {
                 shared.ctl(Ctl::Follow(end));
             }
+            // A call reads in itself before following (`bash_sandbox::taken`); this is the rest.
             Action::ReadInThenFollow { .. } => {
-                shared.ctl(Ctl::ReadIn);
+                shared.ctl(Ctl::FollowCall);
+            }
+            Action::CloseFollow { .. } => {
+                shared.ctl(Ctl::StopFollow);
             }
             // As a held stream's `shell_exit`: whether it is news is today's per-job record's.
             Action::ApplyShellExit { code, .. } => shared.orphaned(
