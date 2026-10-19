@@ -2652,6 +2652,18 @@ puts the job back still running, the kernel closes that follow and the job is un
 `tests/job_notify.rs` runs a real replica against the reference endpoint (`exec_mock`, which makes
 the callbacks) through a stand-in for the edge.
 
+`tests/notify_model.rs` is a Stateright model that drives both pure kernels
+(`notify_kernel::step` and `job_notify::kernel::step`) through every interleaving of one session's
+job across two replicas, within bounds: callbacks lost, late, duplicated, replayed and forged, the
+edge's walk over a changing ring, crashes, takeovers behind the epoch fence, closes, transcript
+switches, `bash_job` calls, and the sandbox dying. The model holds only the environment. It proves
+that each end is reported at most once per session task and, once settled, at least once; that a job
+is unheld only after a successful `keep` with notify and a proof in its window; that a callback never
+opens a session and a forged one changes nothing; that a superseded owner commits nothing; that
+nothing on a timer contacts the sandbox; that a job has one attempt in flight; and that a report
+lands in its own transcript. One mutation per guard shows each property can fail. The wider bounds
+run with `NOTIFY_MODEL_FULL=1`.
+
 **Known gap: a crash can report a sandbox job's end twice.** This is today's behaviour for every
 kept job, held stream or not, and not part of v1.4. A job's end is reported in a turn (a wake turn,
 or the run its notice joined), and its record in the sandbox is deleted afterwards, at the top of
