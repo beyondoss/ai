@@ -263,6 +263,12 @@ impl GrantVerifier {
         Ok(Some(Self::new(keys, seal_key.load()?)))
     }
 
+    /// The exec v1.4 notify key, derived from the fleet seal secret this verifier holds
+    /// ([`crate::notify_token`]).
+    pub fn notify_key(&self) -> crate::notify_token::NotifyKey {
+        crate::notify_token::NotifyKey::from_seal_secret(&self.fleet_secret)
+    }
+
     /// Verify `token` and open its secrets. `now` is unix seconds (a parameter so tests pin it).
     ///
     /// Order: parse → known kid → signature → claims → expiry → unseal. Nothing from the payload is

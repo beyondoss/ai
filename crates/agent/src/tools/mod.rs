@@ -20,6 +20,7 @@ pub(crate) mod fence_tables;
 pub mod find;
 pub mod fs;
 pub mod grep;
+pub mod job_notify;
 pub mod ls;
 pub mod mcp;
 pub mod mcp_apps;

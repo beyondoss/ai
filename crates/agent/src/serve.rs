@@ -846,6 +846,10 @@ pub struct ServeConfig {
     /// consult it yet. `Arc` so every per-session copy of this config shares one keyring and one
     /// fleet secret rather than duplicating the secret per session.
     pub grant_verifier: Option<Arc<crate::grant::GrantVerifier>>,
+    /// exec v1.4's job-end callbacks: the replica's notify key and the sessions it holds, which a
+    /// service session registers with ([`crate::tools::job_notify`]). Filled by the daemon in
+    /// service mode from [`Self::grant_verifier`]'s seal secret; `None` everywhere else.
+    pub job_notify: Option<Arc<crate::tools::job_notify::NotifyHub>>,
     /// When set (daemon mode only), the supervisor reaps a session that has had **no attached
     /// connection** for at least this long and isn't mid-run — dropping its retained `input_tx` so it
     /// persists and exits, exactly like graceful shutdown does per-session (see [`crate::serve_ws`]).
@@ -3283,6 +3287,22 @@ pub(crate) async fn serve_session(
         }
     }
     stop_survivors(&bash_jobs, &persistence).await;
+    // exec v1.4: a sandbox's `job_ended` callback reaches this session only while this task holds
+    // it, registered here for the task's life (dropped, it is unregistered). The job table answers
+    // it. Service mode only: `job_notify` is never set anywhere else.
+    let _job_notify = match (&cfg.job_notify, &service) {
+        (Some(hub), Some(svc)) => {
+            let reg = crate::tools::job_notify::SessionNotify::register(
+                hub,
+                svc.tenant(),
+                persistence.session_id(),
+            );
+            let tracker: Arc<dyn crate::tools::job_notify::JobTracker> = bash_jobs.clone();
+            reg.set_tracker(Arc::downgrade(&tracker));
+            Some(reg)
+        }
+        _ => None,
+    };
 
     // Slash-command prompt templates (`/name args`), discoverable skills, agent definitions and this
     // project's own instruction files — for `get_commands`, for expanding a `/name`/`/skill:name`

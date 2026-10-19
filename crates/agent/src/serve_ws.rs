@@ -123,6 +123,7 @@ use crate::session_store::{
 };
 
 mod browser_guard;
+pub mod job_ended;
 mod tls;
 
 /// The fixed URL path a WebSocket upgrade must target. The front door maps a service subdomain to this
@@ -431,6 +432,9 @@ struct ServiceSupervisor {
     /// The memoized `/readyz` shard probe. Only service mode has one: without `--shard` there is
     /// nothing readiness can check beyond the listener, which is already proven by the request.
     ready: ReadyCache,
+    /// The notify key and the sessions held here, for exec v1.4's `job_ended` callbacks
+    /// ([`job_ended`]). Shared with every session through [`ServeConfig::job_notify`].
+    notify: Arc<crate::tools::job_notify::NotifyHub>,
 }
 
 /// Derive a per-session config from the daemon's: address the session by its routing key and drop
@@ -1923,7 +1927,10 @@ pub async fn serve_ws(
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        let notify = crate::tools::job_notify::NotifyHub::new(verifier.notify_key());
+        cfg.job_notify = Some(notify.clone());
         Some(ServiceSupervisor {
+            notify,
             verifier,
             shards: cfg.shards.clone(),
             // `0` turns the cap off, matching `--session-idle-timeout`'s own convention.
@@ -2235,11 +2242,50 @@ where
 {
     let (mut head, leftover) = match read_http_head(&mut stream).await {
         Ok(v) => v,
-        Err(e) => {
-            supervisor.refuse(&mut stream, &e).await;
+        Err((e, raw)) => {
+            // A head that cannot be parsed cannot be classified; if it may have been a callback,
+            // its refusal says no more than the status, as every callback refusal does.
+            if job_ended::may_be_callback(&raw) {
+                job_ended::refuse(&mut stream, e.status().0).await;
+            } else {
+                supervisor.refuse(&mut stream, &e).await;
+            }
             return Ok(());
         }
     };
+    let arrived = tokio::time::Instant::now();
+
+    // exec v1.4's `job_ended` callbacks are told apart by their head alone, before any other check
+    // — the `Content-Length` rules and the grant included — and never reach the front door below.
+    match job_ended::classify(&head.headers) {
+        job_ended::Class::Callback(token) => {
+            let token = token.to_owned();
+            // A callback carries no grant, and any it does carry is ignored — but never kept.
+            let _ = head.take_grant();
+            let callback = job_ended::Head {
+                method: &head.method,
+                path: &head.path,
+                query: head.query.as_deref(),
+                headers: &head.headers,
+            };
+            let rx = job_ended::Receiver {
+                service_mode: supervisor.service.is_some(),
+                hub: supervisor.service.as_ref().map(|s| &*s.notify),
+            };
+            job_ended::serve(&mut stream, &callback, &token, &leftover, arrived, &rx).await;
+            return Ok(());
+        }
+        job_ended::Class::LooksLike => {
+            job_ended::refuse(&mut stream, 400).await;
+            return Ok(());
+        }
+        job_ended::Class::Other => {}
+    }
+    // Everything else reads `Content-Length` as it always has.
+    if let Some(e) = head.content_length_error.take() {
+        supervisor.refuse(&mut stream, &e).await;
+        return Ok(());
+    }
     // Taken out of the head immediately, before anything else can read, log, or forward it: a grant
     // carries sealed credentials, and the upgrade's own headers are handed on to `create_response`.
     let grant = head.take_grant();
@@ -2762,6 +2808,13 @@ where
     if command.is_empty() {
         return Err(HttpError::BadRequest("missing `type`"));
     }
+    // exec v1.4: `job_ended` is accepted only as a sandbox's callback ([`job_ended`]), never under
+    // a session grant or on the loopback daemon.
+    if command == "job_ended" {
+        return Err(HttpError::Forbidden(
+            "job_ended is accepted only as a sandbox's callback",
+        ));
+    }
 
     if command == "list_daemon_sessions" {
         let frame = supervisor
@@ -2884,6 +2937,9 @@ struct HttpHead {
     query: Option<String>,
     path_and_query: String,
     content_length: Option<usize>,
+    /// Why the `Content-Length` could not be taken, for a request that is not a callback (whose
+    /// own rules are [`job_ended`]'s). Read only after the request is classified.
+    content_length_error: Option<HttpError>,
     transfer_encoding: Option<String>,
     headers: Vec<(String, String)>,
     /// The grant arrived as a `Sec-WebSocket-Protocol` token; the 101 must answer with the marker.
@@ -3073,20 +3129,24 @@ fn parse_http_head(buf: &[u8]) -> Result<(HttpHead, usize), HttpError> {
         None => (path_and_query.clone(), None),
     };
     let mut content_length = None;
+    let mut content_length_error = None;
     let mut transfer_encoding = None;
     let mut collected = Vec::with_capacity(req.headers.len());
     for h in req.headers {
         let name = h.name;
         let value = std::str::from_utf8(h.value).unwrap_or("");
-        if name.eq_ignore_ascii_case("content-length") {
-            let n: usize = value
-                .trim()
-                .parse()
-                .map_err(|_| HttpError::BadRequest("invalid Content-Length"))?;
-            if n > MAX_INBOUND_MESSAGE_BYTES {
-                return Err(HttpError::PayloadTooLarge);
+        // Recorded, not refused: a callback is classified from the head first and has rules of its
+        // own, so a bad value only becomes a refusal once the request is known not to be one.
+        if name.eq_ignore_ascii_case("content-length") && content_length_error.is_none() {
+            match value.trim().parse::<usize>() {
+                Err(_) => {
+                    content_length_error = Some(HttpError::BadRequest("invalid Content-Length"));
+                }
+                Ok(n) if n > MAX_INBOUND_MESSAGE_BYTES => {
+                    content_length_error = Some(HttpError::PayloadTooLarge);
+                }
+                Ok(n) => content_length = Some(n),
             }
-            content_length = Some(n);
         }
         if name.eq_ignore_ascii_case("transfer-encoding") {
             transfer_encoding = Some(value.to_string());
@@ -3100,6 +3160,7 @@ fn parse_http_head(buf: &[u8]) -> Result<(HttpHead, usize), HttpError> {
             query,
             path_and_query,
             content_length,
+            content_length_error,
             transfer_encoding,
             headers: collected,
             grant_subprotocol: false,
@@ -3108,23 +3169,28 @@ fn parse_http_head(buf: &[u8]) -> Result<(HttpHead, usize), HttpError> {
     ))
 }
 
+/// Read and parse one request head. On failure, the error and the bytes read so far.
 async fn read_http_head<S: AsyncRead + Unpin>(
     stream: &mut S,
-) -> Result<(HttpHead, Vec<u8>), HttpError> {
+) -> Result<(HttpHead, Vec<u8>), (HttpError, Vec<u8>)> {
     let mut buf = Vec::with_capacity(512);
     let mut tmp = [0u8; 1024];
     loop {
-        let n = stream.read(&mut tmp).await.map_err(|_| HttpError::Io)?;
+        let n = match stream.read(&mut tmp).await {
+            Ok(n) => n,
+            Err(_) => return Err((HttpError::Io, buf)),
+        };
         if n == 0 {
-            return Err(if buf.is_empty() {
+            let e = if buf.is_empty() {
                 HttpError::BadRequest("empty request")
             } else {
                 HttpError::BadRequest("truncated request")
-            });
+            };
+            return Err((e, buf));
         }
         buf.extend_from_slice(&tmp[..n]);
         if buf.len() > MAX_HEADER_BYTES {
-            return Err(HttpError::BadRequest("headers too large"));
+            return Err((HttpError::BadRequest("headers too large"), buf));
         }
         match parse_http_head(&buf) {
             Ok((head, header_len)) => {
@@ -3132,7 +3198,7 @@ async fn read_http_head<S: AsyncRead + Unpin>(
                 return Ok((head, leftover));
             }
             Err(HttpError::Incomplete) => continue,
-            Err(e) => return Err(e),
+            Err(e) => return Err((e, buf)),
         }
     }
 }
@@ -3752,10 +3818,13 @@ mod tests {
             "POST /_beyond/agent HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
             MAX_INBOUND_MESSAGE_BYTES + 1
         );
-        match parse_http_head(raw.as_bytes()) {
-            Err(HttpError::PayloadTooLarge) => {}
-            other => panic!("expected PayloadTooLarge, got {other:?}"),
-        }
+        // Recorded for after the request is classified (a callback has its own rules).
+        let (head, _) = parse_http_head(raw.as_bytes()).unwrap();
+        assert!(matches!(
+            head.content_length_error,
+            Some(HttpError::PayloadTooLarge)
+        ));
+        assert_eq!(head.content_length, None);
     }
 
     #[test]
