@@ -2260,6 +2260,16 @@ where
 
     // exec v1.4's `job_ended` callbacks are told apart by their head alone, before any other check
     // — the `Content-Length` rules and the grant included — and never reach the front door below.
+    // A non-UTF-8 `Authorization` that reads, byte for byte, as a callback's is refused like a
+    // look-alike: no token that is not UTF-8 can be one.
+    if head
+        .non_utf8_auth
+        .iter()
+        .any(|v| job_ended::bytes_look_like_a_callback(v))
+    {
+        job_ended::refuse(&mut stream, 400).await;
+        return Ok(());
+    }
     match job_ended::classify(&head.headers) {
         job_ended::Class::Callback(token) => {
             let token = token.to_owned();
@@ -2947,6 +2957,9 @@ struct HttpHead {
     headers: Vec<(String, String)>,
     /// The grant arrived as a `Sec-WebSocket-Protocol` token; the 101 must answer with the marker.
     grant_subprotocol: bool,
+    /// The raw bytes of every `Authorization` value that is not UTF-8 (each is `""` in
+    /// [`Self::headers`]), for the callback rule, which reads bytes.
+    non_utf8_auth: Vec<Vec<u8>>,
 }
 
 impl HttpHead {
@@ -3135,9 +3148,15 @@ fn parse_http_head(buf: &[u8]) -> Result<(HttpHead, usize), HttpError> {
     let mut content_length_error = None;
     let mut transfer_encoding = None;
     let mut collected = Vec::with_capacity(req.headers.len());
+    let mut non_utf8_auth = Vec::new();
     for h in req.headers {
         let name = h.name;
         let value = std::str::from_utf8(h.value).unwrap_or("");
+        // A callback is classified on the header's bytes: an `Authorization` that is not UTF-8
+        // would otherwise read as empty here and escape the rule.
+        if name.eq_ignore_ascii_case("authorization") && std::str::from_utf8(h.value).is_err() {
+            non_utf8_auth.push(h.value.to_vec());
+        }
         // Recorded, not refused: a callback is classified from the head first and has rules of its
         // own, so a bad value only becomes a refusal once the request is known not to be one.
         if name.eq_ignore_ascii_case("content-length") && content_length_error.is_none() {
@@ -3167,6 +3186,7 @@ fn parse_http_head(buf: &[u8]) -> Result<(HttpHead, usize), HttpError> {
             transfer_encoding,
             headers: collected,
             grant_subprotocol: false,
+            non_utf8_auth,
         },
         header_len,
     ))

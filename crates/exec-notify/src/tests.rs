@@ -383,6 +383,32 @@ fn the_shell_kernel_is_step() {
         seqs.push(q);
     }
 
+    // A notifier that died and was started again (its lock removed when it exits, or by the
+    // watcher once its pid is gone): a fresh kernel, fed what the supervisor sees on its first
+    // pass, the latest keep and then the shell's exit and the end if they are already there, and
+    // then its attempts as any notifier's.
+    let ended = |outcome, draw| Event::AttemptEnded { outcome, draw };
+    seqs.push(vec![
+        (Event::Keep { notify: true }, 0),
+        (Event::Change, 0),
+        (ended(Outcome::Status(503), 7), 120),
+        (Event::Wake, 1_120),
+        (ended(Outcome::Status(200), 7), 1_300),
+    ]);
+    seqs.push(vec![
+        (Event::Keep { notify: true }, 0),
+        (Event::Change, 0),
+        (Event::Change, 0),
+        (ended(Outcome::Failed, 0xdead_beef), 30_000),
+        (Event::Wake, 31_000),
+        (ended(Outcome::Status(200), 1), 31_200),
+        (Event::Removed, 40_000),
+    ]);
+    seqs.push(vec![
+        (Event::Keep { notify: false }, 0),
+        (Event::Change, 500),
+    ]);
+
     let line = |e: &Event, now: u64| match e {
         Event::Keep { notify: true } => format!("k1 {now} - -"),
         Event::Keep { notify: false } => format!("k0 {now} - -"),

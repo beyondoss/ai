@@ -171,6 +171,13 @@ async fn the_token_header_is_read_exactly() {
         assert_eq!(status, 400, "{headers:?}");
         assert_eq!(got, fixed_400_body, "{headers:?}");
     }
+    // The rule reads bytes: an Authorization that is not UTF-8 but reads as a callback's is
+    // refused as a look-alike, with the fixed body, never handed to the front door.
+    let mut raw_req = format!("POST {t} HTTP/1.1\r\nHost: 127.0.0.1\r\n").into_bytes();
+    raw_req.extend_from_slice(b"Authorization: Bearer bjn_v1.\xff\xfe\r\n");
+    raw_req.extend_from_slice(format!("{len}\r\n\r\n{body}").as_bytes());
+    let (status, got) = raw(svc.port, &raw_req).await;
+    assert_eq!((status, got.as_str()), (400, fixed_400_body), "non-UTF-8");
     // A callback whose Content-Length is not a number is a callback first: refused by the
     // callback's own rules, with its fixed body, never the front door's message.
     let (status, got) = raw(
