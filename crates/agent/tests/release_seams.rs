@@ -49,13 +49,7 @@ fn ungated_seam_names(path: &str, source: &str) -> Vec<String> {
             .find(|&j| {
                 let l = lines[j];
                 let t = l.trim_start();
-                (l.len() - t.len()) < indent
-                    && (t.starts_with("fn ")
-                        || t.starts_with("async fn ")
-                        || t.starts_with("pub fn ")
-                        || t.starts_with("pub(crate) fn ")
-                        || t.starts_with("pub async fn ")
-                        || t.starts_with("pub(crate) async fn "))
+                (l.len() - t.len()) < indent && is_fn_item(t)
             })
             .is_some_and(|f| {
                 lines[..f]
@@ -72,6 +66,18 @@ fn ungated_seam_names(path: &str, source: &str) -> Vec<String> {
         }
     }
     found
+}
+
+/// Whether a trimmed line starts a function item, under any visibility (`pub`, `pub(crate)`,
+/// `pub(super)`, `pub(in …)`) and with `async` or not.
+fn is_fn_item(t: &str) -> bool {
+    let rest = match t.strip_prefix("pub") {
+        Some(r) if r.starts_with('(') => r.split_once(") ").map_or("", |(_, r)| r),
+        Some(r) => r.strip_prefix(' ').unwrap_or(""),
+        None => t,
+    };
+    let rest = rest.strip_prefix("async ").unwrap_or(rest);
+    rest.starts_with("fn ")
 }
 
 #[test]
