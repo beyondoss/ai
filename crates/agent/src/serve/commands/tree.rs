@@ -1,5 +1,43 @@
 use crate::serve::*;
 
+/// The `list_branches` response.
+pub(in crate::serve) fn list_branches_frame(
+    id: Option<String>,
+    persistence: &Persistence,
+) -> OutFrame {
+    response(
+        id,
+        "list_branches",
+        true,
+        Some(json!({ "branches": persistence.list_branches() })),
+        None,
+    )
+}
+
+/// The `get_tree` response. `since` (Task #48, pi-parity gap): return only entries appended after a
+/// tree id the client already has, across every entry type — see [`nodes_since`]. Unmatched is an
+/// error, not a silent full re-fetch, mirroring `get_messages`'s own `since`.
+pub(in crate::serve) fn get_tree_frame(
+    id: Option<String>,
+    cmd: &Value,
+    persistence: &Persistence,
+) -> OutFrame {
+    let nodes = match cmd.get("since").and_then(Value::as_str) {
+        Some(since) => match nodes_since(persistence.tree(), since) {
+            Ok(nodes) => nodes,
+            Err(e) => return response(id, "get_tree", false, None, Some(&e)),
+        },
+        None => persistence.tree(),
+    };
+    response(
+        id,
+        "get_tree",
+        true,
+        Some(json!({ "nodes": nodes, "leaf_id": persistence.active_ids().last() })),
+        None,
+    )
+}
+
 impl SessionLoop {
     pub(in crate::serve) fn cmd_set_label(&mut self, cmd: &Value, id: Option<String>) -> bool {
         match cmd.get("target_id").and_then(Value::as_str) {
@@ -185,44 +223,11 @@ impl SessionLoop {
     }
 
     pub(in crate::serve) fn cmd_list_branches(&mut self, id: Option<String>) -> bool {
-        if !self.emit(response(
-            id,
-            "list_branches",
-            true,
-            Some(json!({ "branches": self.persistence.list_branches() })),
-            None,
-        )) {
-            return false;
-        }
-        true
+        self.emit(list_branches_frame(id, &self.persistence))
     }
 
     pub(in crate::serve) fn cmd_get_tree(&mut self, cmd: &Value, id: Option<String>) -> bool {
-        // `since` (Task #48, pi-parity gap): return only entries appended after a tree id the
-        // client already has, across every entry type — see [`nodes_since`]. Unmatched is an
-        // error, not a silent full re-fetch, mirroring `get_messages`'s own `since` above.
-        let nodes = match cmd.get("since").and_then(Value::as_str) {
-            Some(since) => match nodes_since(self.persistence.tree(), since) {
-                Ok(nodes) => nodes,
-                Err(e) => {
-                    if !self.emit(response(id, "get_tree", false, None, Some(&e))) {
-                        return false;
-                    }
-                    return true;
-                }
-            },
-            None => self.persistence.tree(),
-        };
-        if !self.emit(response(
-            id,
-            "get_tree",
-            true,
-            Some(json!({ "nodes": nodes, "leaf_id": self.persistence.active_ids().last() })),
-            None,
-        )) {
-            return false;
-        }
-        true
+        self.emit(get_tree_frame(id, cmd, &self.persistence))
     }
 
     pub(in crate::serve) async fn cmd_switch_branch(

@@ -418,6 +418,11 @@
 #![deny(clippy::print_stdout)]
 
 mod commands;
+use commands::{
+    Activity, StateView, get_available_models_frame, get_commands_frame, get_messages_frame,
+    get_session_stats_frame, get_state_frame, get_tree_frame, list_all_sessions_frame,
+    list_branches_frame, list_sessions_frame,
+};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -4563,13 +4568,11 @@ impl SessionLoop {
                 if let Some(m) = &self.cfg.metrics {
                     m.sessions_superseded.inc();
                 }
-                if !self.emit(OutFrame::Value(json!({
+                self.emit(OutFrame::Value(json!({
                     "type": "session_superseded",
                     "session_id": self.persistence.session_id(),
                     "tenant": self.mode.tenant(),
-                }))) {
-                    break;
-                }
+                })));
                 break;
             }
             // The events state follows the active transcript (`new_session`, `switch_session`, …) —
@@ -5421,23 +5424,21 @@ impl SessionLoop {
                                                     // is a round trip into the sandbox, which cannot happen
                                                     // while `data` is mutably borrowed.
                                                     let branch = self.mode.git_branch(&self.exec_cell, &self.cwd).await;
-                                                    let mut data = live_stats.snapshot();
-                                                    if let Value::Object(m) = &mut data {
-                                                        insert_session_identity(m, &self.persistence, &self.mode);
-                                                        m.insert("model".into(), json!(self.current_model));
-                                                        m.insert("message_count".into(), Value::Null);
-                                                        m.insert("title".into(), json!(self.persistence.meta.title));
-                                                        m.insert("cwd_stale".into(), json!(self.mode.cwd_is_stale(&self.persistence.meta.cwd, &self.cwd)));
-                                                        // Task #25 (pi-parity fix): same fields, same reasoning, as the idle `get_state` arm below.
-                                                        m.insert("cwd".into(), json!(self.cwd.display().to_string()));
-                                                        m.insert("git_branch".into(), json!(branch));
-                                                        m.insert("is_streaming".into(), json!(true));
-                                                        m.insert("is_compacting".into(), json!(is_compacting.load(Ordering::Relaxed)));
-                                                        if let Value::Object(rt) = runtime_settings(self.current_level, self.current_auto_compaction, self.current_auto_retry, self.current_block_images, self.current_image_auto_resize, &self.steering) {
-                                                            m.extend(rt);
-                                                        }
-                                                    }
-                                                    let _ = self.out_tx.send(response(cid, "get_state", true, Some(data), None));
+                                                    let frame = get_state_frame(
+                                                        cid,
+                                                        live_stats.snapshot(),
+                                                        Value::Null,
+                                                        Activity::Running { is_compacting: is_compacting.load(Ordering::Relaxed) },
+                                                        StateView {
+                                                            persistence: &self.persistence,
+                                                            mode: &self.mode,
+                                                            model: &self.current_model,
+                                                            cwd: &self.cwd,
+                                                            branch,
+                                                            runtime: runtime_settings(self.current_level, self.current_auto_compaction, self.current_auto_retry, self.current_block_images, self.current_image_auto_resize, &self.steering),
+                                                        },
+                                                    );
+                                                    let _ = self.out_tx.send(frame);
                                                 }
                                                 // Answered from the fanout's committed-history snapshot — the
                                                 // same source an attach-time catch-up is seeded from — rather
@@ -5461,10 +5462,7 @@ impl SessionLoop {
                                                         let f = lock_ignoring_poison(&self.out_conn);
                                                         f.history_snapshot()
                                                     };
-                                                    match messages_payload(&msgs, &ids, c.get("since").and_then(Value::as_str)) {
-                                                        Ok(data) => { let _ = self.out_tx.send(response(cid, "get_messages", true, Some(data), None)); }
-                                                        Err(e) => { let _ = self.out_tx.send(response(cid, "get_messages", false, None, Some(&e))); }
-                                                    }
+                                                    let _ = self.out_tx.send(get_messages_frame(cid, c.get("since").and_then(Value::as_str), &msgs, &ids));
                                                 }
                                                 "get_session_stats" => {
                                                     // Fix 8 (pi-parity gap): previously the raw
@@ -5479,36 +5477,13 @@ impl SessionLoop {
                                                     // present as `null` rather than silently absent, so a
                                                     // client sees the same field *set* idle or busy, values
                                                     // aside.
-                                                    let mut data = live_stats.snapshot();
-                                                    if let Value::Object(m) = &mut data {
-                                                        insert_session_identity(m, &self.persistence, &self.mode);
-                                                        for field in [
-                                                            "context_usage",
-                                                            "user_messages",
-                                                            "assistant_messages",
-                                                            "tool_calls",
-                                                            "tool_results",
-                                                            "total_messages",
-                                                        ] {
-                                                            m.insert(field.to_string(), Value::Null);
-                                                        }
-                                                    }
-                                                    let _ = self.out_tx.send(response(cid, "get_session_stats", true, Some(data), None));
+                                                    let _ = self.out_tx.send(get_session_stats_frame(cid, live_stats.snapshot(), Activity::Running { is_compacting: false }, &self.persistence, &self.mode));
                                                 }
                                                 "get_commands" => {
-                                                    let mut commands: Vec<Value> = self.skills.iter().map(|s| {
-                                                        json!({ "name": format!("skill:{}", s.name), "source": "skill", "description": s.description, "scope": s.scope, "path": s.path })
-                                                    }).collect();
-                                                    commands.extend(self.mcp_skills.commands());
-                                                    commands.extend(self.prompt_templates.iter().map(|t| {
-                                                        json!({ "name": t.name, "source": "prompt", "description": t.description, "scope": t.scope, "path": t.path })
-                                                    }));
-                                                    let mcp_diagnostics = self.mcp_skills.diagnostics(&self.skills);
-                                                    let collisions: Vec<&crate::skills::Collision> = self.skill_collisions.iter().chain(self.prompt_collisions.iter()).chain(mcp_diagnostics.iter()).collect();
-                                                    let _ = self.out_tx.send(response(cid, "get_commands", true, Some(json!({ "commands": commands, "collisions": collisions })), None));
+                                                    let _ = self.out_tx.send(get_commands_frame(cid, &self.skills, &self.mcp_skills, &self.prompt_templates, &self.skill_collisions, &self.prompt_collisions));
                                                 }
                                                 "list_branches" => {
-                                                    let _ = self.out_tx.send(response(cid, "list_branches", true, Some(json!({ "branches": self.persistence.list_branches() })), None));
+                                                    let _ = self.out_tx.send(list_branches_frame(cid, &self.persistence));
                                                 }
                                                 "get_todos" => {
                                                     // From the live mirror: `&session` is exclusively borrowed by
@@ -5531,55 +5506,18 @@ impl SessionLoop {
                                                 // A view is interactive while the model runs, too.
                                                 "mcp_app_request" => spawn_app_request(cid, c.clone(), &self.out_tx, &self.mcp_enabled, &self.app_filter, &self.approval, &self.app_detached, &self.mode, &self.mcp_host),
                                                 "get_tree" => {
-                                                    // Same `since` handling as the idle-loop arm below — see
-                                                    // `nodes_since`'s own doc comment (Task #48, pi-parity gap).
-                                                    match c.get("since").and_then(Value::as_str) {
-                                                        Some(since) => match nodes_since(self.persistence.tree(), since) {
-                                                            Ok(nodes) => {
-                                                                let _ = self.out_tx.send(response(cid, "get_tree", true, Some(json!({ "nodes": nodes, "leaf_id": self.persistence.active_ids().last() })), None));
-                                                            }
-                                                            Err(e) => {
-                                                                let _ = self.out_tx.send(response(cid, "get_tree", false, None, Some(&e)));
-                                                            }
-                                                        },
-                                                        None => {
-                                                            let _ = self.out_tx.send(response(cid, "get_tree", true, Some(json!({ "nodes": self.persistence.tree(), "leaf_id": self.persistence.active_ids().last() })), None));
-                                                        }
-                                                    }
+                                                    let _ = self.out_tx.send(get_tree_frame(cid, &c, &self.persistence));
                                                 }
                                                 "list_sessions" => {
-                                                    let progress_id = cid.clone();
-                                                    let progress_tx = self.out_tx.clone();
-                                                    let sessions = self.persistence
-                                                        .list_with_progress(&self.mode, move |scanned, total| {
-                                                            if should_report_scan_progress(scanned, total) {
-                                                                let _ = progress_tx.send(list_progress_frame(progress_id.clone(), "list_sessions", scanned, total));
-                                                            }
-                                                        })
-                                                        .await;
-                                                    let _ = self.out_tx.send(response(cid, "list_sessions", true, Some(listing_page(sessions, &c)), None));
+                                                    let frame = list_sessions_frame(cid, &c, &self.persistence, &self.mode, &self.out_tx).await;
+                                                    let _ = self.out_tx.send(frame);
                                                 }
                                                 "list_all_sessions" => {
-                                                    let progress_id = cid.clone();
-                                                    let progress_tx = self.out_tx.clone();
-                                                    match self.persistence.list_all_with_progress(&self.mode, move |scanned, total| {
-                                                        if should_report_scan_progress(scanned, total) {
-                                                            let _ = progress_tx.send(list_progress_frame(progress_id.clone(), "list_all_sessions", scanned, total));
-                                                        }
-                                                    }).await {
-                                                        Ok(sessions) => {
-                                                            let _ = self.out_tx.send(response(cid, "list_all_sessions", true, Some(listing_page(sessions, &c)), None));
-                                                        }
-                                                        Err(e) => {
-                                                            let _ = self.out_tx.send(response(cid, "list_all_sessions", false, None, Some(&e.to_string())));
-                                                        }
-                                                    }
+                                                    let frame = list_all_sessions_frame(cid, &c, &self.persistence, &self.mode, &self.out_tx).await;
+                                                    let _ = self.out_tx.send(frame);
                                                 }
                                                 "get_available_models" => {
-                                                    // Always the full known-model hint list, never scoped by `--models` — see the
-                                                    // idle-mode handler's identical comment for why.
-                                                    let models: Vec<Value> = listed_models().iter().map(|m| model_info(m)).collect();
-                                                    let _ = self.out_tx.send(response(cid, "get_available_models", true, Some(json!({ "models": models })), None));
+                                                    let _ = self.out_tx.send(get_available_models_frame(cid));
                                                 }
                                                 // A run is actively in flight — no retry backoff is pending yet
                                                 // (that only happens after an attempt fails, outside this loop),

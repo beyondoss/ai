@@ -1,36 +1,79 @@
 use crate::serve::*;
 
+/// The `list_sessions` response. The scan's progress frames go straight to `out_tx` (they are
+/// events, not the response), ahead of the returned frame.
+pub(in crate::serve) async fn list_sessions_frame(
+    id: Option<String>,
+    cmd: &Value,
+    persistence: &Persistence,
+    mode: &Mode,
+    out_tx: &mpsc::UnboundedSender<OutFrame>,
+) -> OutFrame {
+    let progress_id = id.clone();
+    let progress_tx = out_tx.clone();
+    let sessions = persistence
+        .list_with_progress(mode, move |scanned, total| {
+            if should_report_scan_progress(scanned, total) {
+                let _ = progress_tx.send(list_progress_frame(
+                    progress_id.clone(),
+                    "list_sessions",
+                    scanned,
+                    total,
+                ));
+            }
+        })
+        .await;
+    response(
+        id,
+        "list_sessions",
+        true,
+        Some(listing_page(sessions, cmd)),
+        None,
+    )
+}
+
+/// The `list_all_sessions` response; see [`list_sessions_frame`].
+pub(in crate::serve) async fn list_all_sessions_frame(
+    id: Option<String>,
+    cmd: &Value,
+    persistence: &Persistence,
+    mode: &Mode,
+    out_tx: &mpsc::UnboundedSender<OutFrame>,
+) -> OutFrame {
+    let progress_id = id.clone();
+    let progress_tx = out_tx.clone();
+    match persistence
+        .list_all_with_progress(mode, move |scanned, total| {
+            if should_report_scan_progress(scanned, total) {
+                let _ = progress_tx.send(list_progress_frame(
+                    progress_id.clone(),
+                    "list_all_sessions",
+                    scanned,
+                    total,
+                ));
+            }
+        })
+        .await
+    {
+        Ok(sessions) => response(
+            id,
+            "list_all_sessions",
+            true,
+            Some(listing_page(sessions, cmd)),
+            None,
+        ),
+        Err(e) => response(id, "list_all_sessions", false, None, Some(&e.to_string())),
+    }
+}
+
 impl SessionLoop {
     pub(in crate::serve) async fn cmd_list_sessions(
         &mut self,
         cmd: &Value,
         id: Option<String>,
     ) -> bool {
-        let progress_id = id.clone();
-        let progress_tx = self.out_tx.clone();
-        let sessions = self
-            .persistence
-            .list_with_progress(&self.mode, move |scanned, total| {
-                if should_report_scan_progress(scanned, total) {
-                    let _ = progress_tx.send(list_progress_frame(
-                        progress_id.clone(),
-                        "list_sessions",
-                        scanned,
-                        total,
-                    ));
-                }
-            })
-            .await;
-        if !self.emit(response(
-            id,
-            "list_sessions",
-            true,
-            Some(listing_page(sessions, cmd)),
-            None,
-        )) {
-            return false;
-        }
-        true
+        let frame = list_sessions_frame(id, cmd, &self.persistence, &self.mode, &self.out_tx).await;
+        self.emit(frame)
     }
 
     pub(in crate::serve) async fn cmd_list_all_sessions(
@@ -38,46 +81,9 @@ impl SessionLoop {
         cmd: &Value,
         id: Option<String>,
     ) -> bool {
-        let progress_id = id.clone();
-        let progress_tx = self.out_tx.clone();
-        match self
-            .persistence
-            .list_all_with_progress(&self.mode, move |scanned, total| {
-                if should_report_scan_progress(scanned, total) {
-                    let _ = progress_tx.send(list_progress_frame(
-                        progress_id.clone(),
-                        "list_all_sessions",
-                        scanned,
-                        total,
-                    ));
-                }
-            })
-            .await
-        {
-            Ok(sessions) => {
-                if !self.emit(response(
-                    id,
-                    "list_all_sessions",
-                    true,
-                    Some(listing_page(sessions, cmd)),
-                    None,
-                )) {
-                    return false;
-                }
-            }
-            Err(e) => {
-                if !self.emit(response(
-                    id,
-                    "list_all_sessions",
-                    false,
-                    None,
-                    Some(&e.to_string()),
-                )) {
-                    return false;
-                }
-            }
-        }
-        true
+        let frame =
+            list_all_sessions_frame(id, cmd, &self.persistence, &self.mode, &self.out_tx).await;
+        self.emit(frame)
     }
 
     // Soft-deletes (moves to `.trash`) another session — never the one currently active, see
@@ -360,25 +366,17 @@ impl SessionLoop {
         true
     }
 
-    /// pi-parity (Task 4, serve pass 19): the ordinary idle-path logic for `new_session`/
-    /// `switch_session`/`fork`/`clone`/`compact`, each extracted into a macro rather than a function —
-    /// `session`/`persistence`/`agent`/`client`/`current_model`/etc. are all plain local variables of
-    /// this one giant `serve` function body, and a macro lets each expansion reference them directly
-    /// (exactly like `emit!` already references `out_tx`) with no 15-parameter function signature. Each
-    /// is callable from two places: its ordinary top-level command-match arm below, and the `"prompt"`
-    /// arm's busy-loop deferred-until-idle path (`pending_deferred`, see its own doc comment) once a run
-    /// one of these commands interrupted has actually gone idle — see the module's own `serve` doc
-    /// comment / Task 4 for why these five self-abort-and-proceed instead of being rejected as busy.
-    /// `$cmd`/`$id` stand in for whichever command `Value`/response-id are in play: the outer `cmd`/`id`
-    /// when idle, or a deferred command's own stored `Value`/id once its abort has resolved.
+    /// pi-parity (Task 4, serve pass 19): the ordinary idle-path logic for `new_session`, shared with
+    /// `switch_session`/`fork`/`clone`/`compact` below. Each is called from two places: its ordinary
+    /// command-match arm, and the `"prompt"` arm's deferred-until-idle path (`pending_deferred`)
+    /// once a run one of these commands interrupted has actually gone idle — see the module's own
+    /// `serve` doc comment / Task 4 for why these five self-abort-and-proceed instead of being
+    /// rejected as busy. `cmd`/`id` are whichever command `Value`/response-id are in play: the
+    /// arm's own when idle, or a deferred command's stored `Value`/id once its abort has resolved.
     ///
-    /// Responses are sent via a bare `out_tx.send` rather than `emit!`: `emit!`'s bare `break` breaks
-    /// whichever loop *textually* encloses the macro invocation, which differs between the idle call
-    /// site (the outer per-command loop, where breaking on a dead writer is exactly `emit!`'s intended
-    /// behavior) and the deferred call site (a `for` loop over `pending_deferred`, where the same bare
-    /// `break` would only end that short-lived drain loop instead). A bare send whose failure is
-    /// ignored is the same idiom `pending_abort_acks`'s own drain loop (and every other busy-mode
-    /// response in the `"prompt"` arm) already uses for exactly this reason.
+    /// Responses are sent via a bare `out_tx.send` rather than `emit`, and the method returns
+    /// nothing: a dead writer is not worth ending the short-lived deferred drain for, and the idle
+    /// loop finds out on its next read.
     pub(in crate::serve) async fn cmd_new_session(&mut self, cmd: &Value, id: Option<String>) {
         match self.persistence.new_session(
             &self.current_model,
@@ -889,34 +887,24 @@ impl SessionLoop {
                                 }
                                 "get_state" => {
                                     let branch = self.mode.git_branch(&self.exec_cell, &self.cwd).await;
-                                    let mut data = stats_before.clone();
-                                    if let Value::Object(m) = &mut data {
-                                        insert_session_identity(m, &self.persistence, &self.mode);
-                                        m.insert("model".into(), json!(self.current_model));
-                                        m.insert("message_count".into(), json!(message_count_before));
-                                        m.insert("title".into(), json!(self.persistence.meta.title));
-                                        m.insert(
-                                            "cwd_stale".into(),
-                                            json!(self.mode.cwd_is_stale(&self.persistence.meta.cwd, &self.cwd)),
-                                        );
-                                        m.insert("cwd".into(), json!(self.cwd.display().to_string()));
-                                        m.insert("git_branch".into(), json!(branch));
-                                        m.insert("is_streaming".into(), json!(false));
-                                        m.insert("is_compacting".into(), json!(true));
-                                        m.insert("pending_tool_ids".into(), json!(Vec::<String>::new()));
-                                        if let Value::Object(rt) = runtime_settings(self.current_level, self.current_auto_compaction, self.current_auto_retry, self.current_block_images, self.current_image_auto_resize, &self.steering) {
-                                            m.extend(rt);
-                                        }
-                                    }
-                                    let _ = self.out_tx.send(response(cid, "get_state", true, Some(data), None));
+                                    let frame = get_state_frame(
+                                        cid,
+                                        stats_before.clone(),
+                                        json!(message_count_before),
+                                        Activity::Compacting,
+                                        StateView {
+                                            persistence: &self.persistence,
+                                            mode: &self.mode,
+                                            model: &self.current_model,
+                                            cwd: &self.cwd,
+                                            branch,
+                                            runtime: runtime_settings(self.current_level, self.current_auto_compaction, self.current_auto_retry, self.current_block_images, self.current_image_auto_resize, &self.steering),
+                                        },
+                                    );
+                                    let _ = self.out_tx.send(frame);
                                 }
                                 "get_session_stats" => {
-                                    let mut data = stats_before.clone();
-                                    if let Value::Object(m) = &mut data {
-                                        insert_session_identity(m, &self.persistence, &self.mode);
-                                        m.insert("pending_tool_ids".into(), json!(Vec::<String>::new()));
-                                    }
-                                    let _ = self.out_tx.send(response(cid, "get_session_stats", true, Some(data), None));
+                                    let _ = self.out_tx.send(get_session_stats_frame(cid, stats_before.clone(), Activity::Compacting, &self.persistence, &self.mode));
                                 }
                                 // The fanout's snapshot is the transcript as it stood when the
                                 // compaction began (published by the idle loop) — what the busy
@@ -926,10 +914,7 @@ impl SessionLoop {
                                         let f = lock_ignoring_poison(&self.out_conn);
                                         f.history_snapshot()
                                     };
-                                    match messages_payload(&msgs, &ids, c.get("since").and_then(Value::as_str)) {
-                                        Ok(data) => { let _ = self.out_tx.send(response(cid, "get_messages", true, Some(data), None)); }
-                                        Err(e) => { let _ = self.out_tx.send(response(cid, "get_messages", false, None, Some(&e))); }
-                                    }
+                                    let _ = self.out_tx.send(get_messages_frame(cid, c.get("since").and_then(Value::as_str), &msgs, &ids));
                                 }
                                 "prompt" if crate::tools::mcp_events::is_injection(&c) => {
                                     self.deferred_events.push_back(l.to_string());
