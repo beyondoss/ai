@@ -20,6 +20,15 @@
 //! delivery, heartbeats, and above all **kill on disconnect** — are measured, not taken on trust:
 //! the disconnect check watches a backgrounded grandchild that would write a marker file if its
 //! process group outlived the connection.
+//!
+//! An endpoint that advertises job notify (v1.4) is held to [`notify`]'s checks too, against a
+//! callback receiver the verifier runs ([`Expectations::callback_listen`]): the proof's timing and
+//! exact shape, a callback at each state change and for a change during an attempt, one url and
+//! one sender, `keep` not waiting, the grammar, the latest keep governing, nothing without notify or
+//! after removal, no redirects, a verified server, the schedule and the status table, the token kept
+//! out of argv, environment and answers, and a kept job surviving the sandbox going idle (alone, at
+//! the end, for [`Expectations::notify_idle`]). They add about 35 s to a run, the idle window
+//! included.
 
 use std::time::{Duration, Instant};
 
@@ -27,6 +36,9 @@ use super::HttpExecRunner;
 use super::jobs::{JobEvent, JobId, JobScope, JobSpec, JobStatus, SandboxJobs as _};
 use super::jobs_native::NativeJobs;
 use super::stream::{self, Frame, FrameReader, HEARTBEAT_INTERVAL};
+
+/// The v1.4 (job notify) checks; their names are this module's constants.
+pub mod notify;
 
 /// What the verifier holds the endpoint to. [`Default`] is the spec; a test of the verifier itself
 /// shrinks the intervals so it runs in seconds.
@@ -38,6 +50,16 @@ pub struct Expectations {
     /// intervals, the bound an endpoint that only notices a disconnect when a heartbeat write fails
     /// still meets.
     pub kill_within: Duration,
+    /// Where the v1.4 checks' callback receiver listens. The default, an ephemeral loopback port,
+    /// serves an endpoint whose sandbox shares this host's loopback (the in-repo mock, a container
+    /// on the host network): `keep` takes plain `http` only to loopback.
+    pub callback_listen: String,
+    /// The origin the sandbox reaches the receiver at, when it is not the listen address: an
+    /// `https` origin that forwards to [`Self::callback_listen`]. The TLS check is then skipped.
+    pub callback_origin: Option<String>,
+    /// How long a kept job must survive with nothing sent to the sandbox (v1.4 "a kept job
+    /// survives idling"). An auto-stop slower than this goes unseen.
+    pub notify_idle: Duration,
 }
 
 impl Default for Expectations {
@@ -45,6 +67,10 @@ impl Default for Expectations {
         Self {
             heartbeat: HEARTBEAT_INTERVAL,
             kill_within: HEARTBEAT_INTERVAL * 2,
+            // port-0: the callback receiver binds it and holds the listener for the whole run.
+            callback_listen: "127.0.0.1:0".to_string(),
+            callback_origin: None,
+            notify_idle: Duration::from_secs(30),
         }
     }
 }
@@ -72,6 +98,8 @@ pub struct Report {
     pub streams: bool,
     /// The endpoint offers sandbox jobs natively (v1.3).
     pub jobs: bool,
+    /// The endpoint offers job notify (v1.4), natively or for the baseline.
+    pub notify: bool,
     pub checks: Vec<Check>,
 }
 
@@ -90,7 +118,9 @@ impl Report {
     pub fn render(&self) -> String {
         let mut out = format!(
             "exec endpoint: {}\n",
-            if self.jobs {
+            if self.jobs && self.notify {
+                "v1.4 (streams, runs sandbox jobs itself, and calls back when a kept job changes)"
+            } else if self.jobs {
                 "v1.3 (streams, and runs sandbox jobs itself)"
             } else if self.streams {
                 "v1.2 (streams; sandbox jobs run on plain exec commands)"
@@ -140,6 +170,7 @@ pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectatio
             return Report {
                 streams: false,
                 jobs: false,
+                notify: false,
                 checks: vec![fail(ENVELOPE, e)],
             };
         }
@@ -192,12 +223,16 @@ pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectatio
         ] {
             checks.push(skip(name, "not a v1.2 endpoint"));
         }
-        for name in std::iter::once(JOBS).chain(JOB_CHECKS) {
+        for name in std::iter::once(JOBS)
+            .chain(JOB_CHECKS)
+            .chain(notify::CHECKS)
+        {
             checks.push(skip(name, "not a v1.2 endpoint"));
         }
         return Report {
             streams,
             jobs: false,
+            notify: false,
             checks,
         };
     }
@@ -229,9 +264,11 @@ pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectatio
             checks.push(skip(name, "sandbox jobs are not offered"));
         }
     }
+    let notify = notify::checks(&v, &mut checks).await;
     Report {
         streams,
         jobs,
+        notify,
         checks,
     }
 }

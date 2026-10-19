@@ -127,6 +127,43 @@ pub struct MockOptions {
     /// How long `keep` waits to answer once it has recorded the keep and started its proof, so a
     /// callback can overtake the answer.
     pub keep_delay: Duration,
+    /// Ways to get v1.4 wrong, one per conformance check, for the suite that proves the verifier
+    /// catches each. All off by default.
+    pub faults: NotifyFaults,
+}
+
+/// One way per v1.4 conformance check for an endpoint to get the spec wrong. Each is a change to
+/// what the mock feeds the kernel, or to the request it makes, never to the kernel.
+#[derive(Clone, Debug, Default)]
+pub struct NotifyFaults {
+    /// Advertise `notify` as this value instead of `"v1.4"`.
+    pub probe_notify: Option<Value>,
+    /// Accept any `notify`, valid or not.
+    pub accepts_any_notify: bool,
+    /// A `keep` with `notify` leaves a notify already recorded in place.
+    pub keeps_first_notify: bool,
+    /// The body carries a fourth member.
+    pub body_extra_member: bool,
+    /// State-change attempts go to the URL with this appended.
+    pub end_url_suffix: Option<String>,
+    /// `keep` answers only once its proof's attempt has ended.
+    pub keep_waits_for_proof: bool,
+    /// The proof's attempts begin this late.
+    pub proof_delay: Duration,
+    /// No callback at the shell's exit with leftovers.
+    pub no_shell_exit_callback: bool,
+    /// A change while an attempt is in flight is dropped.
+    pub drops_changes_in_flight: bool,
+    /// A `keep` without `notify` leaves the recorded notify in force.
+    pub plain_keep_keeps_notify: bool,
+    /// Redirects are followed.
+    pub follows_redirects: bool,
+    /// Any certificate is accepted.
+    pub accepts_invalid_certs: bool,
+    /// A `404` is retried as if it were a `503`.
+    pub retries_refusals: bool,
+    /// `list` shows each job's notify, token included.
+    pub token_in_list: bool,
 }
 
 /// Which v1.4 notifications a [`MockOptions::lose_callbacks`] endpoint never sends.
@@ -160,6 +197,7 @@ impl Default for MockOptions {
             egress: true,
             lose_callbacks: LoseCallbacks::None,
             keep_delay: Duration::ZERO,
+            faults: NotifyFaults::default(),
         }
     }
 }
@@ -177,6 +215,14 @@ impl MockOptions {
     /// Whether the job probe's answer offers notify (natively, or for the baseline).
     pub fn advertises_notify(&self) -> bool {
         self.notify && self.kept_jobs_survive_idle && self.egress
+    }
+
+    /// The probe answer's `notify` value, when it advertises.
+    fn notify_answer(&self) -> Value {
+        self.faults
+            .probe_notify
+            .clone()
+            .unwrap_or_else(|| json!(NOTIFY_VERSION))
     }
 }
 
@@ -469,7 +515,7 @@ async fn serve_one(mut sock: tokio::net::TcpStream, shared: Shared) {
     // Without native jobs the field is unknown and the command runs, except that an endpoint
     // offering notify for the baseline answers the probe (v1.4).
     if req["job"]["op"] == "probe" && shared.opts.advertises_notify() {
-        respond_json(sock, 200, &json!({ "notify": NOTIFY_VERSION })).await;
+        respond_json(sock, 200, &json!({ "notify": shared.opts.notify_answer() })).await;
         return;
     }
     let wants_stream = req["stream"].as_bool() == Some(true);
@@ -897,7 +943,7 @@ async fn serve_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
         "probe" => {
             let mut answer = json!({ "jobs": "v1.3" });
             if shared.opts.advertises_notify() {
-                answer["notify"] = json!(NOTIFY_VERSION);
+                answer["notify"] = shared.opts.notify_answer();
             }
             respond_json(sock, 200, &answer).await
         }
@@ -944,6 +990,10 @@ async fn serve_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
             let notify = match job.get("notify") {
                 Some(n) if op == "keep" && shared.opts.notify => match parse_notify(n) {
                     Ok(t) => Some(t),
+                    Err(_) if shared.opts.faults.accepts_any_notify => Some(NotifyTarget {
+                        url: n["url"].as_str().unwrap_or("").to_string(),
+                        token: n["token"].as_str().unwrap_or("").to_string(),
+                    }),
                     Err(why) => {
                         return respond_json(
                             sock,
@@ -966,11 +1016,19 @@ async fn serve_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
                             j.seen = job["seen"].as_u64().unwrap_or(j.seen);
                             // The latest keep governs: with notify it replaces the job's (and its
                             // proof abandons whatever was in flight), without it removes it.
+                            let faults = &shared.opts.faults;
                             let event = exec_notify::Event::Keep {
                                 notify: notify.is_some(),
                             };
-                            j.notify = notify;
-                            feed(&shared, j, &key(id), event);
+                            let ignored = faults.plain_keep_keeps_notify && notify.is_none();
+                            let keep_old =
+                                faults.keeps_first_notify && notify.is_some() && j.notify.is_some();
+                            if !ignored {
+                                if !keep_old {
+                                    j.notify = notify;
+                                }
+                                feed(&shared, j, &key(id), event);
+                            }
                         } else {
                             j.seen = job["offset"].as_u64().unwrap_or(j.seen);
                         }
@@ -982,6 +1040,19 @@ async fn serve_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
             if found {
                 if op == "keep" && !shared.opts.keep_delay.is_zero() {
                     tokio::time::sleep(shared.opts.keep_delay).await;
+                }
+                if op == "keep"
+                    && shared.opts.faults.keep_waits_for_proof
+                    && job.get("notify").is_some()
+                {
+                    let since = Instant::now();
+                    while since.elapsed() < ATTEMPT_TIMEOUT
+                        && !shared.callbacks.lock().unwrap().iter().any(|a| {
+                            a.id == id && a.kind == CallbackKind::Proof && a.started >= since
+                        })
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
                 }
                 respond_json(sock, 200, &json!({})).await;
             } else {
@@ -1048,6 +1119,8 @@ async fn serve_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
                         "started": j.started,
                         "ended": j.ended,
                         "label": j.label,
+                        "notify": j.notify.as_ref().filter(|_| shared.opts.faults.token_in_list)
+                            .map(|n| json!({ "url": n.url, "token": n.token })),
                     })
                 })
                 .collect();
@@ -1143,7 +1216,9 @@ async fn start_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
                 // The moment a held stream would send `shell_exit`: v1.4 calls back.
                 if let Some(j) = jobs.map.lock().unwrap().get_mut(&key) {
                     j.shell_exit = Some(code);
-                    feed(&shared, j, &key, exec_notify::Event::Change);
+                    if !shared.opts.faults.no_shell_exit_callback {
+                        change(&shared, j, &key);
+                    }
                 }
                 jobs.bump();
                 while !members(pgid).is_empty() {
@@ -1159,7 +1234,7 @@ async fn start_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
             if let Some(j) = jobs.map.lock().unwrap().get_mut(&key) {
                 j.end = Some(code);
                 j.ended = epoch();
-                feed(&shared, j, &key, exec_notify::Event::Change);
+                change(&shared, j, &key);
             }
             jobs.bump();
         });
@@ -1473,6 +1548,14 @@ fn feed(shared: &Shared, j: &mut MockJob, key: &(String, String), event: exec_no
     }
 }
 
+/// A state change of `j`, fed to its kernel (unless the endpoint drops changes in flight).
+fn change(shared: &Shared, j: &mut MockJob, key: &(String, String)) {
+    if shared.opts.faults.drops_changes_in_flight && j.notifier.kernel.in_flight.is_some() {
+        return;
+    }
+    feed(shared, j, key, exec_notify::Event::Change);
+}
+
 /// One attempt, then its outcome fed back. A lost callback is never sent, and looks delivered to
 /// the sandbox (a path that swallows it); without egress every attempt is a connection error.
 async fn run_attempt(
@@ -1489,6 +1572,16 @@ async fn run_attempt(
         LoseCallbacks::Changes => kind == CallbackKind::Change,
         LoseCallbacks::All => true,
     };
+    let faults = &shared.opts.faults;
+    if kind == CallbackKind::Proof && n == 1 && !faults.proof_delay.is_zero() {
+        tokio::time::sleep(faults.proof_delay).await;
+    }
+    let target = target.map(|mut t| {
+        if let (CallbackKind::Change, Some(suffix)) = (kind, &faults.end_url_suffix) {
+            t.url.push_str(suffix);
+        }
+        t
+    });
     let outcome = match target {
         _ if lost => exec_notify::Outcome::Status(202),
         Some(target) => {
@@ -1508,7 +1601,11 @@ async fn run_attempt(
                 ended: Instant::now(),
                 status,
             });
-            status.map_or(exec_notify::Outcome::Failed, exec_notify::Outcome::Status)
+            match status {
+                Some(404) if faults.retries_refusals => exec_notify::Outcome::Status(503),
+                Some(s) => exec_notify::Outcome::Status(s),
+                None => exec_notify::Outcome::Failed,
+            }
         }
         None => exec_notify::Outcome::Failed,
     };
@@ -1537,8 +1634,14 @@ async fn attempt(shared: &Shared, target: &NotifyTarget, key: &(String, String))
         .client
         .get_or_init(|| async {
             let _ = rustls::crypto::ring::default_provider().install_default();
+            let faults = &shared.opts.faults;
             reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
+                .redirect(if faults.follows_redirects {
+                    reqwest::redirect::Policy::limited(5)
+                } else {
+                    reqwest::redirect::Policy::none()
+                })
+                .tls_danger_accept_invalid_certs(faults.accepts_invalid_certs)
                 .timeout(ATTEMPT_TIMEOUT)
                 .http1_only()
                 .build()
@@ -1549,7 +1652,15 @@ async fn attempt(shared: &Shared, target: &NotifyTarget, key: &(String, String))
         .post(&target.url)
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", target.token))
-        .body(exec_notify::body(&key.0, &key.1))
+        .body(if shared.opts.faults.body_extra_member {
+            format!(
+                "{{\"type\":\"job_ended\",\"scope\":{},\"id\":{},\"state\":\"ended\"}}",
+                Value::from(key.0.as_str()),
+                Value::from(key.1.as_str())
+            )
+        } else {
+            exec_notify::body(&key.0, &key.1)
+        })
         .send()
         .await
         .ok()
