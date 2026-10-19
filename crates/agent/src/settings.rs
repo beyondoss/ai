@@ -170,7 +170,7 @@ pub struct Settings {
     /// "provider timeout": the idle-read timeout between response chunks on the gateway HTTP client (see
     /// `run`'s `--idle-timeout-ms` doc comment, Task #19) — pi-parity fix (Round 3): the last of the
     /// retry/timeout cluster with no persisted fallback at all. Task #38 (pi-parity fix): `serve` gained
-    /// its own `--idle-timeout-ms` flag (`ServeConfig::idle_timeout_ms` in `serve.rs`) falling back to
+    /// its own `--idle-timeout-ms` flag (`ServeConfig::idle_timeout_ms` in `serve/config.rs`) falling back to
     /// this same setting, so both `run` and `serve` consult it now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_provider_timeout_ms: Option<u64>,
@@ -236,7 +236,7 @@ pub struct Settings {
     /// All}` already existed and was already reachable at runtime via `serve`'s `set_steering_mode` RPC
     /// command, but nothing durable backed it — an operator wanting a standing default had to re-issue
     /// that RPC call at the start of every `serve` session. One of `"one_at_a_time"`/`"all"` (the exact
-    /// wire vocabulary `set_steering_mode`'s own `mode` argument already uses — see `serve.rs`'s module
+    /// wire vocabulary `set_steering_mode`'s own `mode` argument already uses — see `serve/`'s module
     /// doc comment), stored as a plain string rather than the enum itself, matching
     /// [`Self::default_reasoning_effort`]'s own "no hard dependency on `agent_core`'s exact type layout"
     /// convention. `None` defaults to `one_at_a_time`, matching both this crate's and pi's own default.

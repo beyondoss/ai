@@ -193,7 +193,7 @@ pub(super) fn resolve_model_scope(patterns: &[String], catalog: &[&str]) -> Vec<
 /// alias-preference rule), and — unlike pi's own `resolveCliModel`, which silently picks whichever
 /// candidate sorts first — never silently guesses on an ambiguous match. Instead mirrors
 /// `SessionRepo::find_path`'s own "ambiguous is a real error naming every candidate, not a guess"
-/// philosophy (see `session_store.rs`), applied consistently to `--model`, `set_model`, and (via
+/// philosophy (see `session_store/`), applied consistently to `--model`, `set_model`, and (via
 /// `resolve_model_scope`, above) the literal entries in a `--models` scope.
 ///
 /// - An exact, case-insensitive match against `catalog` resolves to the catalog's own canonical

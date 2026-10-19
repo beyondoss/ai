@@ -1,4 +1,4 @@
-//! Whole-run retry policy, shared by `serve.rs` (the `"prompt"` command's auto-retry loop, toggleable
+//! Whole-run retry policy, shared by `serve/` (the `"prompt"` command's auto-retry loop, toggleable
 //! via `set_auto_retry`) and `main.rs`'s one-shot `run`/`run --json` (always on — a scripted/cron
 //! invocation has no interactive way to disable it, and nothing about retrying transparently is
 //! output-visible harm).
@@ -133,7 +133,7 @@ impl Default for RunRetryPolicy {
 
 impl RunRetryPolicy {
     /// Build from the same two optional overrides `--retry-max-retries`/`--retry-base-delay-ms` already
-    /// carry through `main.rs`/`serve.rs` — `None` for either falls back to this module's own constant,
+    /// carry through `main.rs`/`serve/` — `None` for either falls back to this module's own constant,
     /// exactly like `agent_core::client`'s identical `unwrap_or(MAX_RETRIES)`/`unwrap_or(BASE_BACKOFF)`.
     pub fn from_overrides(
         max_retries: Option<u32>,

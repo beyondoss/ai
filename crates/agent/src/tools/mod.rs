@@ -653,7 +653,7 @@ impl TouchedFiles {
 /// adding one positional knob and delegating down. That convention stopped paying for itself at
 /// `default_registry_with_prefix_image_auto_resize_and_mcp_tools`: a sixth knob (`root`, which subagents
 /// need) would have meant a sixth name and a sixth wrapper, for two real production call sites
-/// (`main.rs::run_task` and `serve.rs::build_tools`). `Default` + struct-update syntax gives every
+/// (`main.rs::run_task` and `serve/build.rs::build_tools`). `Default` + struct-update syntax gives every
 /// caller the same "only name what you override" ergonomics the ladder existed to provide.
 #[derive(Default)]
 pub struct ToolConfig<'a> {

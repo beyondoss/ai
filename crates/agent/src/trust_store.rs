@@ -451,7 +451,7 @@ mod tests {
         fs::create_dir_all(&not_yet_created).unwrap();
 
         // The real runtime lookup always uses a canonicalized, absolute path (see `canonical_cwd` in
-        // `session_store.rs`) — reproduced directly here rather than via `set_current_dir`.
+        // `session_store/`) — reproduced directly here rather than via `set_current_dir`.
         let real_lookup_path = not_yet_created.canonicalize().unwrap();
         assert_eq!(
             trust_store.lookup(&real_lookup_path),

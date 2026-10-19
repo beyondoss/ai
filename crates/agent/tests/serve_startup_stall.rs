@@ -13,7 +13,7 @@
 //! The same shape as `tool_reactor_stall.rs`, one level up: there a tool must not pin the executor
 //! its own session is on; here a session must not pin the executor every other session is on. The
 //! stall is injected (`BEYOND_AI_AGENT_TEST_SLOW_SESSION_OPEN_MS`, a debug-build-only seam — see
-//! `serve.rs`'s `simulated_slow_open`) because what is being pinned is *where* the open runs, not how
+//! `serve/`'s `simulated_slow_open`) because what is being pinned is *where* the open runs, not how
 //! long it takes: a real transcript big enough to cost whole seconds is neither cheap to build nor
 //! stable across machines, and a tight timing threshold is how a suite gets flaky.
 

@@ -424,7 +424,7 @@ fn serve_proactively_compacts_a_resumed_large_session_on_its_very_next_prompt() 
 #[test]
 fn serve_compact_preserves_pre_compaction_entries_in_get_tree() {
     // F-M3 (pi: rpc.test.ts:328-340): the storage layer's own non-destructive-compaction guarantee
-    // (`session_store.rs`'s `rewrite_compacted_preserves_folded_messages_and_records_provenance`) was
+    // (`session_store/`'s `rewrite_compacted_preserves_folded_messages_and_records_provenance`) was
     // never proven end-to-end through the live RPC surface — a `compact` command followed by `get_tree`
     // must still show the folded, pre-compaction messages (matching this codebase's append-only
     // compaction posture: folded away from the *active* path, never deleted from disk).
@@ -1086,7 +1086,7 @@ fn serve_abort_retry_interrupts_a_pending_whole_run_retry_backoff() {
     assert_eq!(auto_retry_end_frames[0]["final_error"], "retry cancelled");
 
     // The closing error record is withheld from the persist as soon as a retry is decided on (so the
-    // store's message count can't desync — see the withholding site in `serve.rs`), which means a
+    // store's message count can't desync — see the withholding site in `serve/`), which means a
     // retry cancelled during its backoff has to put it *back*, in memory and on disk. It is the only
     // thing keeping role alternation valid: without it the session's last message is the user's own
     // unanswered prompt, and the next `prompt` stacks a second consecutive `user` turn.

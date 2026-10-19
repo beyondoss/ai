@@ -46,7 +46,7 @@ fn spawn_and_warm_up(
 /// leaves waiting), give it time to actually reach the server, then send `busy_cmd` while it's
 /// provably still streaming. Returns `(prompt's own terminal response, busy_cmd's own response)`, in
 /// the order `serve` actually emits them (the interrupted prompt's terminal response first, then the
-/// self-abort-and-proceeded command's — see `serve.rs`'s `pending_deferred` doc comment for why).
+/// self-abort-and-proceeded command's — see `serve/`'s `pending_deferred` doc comment for why).
 fn run_busy_then(
     stdin: &mut ChildStdin,
     stdout: &mut common::Frames,

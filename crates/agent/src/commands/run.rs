@@ -270,7 +270,7 @@ async fn resolve_session(cmd: Command) -> Result<Composed, Box<dyn std::error::E
     // default or `DEFAULT_MODEL` — the distinction a reopened `--session`/`--continue` needs below to
     // know whether to keep going on the model the session was actually last driven on instead of
     // quietly switching it, the same bug class `switch_session` had (see
-    // `Persistence::model_and_level_at_active` in `serve.rs`). A merely-stored default counts as *not*
+    // `Persistence::model_and_level_at_active` in `serve/persistence.rs`). A merely-stored default counts as *not*
     // explicit here — same as an unset flag — since the operator didn't ask for this specific
     // invocation to use it.
     //
@@ -456,10 +456,10 @@ fn resolve_defaults(
     let gateway = configured_gateway.unwrap_or_else(|| DEFAULT_GATEWAY.to_string());
     // Round 3 (pi-parity fix): five more flag/env-only settings gain the same "explicit flag/env, then
     // stored setting, then built-in default" precedence — `serve`'s identical block, in its own command
-    // handler above, for the full set (including `--models`, `serve`-only).
+    // handler (`commands/serve.rs`), for the full set (including `--models`, `serve`-only).
     let bash_shell_path =
         bash_shell_path.or_else(|| stored_settings.default_bash_shell_path.clone());
-    // Task #49 (pi-parity fix): `Command::Serve`'s handler (above in this file) checks this upfront and
+    // Task #49 (pi-parity fix): `Command::Serve`'s handler (in `commands/serve.rs`) checks this upfront and
     // fails fast — `run_task` had no equivalent at all, so a bad `--bash-shell-path`/stored default
     // surfaced only as a confusing spawn error on the first `bash` call, potentially well into a
     // multi-step run, rather than failing the invocation immediately. Validated once the whole
@@ -521,7 +521,7 @@ fn resolve_defaults(
     // indistinguishable from "say nothing" by the time it reaches the `default_reasoning_effort_for_model`
     // fallback below — which silently overrode it back to a default depth (usually medium) instead of
     // actually turning reasoning off. Mirrors `Command::Serve`'s identical `reasoning_effort_explicit`
-    // tracking, above in this file.
+    // tracking, in `commands/serve.rs`.
     let reasoning_effort_explicit = reasoning_effort.is_some() || model_thinking_level.is_some();
     // Fix 2 (pi-parity gap): `--reasoning-effort` previously had no persisted stored-default fallback at
     // all, unlike `default_model`/`default_gateway_url`/`default_session_dir`. Precedence, in order: an
@@ -1113,7 +1113,7 @@ async fn build_agent(
             retry_rate_limit_secs,
         ))
         .with_cache_key(meta.id.clone())
-        // Shared with every subagent (see the `write_locks` construction above) so the parent's own
+        // Shared with every subagent (built in `register_subagent`) so the parent's own
         // edits and a child's serialize on the same path.
         .with_write_locks(write_locks.clone())
         .with_checkpoint_hook(Arc::new(DirectCheckpoint(store.clone())));
@@ -1277,7 +1277,7 @@ async fn drive_run(cmd: Command, runsetup: RunSetup) -> Result<(), Box<dyn std::
     // Task #41 (pi-parity fix): which signal (if any) actually triggered a cancellation, so
     // `unwrap_turn_result` below can exit with the matching POSIX code instead of the same bare
     // `exit(1)` every cancellation used to get regardless of cause. A real `Mutex` (not a bare local,
-    // unlike `serve.rs`'s own `shutdown_cause`) since this is genuinely shared across a task boundary:
+    // unlike `commands/serve.rs`'s own `shutdown_cause`) since this is genuinely shared across a task boundary:
     // the signal wait runs on its own spawned task, concurrently with the run this variable is read
     // from.
     let shutdown_cause: Arc<std::sync::Mutex<Option<serve::Signal>>> =
@@ -1658,7 +1658,7 @@ async fn connect_run_mcp(
 ) {
     // Fail-soft (Task: MCP client support): a server that fails to connect is skipped with a warning,
     // not a fatal error — matches `has_gated_resources`'s own "warn, don't block the run" convention
-    // just above. `stored_settings.mcp_servers` is already trust-gated (a project's own
+    // in `assemble_run`. `stored_settings.mcp_servers` is already trust-gated (a project's own
     // `.beyond/settings.json` — where a project-tier `mcp_servers` entry would live — only merges in at
     // all when `effective_settings_for_cwd` found `cwd` trusted; the global tier always applies).
     let (mcp_live, mcp_catalog, mcp_warnings) = tools::mcp::connect_all(
@@ -1859,7 +1859,7 @@ fn open_run_session(
     resumed_model: Option<String>,
     selected: RunSession,
 ) -> Result<OpenedSession, Box<dyn std::error::Error>> {
-    // Materialize the selection made before anything model-keyed was resolved (see `selected` above):
+    // Materialize the selection made before anything model-keyed was resolved (`select_session`, in `resolve_session`):
     // a fresh session is created only now, once every check that can fail this invocation has passed.
     let (mut store, session) = match selected {
         RunSession::Existing(opened) => {
@@ -1912,7 +1912,7 @@ async fn mount_memory(
     // `/session` working-memory store — the compaction-surviving scratchpad. `run` is single-session, so
     // the session dir is fixed for the whole process: the `<...>.memory/` sibling of a persisted session
     // file (so `session_store` trashes/restores it together), or an id-keyed tempdir when ephemeral. The
-    // session-open block was hoisted above this so `store` is already resolved here. Shared with every
+    // `open_run_session` runs before this, so `store` is already resolved here. Shared with every
     // subagent below by `Arc`, so a child sees the very same `/session` as the parent.
     let mounts: Vec<beyond_ai_agent::memory::Mount> = {
         use beyond_ai_agent::memory::{Mount, MountKind};
@@ -2174,9 +2174,9 @@ fn open_run_meta(
     mut store: &mut Option<SessionStore>,
     timing: &mut beyond_ai_agent::timing::StartupTiming,
 ) -> Result<SessionMeta, Box<dyn std::error::Error>> {
-    // `--name`, applied uniformly across every path above (mirrors `serve`'s own startup check) —
+    // `--name`, applied uniformly across every session-open path (mirrors `serve`'s own startup check) —
     // only for a genuinely fresh session (no messages, no title yet). `--continue`'s
-    // `resume_latest_or_create` branch above mints its own fresh `SessionMeta` internally when no
+    // `resume_latest_or_create` branch in `select_session` mints its own fresh `SessionMeta` internally when no
     // cwd match exists, bypassing the `fresh_meta` closure other branches use, so this was
     // previously the one path `--name` silently never reached even when it *did* open a brand-new
     // session.

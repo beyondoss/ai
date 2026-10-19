@@ -86,7 +86,7 @@ fn fork_at_entry_works_on_an_off_active_path_branch() {
 
 #[test]
 fn fork_at_entry_before_a_non_user_message_is_rejected() {
-    // Track L27: `before` (now the default — see `serve.rs`'s `fork`/`preview_fork`) means "fork
+    // Track L27: `before` (now the default — see `serve/commands/`'s `fork`/`preview_fork`) means "fork
     // right before this entry", which pi's own `getEntriesToFork` (`repo-utils.ts`) only allows
     // anchored to a user turn — forking "before" an assistant reply is ambiguous (which point,
     // exactly, is "before" a reply that has no message of its own between it and the prior turn?).

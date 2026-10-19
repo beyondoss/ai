@@ -540,7 +540,7 @@ impl SessionStore {
     /// this module's other side-channel append-only records), and calling it *after* would anchor at
     /// the new chain's own tip — which `change_at`'s deliberate "anchored-at, not before" exclusion
     /// (see that function's own doc comment) would then never see when a caller queries "the level at
-    /// this same tip", exactly the query `Persistence::model_and_level_at_active` (`serve.rs`) makes
+    /// this same tip", exactly the query `Persistence::model_and_level_at_active` (`serve/persistence.rs`) makes
     /// on every reopen. Anchoring at the root instead means it's picked up by `change_at`'s own base
     /// case (`changes.get(&None)`, checked before any ancestor) for every id in the new tree, the same
     /// way `rewrite_compacted` already re-anchors a resolved model/level onto a fresh chain's `None`
@@ -592,7 +592,7 @@ impl SessionStore {
     /// than the source's *first* `set_model`, wrong in the other direction). Falls back to
     /// `self.meta.model` (the session's true creation-time value) only when nothing was ever recorded
     /// reaching that point — the exact same "nothing changed on this branch yet" resolution
-    /// `Persistence::model_and_level_at` (`serve.rs`) already applies for `switch_branch`/
+    /// `Persistence::model_and_level_at` (`serve/persistence.rs`) already applies for `switch_branch`/
     /// `switch_session`, just scoped to the one value a fork's own new header needs up front.
     pub(super) fn model_at_or_created(&self, target_id: Option<&str>) -> &str {
         target_id

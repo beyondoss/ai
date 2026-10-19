@@ -145,9 +145,8 @@ pub const ANSWER_BODY: &str = r#"{"type":"response","command":"job_ended","succe
 
 /// What [`serve`] needs to know of the replica.
 pub struct Receiver<'a> {
-    /// `serve --service`: callbacks are refused (`403`) anywhere else.
-    pub service_mode: bool,
-    /// The replica's notify key and open sessions; `None` outside service mode.
+    /// The replica's notify key and open sessions; `None` outside `serve --service`, where
+    /// callbacks are refused (`403`).
     pub hub: Option<&'a NotifyHub>,
 }
 
@@ -307,7 +306,7 @@ where
         return Err(Some(400));
     }
     // (4) Service mode.
-    let (true, Some(hub)) = (rx.service_mode, rx.hub) else {
+    let Some(hub) = rx.hub else {
         return Err(Some(403));
     };
     // (5) The token, from the URL's tenant and session and the body's scope and id.

@@ -1078,7 +1078,7 @@ fn a_failed_checkpoint_before_a_tool_means_the_tool_never_runs() {
 #[test]
 fn serve_stdout_stays_valid_json_even_when_a_load_warning_fires() {
     // A prior bug (output-guard gap): the tracing subscriber defaulted to stdout, the same stream
-    // `serve`'s NDJSON protocol writes to. A `tracing::warn!` on a live path (here: `session_store.rs`
+    // `serve`'s NDJSON protocol writes to. A `tracing::warn!` on a live path (here: `session_store/`
     // skipping an unparseable line while loading) would interleave raw log text into the protocol
     // stream, breaking any line-based JSON parser reading it. Plant a session file with exactly that
     // kind of corrupt line, run with `RUST_LOG=warn` so the warning is guaranteed to fire, and assert

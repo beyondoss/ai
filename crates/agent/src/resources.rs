@@ -186,7 +186,7 @@ pub struct PromptOptions<'a> {
     /// doc comment) — a non-empty list with nothing actually model-visible must not still produce an
     /// empty wrapper.
     /// Discovery itself — `skills::discover`/`discover_with_diagnostics` — is the caller's job, not
-    /// this function's: every real caller (`main.rs`'s `run`, `serve.rs`'s startup/`reload`) already
+    /// this function's: every real caller (`main.rs`'s `run`, `serve/`'s startup/`reload`) already
     /// discovers skills separately for its own purposes (expanding a `/skill:name` invocation,
     /// `get_commands`'s collision diagnostics), so re-discovering here as well would walk the exact
     /// same directories twice per startup/reload for no reason. Pass `&[]` (and skip discovery

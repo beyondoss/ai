@@ -124,7 +124,7 @@ fn sigterm_during_a_bash_tool_call_kills_the_whole_process_group_not_just_run_it
 #[test]
 fn sigint_during_a_bash_tool_call_kills_the_whole_process_group_too() {
     // Same fixture as the SIGTERM test, but Ctrl-C (SIGINT) — `ShutdownSignal::wait` races
-    // `tokio::signal::ctrl_c()` alongside `SIGTERM` (see `serve.rs`), so both must behave alike.
+    // `tokio::signal::ctrl_c()` alongside `SIGTERM` (see `serve/`), so both must behave alike.
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("leaked");
     let script = format!("( sleep 1; touch {} ) & sleep 30", marker.display());
@@ -152,7 +152,7 @@ fn sighup_during_a_bash_tool_call_kills_the_whole_process_group_too() {
     // Pi-parity fix: SIGHUP had no handler at all — its default disposition is the same immediate
     // termination as an unhandled SIGTERM, which would skip `GroupKillGuard` and orphan a backgrounded
     // grandchild. Same fixture as the SIGTERM/SIGINT tests above — `ShutdownSignal::wait` now races
-    // `SignalKind::hangup()` alongside them (see `serve.rs`), so all three must behave alike.
+    // `SignalKind::hangup()` alongside them (see `serve/`), so all three must behave alike.
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("leaked");
     let script = format!("( sleep 1; touch {} ) & sleep 30", marker.display());

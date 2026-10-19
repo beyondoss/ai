@@ -1,15 +1,15 @@
 // Bench target: `.unwrap()` sets up fixtures; not production code.
 #![allow(clippy::unwrap_used)]
 
-//! Bench: the two-pass `AgentEvent` → `Value` → `String` serialization `serve.rs`'s old `event_frame`
+//! Bench: the two-pass `AgentEvent` → `Value` → `String` serialization `serve/`'s old `event_frame`
 //! used, versus the single-pass `AgentEvent` → `String` it uses now. This is `serve`'s streaming
 //! control loop's own hot path — once per model-generated delta, not once per tool call — so it never
 //! had a benchmark of its own before this fix; these numbers are what motivated it.
 //!
-//! `serve.rs`'s real `event_frame`/`OutFrame`/`write_frame` aren't reachable from a bench target
+//! `serve/`'s real `event_frame`/`OutFrame`/`write_frame` aren't reachable from a bench target
 //! (they're private — deliberately so, `serve` is a CLI implementation, not a library surface). This
 //! replicates both serialization strategies against the same public `agent_core::AgentEvent` type
-//! instead, so the comparison is honest without widening `serve.rs`'s API just to make it benchable.
+//! instead, so the comparison is honest without widening `serve/`'s API just to make it benchable.
 //! Run: `cargo bench -p beyond-ai-agent --bench serve_events`.
 
 use std::hint::black_box;
@@ -108,7 +108,7 @@ fn frame_line(which: &str) -> String {
 // ── `OutFanout::broadcast`'s per-event clone cost: `Raw(String)` (before) vs `Raw(Bytes)` (after) ──
 //
 // `broadcast` clones the frame once for the in-flight-turn recording, then once per *extra* attached
-// sink (the single-sink case moves, so it clones zero times for the sink). `serve.rs`'s real
+// sink (the single-sink case moves, so it clones zero times for the sink). `serve/`'s real
 // `OutFanout` is private and unreachable from a bench target, so — exactly as the serialize-strategy
 // benches above do — this replicates its clone pattern against the same serialized line. With
 // `String` each clone is a full heap allocation + `memcpy` of the line; with `Bytes` it is a refcount

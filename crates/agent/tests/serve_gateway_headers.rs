@@ -13,7 +13,7 @@ use serde_json::json;
 #[test]
 fn serve_startup_model_override_header_reaches_the_wire_request() {
     // Task 2 (pi-parity fix, serve pass 19): `main.rs::run_task` chains
-    // `.with_extra_headers(model_override_extra_headers(&model))` onto its gateway client; `serve.rs`'s
+    // `.with_extra_headers(model_override_extra_headers(&model))` onto its gateway client; `serve/`'s
     // own `build_gateway_client` never did, silently defeating any `models.json`
     // `ModelOverride.headers` (and the auto-seeded NVIDIA/Kimi-Coding default headers) whenever the
     // model is used via `serve` instead of `run`. `claude-test` is the model `serve_cmd` always starts
