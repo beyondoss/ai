@@ -908,7 +908,7 @@ async fn serve_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
                 return respond_json(sock, 404, &json!({ "error": "no such job" })).await;
             }
             let offset = job["offset"].as_u64().unwrap_or(0);
-            stream_job(sock, shared, key(&id), offset, false, None).await;
+            let _ = stream_job(sock, shared, key(&id), offset, false, None).await;
         }
         "read" => {
             let id = job["id"].as_str().unwrap_or("");
@@ -1165,14 +1165,27 @@ async fn start_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
         });
     }
     if hold {
-        stream_job(sock, shared, key, 0, true, Some(pgid)).await;
+        // A held start is a stream like any other: recorded, with how it ended.
+        let index = {
+            let mut streams = shared.streams.lock().unwrap();
+            streams.push(StreamRecord {
+                pgid,
+                command: req["command"].as_str().unwrap_or("").to_string(),
+                args: args_of(&req),
+                started: Instant::now(),
+                end: None,
+            });
+            streams.len() - 1
+        };
+        let end = stream_job(sock, shared.clone(), key, 0, true, Some(pgid)).await;
+        shared.streams.lock().unwrap()[index].end = Some((end, Instant::now()));
     } else {
         respond_json(sock, 200, &json!({ "started": pgid })).await;
     }
 }
 
 /// Stream a job's output from `offset` to its end. `started`: a held start, which says so first —
-/// and whose job dies with the connection unless it was kept by then.
+/// and whose job dies with the connection unless it was kept by then. How the stream ended.
 async fn stream_job(
     sock: tokio::net::TcpStream,
     shared: Shared,
@@ -1180,7 +1193,7 @@ async fn stream_job(
     offset: u64,
     hold: bool,
     started: Option<u32>,
-) {
+) -> StreamEnd {
     let (mut rd, mut wr) = sock.into_split();
     let head = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
     let mut gone = wr.write_all(head.as_bytes()).await.is_err();
@@ -1235,13 +1248,13 @@ async fn stream_job(
                 tail.extend_from_slice(b"0\r\n\r\n");
                 let _ = wr.write_all(&tail).await;
                 let _ = wr.shutdown().await;
-                return;
+                return StreamEnd::Finished;
             }
             Next::Missing => {
                 let mut tail = chunk(&json!({ "error": "the job is gone" }));
                 tail.extend_from_slice(b"0\r\n\r\n");
                 let _ = wr.write_all(&tail).await;
-                return;
+                return StreamEnd::Finished;
             }
             Next::Wait => {
                 tokio::select! {
@@ -1264,8 +1277,10 @@ async fn stream_job(
         };
         if let Some(g) = pgid {
             signal_group(g, "-KILL");
+            return StreamEnd::Disconnected { killed: true };
         }
     }
+    StreamEnd::Disconnected { killed: false }
 }
 
 // ---------------------------------------------------------------------------------------------

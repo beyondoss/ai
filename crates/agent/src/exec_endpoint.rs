@@ -883,7 +883,13 @@ impl HttpExecRunner {
             url,
             client: {
                 agent_core::ensure_provider();
-                reqwest::Client::new()
+                // An idle connection to the endpoint is closed after 30 s and never probed with TCP
+                // keepalives: once a job is unheld (exec v1.4), nothing may keep the sandbox awake.
+                reqwest::Client::builder()
+                    .pool_idle_timeout(Duration::from_secs(30))
+                    .tcp_keepalive(None)
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new())
             },
             headers: Vec::new(),
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
@@ -2193,7 +2199,14 @@ struct CellRoute {
     /// (`serve --service`) sets it, because there the host is the *replica* — a tenant's `bash`
     /// landing on it is not a stale-config bug but a breach. Fixed at construction.
     strict: bool,
+    /// Told of every real use of the sandbox: each command and filesystem call dispatched through
+    /// the cell. Never told of a sandbox job operation, which goes to the job store directly (exec
+    /// v1.4's live reconcile starts on a use; its own `list` must not count as one).
+    on_use: std::sync::Arc<std::sync::RwLock<Option<UseHook>>>,
 }
+
+/// What [`ExecCell::set_use_hook`] calls on each real use of the sandbox. Must not block.
+pub type UseHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 /// Builds a lazily attached target: the probe and everything it derives, run on first use. Its
 /// error reaches the tool call that needed the target, word for word.
@@ -2249,6 +2262,14 @@ impl CellRoute {
     /// The target to dispatch to — connecting a lazily attached one first, once for every caller
     /// waiting on it — or `None` for this host, or the refusal.
     async fn resolve(&self) -> Result<Option<ExecTarget>, String> {
+        let hook = self
+            .on_use
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
         match self.route() {
             Route::Target(t) => Ok(Some(t)),
             Route::Host => Ok(None),
@@ -2328,6 +2349,11 @@ impl ExecCell {
         });
         *self.route.target.write().unwrap_or_else(|e| e.into_inner()) = None;
         *self.route.lazy.write().unwrap_or_else(|e| e.into_inner()) = Some(lazy);
+    }
+
+    /// Call `hook` on every real use of the sandbox from now on (`None`: stop).
+    pub fn set_use_hook(&self, hook: Option<UseHook>) {
+        *self.route.on_use.write().unwrap_or_else(|e| e.into_inner()) = hook;
     }
 
     /// Connect a lazily attached target now, as a call would. A no-op for any other cell.

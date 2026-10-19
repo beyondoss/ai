@@ -24,6 +24,27 @@ use crate::exec_endpoint::jobs::JobId;
 use crate::notify_token::NotifyKey;
 use kernel::{Action, CallId, Event, Facts, Kernel, Listed, Millis, TableJob};
 
+/// Check `--notify-origin`: an absolute `http`/`https` URL with a host and nothing past the origin
+/// (no path but `/`, no query, no fragment, no userinfo).
+pub fn check_origin(origin: &str) -> Result<(), String> {
+    let url = url::Url::parse(origin)
+        .map_err(|e| format!("--notify-origin {origin:?} is not a URL: {e}"))?;
+    let bare = matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some_and(|h| !h.is_empty())
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none();
+    if bare {
+        Ok(())
+    } else {
+        Err(format!(
+            "--notify-origin {origin:?} must be an http or https origin, like https://edge.example"
+        ))
+    }
+}
+
 /// A session's job table, as the kernel's driver sees it.
 pub trait JobTracker: Send + Sync {
     /// What today's job table says of the job a callback names.
@@ -95,6 +116,9 @@ pub struct SessionNotify {
     tracker: Mutex<Option<Weak<dyn JobTracker>>>,
     /// Wakes the timer task to recompute [`Kernel::next_wake`].
     timer: Arc<Notify>,
+    /// The origin the fleet's edge serves sessions at (`--notify-origin`): what a `keep`'s
+    /// `notify.url` is built on. `None`: notify is not available to this session.
+    origin: Mutex<Option<String>>,
 }
 
 impl SessionNotify {
@@ -116,6 +140,7 @@ impl SessionNotify {
             }),
             tracker: Mutex::new(None),
             timer: Arc::new(Notify::new()),
+            origin: Mutex::new(None),
         });
         lock(&hub.sessions).insert(key, Arc::downgrade(&this));
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
@@ -128,6 +153,28 @@ impl SessionNotify {
     /// having read its sandbox's jobs back.
     pub fn set_tracker(&self, tracker: Weak<dyn JobTracker>) {
         *lock(&self.tracker) = Some(tracker);
+    }
+
+    /// Make notify available to this session's jobs, at `origin` (the edge's, configured by the
+    /// operator), or not (`None`).
+    pub fn set_origin(&self, origin: Option<String>) {
+        *lock(&self.origin) = origin;
+    }
+
+    /// The `notify` a `keep` of job `id` carries: the session's own address at the origin, and a
+    /// token minted for this session and job. `None` when notify is not available.
+    pub fn target_for(&self, id: &JobId) -> Option<crate::exec_endpoint::jobs::JobNotify> {
+        let origin = lock(&self.origin).clone()?;
+        let hub = self.hub.upgrade()?;
+        let (tenant, session) = &self.key;
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("session_id", session)
+            .append_pair("tenant", tenant)
+            .finish();
+        Some(crate::exec_endpoint::jobs::JobNotify {
+            url: format!("{}/_beyond/agent?{query}", origin.trim_end_matches('/')),
+            token: hub.key().mint(tenant, session, id),
+        })
     }
 
     fn tracker(&self) -> Option<Arc<dyn JobTracker>> {
@@ -145,6 +192,14 @@ impl SessionNotify {
 
     /// Feed the kernel one event and perform what it decides.
     pub fn feed(self: &Arc<Self>, event: Event) {
+        for action in self.feed_collect(event) {
+            self.perform_now(action);
+        }
+    }
+
+    /// Feed the kernel one event: answer callbacks and start reconciles as it decides, and return
+    /// its actions about jobs for the caller to perform (a `keep` it must await, say).
+    pub fn feed_collect(self: &Arc<Self>, event: Event) -> Vec<Action> {
         let (actions, answers) = {
             let mut inner = lock(&self.inner);
             let actions = inner.kernel.step(event);
@@ -165,13 +220,20 @@ impl SessionNotify {
         for (tx, status) in answers {
             let _ = tx.send(status);
         }
+        let mut rest = Vec::new();
         for action in actions {
-            self.perform(action);
+            match action {
+                Action::StartReconcile { .. } => self.perform_now(action),
+                other => rest.push(other),
+            }
         }
         self.timer.notify_one();
+        rest
     }
 
-    fn perform(self: &Arc<Self>, action: Action) {
+    /// Perform one of the kernel's actions: a reconcile here, anything about a job through the
+    /// job table.
+    pub fn perform_now(self: &Arc<Self>, action: Action) {
         match action {
             Action::StartReconcile { reconcile } => {
                 let me = Arc::downgrade(self);

@@ -2558,7 +2558,7 @@ killing an unkept job (measured on the far side), a kept job surviving its hold 
 `SIGTERM`-ignoring job and removing it, and `list`/`wipe` staying in their scope. The decoding
 vectors are `tests/fixtures/exec/v1.3-jobs.json` (`tests/exec_jobs_vectors.rs`).
 
-**Job-end notify (v1.4): specified, not built yet.** A replica holds a v1.2 stream to every kept
+**Job-end notify (v1.4).** A replica holds a v1.2 stream to every kept
 job, and that stream's heartbeat keeps an idle sandbox awake for as long as the job runs. The module
 doc's "Sandbox job notify (v1.4)" specifies the fix: `keep` gains an optional `notify` (a URL and an
 opaque `bjn_v1` token), the sandbox's job supervisor POSTs a `job_ended` hint to the session's own
@@ -2575,8 +2575,7 @@ After release nothing contacts the sandbox in the background: an end no callback
 sandbox, a broken path) is noticed at the session's next real use of the sandbox, a `bash_job`
 call or the next open, which is the one accepted difference from today. It opens no new window for
 a duplicate or lost report: across a crash it has exactly today's (below). FLEET.md's "Job-end callbacks" is the edge's half. The replica
-does not use it yet: every replica holds its streams as described above. What is built is the
-endpoint side and the client's half of it. The probe's answer is read as a `JobOffer` (native jobs,
+side is built (below); so are the endpoint side and the client's half of it. The probe's answer is read as a `JobOffer` (native jobs,
 native notify, notify for the baseline, each only on the spec's exact answer), and
 `SandboxJobs::keep_notify` sends `keep` with `notify` natively; a refused `notify` (`400`) comes back
 as `ErrorKind::InvalidInput`, so a caller can keep without it. When an endpoint calls back is one
@@ -2614,10 +2613,30 @@ nothing is opened. Every decision past that is the pure kernel's
 waits for a live reconcile, at most one per session at a time, spaced a second apart, with at most
 16 callbacks waiting and each answered `503` 20 s after it arrived. The callback is answered through
 its own path, never pins the session, and never touches its idle clock. `job_ended` sent any other
-way is refused (`403` over HTTP, a failed `response` otherwise). No job is kept with notify yet, so
-nothing is unheld and the live reconcile's `list` is not wired: those are the next change.
-`tests/serve_job_ended.rs` drives a real replica over raw TCP, and every receiver case of
-`v1.4-callback.json` through the receiver, the driver and the kernel.
+way is refused (`403` over HTTP, a failed `response` otherwise). `tests/serve_job_ended.rs` drives a
+real replica over raw TCP, and every receiver case of `v1.4-callback.json` through the receiver, the
+driver and the kernel.
+
+The release is built too, in service mode with `--notify-origin` (the origin the fleet's edge serves
+sessions at); without it, or with an endpoint that does not offer notify, every job is kept and held
+exactly as before. Parking a job (`tools::bash_sandbox::keep`) feeds the kernel `Kept`, sends the
+`keep` it asks for (with `notify`: the session's own address at that origin, and a token minted for
+the session and job), and feeds back how it was answered; a `400` is answered with a plain `keep`,
+and the job stays held. When the proof and the successful `keep` have both arrived (in either order,
+inside the window), the kernel closes the stream: the job's task is steered by `bash_sandbox::Ctl`,
+stops holding the stream (or the follow standing for it) without ending the job, and reports
+`StreamClosed`, which starts the release's own live reconcile. An unheld job's task then holds
+nothing until the kernel says to follow: a reconcile that lists it `ended` or `lost`, does not list
+it, or cannot list the sandbox starts today's follow from the offset its stream reached (a listed end
+recorded at the listing's time, as a reopen records it); a listed `exited` is applied as a stream's
+`shell_exit`. The live reconcile's only request is `list`, through the job store, never through the
+exec cell, so it does not count as a use; every command and filesystem call through the cell does
+(`ExecCell::set_use_hook`), and starts one when no reconcile ended in the last 30 s. An open
+reconcile that adopts a kept, running job keeps it again with `notify` (`adopted`), its follow
+standing for the stream until the path is proved anew. The exec runner's HTTP client keeps an idle
+connection at most 30 s and sends no TCP keepalives, so nothing holds an unheld job's sandbox awake.
+`tests/job_notify.rs` runs a real replica against the reference endpoint (`exec_mock`, which makes
+the callbacks) through a stand-in for the edge.
 
 **Known gap: a crash can report a sandbox job's end twice.** This is today's behaviour for every
 kept job, held stream or not, and not part of v1.4. A job's end is reported in a turn (a wake turn,
