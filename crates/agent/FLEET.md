@@ -65,6 +65,19 @@ A `503` body carries a human-readable reason (`"that session is open on another 
 The edge picks a replica within a slice by hashing the session id onto a ring with virtual nodes (the reference
 edge uses 64 per replica).
 
+The reference edge's ring, exactly, so a real edge can match it. Every position is `h(bytes)`: 64-bit FNV-1a
+(offset `0xcbf29ce484222325`, prime `0x100000001b3`), then the splitmix64 finalizer
+(`h ^= h >> 30; h *= 0xbf58476d1ce4e5b9; h ^= h >> 27; h *= 0x94d049bb133111eb; h ^= h >> 31`, multiplies
+wrapping). Replica `r` has the 64 positions `h("<r>#0")` … `h("<r>#63")`, `<r>` being its name in the
+ring. A session id `s` belongs to the replica owning the first position at or after `h(s)`, wrapping
+past the top to the lowest one.
+
+**The finalizer is not optional.** FNV-1a alone ends on a multiply, which carries a change in a
+string's last byte only toward the high bits, so the 64 keys of one replica, which differ only at the
+end, hash into one tight cluster. The reference edge shipped that way at first: among three replicas
+named `r1`, `r2` and `r3`, one held 3% of sessions and another 61%. No session was ever unreachable
+for it, but a replica's load had nothing to do with the replica count.
+
 **Not modulo.** With `hash % len` the ring is renumbered whenever the replica count changes, so
 _every_ session moves when one replica joins or leaves. A session that moves while its previous owner
 still holds the lock is answered `503` by its new target, and the retry — which is deterministic, and

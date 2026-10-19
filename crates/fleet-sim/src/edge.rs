@@ -81,16 +81,27 @@ pub struct Target {
 /// the others rather than dumping them all on its neighbour.
 const VNODES_PER_TARGET: usize = 64;
 
-/// FNV-1a. Small, stable across releases, and the ring's positions have to be reproducible — a hash
-/// that changed between builds would move every session on deploy, which is the failure this ring
-/// exists to avoid.
+/// FNV-1a 64, then the splitmix64 finalizer — used for both a session id and a vnode key
+/// (`<replica name>#<n>`, n = 0..64). Small, stable across releases, and the ring's positions have
+/// to be reproducible: a hash that changed between builds would move every session on deploy, which
+/// is the failure this ring exists to avoid.
+///
+/// **The finalizer is not optional.** FNV-1a ends on a multiply, which carries a change in the last
+/// byte only *upward*, so the vnode keys of one replica — `r1#0` … `r1#63`, differing only at the
+/// end — came out as one tight cluster, every one sharing its top byte. The ring had one arc per
+/// replica rather than 64: among `r1`, `r2`, `r3`, `r1` held 3% of sessions and `r2` 61%. The
+/// finalizer mixes every input bit into every output bit, which spreads the vnodes out.
 fn hash(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {
         h ^= u64::from(*b);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    h
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
 }
 
 pub struct Edge {
@@ -339,4 +350,56 @@ fn ring_order<'a>(targets: &'a [Target], session_id: &str) -> Vec<&'a Target> {
         .collect();
     scored.sort_by_key(|(d, _)| *d);
     scored.into_iter().map(|(_, t)| t).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Requirement 1 is only worth having if the ring spreads sessions: with 3, 4 and 5 replicas
+    /// and 10,000 ids, every replica holds within 25% of an even share.
+    ///
+    /// Why 25%: with 64 vnodes per replica a replica's share of the ring is the sum of 64 arcs, so
+    /// its relative standard deviation is about 1/sqrt(64) = 12.5%; sampling 10,000 ids adds about
+    /// 2%. 25% is two of those deviations. The hash and the ids are both fixed, so the test cannot
+    /// flake: it measures one ring, the same way on every run. Before the finalizer the same check
+    /// found `r1` holding 2.5% of sessions among three replicas.
+    #[test]
+    fn the_ring_spreads_sessions_evenly() {
+        let keys = tempfile::tempdir().unwrap_or_else(|e| unreachable!("tempdir: {e}"));
+        let total = 10_000usize;
+        // Ids shaped like a minted session id: a shard, then 16 hex digits.
+        let ids: Vec<String> = (0..total as u64)
+            .map(|i| format!("s1.{:016x}", hash(&i.to_le_bytes())))
+            .collect();
+        for n in 3..=5usize {
+            let targets: Vec<Target> = (1..=n)
+                .map(|i| Target {
+                    name: format!("r{i}"),
+                    addr: Addr::local(0),
+                })
+                .collect();
+            let edge = Edge::new(keys.path(), targets.clone());
+            let mut owned = BTreeMap::<String, usize>::new();
+            for id in &ids {
+                let first = ring_order(&targets, id)[0].name.clone();
+                assert_eq!(
+                    edge.route(id).map(|t| &t.name),
+                    Some(&first),
+                    "the walk starts at the hashed target"
+                );
+                *owned.entry(first).or_default() += 1;
+            }
+            let fair = total / n;
+            for t in &targets {
+                let got = owned.get(&t.name).copied().unwrap_or(0);
+                assert!(
+                    got * 4 > fair * 3 && got * 4 < fair * 5,
+                    "{n} replicas: {} holds {got} of {total} sessions, not within 25% of {fair}: \
+                     {owned:?}",
+                    t.name
+                );
+            }
+        }
+    }
 }
