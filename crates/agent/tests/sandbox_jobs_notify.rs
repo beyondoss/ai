@@ -585,3 +585,74 @@ async fn a_notifier_that_dies_is_started_again() {
         let _ = jobs.wipe(&scope).await;
     }
 }
+
+/// A job kept with notify outlives its hold, whatever its notifier does: its notifier is killed
+/// and started again while the hold is up, then the hold closes, and the job runs on. Under each
+/// rung's shell (dash here, busybox's `sh`, and the live target's).
+#[tokio::test]
+async fn a_job_kept_with_notify_outlives_its_hold() {
+    use beyond_ai_agent::exec_endpoint::jobs::JobEvent;
+    for rung in rungs() {
+        let name = rung.name;
+        let jobs = rung.jobs();
+        if !jobs.holds().await {
+            eprintln!("{name}: this rung cannot hold a job");
+            continue;
+        }
+        let (scope, id) = (rung.scope(), JobId::fresh());
+        let rx = CallbackReceiver::start().await;
+        let started = std::sync::Mutex::new(None::<u32>);
+        let events = |e: JobEvent<'_>| {
+            if let JobEvent::Started(g) = e {
+                *started.lock().unwrap() = Some(g);
+            }
+        };
+        let s = spec("sleep 30");
+        let mut run = Box::pin(jobs.run_held(&scope, &id, &s, &events));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while started.lock().unwrap().is_none() {
+            tokio::select! {
+                r = &mut run => panic!("{name}: ended early: {r:?}"),
+                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+            assert!(Instant::now() < deadline, "{name}: never started");
+        }
+        let pgid = started.lock().unwrap().unwrap();
+        // Kept with notify while the hold is up (the hold keeps being polled meanwhile).
+        let notify = JobNotify {
+            url: rx.url.clone(),
+            token: token(),
+        };
+        let keep = jobs.keep_notify(&scope, &id, 1, "background", 0, &notify);
+        tokio::select! {
+            r = &mut run => panic!("{name}: ended early: {r:?}"),
+            k = keep => k.unwrap(),
+        }
+        let proof = async { rx.wait_for(1, Duration::from_secs(5)).await };
+        tokio::select! {
+            r = &mut run => panic!("{name}: ended early: {r:?}"),
+            got = proof => assert_eq!(got.len(), 1, "{name}: the proof"),
+        }
+        // Its notifier dies and is started again, the hold still up.
+        let dir = format!("{}/{}/{}", scope.root(), scope.name(), id);
+        let pid_cmd = format!("cat {dir}/nlock/pid 2>/dev/null");
+        let first = rung.sh(&pid_cmd).await.stdout.trim().to_string();
+        assert!(!first.is_empty(), "{name}: the notifier records its pid");
+        rung.sh(&format!("kill -KILL {first}")).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let now = rung.sh(&pid_cmd).await.stdout.trim().to_string();
+            if !now.is_empty() && now != first {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{name}: never started again");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // The hold closes: the kept job runs on.
+        drop(run);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let alive = rung.sh(&format!("kill -0 -{pgid} 2>/dev/null")).await;
+        assert_eq!(alive.code, Some(0), "{name}: a kept job died with its hold");
+        let _ = jobs.wipe(&scope).await;
+    }
+}
