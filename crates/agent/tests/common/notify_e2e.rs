@@ -245,13 +245,15 @@ async fn pump(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Route,
+    /// Route it after holding it this long (a slow path).
+    Delay(Duration),
     Answer(u16),
     Drop,
 }
 
-/// A callback's fate, by its job id and how many callbacks for that job the front has seen
-/// (1 for the first, which is the job's proof).
-pub type Policy = Arc<dyn Fn(&str, usize) -> Verdict + Send + Sync>;
+/// A callback's fate, by what the front knows of it: its session, its job id, and how many
+/// callbacks for that job the front has seen (`nth`, 1 for the first, which is the job's proof).
+pub type Policy = Arc<dyn Fn(&SeenCallback) -> Verdict + Send + Sync>;
 
 /// One callback the front saw.
 #[derive(Clone, Debug)]
@@ -263,6 +265,10 @@ pub struct SeenCallback {
     pub nth: usize,
     /// What the sandbox was answered (`0`: the connection was dropped).
     pub status: u16,
+    /// Whether it reached a replica (`false`: the front answered or dropped it itself).
+    pub routed: bool,
+    /// When the front had its final answer.
+    pub answered: Instant,
     /// Each replica slot tried, with its answer (`0`: refused the connection).
     pub tried: Vec<(usize, u16)>,
 }
@@ -360,16 +366,24 @@ impl Front {
                 job,
                 nth,
                 status: 0,
+                routed: false,
+                answered: Instant::now(),
                 tried: Vec::new(),
             }
         });
         if let Some(rec) = &mut record {
             let policy = self.policy.lock().unwrap().clone();
-            match policy.map_or(Verdict::Route, |p| p(&rec.job, rec.nth)) {
+            match policy.map_or(Verdict::Route, |p| p(rec)) {
                 Verdict::Route => {}
+                Verdict::Delay(d) => {
+                    tokio::time::sleep(d).await;
+                    // `at` is when it goes on to a replica.
+                    rec.at = Instant::now();
+                }
                 Verdict::Answer(status) => {
                     let _ = inbound.write_all(fixed_answer(status).as_bytes()).await;
                     rec.status = status;
+                    rec.answered = Instant::now();
                     self.seen.lock().unwrap().push(rec.clone());
                     return None;
                 }
@@ -413,6 +427,8 @@ impl Front {
             }
             if let Some(rec) = &mut record {
                 rec.status = status;
+                rec.routed = true;
+                rec.answered = Instant::now();
                 rec.tried = tried.clone();
                 self.seen.lock().unwrap().push(rec.clone());
             }
@@ -423,6 +439,8 @@ impl Front {
         }
         if let Some(rec) = &mut record {
             rec.status = 503;
+            rec.answered = Instant::now();
+            rec.routed = tried.iter().any(|(_, s)| *s != 0);
             rec.tried = tried;
             self.seen.lock().unwrap().push(rec.clone());
         }
@@ -578,6 +596,8 @@ pub struct E2e {
     pub requests: Arc<Mutex<Vec<String>>>,
     pub procs: Vec<Proc>,
     replica_args: Vec<String>,
+    /// Sessions whose sandbox is reached through a meter of their own ([`Self::isolate`]).
+    meters: Mutex<HashMap<String, Meter>>,
 }
 
 impl E2e {
@@ -619,12 +639,18 @@ impl E2e {
             requests,
             procs,
             replica_args,
+            meters: Mutex::default(),
         }
     }
 
     /// A grant for `session` whose sandbox is reached through the meter.
     pub fn grant(&self, session: &str) -> String {
-        let url = self.meter.url.clone();
+        let url = self
+            .meters
+            .lock()
+            .unwrap()
+            .get(session)
+            .map_or_else(|| self.meter.url.clone(), |m| m.url.clone());
         self.svc
             .token_with(TENANT, session, move |c| c.exec_url = url)
     }
@@ -723,6 +749,17 @@ impl E2e {
         post_to(self.front.port, session, token, scope, job).await
     }
 
+    /// Give `session` a meter of its own, so the bytes its replica exchanges with the sandbox are
+    /// told apart from every other session's on the same endpoint.
+    pub async fn isolate(&self, session: &str) -> Meter {
+        let meter = Meter::start(&self.svc.exec.url).await;
+        self.meters
+            .lock()
+            .unwrap()
+            .insert(session.to_string(), meter.clone());
+        meter
+    }
+
     /// The port of `slot`'s replica (panics when it is down).
     pub fn svc_port(&self, slot: usize) -> u16 {
         match &self.procs[slot] {
@@ -793,7 +830,7 @@ impl E2e {
     pub async fn reports(&self, ws: &mut TestWs, needle: &str) -> usize {
         static ASKS: AtomicUsize = AtomicUsize::new(1);
         let ask = format!("how are things {}", ASKS.fetch_add(1, Ordering::Relaxed));
-        prompt(ws, &ask).await;
+        prompt_when_idle(ws, &ask).await;
         // A prompt sent during a turn is queued behind it: wait for the request that carries it.
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -815,6 +852,22 @@ impl E2e {
         }
     }
 
+    /// Each message of the latest model request that carries `needle`, as role and text: what a
+    /// failed report count prints.
+    pub fn report_contexts(&self, needle: &str) -> Vec<String> {
+        let reqs = self.requests.lock().unwrap();
+        let Some(last) = reqs.iter().rfind(|r| r.contains(needle)) else {
+            return Vec::new();
+        };
+        super::body_json(last)["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|m| m.to_string().contains(needle))
+            .map(|m| format!("{}: {}", m["role"], texts(&m["content"]).join(" | ")))
+            .collect()
+    }
+
     /// Exec requests the endpoint received so far.
     pub fn exec_requests(&self) -> usize {
         self.svc.exec.requests().len()
@@ -826,6 +879,28 @@ pub async fn prompt(ws: &mut TestWs, message: &str) {
     ws_send(ws, json!({"type":"prompt","id":"p","message":message})).await;
     let frames = super::ws_read_until_response(ws, "prompt").await;
     assert_eq!(frames.last().unwrap()["success"], true, "{frames:?}");
+}
+
+/// Send `message` as a prompt once the session is not running one (a wake turn may be), and wait
+/// for its response.
+pub async fn prompt_when_idle(ws: &mut TestWs, message: &str) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        ws_send(ws, json!({"type":"prompt","id":"p","message":message})).await;
+        let frames = super::ws_read_until_response(ws, "prompt").await;
+        let last = frames.last().unwrap();
+        if last["success"] == true {
+            return;
+        }
+        assert!(
+            last["error"]
+                .as_str()
+                .is_some_and(|e| e.starts_with("busy"))
+                && Instant::now() < deadline,
+            "{frames:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// A client command that uses the sandbox (a real use).

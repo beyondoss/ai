@@ -11,7 +11,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::notify_e2e::{E2e, Mode, Setup, Verdict, in_every_mode, notice, unique};
+use common::notify_e2e::{E2e, Mode, SeenCallback, Setup, Verdict, in_every_mode, notice, unique};
 
 /// A job that prints its marker only at its end, so the command line never contains it.
 fn job(secs: u32, marker: &str) -> String {
@@ -108,8 +108,8 @@ async fn without_its_proof_the_stream_stays_held(mode: Mode) {
     let marker = "m7";
     let f = E2e::start(Setup::new(mode)).await;
     f.front
-        .set_policy(Some(std::sync::Arc::new(|_job: &str, nth: usize| {
-            if nth == 1 {
+        .set_policy(Some(std::sync::Arc::new(|c: &SeenCallback| {
+            if c.nth == 1 {
                 Verdict::Answer(404)
             } else {
                 Verdict::Route

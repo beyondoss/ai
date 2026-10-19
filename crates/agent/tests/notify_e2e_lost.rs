@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use common::exec_mock::LoseCallbacks;
 use common::notify_e2e::{
-    E2e, Mode, Setup, Verdict, holds, in_notify_modes, notice, unique, use_sandbox, wait_reaped,
+    E2e, Mode, SeenCallback, Setup, Verdict, holds, in_notify_modes, notice, unique, use_sandbox,
+    wait_reaped,
 };
 
 fn job(secs: u32, marker: &str) -> String {
@@ -37,8 +38,8 @@ async fn losing(mode: Mode, idle_timeout: Option<u64>) -> E2e {
         ..Setup::new(mode)
     })
     .await;
-    f.front.set_policy(Some(Arc::new(|_job: &str, nth: usize| {
-        if nth == 1 {
+    f.front.set_policy(Some(Arc::new(|c: &SeenCallback| {
+        if c.nth == 1 {
             Verdict::Route
         } else {
             Verdict::Answer(404)
@@ -120,7 +121,7 @@ async fn a_dead_sandbox_is_noticed_at_the_next_use(mode: Mode) {
     let quiet = released(&f, session, command).await;
     let model_before = f.model_requests();
     f.front
-        .set_policy(Some(Arc::new(|_job: &str, _nth: usize| Verdict::Drop)));
+        .set_policy(Some(Arc::new(|_: &SeenCallback| Verdict::Drop)));
     f.meter.go_down();
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(

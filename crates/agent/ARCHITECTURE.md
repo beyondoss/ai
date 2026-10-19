@@ -2671,7 +2671,14 @@ the endpoint behind a proxy that counts every byte at the socket, and a model th
 request's last message. It proves silence after release in bytes, a notified end's notice and wake
 equal to the held stream's with notify off, forged, looped and duplicate callbacks, a killed
 replica's takeover, lost callbacks found at the next use or open, a reaped session, and a dead
-sandbox taking today's error path.
+sandbox taking today's error path. `tests/notify_e2e_orderings.rs` drives the same fleet with seeded
+plans that randomize the job's length, what the path does with its proof and its end's callback
+(route, delay, lose an attempt, refuse), and uses, duplicate and forged callbacks, replica kills and
+closes and reopens at random moments, and holds every run to one report per end, at least one while
+open, no session opened by a callback (nothing reaches a closed session's sandbox, on a meter of its
+own), and no byte after release that nothing asked for. CI runs 200 seeds; `NOTIFY_E2E_SEEDS`,
+`NOTIFY_E2E_WORKERS` and `NOTIFY_E2E_BUDGET_SECS` run more, and a failing seed prints the
+`NOTIFY_E2E_SEED=<n>` command that replays it alone.
 
 `tests/notify_model.rs` is a Stateright model that drives both pure kernels
 (`notify_kernel::step` and `job_notify::kernel::step`) through every interleaving of one session's
