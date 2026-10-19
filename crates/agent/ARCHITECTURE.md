@@ -2604,7 +2604,7 @@ runs the same event sequences through `step` and through `SH` under dash and bus
 are `tests/fixtures/exec/v1.4-*.json`, and `tests/exec_notify_vectors.rs` loads each into a strict
 schema, recomputes what follows from its inputs (the token vectors under a reference verifier, the
 retry timelines), and fails when a tagged requirement names no check (`v1.4-checks.json` lists
-each one, with the task that writes it).
+each one).
 
 The token is built: [`notify_token`](src/notify_token.rs) is the only code that makes or checks a
 `bjn_v1` token. `NotifyKey::from_seal_secret` derives `K` (HKDF-SHA256 of the seal secret's bytes
@@ -2616,8 +2616,10 @@ every vector in `v1.4-token.json` and changes every byte of the token and of eac
 
 The receiver is built. A request is classified by its `Authorization` header alone, before its
 `Content-Length` is read ([`serve_ws::job_ended`](src/serve_ws/job_ended.rs)): a look-alike is
-refused `400`, and a callback never reaches the front door's grant check. It is checked in the
-spec's order, and only then looked up among the sessions a task here holds
+refused `400`, a value that is not UTF-8 is read on its bytes (never a callback, a look-alike when
+its bytes match), and a callback never reaches the front door's grant check. It is checked in the
+spec's order (a scope other than the session's own is `401`, as a bad tag is: no replica mints a
+token for it), and only then looked up among the sessions a task here holds
 ([`job_notify::NotifyHub`](src/tools/job_notify.rs)): a session not held here is answered `503` and
 nothing is opened. Every decision past that is the pure kernel's
 ([`job_notify::kernel`](src/tools/job_notify/kernel.rs)): what the job table says of the job
@@ -2650,13 +2652,18 @@ the session and job), and feeds back how it was answered; a `400` is answered wi
 and the job stays held. When the proof and the successful `keep` have both arrived (in either order,
 inside the window), the kernel closes the stream: the job's task is steered by `bash_sandbox::Ctl`,
 stops holding the stream (or the follow standing for it) without ending the job, and reports
-`StreamClosed`, which starts the release's own live reconcile. An unheld job's task then holds
+`StreamClosed`, which starts the release's own live reconcile. A held stream or holding follow that
+returns first (its final frame, or a break) feeds the kernel `StreamEnded`, and a proving or
+closing job is held as today. An unheld job's task then holds
 nothing until the kernel says to follow: a reconcile that lists it `ended` or `lost`, does not list
 it, or cannot list the sandbox starts today's follow from the offset its stream reached (a listed end
 recorded at the listing's time, as a reopen records it); a listed `exited` is applied as a stream's
 `shell_exit`. The live reconcile's only request is `list`, through the job store, never through the
-exec cell, so it does not count as a use; every command and filesystem call through the cell does
-(`ExecCell::set_use_hook`), and is never dropped (the last reconcile may have listed before the end): it starts one at once when none ended in the last 30 s, asks for one at the 30 s mark when one did, and asks for the next while one runs. An open
+exec cell, so it does not count as a use, and neither does any other sandbox job operation (a
+`bash_job` call has its own path, below); every command and filesystem call through the cell does
+(`ExecCell::set_use_hook`), and is never dropped (the last reconcile may have listed before the
+end): it starts one at once when none ended in the last 30 s, asks for one at the 30 s mark when
+one did, and asks for the next while one runs. An open
 reconcile that adopts a kept, running job keeps it again with `notify` (`adopted`), its follow
 standing for the stream until the path is proved anew. The exec runner's HTTP client keeps an idle
 connection at most 30 s and sends no TCP keepalives, so nothing holds an unheld job's sandbox awake.

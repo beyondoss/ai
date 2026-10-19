@@ -1677,7 +1677,7 @@
         "run_in_flight": false
       },
       "expect": {
-        "status": 403,
+        "status": 401,
         "answer_waits_for_list": false,
         "effect": "none"
       },

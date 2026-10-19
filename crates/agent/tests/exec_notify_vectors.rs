@@ -800,7 +800,7 @@ fn reference_receiver(keys: &[([u8; 32], String)], case: &ReceiverCase) -> Recei
     }
     // Step 6.
     if scope != scope_of(&session.tenant, &session.session_id) {
-        return refuse(403);
+        return refuse(401);
     }
     let answer = |waits, effect| ReceiverExpect {
         status: 200,
