@@ -3,6 +3,7 @@
 
 pub(crate) mod auth;
 pub(crate) mod inspect;
+pub(crate) mod run;
 pub(crate) mod serve;
 pub(crate) mod settings;
 pub(crate) mod trust;
