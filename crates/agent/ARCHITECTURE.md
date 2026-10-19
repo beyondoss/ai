@@ -231,9 +231,9 @@ The harness layers several capabilities over the bare tools + loop:
   the same way (no); this is a factual note about current behavior, not a parity gap.
   `trust_store::has_trust_gated_resources(cwd)` short-circuits `project_trusted` to `true` when a
   directory has none of the resources trust actually gates (no `SYSTEM.md`/`APPEND_SYSTEM.md`, no
-  `.claude/skills`, no `.claude/prompts`, no `.beyond/settings.json` or `.claude/settings.json` (Round 3, pi-parity feature — see
-  "Persisted settings" below), no `.agents/skills` anywhere between `cwd` and the enclosing
-  git-repo root) — there's nothing an untrusted checkout could do differently by being trusted, so
+  `.claude/skills`, no `.claude/prompts`, no `.claude/agents`, no `.beyond/settings.json` or `.claude/settings.json` (Round 3, pi-parity feature — see
+  "Persisted settings" below), no `.agents/skills` or `.agents/agents` anywhere between `cwd` and the
+  enclosing git-repo root) — there's nothing an untrusted checkout could do differently by being trusted, so
   requiring an explicit `--trust-project`/`beyond-ai-agent trust` for such a directory is pure operator friction.
   Matches pi's own `hasTrustRequiringProjectResources`/`resolveProjectTrusted` fast path
   (`trust-manager.ts`), which skips its trust store (and interactive prompt) entirely for the same
