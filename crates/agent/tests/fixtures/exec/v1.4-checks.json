@@ -589,7 +589,7 @@
         {
           "kind": "fleet-sim",
           "name": "job-ended-classified-exactly",
-          "task": "D2"
+          "task": "exists"
         },
         {
           "kind": "fixture",
@@ -603,7 +603,7 @@
         {
           "kind": "fleet-sim",
           "name": "job-ended-forwarded-unchanged",
-          "task": "D2"
+          "task": "exists"
         }
       ]
     },
@@ -613,7 +613,7 @@
         {
           "kind": "fleet-sim",
           "name": "job-ended-routed-as-any-request",
-          "task": "D2"
+          "task": "exists"
         }
       ]
     },
@@ -623,7 +623,7 @@
         {
           "kind": "fleet-sim",
           "name": "job-ended-answers-within-25s",
-          "task": "D2"
+          "task": "exists"
         }
       ]
     },
@@ -633,7 +633,7 @@
         {
           "kind": "fleet-sim",
           "name": "job-ended-status-passes-through",
-          "task": "D2"
+          "task": "exists"
         }
       ]
     },
@@ -643,7 +643,7 @@
         {
           "kind": "fleet-sim",
           "name": "job-ended-rate-limited-per-session",
-          "task": "D2"
+          "task": "exists"
         }
       ]
     },
@@ -653,7 +653,7 @@
         {
           "kind": "fleet-sim",
           "name": "job-ended-token-never-logged",
-          "task": "D2"
+          "task": "exists"
         }
       ]
     }

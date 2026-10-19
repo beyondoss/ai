@@ -2626,6 +2626,19 @@ way is refused (`403` over HTTP, a failed `response` otherwise). `tests/serve_jo
 real replica over raw TCP, and every receiver case of `v1.4-callback.json` through the receiver, the
 driver and the kernel.
 
+Across real replicas, `crates/fleet-sim` grades the whole path on the local-directory and NFS
+substrates, over a native v1.4 sandbox and the baseline's `curl` supervisor. Its callback front
+(`src/front.rs`, the reference for FLEET.md's E1–E7) routes each callback over the same ring as a
+session's WebSocket. `job-ended-classified-exactly`, `-forwarded-unchanged`, `-answers-within-25s`,
+`-status-passes-through` and `-rate-limited-per-session` hold the front to its rules against
+stand-in replicas. `job-ended-routed-as-any-request` and `job-ended-token-never-logged` follow real
+proofs and ends to the replica that has the session open. `job-ended-after-takeover` covers a job
+released on a replica that is then killed: the next owner keeps it again, and the end walks past
+the restarted replica and is reported once. `job-ended-across-a-ring-change` has the owner leave
+the ring while the job ends, and the sandbox's retry finds it once it rejoins.
+`job-ended-after-the-session-closed` reaps the session first: every replica answers `503`, nothing
+opens, and the end is reported once on reopen.
+
 The release is built too, in service mode with `--notify-origin` (the origin the fleet's edge serves
 sessions at); without it, or with an endpoint that does not offer notify, every job is kept and held
 exactly as before. Parking a job (`tools::bash_sandbox::keep`) feeds the kernel `Kept`, sends the

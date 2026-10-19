@@ -45,6 +45,7 @@
 mod check;
 mod edge;
 mod faults;
+mod front;
 mod history;
 mod replica;
 mod scenarios;
@@ -73,10 +74,10 @@ async fn main() -> std::process::ExitCode {
 
     match command {
         "list" => {
-            println!("scenario                    claims     substrate");
+            println!("scenario                            claims     substrate");
             for s in scenarios::ALL {
                 println!(
-                    "{:<27} {:<10} {}",
+                    "{:<35} {:<10} {}",
                     s.name,
                     s.claims,
                     if s.needs_shared_fs { "nfs only" } else { "any" }
@@ -349,6 +350,34 @@ async fn run_matrix(kind: Kind, args: &[String]) -> std::process::ExitCode {
             }
             "sandbox-job-exit-noticed-once" => {
                 scenarios::sandbox_job_exit_noticed_once(kind, &history).await
+            }
+            "job-ended-classified-exactly" => {
+                scenarios::job_ended_classified_exactly(kind, &history).await
+            }
+            "job-ended-forwarded-unchanged" => {
+                scenarios::job_ended_forwarded_unchanged(kind, &history).await
+            }
+            "job-ended-routed-as-any-request" => {
+                scenarios::job_ended_routed_as_any_request(kind, &history).await
+            }
+            "job-ended-answers-within-25s" => {
+                scenarios::job_ended_answers_within_25s(kind, &history).await
+            }
+            "job-ended-status-passes-through" => {
+                scenarios::job_ended_status_passes_through(kind, &history).await
+            }
+            "job-ended-rate-limited-per-session" => {
+                scenarios::job_ended_rate_limited_per_session(kind, &history).await
+            }
+            "job-ended-token-never-logged" => {
+                scenarios::job_ended_token_never_logged(kind, &history).await
+            }
+            "job-ended-after-takeover" => scenarios::job_ended_after_takeover(kind, &history).await,
+            "job-ended-across-a-ring-change" => {
+                scenarios::job_ended_across_a_ring_change(kind, &history).await
+            }
+            "job-ended-after-the-session-closed" => {
+                scenarios::job_ended_after_the_session_closed(kind, &history).await
             }
             other => scenarios::Outcome::Skipped(format!("no runner for {other:?}")),
         };
