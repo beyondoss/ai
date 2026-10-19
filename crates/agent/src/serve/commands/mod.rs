@@ -1,5 +1,5 @@
 //! The idle command table's handlers: one `impl SessionLoop` block per concern, one `cmd_<type>`
-//! method per protocol command. `SessionLoop::run` reads a line, and its dispatch `match` calls these.
+//! method per protocol command. `SessionLoop::run` reads a line, and `SessionLoop::dispatch` (in `control.rs`) calls these.
 //! Each returns whether the session goes on (`false` ends the loop, as a closed writer does).
 //!
 //! A reply that a busy loop (a running `prompt` or `compact`) also gives is built by a `<type>_frame`
