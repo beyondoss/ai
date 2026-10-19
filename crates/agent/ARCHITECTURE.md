@@ -5234,8 +5234,9 @@ are allowed now.
   checkout — and is `null` without asking while the sandbox is not attached yet, so a client's poll
   never wakes a reopened session's sandbox.
 - Redacted: `session_file` is `null`, and `TrashEntry.original_path` plus every failed response's
-  `error` have replica mount paths stripped (`ServiceSession::redact`, applied on the one frame
-  funnel).
+  `error` have replica mount paths stripped (`ServiceSession::redact`, applied inside
+  `OutTx::send`, the only handle a session loop, spawned task or forwarder holds on the writer, so
+  the busy loops and detached tasks redact like the idle path).
 - Lifecycle events carry `tenant`, since one replica emits for many.
 - A session that fails to start sends an `{"type":"error", session_id, error}` frame to its attached
   connections before closing. It used to write only to the replica's stderr, leaving the client with

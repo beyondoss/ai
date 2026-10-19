@@ -7,7 +7,7 @@ pub(in crate::serve) async fn list_sessions_frame(
     cmd: &Value,
     persistence: &Persistence,
     mode: &Mode,
-    out_tx: &mpsc::UnboundedSender<OutFrame>,
+    out_tx: &OutTx,
 ) -> OutFrame {
     let progress_id = id.clone();
     let progress_tx = out_tx.clone();
@@ -38,7 +38,7 @@ pub(in crate::serve) async fn list_all_sessions_frame(
     cmd: &Value,
     persistence: &Persistence,
     mode: &Mode,
-    out_tx: &mpsc::UnboundedSender<OutFrame>,
+    out_tx: &OutTx,
 ) -> OutFrame {
     let progress_id = id.clone();
     let progress_tx = out_tx.clone();
@@ -589,7 +589,7 @@ impl SessionLoop {
                 ),
                 Err(e) => response(id, "fork", false, None, Some(&e.to_string())),
             };
-            let _ = self.out_tx.send(redact_frame(&self.mode, frame));
+            let _ = self.out_tx.send(frame);
             return;
         }
         match self
@@ -688,7 +688,7 @@ impl SessionLoop {
                 ),
                 Err(e) => response(id, "clone", false, None, Some(&e.to_string())),
             };
-            let _ = self.out_tx.send(redact_frame(&self.mode, frame));
+            let _ = self.out_tx.send(frame);
             return;
         }
         match self

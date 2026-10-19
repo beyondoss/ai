@@ -322,7 +322,6 @@ impl SessionLoop {
                         &self.skills,
                     );
                     let out_tx = self.out_tx.clone();
-                    let mode = self.mode.clone();
                     let epoch = self.apps_epoch.clone();
                     let mine = {
                         let mut e = lock_ignoring_poison(&self.apps_epoch);
@@ -352,7 +351,7 @@ impl SessionLoop {
                                 ),
                             )
                         };
-                        let _ = out_tx.send(redact_frame(&mode, frame));
+                        let _ = out_tx.send(frame);
                         drop(current);
                     });
                 }

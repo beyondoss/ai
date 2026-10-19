@@ -2577,6 +2577,47 @@ fn redact_frame(mode: &Mode, frame: OutFrame) -> OutFrame {
     OutFrame::Value(v)
 }
 
+/// The session's one way to the writer. `send` runs [`redact_frame`] for the session's mode, and
+/// the raw channel sender never leaves this type, so no loop, spawned task or forwarder can reach
+/// the tenant with an unredacted failed response. Clones carry the mode along.
+#[derive(Clone)]
+pub(crate) struct OutTx {
+    tx: mpsc::UnboundedSender<OutFrame>,
+    mode: Mode,
+}
+
+/// An [`OutTx`] that does not keep the writer alive (see [`OutTx::downgrade`]).
+struct WeakOutTx {
+    tx: mpsc::WeakUnboundedSender<OutFrame>,
+    mode: Mode,
+}
+
+impl WeakOutTx {
+    fn upgrade(&self) -> Option<OutTx> {
+        Some(OutTx {
+            tx: self.tx.upgrade()?,
+            mode: self.mode.clone(),
+        })
+    }
+}
+
+impl OutTx {
+    fn new(tx: mpsc::UnboundedSender<OutFrame>, mode: Mode) -> Self {
+        Self { tx, mode }
+    }
+
+    fn send(&self, frame: OutFrame) -> Result<(), mpsc::error::SendError<OutFrame>> {
+        self.tx.send(redact_frame(&self.mode, frame))
+    }
+
+    fn downgrade(&self) -> WeakOutTx {
+        WeakOutTx {
+            tx: self.tx.downgrade(),
+            mode: self.mode.clone(),
+        }
+    }
+}
+
 fn not_in_repo_mode() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -3100,7 +3141,7 @@ struct SessionLoop {
     bash_tool: Option<Arc<dyn agent_core::Tool>>,
     bash_policy: crate::policy::ToolPolicy,
     host_bash_seq: u32,
-    out_tx: mpsc::UnboundedSender<OutFrame>,
+    out_tx: OutTx,
     writer: tokio::task::JoinHandle<()>,
     mcp_resumer: crate::mcp_resume::Resumer,
     last_history: Arc<Vec<agent_core::Message>>,
@@ -3984,7 +4025,8 @@ impl SessionLoop {
         // detached session (no connection, or a dead one) simply drops frames and keeps running, which is
         // exactly what lets a WebSocket client reconnect and re-attach to a still-live run. The task ends
         // only when every `out_tx` clone is dropped at teardown (`drop(out_tx)` + the joined run).
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<OutFrame>();
+        let (raw_tx, mut out_rx) = mpsc::unbounded_channel::<OutFrame>();
+        let out_tx = OutTx::new(raw_tx, mode.clone());
         let writer = {
             let out_conn = out_conn.clone();
             tokio::spawn(async move {
@@ -4171,11 +4213,10 @@ impl SessionLoop {
     /// the caller answers by stopping the control loop — there is no way to deliver any further
     /// response, so continuing would only swallow output.
     ///
-    /// Every frame passes through `redact_frame` on the way out. It is the one funnel that sees every
-    /// idle-path response, which is where a storage error — and so a replica mount path — would
-    /// otherwise reach a tenant verbatim.
+    /// Every frame passes through `redact_frame` on the way out — inside [`OutTx::send`], which
+    /// is the only way to reach the writer.
     fn emit(&self, frame: OutFrame) -> bool {
-        self.out_tx.send(redact_frame(&self.mode, frame)).is_ok()
+        self.out_tx.send(frame).is_ok()
     }
 
     /// Announce readiness so a client can sync before issuing commands. `false` if the writer is
@@ -5504,7 +5545,7 @@ impl SessionLoop {
                                                     let _ = self.out_tx.send(handle_sample(cid, &c, &self.pending_samplings));
                                                 }
                                                 // A view is interactive while the model runs, too.
-                                                "mcp_app_request" => spawn_app_request(cid, c.clone(), &self.out_tx, &self.mcp_enabled, &self.app_filter, &self.approval, &self.app_detached, &self.mode, &self.mcp_host),
+                                                "mcp_app_request" => spawn_app_request(cid, c.clone(), &self.out_tx, &self.mcp_enabled, &self.app_filter, &self.approval, &self.app_detached, &self.mcp_host),
                                                 "get_tree" => {
                                                     let _ = self.out_tx.send(get_tree_frame(cid, &c, &self.persistence));
                                                 }
@@ -6154,7 +6195,6 @@ impl SessionLoop {
                     &self.app_filter,
                     &self.approval,
                     &self.app_detached,
-                    &self.mode,
                     &self.mcp_host,
                 ),
                 "set_mcp_apps" => {
@@ -6500,7 +6540,7 @@ fn start_mcp_resumer(
     persistence: &Persistence,
     session: &Session,
     cfg: &ServeConfig,
-    out_tx: &mpsc::UnboundedSender<OutFrame>,
+    out_tx: &OutTx,
     mcp_host: &Arc<crate::tools::mcp_host::McpHost>,
     mcp_task_tx: &mpsc::UnboundedSender<(String, Value)>,
     carried: &[crate::mcp_resume::Resolved],
@@ -6547,19 +6587,17 @@ fn start_mcp_resumer(
 fn spawn_app_request(
     id: Option<String>,
     cmd: Value,
-    out_tx: &mpsc::UnboundedSender<OutFrame>,
+    out_tx: &OutTx,
     enabled: &crate::tools::mcp::McpEnabledSet,
     filter: &crate::tools::mcp_apps::ToolFilter,
     approval: &Option<crate::approval::ApprovalRuntime>,
     detached: &crate::tools::mcp_apps::Detached,
-    mode: &Mode,
     session_host: &Arc<crate::tools::mcp_host::McpHost>,
 ) {
     let enabled = enabled.clone();
     let filter = filter.clone();
     let approval = approval.clone();
     let detached = detached.clone();
-    let mode = mode.clone();
     let out_tx = out_tx.clone();
     let session_host = session_host.clone();
     tokio::spawn(async move {
@@ -6577,7 +6615,7 @@ fn spawn_app_request(
             ),
             Err(e) => response(id, "mcp_app_request", false, None, Some(&e)),
         };
-        let _ = out_tx.send(redact_frame(&mode, frame));
+        let _ = out_tx.send(frame);
     });
 }
 
@@ -6585,7 +6623,7 @@ fn spawn_app_request(
 /// straight to an error response.
 fn dispatch_events(
     events_cmds: &Option<crate::tools::mcp_events::McpEventsCommands>,
-    out_tx: &mpsc::UnboundedSender<OutFrame>,
+    out_tx: &OutTx,
     id: Option<String>,
     ctype: &str,
     c: &Value,
@@ -7794,7 +7832,7 @@ impl PendingSteers {
         prompt_templates: &[crate::prompts::PromptTemplate],
         mcp_skills: &crate::tools::mcp_skills::McpSkills,
         steering: &agent_core::Steering,
-        out_tx: &mpsc::UnboundedSender<OutFrame>,
+        out_tx: &OutTx,
     ) {
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -7829,7 +7867,7 @@ impl PendingSteers {
         done: SteerExpanded,
         mcp_skills: &crate::tools::mcp_skills::McpSkills,
         steering: &agent_core::Steering,
-        out_tx: &mpsc::UnboundedSender<OutFrame>,
+        out_tx: &OutTx,
     ) {
         let (seq, text, activation) = done;
         if let Some(entry) = self.queue.iter_mut().find(|e| e.seq == seq)
@@ -7845,7 +7883,7 @@ impl PendingSteers {
         &mut self,
         mcp_skills: &crate::tools::mcp_skills::McpSkills,
         steering: &agent_core::Steering,
-        out_tx: &mpsc::UnboundedSender<OutFrame>,
+        out_tx: &OutTx,
     ) {
         while self
             .queue
@@ -7883,7 +7921,7 @@ impl PendingSteers {
         cancelled: bool,
         mcp_skills: &crate::tools::mcp_skills::McpSkills,
         steering: &agent_core::Steering,
-        out_tx: &mpsc::UnboundedSender<OutFrame>,
+        out_tx: &OutTx,
     ) {
         while let Some(entry) = self.queue.pop_front() {
             let refuse = |entry: PendingSteer, why: &str| {
@@ -7938,7 +7976,7 @@ fn queue_steer(
     lane: SteerLane,
     ack: SteerAck,
     steering: &agent_core::Steering,
-    out_tx: &mpsc::UnboundedSender<OutFrame>,
+    out_tx: &OutTx,
 ) -> bool {
     let m = agent_core::SteeringMessage::new(text, images);
     let queued = match lane {
@@ -9252,7 +9290,7 @@ fn parse_approval_decision(cmd: &Value) -> Result<ApprovalDecision, String> {
 /// `pending_code` until a `"submit_code"` command (processed by the same main loop, concurrently —
 /// see the `"login"` dispatch arm) wakes it with the pasted value.
 struct ServeLoginCallbacks {
-    out_tx: mpsc::UnboundedSender<OutFrame>,
+    out_tx: OutTx,
     id: Option<String>,
     provider: crate::oauth::OAuthProviderId,
     pending_code: PendingCodeSlot,
