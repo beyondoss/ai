@@ -558,11 +558,14 @@
 //! - **N29** A live reconcile MUST start only for these: a callback for an unheld job; a release
 //!   (the release table); and a real use of the sandbox while the session has an unheld job. A
 //!   *real use* is any request the session sends its sandbox other than what this section causes: a
-//!   tool's command, a filesystem operation, discovery, a `bash_job` call. A use starts one only
-//!   when no reconcile ended in the last 30 s, and never delays the use; a use that arrives while
-//!   one runs asks for the next, as a callback does (N30), since the running one may have listed
-//!   before the end it would find. A replica MUST NOT contact a sandbox about its unheld jobs on
-//!   any timer. (check: `job_notify::reconciles_only_on_a_callback_or_a_use`)
+//!   tool's command, a filesystem operation, discovery, a `bash_job` call. A use never delays
+//!   itself, and is never dropped, because the reconcile that last listed may have listed before
+//!   the end the use would find: with none running, a use starts one at once when no reconcile
+//!   ended in the last 30 s, and otherwise asks for one that begins 30 s after the last one ended;
+//!   a use that arrives while one runs asks for the next, as a callback does (N30). A replica MUST
+//!   NOT contact a sandbox about its unheld jobs on any timer of its own: every reconcile, however
+//!   long it waits for its spacing, is one of these asked for. (check:
+//!   `job_notify::reconciles_only_on_a_callback_or_a_use`)
 //! - **N30** A session runs at most one reconcile at a time. A callback or a real use that arrives
 //!   while one runs waits for the next, and every callback and use that arrives during the same
 //!   reconcile shares that next one. The live reconcile a release starts MUST begin after that
