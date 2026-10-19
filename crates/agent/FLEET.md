@@ -206,6 +206,21 @@ follow a job's end through a takeover (`job-ended-after-takeover`), a ring chang
 (`job-ended-across-a-ring-change`), and a session reaped before the end
 (`job-ended-after-the-session-closed`).
 
+**E1–E7 are rules for an L7 front.** The other supported shape is an L4 TCP pass-through (for
+example a cloud accelerator and a network load balancer) to exactly one replica, with TLS ending on
+the agent and `--notify-origin` set to that replica's public origin. There, none of them is needed:
+
+- E2 and E5 hold trivially, because bytes pass through.
+- E3's ring walk does not apply. A `503` while the replica restarts or takes over is retried by the
+  sandbox, for up to its 723 s.
+- E4 is covered by the replica answering within 20 s on its own (N31).
+- E1's classification is what the replica already does itself (N21–N23).
+- E6 is covered by the replica's own bounds: a forged token is refused before any session lookup,
+  one reconcile runs at a time, at most one a second, and at most 16 callbacks wait, the next
+  answered `503` (`MAX_WAITING` in the kernel).
+- E7 holds because an L4 front cannot see the header and the replica never records it
+  (`serve_job_ended::the_replica_never_records_a_callbacks_token`).
+
 The edge SHOULD rate-limit callbacks per source address. A replica already bounds the work a stream
 of valid callbacks can cause (one reconcile at a time per session, at most one a second, at most 16
 callbacks waiting), and refuses a forged one before it looks for the session.
