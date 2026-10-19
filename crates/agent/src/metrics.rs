@@ -122,6 +122,86 @@ impl Refusal {
     }
 }
 
+/// How a `job_ended` callback (exec v1.4) was answered — the closed label set of
+/// `agent_job_callbacks_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobCallback {
+    /// `200`: a hint taken, or answered after a live reconcile listed the scope.
+    Accepted,
+    /// `200`: the job's proof, inside its window.
+    Proof,
+    /// `200`: a repeat for an end already recorded.
+    Duplicate,
+    /// `410`: a job the session does not know.
+    Gone,
+    /// `503` from the session: a call has the job, the list failed, too many waiting, or late.
+    Unavailable,
+    /// `503`: no session task here holds the session.
+    NotOpen,
+    /// Refused before the session was looked up (the request, the token or the scope).
+    Refused,
+}
+
+impl JobCallback {
+    const ALL: [Self; 7] = [
+        Self::Accepted,
+        Self::Proof,
+        Self::Duplicate,
+        Self::Gone,
+        Self::Unavailable,
+        Self::NotOpen,
+        Self::Refused,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Proof => "proof",
+            Self::Duplicate => "duplicate",
+            Self::Gone => "gone",
+            Self::Unavailable => "unavailable",
+            Self::NotOpen => "not_open",
+            Self::Refused => "refused",
+        }
+    }
+}
+
+/// Why a kept job stayed held by its stream rather than being let go of (exec v1.4's fallback) —
+/// the closed label set of `agent_job_notify_held_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobHeld {
+    /// Notify was not available: no `--notify-origin`, or the endpoint does not offer it.
+    Unavailable,
+    /// The endpoint refused the `notify` (`400`).
+    Refused,
+    /// `keep` with `notify` failed some other way.
+    KeepFailed,
+    /// The proof window closed with no proof.
+    NoProof,
+    /// The job's stream ended while it was proving.
+    Ended,
+}
+
+impl JobHeld {
+    const ALL: [Self; 5] = [
+        Self::Unavailable,
+        Self::Refused,
+        Self::KeepFailed,
+        Self::NoProof,
+        Self::Ended,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::Refused => "refused",
+            Self::KeepFailed => "keep_failed",
+            Self::NoProof => "no_proof",
+            Self::Ended => "ended",
+        }
+    }
+}
+
 /// Every instrument a replica publishes, with its children resolved once.
 ///
 /// Cloneable by `Arc` only — one of these exists per process, built in `main`.
@@ -179,6 +259,14 @@ pub struct Metrics {
     threads: IntGauge,
 
     refusals: IntCounterVec,
+
+    /// exec v1.4 `job_ended` callbacks, by how they were answered.
+    job_callbacks: IntCounterVec,
+    /// Kept jobs left held by their stream instead of let go of, by why.
+    job_held: IntCounterVec,
+    /// From a job's end (the sandbox's `ended` time) to the session recording it, for an end an
+    /// unheld job's reconcile found: how much later than a held stream notify learns of an end.
+    pub job_end_to_notice_seconds: Histogram,
 }
 
 impl Metrics {
@@ -247,6 +335,38 @@ impl Metrics {
         registry.register(Box::new(ready_probe_seconds.clone()))?;
         registry.register(Box::new(threads.clone()))?;
         registry.register(Box::new(refusals.clone()))?;
+        let job_callbacks = IntCounterVec::new(
+            Opts::new(
+                "agent_job_callbacks_total",
+                "Sandbox job_ended callbacks (exec v1.4), by how they were answered.",
+            ),
+            &["outcome"],
+        )?;
+        let job_held = IntCounterVec::new(
+            Opts::new(
+                "agent_job_notify_held_total",
+                "Kept jobs left held by their stream instead of let go of, by why.",
+            ),
+            &["reason"],
+        )?;
+        let job_end_to_notice_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "agent_job_end_to_notice_seconds",
+                "From an unheld job's end to the session recording it.",
+            )
+            .buckets(vec![
+                0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0, 900.0, 3600.0,
+            ]),
+        )?;
+        registry.register(Box::new(job_callbacks.clone()))?;
+        registry.register(Box::new(job_held.clone()))?;
+        registry.register(Box::new(job_end_to_notice_seconds.clone()))?;
+        for o in JobCallback::ALL {
+            job_callbacks.with_label_values(&[o.as_str()]);
+        }
+        for r in JobHeld::ALL {
+            job_held.with_label_values(&[r.as_str()]);
+        }
 
         // Touch every child once so a series exists at zero rather than appearing on first use. An
         // alert on `rate(agent_refusals_total{reason="unavailable"}[5m])` should read zero on a
@@ -283,7 +403,20 @@ impl Metrics {
             ready_probe_seconds,
             threads,
             refusals,
+            job_callbacks,
+            job_held,
+            job_end_to_notice_seconds,
         }))
+    }
+
+    pub fn job_callback(&self, outcome: JobCallback) {
+        self.job_callbacks
+            .with_label_values(&[outcome.as_str()])
+            .inc();
+    }
+
+    pub fn job_held(&self, why: JobHeld) {
+        self.job_held.with_label_values(&[why.as_str()]).inc();
     }
 
     pub fn session_ended(&self, reason: SessionEnd) {

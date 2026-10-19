@@ -1927,7 +1927,10 @@ pub async fn serve_ws(
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        let notify = crate::tools::job_notify::NotifyHub::new(verifier.notify_key());
+        let notify = crate::tools::job_notify::NotifyHub::with_metrics(
+            verifier.notify_key(),
+            cfg.metrics.clone(),
+        );
         cfg.job_notify = Some(notify.clone());
         Some(ServiceSupervisor {
             notify,

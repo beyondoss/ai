@@ -281,6 +281,9 @@ async fn steered(
                 match (outcome, kind) {
                     (Some(r), FollowKind::End(Some(end))) => {
                         shared.set_end_at(ago(end.at));
+                        if let Some(n) = shared.table().and_then(|t| t.notify()) {
+                            n.end_recorded(end.at);
+                        }
                         return r.or_else(|e| match end.code {
                             Some(code) => Ok(status_result(code)),
                             None => Err(format!("{LOST_END} ({e})")),
