@@ -4180,7 +4180,7 @@ impl SessionLoop {
                     "type": "ready",
                     "session_id": self.persistence.session_id(),
                     "model": self.current_model,
-                    "cwd_stale": cwd_is_stale(&self.persistence.meta.cwd, &self.cwd),
+                    "cwd_stale": self.mode.cwd_is_stale(&self.persistence.meta.cwd, &self.cwd),
                 })
                 .into(),
             )
@@ -4403,7 +4403,7 @@ impl SessionLoop {
                     true,
                     Some(json!({
                         "session_id": self.persistence.session_id(),
-                        "cwd_stale": cwd_is_stale(&self.persistence.meta.cwd, &self.cwd),
+                        "cwd_stale": self.mode.cwd_is_stale(&self.persistence.meta.cwd, &self.cwd),
                         "parent": self.persistence.meta.parent,
                     })),
                     None,
@@ -4492,7 +4492,7 @@ impl SessionLoop {
                         true,
                         Some(json!({
                             "session_id": self.persistence.session_id(),
-                            "cwd_stale": cwd_is_stale(&self.persistence.meta.cwd, &self.cwd),
+                            "cwd_stale": self.mode.cwd_is_stale(&self.persistence.meta.cwd, &self.cwd),
                             "model": self.current_model,
                             // Task 3 (pi-parity fix, serve pass 19): matches `switch_branch`/`fork`/
                             // `clone`'s own response shape — previously omitted here, forcing a
@@ -4642,7 +4642,7 @@ impl SessionLoop {
                     true,
                     Some(json!({
                         "session_id": self.persistence.session_id(),
-                        "cwd_stale": cwd_is_stale(&self.persistence.meta.cwd, &self.cwd),
+                        "cwd_stale": self.mode.cwd_is_stale(&self.persistence.meta.cwd, &self.cwd),
                         "model": self.current_model,
                         "reasoning_effort": self.current_level.as_str(),
                         "text": fork_text,
@@ -4739,7 +4739,7 @@ impl SessionLoop {
                     true,
                     Some(json!({
                         "session_id": self.persistence.session_id(),
-                        "cwd_stale": cwd_is_stale(&self.persistence.meta.cwd, &self.cwd),
+                        "cwd_stale": self.mode.cwd_is_stale(&self.persistence.meta.cwd, &self.cwd),
                         "model": self.current_model,
                         "reasoning_effort": self.current_level.as_str(),
                     })),
