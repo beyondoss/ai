@@ -916,12 +916,34 @@ impl SessionLoop {
                                     };
                                     let _ = self.out_tx.send(get_messages_frame(cid, c.get("since").and_then(Value::as_str), &msgs, &ids));
                                 }
+                                // The reads that need no `&mut session`, answered through the same
+                                // `<type>_frame` functions as the idle table and the prompt busy loop.
+                                "get_commands" => {
+                                    let _ = self.out_tx.send(get_commands_frame(cid, &self.skills, &self.mcp_skills, &self.prompt_templates, &self.skill_collisions, &self.prompt_collisions));
+                                }
+                                "list_branches" => {
+                                    let _ = self.out_tx.send(list_branches_frame(cid, &self.persistence));
+                                }
+                                "get_tree" => {
+                                    let _ = self.out_tx.send(get_tree_frame(cid, &c, &self.persistence));
+                                }
+                                "list_sessions" => {
+                                    let frame = list_sessions_frame(cid, &c, &self.persistence, &self.mode, &self.out_tx).await;
+                                    let _ = self.out_tx.send(frame);
+                                }
+                                "list_all_sessions" => {
+                                    let frame = list_all_sessions_frame(cid, &c, &self.persistence, &self.mode, &self.out_tx).await;
+                                    let _ = self.out_tx.send(frame);
+                                }
+                                "get_available_models" => {
+                                    let _ = self.out_tx.send(get_available_models_frame(cid));
+                                }
                                 "prompt" if crate::tools::mcp_events::is_injection(&c) => {
                                     self.deferred_events.push_back(l.to_string());
                                 }
                                 events_cmd if events_cmd.starts_with("mcp_events_") => dispatch_events(&self.events_cmds, &self.out_tx, cid, events_cmd, &c),
                                 other => {
-                                    let _ = self.out_tx.send(response(cid, other, false, None, Some("busy: a compaction is running; only `abort` (which cancels it) and get_state/get_session_stats/get_messages are accepted")));
+                                    let _ = self.out_tx.send(response(cid, other, false, None, Some("busy: a compaction is running; only `abort` (which cancels it) and the read-only commands (get_state/get_session_stats/get_messages/get_commands/list_branches/get_tree/list_sessions/list_all_sessions/get_available_models) are accepted")));
                                 }
                             }
                         }

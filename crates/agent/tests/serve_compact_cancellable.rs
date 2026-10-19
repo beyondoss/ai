@@ -175,3 +175,45 @@ fn sigterm_ends_a_manual_compact_promptly() {
         t0.elapsed()
     );
 }
+
+/// The reads the prompt busy loop answers without `&mut session` are answered mid-compaction too,
+/// not refused as busy.
+#[test]
+fn the_prompt_loops_other_reads_are_answered_mid_compact() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = seeded_session(dir.path());
+    let mut child = spawn(&session_file);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = common::child_frames(&mut child);
+    send(&mut stdin, json!({ "type": "compact", "id": "c1" }));
+    std::thread::sleep(Duration::from_millis(700));
+    let reads = [
+        "get_commands",
+        "get_tree",
+        "list_branches",
+        "list_sessions",
+        "list_all_sessions",
+        "get_available_models",
+    ];
+    for read in reads {
+        send(&mut stdin, json!({ "type": read, "id": read }));
+    }
+    let seen = responses(&mut stdout, reads.len(), Duration::from_secs(10));
+    for read in reads {
+        let reply = seen
+            .iter()
+            .find(|f| f["id"] == read)
+            .unwrap_or_else(|| panic!("no response to {read}: {seen:#?}"));
+        // `list_all_sessions` needs `--session-dir`, which this session lacks: a real answer, an
+        // error, but not a busy refusal.
+        let busy = reply["error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("busy"));
+        assert!(!busy, "{read} was refused as busy: {reply}");
+        if read != "list_all_sessions" {
+            assert_eq!(reply["success"], true, "{read}: {reply}");
+        }
+    }
+    send(&mut stdin, json!({ "type": "abort", "id": "a1" }));
+    responses(&mut stdout, 2, Duration::from_secs(10));
+}
