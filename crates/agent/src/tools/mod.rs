@@ -107,6 +107,13 @@ pub(crate) fn normalize_path_with_home(path: &str, home: Option<&str>) -> String
     expand_tilde(&folded, home)
 }
 
+/// [`normalize_path_with_home`] without the Unicode-space fold: the path as the model spelled it, so a
+/// file whose real name holds U+00A0 or U+202F can be addressed exactly.
+fn normalize_exact(path: &str, home: Option<&str>) -> String {
+    decode_file_url(path)
+        .unwrap_or_else(|| expand_tilde(path.strip_prefix('@').unwrap_or(path), home))
+}
+
 /// Unwrap a `file://` URL argument into a plain filesystem path — pi's `normalizePath` does the same
 /// (`fileURLToPath`) before any other normalization, so a path a model composed from something it saw
 /// as a URL (a log line, an editor deep-link) still resolves instead of every fs tool reporting a
@@ -520,7 +527,7 @@ pub(crate) fn write_key_ci(root: &Path, path: &str, world: &fs::PathWorld) -> (S
 }
 
 /// Resolve a model-supplied `path` argument against a filesystem tool's configured `root`: normalize it
-/// ([`normalize_path`] — `~`, `file://`, a leading `@`, folded Unicode spaces), then, if it is still
+/// ([`normalize_path`] — `~`, `file://`, a leading `@`, folded Unicode spaces, the fold skipped when the path exists exactly as given), then, if it is still
 /// *relative*, join it onto `root`.
 ///
 /// This is the seam that makes a per-child working directory possible at all. `read`/`write`/`edit` take
@@ -538,7 +545,15 @@ pub(crate) fn write_key_ci(root: &Path, path: &str, world: &fs::PathWorld) -> (S
 /// offer. The guarantee is that two cooperating children fanned out in parallel don't silently stomp each
 /// other, not that a determined one is jailed.
 pub(crate) fn resolve_against(root: &Path, path: &str) -> String {
-    join_against(root, normalize_path(path))
+    let exact = join_against(root, normalize_exact(path, home_dir().as_deref()));
+    let folded = join_against(root, normalize_path(path));
+    // The space fold exists for pasted/typo'd paths. A file whose real name contains U+00A0 and
+    // friends must still be reachable by that exact name, so the fold only applies when it isn't there.
+    if exact != folded && std::fs::symlink_metadata(&exact).is_ok() {
+        exact
+    } else {
+        folded
+    }
 }
 
 /// [`resolve_against`], but expanding `~` against the home of whichever filesystem `world` names —
@@ -1081,6 +1096,24 @@ mod tests {
     fn normalize_path_folds_a_non_breaking_space_to_a_plain_space() {
         // U+00A0 NBSP — a common artifact of copy-pasting a path from a terminal or rich-text source.
         assert_eq!(normalize_path("foo\u{00A0}bar.txt"), "foo bar.txt");
+    }
+
+    #[test]
+    fn resolve_against_prefers_an_existing_file_with_a_unicode_space_in_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("shot\u{202F}1.txt");
+        std::fs::write(&real, "x").unwrap();
+        let sibling = dir.path().join("shot 1.txt");
+        // Exists exactly as given: addressed exactly, not folded onto a sibling name.
+        assert_eq!(
+            resolve_against(dir.path(), "shot\u{202F}1.txt"),
+            real.display().to_string()
+        );
+        // Does not exist as given: the typo fold still applies.
+        assert_eq!(
+            resolve_against(dir.path(), "shot\u{00A0}1.txt"),
+            sibling.display().to_string()
+        );
     }
 
     #[test]
