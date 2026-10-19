@@ -518,7 +518,7 @@ builder on `Agent` or `ModelRequest`, and each is exercised by unit tests):
   summarizing model asked to "merge the previous summary" will paraphrase or drop specifics, so nothing
   that _must_ survive a cut may depend on it doing so. `CompactionProvenance` (`Session::compaction`) is
   the channel that does: `merge_provenance` folds it forward every round from the doomed prefix,
-  `crates/agent`'s `session_store.rs` persists it on the `Entry::Compaction` record and restores it on
+  `crates/agent`'s `session_store` persists it on the `Entry::Compaction` record and restores it on
   reopen, and `Agent::compact` re-renders it into every new summary by appending host-generated blocks
   to the model's prose — never trusting the prose itself.
 
