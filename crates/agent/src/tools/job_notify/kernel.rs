@@ -196,11 +196,53 @@ pub enum Event {
     TranscriptSwitched,
 }
 
+/// Why a callback got the answer it got: what the replica's metrics count it as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Why {
+    /// The job's proof, inside its window.
+    Proof,
+    /// A hint about a job held or proving (or a proof after its window): nothing to do.
+    Hint,
+    /// The session has not read its sandbox's jobs back yet.
+    NotReadBack,
+    /// A live reconcile that began after it arrived listed the scope.
+    Listed,
+    /// The job's end is already recorded: a repeat.
+    Recorded,
+    /// A `bash_job` call has the job.
+    Taken,
+    /// The session neither tracks the job nor has recorded its end.
+    Unknown,
+    /// No answer was ready in time.
+    Late,
+    /// Too many callbacks were waiting.
+    Full,
+    /// The reconcile could not list the sandbox.
+    Unlisted,
+}
+
+/// Why a kept job stays held (by its stream, as today) rather than being unheld.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HeldWhy {
+    /// Notify is not available (no origin configured, or the endpoint does not offer it).
+    Unavailable,
+    /// The endpoint refused the `notify` (`400`).
+    Refused,
+    /// `keep` with notify failed some other way.
+    KeepFailed,
+    /// The proof window closed with no proof.
+    NoProof,
+    /// Its stream ended (or broke) while it was proving.
+    Ended,
+}
+
 /// Something the caller must do.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
     /// Answer a callback with this status: `200` (a `job_ended` response), `410` or `503`.
-    Answer { call: CallId, status: u16 },
+    Answer { call: CallId, status: u16, why: Why },
+    /// The job stays held, as today (for the replica's metrics; nothing to send).
+    Held { job: String, why: HeldWhy },
     /// Send `keep` for the job, with notify or without.
     SendKeep { job: String, notify: bool },
     /// Close the job's stream (or the follow standing for it), then report [`Event::StreamClosed`].
@@ -340,7 +382,19 @@ impl Kernel {
                     out.push(Action::SendKeep { job, notify: true });
                 } else if !adopted {
                     self.jobs.remove(&job);
-                    out.push(Action::SendKeep { job, notify: false });
+                    out.push(Action::SendKeep {
+                        job: job.clone(),
+                        notify: false,
+                    });
+                    out.push(Action::Held {
+                        job,
+                        why: HeldWhy::Unavailable,
+                    });
+                } else {
+                    out.push(Action::Held {
+                        job,
+                        why: HeldWhy::Unavailable,
+                    });
                 }
             }
             Event::KeepAnswered { job, outcome, now } => {
@@ -360,10 +414,21 @@ impl Kernel {
                         }
                         KeepOutcome::Refused => {
                             self.jobs.remove(&job);
-                            out.push(Action::SendKeep { job, notify: false });
+                            out.push(Action::SendKeep {
+                                job: job.clone(),
+                                notify: false,
+                            });
+                            out.push(Action::Held {
+                                job,
+                                why: HeldWhy::Refused,
+                            });
                         }
                         KeepOutcome::Failed => {
                             self.jobs.remove(&job);
+                            out.push(Action::Held {
+                                job,
+                                why: HeldWhy::KeepFailed,
+                            });
                         }
                     }
                 }
@@ -394,6 +459,10 @@ impl Kernel {
                     Some(JobState::Proving { .. } | JobState::Closing)
                 ) {
                     self.jobs.remove(&job);
+                    out.push(Action::Held {
+                        job,
+                        why: HeldWhy::Ended,
+                    });
                 }
             }
             Event::Listed {
@@ -466,19 +535,19 @@ impl Kernel {
         now: Millis,
         out: &mut Vec<Action>,
     ) {
-        let answer = |status| Action::Answer { call, status };
+        let answer = |status, why| Action::Answer { call, status, why };
         if self.waiting.len() >= MAX_WAITING {
-            out.push(answer(503));
+            out.push(answer(503, Why::Full));
             return;
         }
         // Not read back yet: nothing here is known to be the session's, and nothing is contacted.
         if !facts.open_reconcile_done {
-            out.push(answer(200));
+            out.push(answer(200, Why::NotReadBack));
             return;
         }
         // A call has it: asked again once the call records the end or puts it back.
         if facts.job == TableJob::Taken {
-            out.push(answer(503));
+            out.push(answer(503, Why::Taken));
             return;
         }
         match self.jobs.get_mut(&job) {
@@ -494,10 +563,10 @@ impl Kernel {
                         self.release(job, out);
                     }
                 }
-                out.push(answer(200));
+                out.push(answer(200, if inside { Why::Proof } else { Why::Hint }));
             }
-            Some(JobState::Closing) => out.push(answer(200)),
-            Some(JobState::Taken { .. }) => out.push(answer(503)),
+            Some(JobState::Closing) => out.push(answer(200, Why::Hint)),
+            Some(JobState::Taken { .. }) => out.push(answer(503, Why::Taken)),
             Some(JobState::Unheld { .. }) => {
                 self.waiting.insert(call, now + ANSWER_LIMIT);
                 self.next
@@ -506,11 +575,12 @@ impl Kernel {
                     .push(call);
                 self.maybe_start(now, out);
             }
-            None => out.push(answer(match facts.job {
-                TableJob::Running | TableJob::Ended => 200,
-                TableJob::Taken => 503,
-                TableJob::Absent => 410,
-            })),
+            None => out.push(match facts.job {
+                TableJob::Running => answer(200, Why::Hint),
+                TableJob::Ended => answer(200, Why::Recorded),
+                TableJob::Taken => answer(503, Why::Taken),
+                TableJob::Absent => answer(410, Why::Unknown),
+            }),
         }
     }
 
@@ -529,12 +599,28 @@ impl Kernel {
             .collect();
         for call in late {
             self.waiting.remove(&call);
-            out.push(Action::Answer { call, status: 503 });
+            out.push(Action::Answer {
+                call,
+                status: 503,
+                why: Why::Late,
+            });
         }
         // A window that closed with no proof leaves the job held for good.
-        self.jobs.retain(
-            |_, s| !matches!(s, JobState::Proving { window_until: Some(t), .. } if *t <= now),
-        );
+        let closed: Vec<String> = self
+            .jobs
+            .iter()
+            .filter(
+                |(_, s)| matches!(s, JobState::Proving { window_until: Some(t), .. } if *t <= now),
+            )
+            .map(|(j, _)| j.clone())
+            .collect();
+        for job in closed {
+            self.jobs.remove(&job);
+            out.push(Action::Held {
+                job,
+                why: HeldWhy::NoProof,
+            });
+        }
         self.maybe_start(now, out);
     }
 
@@ -615,10 +701,14 @@ impl Kernel {
                 });
             }
         }
-        let status = if listing.is_some() { 200 } else { 503 };
+        let (status, why) = if listing.is_some() {
+            (200, Why::Listed)
+        } else {
+            (503, Why::Unlisted)
+        };
         for call in running.waiters {
             if self.waiting.remove(&call).is_some() {
-                out.push(Action::Answer { call, status });
+                out.push(Action::Answer { call, status, why });
             }
         }
         self.maybe_start(now, out);
@@ -723,10 +813,18 @@ mod tests {
             a,
             [Action::Answer {
                 call: 1,
-                status: 200
+                status: 200,
+                why: Why::Hint
             }]
         );
-        k.step(Event::Tick { now: PROOF_WINDOW });
+        let a = k.step(Event::Tick { now: PROOF_WINDOW });
+        assert_eq!(
+            a,
+            [Action::Held {
+                job: J.into(),
+                why: HeldWhy::NoProof
+            }]
+        );
         assert_eq!(k.job(J), None, "held for good");
     }
 
@@ -745,10 +843,16 @@ mod tests {
         });
         assert_eq!(
             a,
-            [Action::SendKeep {
-                job: J.into(),
-                notify: false
-            }]
+            [
+                Action::SendKeep {
+                    job: J.into(),
+                    notify: false
+                },
+                Action::Held {
+                    job: J.into(),
+                    why: HeldWhy::Refused
+                }
+            ]
         );
         assert_eq!(k.job(J), None);
     }
@@ -769,7 +873,8 @@ mod tests {
             a,
             [Action::Answer {
                 call: 1,
-                status: 503
+                status: 503,
+                why: Why::Taken
             }]
         );
         assert_eq!(
@@ -816,7 +921,8 @@ mod tests {
             a,
             [Action::Answer {
                 call: 1,
-                status: 200
+                status: 200,
+                why: Why::Listed
             }]
         );
         // The next waits for the spacing.
@@ -836,11 +942,13 @@ mod tests {
             [
                 Action::Answer {
                     call: 2,
-                    status: 200
+                    status: 200,
+                    why: Why::Listed
                 },
                 Action::Answer {
                     call: 3,
-                    status: 200
+                    status: 200,
+                    why: Why::Listed
                 }
             ]
         );

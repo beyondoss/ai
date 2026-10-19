@@ -1669,7 +1669,10 @@ impl super::job_notify::JobTracker for BashJobs {
             | Action::ReadInThenFollow { job, .. }
             | Action::CloseFollow { job } => job.clone(),
             // A `keep` is the keeping caller's to send; nothing else here concerns a job.
-            Action::SendKeep { .. } | Action::StartReconcile { .. } | Action::Answer { .. } => {
+            Action::SendKeep { .. }
+            | Action::StartReconcile { .. }
+            | Action::Answer { .. }
+            | Action::Held { .. } => {
                 return;
             }
         };

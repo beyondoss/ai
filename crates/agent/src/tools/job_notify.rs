@@ -45,6 +45,31 @@ pub fn check_origin(origin: &str) -> Result<(), String> {
     }
 }
 
+/// What the replica's metrics count an answer as.
+fn callback_outcome(why: kernel::Why) -> crate::metrics::JobCallback {
+    use crate::metrics::JobCallback;
+    use kernel::Why;
+    match why {
+        Why::Proof => JobCallback::Proof,
+        Why::Recorded => JobCallback::Duplicate,
+        Why::Hint | Why::NotReadBack | Why::Listed => JobCallback::Accepted,
+        Why::Unknown => JobCallback::Gone,
+        Why::Taken | Why::Late | Why::Full | Why::Unlisted => JobCallback::Unavailable,
+    }
+}
+
+fn held_reason(why: kernel::HeldWhy) -> crate::metrics::JobHeld {
+    use crate::metrics::JobHeld;
+    use kernel::HeldWhy;
+    match why {
+        HeldWhy::Unavailable => JobHeld::Unavailable,
+        HeldWhy::Refused => JobHeld::Refused,
+        HeldWhy::KeepFailed => JobHeld::KeepFailed,
+        HeldWhy::NoProof => JobHeld::NoProof,
+        HeldWhy::Ended => JobHeld::Ended,
+    }
+}
+
 /// A session's job table, as the kernel's driver sees it.
 pub trait JobTracker: Send + Sync {
     /// What today's job table says of the job a callback names.
@@ -63,14 +88,29 @@ pub trait JobTracker: Send + Sync {
 pub struct NotifyHub {
     key: NotifyKey,
     sessions: Mutex<HashMap<(String, String), Weak<SessionNotify>>>,
+    metrics: Option<Arc<crate::metrics::Metrics>>,
 }
 
 impl NotifyHub {
     pub fn new(key: NotifyKey) -> Arc<Self> {
+        Self::with_metrics(key, None)
+    }
+
+    /// [`Self::new`], counting callbacks and fallbacks in `metrics` (`--metrics-listen`).
+    pub fn with_metrics(
+        key: NotifyKey,
+        metrics: Option<Arc<crate::metrics::Metrics>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             key,
             sessions: Mutex::new(HashMap::new()),
+            metrics,
         })
+    }
+
+    /// The replica's metrics, when it publishes them.
+    pub fn metrics(&self) -> Option<&Arc<crate::metrics::Metrics>> {
+        self.metrics.as_ref()
     }
 
     /// The replica's notify key: the one it mints and verifies under.
@@ -200,6 +240,7 @@ impl SessionNotify {
     /// Feed the kernel one event: answer callbacks and start reconciles as it decides, and return
     /// its actions about jobs for the caller to perform (a `keep` it must await, say).
     pub fn feed_collect(self: &Arc<Self>, event: Event) -> Vec<Action> {
+        let metrics = self.hub.upgrade().and_then(|h| h.metrics().cloned());
         let (actions, answers) = {
             let mut inner = lock(&self.inner);
             let actions = inner.kernel.step(event);
@@ -207,9 +248,17 @@ impl SessionNotify {
             let mut rest = Vec::new();
             for a in actions {
                 match a {
-                    Action::Answer { call, status } => {
+                    Action::Answer { call, status, why } => {
+                        if let Some(m) = &metrics {
+                            m.job_callback(callback_outcome(why));
+                        }
                         if let Some(tx) = inner.calls.remove(&call) {
                             answers.push((tx, status));
+                        }
+                    }
+                    Action::Held { why, .. } => {
+                        if let Some(m) = &metrics {
+                            m.job_held(held_reason(why));
                         }
                     }
                     other => rest.push(other),
@@ -256,7 +305,7 @@ impl SessionNotify {
                     rt.spawn(run);
                 }
             }
-            Action::Answer { .. } => {}
+            Action::Answer { .. } | Action::Held { .. } => {}
             other => {
                 if let Some(t) = self.tracker() {
                     t.perform(other);
@@ -298,6 +347,20 @@ impl SessionNotify {
         let status = rx.await.unwrap_or(503);
         guard.answered = true;
         status
+    }
+
+    /// Count how long after a job's end (`ended`, epoch seconds) the session recorded it.
+    pub fn end_recorded(&self, ended: u64) {
+        let Some(m) = self.hub.upgrade().and_then(|h| h.metrics().cloned()) else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        #[allow(clippy::cast_precision_loss)]
+        m.job_end_to_notice_seconds
+            .observe((now - ended as f64).max(0.0));
     }
 
     /// The kernel's state, for tests and diagnostics.
@@ -448,6 +511,111 @@ mod tests {
             outcome: kernel::KeepOutcome::Succeeded,
             now,
         });
+    }
+
+    /// The value of a series in a scrape.
+    fn sample(text: &str, series: &str) -> f64 {
+        text.lines()
+            .find_map(|l| {
+                l.strip_prefix(series)
+                    .map(|v| v.trim().parse::<f64>().unwrap())
+            })
+            .unwrap_or_else(|| panic!("no {series} in {text}"))
+    }
+
+    #[tokio::test]
+    async fn every_counter_moves() {
+        let metrics = crate::metrics::Metrics::new().unwrap();
+        let hub = NotifyHub::with_metrics(
+            NotifyKey::from_secret_bytes(&[7; 32]),
+            Some(metrics.clone()),
+        );
+        let scrape = || String::from_utf8(metrics.encode()).unwrap();
+        let cb = |o: &str| format!("agent_job_callbacks_total{{outcome=\"{o}\"}}");
+        let held = |r: &str| format!("agent_job_notify_held_total{{reason=\"{r}\"}}");
+        for o in ["accepted", "proof", "duplicate", "gone", "unavailable"] {
+            assert_eq!(sample(&scrape(), &cb(o)), 0.0, "{o}");
+        }
+
+        // Callback answers, by the table's facts.
+        for (job, outcome) in [
+            (TableJob::Running, "accepted"),
+            (TableJob::Ended, "duplicate"),
+            (TableJob::Absent, "gone"),
+            (TableJob::Taken, "unavailable"),
+        ] {
+            let f = fake(job, Some(Listed::Running));
+            let s = session(&hub, &f);
+            s.callback(&id(), Instant::now()).await;
+            assert_eq!(sample(&scrape(), &cb(outcome)), 1.0, "{outcome}");
+        }
+        // The proof.
+        let f = fake(TableJob::Running, Some(Listed::Running));
+        let s = session(&hub, &f);
+        release(&s);
+        assert_eq!(s.callback(&id(), Instant::now()).await, 200);
+        assert_eq!(sample(&scrape(), &cb("proof")), 1.0);
+
+        // Why a job stays held.
+        let job = || ID.to_string();
+        s.feed(Event::Kept {
+            job: job(),
+            notify_available: false,
+            adopted: false,
+        });
+        assert_eq!(sample(&scrape(), &held("unavailable")), 1.0);
+        for (outcome, reason) in [
+            (kernel::KeepOutcome::Refused, "refused"),
+            (kernel::KeepOutcome::Failed, "keep_failed"),
+        ] {
+            s.feed(Event::Kept {
+                job: job(),
+                notify_available: true,
+                adopted: false,
+            });
+            let now = s.now();
+            s.feed(Event::KeepAnswered {
+                job: job(),
+                outcome,
+                now,
+            });
+            assert_eq!(sample(&scrape(), &held(reason)), 1.0, "{reason}");
+        }
+        s.feed(Event::Kept {
+            job: job(),
+            notify_available: true,
+            adopted: false,
+        });
+        s.feed(Event::StreamEnded { job: job() });
+        assert_eq!(sample(&scrape(), &held("ended")), 1.0);
+        s.feed(Event::Kept {
+            job: job(),
+            notify_available: true,
+            adopted: false,
+        });
+        let now = s.now();
+        s.feed(Event::KeepAnswered {
+            job: job(),
+            outcome: kernel::KeepOutcome::Succeeded,
+            now,
+        });
+        s.feed(Event::Tick {
+            now: now + kernel::PROOF_WINDOW,
+        });
+        assert_eq!(sample(&scrape(), &held("no_proof")), 1.0);
+
+        // From an end to its record.
+        let ended = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 5;
+        s.end_recorded(ended);
+        assert_eq!(
+            sample(&scrape(), "agent_job_end_to_notice_seconds_count"),
+            1.0
+        );
+        assert!(sample(&scrape(), "agent_job_end_to_notice_seconds_sum") >= 4.0);
     }
 
     #[tokio::test]

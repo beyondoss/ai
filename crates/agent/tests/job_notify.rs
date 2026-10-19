@@ -694,7 +694,8 @@ fn reconciles_only_on_a_callback_or_a_use() {
         a,
         [Action::Answer {
             call: 7,
-            status: 200
+            status: 200,
+            why: beyond_ai_agent::tools::job_notify::kernel::Why::Hint
         }]
     );
     // One about the unheld job does, after the spacing.

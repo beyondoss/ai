@@ -158,6 +158,9 @@ pub async fn serve<S>(
         Err(None) => return,
     };
     refuse(stream, status).await;
+    if let Some(m) = rx.hub.and_then(NotifyHub::metrics) {
+        m.job_callback(crate::metrics::JobCallback::Refused);
+    }
 }
 
 /// Write a callback's refusal with its fixed body.
@@ -223,7 +226,7 @@ fn is_job_id(id: &str) -> bool {
     (1..=32).contains(&id.len()) && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// The checks, in order. `Err(Some(status))` is a refusal to write; `Err(None)` means nothing
+/// The checks, in order. `Err(Some(status))` is a refusal to write (and count); `Err(None)` means nothing
 /// more is to be written; `Ok` that the answer was written.
 async fn check<S>(
     stream: &mut S,
@@ -298,7 +301,11 @@ where
     }
     // Only now: is the session held here? A callback never opens one.
     let Some(session) = hub.find(&tenant, &session_id) else {
-        return Err(Some(503));
+        if let Some(m) = hub.metrics() {
+            m.job_callback(crate::metrics::JobCallback::NotOpen);
+        }
+        refuse(stream, 503).await;
+        return Err(None);
     };
     let Some(id) = JobId::parse(id) else {
         return Err(Some(400));
@@ -309,11 +316,13 @@ where
         () = closed(stream) => return Err(None),
     };
     drop(session);
+    // The session's driver counted its answer.
     if answer == 200 {
         let _ = write(stream, 200, "OK", ANSWER_BODY).await;
-        return Ok(());
+    } else {
+        refuse(stream, answer).await;
     }
-    Err(Some(answer))
+    Ok(())
 }
 
 /// Exactly `len` body bytes: what was read past the head, then the rest. `None` if the connection

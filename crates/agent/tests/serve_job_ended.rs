@@ -960,3 +960,61 @@ async fn one_report_per_end() {
         "no request without it after the first, and no extra turn"
     );
 }
+
+/// The receiver counts what it answers itself: refusals before the session lookup, and callbacks
+/// for a session not held here.
+#[tokio::test]
+async fn the_receiver_counts_what_it_answers() {
+    let metrics = beyond_ai_agent::metrics::Metrics::new().unwrap();
+    let hub = NotifyHub::with_metrics(fixture_key(), Some(metrics.clone()));
+    let (tenant, session) = fx_url_session();
+    let scope = JobScope::for_session(Some(&tenant), &session);
+    let body = body_for(scope.name(), JOB);
+    let query = format!("session_id={session}&tenant={tenant}");
+    let headers = |token: &str| {
+        vec![
+            ("Authorization".to_string(), format!("Bearer {token}")),
+            ("Content-Length".to_string(), body.len().to_string()),
+        ]
+    };
+    let value = |series: &str| -> f64 {
+        String::from_utf8(metrics.encode())
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix(series).map(|v| v.trim().parse().unwrap()))
+            .unwrap()
+    };
+    let (status, _) = serve_one(
+        Some(&hub),
+        true,
+        "POST",
+        "/_beyond/agent",
+        Some(&query),
+        &headers("bjn_v1.00000000.x"),
+        body.as_bytes(),
+        Instant::now(),
+    )
+    .await;
+    assert_eq!(status, 401);
+    assert_eq!(
+        value(r#"agent_job_callbacks_total{outcome="refused"}"#),
+        1.0
+    );
+    let token = fixture_key().mint(&tenant, &session, &JobId::parse(JOB).unwrap());
+    let (status, _) = serve_one(
+        Some(&hub),
+        true,
+        "POST",
+        "/_beyond/agent",
+        Some(&query),
+        &headers(&token),
+        body.as_bytes(),
+        Instant::now(),
+    )
+    .await;
+    assert_eq!(status, 503);
+    assert_eq!(
+        value(r#"agent_job_callbacks_total{outcome="not_open"}"#),
+        1.0
+    );
+}
