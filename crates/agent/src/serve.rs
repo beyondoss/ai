@@ -436,6 +436,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::gateway_credential::{GatewayCredential, resolve_gateway_credential};
+use crate::mode::Mode;
 use crate::session_store::{
     BranchInfo, BranchSummaryDetails, SessionMeta, SessionRepo, SessionStore, search_sessions,
 };
@@ -909,6 +910,13 @@ pub struct ServeConfig {
     /// `Duration::ZERO` — the default — means a signal shuts the daemon down at once, exactly as it
     /// did before drain existed, so Ctrl-C on a laptop daemon is still instant.
     pub drain_grace: std::time::Duration,
+}
+
+impl ServeConfig {
+    /// Which world this config's session lives in: its grant's, or this host's.
+    fn mode(&self) -> Mode {
+        Mode::from(self.service.clone())
+    }
 }
 
 /// Resolve whether a project is trusted for this session, from already-gathered inputs — shared by
@@ -1417,21 +1425,17 @@ impl Persistence {
         // Service mode first, and with no fallback: the tenant's own directory or nothing. A
         // `service_mode` config that reached a session without a grant would otherwise land in the
         // per-cwd default repo below — the replica's own disk, shared across tenants.
-        if cfg.service_mode {
-            let service = cfg.service.as_ref().ok_or_else(|| {
-                std::io::Error::other(
-                    "service mode: this session has no verified grant, so it has nowhere to persist",
-                )
-            })?;
+        let mode = Mode::for_persistence(cfg)?;
+        if let Some((session_dir, workspace_root, repo_options)) = mode.tenant_storage() {
             // Epoch segments, sealed with the tenant's own keys, and minting derived ids onto this
             // session's shard: the layout a mount shared by many replicas needs (see
             // `session_store`'s "Ownership: the epoch fence").
             return Self::open_repo_with(
-                &service.session_dir,
-                service.workspace_root(),
+                session_dir,
+                workspace_root,
                 &cfg.model,
                 SessionSelect::from_cfg(cfg),
-                service.repo_options_for(service.session_id()),
+                repo_options,
                 false,
             );
         }
@@ -1906,14 +1910,14 @@ impl Persistence {
     /// preview a fork point before committing to it.
     fn fork_messages(
         &self,
-        service: Option<&crate::service::ServiceSession>,
+        mode: &Mode,
         session_id: &str,
         upto: usize,
         entry_id: Option<&str>,
         before: bool,
     ) -> std::io::Result<Vec<agent_core::Message>> {
-        let repo = self.repo_for(service, session_id)?;
-        Self::require_exactly(service, &repo, session_id)?;
+        let repo = self.repo_for(mode, session_id)?;
+        Self::require_exactly(mode, &repo, session_id)?;
         if let Some(entry_id) = entry_id {
             return repo.fork_at_entry_messages(session_id, entry_id, before);
         }
@@ -1929,21 +1933,11 @@ impl Persistence {
     /// several mounts, and a command must reach the one it actually named rather than quietly
     /// operating on whichever mount this connection happened to land on. A shard this replica
     /// doesn't serve is an error, not an empty result.
-    fn repo_for(
-        &self,
-        service: Option<&crate::service::ServiceSession>,
-        id: &str,
-    ) -> std::io::Result<SessionRepo> {
-        let Some(service) = service else {
-            return self.repo.clone().ok_or_else(not_in_repo_mode);
-        };
-        let dir = service.session_dir_for(id).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("session {id} is on a shard this replica does not serve"),
-            )
-        })?;
-        SessionRepo::open_with(dir, service.repo_options_for(id))
+    fn repo_for(&self, mode: &Mode, id: &str) -> std::io::Result<SessionRepo> {
+        match mode.tenant_repo_for(id) {
+            Some(repo) => repo,
+            None => self.repo.clone().ok_or_else(not_in_repo_mode),
+        }
     }
 
     /// Service mode only: refuse an id that doesn't name a session **exactly**.
@@ -1952,12 +1946,8 @@ impl Persistence {
     /// fallback is a convenience for an id a human typed. A tenant's ids are minted, never typed, so
     /// there a prefix match turns "that session is gone" into "here is a neighbour of it" — and, for
     /// `delete`, turns a miss into a silent `Ok`. Exact or error.
-    fn require_exactly(
-        service: Option<&crate::service::ServiceSession>,
-        repo: &SessionRepo,
-        id: &str,
-    ) -> std::io::Result<()> {
-        if service.is_none() {
+    fn require_exactly(mode: &Mode, repo: &SessionRepo, id: &str) -> std::io::Result<()> {
+        if !mode.requires_exact_ids() {
             return Ok(());
         }
         if repo.has_exact(id)? {
@@ -1977,19 +1967,15 @@ impl Persistence {
     /// file left to persist the next turn into — a footgun no legitimate caller needs, since `list_
     /// sessions`/`list_all_sessions` responses report which id is current. A client that genuinely wants
     /// that must `new_session`/`switch_session` away first.
-    fn delete(
-        &self,
-        service: Option<&crate::service::ServiceSession>,
-        id: &str,
-    ) -> std::io::Result<()> {
-        let repo = self.repo_for(service, id)?;
+    fn delete(&self, mode: &Mode, id: &str) -> std::io::Result<()> {
+        let repo = self.repo_for(mode, id)?;
         if id == self.session_id() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "cannot delete the currently active session — switch to another session first",
             ));
         }
-        Self::require_exactly(service, &repo, id)?;
+        Self::require_exactly(mode, &repo, id)?;
         repo.delete(id)
     }
 
@@ -1998,18 +1984,15 @@ impl Persistence {
     ///
     /// In service mode the trash of **every** mounted shard's tenant directory is merged, so a
     /// session deleted on one mount is restorable from any connection this tenant holds.
-    fn list_trash(
-        &self,
-        service: Option<&crate::service::ServiceSession>,
-    ) -> std::io::Result<Vec<crate::session_store::TrashEntry>> {
-        if let Some(service) = service {
+    fn list_trash(&self, mode: &Mode) -> std::io::Result<Vec<crate::session_store::TrashEntry>> {
+        if let Some((dirs, layout)) = mode.tenant_scope() {
             let mut all = Vec::new();
             // Read-only across every mount, so no id prefix: nothing here mints a session.
             let opts = crate::session_store::RepoOptions {
-                layout: service.layout(),
+                layout,
                 id_prefix: None,
             };
-            for dir in service.tenant_session_dirs() {
+            for dir in dirs {
                 if dir.is_dir() {
                     all.extend(SessionRepo::open_with(dir, opts.clone())?.list_trash()?);
                 }
@@ -2023,12 +2006,8 @@ impl Persistence {
 
     /// Restore a session by id out of `.trash/` back to its original location (repo mode only) — see
     /// [`crate::session_store::SessionRepo::restore_session`].
-    fn restore_session(
-        &self,
-        service: Option<&crate::service::ServiceSession>,
-        id: &str,
-    ) -> std::io::Result<bool> {
-        self.repo_for(service, id)?.restore_session(id)
+    fn restore_session(&self, mode: &Mode, id: &str) -> std::io::Result<bool> {
+        self.repo_for(mode, id)?.restore_session(id)
     }
 
     /// This process's own cwd's sessions, newest first (empty unless in repo mode).
@@ -2055,16 +2034,11 @@ impl Persistence {
     /// filtering would only hide a tenant's own sessions whose workspace path happens to have moved.
     async fn list_with_progress(
         &self,
-        service: Option<&crate::service::ServiceSession>,
+        mode: &Mode,
         on_progress: impl Fn(usize, usize) + Send + Sync + 'static,
     ) -> Vec<SessionMeta> {
-        if let Some(service) = service {
-            return scan_session_dirs(
-                vec![service.session_dir.clone()],
-                service.layout(),
-                on_progress,
-            )
-            .await;
+        if let Some((dirs, layout)) = mode.listing_scope() {
+            return scan_session_dirs(dirs, layout, on_progress).await;
         }
         let Some(repo) = self.repo.clone() else {
             return Vec::new();
@@ -2101,16 +2075,11 @@ impl Persistence {
     /// tenant's, and never the sibling-project walk (that root is the replica's).
     async fn list_all_with_progress(
         &self,
-        service: Option<&crate::service::ServiceSession>,
+        mode: &Mode,
         on_progress: impl Fn(usize, usize) + Send + Sync + 'static,
     ) -> std::io::Result<Vec<SessionMeta>> {
-        if let Some(service) = service {
-            return Ok(scan_session_dirs(
-                service.tenant_session_dirs(),
-                service.layout(),
-                on_progress,
-            )
-            .await);
+        if let Some((dirs, layout)) = mode.tenant_scope() {
+            return Ok(scan_session_dirs(dirs, layout, on_progress).await);
         }
         let repo = self.repo.as_ref().ok_or_else(not_in_repo_mode)?;
         let root = repo
@@ -2568,10 +2537,10 @@ impl Persistence {
 /// even inspected — an `OutFrame::Raw` (every streamed event, the hot path) short-circuits on its
 /// variant, and a successful response on one map lookup. Error text is where host paths actually
 /// leak: `std::io::Error` from the session store names the file it failed on.
-fn redact_frame(service: Option<&crate::service::ServiceSession>, frame: OutFrame) -> OutFrame {
-    let Some(service) = service else {
+fn redact_frame(mode: &Mode, frame: OutFrame) -> OutFrame {
+    if !mode.redacts_host_paths() {
         return frame;
-    };
+    }
     let OutFrame::Value(mut v) = frame else {
         return frame;
     };
@@ -2579,7 +2548,7 @@ fn redact_frame(service: Option<&crate::service::ServiceSession>, frame: OutFram
         && map.get("success") == Some(&Value::Bool(false))
         && let Some(Value::String(error)) = map.get("error")
     {
-        let redacted = service.redact(error);
+        let redacted = mode.redact(error);
         map.insert("error".into(), Value::String(redacted));
     }
     OutFrame::Value(v)
@@ -2668,7 +2637,7 @@ fn current_todos(session: &Session) -> Option<Value> {
 /// task *and* the shared runtime thread, whereas awaiting a `spawn_blocking` suspends the caller either
 /// way and only ever frees the thread. No filesystem watcher or caching: a plain request/response poll
 /// has nothing to invalidate, and a `git` invocation is cheap enough to just redo every call.
-async fn git_branch(cwd: &std::path::Path) -> Option<String> {
+pub(crate) async fn git_branch(cwd: &std::path::Path) -> Option<String> {
     let output = tokio::process::Command::new("git")
         .args(["symbolic-ref", "--short", "HEAD"])
         .current_dir(cwd)
@@ -2701,7 +2670,10 @@ const GIT_BRANCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 /// until something does.
 ///
 /// [`ExecCell::pending`]: crate::exec_endpoint::ExecCell::pending
-async fn git_branch_in(exec: &crate::exec_endpoint::ExecCell, cwd: &str) -> Option<String> {
+pub(crate) async fn git_branch_in(
+    exec: &crate::exec_endpoint::ExecCell,
+    cwd: &str,
+) -> Option<String> {
     if exec.pending() {
         return None;
     }
@@ -3051,32 +3023,27 @@ pub(crate) async fn serve_session(
     // worktree sweep — the only repo they could see is the replica's) or re-aimed at the sandbox
     // through the session's own backend (`ServiceSession::resources` below). What must never
     // happen is the third option: walking the replica's cwd and calling the result a tenant's.
-    let service = cfg.service.clone();
-    let cwd = match &service {
-        Some(svc) => std::path::PathBuf::from(svc.workspace_root()),
-        None => crate::session_store::canonical_cwd(&std::env::current_dir().unwrap_or_default()),
-    };
+    let mode = cfg.mode();
+    let cwd = mode.session_cwd();
     let has_gated_resources =
-        service.is_none() && crate::trust_store::has_trust_gated_resources(&cwd);
+        mode.trust_gate_applies() && crate::trust_store::has_trust_gated_resources(&cwd);
     // `disk_overrides` stays off in service mode: it governs whether the **replica's** filesystem
     // may set a tenant's base prompt, and the answer to that is never yes. The tenant's own
     // `SYSTEM.md`/`APPEND_SYSTEM.md` arrive instead as `base`/`append` below, read from its sandbox.
-    let disk_overrides = service.is_none();
+    let disk_overrides = mode.reads_disk_overrides();
     // Sandbox content is the tenant's own, so it counts as trusted — there is no second party for
     // the trust gate to protect against inside one tenant's own box.
-    let mut project_trusted = match &service {
-        Some(_) => true,
-        None => resolve_project_trust(
+    let mut project_trusted = !mode.trust_gate_applies()
+        || resolve_project_trust(
             cfg.trust_project,
             cfg.force_untrusted,
             cfg.default_project_trust,
             crate::trust_store::TrustStore::open_default().lookup(&cwd),
             has_gated_resources,
-        ),
-    };
+        );
     // Reap any subagent worktree orphaned by a previous crash of a process against this repo. Not
     // in service mode: the only repo this could sweep is the replica's own checkout.
-    if service.is_none() {
+    if mode.sweeps_worktrees() {
         crate::worktree::sweep(&cwd);
     }
 
@@ -3104,10 +3071,7 @@ pub(crate) async fn serve_session(
     // Strict in service mode: an empty cell is an error, never this host. The fallback that makes a
     // local session convenient (`RealRunner`/`LocalFs`) is, on a replica, a tenant's tool running on
     // the machine every other tenant shares.
-    let exec_cell = match &service {
-        Some(_) => crate::exec_endpoint::ExecCell::strict(),
-        None => crate::exec_endpoint::ExecCell::new(),
-    };
+    let exec_cell = mode.new_exec_cell();
     // `bash` jobs outlive the run that started them here: ending a turn leaves them running, and the
     // idle loop below starts a turn when one ends (see the `bash_jobs_wake` arm). They end with the
     // session (stopped explicitly when this function returns), and a transcript switch stops them
@@ -3141,14 +3105,10 @@ pub(crate) async fn serve_session(
     // Fail-soft per connector (a dead server costs its own tools, not the session), and the
     // warnings stay on the replica: they name the tenant's own connectors, but the client asked for
     // a session, not a connect report.
-    if let Some(svc) = &service {
-        let (tools, catalog, warnings) = svc.mcp(cfg.mcp_http.as_ref(), mcp_host.clone()).await;
-        cfg.mcp_apps = Some(svc.mcp_apps_pool(cfg.mcp_http.clone(), mcp_host.clone()));
-        for warning in &warnings {
-            eprintln!("warning: session {}: {warning}", persistence.session_id());
-        }
-        cfg.mcp_tools = tools;
-        cfg.mcp_catalog = catalog;
+    if mode
+        .connect_session_mcp(&mut cfg, &mcp_host, persistence.session_id())
+        .await
+    {
         timing.mark("connect session MCP connectors");
     }
     // This session's view of the shared catalog: its non-tool MCP requests are registered under
@@ -3160,7 +3120,7 @@ pub(crate) async fn serve_session(
     // arriving event can be injected as an ordinary `prompt` command; with no servers there is
     // nothing to interpose for, and the channel stays exactly as it was.
     let mut mcp_events = None;
-    if service.is_none() && !cfg.mcp_catalog.is_empty() {
+    if mode.allows_mcp_events() && !cfg.mcp_catalog.is_empty() {
         let out = Arc::downgrade(&out_conn);
         let emit: crate::tools::mcp_events::Emitter = Arc::new(move |frame: Value| {
             if let Some(out) = out.upgrade() {
@@ -3214,13 +3174,12 @@ pub(crate) async fn serve_session(
     // sandbox for its prompt anyway, and one that doesn't answer **ends the session** rather than
     // leaving it running with nowhere for its tools to go. That error propagates out of
     // `serve_session`, which the daemon turns into an error frame on every attached connection.
-    let sandbox_snapshot = match (&service, persistence.session_file()) {
-        (Some(svc), Some(file)) => {
-            svc.load_snapshot(file, persistence.session_id(), cfg.context_files)
-        }
-        _ => None,
-    };
-    match &service {
+    let sandbox_snapshot = mode.load_sandbox_snapshot(
+        persistence.session_file(),
+        persistence.session_id(),
+        cfg.context_files,
+    );
+    match mode.service() {
         Some(svc) => {
             exec_cell.set_lazy(
                 svc.lazy_exec(cfg.exec_max_response_bytes),
@@ -3278,7 +3237,7 @@ pub(crate) async fn serve_session(
     // at its first use (or when one is asked about), and until then the reopen note says they have
     // not been checked.
     bash_jobs.set_scope(Some(crate::exec_endpoint::jobs::JobScope::for_session(
-        service.as_ref().map(|svc| svc.tenant()),
+        mode.tenant(),
         persistence.session_id(),
     )));
     if exec_cell.pending() {
@@ -3293,7 +3252,7 @@ pub(crate) async fn serve_session(
     // exec v1.4: a sandbox's `job_ended` callback reaches this session only while this task holds
     // it, registered here for the task's life (dropped, it is unregistered). The job table answers
     // it. Service mode only: `job_notify` is never set anywhere else.
-    let job_notify = match (&cfg.job_notify, &service) {
+    let job_notify = match (&cfg.job_notify, mode.service()) {
         (Some(hub), Some(svc)) => {
             let reg = crate::tools::job_notify::SessionNotify::register(
                 hub,
@@ -3337,21 +3296,23 @@ pub(crate) async fn serve_session(
     // snapshot saves; `sandbox_snapshot_dirty` says the saved one is behind it (written at the top
     // of the loop, once the session's directory exists).
     let mut sandbox_refresh = sandbox_snapshot.is_some();
-    let mut sandbox_snapshot_dirty = service.is_some() && sandbox_snapshot.is_none();
+    let mut sandbox_snapshot_dirty = mode.keeps_sandbox_snapshot() && sandbox_snapshot.is_none();
     let mut sandbox_resources: Option<crate::service::Resources> = None;
-    let mut discovered = match (&service, sandbox_snapshot) {
-        (Some(_), Some(snapshot)) => {
+    let mut discovered = match sandbox_snapshot {
+        Some(snapshot) => {
             sandbox_resources = Some(snapshot.resources.clone());
             Discovered::from(snapshot.resources)
         }
-        (Some(svc), None) => {
-            let found = svc
-                .resources(exec_cell.backend().as_ref(), cfg.context_files)
-                .await;
-            sandbox_resources = Some(found.clone());
-            Discovered::from(found)
-        }
-        (None, _) => discover_resources(&cfg, &cwd, project_trusted).await,
+        None => match mode
+            .discover_sandbox_resources(&exec_cell, cfg.context_files)
+            .await
+        {
+            Some(found) => {
+                sandbox_resources = Some(found.clone());
+                Discovered::from(found)
+            }
+            None => discover_resources(&cfg, &cwd, project_trusted).await,
+        },
     };
     // Agent definitions are trust-gated exactly like skills (a project-local `.claude/agents/*.md`
     // body is injected verbatim as a child's system prompt), so they're discovered here — after trust
@@ -3389,13 +3350,14 @@ pub(crate) async fn serve_session(
     // In service mode the backend is the tenant's own `<home shard>/<tenant>/memory` — never a DSN
     // (`--memory` is refused) and never a path derived from the replica's cwd.
     let memory_backend: Option<Arc<dyn crate::memory::MemoryBackend>> =
-        match (cfg.no_memory || cfg.no_tools, &service) {
-            (true, _) => None,
-            (false, Some(svc)) => Some(svc.memory_backend()),
-            (false, None) => Some(
-                crate::memory::open(cfg.memory.as_deref(), &cwd)
+        if cfg.no_memory || cfg.no_tools {
+            None
+        } else {
+            Some(match mode.tenant_memory_backend() {
+                Some(backend) => backend,
+                None => crate::memory::open(cfg.memory.as_deref(), &cwd)
                     .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?,
-            ),
+            })
         };
     let has_memory = memory_backend.is_some();
     // The per-session working-memory mount (`/session`) rides a *shared, swappable* directory cell: a
@@ -3415,10 +3377,7 @@ pub(crate) async fn serve_session(
                 // the transcript beside it: `<id>/memory/` lives on the same shared mount they do.
                 let session_backend =
                     crate::memory::file::FileBackend::session_shared(session_dir_cell.clone());
-                let session_backend = match &service {
-                    Some(svc) => session_backend.sealed(Arc::clone(svc.codec())),
-                    None => session_backend,
-                };
+                let session_backend = mode.seal_session_memory(session_backend);
                 v.push(crate::memory::Mount {
                     kind: crate::memory::MountKind::Session,
                     backend: Arc::new(session_backend),
@@ -3467,7 +3426,7 @@ pub(crate) async fn serve_session(
             // spec belongs to whichever grant last ran this session, and its credentials are not
             // persisted at all (see below). Lazily, as at startup: the incoming session probes it
             // again on its first use, and nothing is sent for the switch itself.
-            if let Some(svc) = &service {
+            if let Some(svc) = mode.service() {
                 exec_cell.set_lazy(
                     svc.lazy_exec(cfg.exec_max_response_bytes),
                     svc.sandbox().map(|s| s.home),
@@ -3580,12 +3539,9 @@ pub(crate) async fn serve_session(
     };
     // Service mode strips replica paths from what a tenant's client sees — a view's cancelled reason
     // included (it is an error string from the transport).
-    let app_redact: crate::tools::mcp_apps::Redactor = match &service {
-        Some(svc) => {
-            let svc = svc.clone();
-            Arc::new(move |text: &str| svc.redact(text))
-        }
-        None => Arc::new(|text: &str| text.to_owned()),
+    let app_redact: crate::tools::mcp_apps::Redactor = {
+        let mode = mode.clone();
+        Arc::new(move |text: &str| mode.redact(text))
     };
     // A bridge request with nobody left to answer is cancelled (see `mcp_apps::handle_request`).
     let app_detached: crate::tools::mcp_apps::Detached = {
@@ -3627,7 +3583,7 @@ pub(crate) async fn serve_session(
             let filter = app_filter.clone();
             let approval = approval.clone();
             let detached = app_detached.clone();
-            let service = service.clone();
+            let mode = mode.clone();
             let out_tx = $out_tx.clone();
             let session_host = mcp_host.clone();
             tokio::spawn(async move {
@@ -3644,7 +3600,7 @@ pub(crate) async fn serve_session(
                     ),
                     Err(e) => response(id, "mcp_app_request", false, None, Some(&e)),
                 };
-                let _ = out_tx.send(redact_frame(service.as_deref(), frame));
+                let _ = out_tx.send(redact_frame(&mode, frame));
             });
         }};
     }
@@ -3797,7 +3753,9 @@ pub(crate) async fn serve_session(
     // reading it would let the operator's machine configure a tenant, and writing it would let one
     // tenant's toggle reach every other session on the replica. Every `set_*` toggle below stays
     // session-local there (see `persist_setting!`), and the starting value is the built-in default.
-    let mut settings_store = (!cfg.service_mode).then(crate::settings::SettingsStore::open_default);
+    let mut settings_store = mode
+        .reads_operator_settings()
+        .then(crate::settings::SettingsStore::open_default);
     let mut current_auto_compaction = if cfg.no_compaction {
         false
     } else {
@@ -3852,7 +3810,7 @@ pub(crate) async fn serve_session(
                 &current_model,
                 &write_locks,
                 &skills,
-                service.is_some().then_some(context_files.as_slice()),
+                mode.context_files(context_files.as_slice()),
                 mounts.clone(),
                 approval.as_ref(),
                 &mcp_enabled,
@@ -4067,10 +4025,7 @@ pub(crate) async fn serve_session(
     // otherwise reach a tenant verbatim.
     macro_rules! emit {
         ($frame:expr) => {
-            if out_tx
-                .send(redact_frame(service.as_deref(), $frame))
-                .is_err()
-            {
+            if out_tx.send(redact_frame(&mode, $frame)).is_err() {
                 break;
             }
         };
@@ -4106,9 +4061,7 @@ pub(crate) async fn serve_session(
                 last_history = session.messages.clone();
             }
             if let Some(file) = persistence.session_file().map(std::path::Path::to_path_buf) {
-                let seal = service
-                    .as_ref()
-                    .map(|svc| (Arc::clone(svc.codec()), persistence.session_id().to_string()));
+                let seal = mode.sidecar_seal(persistence.session_id());
                 let ctx = crate::tools::mcp_apps::Sidecar::new(
                     &file,
                     crate::tools::mcp_apps::Sidecar::CONTEXT,
@@ -4389,7 +4342,7 @@ pub(crate) async fn serve_session(
             };
             // Service mode derives without switching: this task keeps its own id, its lock and its
             // grant, and the client gets the new id to connect to. See `fork_detached`.
-            if service.is_some() {
+            if mode.forks_detached() {
                 let frame = match persistence.fork_detached(upto, target_id, before) {
                     Ok(new_id) => response(
                         $id,
@@ -4404,7 +4357,7 @@ pub(crate) async fn serve_session(
                     ),
                     Err(e) => response($id, "fork", false, None, Some(&e.to_string())),
                 };
-                let _ = out_tx.send(redact_frame(service.as_deref(), frame));
+                let _ = out_tx.send(redact_frame(&mode, frame));
                 continue;
             }
             match persistence.fork(upto, target_id, before, starting_level) {
@@ -4488,7 +4441,7 @@ pub(crate) async fn serve_session(
         ($cmd:expr, $id:expr) => {{
             // pi's own `clone` — fork the current session at its current tip, with no arguments.
             // Service mode derives without switching, exactly like `fork` above.
-            if service.is_some() {
+            if mode.forks_detached() {
                 let frame = match persistence.fork_detached(usize::MAX, None, false) {
                     Ok(new_id) => response(
                         $id,
@@ -4499,7 +4452,7 @@ pub(crate) async fn serve_session(
                     ),
                     Err(e) => response($id, "clone", false, None, Some(&e.to_string())),
                 };
-                let _ = out_tx.send(redact_frame(service.as_deref(), frame));
+                let _ = out_tx.send(redact_frame(&mode, frame));
                 continue;
             }
             match persistence.fork(usize::MAX, None, false, starting_level) {
@@ -4761,19 +4714,16 @@ pub(crate) async fn serve_session(
                                         compact_abort_acks.push(cid);
                                     }
                                     "get_state" => {
-                                        let branch = match &service {
-                                            Some(svc) => git_branch_in(&exec_cell, svc.workspace_root()).await,
-                                            None => git_branch(&cwd).await,
-                                        };
+                                        let branch = mode.git_branch(&exec_cell, &cwd).await;
                                         let mut data = stats_before.clone();
                                         if let Value::Object(m) = &mut data {
-                                            insert_session_identity(m, &persistence, service.as_deref());
+                                            insert_session_identity(m, &persistence, &mode);
                                             m.insert("model".into(), json!(current_model));
                                             m.insert("message_count".into(), json!(message_count_before));
                                             m.insert("title".into(), json!(persistence.meta.title));
                                             m.insert(
                                                 "cwd_stale".into(),
-                                                json!(service.is_none() && cwd_is_stale(&persistence.meta.cwd, &cwd)),
+                                                json!(mode.cwd_is_stale(&persistence.meta.cwd, &cwd)),
                                             );
                                             m.insert("cwd".into(), json!(cwd.display().to_string()));
                                             m.insert("git_branch".into(), json!(branch));
@@ -4789,7 +4739,7 @@ pub(crate) async fn serve_session(
                                     "get_session_stats" => {
                                         let mut data = stats_before.clone();
                                         if let Value::Object(m) = &mut data {
-                                            insert_session_identity(m, &persistence, service.as_deref());
+                                            insert_session_identity(m, &persistence, &mode);
                                             m.insert("pending_tool_ids".into(), json!(Vec::<String>::new()));
                                         }
                                         let _ = out_tx.send(response(cid, "get_session_stats", true, Some(data), None));
@@ -4903,7 +4853,7 @@ pub(crate) async fn serve_session(
                     &current_model,
                     &write_locks,
                     &skills,
-                    service.is_some().then_some(context_files.as_slice()),
+                    mode.context_files(context_files.as_slice()),
                     mounts.clone(),
                     approval.as_ref(),
                     &mcp_enabled,
@@ -5007,7 +4957,7 @@ pub(crate) async fn serve_session(
                 crate::tools::bash_sandbox::wipe(exec_cell.runner(), &old).await;
             }
             bash_jobs.set_scope(Some(crate::exec_endpoint::jobs::JobScope::for_session(
-                service.as_ref().map(|svc| svc.tenant()),
+                mode.tenant(),
                 persistence.session_id(),
             )));
             if exec_cell.pending() {
@@ -5017,7 +4967,7 @@ pub(crate) async fn serve_session(
             }
             stop_survivors(&bash_jobs, &persistence).await;
             // The snapshot belongs beside the transcript the session is on now.
-            sandbox_snapshot_dirty = service.is_some();
+            sandbox_snapshot_dirty = mode.keeps_sandbox_snapshot();
             bash_jobs.set_recorder(Some(procs_recorder(&mcp_task_tx, persistence.session_id())));
             if !stopped_jobs.is_empty() {
                 emit!(OutFrame::Value(json!({
@@ -5036,11 +4986,12 @@ pub(crate) async fn serve_session(
             {
                 tracing::warn!(error = %e, "could not read back the session's sandbox jobs");
             }
-            if sandbox_refresh && let Some(svc) = service.clone() {
+            if sandbox_refresh
+                && let Some(found) = mode
+                    .discover_sandbox_resources(&exec_cell, cfg.context_files)
+                    .await
+            {
                 sandbox_refresh = false;
-                let found = svc
-                    .resources(exec_cell.backend().as_ref(), cfg.context_files)
-                    .await;
                 if sandbox_resources.as_ref() != Some(&found) {
                     sandbox_resources = Some(found.clone());
                     apply_discovered!(Discovered::from(found));
@@ -5050,17 +5001,15 @@ pub(crate) async fn serve_session(
             }
         }
         if sandbox_snapshot_dirty
-            && let (Some(svc), Some(resources), Some(file)) =
-                (&service, &sandbox_resources, persistence.session_file())
-            && let Some(sandbox) = svc.sandbox()
-        {
-            match svc.save_snapshot(
+            && let (Some(resources), Some(file)) = (&sandbox_resources, persistence.session_file())
+            && let Some(saved) = mode.save_sandbox_snapshot(
                 file,
                 persistence.session_id(),
                 cfg.context_files,
-                &sandbox,
                 resources,
-            ) {
+            )
+        {
+            match saved {
                 Ok(()) => sandbox_snapshot_dirty = false,
                 // Its directory does not exist yet (a session with nothing on disk): next time.
                 Err(e) => tracing::debug!(error = %e, "sandbox snapshot not saved yet"),
@@ -5080,7 +5029,7 @@ pub(crate) async fn serve_session(
             emit!(OutFrame::Value(json!({
                 "type": "session_superseded",
                 "session_id": persistence.session_id(),
-                "tenant": service.as_ref().map(|svc| svc.tenant()),
+                "tenant": mode.tenant(),
             })));
             break;
         }
@@ -5167,9 +5116,7 @@ pub(crate) async fn serve_session(
         // Service mode refuses a handful of commands outright (see `service::refused_command`).
         // Checked here, ahead of the dispatch — and again at each busy-loop intercept below, so a
         // command that is going to be refused never gets there by cancelling a running prompt first.
-        if service.is_some()
-            && let Some(why) = crate::service::refused_command(&ctype)
-        {
+        if let Some(why) = mode.refused_command(&ctype) {
             emit!(response(id, &ctype, false, None, Some(why)));
             continue;
         }
@@ -5390,7 +5337,7 @@ pub(crate) async fn serve_session(
                         persistence.session_id().to_string(),
                         // One replica emits for many tenants in service mode, so every event says
                         // whose run it is. Absent (and omitted on the wire) otherwise.
-                        service.as_ref().map(|svc| svc.tenant().to_owned()),
+                        mode.tenant().map(str::to_owned),
                         id.clone(),
                         current_model.clone(),
                     )
@@ -5728,10 +5675,17 @@ pub(crate) async fn serve_session(
                                         // below: `fork`/`clone`/`new_session`/`switch_session` cancel
                                         // the running prompt before they defer, so refusing them only
                                         // at the idle dispatch would let a refused command kill a run.
-                                        if service.is_some()
-                                            && let Some(why) = crate::service::refused_command(ctype)
+                                        if let Some(why) = mode.refused_command(ctype)
                                         {
                                             let _ = out_tx.send(response(cid, ctype, false, None, Some(why)));
+                                            continue;
+                                        }
+                                        // In service mode `fork`/`clone` derive a *new* session and
+                                        // leave this one running (see `fork_detached`), so there is
+                                        // nothing here worth a run for: "busy" costs the client a
+                                        // retry, cancelling would cost it the turn.
+                                        if let Some(why) = mode.busy_refusal_for_fork_clone(ctype, "running") {
+                                            let _ = out_tx.send(response(cid, ctype, false, None, Some(&why)));
                                             continue;
                                         }
                                         match ctype {
@@ -5871,13 +5825,10 @@ pub(crate) async fn serve_session(
                                                 // Resolved before the borrow below: in service mode it
                                                 // is a round trip into the sandbox, which cannot happen
                                                 // while `data` is mutably borrowed.
-                                                let branch = match &service {
-                                                    Some(svc) => git_branch_in(&exec_cell, svc.workspace_root()).await,
-                                                    None => git_branch(&cwd).await,
-                                                };
+                                                let branch = mode.git_branch(&exec_cell, &cwd).await;
                                                 let mut data = live_stats.snapshot();
                                                 if let Value::Object(m) = &mut data {
-                                                    insert_session_identity(m, &persistence, service.as_deref());
+                                                    insert_session_identity(m, &persistence, &mode);
                                                     m.insert("model".into(), json!(current_model));
                                                     m.insert("message_count".into(), Value::Null);
                                                     m.insert("title".into(), json!(persistence.meta.title));
@@ -5935,7 +5886,7 @@ pub(crate) async fn serve_session(
                                                 // aside.
                                                 let mut data = live_stats.snapshot();
                                                 if let Value::Object(m) = &mut data {
-                                                    insert_session_identity(m, &persistence, service.as_deref());
+                                                    insert_session_identity(m, &persistence, &mode);
                                                     for field in [
                                                         "context_usage",
                                                         "user_messages",
@@ -6005,7 +5956,7 @@ pub(crate) async fn serve_session(
                                                 let progress_id = cid.clone();
                                                 let progress_tx = out_tx.clone();
                                                 let sessions = persistence
-                                                    .list_with_progress(service.as_deref(), move |scanned, total| {
+                                                    .list_with_progress(&mode, move |scanned, total| {
                                                         if should_report_scan_progress(scanned, total) {
                                                             let _ = progress_tx.send(list_progress_frame(progress_id.clone(), "list_sessions", scanned, total));
                                                         }
@@ -6016,7 +5967,7 @@ pub(crate) async fn serve_session(
                                             "list_all_sessions" => {
                                                 let progress_id = cid.clone();
                                                 let progress_tx = out_tx.clone();
-                                                match persistence.list_all_with_progress(service.as_deref(), move |scanned, total| {
+                                                match persistence.list_all_with_progress(&mode, move |scanned, total| {
                                                     if should_report_scan_progress(scanned, total) {
                                                         let _ = progress_tx.send(list_progress_frame(progress_id.clone(), "list_all_sessions", scanned, total));
                                                     }
@@ -6041,13 +5992,6 @@ pub(crate) async fn serve_session(
                                             // as `abort`'s own idle-mode no-op below.
                                             "abort_retry" => {
                                                 let _ = out_tx.send(response(cid, "abort_retry", true, None, None));
-                                            }
-                                            // In service mode these two derive a *new* session and
-                                            // leave this one running (see `fork_detached`), so there
-                                            // is nothing here worth a run for: "busy" costs the
-                                            // client a retry, cancelling would cost it the turn.
-                                            busy @ ("fork" | "clone") if service.is_some() => {
-                                                let _ = out_tx.send(response(cid, busy, false, None, Some("busy: a prompt is running; fork/clone copy what is on disk, so retry once the run has finished")));
                                             }
                                             // pi-parity (Task 4): pi's real product has no busy/idle
                                             // gating at all for these — `compact()`/`switchSession`/
@@ -6245,10 +6189,16 @@ pub(crate) async fn serve_session(
                                             let cmd_type = c.get("type").and_then(Value::as_str).unwrap_or("");
                                             // Same gate as the live-run loop above: a refused command
                                             // must not end the retry sequence a run is waiting on.
-                                            if service.is_some()
-                                                && let Some(why) = crate::service::refused_command(cmd_type)
+                                            if let Some(why) = mode.refused_command(cmd_type)
                                             {
                                                 let _ = out_tx.send(response(cid, cmd_type, false, None, Some(why)));
+                                                continue;
+                                            }
+                                            // Same as the live-run loop: in service mode a
+                                            // `fork`/`clone` has no reason to end the retry
+                                            // sequence this run is waiting on.
+                                            if let Some(why) = mode.busy_refusal_for_fork_clone(cmd_type, "retrying") {
+                                                let _ = out_tx.send(response(cid, cmd_type, false, None, Some(&why)));
                                                 continue;
                                             }
                                             match cmd_type {
@@ -6256,12 +6206,6 @@ pub(crate) async fn serve_session(
                                                     retry_cancelled = true;
                                                     let _ = out_tx.send(response(cid, cmd_type, true, None, None));
                                                     break;
-                                                }
-                                                // Same as the live-run loop's arm: in service mode a
-                                                // `fork`/`clone` has no reason to end the retry
-                                                // sequence this run is waiting on.
-                                                busy @ ("fork" | "clone") if service.is_some() => {
-                                                    let _ = out_tx.send(response(cid, busy, false, None, Some("busy: a prompt is retrying; fork/clone copy what is on disk, so retry once the run has finished")));
                                                 }
                                                 // pi-parity (Task 4): same self-abort-and-proceed
                                                 // treatment as the live-run busy-loop's own arm above —
@@ -6942,7 +6886,7 @@ pub(crate) async fn serve_session(
                                 &skills,
                             );
                             let out_tx = out_tx.clone();
-                            let service = service.clone();
+                            let mode = mode.clone();
                             let epoch = apps_epoch.clone();
                             let mine = {
                                 let mut e = lock_ignoring_poison(&apps_epoch);
@@ -6972,7 +6916,7 @@ pub(crate) async fn serve_session(
                                         ),
                                     )
                                 };
-                                let _ = out_tx.send(redact_frame(service.as_deref(), frame));
+                                let _ = out_tx.send(redact_frame(&mode, frame));
                                 drop(current);
                             });
                         }
@@ -6999,7 +6943,7 @@ pub(crate) async fn serve_session(
             "get_state" => {
                 let mut data = session_stats(&session, &compaction_config(&cfg, &current_model));
                 if let Value::Object(m) = &mut data {
-                    insert_session_identity(m, &persistence, service.as_deref());
+                    insert_session_identity(m, &persistence, &mode);
                     m.insert("model".into(), json!(current_model));
                     m.insert("message_count".into(), json!(session.messages.len()));
                     m.insert("title".into(), json!(persistence.meta.title));
@@ -7007,7 +6951,7 @@ pub(crate) async fn serve_session(
                     // staleness check stats the path — on the replica, where it doesn't exist.
                     m.insert(
                         "cwd_stale".into(),
-                        json!(service.is_none() && cwd_is_stale(&persistence.meta.cwd, &cwd)),
+                        json!(mode.cwd_is_stale(&persistence.meta.cwd, &cwd)),
                     );
                     // Task #25 (pi-parity fix): the directory (and, best-effort, branch) the agent's
                     // tools are actually operating against — the live process `cwd`, not
@@ -7021,12 +6965,7 @@ pub(crate) async fn serve_session(
                     // or — worse — answer about the replica's own checkout.
                     m.insert(
                         "git_branch".into(),
-                        match &service {
-                            Some(svc) => {
-                                json!(git_branch_in(&exec_cell, svc.workspace_root()).await)
-                            }
-                            None => json!(git_branch(&cwd).await),
-                        },
+                        json!(mode.git_branch(&exec_cell, &cwd).await),
                     );
                     // Both hardcoded, not stale placeholders: no `prompt`/compaction can possibly be
                     // in flight here at all — this arm only ever runs from the idle main loop, which
@@ -7069,7 +7008,7 @@ pub(crate) async fn serve_session(
                 let progress_id = id.clone();
                 let progress_tx = out_tx.clone();
                 let sessions = persistence
-                    .list_with_progress(service.as_deref(), move |scanned, total| {
+                    .list_with_progress(&mode, move |scanned, total| {
                         if should_report_scan_progress(scanned, total) {
                             let _ = progress_tx.send(list_progress_frame(
                                 progress_id.clone(),
@@ -7092,7 +7031,7 @@ pub(crate) async fn serve_session(
                 let progress_id = id.clone();
                 let progress_tx = out_tx.clone();
                 match persistence
-                    .list_all_with_progress(service.as_deref(), move |scanned, total| {
+                    .list_all_with_progress(&mode, move |scanned, total| {
                         if should_report_scan_progress(scanned, total) {
                             let _ = progress_tx.send(list_progress_frame(
                                 progress_id.clone(),
@@ -7127,14 +7066,14 @@ pub(crate) async fn serve_session(
             // `Persistence::delete`'s doc comment. Idempotent: deleting an absent (or already-deleted)
             // session id is a successful no-op.
             "delete_session" => match cmd.get("session_id").and_then(Value::as_str) {
-                Some(target) => match persistence.delete(service.as_deref(), target) {
+                Some(target) => match persistence.delete(&mode, target) {
                     Ok(()) => {
                         // A deleted session is ended: its jobs in this sandbox stop. (In another
                         // sandbox they end with it — tearing that down is its owner's business.)
                         crate::tools::bash_sandbox::wipe(
                             exec_cell.runner(),
                             &crate::exec_endpoint::jobs::JobScope::for_session(
-                                service.as_ref().map(|svc| svc.tenant()),
+                                mode.tenant(),
                                 target,
                             ),
                         )
@@ -7163,14 +7102,14 @@ pub(crate) async fn serve_session(
             // (id/deleted_at/original_path — see `session_store::TrashEntry`); `restore_session` moves an
             // entry back out. Deliberately not a full trash-management UI (no bulk purge, no age-based
             // pruning) — a low-priority nice-to-have, not a core session-lifecycle feature.
-            "list_trash" => match persistence.list_trash(service.as_deref()) {
+            "list_trash" => match persistence.list_trash(&mode) {
                 Ok(mut trash) => {
                     // `original_path` is a replica mount path. The id is what `restore_session`
                     // takes, so the path was only ever informational — redacted rather than dropped
                     // so the shape of the response doesn't change per mode.
-                    if let Some(svc) = &service {
+                    if mode.redacts_host_paths() {
                         for entry in &mut trash {
-                            entry.original_path = svc.redact(&entry.original_path);
+                            entry.original_path = mode.redact(&entry.original_path);
                         }
                     }
                     emit!(response(
@@ -7190,7 +7129,7 @@ pub(crate) async fn serve_session(
                 )),
             },
             "restore_session" => match cmd.get("session_id").and_then(Value::as_str) {
-                Some(target) => match persistence.restore_session(service.as_deref(), target) {
+                Some(target) => match persistence.restore_session(&mode, target) {
                     Ok(true) => emit!(response(id, "restore_session", true, None, None)),
                     Ok(false) => emit!(response(
                         id,
@@ -7268,13 +7207,7 @@ pub(crate) async fn serve_session(
                 // Same default as `fork` itself, above — a preview must match what `fork` would
                 // actually produce.
                 let before = cmd.get("before").and_then(Value::as_bool).unwrap_or(true);
-                match persistence.fork_messages(
-                    service.as_deref(),
-                    &target_id,
-                    upto,
-                    entry_id,
-                    before,
-                ) {
+                match persistence.fork_messages(&mode, &target_id, upto, entry_id, before) {
                     Ok(messages) => emit!(response(
                         id,
                         "preview_fork",
@@ -7322,7 +7255,7 @@ pub(crate) async fn serve_session(
                 // transcript on the replica's disk (and hand the caller a host path to read it
                 // back), and there is no per-tenant filesystem here to write it to instead. An
                 // explicit `output_path` is refused rather than silently ignored.
-                if service.is_some() {
+                if mode.exports_inline() {
                     if output_path.is_some() {
                         emit!(response(
                             id,
@@ -7574,7 +7507,7 @@ pub(crate) async fn serve_session(
                 // different field sets for the same command.
                 let mut data = session_stats(&session, &compaction_config(&cfg, &current_model));
                 if let Value::Object(m) = &mut data {
-                    insert_session_identity(m, &persistence, service.as_deref());
+                    insert_session_identity(m, &persistence, &mode);
                     m.insert("pending_tool_ids".into(), json!(Vec::<String>::new()));
                 }
                 emit!(response(id, "get_session_stats", true, Some(data), None));
@@ -7636,7 +7569,7 @@ pub(crate) async fn serve_session(
                 // through the same seam startup used, not the replica's filesystem. Trust plays no
                 // part there: a sandbox's contents are the one tenant's own (see `resolve_project_trust`'s
                 // startup call site).
-                if service.is_none() {
+                if mode.trust_gate_applies() {
                     let has_gated_resources = crate::trust_store::has_trust_gated_resources(&cwd);
                     project_trusted = resolve_project_trust(
                         cfg.trust_project,
@@ -7663,13 +7596,13 @@ pub(crate) async fn serve_session(
                         );
                     }
                 }
-                let discovered = match &service {
+                let discovered = match mode
+                    .discover_sandbox_resources(&exec_cell, cfg.context_files)
+                    .await
+                {
                     // The tenant's sandbox, through the same seam startup used; what it found is
                     // what the snapshot saves from now on.
-                    Some(svc) => {
-                        let found = svc
-                            .resources(exec_cell.backend().as_ref(), cfg.context_files)
-                            .await;
+                    Some(found) => {
                         sandbox_resources = Some(found.clone());
                         sandbox_snapshot_dirty = true;
                         sandbox_refresh = false;
@@ -9279,7 +9212,9 @@ fn parse_output_spec(cmd: &Value) -> Result<OutputSpec, String> {
 /// primitive both live in this same library crate and already depend on) rather than one calling the
 /// other. Kept to the same trivial one-lookup shape as `main.rs`'s copy so the two can't drift on
 /// anything but this wrapper itself.
-fn model_override_extra_headers(model: &str) -> std::collections::HashMap<String, String> {
+pub(crate) fn model_override_extra_headers(
+    model: &str,
+) -> std::collections::HashMap<String, String> {
     crate::settings::ModelOverrides::open_default()
         .get(model)
         .map(|over| over.resolved_headers())
@@ -9303,8 +9238,8 @@ fn model_override_extra_headers(model: &str) -> std::collections::HashMap<String
 /// and if it is wrong the session fails rather than silently billing whoever the replica is logged
 /// in as. The retry / shared-client / idle-timeout chain is unchanged either way.
 fn build_gateway_client(cfg: &ServeConfig, model: &str) -> Result<GatewayClient, String> {
-    let service_key = cfg.service.as_ref().map(|svc| svc.gateway_key().to_owned());
-    let client = match service_key {
+    let mode = cfg.mode();
+    let client = match mode.gateway_key() {
         Some(key) => GatewayClient::new(cfg.gateway.clone(), key).map_err(|e| e.to_string())?,
         None => match resolve_gateway_credential(cfg.key.clone(), model, &cfg.provider_env)? {
             GatewayCredential::Static(key) => {
@@ -9333,11 +9268,7 @@ fn build_gateway_client(cfg: &ServeConfig, model: &str) -> Result<GatewayClient,
     // when no override configures any headers, since an empty map is also `GatewayClient::new`'s own
     // default.
     // Empty in service mode: `models.json` is the replica operator's own file.
-    .with_extra_headers(if cfg.service_mode {
-        std::collections::HashMap::new()
-    } else {
-        model_override_extra_headers(model)
-    });
+    .with_extra_headers(mode.extra_headers(model));
     // Task #30 (pi-parity feature): `run`'s identical `--retry-max-backoff-ms` wiring (`main.rs::
     // run_task`'s own `with_max_backoff` call site) previously had no `serve` counterpart — called on
     // every model switch, same as `with_retry` above, so the override survives a mid-run switch.
@@ -9438,11 +9369,7 @@ fn build_subagent_ctx(
         tool_cfg: subagent::ChildToolConfig {
             bash_shell_path: cfg.bash_shell_path.clone(),
             bash_command_prefix: cfg.bash_command_prefix.clone(),
-            remote_shell: cfg
-                .service
-                .as_ref()
-                .and_then(|svc| svc.sandbox())
-                .map(|sandbox| sandbox.shell),
+            remote_shell: cfg.mode().remote_shell(),
             web_allow_private: cfg.web_allow_private,
             web_allow_hosts: cfg.web_allow_hosts.clone(),
             web_timeout_ms: cfg.web_timeout_ms,
@@ -9463,7 +9390,7 @@ fn build_subagent_ctx(
         project_trusted,
         // A child is as fail-closed about the replica's filesystem as its parent (see
         // `PromptOptions::disk_overrides`) — otherwise delegating would be a way around it.
-        disk_overrides: !cfg.service_mode,
+        disk_overrides: cfg.mode().reads_disk_overrides(),
         prompt_guidelines: Vec::new(),
         // `build_agent` writes the parent's model and loop settings here on every (re)build, the first
         // one included, before any child can be dispatched.
@@ -9886,10 +9813,7 @@ async fn discover_resources(cfg: &ServeConfig, cwd: &Path, project_trusted: bool
 /// stats. Empty otherwise, which [`tools::ToolConfig::root`] reads as "the process cwd": the
 /// behavior every non-service caller had before roots existed.
 fn tool_root(cfg: &ServeConfig) -> std::path::PathBuf {
-    cfg.service
-        .as_ref()
-        .map(|svc| std::path::PathBuf::from(svc.workspace_root()))
-        .unwrap_or_default()
+    cfg.mode().tool_root()
 }
 
 /// `host_bash_jobs`: `Some` only for the host `bash` command's own instance, which waits for every
@@ -9947,11 +9871,7 @@ fn build_tools(
         // What the startup probe found on the far side (`bash` or `sh`). Ignored in the local world
         // and whenever `--bash-shell-path` is set; `None` falls back to `sh`, never a `bash` a
         // busybox sandbox would fail every command on.
-        remote_shell: cfg
-            .service
-            .as_ref()
-            .and_then(|svc| svc.sandbox())
-            .map(|sandbox| sandbox.shell),
+        remote_shell: cfg.mode().remote_shell(),
     });
     tools::apply_filter(
         &mut registry,
@@ -10879,20 +10799,17 @@ fn message_type_breakdown(session: &Session) -> MessageTypeBreakdown {
 /// previously omitted both in its idle response, and its entire busy response, unlike `get_state`'s own
 /// sibling arms, which already backfilled them from these same two sources). Shared so the two RPC
 /// types can't drift out of shape with each other again.
-/// `service` is `Some` in service mode, where `session_file` reports `null`: the path is a mount on
+/// In service mode `session_file` reports `null`: the path is a mount on
 /// the replica, which is this tenant's storage but not its filesystem — nothing on the other end can
 /// open it, and publishing it would leak the fleet's layout. The id is the address that matters.
-fn insert_session_identity(
-    m: &mut Map<String, Value>,
-    persistence: &Persistence,
-    service: Option<&crate::service::ServiceSession>,
-) {
+fn insert_session_identity(m: &mut Map<String, Value>, persistence: &Persistence, mode: &Mode) {
     m.insert("session_id".into(), json!(persistence.session_id()));
     m.insert(
         "session_file".into(),
-        match service {
-            Some(_) => Value::Null,
-            None => json!(persistence.session_file().map(|p| p.display().to_string())),
+        if mode.reports_session_file() {
+            json!(persistence.session_file().map(|p| p.display().to_string()))
+        } else {
+            Value::Null
         },
     );
 }
@@ -14533,13 +14450,13 @@ mod tests {
             meta: SessionMeta::new("/w", "claude-test"),
         };
         let err = persistence
-            .list_trash(None)
+            .list_trash(&Mode::Local)
             .expect_err("must fail clearly outside repo mode");
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
         assert!(err.to_string().contains("not in repo mode"), "got: {err}");
 
         let err = persistence
-            .restore_session(None, "some-id")
+            .restore_session(&Mode::Local, "some-id")
             .expect_err("must fail clearly outside repo mode");
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     }
@@ -14553,15 +14470,23 @@ mod tests {
         let other = repo.create(SessionMeta::new("/w", "claude-test")).unwrap();
         let other_id = other.meta().id.clone();
 
-        assert!(persistence.list_trash(None).unwrap().is_empty());
-        persistence.delete(None, &other_id).unwrap();
-        let trash = persistence.list_trash(None).unwrap();
+        assert!(persistence.list_trash(&Mode::Local).unwrap().is_empty());
+        persistence.delete(&Mode::Local, &other_id).unwrap();
+        let trash = persistence.list_trash(&Mode::Local).unwrap();
         assert_eq!(trash.len(), 1);
         assert_eq!(trash[0].id, other_id);
 
-        assert!(persistence.restore_session(None, &other_id).unwrap());
-        assert!(persistence.list_trash(None).unwrap().is_empty());
-        assert!(!persistence.restore_session(None, "never-existed").unwrap());
+        assert!(
+            persistence
+                .restore_session(&Mode::Local, &other_id)
+                .unwrap()
+        );
+        assert!(persistence.list_trash(&Mode::Local).unwrap().is_empty());
+        assert!(
+            !persistence
+                .restore_session(&Mode::Local, "never-existed")
+                .unwrap()
+        );
     }
 
     /// A checkpoint is acknowledged only once its write is done, and with the write's result: the

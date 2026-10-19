@@ -30,6 +30,7 @@ pub mod mcp_auth_store;
 pub mod mcp_resume;
 pub mod memory;
 pub mod metrics;
+pub(crate) mod mode;
 pub mod notify_token;
 pub mod oauth;
 pub(crate) mod path_utils;
