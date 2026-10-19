@@ -275,6 +275,49 @@ async fn get_state_mid_run_is_never_cwd_stale() {
     assert_eq!(state["cwd_stale"], false, "got: {state:#?}");
 }
 
+/// A failed reply sent while a run is busy is redacted exactly like an idle one. `get_tree` with an
+/// unknown `since` echoes the id back in its error, so the shard root the client names comes back
+/// inside an error string: the stand-in for any storage error that names the file it failed on.
+#[tokio::test]
+async fn failed_reply_mid_run_is_redacted() {
+    let (base, _requests) = spawn_model_server(vec![
+        turn_tool_use(
+            "toolu_rd",
+            "bash",
+            &json!({ "command": "sleep 2" }).to_string(),
+        ),
+        turn_text("done"),
+    ]);
+    let svc = Service::start(&base, &["s1"]).await;
+    let token = svc.token("00tenant1", "s1.alpha");
+    let mut ws = ws_connect_with_headers(svc.port, Some("s1.alpha"), &svc.header(&token))
+        .await
+        .expect("a valid grant opens its session");
+
+    ws_send(&mut ws, json!({"type":"prompt","id":"p1","message":"go"})).await;
+    while let Some(f) = ws_next_frame(&mut ws).await {
+        if f["type"] == "event" && f["event"]["kind"] == "tool_start" {
+            break;
+        }
+    }
+    let root = svc.shard("s1").to_string_lossy().into_owned();
+    ws_send(
+        &mut ws,
+        json!({"type":"get_tree","id":"t1","since":format!("{root}/entry")}),
+    )
+    .await;
+    let frames = ws_read_until_response(&mut ws, "get_tree").await;
+    let reply = frames.last().unwrap();
+    assert_eq!(reply["success"], false, "{reply:#?}");
+    let error = reply["error"].as_str().expect("an error string");
+    assert!(error.contains("no entry with id"), "got: {error}");
+    assert!(
+        !error.contains(&root),
+        "a host path reached the tenant mid-run: {error}"
+    );
+    assert!(error.contains("<store>"), "got: {error}");
+}
+
 /// The same rule as `get_state`, on the other replies that report `cwd_stale`: the `ready` frame a
 /// session sends on opening and the `new_session` answer. `switch_session` is refused in service
 /// mode, and `fork`/`clone` derive a detached session whose reply carries only the new id, so the
