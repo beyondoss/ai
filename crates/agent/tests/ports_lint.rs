@@ -58,7 +58,7 @@ use std::path::{Path, PathBuf};
 /// (`// port-0:`) sites it has. Adding one is a reviewed change here, not just a comment there.
 const ALLOWED: &[(&str, usize)] = &[
     // `agent mcp login`: the callback listener is held and the redirect URI names its port.
-    ("agent/src/main.rs", 1),
+    ("agent/src/commands/auth.rs", 1),
     // The `CallbackServer` under test holds its listener.
     ("agent/src/oauth/callback_server.rs", 1),
     // Fixture servers, run as children: each binds port 0, keeps it, and announces it.
