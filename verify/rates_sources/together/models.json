@@ -2470,6 +2470,25 @@
     "type": "chat"
   },
   {
+    "context_length": 1048576,
+    "display_name": "DeepSeek V4.1 Flash 1017",
+    "id": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+    "organization": "DeepSeek",
+    "pricing": {
+      "base": 0,
+      "cached_input": 0.006,
+      "finetune": 0,
+      "hourly": 0,
+      "image": 0,
+      "image_pixel": 0,
+      "input": 0.3,
+      "output": 1.2,
+      "transcribe": 0,
+      "video": 0
+    },
+    "type": "chat"
+  },
+  {
     "context_length": 16384,
     "display_name": "Deepseek Coder 33B Instruct",
     "id": "deepseek-ai/deepseek-coder-33b-instruct",
