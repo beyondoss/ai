@@ -40,6 +40,9 @@ pub mod mcp_events_fixture;
 pub mod mcp_fixture;
 /// A real OAuth-protected MCP server with mid-session controls, and the `mcp-login` steps.
 pub mod mcp_oauth_fixture;
+/// Real replicas behind a ring-routing front, a byte-metered endpoint, in three endpoint modes:
+/// the job notify end-to-end suites.
+pub mod notify_e2e;
 /// A replica, the reference v1.4 endpoint and a stand-in edge, for the job notify suites.
 pub mod notify_fleet;
 /// `bash` + `bash_job` over a remote runner, for the streaming exec suites.
