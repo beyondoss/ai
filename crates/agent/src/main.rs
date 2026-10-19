@@ -25,6 +25,7 @@ use agent_core::{Agent, GatewayClient, Session, StreamEvent, Tool};
 use beyond_ai_agent::gateway_credential::{
     GatewayCredential, resolve_gateway_credential_and_headers,
 };
+use beyond_ai_agent::mode::Mode;
 use beyond_ai_agent::policy::ToolPolicy;
 use beyond_ai_agent::session_store::{
     SessionMeta, SessionRepo, SessionStore, canonical_cwd, default_session_dir, fork_by_arg,
@@ -1531,7 +1532,7 @@ fn runtime_workers(configured: Option<usize>, env_set: bool, service: bool) -> O
         // `Some(0)` is tokio's own default: one worker per core, and `available_parallelism`
         // respects a cgroup CPU quota — so a replica gets workers in proportion to the CPU its task
         // was actually given, which is the thing worth scaling with.
-        None if service && !env_set => Some(0),
+        None if Mode::process(service).scales_workers_with_cores() && !env_set => Some(0),
         None => None,
     }
 }
@@ -1998,8 +1999,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .into(),
                 );
             }
+            // Decided once, here; every later "does service mode change this?" asks it.
+            let mode = Mode::process(service);
             if let Some(origin) = &notify_origin {
-                if !service {
+                if !mode.offers_job_notify() {
                     return Err(
                         "--notify-origin needs --service: job notify is a service-mode \
                                 feature"
@@ -2008,7 +2011,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 beyond_ai_agent::tools::job_notify::check_origin(origin)?;
             }
-            if service {
+            if mode.refuses_host_resources() {
                 if grant_verifier.is_none() {
                     return Err(
                         "--service requires --grant-key and --seal-key (or AI_AGENT_SEAL_KEY_B64): every connection must \
@@ -2113,10 +2116,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // tenant. An empty `Settings` makes every `or_else` fall through to this crate's own
             // built-in default, exactly as it does on a machine with no settings file.
             let cwd = canonical_cwd(&std::env::current_dir().unwrap_or_default());
-            let stored_settings = if service {
-                beyond_ai_agent::settings::Settings::default()
-            } else {
+            let stored_settings = if mode.reads_operator_settings() {
                 beyond_ai_agent::settings::effective_settings_for_cwd(&cwd)
+            } else {
+                beyond_ai_agent::settings::Settings::default()
             };
             // Round 3 (pi-parity fix): same "explicit flag/env, then stored setting, then built-in
             // default" precedence as every other `stored_settings`-backed fallback here — see
@@ -2278,12 +2281,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // connected once process-wide and shared by every session — the exact opposite of what
             // a tenant needs. A tenant's connectors come from its grant, per session (a later PR);
             // until then it has none rather than the replica's.
-            let (mcp_tools, mcp_catalog) = if service {
-                (
-                    tools::mcp::McpTools::default(),
-                    tools::mcp::McpCatalog::default(),
-                )
-            } else {
+            let (mcp_tools, mcp_catalog) = if mode.connects_operator_mcp() {
                 let (mcp_tools, mcp_catalog, mcp_warnings) = tools::mcp::connect_all(
                     stored_settings.mcp_servers.as_deref().unwrap_or(&[]),
                     tools::mcp::idle_reap_after_from_env(),
@@ -2294,11 +2292,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("warning: {warning}");
                 }
                 (mcp_tools, mcp_catalog)
+            } else {
+                (
+                    tools::mcp::McpTools::default(),
+                    tools::mcp::McpCatalog::default(),
+                )
             };
             // The same servers, dialed again with MCP Apps advertised — in the background, the first
             // time a session's client declares it renders apps (`set_mcp_apps`); never otherwise.
             // Service mode has none here: a tenant's apps pool is built per session, from its grant.
-            let mcp_apps = (!service).then(|| {
+            let mcp_apps = mode.connects_operator_mcp().then(|| {
                 tools::mcp::apps_pool(
                     stored_settings.mcp_servers.as_deref().unwrap_or(&[]),
                     tools::mcp::idle_reap_after_from_env(),
@@ -2311,13 +2314,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // the gateway's shared h2c pool — that one is pinned to one known hop, and a tenant's
             // connector is an arbitrary third-party endpoint. Its egress policy is fixed at build
             // time, which is why it is a process flag rather than anything a grant can ask for.
-            let mcp_http = if service {
-                Some(tools::mcp::McpEgress::new(
-                    tools::web::ssrf::EgressPolicy::new(mcp_allow_private, &[]),
-                )?)
-            } else {
-                None
-            };
+            let mcp_http = mode.session_mcp_egress(mcp_allow_private)?;
             // Parse the UDS socket mode from its octal string (`0o660`, `660`, `0660` all work) up
             // front so a bad value fails fast with a clear message rather than deep in the listener.
             let listen_uds_mode: Option<u32> = match &listen_uds_mode {
@@ -2338,13 +2335,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // `ANTHROPIC_API_KEY` and friends are this replica's environment, and a session's
                 // only credential is the one sealed in its grant (see `serve::build_gateway_client`).
                 // An empty `ProviderEnv` keeps every later `resolve_gateway_credential` call inert.
-                provider_env: if service {
-                    beyond_ai_agent::gateway_credential::ProviderEnv::default()
-                } else {
-                    beyond_ai_agent::gateway_credential::ProviderEnv::from_process_env(
-                        configured_gateway.is_some(),
-                    )
-                },
+                provider_env: mode.provider_env(configured_gateway.is_some()),
                 gateway: configured_gateway.unwrap_or_else(|| DEFAULT_GATEWAY.to_string()),
                 key,
                 model: resolved_model,
@@ -2374,11 +2365,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // The daemon path (`serve_ws`) fills this from `upstream_http2` before spawning any
                 // session; the stdio/`run` path leaves it `None` and never pools.
                 shared_http: None,
-                service_mode: service,
+                mode,
                 shards,
                 // Per connection, never per process: filled in by `serve_ws::session_cfg` from the
                 // grant that spawned the session.
-                service: None,
                 max_live_sessions,
                 mcp_http,
                 mcp_events_callback_url,
