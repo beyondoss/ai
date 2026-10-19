@@ -417,6 +417,82 @@ async fn refusals_say_nothing() {
     }
 }
 
+/// N20 for the receiver, and FLEET.md's L4 pass-through note: the replica never records a
+/// callback's token. Every way a callback is answered (accepted, bad tag, look-alike, not open
+/// here, wrong path) is sent, then the replica's captured stderr is searched for each token.
+#[tokio::test]
+async fn the_replica_never_records_a_callbacks_token() {
+    let svc = service().await;
+    let key = seal_key(&svc);
+    let id = JobId::parse(JOB).unwrap();
+    let scope = JobScope::for_session(Some(TENANT), SESSION);
+    let body = body_for(scope.name(), JOB);
+    let len = format!("Content-Length: {}", body.len());
+    let t = target(TENANT, SESSION);
+    let good = key.mint(TENANT, SESSION, &id);
+    let forged = NotifyKey::from_secret_bytes(&[5; 32]).mint(TENANT, SESSION, &id);
+    let send = |method: &str, target: &str, auth: String| {
+        request(method, target, &[auth, len.clone()], &body)
+    };
+
+    let tokens = vec![good.clone(), forged.clone(), format!("{good}x")];
+    let sent = vec![
+        // Not open here: 503.
+        (
+            send("POST", &t, format!("Authorization: Bearer {good}")),
+            503,
+        ),
+        // A bad tag: 401.
+        (
+            send("POST", &t, format!("Authorization: Bearer {good}x")),
+            401,
+        ),
+        // A look-alike: 400.
+        (
+            send("POST", &t, format!("Authorization: Bearer\t{good}")),
+            400,
+        ),
+        // Not a POST: 403.
+        (
+            send("GET", &t, format!("Authorization: Bearer {good}")),
+            403,
+        ),
+        // Wrong path: 404.
+        (
+            send(
+                "POST",
+                "/elsewhere",
+                format!("Authorization: Bearer {good}"),
+            ),
+            404,
+        ),
+        // A key this replica does not hold: its kid is unknown here.
+        (
+            send("POST", &t, format!("Authorization: Bearer {forged}")),
+            503,
+        ),
+    ];
+    for (req, want) in sent {
+        let (status, _) = raw(svc.port, &req).await;
+        assert_eq!(status, want);
+    }
+    // Accepted: the session is open here, so the token is checked and the callback answered.
+    let ws = open(&svc).await;
+    let (status, _) = raw(svc.port, &callback(&key, TENANT, SESSION)).await;
+    assert!(status == 200 || status == 410, "{status}");
+    drop(ws);
+
+    let logged =
+        std::fs::read_to_string(&svc.stderr_log).expect("the replica's stderr was captured");
+    for token in tokens {
+        let secret = token.strip_prefix("bjn_v1.").unwrap_or(&token);
+        assert!(
+            !logged.contains(secret),
+            "a token reached the replica's stderr:\n{logged}"
+        );
+    }
+}
+
 /// N26: served while a run is in flight, with a status of its own, never the busy `200`.
 #[tokio::test]
 async fn served_during_a_run() {
