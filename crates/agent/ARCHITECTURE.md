@@ -2594,7 +2594,10 @@ in integer milliseconds so `sh` computes the same number. The baseline (`ShellJo
 only when the endpoint advertises it for the baseline, its probe finds `curl`, and standard input
 reaches the sandbox: `keep` takes the URL and token on stdin into a 0600 curl config, and the job's
 supervisor sends every attempt with the one pinned `curl` invocation, run by a notifier in its own
-session whose decisions come from the kernel's shell twin (`exec_notify::SH`). A differential test
+session whose decisions come from the kernel's shell twin (`exec_notify::SH`). The notifier holds
+a lock (`nlock`, with its pid) that it removes when it exits, and that the job's watcher removes once
+that pid is gone, so a notifier that dies is started again: a fresh kernel, which owes the latest
+keep's callback anew (a hint, so harmless). A differential test
 runs the same event sequences through `step` and through `SH` under dash and busybox `sh`, and
 `tests/sandbox_jobs_notify.rs` runs the supervisor on this host's tools, on busybox's alone, and
 (in CI's `exec-live` shard) in an Alpine container. The vectors

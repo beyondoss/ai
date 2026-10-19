@@ -162,6 +162,9 @@ pub(crate) async fn run(
             r = held => Some(r),
             () = ctl.until(|c| matches!(c, Ctl::Close)) => None,
         };
+        if outcome.is_some() {
+            stream_ended(shared, link);
+        }
         match outcome {
             Some(Ok(code)) => return Ok(status_result(code)),
             Some(Err(e)) if !link.kept() => return Err(e.to_string()),
@@ -289,12 +292,26 @@ async fn steered(
                             None => Err(format!("{LOST_END} ({e})")),
                         });
                     }
+                    (Some(r), FollowKind::Holding) => {
+                        stream_ended(shared, link);
+                        return r;
+                    }
                     (Some(r), _) => return r,
                     (None, FollowKind::Holding) => Phase::Released,
                     (None, _) => Phase::Unheld,
                 }
             }
         };
+    }
+}
+
+/// The stream holding a job (or the follow standing for it) delivered its final frame or broke:
+/// a proving or closing job is held as today from here (the release table's `proving, held` row).
+fn stream_ended(shared: &JobShared, link: &SandboxLink) {
+    if let Some(n) = shared.table().and_then(|t| t.notify()) {
+        n.feed(Event::StreamEnded {
+            job: link.id.as_str().to_string(),
+        });
     }
 }
 
@@ -812,5 +829,64 @@ pub async fn wipe(runner: Arc<dyn CommandRunner>, scope: &JobScope) {
         }
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "could not wipe an ended session's sandbox jobs"),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod notify_tests {
+    use super::*;
+    use crate::tools::job_notify::kernel::JobState;
+    use crate::tools::job_notify::{NotifyHub, SessionNotify};
+    use beyond_ai_test_support::exec_mock::{ExecMock, LoseCallbacks, MockOptions};
+
+    /// A proving job whose stream delivers its final frame leaves v1.4's proving state: the
+    /// release table's `proving, held` row, fed as production feeds it.
+    #[tokio::test]
+    async fn a_proving_jobs_stream_end_leaves_proving() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = ExecMock::start_with(
+            dir.path(),
+            MockOptions {
+                lose_callbacks: LoseCallbacks::All,
+                ..MockOptions::notifying()
+            },
+        )
+        .await;
+        let runner =
+            std::sync::Arc::new(crate::exec_endpoint::HttpExecRunner::new(&mock.url).unwrap());
+        let store = runner.sandbox_jobs().unwrap();
+        assert!(store.available().await);
+        let jobs = Arc::new(BashJobs::new(EndPolicy::KeepRunning));
+        let hub = NotifyHub::new(crate::notify_token::NotifyKey::from_secret_bytes(&[5; 32]));
+        let session = SessionNotify::register(&hub, "t", "s");
+        jobs.set_notify(Some(&session));
+        let scope = JobScope::under(dir.path().to_string_lossy(), "s");
+        let link = SandboxLink::new(store, scope, JobId::fresh(), false);
+        let shared = Arc::new(JobShared::in_sandbox(link.clone(), 0, &jobs));
+        let spec = JobSpec {
+            program: "sh".into(),
+            args: vec!["-c".into(), "sleep 1".into()],
+            cwd: None,
+            label: "sleep 1".into(),
+        };
+        let job = link.id.as_str().to_string();
+        let task = {
+            let (shared, link) = (shared.clone(), link.clone());
+            tokio::spawn(async move { run(&shared, &link, &spec, true).await })
+        };
+        // Kept with notify, its proof never comes: proving.
+        session.feed(Event::Kept {
+            job: job.clone(),
+            notify_available: true,
+            adopted: false,
+        });
+        assert!(matches!(
+            session.kernel().job(&job),
+            Some(JobState::Proving { .. })
+        ));
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result.code, Some(0));
+        assert_eq!(session.kernel().job(&job), None, "held, as today");
     }
 }

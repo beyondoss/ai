@@ -516,3 +516,72 @@ async fn the_token_is_never_logged() {
         let _ = jobs.wipe(&scope).await;
     }
 }
+
+/// A notifier that dies is started again: the watcher removes the lock of a notifier whose pid is
+/// gone (here killed with `SIGKILL`, which runs no trap), a new one takes it, and, being a fresh
+/// kernel, owes the latest keep's callback anew. A notifier that finishes removes its own lock.
+#[tokio::test]
+async fn a_notifier_that_dies_is_started_again() {
+    for rung in rungs() {
+        let name = rung.name;
+        let jobs = rung.jobs();
+        let (scope, id) = (rung.scope(), JobId::fresh());
+        let rx = CallbackReceiver::start().await;
+        jobs.start_kept(&scope, &id, &spec("sleep 6"))
+            .await
+            .unwrap();
+        jobs.keep_notify(
+            &scope,
+            &id,
+            1,
+            "background",
+            0,
+            &JobNotify {
+                url: rx.url.clone(),
+                token: token(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rx.wait_for(1, Duration::from_secs(5)).await.len(),
+            1,
+            "{name}: the proof"
+        );
+        let dir = format!("{}/{}/{}", scope.root(), scope.name(), id);
+        let pid_cmd = format!("cat {dir}/nlock/pid 2>/dev/null");
+        let first = rung.sh(&pid_cmd).await.stdout.trim().to_string();
+        assert!(!first.is_empty(), "{name}: the notifier records its pid");
+        rung.sh(&format!("kill -KILL {first}")).await;
+        // Started again, with a pid of its own, and it calls back again.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let now = rung.sh(&pid_cmd).await.stdout.trim().to_string();
+            if !now.is_empty() && now != first {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{name}: never started again");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            rx.wait_for(2, Duration::from_secs(5)).await.len() >= 2,
+            "{name}: the new notifier owes the keep's callback"
+        );
+        // The end is called back, and the notifier, done, removes its lock.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let gone = rung
+                .sh(&format!("test -e {dir}/end && test ! -d {dir}/nlock"))
+                .await;
+            if gone.code == Some(0) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{name}: the lock outlived its notifier"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let _ = jobs.wipe(&scope).await;
+    }
+}

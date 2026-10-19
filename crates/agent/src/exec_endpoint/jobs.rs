@@ -31,7 +31,9 @@
 //!       notifier                  this supervisor can notify (v1.4); `keep` refuses notify without it
 //!       notify                    0600: the curl config of the latest keep's notify (url, headers, body)
 //!       ngen                      bumped by every keep once one has carried notify
-//!       nlock                     the notifier runs (a directory: `mkdir` is the lock)
+//!       nlock/pid                 the notifier runs (a directory: `mkdir` is the lock), and its pid;
+//!                                 removed when it exits, or by the watcher once that pid is gone,
+//!                                 so a notifier that dies is started again
 //!       left                      the shell exited with its group alive (a held stream's `shell_exit`)
 //!       n.out                     the status the last callback attempt got
 //! ```
@@ -1336,6 +1338,9 @@ kdo() {
 }
 notifier() {
   mkdir "$j/nlock" 2>/dev/null || return 0
+  sh -c 'echo $PPID' >"$j/nlock/pid"
+  trap 'rm -rf "$j/nlock"' EXIT
+  trap 'exit 1' HUP INT TERM
   exec </dev/null >/dev/null 2>&1 3>&- 4>&-
   KN=0 KR=0 KO=0 KS=0 KI= KA=0 KW= KX= ng= cp= now=0 sx= se=
   while :; do
@@ -1395,6 +1400,9 @@ say "start:$g"
   t=0
   while [ -d "$j" ] && [ ! -e "$j/end" ]; do
     if [ ! -e "$j/keep" ] && ! alive "$w"; then kill -KILL -"$g"; fi
+    if [ -d "$j/nlock" ] && read -r np 2>/dev/null <"$j/nlock/pid" && ! alive "$np"; then
+      rm -rf "$j/nlock"
+    fi
     if [ -e "$j/ngen" ] && [ ! -d "$j/nlock" ]; then ( notifier ) & fi
     t=$((t + 1))
     if [ $t -ge 8 ]; then

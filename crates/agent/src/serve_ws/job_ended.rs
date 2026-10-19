@@ -99,6 +99,26 @@ fn looks_like(v: &str) -> bool {
             .starts_with("bjn_v1.")
 }
 
+/// Whether an `Authorization` value's bytes look like a callback's (`bearer` in any case, any run
+/// of spaces and tabs, `bjn_v1.`, after leading spaces and tabs): the look-alike rule read on bytes,
+/// for a value that is not UTF-8.
+pub fn bytes_look_like_a_callback(v: &[u8]) -> bool {
+    let start = v
+        .iter()
+        .position(|b| !matches!(b, b' ' | b'\t'))
+        .unwrap_or(v.len());
+    let v = &v[start..];
+    if v.len() < 6 || !v[..6].eq_ignore_ascii_case(b"bearer") {
+        return false;
+    }
+    let rest = &v[6..];
+    let at = rest
+        .iter()
+        .position(|b| !matches!(b, b' ' | b'\t'))
+        .unwrap_or(rest.len());
+    rest[at..].starts_with(b"bjn_v1.")
+}
+
 /// Whether a request whose head could not be parsed may have been a callback: its raw bytes name
 /// the token's prefix. Its refusal then gets the fixed body too.
 pub fn may_be_callback(raw: &[u8]) -> bool {
@@ -394,6 +414,16 @@ mod tests {
         // Other headers are not looked at.
         let h = vec![("X-Authorization".into(), "Bearer bjn_v1.x".into())];
         assert_eq!(classify(&h), Class::Other);
+    }
+
+    #[test]
+    fn bytes_are_read_as_the_rule_reads_them() {
+        assert!(bytes_look_like_a_callback(b"Bearer bjn_v1.\xff"));
+        assert!(bytes_look_like_a_callback(b" \tBEARER\t bjn_v1.x\xfe"));
+        assert!(bytes_look_like_a_callback(b"bearerbjn_v1.\xff"));
+        assert!(!bytes_look_like_a_callback(b"Basic \xff"));
+        assert!(!bytes_look_like_a_callback(b"Bearer bsg_v1.\xff"));
+        assert!(!bytes_look_like_a_callback(b"\xffBearer bjn_v1."));
     }
 
     #[test]
