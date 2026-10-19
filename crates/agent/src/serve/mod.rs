@@ -417,6 +417,8 @@
 //! risk than in the Node ecosystem pi targets, where ad hoc `console.log` debug output is common.
 #![deny(clippy::print_stdout)]
 
+mod commands;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -4342,645 +4344,6 @@ impl SessionLoop {
         fanout.end_turn();
     }
 
-    /// pi-parity (Task 4, serve pass 19): the ordinary idle-path logic for `new_session`/
-    /// `switch_session`/`fork`/`clone`/`compact`, each extracted into a macro rather than a function —
-    /// `session`/`persistence`/`agent`/`client`/`current_model`/etc. are all plain local variables of
-    /// this one giant `serve` function body, and a macro lets each expansion reference them directly
-    /// (exactly like `emit!` already references `out_tx`) with no 15-parameter function signature. Each
-    /// is callable from two places: its ordinary top-level command-match arm below, and the `"prompt"`
-    /// arm's busy-loop deferred-until-idle path (`pending_deferred`, see its own doc comment) once a run
-    /// one of these commands interrupted has actually gone idle — see the module's own `serve` doc
-    /// comment / Task 4 for why these five self-abort-and-proceed instead of being rejected as busy.
-    /// `$cmd`/`$id` stand in for whichever command `Value`/response-id are in play: the outer `cmd`/`id`
-    /// when idle, or a deferred command's own stored `Value`/id once its abort has resolved.
-    ///
-    /// Responses are sent via a bare `out_tx.send` rather than `emit!`: `emit!`'s bare `break` breaks
-    /// whichever loop *textually* encloses the macro invocation, which differs between the idle call
-    /// site (the outer per-command loop, where breaking on a dead writer is exactly `emit!`'s intended
-    /// behavior) and the deferred call site (a `for` loop over `pending_deferred`, where the same bare
-    /// `break` would only end that short-lived drain loop instead). A bare send whose failure is
-    /// ignored is the same idiom `pending_abort_acks`'s own drain loop (and every other busy-mode
-    /// response in the `"prompt"` arm) already uses for exactly this reason.
-    async fn do_new_session(&mut self, cmd: &Value, id: Option<String>) {
-        match self.persistence.new_session(
-            &self.current_model,
-            cmd.get("parent_session").and_then(Value::as_str),
-        ) {
-            Ok(s) => {
-                self.session = s;
-                self.repoint_session_memory();
-                self.reset_exec_endpoint().await;
-                self.reset_mcp_enabled();
-                self.reset_approval_memory();
-                self.steering.clear();
-                // Fresh session defaults to all MCP servers enabled — rebuild so a previous
-                // session's allowlist cannot linger on this process's Agent.
-                self.agent = build_agent(
-                    &self.exec_cell,
-                    self.client.clone(),
-                    &full_system(&self.static_system, &self.cwd, &self.mcp_skills),
-                    &self.cfg,
-                    &self.current_model,
-                    self.current_thinking,
-                    self.current_level,
-                    self.current_auto_compaction,
-                    self.current_auto_retry,
-                    self.current_block_images,
-                    self.current_image_auto_resize,
-                    self.persistence.session_id(),
-                    &self.write_locks,
-                    &self.checkpoint,
-                    self.subagent_ctx.as_ref(),
-                    self.structured_output.as_ref(),
-                    self.memory_tool.as_ref(),
-                    self.approval.as_ref(),
-                    &self.mcp_enabled,
-                    &self.skills,
-                );
-                let _ = self.out_tx.send(response(
-                    id,
-                    "new_session",
-                    true,
-                    Some(json!({
-                        "session_id": self.persistence.session_id(),
-                        "cwd_stale": self.mode.cwd_is_stale(&self.persistence.meta.cwd, &self.cwd),
-                        "parent": self.persistence.meta.parent,
-                    })),
-                    None,
-                ));
-            }
-            Err(e) => {
-                let _ = self.out_tx.send(response(
-                    id,
-                    "new_session",
-                    false,
-                    None,
-                    Some(&e.to_string()),
-                ));
-            }
-        }
-    }
-
-    async fn do_switch_session(&mut self, cmd: &Value, id: Option<String>) {
-        match cmd.get("session_id").and_then(Value::as_str) {
-            Some(target) => match self.persistence.switch(target) {
-                Ok(s) => {
-                    self.session = s;
-                    close_interrupted_prompt(&mut self.session);
-                    self.repoint_session_memory();
-                    self.reset_exec_endpoint().await;
-                    self.reset_mcp_enabled();
-                    self.reset_approval_memory();
-                    self.steering.clear();
-                    // Restore whichever model/thinking-level this session was actually last
-                    // running on, the same way `switch_branch` already does — without this, the
-                    // process's current global model/level (possibly set on a *different* session
-                    // entirely) silently bled into the reattached session. See
-                    // `model_and_level_at_active`'s doc comment.
-                    let (restored_model, restored_level) = self
-                        .persistence
-                        .model_and_level_at_active(self.starting_level);
-                    let restored_level = agent_core::clamp_thinking_level(
-                        &agent_core::capabilities(&restored_model),
-                        restored_level,
-                    );
-                    if restored_model != self.current_model {
-                        self.session.scrub_cross_model_state(&restored_model);
-                        match build_gateway_client(&self.cfg, &restored_model) {
-                            Ok(new_client) => self.client = Arc::new(new_client),
-                            Err(e) => eprintln!(
-                                "serve: could not resolve a gateway credential for restored model {restored_model:?}: \
-                                     {e} — keeping the previous client"
-                            ),
-                        }
-                        self.current_model = restored_model;
-                    }
-                    if restored_level != self.current_level {
-                        self.current_level = restored_level;
-                        self.current_thinking = None;
-                    }
-                    // MCP kit reset to all-enabled above — rebuild so the advertised tool set
-                    // cannot keep the previous session's allowlist.
-                    // always rebuild (MCP kit may have reset; model/level may have changed)
-                    {
-                        self.agent = build_agent(
-                            &self.exec_cell,
-                            self.client.clone(),
-                            &full_system(&self.static_system, &self.cwd, &self.mcp_skills),
-                            &self.cfg,
-                            &self.current_model,
-                            self.current_thinking,
-                            self.current_level,
-                            self.current_auto_compaction,
-                            self.current_auto_retry,
-                            self.current_block_images,
-                            self.current_image_auto_resize,
-                            self.persistence.session_id(),
-                            &self.write_locks,
-                            &self.checkpoint,
-                            self.subagent_ctx.as_ref(),
-                            self.structured_output.as_ref(),
-                            self.memory_tool.as_ref(),
-                            self.approval.as_ref(),
-                            &self.mcp_enabled,
-                            &self.skills,
-                        );
-                    }
-                    let _ = self.out_tx.send(response(
-                        id,
-                        "switch_session",
-                        true,
-                        Some(json!({
-                            "session_id": self.persistence.session_id(),
-                            "cwd_stale": self.mode.cwd_is_stale(&self.persistence.meta.cwd, &self.cwd),
-                            "model": self.current_model,
-                            // Task 3 (pi-parity fix, serve pass 19): matches `switch_branch`/`fork`/
-                            // `clone`'s own response shape — previously omitted here, forcing a
-                            // client to make a separate `get_state` round trip after every
-                            // `switch_session` its 3 sibling commands don't need.
-                            "reasoning_effort": self.current_level.as_str(),
-                        })),
-                        None,
-                    ));
-                }
-                Err(e) => {
-                    let _ = self.out_tx.send(response(
-                        id,
-                        "switch_session",
-                        false,
-                        None,
-                        Some(&e.to_string()),
-                    ));
-                }
-            },
-            None => {
-                let _ = self.out_tx.send(response(
-                    id,
-                    "switch_session",
-                    false,
-                    None,
-                    Some("missing `session_id`"),
-                ));
-            }
-        }
-    }
-
-    async fn do_fork(&mut self, cmd: &Value, id: Option<String>) {
-        // `upto` messages to copy into the new session; absent = clone the whole session.
-        // `target_id`, when given, forks at that specific tree entry instead — anywhere in the
-        // whole tree, not just a message-count prefix of the active path (`before` excludes the
-        // entry itself); wins over `upto` if both are present.
-        let upto = cmd
-            .get("upto")
-            .and_then(Value::as_u64)
-            .map(|n| n as usize)
-            .unwrap_or(usize::MAX);
-        let target_id = cmd.get("target_id").and_then(Value::as_str);
-        // Defaults to `true` (excluding the target entry itself), matching pi's real production
-        // client convention.
-        let before = cmd.get("before").and_then(Value::as_bool).unwrap_or(true);
-        // Resolved *before* `persistence.fork` below swaps `self.store` onto the freshly created
-        // session — `target_id` can name an entry that isn't even on the copied prefix (an
-        // off-active-path fork point, or one `before` excludes), so it wouldn't survive into the
-        // new tree to look up afterward.
-        let fork_text = match target_id {
-            Some(tid) => self
-                .persistence
-                .store
-                .as_ref()
-                .and_then(|s| s.message_at(tid))
-                .and_then(message_text),
-            None => upto
-                .min(self.session.messages.len())
-                .checked_sub(1)
-                .and_then(|i| self.session.messages.get(i))
-                .and_then(message_text),
-        };
-        // Service mode derives without switching: this task keeps its own id, its lock and its
-        // grant, and the client gets the new id to connect to. See `fork_detached`.
-        if self.mode.forks_detached() {
-            let frame = match self.persistence.fork_detached(upto, target_id, before) {
-                Ok(new_id) => response(
-                    id,
-                    "fork",
-                    true,
-                    Some(json!({
-                        "session_id": new_id,
-                        "switched": false,
-                        "text": fork_text,
-                    })),
-                    None,
-                ),
-                Err(e) => response(id, "fork", false, None, Some(&e.to_string())),
-            };
-            let _ = self.out_tx.send(redact_frame(&self.mode, frame));
-            return;
-        }
-        match self
-            .persistence
-            .fork(upto, target_id, before, self.starting_level)
-        {
-            Ok((mut s, restored_model, restored_level)) => {
-                // The fork keeps the view context of the turns it copies (see `mcp_apps::carry_context`).
-                crate::tools::mcp_apps::carry_context(&self.session, &mut s);
-                self.session = s;
-                self.repoint_session_memory();
-                self.reset_exec_endpoint().await;
-                self.reset_mcp_enabled();
-                self.steering.clear();
-                // Restore whichever model/thinking-level was actually active at the forked-from
-                // point, the same way `switch_session`/`switch_branch` already do.
-                let restored_level = agent_core::clamp_thinking_level(
-                    &agent_core::capabilities(&restored_model),
-                    restored_level,
-                );
-                if restored_model != self.current_model {
-                    self.session.scrub_cross_model_state(&restored_model);
-                    match build_gateway_client(&self.cfg, &restored_model) {
-                        Ok(new_client) => self.client = Arc::new(new_client),
-                        Err(e) => eprintln!(
-                            "serve: could not resolve a gateway credential for restored model {restored_model:?}: \
-                                 {e} — keeping the previous client"
-                        ),
-                    }
-                    self.current_model = restored_model;
-                }
-                if restored_level != self.current_level {
-                    self.current_level = restored_level;
-                    self.current_thinking = None;
-                }
-                // MCP kit was reset to all-enabled with the session switch — rebuild so the
-                // advertised tool set cannot keep the previous session's allowlist.
-                // always rebuild (MCP kit may have reset; model/level may have changed)
-                {
-                    self.agent = build_agent(
-                        &self.exec_cell,
-                        self.client.clone(),
-                        &full_system(&self.static_system, &self.cwd, &self.mcp_skills),
-                        &self.cfg,
-                        &self.current_model,
-                        self.current_thinking,
-                        self.current_level,
-                        self.current_auto_compaction,
-                        self.current_auto_retry,
-                        self.current_block_images,
-                        self.current_image_auto_resize,
-                        self.persistence.session_id(),
-                        &self.write_locks,
-                        &self.checkpoint,
-                        self.subagent_ctx.as_ref(),
-                        self.structured_output.as_ref(),
-                        self.memory_tool.as_ref(),
-                        self.approval.as_ref(),
-                        &self.mcp_enabled,
-                        &self.skills,
-                    );
-                }
-                let _ = self.out_tx.send(response(
-                    id,
-                    "fork",
-                    true,
-                    Some(json!({
-                        "session_id": self.persistence.session_id(),
-                        "cwd_stale": self.mode.cwd_is_stale(&self.persistence.meta.cwd, &self.cwd),
-                        "model": self.current_model,
-                        "reasoning_effort": self.current_level.as_str(),
-                        "text": fork_text,
-                    })),
-                    None,
-                ));
-            }
-            Err(e) => {
-                let _ = self
-                    .out_tx
-                    .send(response(id, "fork", false, None, Some(&e.to_string())));
-            }
-        }
-    }
-
-    async fn do_clone(&mut self, id: Option<String>) {
-        // pi's own `clone` — fork the current session at its current tip, with no arguments.
-        // Service mode derives without switching, exactly like `fork` above.
-        if self.mode.forks_detached() {
-            let frame = match self.persistence.fork_detached(usize::MAX, None, false) {
-                Ok(new_id) => response(
-                    id,
-                    "clone",
-                    true,
-                    Some(json!({ "session_id": new_id, "switched": false })),
-                    None,
-                ),
-                Err(e) => response(id, "clone", false, None, Some(&e.to_string())),
-            };
-            let _ = self.out_tx.send(redact_frame(&self.mode, frame));
-            return;
-        }
-        match self
-            .persistence
-            .fork(usize::MAX, None, false, self.starting_level)
-        {
-            Ok((mut s, restored_model, restored_level)) => {
-                // The clone keeps the view context its turns carried (see `mcp_apps::carry_context`).
-                crate::tools::mcp_apps::carry_context(&self.session, &mut s);
-                self.session = s;
-                self.repoint_session_memory();
-                self.reset_exec_endpoint().await;
-                self.reset_mcp_enabled();
-                self.steering.clear();
-                let restored_level = agent_core::clamp_thinking_level(
-                    &agent_core::capabilities(&restored_model),
-                    restored_level,
-                );
-                if restored_model != self.current_model {
-                    self.session.scrub_cross_model_state(&restored_model);
-                    match build_gateway_client(&self.cfg, &restored_model) {
-                        Ok(new_client) => self.client = Arc::new(new_client),
-                        Err(e) => eprintln!(
-                            "serve: could not resolve a gateway credential for restored model {restored_model:?}: \
-                                 {e} — keeping the previous client"
-                        ),
-                    }
-                    self.current_model = restored_model;
-                }
-                if restored_level != self.current_level {
-                    self.current_level = restored_level;
-                    self.current_thinking = None;
-                }
-                // MCP kit was reset to all-enabled with the session switch — rebuild so the
-                // advertised tool set cannot keep the previous session's allowlist.
-                // always rebuild (MCP kit may have reset; model/level may have changed)
-                {
-                    self.agent = build_agent(
-                        &self.exec_cell,
-                        self.client.clone(),
-                        &full_system(&self.static_system, &self.cwd, &self.mcp_skills),
-                        &self.cfg,
-                        &self.current_model,
-                        self.current_thinking,
-                        self.current_level,
-                        self.current_auto_compaction,
-                        self.current_auto_retry,
-                        self.current_block_images,
-                        self.current_image_auto_resize,
-                        self.persistence.session_id(),
-                        &self.write_locks,
-                        &self.checkpoint,
-                        self.subagent_ctx.as_ref(),
-                        self.structured_output.as_ref(),
-                        self.memory_tool.as_ref(),
-                        self.approval.as_ref(),
-                        &self.mcp_enabled,
-                        &self.skills,
-                    );
-                }
-                let _ = self.out_tx.send(response(
-                    id,
-                    "clone",
-                    true,
-                    Some(json!({
-                        "session_id": self.persistence.session_id(),
-                        "cwd_stale": self.mode.cwd_is_stale(&self.persistence.meta.cwd, &self.cwd),
-                        "model": self.current_model,
-                        "reasoning_effort": self.current_level.as_str(),
-                    })),
-                    None,
-                ));
-            }
-            Err(e) => {
-                let _ = self
-                    .out_tx
-                    .send(response(id, "clone", false, None, Some(&e.to_string())));
-            }
-        }
-    }
-
-    async fn do_compact(&mut self, cmd: &Value, id: Option<String>) -> bool {
-        // Manual compaction (no run in flight here). Streams a `compacted` event if it cuts.
-        // `custom_instructions`, when given, steers what the summary emphasizes.
-        //
-        // Evaluates to whether the session goes on: `false` once stdin closed or a shutdown
-        // signal arrived mid-compaction, for the caller to end the session loop.
-        //
-        // The summary is a model call (up to the stream idle timeout per call), so it runs inside
-        // a select that keeps the session answering, the same shape as the host-`bash` loop:
-        // `abort` cancels it, read-only commands are answered from a pre-compaction snapshot,
-        // anything else is refused as busy, and shutdown or EOF cancel it.
-        let custom_instructions = cmd.get("custom_instructions").and_then(Value::as_str);
-        // Busy for the reaper and drain until the response is sent (see `BusyGuard`).
-        let _busy = BusyGuard::mark(&self.running);
-        let tx = self.out_tx.clone();
-        let mut compacted_tokens_before: Option<u32> = None;
-        let mut compacted_summary: Option<String> = None;
-        let mut compacted_tokens_after: Option<u32> = None;
-        let mut compacted_first_kept: Option<usize> = None;
-        // A compaction ends in a checkpoint, which waits until it is on disk (see
-        // `ChannelCheckpoint`): persist checkpoints while it runs, as the prompt loop does. Scoped
-        // so the compaction's borrows (`session`, the `compacted_*` slots) end with it.
-        // The pre-compaction active path, for `first_kept_entry_id` below: the compaction's own
-        // checkpoint rewrites the store before the call returns.
-        let ids_before: Vec<String> = self
-            .persistence
-            .store
-            .as_ref()
-            .map(|s| s.active_ids().to_vec())
-            .unwrap_or_default();
-        // What the read-only commands answer while the compaction holds `&mut session`: the
-        // session as it stands until the compaction lands.
-        let stats_before = session_stats(
-            &self.session,
-            &compaction_config(&self.cfg, &self.current_model),
-        );
-        let message_count_before = self.session.messages.len();
-        let mut compact_open = true;
-        // An `abort` is acknowledged once the compaction has actually stopped, after its own
-        // response, as a mid-run abort is.
-        let mut compact_abort_acks: Vec<Option<String>> = Vec::new();
-        let result = {
-            let compaction_cancel = CancellationToken::new();
-            // No usage reaches a compaction's sink, so no pressure point applies.
-            let manual_steers =
-                crate::memory::SessionSteers::new(self.session_memory_active, u32::MAX);
-            let mut on_event = |ev: AgentEvent| {
-                if let AgentEvent::Compacted {
-                    tokens_before,
-                    summary,
-                    tokens_after,
-                    first_kept,
-                    ..
-                } = &ev
-                {
-                    compacted_tokens_before = Some(*tokens_before);
-                    compacted_summary = Some(summary.clone());
-                    compacted_tokens_after = Some(*tokens_after);
-                    compacted_first_kept = Some(*first_kept);
-                }
-                // The shared steer observer, as in the `prompt` run: a manual `compact` also
-                // folds specifics into a lossy summary, so the model is steered to read back its
-                // `/session` working memory on its next turn.
-                manual_steers.observe(&ev, &self.steering);
-                if let Some(frame) = event_frame(ev) {
-                    let _ = tx.send(frame);
-                }
-            };
-            let compaction = self.agent.compact(
-                &mut self.session,
-                agent_core::CompactionReason::Manual,
-                &compaction_cancel,
-                &mut on_event,
-                custom_instructions,
-            );
-            tokio::pin!(compaction);
-            loop {
-                tokio::select! {
-                    biased;
-                    Some((messages, provenance, edited, cuts, ack)) = self.checkpoint_rx.recv() => {
-                        let (p, r) = write_then_ack(
-                            persist_messages_blocking(self.persistence.take_for_blocking(), messages, provenance, edited, cuts),
-                            ack,
-                        )
-                        .await;
-                        self.persistence = p;
-                        if let Err(e) = r {
-                            tracing::warn!(error = %e, "compaction checkpoint failed to persist");
-                        }
-                    }
-                    r = &mut compaction => break r,
-                    sig = self.shutdown.wait(), if compact_open => {
-                        self.shutdown_cause = Some(sig);
-                        compact_open = false;
-                        compaction_cancel.cancel();
-                    }
-                    maybe_line = self.input_rx.recv(), if compact_open => match maybe_line {
-                        Some(l) => {
-                            let l = l.trim();
-                            if l.is_empty() {
-                                continue;
-                            }
-                            let c: Value = match serde_json::from_str(l) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    let _ = self.out_tx.send(response(None, "parse", false, None, Some(&format!("invalid JSON: {e}"))));
-                                    continue;
-                                }
-                            };
-                            let cid = c.get("id").and_then(Value::as_str).map(str::to_string);
-                            match c.get("type").and_then(Value::as_str).unwrap_or("") {
-                                "abort" => {
-                                    compaction_cancel.cancel();
-                                    compact_abort_acks.push(cid);
-                                }
-                                "get_state" => {
-                                    let branch = self.mode.git_branch(&self.exec_cell, &self.cwd).await;
-                                    let mut data = stats_before.clone();
-                                    if let Value::Object(m) = &mut data {
-                                        insert_session_identity(m, &self.persistence, &self.mode);
-                                        m.insert("model".into(), json!(self.current_model));
-                                        m.insert("message_count".into(), json!(message_count_before));
-                                        m.insert("title".into(), json!(self.persistence.meta.title));
-                                        m.insert(
-                                            "cwd_stale".into(),
-                                            json!(self.mode.cwd_is_stale(&self.persistence.meta.cwd, &self.cwd)),
-                                        );
-                                        m.insert("cwd".into(), json!(self.cwd.display().to_string()));
-                                        m.insert("git_branch".into(), json!(branch));
-                                        m.insert("is_streaming".into(), json!(false));
-                                        m.insert("is_compacting".into(), json!(true));
-                                        m.insert("pending_tool_ids".into(), json!(Vec::<String>::new()));
-                                        if let Value::Object(rt) = runtime_settings(self.current_level, self.current_auto_compaction, self.current_auto_retry, self.current_block_images, self.current_image_auto_resize, &self.steering) {
-                                            m.extend(rt);
-                                        }
-                                    }
-                                    let _ = self.out_tx.send(response(cid, "get_state", true, Some(data), None));
-                                }
-                                "get_session_stats" => {
-                                    let mut data = stats_before.clone();
-                                    if let Value::Object(m) = &mut data {
-                                        insert_session_identity(m, &self.persistence, &self.mode);
-                                        m.insert("pending_tool_ids".into(), json!(Vec::<String>::new()));
-                                    }
-                                    let _ = self.out_tx.send(response(cid, "get_session_stats", true, Some(data), None));
-                                }
-                                // The fanout's snapshot is the transcript as it stood when the
-                                // compaction began (published by the idle loop) — what the busy
-                                // prompt loop answers from too.
-                                "get_messages" => {
-                                    let (msgs, ids) = {
-                                        let f = lock_ignoring_poison(&self.out_conn);
-                                        f.history_snapshot()
-                                    };
-                                    match messages_payload(&msgs, &ids, c.get("since").and_then(Value::as_str)) {
-                                        Ok(data) => { let _ = self.out_tx.send(response(cid, "get_messages", true, Some(data), None)); }
-                                        Err(e) => { let _ = self.out_tx.send(response(cid, "get_messages", false, None, Some(&e))); }
-                                    }
-                                }
-                                "prompt" if crate::tools::mcp_events::is_injection(&c) => {
-                                    self.deferred_events.push_back(l.to_string());
-                                }
-                                events_cmd if events_cmd.starts_with("mcp_events_") => dispatch_events(&self.events_cmds, &self.out_tx, cid, events_cmd, &c),
-                                other => {
-                                    let _ = self.out_tx.send(response(cid, other, false, None, Some("busy: a compaction is running; only `abort` (which cancels it) and get_state/get_session_stats/get_messages are accepted")));
-                                }
-                            }
-                        }
-                        None => {
-                            compact_open = false;
-                            compaction_cancel.cancel();
-                        }
-                    },
-                }
-            }
-        };
-        match result {
-            Ok(outcome) => {
-                // The tree entry that begins the retained (post-compaction) portion of history —
-                // resolved against the active path as it was before the compaction rewrote it.
-                let first_kept_entry_id =
-                    compacted_first_kept.and_then(|first_kept| ids_before.get(first_kept).cloned());
-                while self.checkpoint_rx.try_recv().is_ok() {}
-                let (p, persist_result) =
-                    persist_blocking(self.persistence.take_for_blocking(), self.session.clone())
-                        .await;
-                self.persistence = p;
-                match persist_result {
-                    Ok(()) => {
-                        let _ = self.out_tx.send(response(
-                            id,
-                            "compact",
-                            true,
-                            Some(json!({
-                                "compacted": outcome.compacted(),
-                                "reason": outcome.reason(),
-                                "summary": compacted_summary,
-                                "tokens_before": compacted_tokens_before,
-                                "tokens_after": compacted_tokens_after,
-                                "first_kept_entry_id": first_kept_entry_id,
-                            })),
-                            None,
-                        ));
-                    }
-                    Err(e) => {
-                        let _ = self.out_tx.send(response(
-                            id,
-                            "compact",
-                            false,
-                            None,
-                            Some(&format!("compacted but failed to persist: {e}")),
-                        ));
-                    }
-                }
-            }
-            Err(e) => {
-                let _ =
-                    self.out_tx
-                        .send(response(id, "compact", false, None, Some(&e.to_string())));
-            }
-        }
-        for ack in compact_abort_acks {
-            let _ = self.out_tx.send(response(ack, "abort", true, None, None));
-        }
-        compact_open
-    }
-
     /// Install a freshly discovered resource set: the lists `get_commands` and prompt expansion read,
     /// the subagent context, the static system prompt, and the agent built over them. `reload` and
     /// the post-reopen refresh share it, so the two cannot drift.
@@ -5304,1746 +4667,77 @@ impl SessionLoop {
             }
 
             match ctype.as_str() {
-            "prompt" => {
-                // `output_schema` makes this prompt a callable function: the model must fill the schema
-                // in via `structured_output` rather than answering in prose, and the validated payload
-                // rides the terminal response's `data.structured_output`. Handled before the ack, so a
-                // malformed schema is rejected outright rather than acknowledged and then failed.
-                //
-                // Installing (or removing, or changing) a schema changes both the *tool set* and the
-                // system-prompt section that tells the model to use it, so both are rebuilt — through
-                // the very same `build_agent` path `set_model` already uses. A prompt repeating the
-                // schema it already had rebuilds nothing.
-                match parse_output_spec(&cmd) {
-                    Err(e) => {
-                        if !self.emit(response(id, "prompt", false, None, Some(&e))) { break; }
-                        continue;
-                    }
-                    Ok(spec) if spec != self.current_output_spec => {
-                        self.structured_output = match &spec {
-                            Some((schema, description)) => {
-                                match crate::tools::structured_output::StructuredOutput::new(
-                                    schema.clone(),
-                                    description.clone(),
-                                    self.output_slot.clone(),
-                                ) {
-                                    Ok(tool) => Some(Arc::new(tool)),
-                                    Err(e) => {
-                                        if !self.emit(response(id, "prompt", false, None, Some(&e))) { break; }
-                                        continue;
-                                    }
-                                }
-                            }
-                            None => None,
-                        };
-                        self.current_output_spec = spec;
-                        self.memory_sections = crate::memory::mount_sections(&self.mounts).await;
-                        self.static_system = crate::resources::build_static_system_prompt_with_context(
-                            &crate::resources::PromptOptions {
-                                base: self.sandbox_system.as_deref(),
-                                default_base: &self.cfg.system,
-                                append: self.cfg.append_system.as_deref().or(self.sandbox_append.as_deref()),
-                                cwd: &self.cwd,
-                                include_context_files: self.cfg.context_files,
-                                skills: &self.skills,
-                                context_window: agent_core::capabilities(&self.cfg.model).context_window,
-                                has_read: self.has_read,
-                                has_todo: self.has_todo,
-                                has_structured_output: self.structured_output.is_some(),
-                                has_memory: self.has_memory,
-                                memory_sections: &self.memory_sections,
-                                project_trusted: self.project_trusted,
-                                agents: &self.cfg.agents,
-                                disk_overrides: self.disk_overrides,
-                            },
-                            &self.context_files,
-                        );
-                        self.agent = build_agent(
-                            &self.exec_cell,
-                            self.client.clone(),
-                            &full_system(&self.static_system, &self.cwd, &self.mcp_skills),
-                            &self.cfg,
-                            &self.current_model,
-                            self.current_thinking,
-                            self.current_level,
-                            self.current_auto_compaction,
-                            self.current_auto_retry,
-                            self.current_block_images,
-                            self.current_image_auto_resize,
-                            self.persistence.session_id(),
-                            &self.write_locks,
-                            &self.checkpoint,
-                            self.subagent_ctx.as_ref(),
-                            self.structured_output.as_ref(),
-                            self.memory_tool.as_ref(),
-                            self.approval.as_ref(),
-                            &self.mcp_enabled,
-                            &self.skills,
-                        );
-                    }
-                    Ok(_) => {}
-                }
-                // A previous prompt's answer must never be mistaken for this one's.
-                self.output_slot.clear();
-                // Refresh the cheap, time-varying part of the system prompt (the date) every turn —
-                // the expensive discovery-based static half only changes on `set_model`/`set_thinking`/
-                // `reload`, so it's cached rather than recomputed here.
-                // A skills listing whose `ttlMs` ran out, or that a server said changed, is re-listed
-                // now — when it is needed — so a skill published after connect is offered this turn.
-                self.mcp_skills.refresh().await;
-                // The session may be one this process never ran (a switch, a fork, a restart) whose
-                // transcript still holds an MCP skill's SKILL.md: the model is acting on it, so the
-                // code-execution gate must be too.
-                self.mcp_enabled
-                    .skill_session()
-                    .restore_from_transcript(&self.session.messages);
-                // The session's MCP Apps connections moved since the agent was built (an apps dial
-                // landed, or went into backoff): rebuild, so this turn advertises what is up now.
-                let apps_generation_now = self.mcp_enabled.apps().map(|view| view.generation());
-                // Likewise a server re-listed its tools since then.
-                let mcp_tools_now = self.cfg.mcp_tools.generation();
-                if apps_generation_now != self.apps_generation || mcp_tools_now != self.mcp_tools_generation {
-                    self.apps_generation = apps_generation_now;
-                    self.mcp_tools_generation = mcp_tools_now;
-                    self.agent = build_agent(
-                        &self.exec_cell,
-                        self.client.clone(),
-                        &full_system(&self.static_system, &self.cwd, &self.mcp_skills),
-                        &self.cfg,
-                        &self.current_model,
-                        self.current_thinking,
-                        self.current_level,
-                        self.current_auto_compaction,
-                        self.current_auto_retry,
-                        self.current_block_images,
-                        self.current_image_auto_resize,
-                        self.persistence.session_id(),
-                        &self.write_locks,
-                        &self.checkpoint,
-                        self.subagent_ctx.as_ref(),
-                        self.structured_output.as_ref(),
-                        self.memory_tool.as_ref(),
-                        self.approval.as_ref(),
-                        &self.mcp_enabled,
-                        &self.skills,
-                    );
-                }
-                // And one that changes them during this run reaches it at the next turn boundary.
-                self.steering.set_tool_source(Some(crate::tools::mcp::tool_source(
-                    self.cfg.mcp_tools.clone(),
-                    self.mcp_enabled.clone(),
-                    self.mcp_tools_generation,
-                    self.mcp_filter.clone(),
-                )));
-                self.agent.set_system(full_system(&self.static_system, &self.cwd, &self.mcp_skills));
-                // A `prompt` with no (or non-string) `message` is a malformed command: running an
-                // empty user turn would spend a model call on nothing and still report success.
-                let Some(message) = cmd.get("message").and_then(Value::as_str) else {
-                    if !self.emit(response(
-                        id,
-                        "prompt",
-                        false,
-                        None,
-                        Some("missing `message`"),
-                    )) { break; }
-                    continue;
-                };
-                let message =
-                    expand_message(message, &self.skills, &self.prompt_templates, &self.mcp_skills).await;
-                // Optional image attachments: `images: [{media_type, data}]` (base64). Builds a
-                // multimodal user turn; absent or empty → a plain text turn.
-                let images = parse_images(cmd.get("images"));
-                // MCP tasks a previous process left in flight are waited on and answered before this
-                // turn's model call (see `crate::mcp_resume`), by the first attempt only.
-                // A resumer that finished with a task's server unreachable left that task pending:
-                // a fresh one tries it again now (its finished results carry over).
-                //
-                // Journal writes still queued in `mcp_task_rx` are not drained here, and nothing
-                // below depends on them. A finished task's result: a restarted resumer is handed the
-                // old one's results (`mcp_carried`), so it never re-polls. A placeholder mark queued
-                // as this prompt arrives: its placeholder is not on the path yet (this prompt's
-                // `resume_into_turn` splices it, adding the resumer's own placeholder ids to the
-                // journal's), and once a run has put one there, the run-end drain journals its mark
-                // before the next prompt reads the journal.
-                let mut mcp_carried = Vec::new();
-                if self.mcp_resumer.session_id() != self.persistence.session_id() {
-                    self.mcp_resumer = self.start_mcp_resumer(&[]);
-                } else if self.mcp_resumer.needs_retry() {
-                    mcp_carried = self.mcp_resumer.finals();
-                    self.mcp_resumer = self.start_mcp_resumer(&mcp_carried);
-                }
-                let mut mcp_resume_first = true;
-                let mut mcp_journaled = crate::mcp_resume::results(
-                    &self.persistence.active_journal(crate::mcp_resume::RESULT_ENTRY_KIND),
-                );
-                mcp_journaled.extend(mcp_carried);
-                let mcp_placeholders = crate::mcp_resume::placeholder_ids(
-                    &self.persistence.active_journal(crate::mcp_resume::PLACEHOLDER_ENTRY_KIND),
-                );
-                if images.is_empty() {
-                    self.session.user(message);
-                } else {
-                    self.session.push(agent_core::Message::user_with_images(message, images));
-                }
-                // MCP App views' new model context rides this turn as a request-only block of its
-                // own — untrusted data, labelled as such, never in the user's text, never persisted,
-                // and never in the system prompt, whose bytes (and so the prompt cache) it would
-                // otherwise churn on every update. See `Session::attach_request_block`.
-                if let Some(context) =
-                    crate::tools::mcp_apps::take_undelivered_context(&self.mcp_enabled)
-                {
-                    self.session.attach_request_block(context);
-                }
-                // Acknowledge immediately — the turn is queued and about to start — rather than
-                // leaving a client with no signal until the (possibly much later) terminal response.
-                if !self.emit(ack(id.clone(), "prompt")) { break; }
-                // The reaper must see this session as mid-run from the ack, not from when the model
-                // call actually starts. An HTTP POST returns 202 on this ack and unpins; the gap
-                // between ack and `run_events_steered` (and the retry-backoff window between
-                // attempts) is still "a prompt is in flight" — reaping here would drop a run the
-                // client was just told had started. Cleared after the terminal `prompt` response.
-                // `swap`, not `store`: the gauge must follow *transitions*. The retry path below
-                // re-asserts this flag while a run is already in flight, and an unconditional `inc`
-                // there would count one prompt twice and never come back down.
-                if !self.running.swap(true, Ordering::Relaxed)
-                    && let Some(m) = &self.cfg.metrics
-                {
-                    m.runs_in_flight.inc();
-                }
-                // One run_id for the whole prompt, including whole-run retries. Minted here, next to
-                // the ack the client just got, so a crash between accept and the loop still has a
-                // `started` in flight. Unconfigured (`NoLifecycle`) skips construction entirely.
-                let life = self.cfg.lifecycle.enabled().then(|| {
-                    crate::lifecycle::Run::begin(
-                        Arc::clone(&self.cfg.lifecycle),
-                        self.persistence.session_id().to_string(),
-                        // One replica emits for many tenants in service mode, so every event says
-                        // whose run it is. Absent (and omitted on the wire) otherwise.
-                        self.mode.tenant().map(str::to_owned),
-                        id.clone(),
-                        self.current_model.clone(),
-                    )
-                });
-                let cancel = CancellationToken::new();
-                // Whether the run's *last* turn ended in a refusal — set from every `TurnEnd`, so by
-                // the time the run returns it reflects only the final one (any refusal earlier in a
-                // multi-turn run is superseded once the model goes on to call tools or answer plainly).
-                // Reset per retry attempt, so the value read after the loop reflects only the last.
-                let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                // Whether an auto-triggered compaction is *currently* in flight this instant — pi's
-                // `isCompacting`, surfaced from `get_state`. Set on `AgentEvent::CompactionStart`,
-                // cleared on `Compacted`/`CompactionFailed` *or* the very next event of any other kind
-                // (`TurnStart` for the run's next turn, ordinarily) — `Agent::compact` can end without
-                // ever emitting `Compacted` (an empty-summary no-op, or a failure reported via
-                // `CompactionFailed` rather than propagated — see that event's doc comment), and its own
-                // model call uses a discarding inner sink, so nothing else can arrive between
-                // `CompactionStart` and whatever naturally follows it; clearing on "anything else" is
-                // exact, not a guess.
-                // Manual `compact`/branch-summary-on-`switch_branch` don't touch this: both only ever
-                // run from the idle main loop, which processes one command to completion before reading
-                // the next — no concurrent `get_state` could ever observe them in flight anyway.
-                let is_compacting = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                // The `/session` steers (pressure nudge, compaction reminder) — the observer `run`
-                // shares, see `crate::memory::SessionSteers`. Declared here (per prompt-run) so its
-                // once-per-fill-cycle nudge state survives the per-retry-attempt observer rebuild below;
-                // the pressure point is re-pointed per attempt (a `set_model` changes the trigger).
-                let session_steers = Arc::new(crate::memory::SessionSteers::new(
-                    self.session_memory_active,
-                    u32::MAX,
-                ));
-
-                // Start recording this run's frames for mid-turn replay (see `OutFanout::turn`). Here,
-                // outside the auto-retry loop below, so one recording spans the whole `prompt`: a client
-                // that never dropped saw every attempt's frames and the `auto_retry_start` notices
-                // between them, and a client that re-attaches is owed the same. The idle loop's
-                // `sync_history!` ends the recording once the run is over and its messages have committed.
-                lock_ignoring_poison(&self.out_conn).begin_turn();
-
-                // Drive the run while staying responsive to stdin: `abort` cancels it, `steer` queues a
-                // mid-run injection and `follow_up` a stop-boundary one; any other command is
-                // rejected as busy (the session is borrowed by the in-flight run). If stdin closes
-                // mid-run, cancel and drain. The block scopes the run's `&mut session` borrow so we can
-                // persist after.
-                let mut stdin_open = true;
-                // A run that ends in a transient-looking `Err` (`crate::retry::is_retryable_whole_run`
-                // — a superset of `run_turn`'s own mid-stream retry's `is_retryable_mid_stream`, plus
-                // raw HTTP status digits appropriate only at this outer layer) is automatically
-                // re-invoked against the *same* session — resuming from wherever it left off, not
-                // restarting the turn — up to `retry::MAX_RUN_RETRIES` times with backoff. pi's
-                // `agent-session.ts` equivalent (`_prepareRetry`/`isRetryableAssistantError`); ours is
-                // gated by the same `current_auto_retry` toggle as the mid-stream layer below it (one
-                // user-facing "retries on/off" concept, even though internally it's two layers), and
-                // never retries past a client disconnect or an explicit `abort`
-                // (`is_retryable_whole_run` already excludes `Error::Cancelled` transitively through
-                // `is_retryable_mid_stream`, and `stdin_open`/`cancel.is_cancelled()` below are
-                // redundant, cheap belt-and-suspenders on top of that). The backoff sleep itself *is*
-                // raced against `abort`/`abort_retry`/shutdown (see the `select!` around the `sleep`
-                // below) — a client abort during backoff takes effect immediately, not just once the
-                // next attempt starts.
-                let mut retry_attempt: u32 = 0;
-                // Retries since the run last made progress — what `max_retries` and the backoff count.
-                // `retry_attempt` above keeps counting every retry of this prompt (lifecycle, the
-                // closing `auto_retry_end`); this one resets when a failed attempt still committed a
-                // step, so a long run that recovers from one blip doesn't carry it against the next.
-                let mut stalled_retries: u32 = 0;
-                // Whether the final post-attempt persist (below) failed to write to disk — surfaced in
-                // the terminal `prompt` response instead of being silently swallowed, since an agent run
-                // that appears to succeed while its transcript failed to persist is exactly the failure
-                // mode this exists to catch. Always set from *that* persist's own outcome alone, once
-                // per attempt: it re-persists the whole current session state fresh, so it's a strict
-                // superset of any mid-run checkpoint along the way (see the `checkpoint_rx.recv()` arm's
-                // comment below) — a checkpoint that failed but was then followed by a successful final
-                // persist must report success, not a stale failure the superseding write already fixed.
-                let mut persist_error: Option<String>;
-                // pi-parity (Task 4, serve pass 19): `compact`/`switch_session`/`fork`/`clone`/
-                // `new_session` received while this run (or its auto-retry backoff wait) is in flight
-                // self-abort-and-proceed instead of being rejected as busy — cancelled via the exact
-                // same `cancel.cancel()`/deferred-until-idle discipline `abort` itself already uses
-                // (see `pending_abort_acks` just below), then queued here (raw command + its own `id`)
-                // to run their ordinary idle-path logic once this attempt has actually gone idle, in
-                // the order received. Declared outside the loop (not inside, like `pending_abort_acks`)
-                // and `clear()`-reset every attempt, not re-declared: a deferred command always forces
-                // this attempt to end via cancellation (a cancelled/aborted result is never itself
-                // retryable — see the match on `attempt_result` below), so it's always populated and
-                // drained within the very same iteration, but the drain happens *after* this loop
-                // returns, once `session`/`persistence` are no longer borrowed by `run` — a variable
-                // declared inside the loop body would be dropped at `break` and unreachable there.
-                let mut pending_deferred: Vec<(Option<String>, Value)> = Vec::new();
-                // MCP Events injection batches this run carries: its own prompt's, and each one
-                // steered in while it runs (with the text the model would receive). Settled once
-                // the run is over — see "A batch is delivered only once" below.
-                let own_injection = crate::tools::mcp_events::injection_batch(&cmd);
-                let mut steered_injections: Vec<u64> = Vec::new();
-                let result = 'retry: loop {
-                    let steps_at_start = self.session.steps;
-                    refused.store(false, Ordering::Relaxed);
-                    is_compacting.store(false, Ordering::Relaxed);
-                    pending_deferred.clear();
-                    // `abort` command ids received while this run is still unwinding — acked only once
-                    // the run has actually gone idle (see the flush right after `attempt_result` below,
-                    // and that ack's own doc comment for why it's deferred rather than sent the instant
-                    // `cancel.cancel()` is called).
-                    let mut pending_abort_acks: Vec<Option<String>> = Vec::new();
-                    let tx = self.out_tx.clone();
-                    let mcp_task_journal = self.mcp_task_tx.clone();
-                    let mcp_journal_session = self.persistence.session_id().to_owned();
-                    let refused_sink = refused.clone();
-                    let is_compacting_sink = is_compacting.clone();
-                    // Live token/step counters a `get_state`/`get_session_stats` sent while this run is in
-                    // flight can answer from (see the busy-loop's own arms for those types below) — seeded
-                    // fresh from the session's *current* totals every attempt (a retry may follow a partial,
-                    // already-persisted success from an earlier attempt in this same loop), then kept current
-                    // from the same events a streaming client already observes.
-                    let live_stats = Arc::new(LiveStats::from_session(&self.session));
-                    let live_stats_sink = live_stats.clone();
-                    // A clone for the observer to push the compaction reminder + pressure nudge through —
-                    // consumed by this attempt's `move` closure, so re-cloned per attempt.
-                    let steer_on_compact = self.steering.clone();
-                    let session_steers_sink = session_steers.clone();
-                    // The live-prompt size at which to warn of an approaching compaction, against the
-                    // *current* model (a `set_model` mid-session changes it): the same trigger
-                    // `build_agent` hands this session's `Agent`.
-                    session_steers.set_pressure_point(crate::memory::compaction_pressure_point(
-                        compaction_config(&self.cfg, &self.current_model).trigger_tokens(),
-                    ));
-
-                    // Mark this session busy for the reaper's benefit (daemon mode). Already set at
-                    // the ack above; re-asserted here so a retry attempt is still protected if anything
-                    // cleared it. The matching clear is *after* the whole prompt, not after this
-                    // attempt — retry backoff is still mid-run.
-                    if !self.running.swap(true, Ordering::Relaxed)
-                        && let Some(m) = &self.cfg.metrics
-                    {
-                        m.runs_in_flight.inc();
-                    }
-                    if let Some(life) = &life {
-                        life.set_attempt(retry_attempt);
-                    }
-                    let life_obs = life.clone();
-                    let attempt_result = {
-                        // A steered MCP Events batch is delivered the moment the model receives it: the
-                        // run's `Steered` event reports its tag after the transcript holding it is
-                        // checkpointed, and it is recorded — durably — right then, never re-derived
-                        // from the transcript afterwards (a compaction may have summarized it away).
-                        let receipts_sink = self.mcp_events.as_ref().map(|hub| hub.receipts());
-                        let mut sink = move |ev: AgentEvent| {
-                            if let AgentEvent::Steered { tags, .. } = &ev
-                                && let Some(receipts) = &receipts_sink
-                            {
-                                for tag in tags {
-                                    receipts.received(*tag);
-                                }
-                            }
-                            // Set on `CompactionStart`, cleared on literally anything else — see
-                            // `is_compacting`'s own declaration above for why that's exact, not a
-                            // conservative approximation.
-                            is_compacting_sink.store(
-                                matches!(ev, AgentEvent::CompactionStart { .. }),
-                                Ordering::Relaxed,
-                            );
-                            // The `/session` steers: the nudge before a compaction, the recall
-                            // reminder after one.
-                            session_steers_sink.observe(&ev, &steer_on_compact);
-                            if let AgentEvent::TurnEnd { stop_reason, step } = &ev {
-                                refused_sink
-                                    .store(*stop_reason == StopReason::Refusal, Ordering::Relaxed);
-                                live_stats_sink.set_steps(*step);
-                            }
-                            // A subagent's requests count toward this session's totals (the loop
-                            // already folds them into the `Session`); mirrored here so mid-run
-                            // stats agree with what the session will say once the run ends.
-                            if let AgentEvent::ToolUsage { usage, .. } = &ev {
-                                live_stats_sink.record_delegated_usage(usage);
-                            }
-                            if let AgentEvent::Stream(StreamEvent::Usage(usage)) = &ev {
-                                live_stats_sink.record_usage(usage);
-                            }
-                            // B-L1: mirrors the same events into `pending_tool_ids`, so `get_state`
-                            // can answer "which calls are still running" mid-turn — see that
-                            // field's own doc comment.
-                            if let AgentEvent::ToolStart { id, .. } = &ev {
-                                live_stats_sink.tool_started(id.clone());
-                            }
-                            if let AgentEvent::ToolEnd { id, .. } = &ev {
-                                live_stats_sink.tool_ended(id);
-                            }
-                            // Same mirroring, for the `todo` list — see `LiveStats::todos`. The tool
-                            // validates before it emits, so a rejected call never lands here and the
-                            // mirror only ever holds a list the model actually committed.
-                            if let AgentEvent::ToolProgress {
-                                name,
-                                details: Some(d),
-                                ..
-                            } = &ev
-                                && name == crate::tools::todo::NAME
-                                && let Some(todos) = d.get("todos")
-                            {
-                                live_stats_sink.todos_updated(todos.clone());
-                            }
-                            // Best-effort: a sync sink can't break the control loop. If the writer is
-                            // gone the send fails here and the terminal response send below detects it
-                            // via `emit!` and stops the loop. An unserializable event is skipped rather
-                            // than emitted as a malformed frame (see `event_frame`).
-                            if let AgentEvent::ToolProgress {
-                                id,
-                                details: Some(d),
-                                ..
-                            } = &ev
-                                && let Some(record) = d.get(crate::tools::mcp::MCP_TASK_DETAILS_KEY)
-                            {
-                                let _ = mcp_task_journal.send((
-                                    crate::mcp_resume::TASK_ENTRY_KIND.to_owned(),
-                                    crate::mcp_resume::task_entry(record, id, &mcp_journal_session),
-                                ));
-                            }
-                            if let Some(life) = &life_obs {
-                                life.observe(&ev);
-                            }
-                            if let Some(frame) = event_frame(ev) {
-                                let _ = tx.send(frame);
-                            }
-                        };
-                        let resume_first = std::mem::take(&mut mcp_resume_first);
-                        let resumer = &self.mcp_resumer;
-                        let journaled = &mcp_journaled;
-                        let placeholders = &mcp_placeholders;
-                        let run_cancel = cancel.clone();
-                        let run = crate::tools::mcp::with_session_host(self.mcp_host.clone(), async {
-                            if resume_first {
-                                crate::mcp_resume::resume_into_turn(
-                                    &mut self.session,
-                                    resumer,
-                                    journaled,
-                                    placeholders,
-                                    &mut sink,
-                                    &run_cancel,
-                                )
-                                .await;
-                            }
-                            self.agent
-                                .run_events_steered(
-                                    &mut self.session,
-                                    &mut sink,
-                                    run_cancel.clone(),
-                                    self.steering.clone(),
-                                )
-                                .await
-                        });
-                        tokio::pin!(run);
-                        // No timer when unconfigured or `--lifecycle-heartbeat-secs 0`. Tool-edge
-                        // samples still fire from `observe` above.
-                        let mut heartbeat = life.as_ref().and_then(|_| {
-                            crate::lifecycle::heartbeat_interval(self.cfg.lifecycle_heartbeat)
-                        });
-                        // Consume the immediate first tick so the first sample is one interval in,
-                        // not stacked on `started`.
-                        if let Some(h) = heartbeat.as_mut() {
-                            h.tick().await;
-                        }
-                        let life_beat = life.clone();
-                        loop {
-                            tokio::select! {
-                                biased;
-                                r = &mut run => break r,
-                                // A `/skill:` steer's expansion finished: queue it, and anything that
-                                // arrived after it, in order.
-                                Some(done) = self.steer_done_rx.recv() => {
-                                    self.pending_steers.expanded(done, &self.mcp_skills, &self.steering, &self.out_tx);
-                                }
-                                // A shutdown request mid-run gets the same treatment as stdin closing:
-                                // cancel and let the run unwind so the code below can persist before we
-                                // fall out of the outer loop (`!stdin_open` breaks it, further down).
-                                sig = self.shutdown.wait() => {
-                                    self.shutdown_cause = Some(sig);
-                                    stdin_open = false;
-                                    cancel.cancel();
-                                }
-                                // Drain and persist each mid-run checkpoint as it arrives (see
-                                // `ChannelCheckpoint`). `persistence` isn't touched by `run` itself (only
-                                // `session` is borrowed there), so reassigning it here is safe exactly like
-                                // `stdin_open`/`cancel` being mutated from a sibling branch above. Any
-                                // checkpoint still left undrained once the run ends is explicitly swept up
-                                // right after this loop, below, before it can leak into some later, unrelated
-                                // turn — see that drain's own comment for why "harmless, the final persist
-                                // is a superset" isn't quite true on its own.
-                                Some((messages, provenance, edited, cuts, ack)) = self.checkpoint_rx.recv() => {
-                                    // The agent is waiting on the acknowledgement before it dispatches
-                                    // the next tool, and acts on a failure — the tool does not run (see
-                                    // `ChannelCheckpoint`). Sent only once the write is done.
-                                    let (p, r) = write_then_ack(
-                                        persist_messages_blocking(self.persistence.take_for_blocking(), messages, provenance, edited, cuts),
-                                        ack,
-                                    )
-                                    .await;
-                                    self.persistence = p;
-                                    // Note this deliberately does *not* republish the fanout's catch-up
-                                    // history, even though a perfectly good snapshot is right here. The
-                                    // catch-up's contract is base-plus-frames: `history` is the transcript
-                                    // as of this run's start and `OutFanout::turn` is every frame since, so
-                                    // a reconnecting client reconstructs exactly what a never-dropped one
-                                    // saw. Advancing `history` here would put a mid-turn-committed message
-                                    // in the catch-up *and* again in the replayed frames — rendered twice.
-                                    // See `sync_history!`, which republishes once the run is over.
-                                    //
-                                    // Logged, not tracked in `persist_error`: the unconditional final
-                                    // persist below re-persists the whole session fresh regardless, so
-                                    // this checkpoint's own outcome never affects what's reported to the
-                                    // client — only worth knowing about here for operational visibility.
-                                    if let Err(e) = r {
-                                        tracing::warn!(error = %e, "mid-run checkpoint failed to persist");
-                                    }
-                                }
-                                // After the checkpoint arm (`biased`), so the assistant's `tool_use` is on
-                                // disk before the task record that answers it.
-                                Some((kind, data)) = self.mcp_task_rx.recv() => {
-                                    journal_mcp(&mut self.persistence, &kind, data);
-                                }
-                                maybe_line = self.input_rx.recv(), if stdin_open => match maybe_line {
-                                    Some(l) => {
-                                        let l = l.trim();
-                                        if l.is_empty() {
-                                            continue;
-                                        }
-                                        let c: Value = match serde_json::from_str(l) {
-                                            Ok(v) => v,
-                                            Err(e) => {
-                                                let _ = self.out_tx.send(response(None, "parse", false, None, Some(&format!("invalid JSON: {e}"))));
-                                                continue;
-                                            }
-                                        };
-                                        let cid = c.get("id").and_then(Value::as_str).map(str::to_string);
-                                        let ctype = c.get("type").and_then(Value::as_str).unwrap_or("");
-                                        // Service mode gates here too, *ahead* of the self-abort arm
-                                        // below: `fork`/`clone`/`new_session`/`switch_session` cancel
-                                        // the running prompt before they defer, so refusing them only
-                                        // at the idle dispatch would let a refused command kill a run.
-                                        if let Some(why) = self.mode.refused_command(ctype)
-                                        {
-                                            let _ = self.out_tx.send(response(cid, ctype, false, None, Some(why)));
-                                            continue;
-                                        }
-                                        // In service mode `fork`/`clone` derive a *new* session and
-                                        // leave this one running (see `fork_detached`), so there is
-                                        // nothing here worth a run for: "busy" costs the client a
-                                        // retry, cancelling would cost it the turn.
-                                        if let Some(why) = self.mode.busy_refusal_for_fork_clone(ctype, "running") {
-                                            let _ = self.out_tx.send(response(cid, ctype, false, None, Some(&why)));
-                                            continue;
-                                        }
-                                        match ctype {
-                                            // Fix 4 (pi-parity gap): the ack is *not* sent here — see
-                                            // the flush right after this busy-loop exits, below. Sending
-                                            // it immediately (the instant `cancel.cancel()` is called)
-                                            // let a client that — correctly, per this RPC's own contract
-                                            // — treats the ack as "safe to send the next command" get
-                                            // rejected as busy: this same busy-loop keeps rejecting every
-                                            // non-abort command as busy until `run` itself actually
-                                            // resolves, which can lag well behind the cancellation
-                                            // request while in-flight tool calls/HTTP streams unwind.
-                                            // Matches pi's `agent-session.ts`, which awaits
-                                            // `waitForIdle()` before acking `abort`.
-                                            "abort" => {
-                                                cancel.cancel();
-                                                // A view's bridge requests are the user's work too.
-                                                crate::tools::mcp_apps::cancel_requests(&self.mcp_enabled);
-                                                pending_abort_acks.push(cid);
-                                            }
-                                            "stop_after_turn" => {
-                                                // Graceful, not a cancel: the current turn's tool calls (if
-                                                // any) still finish and their results are committed; the run
-                                                // just doesn't start another model call afterward. See
-                                                // `agent_core::Steering::request_stop`.
-                                                self.steering.request_stop();
-                                                let _ = self.out_tx.send(response(cid, "stop_after_turn", true, None, None));
-                                            }
-                                            "switch_model" => {
-                                                // Pi-parity gap (pi's `prepareNextTurn`): unlike `set_model`
-                                                // (which only takes effect on the *next* `prompt`), this
-                                                // retargets the run already in flight — the current turn's
-                                                // own request is unaffected, but every subsequent turn of
-                                                // this same run targets the new model. See
-                                                // `agent_core::Steering::request_model_switch`.
-                                                match c.get("model").and_then(Value::as_str) {
-                                                    Some(model) => {
-                                                        let thinking = c
-                                                            .get("thinking")
-                                                            .and_then(Value::as_u64)
-                                                            .map(|t| t as u32);
-                                                        self.steering.request_model_switch(model, thinking);
-                                                        let _ = self.out_tx.send(response(cid, "switch_model", true, None, None));
-                                                    }
-                                                    None => {
-                                                        let _ = self.out_tx.send(response(cid, "switch_model", false, None, Some("missing `model`")));
-                                                    }
-                                                }
-                                            }
-                                            cmd @ ("steer" | "follow_up") => {
-                                                match c.get("message").and_then(Value::as_str) {
-                                                    Some(m) => {
-                                                        // Same expansion (and the same optional
-                                                        // `images` attachments) a fresh `prompt` gets —
-                                                        // a `/skill:name`/`/name` invocation, or an
-                                                        // image, steered or queued this way must not
-                                                        // reach the model unexpanded/dropped just
-                                                        // because it arrived on a different command
-                                                        // type.
-                                                        // `steer` redirects mid-run (injected at the next
-                                                        // tool turn); `follow_up` waits for the stop
-                                                        // boundary. Two separate lanes. The pushing
-                                                        // client learns what's actually queued from its
-                                                        // own ack (Fix 5), including a full lane's
-                                                        // refusal. See `PendingSteers` for why an
-                                                        // MCP `/skill:` is expanded off this loop.
-                                                        let lane = if cmd == "steer" { SteerLane::Steer } else { SteerLane::FollowUp };
-                                                        self.pending_steers.receive(cid, m, parse_images(c.get("images")), lane, SteerAck::Command(if cmd == "steer" { "steer" } else { "follow_up" }), &self.skills, &self.prompt_templates, &self.mcp_skills, &self.steering, &self.out_tx);
-                                                    }
-                                                    None => {
-                                                        let _ = self.out_tx.send(response(cid, cmd, false, None, Some("missing `message`")));
-                                                    }
-                                                }
-                                            }
-                                            // A `prompt` sent while busy is rejected by default (the
-                                            // session is borrowed by the in-flight run) — *unless* it
-                                            // carries `streaming_behavior: "steer"|"follow_up"`, in which
-                                            // case its `message` is routed through the same `Steering`
-                                            // queue as an explicit `steer`/`follow_up` command, rather than
-                                            // forcing the client to re-encode it as a different command type.
-                                            // An injected event follow-up runs as its own prompt once this run is
-                                            // over (it is what the coalescer would have sent then anyway).
-                                            "prompt" if crate::tools::mcp_events::is_injection(&c)
-                                                && c.get("streaming_behavior").and_then(Value::as_str) != Some("steer") =>
-                                            {
-                                                self.deferred_events.push_back(l.to_string());
-                                            }
-                                            "prompt" => {
-                                                match (
-                                                    c.get("streaming_behavior").and_then(Value::as_str),
-                                                    c.get("message").and_then(Value::as_str),
-                                                ) {
-                                                    (Some("steer"), Some(m)) => {
-                                                        // An MCP Events injection is host-authored text, never a
-                                                        // `/skill:`: queued at once, so its delivery bookkeeping
-                                                        // (and deferral on a full lane) stays exact.
-                                                        if let Some(batch) = crate::tools::mcp_events::injection_batch(&c) {
-                                                            let text = crate::skills::expand_if_skill_invocation(m, &self.skills);
-                                                            let text = crate::prompts::expand_if_slash(&text, &self.prompt_templates);
-                                                            let m = agent_core::SteeringMessage::new(text, parse_images(c.get("images")))
-                                                                .with_tag(batch);
-                                                            let queued = self.steering.push_steer(m);
-                                                            if !queued {
-                                                                self.deferred_events.push_back(l.to_string());
-                                                                continue;
-                                                            }
-                                                            steered_injections.push(batch);
-                                                            let mut data = queue_content(&self.steering);
-                                                            data["queued_as"] = json!("steer");
-                                                            let _ = self.out_tx.send(response(cid, "prompt", true, Some(data), None));
-                                                            continue;
-                                                        }
-                                                        // Fix 5 (pi-parity gap): same queue-content
-                                                        // visibility the dedicated `steer`/`follow_up`
-                                                        // commands' own acks carry, plus `queued_as`.
-                                                        self.pending_steers.receive(cid, m, parse_images(c.get("images")), SteerLane::Steer, SteerAck::Prompt, &self.skills, &self.prompt_templates, &self.mcp_skills, &self.steering, &self.out_tx);
-                                                    }
-                                                    (Some("follow_up"), Some(m)) => {
-                                                        self.pending_steers.receive(cid, m, parse_images(c.get("images")), SteerLane::FollowUp, SteerAck::Prompt, &self.skills, &self.prompt_templates, &self.mcp_skills, &self.steering, &self.out_tx);
-                                                    }
-                                                    _ => {
-                                                        let _ = self.out_tx.send(response(cid, "prompt", false, None, Some("busy: a prompt is running; only `abort`/`steer`/`follow_up`, or a `prompt` with `streaming_behavior: \"steer\"|\"follow_up\"`, are accepted")));
-                                                    }
-                                                }
-                                            }
-                                            // Read-only commands that don't need the `&mut Session` this
-                                            // run holds — answered live instead of rejected as busy, so a
-                                            // client polling for progress (tokens/steps so far) during a
-                                            // long tool-heavy turn isn't left with nothing until it ends.
-                                            // `get_state`/`get_session_stats` read `live_stats` (mirrored
-                                            // from this run's own events, see above) instead of `session`
-                                            // directly; `message_count` is `null` here specifically — it's
-                                            // the one `get_state` field that genuinely needs `&session` to
-                                            // report exactly, and a stale/guessed number would be worse
-                                            // than an honest "not available mid-run".
-                                            "get_state" => {
-                                                // Resolved before the borrow below: in service mode it
-                                                // is a round trip into the sandbox, which cannot happen
-                                                // while `data` is mutably borrowed.
-                                                let branch = self.mode.git_branch(&self.exec_cell, &self.cwd).await;
-                                                let mut data = live_stats.snapshot();
-                                                if let Value::Object(m) = &mut data {
-                                                    insert_session_identity(m, &self.persistence, &self.mode);
-                                                    m.insert("model".into(), json!(self.current_model));
-                                                    m.insert("message_count".into(), Value::Null);
-                                                    m.insert("title".into(), json!(self.persistence.meta.title));
-                                                    m.insert("cwd_stale".into(), json!(self.mode.cwd_is_stale(&self.persistence.meta.cwd, &self.cwd)));
-                                                    // Task #25 (pi-parity fix): same fields, same reasoning, as the idle `get_state` arm below.
-                                                    m.insert("cwd".into(), json!(self.cwd.display().to_string()));
-                                                    m.insert("git_branch".into(), json!(branch));
-                                                    m.insert("is_streaming".into(), json!(true));
-                                                    m.insert("is_compacting".into(), json!(is_compacting.load(Ordering::Relaxed)));
-                                                    if let Value::Object(rt) = runtime_settings(self.current_level, self.current_auto_compaction, self.current_auto_retry, self.current_block_images, self.current_image_auto_resize, &self.steering) {
-                                                        m.extend(rt);
-                                                    }
-                                                }
-                                                let _ = self.out_tx.send(response(cid, "get_state", true, Some(data), None));
-                                            }
-                                            // Answered from the fanout's committed-history snapshot — the
-                                            // same source an attach-time catch-up is seeded from — rather
-                                            // than from `session`, which this run holds `&mut` for its whole
-                                            // duration. Rejecting this as busy (as it was) left a client that
-                                            // re-attached mid-run unable to fetch the history it had missed
-                                            // for as long as the run lasted, having already been shown that
-                                            // run's live output: it rendered the tail of a turn whose earlier
-                                            // messages it had never seen, and could only reconcile once the
-                                            // run finally ended.
-                                            //
-                                            // The snapshot is the transcript as of this run's start (see
-                                            // `sync_history!` for why it deliberately doesn't advance
-                                            // mid-run). The turn in flight is carried by the event frames the
-                                            // client is concurrently receiving — replayed from `OutFanout::
-                                            // turn` if it attached partway in — so base-plus-frames still
-                                            // adds up to the whole picture. Its messages land here the moment
-                                            // the run ends.
-                                            "get_messages" => {
-                                                let (msgs, ids) = {
-                                                    let f = lock_ignoring_poison(&self.out_conn);
-                                                    f.history_snapshot()
-                                                };
-                                                match messages_payload(&msgs, &ids, c.get("since").and_then(Value::as_str)) {
-                                                    Ok(data) => { let _ = self.out_tx.send(response(cid, "get_messages", true, Some(data), None)); }
-                                                    Err(e) => { let _ = self.out_tx.send(response(cid, "get_messages", false, None, Some(&e))); }
-                                                }
-                                            }
-                                            "get_session_stats" => {
-                                                // Fix 8 (pi-parity gap): previously the raw
-                                                // `LiveStats::snapshot()` verbatim — dropping
-                                                // session_id/session_file (this process's own live
-                                                // sources, same as `get_state`'s busy arm just above)
-                                                // and user_messages/assistant_messages/tool_calls/
-                                                // tool_results/total_messages/context_usage (genuinely
-                                                // unavailable mid-run: `&session` is exclusively
-                                                // borrowed by the in-flight turn, the same reason
-                                                // `get_state`'s own `message_count` is `null` here) —
-                                                // present as `null` rather than silently absent, so a
-                                                // client sees the same field *set* idle or busy, values
-                                                // aside.
-                                                let mut data = live_stats.snapshot();
-                                                if let Value::Object(m) = &mut data {
-                                                    insert_session_identity(m, &self.persistence, &self.mode);
-                                                    for field in [
-                                                        "context_usage",
-                                                        "user_messages",
-                                                        "assistant_messages",
-                                                        "tool_calls",
-                                                        "tool_results",
-                                                        "total_messages",
-                                                    ] {
-                                                        m.insert(field.to_string(), Value::Null);
-                                                    }
-                                                }
-                                                let _ = self.out_tx.send(response(cid, "get_session_stats", true, Some(data), None));
-                                            }
-                                            "get_commands" => {
-                                                let mut commands: Vec<Value> = self.skills.iter().map(|s| {
-                                                    json!({ "name": format!("skill:{}", s.name), "source": "skill", "description": s.description, "scope": s.scope, "path": s.path })
-                                                }).collect();
-                                                commands.extend(self.mcp_skills.commands());
-                                                commands.extend(self.prompt_templates.iter().map(|t| {
-                                                    json!({ "name": t.name, "source": "prompt", "description": t.description, "scope": t.scope, "path": t.path })
-                                                }));
-                                                let mcp_diagnostics = self.mcp_skills.diagnostics(&self.skills);
-                                                let collisions: Vec<&crate::skills::Collision> = self.skill_collisions.iter().chain(self.prompt_collisions.iter()).chain(mcp_diagnostics.iter()).collect();
-                                                let _ = self.out_tx.send(response(cid, "get_commands", true, Some(json!({ "commands": commands, "collisions": collisions })), None));
-                                            }
-                                            "list_branches" => {
-                                                let _ = self.out_tx.send(response(cid, "list_branches", true, Some(json!({ "branches": self.persistence.list_branches() })), None));
-                                            }
-                                            "get_todos" => {
-                                                // From the live mirror: `&session` is exclusively borrowed by
-                                                // the in-flight turn. See `LiveStats::todos`.
-                                                let _ = self.out_tx.send(response(cid, "get_todos", true, Some(json!({ "todos": live_stats.todos() })), None));
-                                            }
-                                            // The arm that matters: an approval question is only ever
-                                            // outstanding *while a run is blocked inside the gate*, so this
-                                            // must be answerable mid-run. `accepted:false` tells the losing
-                                            // client in a multi-attach race that its answer arrived too late.
-                                            "approve" => {
-                                                let _ = self.out_tx.send(handle_approve(cid, &c, &self.pending_approvals, self.approval.is_some()));
-                                            }
-                                            "elicit" => {
-                                                let _ = self.out_tx.send(handle_elicit(cid, &c, Some(&self.pending_elicitations)));
-                                            }
-                                            "sample" => {
-                                                let _ = self.out_tx.send(handle_sample(cid, &c, &self.pending_samplings));
-                                            }
-                                            // A view is interactive while the model runs, too.
-                                            "mcp_app_request" => spawn_app_request(cid, c.clone(), &self.out_tx, &self.mcp_enabled, &self.app_filter, &self.approval, &self.app_detached, &self.mode, &self.mcp_host),
-                                            "get_tree" => {
-                                                // Same `since` handling as the idle-loop arm below — see
-                                                // `nodes_since`'s own doc comment (Task #48, pi-parity gap).
-                                                match c.get("since").and_then(Value::as_str) {
-                                                    Some(since) => match nodes_since(self.persistence.tree(), since) {
-                                                        Ok(nodes) => {
-                                                            let _ = self.out_tx.send(response(cid, "get_tree", true, Some(json!({ "nodes": nodes, "leaf_id": self.persistence.active_ids().last() })), None));
-                                                        }
-                                                        Err(e) => {
-                                                            let _ = self.out_tx.send(response(cid, "get_tree", false, None, Some(&e)));
-                                                        }
-                                                    },
-                                                    None => {
-                                                        let _ = self.out_tx.send(response(cid, "get_tree", true, Some(json!({ "nodes": self.persistence.tree(), "leaf_id": self.persistence.active_ids().last() })), None));
-                                                    }
-                                                }
-                                            }
-                                            "list_sessions" => {
-                                                let progress_id = cid.clone();
-                                                let progress_tx = self.out_tx.clone();
-                                                let sessions = self.persistence
-                                                    .list_with_progress(&self.mode, move |scanned, total| {
-                                                        if should_report_scan_progress(scanned, total) {
-                                                            let _ = progress_tx.send(list_progress_frame(progress_id.clone(), "list_sessions", scanned, total));
-                                                        }
-                                                    })
-                                                    .await;
-                                                let _ = self.out_tx.send(response(cid, "list_sessions", true, Some(listing_page(sessions, &c)), None));
-                                            }
-                                            "list_all_sessions" => {
-                                                let progress_id = cid.clone();
-                                                let progress_tx = self.out_tx.clone();
-                                                match self.persistence.list_all_with_progress(&self.mode, move |scanned, total| {
-                                                    if should_report_scan_progress(scanned, total) {
-                                                        let _ = progress_tx.send(list_progress_frame(progress_id.clone(), "list_all_sessions", scanned, total));
-                                                    }
-                                                }).await {
-                                                    Ok(sessions) => {
-                                                        let _ = self.out_tx.send(response(cid, "list_all_sessions", true, Some(listing_page(sessions, &c)), None));
-                                                    }
-                                                    Err(e) => {
-                                                        let _ = self.out_tx.send(response(cid, "list_all_sessions", false, None, Some(&e.to_string())));
-                                                    }
-                                                }
-                                            }
-                                            "get_available_models" => {
-                                                // Always the full known-model hint list, never scoped by `--models` — see the
-                                                // idle-mode handler's identical comment for why.
-                                                let models: Vec<Value> = listed_models().iter().map(|m| model_info(m)).collect();
-                                                let _ = self.out_tx.send(response(cid, "get_available_models", true, Some(json!({ "models": models })), None));
-                                            }
-                                            // A run is actively in flight — no retry backoff is pending yet
-                                            // (that only happens after an attempt fails, outside this loop),
-                                            // so there's nothing to cancel. Acknowledge idempotently, same
-                                            // as `abort`'s own idle-mode no-op below.
-                                            "abort_retry" => {
-                                                let _ = self.out_tx.send(response(cid, "abort_retry", true, None, None));
-                                            }
-                                            // pi-parity (Task 4): pi's real product has no busy/idle
-                                            // gating at all for these — `compact()`/`switchSession`/
-                                            // `newSession`/`fork` all call `abort()` unconditionally
-                                            // before replacing the session, with no check for whether a
-                                            // prompt is currently streaming. Mirrored here: cancel this
-                                            // run exactly like an explicit `abort` (same token), then
-                                            // queue the raw command to run its ordinary idle-path logic
-                                            // once the run has actually gone idle — see
-                                            // `pending_deferred`'s own doc comment above. No ack is sent
-                                            // here; the command's own idle-path response (sent once
-                                            // idle, below) doubles as it, same as `abort`'s own deferred
-                                            // ack just above.
-                                            "compact" | "switch_session" | "fork" | "clone"
-                                            | "new_session" => {
-                                                cancel.cancel();
-                                                pending_deferred.push((cid, c.clone()));
-                                            }
-                                            events_cmd if events_cmd.starts_with("mcp_events_") => dispatch_events(&self.events_cmds, &self.out_tx, cid, events_cmd, &c),
-                                            other => {
-                                                let _ = self.out_tx.send(response(cid, other, false, None, Some("busy: a prompt is running; only `abort`/`abort_retry`/`steer`/`follow_up`, `compact`/`switch_session`/`fork`/`clone`/`new_session` (which self-abort-and-proceed), or a handful of read-only commands (get_state/get_session_stats/get_messages/get_commands/list_branches/get_tree/list_sessions/list_all_sessions/get_available_models), are accepted")));
-                                            }
-                                        }
-                                    }
-                                    // stdin closed (or errored) mid-run: cancel and let the run unwind, then
-                                    // we'll fall out of the outer loop below.
-                                    None => {
-                                        stdin_open = false;
-                                        cancel.cancel();
-                                    }
-                                },
-                                _ = async {
-                                    match heartbeat.as_mut() {
-                                        Some(h) => {
-                                            h.tick().await;
-                                        }
-                                        None => std::future::pending::<()>().await,
-                                    }
-                                } => {
-                                    if let Some(life) = &life_beat {
-                                        life.heartbeat();
-                                    }
-                                }
-                            }
-                        }
-                    };
-                    // Do **not** clear `running` here. The attempt's future has resolved, but the
-                    // prompt may still retry (backoff below) or emit its terminal response; an HTTP
-                    // POST that already unpinned on the ack would otherwise be reapable in that gap.
-                    // Cleared after `emit!(frame)` once the command is actually done.
-
-                    // Fix 4: the run has now actually gone idle — `run_events_steered`'s future only
-                    // resolves once the whole run (including tool cleanup) has stopped touching
-                    // `session` — so it's safe to tell a client-issued `abort` it can now send its next
-                    // command without racing this busy-loop's own "still draining" rejection above.
-                    for cid in pending_abort_acks.drain(..) {
-                        let _ = self.out_tx.send(response(cid, "abort", true, None, None));
-                    }
-                    // Steers still waiting on a skill belong to this run, which is over: cancel them
-                    // (before any `new_session`/`switch_session`/`fork`/`clone` waiting behind it runs)
-                    // and say so; anything ready behind them is queued in order.
-                    self.pending_steers
-                        .end_run(
-                            matches!(&attempt_result, Err(agent_core::Error::Cancelled)),
-                            &self.mcp_skills,
-                            &self.steering,
-                            &self.out_tx,
-                        )
-                        .await;
-                    while self.steer_done_rx.try_recv().is_ok() {}
-
-                    // A checkpoint sent right as the run above ended (see `agent_core::Agent`'s final,
-                    // unconditional post-run `checkpoint.checkpoint(session)`) races the `r = &mut run`
-                    // arm above under `biased` select: whichever is ready first wins, so a checkpoint
-                    // that arrived in the same instant the run itself completed can be left sitting in
-                    // `checkpoint_rx`'s buffer, undrained. Track (pi-parity fix, found via this crate's
-                    // own test suite going red): left alone, that stale message would only ever get
-                    // drained during some *later*, unrelated prompt's own inner loop — by which point an
-                    // intervening `new_session`/`switch_session`/`fork`/`switch_branch` may have already
-                    // swapped `persistence` onto a *different* session's store, so draining it there
-                    // would silently write *this* turn's content into that other session's file (and,
-                    // via `append_new`'s `messages.len() <= self.persisted` dedup guard, could mask that
-                    // later turn's own real content entirely). Discarded here, not persisted: the
-                    // unconditional `persist_blocking` right below is a strict superset of it for this
-                    // turn's own final state, and this must run *before* any later command gets a chance
-                    // to swap `persistence` out from under it.
-                    while self.checkpoint_rx.try_recv().is_ok() {}
-                    // MCP journal writes still queued belong to *this* session: persist them now,
-                    // before a deferred command can swap `persistence` (they would be dropped by the
-                    // session-id check, but this session would lose them).
-                    while let Ok((kind, data)) = self.mcp_task_rx.try_recv() {
-                        journal_mcp(&mut self.persistence, &kind, data);
-                    }
-
-                    // Whether this attempt is about to be retried. Decided *here*, before the persist
-                    // below, and reused verbatim as the retry arm's own guard — the two must not be
-                    // able to disagree, because the closing error record has to be dropped on the same
-                    // side of the persist in memory as it is on disk.
-                    if self.session.steps > steps_at_start {
-                        stalled_retries = 0;
-                    }
-                    let will_retry = matches!(&attempt_result, Err(e)
-                        if self.current_auto_retry
-                            && stdin_open
-                            && !cancel.is_cancelled()
-                            && stalled_retries < self.run_retry_policy.max_retries
-                            && crate::retry::is_retryable_whole_run(e));
-
-                    // The failed attempt's closing error record (`run_events_steered` always pushes one
-                    // on an `Err`-ending run) must not survive into the retry — this is the *same* run
-                    // resuming from scratch, not a client's own fresh prompt, so it has to be genuinely
-                    // invisible in the transcript rather than stacked under the retry's real response.
+                "prompt" => {
+                    // `output_schema` makes this prompt a callable function: the model must fill the schema
+                    // in via `structured_output` rather than answering in prose, and the validated payload
+                    // rides the terminal response's `data.structured_output`. Handled before the ack, so a
+                    // malformed schema is rejected outright rather than acknowledged and then failed.
                     //
-                    // Popped *before* the persist below, not after it. `SessionStore::append_new` is
-                    // keyed on a count (`messages.len() <= self.persisted` skips, and each append sets
-                    // `persisted = messages.len()`), so it has no way to notice the message list got
-                    // *shorter*: persisting N+1 messages and then shrinking to N desynced the two for
-                    // the rest of the session. The retry re-produced the assistant message, `len` was
-                    // back to N+1, the append early-returned, and that message was silently **never
-                    // written** — with the following `tool_result` then chaining onto the error record's
-                    // node instead. Nothing reconciles a shrink (`rewrite` is only reachable via
-                    // compaction/fork/branch), and the existing e2e coverage missed it entirely by
-                    // asserting against the live in-memory transcript rather than a reload.
-                    //
-                    // Kept rather than dropped: if the retry is cancelled during its backoff below, this
-                    // run ends here after all, and the record has to go back — it is the only thing
-                    // keeping the session's role alternation valid for whatever prompt comes next (see
-                    // `a_prompt_after_a_failed_run_does_not_double_push_a_user_turn` in `agent_core`;
-                    // there is no guard against a double-pushed `user` turn anywhere else).
-                    let mut withheld_error_record = None;
-                    if will_retry {
-                        withheld_error_record = self.session
-                            .messages
-                            .last()
-                            .filter(|m| m.error_message.is_some())
-                            .cloned();
-                        self.session.pop_error_record();
-                    }
-
-                    // Persist whatever this attempt produced (even a failed one may have committed a tool
-                    // round-trip or two before the error) before deciding whether to retry.
-                    {
-                        let (p, r) = persist_blocking(self.persistence.take_for_blocking(), self.session.clone()).await;
-                        self.persistence = p;
-                        persist_error = r.err().map(|e| e.to_string());
-                    }
-
-                    match &attempt_result {
-                        Err(e) if will_retry => {
-                            retry_attempt += 1;
-                            stalled_retries += 1;
-                            let delay = self.run_retry_policy.backoff(stalled_retries);
-                            let _ = self.out_tx.send(auto_retry_frame(
-                                id.clone(),
-                                stalled_retries,
-                                self.run_retry_policy.max_retries,
-                                delay.as_millis() as u64,
-                                &e.to_string(),
-                            ));
-                            // Race the backoff itself against `abort`/`abort_retry`/shutdown, instead
-                            // of a bare `sleep` no command can interrupt — no run is in flight during
-                            // this wait, so only those two commands (plus stdin closing) are accepted;
-                            // anything else is rejected as busy, the same shape the live-run busy-loop
-                            // uses. A cancelled retry surfaces the *real* underlying error that
-                            // triggered it (`attempt_result`, set below), not a synthetic
-                            // `Error::Cancelled` — nothing was actually cancelled mid-flight, the
-                            // automatic retry was just declined.
-                            let mut retry_cancelled = false;
-                            let sleep = tokio::time::sleep(delay);
-                            tokio::pin!(sleep);
-                            loop {
-                                tokio::select! {
-                                    biased;
-                                    () = &mut sleep => break,
-                                    sig = self.shutdown.wait() => {
-                                        self.shutdown_cause = Some(sig);
-                                        stdin_open = false;
-                                        retry_cancelled = true;
-                                        break;
-                                    }
-                                    maybe_line = self.input_rx.recv(), if stdin_open => match maybe_line {
-                                        Some(l) => {
-                                            let l = l.trim();
-                                            if l.is_empty() {
-                                                continue;
-                                            }
-                                            let c: Value = match serde_json::from_str(l) {
-                                                Ok(v) => v,
-                                                Err(e) => {
-                                                    let _ = self.out_tx.send(response(None, "parse", false, None, Some(&format!("invalid JSON: {e}"))));
-                                                    continue;
-                                                }
-                                            };
-                                            let cid = c.get("id").and_then(Value::as_str).map(str::to_string);
-                                            let cmd_type = c.get("type").and_then(Value::as_str).unwrap_or("");
-                                            // Same gate as the live-run loop above: a refused command
-                                            // must not end the retry sequence a run is waiting on.
-                                            if let Some(why) = self.mode.refused_command(cmd_type)
-                                            {
-                                                let _ = self.out_tx.send(response(cid, cmd_type, false, None, Some(why)));
-                                                continue;
-                                            }
-                                            // Same as the live-run loop: in service mode a
-                                            // `fork`/`clone` has no reason to end the retry
-                                            // sequence this run is waiting on.
-                                            if let Some(why) = self.mode.busy_refusal_for_fork_clone(cmd_type, "retrying") {
-                                                let _ = self.out_tx.send(response(cid, cmd_type, false, None, Some(&why)));
-                                                continue;
-                                            }
-                                            match cmd_type {
-                                                "abort" | "abort_retry" => {
-                                                    retry_cancelled = true;
-                                                    let _ = self.out_tx.send(response(cid, cmd_type, true, None, None));
-                                                    break;
-                                                }
-                                                // pi-parity (Task 4): same self-abort-and-proceed
-                                                // treatment as the live-run busy-loop's own arm above —
-                                                // this backoff wait is still "a prompt is running" from
-                                                // the client's point of view. Ends the retry sequence
-                                                // (like `abort_retry`) and queues the command to run
-                                                // once idle, via the same `pending_deferred` drained
-                                                // right after this whole retry loop.
-                                                "compact" | "switch_session" | "fork" | "clone"
-                                                | "new_session" => {
-                                                    retry_cancelled = true;
-                                                    pending_deferred.push((cid, c.clone()));
-                                                    break;
-                                                }
-                                                "prompt" if crate::tools::mcp_events::is_injection(&c) => {
-                                                    self.deferred_events.push_back(l.to_string());
-                                                }
-                                                events_cmd if events_cmd.starts_with("mcp_events_") => dispatch_events(&self.events_cmds, &self.out_tx, cid, events_cmd, &c),
-                                                other => {
-                                                    let _ = self.out_tx.send(response(cid, other, false, None, Some("busy: retrying after a transient error; only `abort`/`abort_retry`/`compact`/`switch_session`/`fork`/`clone`/`new_session` are accepted")));
-                                                }
-                                            }
-                                        }
-                                        None => {
-                                            stdin_open = false;
-                                            retry_cancelled = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            if retry_cancelled {
-                                // No retry after all — this run ends on the attempt that just failed,
-                                // so the closing error record withheld above has to go back, in memory
-                                // *and* on disk. Without it the session's last message is the user's own
-                                // unanswered prompt, and the next `prompt` would stack a second
-                                // consecutive `user` turn, a shape no dialect accepts. A plain append
-                                // (never a compacted rewrite): any compaction this attempt performed was
-                                // already written by the persist above, and this only adds one message
-                                // on top of it.
-                                if let Some(record) = withheld_error_record.take() {
-                                    self.session.push(record);
-                                    let (p, r) =
-                                        persist_blocking(self.persistence.take_for_blocking(), self.session.clone()).await;
-                                    self.persistence = p;
-                                    if let Err(e) = r {
-                                        persist_error = Some(e.to_string());
-                                    }
-                                }
-                                let _ = self.out_tx.send(auto_retry_end_frame(
-                                    id.clone(),
-                                    false,
-                                    retry_attempt,
-                                    Some("retry cancelled"),
-                                ));
-                                break 'retry attempt_result;
-                            }
-                            continue 'retry;
-                        }
-                        _ => {
-                            // A terminal notice only for a sequence that actually retried at least
-                            // once — a first-attempt success or an immediately-non-retryable failure
-                            // never emitted `auto_retry`, so it needs no "the retries ended" notice
-                            // either. Mirrors pi's own `this._retryAttempt > 0` guard.
-                            if retry_attempt > 0 {
-                                let (success, final_error) = match &attempt_result {
-                                    Ok(_) => (true, None),
-                                    Err(e) => (false, Some(e.to_string())),
-                                };
-                                let _ = self.out_tx.send(auto_retry_end_frame(
-                                    id.clone(),
-                                    success,
-                                    retry_attempt,
-                                    final_error.as_deref(),
-                                ));
-                            }
-                            break 'retry attempt_result;
-                        }
-                    }
-                };
-
-                // The turn is over, however it ended: its yielded `bash` jobs (a foreground command
-                // that went quiet or kept printing) stop with it, as the stop reminder told the model
-                // — an idle session must not accumulate hung loops. Intended jobs keep running. Said
-                // to the client before the terminal response, like `run`'s `--json` line.
-                let stopped_jobs = {
-                    let jobs = self.bash_jobs.clone();
-                    tokio::task::spawn_blocking(move || jobs.end_turn())
-                        .await
-                        .unwrap_or_default()
-                };
-                if !stopped_jobs.is_empty()
-                    && !self.emit(OutFrame::Value(json!({
-                        "type": "bash_jobs_stopped",
-                        "jobs": stopped_jobs,
-                    }))) { break; }
-
-                let frame = match result {
-                    Ok(()) => {
-                        let mut data =
-                            session_stats(&self.session, &compaction_config(&self.cfg, &self.current_model));
-                        if let Value::Object(m) = &mut data {
-                            m.insert("refused".into(), json!(refused.load(Ordering::Relaxed)));
-                            // Present exactly when this prompt asked for typed output, so a client can
-                            // tell "the model never produced a payload" (`null`) apart from "this run
-                            // wasn't asked for one" (field absent) — the same reason `refused` is always
-                            // present rather than only when true. Read after the run has fully drained,
-                            // so a mixed batch (`structured_output` + `edit` in one turn, which the
-                            // loop's unanimous-terminate rule lets continue) reports the final value.
-                            if self.current_output_spec.is_some() {
-                                m.insert(
-                                    "structured_output".into(),
-                                    self.output_slot.get().unwrap_or(Value::Null),
-                                );
-                            }
-                        }
-                        match &persist_error {
-                            // The run itself succeeded, but its transcript failed to durably persist —
-                            // report failure rather than a false success (still with `data`: the run
-                            // did produce a real result, just not one safely on disk yet).
-                            Some(e) => response(
-                                id.clone(),
-                                "prompt",
-                                false,
-                                Some(data),
-                                Some(&format!("run completed but failed to persist: {e}")),
-                            ),
-                            None => response(id.clone(), "prompt", true, Some(data), None),
-                        }
-                    }
-                    Err(ref e) => response(id.clone(), "prompt", false, None, Some(&e.to_string())),
-                };
-                if let Some(life) = &life {
-                    let summary = crate::lifecycle::closing_summary(&self.session);
-                    let structured = self.current_output_spec
-                        .is_some()
-                        .then(|| self.output_slot.get().unwrap_or(Value::Null));
-                    let refused_now = refused.load(Ordering::Relaxed);
-                    match &result {
-                        Ok(()) => match &persist_error {
-                            Some(e) => life.failed(
-                                self.session.steps,
-                                format!("run completed but failed to persist: {e}"),
-                                refused_now,
-                                summary,
-                                structured,
-                            ),
-                            None => life.succeeded(self.session.steps, refused_now, summary, structured),
-                        },
-                        Err(agent_core::Error::Cancelled) => {
-                            life.aborted(self.session.steps, summary);
-                        }
+                    // Installing (or removing, or changing) a schema changes both the *tool set* and the
+                    // system-prompt section that tells the model to use it, so both are rebuilt — through
+                    // the very same `build_agent` path `set_model` already uses. A prompt repeating the
+                    // schema it already had rebuilds nothing.
+                    match parse_output_spec(&cmd) {
                         Err(e) => {
-                            life.failed(self.session.steps, e.to_string(), false, summary, structured);
-                        }
-                    }
-                }
-                if !self.emit(frame) { break; }
-
-                // Name the session, once, from the exchange that just happened.
-                //
-                // **After `emit!(frame)`**, deliberately: this is a second model call, and running
-                // it before the response would charge its latency to the client's first turn for a
-                // decoration. The `SessionNamed` lifecycle event is its own event rather than a
-                // field on the terminal one precisely so it can arrive a moment later without
-                // anything depending on the order.
-                //
-                // Only after a run that succeeded *and* persisted: a title describes what a session
-                // turned out to be about, and there is nothing to describe about a first turn that
-                // failed. Generated once and never regenerated — a session is about what it was
-                // opened for, and re-titling it later would make it change names underneath whoever
-                // was looking for it.
-                //
-                // Best-effort at every step. A session that works without a name is worth more than
-                // one that fails because a decoration could not be generated, so a model error, a
-                // refusal, or an unusable reply all leave the title exactly as it was: absent.
-                // No store means `set_title` is a no-op, so the call could only ever be waste.
-                if self.persistence.store.is_some()
-                    && matches!(result, Ok(()))
-                    && persist_error.is_none()
-                    && self.persistence.meta.title.is_none()
-                    && self.title_attempted_for.as_deref() != Some(self.persistence.meta.id.as_str())
-                    && !self.session.messages.is_empty()
-                {
-                    self.title_attempted_for = Some(self.persistence.meta.id.clone());
-                    match self.agent.title_for(&self.session.messages, &cancel).await {
-                        Ok(Some(title)) => {
-                            if let Err(e) = self.persistence.set_title(&title) {
-                                eprintln!(
-                                    "serve: could not persist the generated session title: {e}"
-                                );
-                            }
-                            // Announced whether or not it persisted: the consumer's catalog is a
-                            // separate copy, and a title that reached one of the two is better than
-                            // a title that reached neither.
-                            if let Some(life) = &life {
-                                life.named(title);
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => eprintln!("serve: could not generate a session title: {e}"),
-                    }
-                }
-
-                // A batch is delivered only once the model has it in a transcript that persisted:
-                // the run's own prompt when the run did not fail (an abort still leaves the prompt
-                // in the transcript the next run reads); a steered one exactly when the run's
-                // `Steered` event reported it (already recorded then — see the `Steered` arm above)
-                // — an abort clears the steer lane (`clear_run_scoped`) before the model sees what
-                // is queued there. Everything else goes back to pending, to be injected again.
-                if let Some(hub) = &self.mcp_events
-                    && (own_injection.is_some() || !steered_injections.is_empty())
-                {
-                    let run_ok = persist_error.is_none()
-                        && matches!(result, Ok(()) | Err(agent_core::Error::Cancelled));
-                    let (mut delivered, mut returned) = (Vec::new(), Vec::new());
-                    if let Some(b) = own_injection {
-                        if run_ok {
-                            delivered.push(b)
-                        } else {
-                            returned.push(b)
-                        }
-                    }
-                    // A steered batch the model received has already left the pending queue (see
-                    // `receipts_sink`); returning it is a no-op. One it never received — an abort
-                    // cleared the steer lane — goes back to pending.
-                    returned.append(&mut steered_injections);
-                    hub.finish_run(&delivered, &returned).await;
-                }
-                if self.running.swap(false, Ordering::Relaxed)
-                    && let Some(m) = &self.cfg.metrics
-                {
-                    m.runs_in_flight.dec();
-                }
-                // pi-parity (Task 4): this run has now actually gone idle (same guarantee
-                // `pending_abort_acks` relies on above) and its own terminal response has just been
-                // sent — run each command that arrived mid-run and self-aborted-and-proceeded through
-                // its ordinary idle-path logic now, in the order received. Exactly what a client
-                // manually sending `abort`, waiting for the response, then retrying the command would
-                // have produced, minus the extra round trip.
-                for (dcid, dcmd) in pending_deferred.drain(..) {
-                    match dcmd.get("type").and_then(Value::as_str).unwrap_or("") {
-                        "new_session" => self.do_new_session(&dcmd, dcid).await,
-                        "switch_session" => self.do_switch_session(&dcmd, dcid).await,
-                        "fork" => self.do_fork(&dcmd, dcid).await,
-                        "clone" => self.do_clone(dcid).await,
-                        "compact" => {
-                            if !self.do_compact(&dcmd, dcid).await {
-                                stdin_open = false;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                if !stdin_open {
-                    break;
-                }
-            }
-            // Reachable while idle (a mid-run `steer`/`follow_up` is handled inside the `prompt` arm's
-            // own busy-loop above, which shares this same persistent `steering` handle) — queues for
-            // whichever `prompt` runs next, rather than being rejected as an unknown command just
-            // because nothing is in flight *yet*.
-            cmd_type @ ("steer" | "follow_up") => {
-                match cmd.get("message").and_then(Value::as_str) {
-                    Some(m) => {
-                        let m = expand_message(m, &self.skills, &self.prompt_templates, &self.mcp_skills).await;
-                        let m =
-                            agent_core::SteeringMessage::new(m, parse_images(cmd.get("images")));
-                        let queued = if cmd_type == "steer" {
-                            self.steering.push_steer(m)
-                        } else {
-                            self.steering.push(m)
-                        };
-                        // Fix 5 (pi-parity gap): see `queue_content`'s own doc comment. A lane at its
-                        // cap refuses the message; the ack reports that rather than claiming it queued.
-                        if !self.emit(response(
-                            id,
-                            cmd_type,
-                            queued,
-                            Some(queue_content(&self.steering)),
-                            (!queued).then_some(STEERING_QUEUE_FULL)
-                        )) { break; }
-                    }
-                    None => if !self.emit(response(
-                        id,
-                        cmd_type,
-                        false,
-                        None,
-                        Some("missing `message`")
-                    )) { break; },
-                }
-            }
-            "abort" => {
-                // No run is in flight (a mid-run abort is handled inside the `prompt` arm above), so
-                // the only work to cancel is a view's bridge requests — acknowledge idempotently.
-                crate::tools::mcp_apps::cancel_requests(&self.mcp_enabled);
-                if !self.emit(response(id, "abort", true, None, None)) { break; }
-            }
-            "abort_retry" => {
-                // Same idea as `abort` above: interrupting a pending whole-run-retry backoff only
-                // means something while a `prompt` is between attempts (handled inside that arm's own
-                // retry loop) — idle, there's no backoff in progress to cancel.
-                if !self.emit(response(id, "abort_retry", true, None, None)) { break; }
-            }
-            "stop_after_turn" => {
-                // No run is in flight, so there is no turn boundary to stop at. Unlike `steer`/
-                // `follow_up`, deliberately *not* forwarded to `steering.request_stop()` here: that
-                // would silently cut the *next* `prompt` off after its first turn, surprising a client
-                // that sent this expecting to affect a run that no longer exists. Acknowledge as a
-                // no-op instead, matching `abort`'s idle behavior.
-                if !self.emit(response(id, "stop_after_turn", true, None, None)) { break; }
-            }
-            "switch_model" => {
-                // No run is in flight, so there is no next turn to retarget — changing the model while
-                // idle is `set_model`'s job (it takes effect immediately, on the very next `prompt`).
-                // Acknowledge as a no-op rather than silently queuing a switch that would surprise a
-                // later, unrelated run, matching `stop_after_turn`'s idle behavior.
-                if !self.emit(response(
-                    id,
-                    "switch_model",
-                    true,
-                    Some(json!({ "note": "no run in flight; use set_model instead" })),
-                    None
-                )) { break; }
-            }
-            "set_exec_endpoint" => {
-                // Point *this session's* tools at an exec endpoint, or clear it back to the host.
-                //
-                // Per-session rather than per-process because that is what a multi-tenant server
-                // needs: one machine per tenant, established when the session is set up and torn down
-                // with it. It takes effect on the very next tool call — the tools read the cell rather
-                // than capturing a target — so no registry rebuild is involved and none can be missed.
-                let url = cmd.get("url").and_then(Value::as_str);
-                let exec_cmd = cmd.get("command").and_then(Value::as_str);
-                let headers: Vec<String> = cmd
-                    .get("headers")
-                    .and_then(Value::as_array)
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let outcome = match (url, exec_cmd) {
-                    (Some(_), Some(_)) => Err("give `url` or `command`, not both".to_string()),
-                    (Some(u), None) => crate::exec_endpoint::ExecTarget::http(
-                        u,
-                        &headers,
-                        self.cfg.exec_max_response_bytes,
-                    )
-                    .await
-                    .map(Some),
-                    (None, Some(c)) => crate::exec_endpoint::ExecTarget::template(c)
-                        .await
-                        .map(Some),
-                    // Neither: detach, back to this host. Explicit rather than an error so a client
-                    // can hand a session back to local execution without tearing it down.
-                    (None, None) => Ok(None),
-                };
-                match outcome {
-                    Ok(target) => {
-                        let engine = target
-                            .as_ref()
-                            .map(|t| format!("{:?}", t.search_engine()))
-                            .unwrap_or_else(|| "local".to_string());
-                        // Recorded on the session header so a resume reattaches rather than silently
-                        // falling back to the host — which for a sandboxed session would move the
-                        // tenant's work onto the server.
-                        self.persistence.set_exec_endpoint(if target.is_some() {
-                            Some(json!({
-                                "url": url,
-                                "command": exec_cmd,
-                                "headers": headers,
-                            }))
-                        } else {
-                            None
-                        });
-                        self.exec_cell.set(target);
-                        if !self.emit(response(
-                            id,
-                            "set_exec_endpoint",
-                            true,
-                            Some(
-                                json!({ "attached": url.is_some() || exec_cmd.is_some(), "engine": engine })
-                            ),
-                            None
-                        )) { break; }
-                    }
-                    Err(e) => if !self.emit(response(id, "set_exec_endpoint", false, None, Some(&e))) { break; },
-                }
-            }
-            "set_mcp_enabled" => {
-                // Session-scoped MCP kit: which configured servers' tools are advertised.
-                //
-                // - omit `servers` / `servers: null` → all configured servers enabled (default)
-                // - `servers: []` → none (MCP tools gone from the registry)
-                // - `servers: ["a","b"]` → only those names
-                //
-                // Unknown names are rejected so a typo cannot silently empty the kit. Takes effect on
-                // the next model turn via an `Agent` rebuild (idle) — same shape as `set_model`.
-                let configured =
-                    crate::tools::mcp::server_names_from_tools(&self.cfg.mcp_tools.snapshot());
-                let outcome = match cmd.get("servers") {
-                    None | Some(Value::Null) => {
-                        self.mcp_enabled.set(None);
-                        Ok(json!({
-                            "mode": "all",
-                            "enabled": configured.clone(),
-                            "configured": configured,
-                        }))
-                    }
-                    Some(Value::Array(arr)) => {
-                        let mut names = std::collections::HashSet::new();
-                        let mut unknown = Vec::new();
-                        let mut bad_entry = false;
-                        for v in arr {
-                            let Some(name) = v.as_str() else {
-                                bad_entry = true;
+                            if !self.emit(response(id, "prompt", false, None, Some(&e))) {
                                 break;
-                            };
-                            if configured.iter().any(|c| c == name) {
-                                names.insert(name.to_string());
-                            } else {
-                                unknown.push(name.to_string());
                             }
-                        }
-                        if bad_entry {
-                            Err("`servers` entries must be strings".into())
-                        } else if !unknown.is_empty() {
-                            Err(format!(
-                                "unknown MCP server(s): {}; configured: {}",
-                                unknown.join(", "),
-                                if configured.is_empty() {
-                                    "(none)".into()
-                                } else {
-                                    configured.join(", ")
-                                }
-                            ))
-                        } else {
-                            let enabled: Vec<String> = {
-                                let mut v: Vec<_> = names.iter().cloned().collect();
-                                v.sort();
-                                v
-                            };
-                            self.mcp_enabled.set(Some(names));
-                            Ok(json!({
-                                "mode": "allowlist",
-                                "enabled": enabled,
-                                "configured": configured,
-                            }))
-                        }
-                    }
-                    Some(_) => Err("`servers` must be an array of server names, or null".into()),
-                };
-                match outcome {
-                    Ok(data) => {
-                        self.agent = build_agent(
-                            &self.exec_cell,
-                            self.client.clone(),
-                            &full_system(&self.static_system, &self.cwd, &self.mcp_skills),
-                            &self.cfg,
-                            &self.current_model,
-                            self.current_thinking,
-                            self.current_level,
-                            self.current_auto_compaction,
-                            self.current_auto_retry,
-                            self.current_block_images,
-                            self.current_image_auto_resize,
-                            self.persistence.session_id(),
-                            &self.write_locks,
-                            &self.checkpoint,
-                            self.subagent_ctx.as_ref(),
-                            self.structured_output.as_ref(),
-                            self.memory_tool.as_ref(),
-                            self.approval.as_ref(),
-                            &self.mcp_enabled,
-                            &self.skills,
-                        );
-                        if !self.emit(response(id, "set_mcp_enabled", true, Some(data), None)) { break; }
-                    }
-                    Err(e) => if !self.emit(response(id, "set_mcp_enabled", false, None, Some(&e))) { break; },
-                }
-            }
-            "get_mcp" => {
-                let configured =
-                    crate::tools::mcp::server_names_from_tools(&self.cfg.mcp_tools.snapshot());
-                let snapshot = self.mcp_enabled.snapshot();
-                let (mode, enabled) = match &snapshot {
-                    None => ("all".to_string(), configured.clone()),
-                    Some(set) => {
-                        let mut v: Vec<_> = set.iter().cloned().collect();
-                        v.sort();
-                        ("allowlist".to_string(), v)
-                    }
-                };
-                // `names`, not `definitions`: a tool deferred behind `tool_search` is still loaded.
-                let tools: Vec<String> = build_tools(
-                    &self.cfg,
-                    self.cfg.image_auto_resize,
-                    &self.exec_cell,
-                    &self.mcp_enabled,
-                    &self.skills,
-                    None,
-                )
-                .names()
-                .into_iter()
-                .filter(|n| n.starts_with("mcp__"))
-                .collect();
-                let catalogs = self.cfg.mcp_catalog.filter_enabled(&self.mcp_enabled);
-                let resources: Vec<_> = catalogs
-                    .iter()
-                    .flat_map(|s| s.resources.iter().cloned())
-                    .collect();
-                let prompts: Vec<_> = catalogs
-                    .iter()
-                    .flat_map(|s| s.prompts.iter().cloned())
-                    .collect();
-                let servers: Vec<_> = catalogs
-                    .iter()
-                    .map(|s| {
-                        json!({
-                            "name": s.name,
-                            "protocol_version": s.protocol_version,
-                            "resources": s.resources.len(),
-                            "prompts": s.prompts.len(),
-                        })
-                    })
-                    .collect();
-                if !self.emit(response(
-                    id,
-                    "get_mcp",
-                    true,
-                    Some(json!({
-                        "mode": mode,
-                        "enabled": enabled,
-                        "configured": configured,
-                        "tools": tools,
-                        "resources": resources,
-                        "prompts": prompts,
-                        "servers": servers,
-                        "apps": self.mcp_enabled.apps().map(|view| json!({
-                            "spec": crate::tools::mcp_apps::SPEC_REVISION,
-                            "servers": view.servers(),
-                        })),
-                    })),
-                    None
-                )) { break; }
-            }
-            "mcp_complete" => {
-                let Some(server) = cmd.get("server").and_then(Value::as_str) else {
-                    if !self.emit(response(
-                        id,
-                        "mcp_complete",
-                        false,
-                        None,
-                        Some("missing `server`")
-                    )) { break; }
-                    continue;
-                };
-                let Some(params_val) = cmd.get("params") else {
-                    if !self.emit(response(
-                        id,
-                        "mcp_complete",
-                        false,
-                        None,
-                        Some("missing `params` (CompleteRequestParams JSON)")
-                    )) { break; }
-                    continue;
-                };
-                let params: rmcp::model::CompleteRequestParams =
-                    match serde_json::from_value(params_val.clone()) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            if !self.emit(response(
-                                id,
-                                "mcp_complete",
-                                false,
-                                None,
-                                Some(&format!("invalid `params`: {e}"))
-                            )) { break; }
                             continue;
                         }
-                    };
-                match self.cfg.mcp_catalog.complete(server, params).await {
-                    Ok(result) => if !self.emit(response(
-                        id,
-                        "mcp_complete",
-                        true,
-                        Some(serde_json::to_value(result).unwrap_or(Value::Null)),
-                        None
-                    )) { break; },
-                    Err(e) => if !self.emit(response(id, "mcp_complete", false, None, Some(&e))) { break; },
-                }
-            }
-            "elicit" => {
-                if !self.emit(handle_elicit(id, &cmd, Some(&self.pending_elicitations))) { break; }
-            }
-            "sample" => {
-                if !self.emit(handle_sample(id, &cmd, &self.pending_samplings)) { break; }
-            }
-            "mcp_app_request" => spawn_app_request(id, cmd.clone(), &self.out_tx, &self.mcp_enabled, &self.app_filter, &self.approval, &self.app_detached, &self.mode, &self.mcp_host),
-            "set_mcp_apps" => {
-                // A client declares (or withdraws) that it renders MCP Apps for this session. The
-                // tool set changes, so — like `set_mcp_enabled` — the agent is rebuilt. Declaring
-                // answers once the apps connections have dialed, from a task of its own: the
-                // command loop never waits on a dial, and until it lands the session keeps its
-                // plain tools (a prompt rebuilds onto the apps flavor when it does).
-                match cmd.get("enabled").and_then(Value::as_bool) {
-                    Some(false) => {
-                        let mut epoch = lock_ignoring_poison(&self.apps_epoch);
-                        *epoch += 1;
-                        crate::tools::mcp_apps::close(&self.mcp_enabled, "mcp_apps_disabled");
-                        lock_ignoring_poison(&self.out_conn).clear_app_views();
-                        self.apps_generation = None;
-                        self.agent = build_agent(
-                            &self.exec_cell,
-                            self.client.clone(),
-                            &full_system(&self.static_system, &self.cwd, &self.mcp_skills),
-                            &self.cfg,
-                            &self.current_model,
-                            self.current_thinking,
-                            self.current_level,
-                            self.current_auto_compaction,
-                            self.current_auto_retry,
-                            self.current_block_images,
-                            self.current_image_auto_resize,
-                            self.persistence.session_id(),
-                            &self.write_locks,
-                            &self.checkpoint,
-                            self.subagent_ctx.as_ref(),
-                            self.structured_output.as_ref(),
-                            self.memory_tool.as_ref(),
-                            self.approval.as_ref(),
-                            &self.mcp_enabled,
-                            &self.skills,
-                        );
-                        if !self.emit(response(
-                            id,
-                            "set_mcp_apps",
-                            true,
-                            Some(json!({ "enabled": false })),
-                            None
-                        )) { break; }
-                        drop(epoch);
-                    }
-                    Some(true) => match crate::tools::mcp_apps::configure(
-                        self.cfg.mcp_apps.as_ref(),
-                        &self.mcp_enabled,
-                        &cmd,
-                        self.cfg.no_tools,
-                        self.app_sink.clone(),
-                        self.app_redact.clone(),
-                        lock_ignoring_poison(&self.out_conn).app_view_servers(),
-                    ) {
-                        Ok(pool) => {
-                            self.apps_generation = self.mcp_enabled.apps().map(|view| view.generation());
+                        Ok(spec) if spec != self.current_output_spec => {
+                            self.structured_output = match &spec {
+                                Some((schema, description)) => {
+                                    match crate::tools::structured_output::StructuredOutput::new(
+                                        schema.clone(),
+                                        description.clone(),
+                                        self.output_slot.clone(),
+                                    ) {
+                                        Ok(tool) => Some(Arc::new(tool)),
+                                        Err(e) => {
+                                            if !self.emit(response(
+                                                id,
+                                                "prompt",
+                                                false,
+                                                None,
+                                                Some(&e),
+                                            )) {
+                                                break;
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                }
+                                None => None,
+                            };
+                            self.current_output_spec = spec;
+                            self.memory_sections =
+                                crate::memory::mount_sections(&self.mounts).await;
+                            self.static_system =
+                                crate::resources::build_static_system_prompt_with_context(
+                                    &crate::resources::PromptOptions {
+                                        base: self.sandbox_system.as_deref(),
+                                        default_base: &self.cfg.system,
+                                        append: self
+                                            .cfg
+                                            .append_system
+                                            .as_deref()
+                                            .or(self.sandbox_append.as_deref()),
+                                        cwd: &self.cwd,
+                                        include_context_files: self.cfg.context_files,
+                                        skills: &self.skills,
+                                        context_window: agent_core::capabilities(&self.cfg.model)
+                                            .context_window,
+                                        has_read: self.has_read,
+                                        has_todo: self.has_todo,
+                                        has_structured_output: self.structured_output.is_some(),
+                                        has_memory: self.has_memory,
+                                        memory_sections: &self.memory_sections,
+                                        project_trusted: self.project_trusted,
+                                        agents: &self.cfg.agents,
+                                        disk_overrides: self.disk_overrides,
+                                    },
+                                    &self.context_files,
+                                );
                             self.agent = build_agent(
                                 &self.exec_cell,
                                 self.client.clone(),
@@ -7066,2222 +4760,1712 @@ impl SessionLoop {
                                 &self.mcp_enabled,
                                 &self.skills,
                             );
-                            let out_tx = self.out_tx.clone();
-                            let mode = self.mode.clone();
-                            let epoch = self.apps_epoch.clone();
-                            let mine = {
-                                let mut e = lock_ignoring_poison(&self.apps_epoch);
-                                *e += 1;
-                                *e
-                            };
-                            tokio::spawn(async move {
-                                let status = pool.ensure().await;
-                                let current = lock_ignoring_poison(&epoch);
-                                let frame = if *current == mine {
-                                    response(
-                                        id,
-                                        "set_mcp_apps",
-                                        true,
-                                        Some(crate::tools::mcp_apps::configured(status)),
-                                        None,
-                                    )
-                                } else {
-                                    response(
-                                        id,
-                                        "set_mcp_apps",
-                                        false,
-                                        None,
-                                        Some(
-                                            "superseded: a later set_mcp_apps (or session switch) \
-                                             replaced this declaration",
-                                        ),
-                                    )
-                                };
-                                let _ = out_tx.send(redact_frame(&mode, frame));
-                                drop(current);
-                            });
                         }
-                        Err(e) => if !self.emit(response(id, "set_mcp_apps", false, None, Some(&e))) { break; },
-                    },
-                    None => if !self.emit(response(
-                        id,
-                        "set_mcp_apps",
-                        false,
-                        None,
-                        Some("missing boolean `enabled`")
-                    )) { break; },
-                }
-            }
-            // Test-only, in debug builds and only with `BEYOND_AI_AGENT_TEST_PANICS` set: panic right
-            // here, inside the session loop, so the way a panic leaves `serve` can be tested.
-            #[cfg(debug_assertions)]
-            "__test_panic" if std::env::var_os("BEYOND_AI_AGENT_TEST_PANICS").is_some() => {
-                #[allow(clippy::panic)]
-                {
-                    panic!("test panic requested inside serve");
-                }
-            }
-            "get_state" => {
-                let mut data = session_stats(&self.session, &compaction_config(&self.cfg, &self.current_model));
-                if let Value::Object(m) = &mut data {
-                    insert_session_identity(m, &self.persistence, &self.mode);
-                    m.insert("model".into(), json!(self.current_model));
-                    m.insert("message_count".into(), json!(self.session.messages.len()));
-                    m.insert("title".into(), json!(self.persistence.meta.title));
-                    // Never stale in service mode: the recorded cwd *is* `workspace_root`, and the
-                    // staleness check stats the path — on the replica, where it doesn't exist.
-                    m.insert(
-                        "cwd_stale".into(),
-                        json!(self.mode.cwd_is_stale(&self.persistence.meta.cwd, &self.cwd)),
-                    );
-                    // Task #25 (pi-parity fix): the directory (and, best-effort, branch) the agent's
-                    // tools are actually operating against — the live process `cwd`, not
-                    // `persistence.meta.cwd` (already separately surfaced via `cwd_stale` when the two
-                    // disagree), since that's what a remote client with no shared filesystem needs to
-                    // know. See `git_branch`'s own doc comment for why a lookup failure is `null`, not
-                    // an error.
-                    m.insert("cwd".into(), json!(self.cwd.display().to_string()));
-                    // In service mode the lookup runs **in the sandbox**, through this session's own
-                    // runner: `cwd` is a sandbox path, so asking this host about it would either fail
-                    // or — worse — answer about the replica's own checkout.
-                    m.insert(
-                        "git_branch".into(),
-                        json!(self.mode.git_branch(&self.exec_cell, &self.cwd).await),
-                    );
-                    // Both hardcoded, not stale placeholders: no `prompt`/compaction can possibly be
-                    // in flight here at all — this arm only ever runs from the idle main loop, which
-                    // processes one command to completion before reading the next, so there is no
-                    // concurrently-running turn or compaction this response could be racing.
-                    m.insert("is_streaming".into(), json!(false));
-                    m.insert("is_compacting".into(), json!(false));
-                    // Same reasoning as `is_streaming`/`is_compacting` above: idle means nothing is
-                    // dispatching a tool call either.
-                    m.insert("pending_tool_ids".into(), json!(Vec::<String>::new()));
-                    if let Value::Object(rt) = runtime_settings(
-                        self.current_level,
-                        self.current_auto_compaction,
-                        self.current_auto_retry,
-                        self.current_block_images,
-                        self.current_image_auto_resize,
-                        &self.steering,
-                    ) {
-                        m.extend(rt);
+                        Ok(_) => {}
                     }
-                }
-                if !self.emit(response(id, "get_state", true, Some(data), None)) { break; }
-            }
-            "get_messages" => {
-                // Idle: `session` is ours to read. The busy loop answers the same command from the
-                // fanout's committed-history snapshot instead (the run holds `&mut session`), through
-                // this same [`messages_payload`] — one payload shape either way.
-                let msg_ids = self.persistence.active_ids();
-                match messages_payload(
-                    &self.session.messages,
-                    msg_ids,
-                    cmd.get("since").and_then(Value::as_str),
-                ) {
-                    Ok(data) => if !self.emit(response(id, "get_messages", true, Some(data), None)) { break; },
-                    Err(e) => if !self.emit(response(id, "get_messages", false, None, Some(&e))) { break; },
-                }
-            }
-            "new_session" => self.do_new_session(&cmd, id).await,
-            "list_sessions" => {
-                let progress_id = id.clone();
-                let progress_tx = self.out_tx.clone();
-                let sessions = self.persistence
-                    .list_with_progress(&self.mode, move |scanned, total| {
-                        if should_report_scan_progress(scanned, total) {
-                            let _ = progress_tx.send(list_progress_frame(
-                                progress_id.clone(),
-                                "list_sessions",
-                                scanned,
-                                total,
-                            ));
-                        }
-                    })
-                    .await;
-                if !self.emit(response(
-                    id,
-                    "list_sessions",
-                    true,
-                    Some(listing_page(sessions, &cmd)),
-                    None,
-                )) { break; }
-            }
-            "list_all_sessions" => {
-                let progress_id = id.clone();
-                let progress_tx = self.out_tx.clone();
-                match self.persistence
-                    .list_all_with_progress(&self.mode, move |scanned, total| {
-                        if should_report_scan_progress(scanned, total) {
-                            let _ = progress_tx.send(list_progress_frame(
-                                progress_id.clone(),
-                                "list_all_sessions",
-                                scanned,
-                                total,
-                            ));
-                        }
-                    })
-                    .await
-                {
-                    Ok(sessions) => {
+                    // A previous prompt's answer must never be mistaken for this one's.
+                    self.output_slot.clear();
+                    // Refresh the cheap, time-varying part of the system prompt (the date) every turn —
+                    // the expensive discovery-based static half only changes on `set_model`/`set_thinking`/
+                    // `reload`, so it's cached rather than recomputed here.
+                    // A skills listing whose `ttlMs` ran out, or that a server said changed, is re-listed
+                    // now — when it is needed — so a skill published after connect is offered this turn.
+                    self.mcp_skills.refresh().await;
+                    // The session may be one this process never ran (a switch, a fork, a restart) whose
+                    // transcript still holds an MCP skill's SKILL.md: the model is acting on it, so the
+                    // code-execution gate must be too.
+                    self.mcp_enabled
+                        .skill_session()
+                        .restore_from_transcript(&self.session.messages);
+                    // The session's MCP Apps connections moved since the agent was built (an apps dial
+                    // landed, or went into backoff): rebuild, so this turn advertises what is up now.
+                    let apps_generation_now = self.mcp_enabled.apps().map(|view| view.generation());
+                    // Likewise a server re-listed its tools since then.
+                    let mcp_tools_now = self.cfg.mcp_tools.generation();
+                    if apps_generation_now != self.apps_generation
+                        || mcp_tools_now != self.mcp_tools_generation
+                    {
+                        self.apps_generation = apps_generation_now;
+                        self.mcp_tools_generation = mcp_tools_now;
+                        self.agent = build_agent(
+                            &self.exec_cell,
+                            self.client.clone(),
+                            &full_system(&self.static_system, &self.cwd, &self.mcp_skills),
+                            &self.cfg,
+                            &self.current_model,
+                            self.current_thinking,
+                            self.current_level,
+                            self.current_auto_compaction,
+                            self.current_auto_retry,
+                            self.current_block_images,
+                            self.current_image_auto_resize,
+                            self.persistence.session_id(),
+                            &self.write_locks,
+                            &self.checkpoint,
+                            self.subagent_ctx.as_ref(),
+                            self.structured_output.as_ref(),
+                            self.memory_tool.as_ref(),
+                            self.approval.as_ref(),
+                            &self.mcp_enabled,
+                            &self.skills,
+                        );
+                    }
+                    // And one that changes them during this run reaches it at the next turn boundary.
+                    self.steering
+                        .set_tool_source(Some(crate::tools::mcp::tool_source(
+                            self.cfg.mcp_tools.clone(),
+                            self.mcp_enabled.clone(),
+                            self.mcp_tools_generation,
+                            self.mcp_filter.clone(),
+                        )));
+                    self.agent.set_system(full_system(
+                        &self.static_system,
+                        &self.cwd,
+                        &self.mcp_skills,
+                    ));
+                    // A `prompt` with no (or non-string) `message` is a malformed command: running an
+                    // empty user turn would spend a model call on nothing and still report success.
+                    let Some(message) = cmd.get("message").and_then(Value::as_str) else {
                         if !self.emit(response(
                             id,
-                            "list_all_sessions",
-                            true,
-                            Some(listing_page(sessions, &cmd)),
-                            None,
-                        )) { break; }
-                    }
-                    Err(e) => if !self.emit(response(
-                        id,
-                        "list_all_sessions",
-                        false,
-                        None,
-                        Some(&e.to_string())
-                    )) { break; },
-                }
-            }
-            "switch_session" => self.do_switch_session(&cmd, id).await,
-            // Soft-deletes (moves to `.trash`) another session — never the one currently active, see
-            // `Persistence::delete`'s doc comment. Idempotent: deleting an absent (or already-deleted)
-            // session id is a successful no-op.
-            "delete_session" => match cmd.get("session_id").and_then(Value::as_str) {
-                Some(target) => match self.persistence.delete(&self.mode, target) {
-                    Ok(()) => {
-                        // A deleted session is ended: its jobs in this sandbox stop. (In another
-                        // sandbox they end with it — tearing that down is its owner's business.)
-                        crate::tools::bash_sandbox::wipe(
-                            self.exec_cell.runner(),
-                            &crate::exec_endpoint::jobs::JobScope::for_session(
-                                self.mode.tenant(),
-                                target,
-                            ),
-                        )
-                        .await;
-                        if !self.emit(response(id, "delete_session", true, None, None)) { break; }
-                    }
-                    Err(e) => if !self.emit(response(
-                        id,
-                        "delete_session",
-                        false,
-                        None,
-                        Some(&e.to_string())
-                    )) { break; },
-                },
-                None => if !self.emit(response(
-                    id,
-                    "delete_session",
-                    false,
-                    None,
-                    Some("missing `session_id`")
-                )) { break; },
-            },
-            // Minimal surface (Fix 7, pi-parity gap) over `delete_session`'s own `.trash/` soft-delete —
-            // nothing previously read, listed, restored from, or pruned it, so a mistaken delete was
-            // recoverable only by reaching for a shell. `list_trash` reports basic metadata
-            // (id/deleted_at/original_path — see `session_store::TrashEntry`); `restore_session` moves an
-            // entry back out. Deliberately not a full trash-management UI (no bulk purge, no age-based
-            // pruning) — a low-priority nice-to-have, not a core session-lifecycle feature.
-            "list_trash" => match self.persistence.list_trash(&self.mode) {
-                Ok(mut trash) => {
-                    // `original_path` is a replica mount path. The id is what `restore_session`
-                    // takes, so the path was only ever informational — redacted rather than dropped
-                    // so the shape of the response doesn't change per mode.
-                    if self.mode.redacts_host_paths() {
-                        for entry in &mut trash {
-                            entry.original_path = self.mode.redact(&entry.original_path);
-                        }
-                    }
-                    if !self.emit(response(
-                        id,
-                        "list_trash",
-                        true,
-                        Some(json!({ "trash": trash })),
-                        None,
-                    )) { break; }
-                }
-                Err(e) => if !self.emit(response(
-                    id,
-                    "list_trash",
-                    false,
-                    None,
-                    Some(&e.to_string())
-                )) { break; },
-            },
-            "restore_session" => match cmd.get("session_id").and_then(Value::as_str) {
-                Some(target) => match self.persistence.restore_session(&self.mode, target) {
-                    Ok(true) => if !self.emit(response(id, "restore_session", true, None, None)) { break; },
-                    Ok(false) => if !self.emit(response(
-                        id,
-                        "restore_session",
-                        false,
-                        None,
-                        Some(&format!("no trashed session {target}"))
-                    )) { break; },
-                    Err(e) => if !self.emit(response(
-                        id,
-                        "restore_session",
-                        false,
-                        None,
-                        Some(&e.to_string())
-                    )) { break; },
-                },
-                None => if !self.emit(response(
-                    id,
-                    "restore_session",
-                    false,
-                    None,
-                    Some("missing `session_id`")
-                )) { break; },
-            },
-            "fork" => self.do_fork(&cmd, id).await,
-            // pi's own `clone` — fork the current session at its current tip, with no arguments —
-            // exists there because pi's `fork` *requires* an explicit `entryId`; this crate's `fork`
-            // already defaults to exactly that (no `upto`/`target_id` given), so `clone` is a thin,
-            // deliberately-argument-free alias over the same call for a client speaking pi's protocol
-            // shape, not a second code path.
-            "clone" => self.do_clone(id).await,
-            "get_fork_messages" => {
-                // pi-compatible contract: no parameters, every user-turn entry across the WHOLE session
-                // tree — every branch, not just the active path — as a flat `{entry_id, text}` candidate
-                // list (pi's own `getUserMessagesForForking`), for a client to build a fork-point picker
-                // from and then feed one `entry_id` to `fork`'s own `target_id`/`fork_at_entry`. This is
-                // a listing, not a preview of any one fork's output — see `preview_fork` for that.
-                // Track (pi-parity fix): previously scoped to `persistence.active_ids()` only, so a
-                // message on a branch the session had already navigated away from (via `switch_branch`)
-                // never appeared as a fork candidate at all — empty (not an error) in pure in-memory mode,
-                // same as every other persistence-dependent listing here.
-                let candidates: Vec<Value> = self.persistence
-                    .all_user_messages()
-                    .iter()
-                    .filter_map(|(entry_id, m)| {
-                        user_message_text(m)
-                            .map(|text| json!({ "entry_id": entry_id, "text": text }))
-                    })
-                    .collect();
-                if !self.emit(response(
-                    id,
-                    "get_fork_messages",
-                    true,
-                    Some(json!({ "messages": candidates })),
-                    None,
-                )) { break; }
-            }
-            "preview_fork" => {
-                // A read-only preview of what `fork` would produce for `session_id` (default: the
-                // current session) at `upto` messages — no new session file, no switch. Lets a client
-                // browsing `list_sessions` show a fork point before committing to it. This crate's own
-                // extension beyond pi's protocol (previously misnamed `get_fork_messages`, colliding
-                // with pi's own same-named but differently-shaped command — see the module doc comment).
-                let target_id = cmd
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| self.persistence.session_id().to_string());
-                let upto = cmd
-                    .get("upto")
-                    .and_then(Value::as_u64)
-                    .map(|n| n as usize)
-                    .unwrap_or(usize::MAX);
-                let entry_id = cmd.get("target_id").and_then(Value::as_str);
-                // Same default as `fork` itself, above — a preview must match what `fork` would
-                // actually produce.
-                let before = cmd.get("before").and_then(Value::as_bool).unwrap_or(true);
-                match self.persistence.fork_messages(&self.mode, &target_id, upto, entry_id, before) {
-                    Ok(messages) => if !self.emit(response(
-                        id,
-                        "preview_fork",
-                        true,
-                        Some(json!({ "messages": messages })),
-                        None,
-                    )) { break; },
-                    Err(e) => if !self.emit(response(
-                        id,
-                        "preview_fork",
-                        false,
-                        None,
-                        Some(&e.to_string())
-                    )) { break; },
-                }
-            }
-            "export_html" => {
-                let output_path = cmd.get("output_path").and_then(Value::as_str);
-                let branches = self.persistence.abandoned_branches();
-                let events = self.persistence.export_events();
-                // `export_html_full` (Task #44 integration): this session's actual system prompt (the
-                // same static-plus-dynamic-footer join every `prompt` sends — see `full_system`) and
-                // tool set (`build_tools(&cfg)`, the same on-demand rebuild `has_read`/`bash_tool`
-                // already call elsewhere in this function rather than keeping a long-lived registry
-                // variable around), plus `session`'s own running token totals — previously omitted
-                // entirely via the plainer `export_html_with_entries`.
-                let system_prompt = full_system(&self.static_system, &self.cwd, &self.mcp_skills);
-                let registry = build_tools(
-                    &self.cfg,
-                    self.cfg.image_auto_resize,
-                    &self.exec_cell,
-                    &self.mcp_enabled,
-                    &self.skills,
-                    None,
-                );
-                let mut tool_defs = registry.definitions();
-                tool_defs.extend(registry.deferred_definitions());
-                let usage = crate::export::UsageTotals {
-                    input_tokens: self.session.input_tokens,
-                    output_tokens: self.session.output_tokens,
-                    cache_read_tokens: self.session.cache_read_tokens,
-                    cache_write_tokens: self.session.cache_write_tokens,
-                };
-                // Service mode returns the document **inline**: writing a file would put a whole
-                // transcript on the replica's disk (and hand the caller a host path to read it
-                // back), and there is no per-tenant filesystem here to write it to instead. An
-                // explicit `output_path` is refused rather than silently ignored.
-                if self.mode.exports_inline() {
-                    if output_path.is_some() {
-                        if !self.emit(response(
-                            id,
-                            "export_html",
+                            "prompt",
                             false,
                             None,
-                            Some(
-                                "refused in service mode: `output_path` writes to the replica's \
-                                  disk — omit it and read `data.html` from this response"
-                            ),
-                        )) { break; }
+                            Some("missing `message`"),
+                        )) {
+                            break;
+                        }
                         continue;
-                    }
-                    let html = crate::export::render_html_full(
-                        &self.persistence.meta,
-                        &self.session.messages,
-                        &branches,
-                        Some(usage),
-                        events,
-                        Some(&system_prompt),
-                        Some(&tool_defs),
-                    );
-                    if !self.emit(response(
-                        id,
-                        "export_html",
-                        true,
-                        Some(json!({ "html": html })),
-                        None,
-                    )) { break; }
-                    continue;
-                }
-                match crate::export::export_html_full(
-                    &self.persistence.meta,
-                    &self.session.messages,
-                    &branches,
-                    Some(usage),
-                    events,
-                    Some(&system_prompt),
-                    Some(&tool_defs),
-                    output_path,
-                ) {
-                    Ok(path) => if !self.emit(response(
-                        id,
-                        "export_html",
-                        true,
-                        Some(json!({ "path": path.to_string_lossy() })),
-                        None,
-                    )) { break; },
-                    Err(e) => if !self.emit(response(
-                        id,
-                        "export_html",
-                        false,
-                        None,
-                        Some(&e.to_string())
-                    )) { break; },
-                }
-            }
-            "set_session_name" => match cmd.get("title").and_then(Value::as_str) {
-                Some(title) => match self.persistence.set_title(title) {
-                    Ok(()) => {
-                        // pi: `session_info_changed` (`rpc-mode.ts:632-639`) — a push notification so a
-                        // client learns the final *sanitized* name (newlines collapsed, or cleared
-                        // entirely if the sanitized result is empty — see `sanitize_title`) without a
-                        // second `get_state` round trip. Sent as its own unsolicited frame (like
-                        // `list_progress`/`auto_retry` above) *and* echoed on the response's own `data`,
-                        // since unlike pi's multi-subscriber extension model this protocol has exactly
-                        // one client and the response is already the more direct notification path.
-                        let title = self.persistence.meta.title.clone();
-                        let _ = self.out_tx.send(session_info_changed_frame(id.clone(), title.clone()));
-                        if !self.emit(response(
-                            id,
-                            "set_session_name",
-                            true,
-                            Some(json!({ "title": title })),
-                            None,
-                        )) { break; }
-                    }
-                    Err(e) => if !self.emit(response(
-                        id,
-                        "set_session_name",
-                        false,
-                        None,
-                        Some(&e.to_string())
-                    )) { break; },
-                },
-                None => if !self.emit(response(
-                    id,
-                    "set_session_name",
-                    false,
-                    None,
-                    Some("missing `title`")
-                )) { break; },
-            },
-            "set_label" => match cmd.get("target_id").and_then(Value::as_str) {
-                Some(target_id) => match cmd.get("label") {
-                    // Present-but-null is the explicit "clear it" signal; a missing key is an error
-                    // (so a typo can't silently no-op) — matches `set_thinking`'s own `budget` contract.
-                    Some(Value::Null) => match self.persistence.set_label(target_id, None) {
-                        Ok(()) => if !self.emit(response(
-                            id,
-                            "set_label",
-                            true,
-                            Some(json!({ "target_id": target_id, "label": Value::Null })),
-                            None,
-                        )) { break; },
-                        Err(e) => {
-                            if !self.emit(response(id, "set_label", false, None, Some(&e.to_string()))) { break; }
-                        }
-                    },
-                    Some(Value::String(label)) => {
-                        match self.persistence.set_label(target_id, Some(label)) {
-                            Ok(()) => if !self.emit(response(
-                                id,
-                                "set_label",
-                                true,
-                                Some(json!({ "target_id": target_id, "label": label })),
-                                None,
-                            )) { break; },
-                            Err(e) => {
-                                if !self.emit(response(id, "set_label", false, None, Some(&e.to_string()))) { break; }
-                            }
-                        }
-                    }
-                    Some(_) => if !self.emit(response(
-                        id,
-                        "set_label",
-                        false,
-                        None,
-                        Some("`label` must be a string or null")
-                    )) { break; },
-                    None => if !self.emit(response(
-                        id,
-                        "set_label",
-                        false,
-                        None,
-                        Some("missing `label` — pass a string to set it or null to clear it")
-                    )) { break; },
-                },
-                None => if !self.emit(response(
-                    id,
-                    "set_label",
-                    false,
-                    None,
-                    Some("missing `target_id`")
-                )) { break; },
-            },
-            "get_label" => match cmd.get("target_id").and_then(Value::as_str) {
-                Some(target_id) => match self.persistence.get_label(target_id) {
-                    Ok(label) => if !self.emit(response(
-                        id,
-                        "get_label",
-                        true,
-                        Some(json!({ "target_id": target_id, "label": label })),
-                        None,
-                    )) { break; },
-                    Err(e) => if !self.emit(response(id, "get_label", false, None, Some(&e.to_string()))) { break; },
-                },
-                None => if !self.emit(response(
-                    id,
-                    "get_label",
-                    false,
-                    None,
-                    Some("missing `target_id`")
-                )) { break; },
-            },
-            "append_custom" => match cmd.get("kind").and_then(Value::as_str) {
-                // The host's own journal kinds: an entry of one is trusted when the session is
-                // replayed (a task to resume, a result to deliver), so a client must not be able to
-                // write one.
-                Some(kind) if crate::session_store::is_host_custom_kind(kind) => if !self.emit(response(
-                    id,
-                    "append_custom",
-                    false,
-                    None,
-                    Some(&format!(
-                        "custom entry kind `{kind}` is reserved for entries the agent writes itself"
-                    ))
-                )) { break; },
-                Some(kind) => {
-                    let data = cmd.get("data").cloned().unwrap_or_else(|| json!({}));
-                    match self.persistence.append_custom(kind, data) {
-                        Ok(new_id) => if !self.emit(response(
-                            id,
-                            "append_custom",
-                            true,
-                            Some(json!({ "id": new_id })),
-                            None,
-                        )) { break; },
-                        Err(e) => {
-                            if !self.emit(response(
-                                id,
-                                "append_custom",
-                                false,
-                                None,
-                                Some(&e.to_string())
-                            )) { break; }
-                        }
-                    }
-                }
-                None => if !self.emit(response(
-                    id,
-                    "append_custom",
-                    false,
-                    None,
-                    Some("missing `kind`")
-                )) { break; },
-            },
-            "compact" => {
-                if !self.do_compact(&cmd, id).await {
-                    break;
-                }
-            }
-            "get_last_assistant_text" => {
-                let text = last_assistant_text(&self.session);
-                if !self.emit(response(
-                    id,
-                    "get_last_assistant_text",
-                    true,
-                    Some(json!({ "text": text })),
-                    None,
-                )) { break; }
-            }
-            // Reachable while idle only for a stale/duplicate answer (`accepted:false`): a real question
-            // can only be outstanding while a run is in flight, which is the busy arm above.
-            "approve" => {
-                if !self.emit(handle_approve(
-                    id,
-                    &cmd,
-                    &self.pending_approvals,
-                    self.approval.is_some()
-                )) { break; }
-            }
-            "get_todos" => {
-                // Straight from the session while idle — no mirror needed, and no chance of one going
-                // stale against a `switch_branch`/`fork`/`compact` that happened since the last turn.
-                if !self.emit(response(
-                    id,
-                    "get_todos",
-                    true,
-                    Some(json!({ "todos": current_todos(&self.session) })),
-                    None,
-                )) { break; }
-            }
-            "get_session_stats" => {
-                // Fix 8 (pi-parity gap): backfills session_id/session_file (mirroring get_state's own
-                // idle arm, above) and pending_tool_ids (mirroring get_state's own "nothing pending
-                // while idle" convention) — previously omitted, unlike the busy-mode arm's
-                // `LiveStats::snapshot()`-derived `pending_tool_ids`, so idle and busy reported
-                // different field sets for the same command.
-                let mut data = session_stats(&self.session, &compaction_config(&self.cfg, &self.current_model));
-                if let Value::Object(m) = &mut data {
-                    insert_session_identity(m, &self.persistence, &self.mode);
-                    m.insert("pending_tool_ids".into(), json!(Vec::<String>::new()));
-                }
-                if !self.emit(response(id, "get_session_stats", true, Some(data), None)) { break; }
-            }
-            "get_commands" => {
-                // Skills (read-on-demand) and prompt templates (`/name`), for client autocomplete.
-                // `scope`/`path` (Task #39 pi-parity fix — previously omitted entirely) mirror pi's own
-                // `get_commands` `sourceInfo.scope`/`sourceInfo.path`: which discovery root a command
-                // actually came from (`"user"`/`"project"`/`"temporary"`) and its on-disk location.
-                let mut commands: Vec<Value> = self.skills
-                    .iter()
-                    .map(|s| {
-                        json!({
-                            "name": format!("skill:{}", s.name),
-                            "source": "skill",
-                            "description": s.description,
-                            "scope": s.scope,
-                            "path": s.path,
-                        })
-                    })
-                    .collect();
-                // MCP-served skills (`scope: "mcp"`, `path` = the SKILL.md URI) of enabled servers.
-                commands.extend(self.mcp_skills.commands());
-                commands.extend(self.prompt_templates.iter().map(|t| {
-                    json!({
-                        "name": t.name,
-                        "source": "prompt",
-                        "description": t.description,
-                        "scope": t.scope,
-                        "path": t.path,
-                    })
-                }));
-                // Every shadowed name (a skill or template defined at more than one path) is otherwise
-                // silently resolved with no way for a client to notice — surfaced here instead.
-                // MCP skills' diagnostics too: entries declined (invalid, dynamic, over the
-                // per-skill limits), same-name entries, and on-disk name clashes.
-                let mcp_diagnostics = self.mcp_skills.diagnostics(&self.skills);
-                let collisions: Vec<&crate::skills::Collision> = self.skill_collisions
-                    .iter()
-                    .chain(self.prompt_collisions.iter())
-                    .chain(mcp_diagnostics.iter())
-                    .collect();
-                if !self.emit(response(
-                    id,
-                    "get_commands",
-                    true,
-                    Some(json!({ "commands": commands, "collisions": collisions })),
-                    None,
-                )) { break; }
-            }
-            "reload" => {
-                // Re-run the full (expensive) discovery pi's `/reload` triggers: project
-                // instructions, `SYSTEM.md`, skills, prompt templates and agent definitions may all
-                // have changed since startup — and, on this host, so may trust (`agent trust`/
-                // `--trust-project`). The per-turn `full_system` refresh alone only ever picks up the
-                // cheap date/cwd footer.
-                //
-                // Allowed in service mode precisely because this re-walks the **tenant's** sandbox
-                // through the same seam startup used, not the replica's filesystem. Trust plays no
-                // part there: a sandbox's contents are the one tenant's own (see `resolve_project_trust`'s
-                // startup call site).
-                if self.mode.trust_gate_applies() {
-                    let has_gated_resources = crate::trust_store::has_trust_gated_resources(&self.cwd);
-                    self.project_trusted = resolve_project_trust(
-                        self.cfg.trust_project,
-                        self.cfg.force_untrusted,
-                        self.cfg.default_project_trust,
-                        crate::trust_store::TrustStore::open_default().lookup(&self.cwd),
-                        has_gated_resources,
-                    );
-                    // Track L32 (pi-parity fix): same warning as startup, above — trust may have just
-                    // changed to untrusted (or gated resources may have just appeared on disk) as of
-                    // this very `reload`, and an operator watching stderr deserves the same signal
-                    // they'd have gotten from a fresh `serve` invocation instead of silence.
-                    if !self.project_trusted && has_gated_resources {
-                        eprintln!(
-                            "warning: {} has a project-local SYSTEM.md/APPEND_SYSTEM.md, skills, \
-                             prompt templates, or a settings.json on disk, but the project isn't \
-                             trusted, so they were skipped — pass --trust-project or run `{program} \
-                             trust {}` to enable them (a project's own settings.json additionally \
-                             requires a *persisted* `{program} trust`, not just a one-off \
-                             --trust-project)",
-                            self.cwd.display(),
-                            self.cwd.display(),
-                            program = crate::PROGRAM
-                        );
-                    }
-                }
-                let discovered = match self.mode
-                    .discover_sandbox_resources(&self.exec_cell, self.cfg.context_files)
-                    .await
-                {
-                    // The tenant's sandbox, through the same seam startup used; what it found is
-                    // what the snapshot saves from now on.
-                    Some(found) => {
-                        self.sandbox_resources = Some(found.clone());
-                        self.sandbox_snapshot_dirty = true;
-                        self.sandbox_refresh = false;
-                        Discovered::from(found)
-                    }
-                    None => discover_resources(&self.cfg, &self.cwd, self.project_trusted).await,
-                };
-                self.apply_discovered(discovered).await;
-                if !self.emit(response(id, "reload", true, None, None)) { break; }
-            }
-            // Rejects an empty/whitespace-only id, and — Fix 10 (pi-parity feature) — resolves a
-            // partial/fuzzy id against the known-model hint list first (`resolve_model_id`, mirroring
-            // `--model`'s identical resolution in `main.rs`): a genuinely unrecognized id (no partial
-            // match at all) is still forwarded verbatim, unlike pi (which talks directly to each
-            // provider and can validate against a live, authoritative registry of what it's actually
-            // configured to reach) — this process has no local source of truth to validate a real id
-            // against, and `available_models()` is explicitly documented as a non-exhaustive picker
-            // hint, not an allowlist (see its own doc comment). An empty string sneaking through
-            // `Value::as_str` and getting durably recorded via `record_model_change` is caught here too,
-            // the same class of fix `set_session_name` already got (reject empty, don't pretend to
-            // validate against a list this process can't actually authoritatively check). `model` may
-            // also carry a `:<level>` suffix (Fix 2, pi-parity gap — e.g. `"sonnet:high"`); when present,
-            // `resolve_model_id` returns it alongside the resolved id and it wins outright over whatever
-            // level was already active.
-            "set_model" => match cmd
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|raw| resolve_model_id(raw, available_models()))
-            {
-                Some(Ok((model, thinking_level))) => {
-                    let model = model.as_str();
-                    // Re-derive the gateway credential/routing for `model` before touching any other
-                    // state — a switch can cross OAuth providers (or `models.json` overrides), and
-                    // this must fail closed (leaving `current_model`/the persisted lineage untouched)
-                    // rather than silently keep using whichever client happened to be active before.
-                    // Skipped when `model` is already the active one, for the same reason
-                    // `record_result` below skips a redundant persist: a no-op `set_model <current>`
-                    // shouldn't discard `OAuthCredentialSource`'s in-memory token cache for nothing.
-                    let new_client = if model == self.current_model {
-                        Ok(None)
-                    } else {
-                        build_gateway_client(&self.cfg, model).map(|c| Some(Arc::new(c)))
                     };
-                    match new_client {
-                        Ok(new_client) => {
-                            // Persist the lineage marker *before* applying the switch in memory: if it
-                            // fails to write, leave the live model unchanged too, rather than forking
-                            // live state away from what's durably recorded (an `Err` here aborts the
-                            // whole switch).
-                            let record_result = if model != self.current_model {
-                                self.persistence.record_model_change(model)
-                            } else {
-                                Ok(())
-                            };
-                            match record_result {
-                                Ok(()) => {
-                                    // A signed thinking block is only valid for replay to the model
-                                    // that produced it, and a combined OpenAI-Responses tool-call id
-                                    // only means anything back to that same model — scrub both from
-                                    // any message not already stamped with the model we're switching
-                                    // to.
-                                    self.session.scrub_cross_model_state(model);
-                                    self.current_model = model.to_string();
-                                    // Fix 2 (pi-parity gap): a `:<level>` suffix on `model` (e.g.
-                                    // `sonnet:high`) wins outright over whatever level was already
-                                    // active — the operator explicitly asked for this depth on the new
-                                    // model. No suffix falls back to re-clamping the *existing* level
-                                    // against the *new* model instead, same as before this fix: e.g. a
-                                    // session sitting at `Off` on a disable-capable model must not
-                                    // silently carry that `Off` over to a model that can't actually
-                                    // disable reasoning.
-                                    self.current_level = agent_core::clamp_thinking_level(
-                                        &agent_core::capabilities(&self.current_model),
-                                        thinking_level.unwrap_or(self.current_level),
-                                    );
-                                    if let Some(new_client) = new_client {
-                                        self.client = new_client;
+                    let message = expand_message(
+                        message,
+                        &self.skills,
+                        &self.prompt_templates,
+                        &self.mcp_skills,
+                    )
+                    .await;
+                    // Optional image attachments: `images: [{media_type, data}]` (base64). Builds a
+                    // multimodal user turn; absent or empty → a plain text turn.
+                    let images = parse_images(cmd.get("images"));
+                    // MCP tasks a previous process left in flight are waited on and answered before this
+                    // turn's model call (see `crate::mcp_resume`), by the first attempt only.
+                    // A resumer that finished with a task's server unreachable left that task pending:
+                    // a fresh one tries it again now (its finished results carry over).
+                    //
+                    // Journal writes still queued in `mcp_task_rx` are not drained here, and nothing
+                    // below depends on them. A finished task's result: a restarted resumer is handed the
+                    // old one's results (`mcp_carried`), so it never re-polls. A placeholder mark queued
+                    // as this prompt arrives: its placeholder is not on the path yet (this prompt's
+                    // `resume_into_turn` splices it, adding the resumer's own placeholder ids to the
+                    // journal's), and once a run has put one there, the run-end drain journals its mark
+                    // before the next prompt reads the journal.
+                    let mut mcp_carried = Vec::new();
+                    if self.mcp_resumer.session_id() != self.persistence.session_id() {
+                        self.mcp_resumer = self.start_mcp_resumer(&[]);
+                    } else if self.mcp_resumer.needs_retry() {
+                        mcp_carried = self.mcp_resumer.finals();
+                        self.mcp_resumer = self.start_mcp_resumer(&mcp_carried);
+                    }
+                    let mut mcp_resume_first = true;
+                    let mut mcp_journaled = crate::mcp_resume::results(
+                        &self
+                            .persistence
+                            .active_journal(crate::mcp_resume::RESULT_ENTRY_KIND),
+                    );
+                    mcp_journaled.extend(mcp_carried);
+                    let mcp_placeholders = crate::mcp_resume::placeholder_ids(
+                        &self
+                            .persistence
+                            .active_journal(crate::mcp_resume::PLACEHOLDER_ENTRY_KIND),
+                    );
+                    if images.is_empty() {
+                        self.session.user(message);
+                    } else {
+                        self.session
+                            .push(agent_core::Message::user_with_images(message, images));
+                    }
+                    // MCP App views' new model context rides this turn as a request-only block of its
+                    // own — untrusted data, labelled as such, never in the user's text, never persisted,
+                    // and never in the system prompt, whose bytes (and so the prompt cache) it would
+                    // otherwise churn on every update. See `Session::attach_request_block`.
+                    if let Some(context) =
+                        crate::tools::mcp_apps::take_undelivered_context(&self.mcp_enabled)
+                    {
+                        self.session.attach_request_block(context);
+                    }
+                    // Acknowledge immediately — the turn is queued and about to start — rather than
+                    // leaving a client with no signal until the (possibly much later) terminal response.
+                    if !self.emit(ack(id.clone(), "prompt")) {
+                        break;
+                    }
+                    // The reaper must see this session as mid-run from the ack, not from when the model
+                    // call actually starts. An HTTP POST returns 202 on this ack and unpins; the gap
+                    // between ack and `run_events_steered` (and the retry-backoff window between
+                    // attempts) is still "a prompt is in flight" — reaping here would drop a run the
+                    // client was just told had started. Cleared after the terminal `prompt` response.
+                    // `swap`, not `store`: the gauge must follow *transitions*. The retry path below
+                    // re-asserts this flag while a run is already in flight, and an unconditional `inc`
+                    // there would count one prompt twice and never come back down.
+                    if !self.running.swap(true, Ordering::Relaxed)
+                        && let Some(m) = &self.cfg.metrics
+                    {
+                        m.runs_in_flight.inc();
+                    }
+                    // One run_id for the whole prompt, including whole-run retries. Minted here, next to
+                    // the ack the client just got, so a crash between accept and the loop still has a
+                    // `started` in flight. Unconfigured (`NoLifecycle`) skips construction entirely.
+                    let life = self.cfg.lifecycle.enabled().then(|| {
+                        crate::lifecycle::Run::begin(
+                            Arc::clone(&self.cfg.lifecycle),
+                            self.persistence.session_id().to_string(),
+                            // One replica emits for many tenants in service mode, so every event says
+                            // whose run it is. Absent (and omitted on the wire) otherwise.
+                            self.mode.tenant().map(str::to_owned),
+                            id.clone(),
+                            self.current_model.clone(),
+                        )
+                    });
+                    let cancel = CancellationToken::new();
+                    // Whether the run's *last* turn ended in a refusal — set from every `TurnEnd`, so by
+                    // the time the run returns it reflects only the final one (any refusal earlier in a
+                    // multi-turn run is superseded once the model goes on to call tools or answer plainly).
+                    // Reset per retry attempt, so the value read after the loop reflects only the last.
+                    let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    // Whether an auto-triggered compaction is *currently* in flight this instant — pi's
+                    // `isCompacting`, surfaced from `get_state`. Set on `AgentEvent::CompactionStart`,
+                    // cleared on `Compacted`/`CompactionFailed` *or* the very next event of any other kind
+                    // (`TurnStart` for the run's next turn, ordinarily) — `Agent::compact` can end without
+                    // ever emitting `Compacted` (an empty-summary no-op, or a failure reported via
+                    // `CompactionFailed` rather than propagated — see that event's doc comment), and its own
+                    // model call uses a discarding inner sink, so nothing else can arrive between
+                    // `CompactionStart` and whatever naturally follows it; clearing on "anything else" is
+                    // exact, not a guess.
+                    // Manual `compact`/branch-summary-on-`switch_branch` don't touch this: both only ever
+                    // run from the idle main loop, which processes one command to completion before reading
+                    // the next — no concurrent `get_state` could ever observe them in flight anyway.
+                    let is_compacting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    // The `/session` steers (pressure nudge, compaction reminder) — the observer `run`
+                    // shares, see `crate::memory::SessionSteers`. Declared here (per prompt-run) so its
+                    // once-per-fill-cycle nudge state survives the per-retry-attempt observer rebuild below;
+                    // the pressure point is re-pointed per attempt (a `set_model` changes the trigger).
+                    let session_steers = Arc::new(crate::memory::SessionSteers::new(
+                        self.session_memory_active,
+                        u32::MAX,
+                    ));
+
+                    // Start recording this run's frames for mid-turn replay (see `OutFanout::turn`). Here,
+                    // outside the auto-retry loop below, so one recording spans the whole `prompt`: a client
+                    // that never dropped saw every attempt's frames and the `auto_retry_start` notices
+                    // between them, and a client that re-attaches is owed the same. The idle loop's
+                    // `sync_history!` ends the recording once the run is over and its messages have committed.
+                    lock_ignoring_poison(&self.out_conn).begin_turn();
+
+                    // Drive the run while staying responsive to stdin: `abort` cancels it, `steer` queues a
+                    // mid-run injection and `follow_up` a stop-boundary one; any other command is
+                    // rejected as busy (the session is borrowed by the in-flight run). If stdin closes
+                    // mid-run, cancel and drain. The block scopes the run's `&mut session` borrow so we can
+                    // persist after.
+                    let mut stdin_open = true;
+                    // A run that ends in a transient-looking `Err` (`crate::retry::is_retryable_whole_run`
+                    // — a superset of `run_turn`'s own mid-stream retry's `is_retryable_mid_stream`, plus
+                    // raw HTTP status digits appropriate only at this outer layer) is automatically
+                    // re-invoked against the *same* session — resuming from wherever it left off, not
+                    // restarting the turn — up to `retry::MAX_RUN_RETRIES` times with backoff. pi's
+                    // `agent-session.ts` equivalent (`_prepareRetry`/`isRetryableAssistantError`); ours is
+                    // gated by the same `current_auto_retry` toggle as the mid-stream layer below it (one
+                    // user-facing "retries on/off" concept, even though internally it's two layers), and
+                    // never retries past a client disconnect or an explicit `abort`
+                    // (`is_retryable_whole_run` already excludes `Error::Cancelled` transitively through
+                    // `is_retryable_mid_stream`, and `stdin_open`/`cancel.is_cancelled()` below are
+                    // redundant, cheap belt-and-suspenders on top of that). The backoff sleep itself *is*
+                    // raced against `abort`/`abort_retry`/shutdown (see the `select!` around the `sleep`
+                    // below) — a client abort during backoff takes effect immediately, not just once the
+                    // next attempt starts.
+                    let mut retry_attempt: u32 = 0;
+                    // Retries since the run last made progress — what `max_retries` and the backoff count.
+                    // `retry_attempt` above keeps counting every retry of this prompt (lifecycle, the
+                    // closing `auto_retry_end`); this one resets when a failed attempt still committed a
+                    // step, so a long run that recovers from one blip doesn't carry it against the next.
+                    let mut stalled_retries: u32 = 0;
+                    // Whether the final post-attempt persist (below) failed to write to disk — surfaced in
+                    // the terminal `prompt` response instead of being silently swallowed, since an agent run
+                    // that appears to succeed while its transcript failed to persist is exactly the failure
+                    // mode this exists to catch. Always set from *that* persist's own outcome alone, once
+                    // per attempt: it re-persists the whole current session state fresh, so it's a strict
+                    // superset of any mid-run checkpoint along the way (see the `checkpoint_rx.recv()` arm's
+                    // comment below) — a checkpoint that failed but was then followed by a successful final
+                    // persist must report success, not a stale failure the superseding write already fixed.
+                    let mut persist_error: Option<String>;
+                    // pi-parity (Task 4, serve pass 19): `compact`/`switch_session`/`fork`/`clone`/
+                    // `new_session` received while this run (or its auto-retry backoff wait) is in flight
+                    // self-abort-and-proceed instead of being rejected as busy — cancelled via the exact
+                    // same `cancel.cancel()`/deferred-until-idle discipline `abort` itself already uses
+                    // (see `pending_abort_acks` just below), then queued here (raw command + its own `id`)
+                    // to run their ordinary idle-path logic once this attempt has actually gone idle, in
+                    // the order received. Declared outside the loop (not inside, like `pending_abort_acks`)
+                    // and `clear()`-reset every attempt, not re-declared: a deferred command always forces
+                    // this attempt to end via cancellation (a cancelled/aborted result is never itself
+                    // retryable — see the match on `attempt_result` below), so it's always populated and
+                    // drained within the very same iteration, but the drain happens *after* this loop
+                    // returns, once `session`/`persistence` are no longer borrowed by `run` — a variable
+                    // declared inside the loop body would be dropped at `break` and unreachable there.
+                    let mut pending_deferred: Vec<(Option<String>, Value)> = Vec::new();
+                    // MCP Events injection batches this run carries: its own prompt's, and each one
+                    // steered in while it runs (with the text the model would receive). Settled once
+                    // the run is over — see "A batch is delivered only once" below.
+                    let own_injection = crate::tools::mcp_events::injection_batch(&cmd);
+                    let mut steered_injections: Vec<u64> = Vec::new();
+                    let result = 'retry: loop {
+                        let steps_at_start = self.session.steps;
+                        refused.store(false, Ordering::Relaxed);
+                        is_compacting.store(false, Ordering::Relaxed);
+                        pending_deferred.clear();
+                        // `abort` command ids received while this run is still unwinding — acked only once
+                        // the run has actually gone idle (see the flush right after `attempt_result` below,
+                        // and that ack's own doc comment for why it's deferred rather than sent the instant
+                        // `cancel.cancel()` is called).
+                        let mut pending_abort_acks: Vec<Option<String>> = Vec::new();
+                        let tx = self.out_tx.clone();
+                        let mcp_task_journal = self.mcp_task_tx.clone();
+                        let mcp_journal_session = self.persistence.session_id().to_owned();
+                        let refused_sink = refused.clone();
+                        let is_compacting_sink = is_compacting.clone();
+                        // Live token/step counters a `get_state`/`get_session_stats` sent while this run is in
+                        // flight can answer from (see the busy-loop's own arms for those types below) — seeded
+                        // fresh from the session's *current* totals every attempt (a retry may follow a partial,
+                        // already-persisted success from an earlier attempt in this same loop), then kept current
+                        // from the same events a streaming client already observes.
+                        let live_stats = Arc::new(LiveStats::from_session(&self.session));
+                        let live_stats_sink = live_stats.clone();
+                        // A clone for the observer to push the compaction reminder + pressure nudge through —
+                        // consumed by this attempt's `move` closure, so re-cloned per attempt.
+                        let steer_on_compact = self.steering.clone();
+                        let session_steers_sink = session_steers.clone();
+                        // The live-prompt size at which to warn of an approaching compaction, against the
+                        // *current* model (a `set_model` mid-session changes it): the same trigger
+                        // `build_agent` hands this session's `Agent`.
+                        session_steers.set_pressure_point(
+                            crate::memory::compaction_pressure_point(
+                                compaction_config(&self.cfg, &self.current_model).trigger_tokens(),
+                            ),
+                        );
+
+                        // Mark this session busy for the reaper's benefit (daemon mode). Already set at
+                        // the ack above; re-asserted here so a retry attempt is still protected if anything
+                        // cleared it. The matching clear is *after* the whole prompt, not after this
+                        // attempt — retry backoff is still mid-run.
+                        if !self.running.swap(true, Ordering::Relaxed)
+                            && let Some(m) = &self.cfg.metrics
+                        {
+                            m.runs_in_flight.inc();
+                        }
+                        if let Some(life) = &life {
+                            life.set_attempt(retry_attempt);
+                        }
+                        let life_obs = life.clone();
+                        let attempt_result = {
+                            // A steered MCP Events batch is delivered the moment the model receives it: the
+                            // run's `Steered` event reports its tag after the transcript holding it is
+                            // checkpointed, and it is recorded — durably — right then, never re-derived
+                            // from the transcript afterwards (a compaction may have summarized it away).
+                            let receipts_sink = self.mcp_events.as_ref().map(|hub| hub.receipts());
+                            let mut sink = move |ev: AgentEvent| {
+                                if let AgentEvent::Steered { tags, .. } = &ev
+                                    && let Some(receipts) = &receipts_sink
+                                {
+                                    for tag in tags {
+                                        receipts.received(*tag);
                                     }
-                                    self.agent = build_agent(
-                                        &self.exec_cell,
-                                        self.client.clone(),
-                                        &full_system(&self.static_system, &self.cwd, &self.mcp_skills),
-                                        &self.cfg,
-                                        &self.current_model,
-                                        self.current_thinking,
-                                        self.current_level,
-                                        self.current_auto_compaction,
-                                        self.current_auto_retry,
-                                        self.current_block_images,
-                                        self.current_image_auto_resize,
-                                        self.persistence.session_id(),
-                                        &self.write_locks,
-                                        &self.checkpoint,
-                                        self.subagent_ctx.as_ref(),
-                                        self.structured_output.as_ref(),
-                                        self.memory_tool.as_ref(),
-                                        self.approval.as_ref(),
-                                        &self.mcp_enabled,
-                                        &self.skills,
+                                }
+                                // Set on `CompactionStart`, cleared on literally anything else — see
+                                // `is_compacting`'s own declaration above for why that's exact, not a
+                                // conservative approximation.
+                                is_compacting_sink.store(
+                                    matches!(ev, AgentEvent::CompactionStart { .. }),
+                                    Ordering::Relaxed,
+                                );
+                                // The `/session` steers: the nudge before a compaction, the recall
+                                // reminder after one.
+                                session_steers_sink.observe(&ev, &steer_on_compact);
+                                if let AgentEvent::TurnEnd { stop_reason, step } = &ev {
+                                    refused_sink.store(
+                                        *stop_reason == StopReason::Refusal,
+                                        Ordering::Relaxed,
                                     );
-                                    if !self.emit(response(
-                                        id,
-                                        "set_model",
-                                        true,
-                                        Some(model_switch_response(&self.current_model, self.current_level)),
-                                        None,
-                                    )) { break; }
+                                    live_stats_sink.set_steps(*step);
                                 }
-                                Err(e) => {
-                                    if !self.emit(response(
-                                        id,
-                                        "set_model",
-                                        false,
-                                        None,
-                                        Some(&e.to_string())
-                                    )) { break; }
+                                // A subagent's requests count toward this session's totals (the loop
+                                // already folds them into the `Session`); mirrored here so mid-run
+                                // stats agree with what the session will say once the run ends.
+                                if let AgentEvent::ToolUsage { usage, .. } = &ev {
+                                    live_stats_sink.record_delegated_usage(usage);
                                 }
-                            }
-                        }
-                        Err(e) => if !self.emit(response(id, "set_model", false, None, Some(&e))) { break; },
-                    }
-                }
-                Some(Err(e)) => if !self.emit(response(id, "set_model", false, None, Some(&e))) { break; },
-                None => if !self.emit(response(
-                    id,
-                    "set_model",
-                    false,
-                    None,
-                    Some("missing or empty `model`")
-                )) { break; },
-            },
-            "set_thinking" => {
-                // `budget` is a positive integer to enable extended thinking, or `null` to disable it.
-                // A present-but-null value is the explicit "turn it off" signal; a missing key is an
-                // error (so a typo can't silently no-op).
-                match cmd.get("budget") {
-                    Some(Value::Null) => {
-                        self.current_thinking = None;
-                        self.agent = build_agent(
-                            &self.exec_cell,
-                            self.client.clone(),
-                            &full_system(&self.static_system, &self.cwd, &self.mcp_skills),
-                            &self.cfg,
-                            &self.current_model,
-                            self.current_thinking,
-                            self.current_level,
-                            self.current_auto_compaction,
-                            self.current_auto_retry,
-                            self.current_block_images,
-                            self.current_image_auto_resize,
-                            self.persistence.session_id(),
-                            &self.write_locks,
-                            &self.checkpoint,
-                            self.subagent_ctx.as_ref(),
-                            self.structured_output.as_ref(),
-                            self.memory_tool.as_ref(),
-                            self.approval.as_ref(),
-                            &self.mcp_enabled,
-                            &self.skills,
-                        );
-                        if !self.emit(response(
-                            id,
-                            "set_thinking",
-                            true,
-                            Some(json!({ "thinking": Value::Null })),
-                            None,
-                        )) { break; }
-                    }
-                    Some(v) if v.as_u64().is_some() => {
-                        self.current_thinking = v.as_u64().map(|n| n as u32);
-                        self.agent = build_agent(
-                            &self.exec_cell,
-                            self.client.clone(),
-                            &full_system(&self.static_system, &self.cwd, &self.mcp_skills),
-                            &self.cfg,
-                            &self.current_model,
-                            self.current_thinking,
-                            self.current_level,
-                            self.current_auto_compaction,
-                            self.current_auto_retry,
-                            self.current_block_images,
-                            self.current_image_auto_resize,
-                            self.persistence.session_id(),
-                            &self.write_locks,
-                            &self.checkpoint,
-                            self.subagent_ctx.as_ref(),
-                            self.structured_output.as_ref(),
-                            self.memory_tool.as_ref(),
-                            self.approval.as_ref(),
-                            &self.mcp_enabled,
-                            &self.skills,
-                        );
-                        if !self.emit(response(
-                            id,
-                            "set_thinking",
-                            true,
-                            Some(json!({ "thinking": self.current_thinking })),
-                            None,
-                        )) { break; }
-                    }
-                    _ => if !self.emit(response(
-                        id,
-                        "set_thinking",
-                        false,
-                        None,
-                        Some("`budget` must be a non-negative integer or null"),
-                    )) { break; },
-                }
-            }
-            "set_reasoning_effort" => {
-                // `effort` is one of the portable level names ("off"/"minimal"/"low"/"medium"/"high"/
-                // "xhigh"), or `null` as an alias for `"off"`. Unlike `set_thinking`, this sets
-                // `current_level` directly (no raw-override concept — a named effort already *is* a
-                // ladder rung) and clears any pending `set_thinking` override, for the same reason
-                // `cycle_thinking_level` does: the newly-requested level should take visible effect
-                // immediately, not be silently masked by a stale raw budget.
-                let parsed = match cmd.get("effort") {
-                    Some(Value::Null) => Some(agent_core::ThinkingLevel::Off),
-                    Some(Value::String(s)) => agent_core::ThinkingLevel::parse(s),
-                    _ => None,
-                };
-                match parsed {
-                    Some(level) => {
-                        // Clamp against `current_model`'s capabilities before storing or recording:
-                        // an explicit `"off"` request is only honored if the model can actually
-                        // disable reasoning; otherwise it's bumped to the model's own floor rather
-                        // than silently persisted as a level the wire can't represent.
-                        let level = agent_core::clamp_thinking_level(
-                            &agent_core::capabilities(&self.current_model),
-                            level,
-                        );
-                        let record_result = if level != self.current_level {
-                            self.persistence.record_thinking_level_change(level.as_str())
-                        } else {
-                            Ok(())
-                        };
-                        match record_result {
-                            Ok(()) => {
-                                self.current_level = level;
-                                self.current_thinking = None;
-                                self.agent = build_agent(
-                                    &self.exec_cell,
-                                    self.client.clone(),
-                                    &full_system(&self.static_system, &self.cwd, &self.mcp_skills),
-                                    &self.cfg,
-                                    &self.current_model,
-                                    self.current_thinking,
-                                    self.current_level,
-                                    self.current_auto_compaction,
-                                    self.current_auto_retry,
-                                    self.current_block_images,
-                                    self.current_image_auto_resize,
-                                    self.persistence.session_id(),
-                                    &self.write_locks,
-                                    &self.checkpoint,
-                                    self.subagent_ctx.as_ref(),
-                                    self.structured_output.as_ref(),
-                                    self.memory_tool.as_ref(),
-                                    self.approval.as_ref(),
-                                    &self.mcp_enabled,
-                                    &self.skills,
-                                );
-                                let (thinking, reasoning_effort) = agent_core::thinking_for_level(
-                                    &agent_core::capabilities(&self.current_model),
-                                    self.current_level,
-                                );
-                                if !self.emit(response(
+                                if let AgentEvent::Stream(StreamEvent::Usage(usage)) = &ev {
+                                    live_stats_sink.record_usage(usage);
+                                }
+                                // B-L1: mirrors the same events into `pending_tool_ids`, so `get_state`
+                                // can answer "which calls are still running" mid-turn — see that
+                                // field's own doc comment.
+                                if let AgentEvent::ToolStart { id, .. } = &ev {
+                                    live_stats_sink.tool_started(id.clone());
+                                }
+                                if let AgentEvent::ToolEnd { id, .. } = &ev {
+                                    live_stats_sink.tool_ended(id);
+                                }
+                                // Same mirroring, for the `todo` list — see `LiveStats::todos`. The tool
+                                // validates before it emits, so a rejected call never lands here and the
+                                // mirror only ever holds a list the model actually committed.
+                                if let AgentEvent::ToolProgress {
+                                    name,
+                                    details: Some(d),
+                                    ..
+                                } = &ev
+                                    && name == crate::tools::todo::NAME
+                                    && let Some(todos) = d.get("todos")
+                                {
+                                    live_stats_sink.todos_updated(todos.clone());
+                                }
+                                // Best-effort: a sync sink can't break the control loop. If the writer is
+                                // gone the send fails here and the terminal response send below detects it
+                                // via `emit!` and stops the loop. An unserializable event is skipped rather
+                                // than emitted as a malformed frame (see `event_frame`).
+                                if let AgentEvent::ToolProgress {
                                     id,
-                                    "set_reasoning_effort",
-                                    true,
-                                    Some(json!({
-                                        "level": self.current_level.as_str(),
-                                        "thinking": thinking,
-                                        "reasoning_effort": reasoning_effort.map(|e| e.as_str()),
-                                    })),
-                                    None,
-                                )) { break; }
+                                    details: Some(d),
+                                    ..
+                                } = &ev
+                                    && let Some(record) =
+                                        d.get(crate::tools::mcp::MCP_TASK_DETAILS_KEY)
+                                {
+                                    let _ = mcp_task_journal.send((
+                                        crate::mcp_resume::TASK_ENTRY_KIND.to_owned(),
+                                        crate::mcp_resume::task_entry(
+                                            record,
+                                            id,
+                                            &mcp_journal_session,
+                                        ),
+                                    ));
+                                }
+                                if let Some(life) = &life_obs {
+                                    life.observe(&ev);
+                                }
+                                if let Some(frame) = event_frame(ev) {
+                                    let _ = tx.send(frame);
+                                }
+                            };
+                            let resume_first = std::mem::take(&mut mcp_resume_first);
+                            let resumer = &self.mcp_resumer;
+                            let journaled = &mcp_journaled;
+                            let placeholders = &mcp_placeholders;
+                            let run_cancel = cancel.clone();
+                            let run = crate::tools::mcp::with_session_host(
+                                self.mcp_host.clone(),
+                                async {
+                                    if resume_first {
+                                        crate::mcp_resume::resume_into_turn(
+                                            &mut self.session,
+                                            resumer,
+                                            journaled,
+                                            placeholders,
+                                            &mut sink,
+                                            &run_cancel,
+                                        )
+                                        .await;
+                                    }
+                                    self.agent
+                                        .run_events_steered(
+                                            &mut self.session,
+                                            &mut sink,
+                                            run_cancel.clone(),
+                                            self.steering.clone(),
+                                        )
+                                        .await
+                                },
+                            );
+                            tokio::pin!(run);
+                            // No timer when unconfigured or `--lifecycle-heartbeat-secs 0`. Tool-edge
+                            // samples still fire from `observe` above.
+                            let mut heartbeat = life.as_ref().and_then(|_| {
+                                crate::lifecycle::heartbeat_interval(self.cfg.lifecycle_heartbeat)
+                            });
+                            // Consume the immediate first tick so the first sample is one interval in,
+                            // not stacked on `started`.
+                            if let Some(h) = heartbeat.as_mut() {
+                                h.tick().await;
                             }
-                            Err(e) => if !self.emit(response(
-                                id,
-                                "set_reasoning_effort",
-                                false,
-                                None,
-                                Some(&e.to_string())
-                            )) { break; },
-                        }
-                    }
-                    None => if !self.emit(response(
-                        id,
-                        "set_reasoning_effort",
-                        false,
-                        None,
-                        Some("`effort` must be one of off/minimal/low/medium/high/xhigh, or null"),
-                    )) { break; },
-                }
-            }
-            "cycle_model" => {
-                // Advance through `cycle_models` (the `--models`-scoped list, or the full known-model
-                // hint list when unscoped), wrapping — a quick way for a client to step through the
-                // candidate list without needing its own copy of it. An id outside the list (a custom
-                // `set_model` the client issued directly) wraps to the first entry, same as "not found".
-                let next_idx = self.cycle_models
-                    .iter()
-                    .position(|m| m == &self.current_model)
-                    .map_or(0, |i| (i + 1) % self.cycle_models.len());
-                let next_model = self.cycle_models[next_idx].clone();
-                // A `pattern:level` pin from `--models` (e.g. `gpt-4o:high`) rides along whenever
-                // cycling lands on that model — pi's own `ScopedModel.thinkingLevel`/
-                // `_cycleScopedModel`. Landing on an unpinned model just keeps whatever level was
-                // already active, same as pi.
-                let pinned_level = self.scoped_models
-                    .iter()
-                    .find(|m| m.id == next_model)
-                    .and_then(|m| m.thinking_level);
-                // See `set_model`'s identical re-derivation for why this must happen before anything
-                // else, and why it's skipped when `next_model` (wrapping back around) is already the
-                // active one.
-                let new_client = if next_model == self.current_model {
-                    Ok(None)
-                } else {
-                    build_gateway_client(&self.cfg, &next_model).map(|c| Some(Arc::new(c)))
-                };
-                match new_client {
-                    Ok(new_client) => {
-                        let record_result = if next_model != self.current_model {
-                            self.persistence.record_model_change(&next_model)
-                        } else {
-                            Ok(())
-                        };
-                        match record_result {
-                            Ok(()) => {
-                                self.session.scrub_cross_model_state(&next_model);
-                                self.current_model = next_model;
-                                if let Some(level) = pinned_level {
-                                    // Same staleness hazard `cycle_thinking_level` already guards
-                                    // against: a stale raw-budget override must not silently outlive
-                                    // the level it was pinned over.
-                                    self.current_thinking = None;
-                                    self.current_level = level;
-                                }
-                                // See `set_model`'s identical re-clamp for why this can't be skipped.
-                                self.current_level = agent_core::clamp_thinking_level(
-                                    &agent_core::capabilities(&self.current_model),
-                                    self.current_level,
-                                );
-                                if let Some(new_client) = new_client {
-                                    self.client = new_client;
-                                }
-                                self.agent = build_agent(
-                                    &self.exec_cell,
-                                    self.client.clone(),
-                                    &full_system(&self.static_system, &self.cwd, &self.mcp_skills),
-                                    &self.cfg,
-                                    &self.current_model,
-                                    self.current_thinking,
-                                    self.current_level,
-                                    self.current_auto_compaction,
-                                    self.current_auto_retry,
-                                    self.current_block_images,
-                                    self.current_image_auto_resize,
-                                    self.persistence.session_id(),
-                                    &self.write_locks,
-                                    &self.checkpoint,
-                                    self.subagent_ctx.as_ref(),
-                                    self.structured_output.as_ref(),
-                                    self.memory_tool.as_ref(),
-                                    self.approval.as_ref(),
-                                    &self.mcp_enabled,
-                                    &self.skills,
-                                );
-                                let mut resp_data =
-                                    model_switch_response(&self.current_model, self.current_level);
-                                if let Value::Object(map) = &mut resp_data {
-                                    map.insert("scoped".to_string(), json!(!self.cfg.models.is_empty()));
-                                }
-                                if !self.emit(response(id, "cycle_model", true, Some(resp_data), None)) { break; }
-                            }
-                            Err(e) => if !self.emit(response(
-                                id,
-                                "cycle_model",
-                                false,
-                                None,
-                                Some(&e.to_string())
-                            )) { break; },
-                        }
-                    }
-                    Err(e) => if !self.emit(response(id, "cycle_model", false, None, Some(&e))) { break; },
-                }
-            }
-            "cycle_thinking_level" => {
-                // Advance the portable Off/Minimal/Low/Medium/High/XHigh ladder, wrapping, and clear
-                // any explicit raw-budget override (`set_thinking`) — otherwise a stale override could
-                // silently mask the level having just changed. `thinking_for_level` reports what the
-                // new level actually resolves to for `current_model` specifically, so the response
-                // reflects reality rather than a number that may be meaningless for this model's shape.
-                // Advances through only the levels `current_model` actually supports (see
-                // `next_available_thinking_level`'s doc comment) rather than the raw 6-rung ladder —
-                // a blind `.next()` would let the cycle land on (and durably record) an `Off` or
-                // `xhigh` state the active model can't represent on the wire.
-                let next_level = agent_core::next_available_thinking_level(
-                    &agent_core::capabilities(&self.current_model),
-                    self.current_level,
-                );
-                match self.persistence.record_thinking_level_change(next_level.as_str()) {
-                    Ok(()) => {
-                        self.current_level = next_level;
-                        self.current_thinking = None;
-                        self.agent = build_agent(
-                            &self.exec_cell,
-                            self.client.clone(),
-                            &full_system(&self.static_system, &self.cwd, &self.mcp_skills),
-                            &self.cfg,
-                            &self.current_model,
-                            self.current_thinking,
-                            self.current_level,
-                            self.current_auto_compaction,
-                            self.current_auto_retry,
-                            self.current_block_images,
-                            self.current_image_auto_resize,
-                            self.persistence.session_id(),
-                            &self.write_locks,
-                            &self.checkpoint,
-                            self.subagent_ctx.as_ref(),
-                            self.structured_output.as_ref(),
-                            self.memory_tool.as_ref(),
-                            self.approval.as_ref(),
-                            &self.mcp_enabled,
-                            &self.skills,
-                        );
-                        let (thinking, reasoning_effort) = agent_core::thinking_for_level(
-                            &agent_core::capabilities(&self.current_model),
-                            self.current_level,
-                        );
-                        if !self.emit(response(
-                            id,
-                            "cycle_thinking_level",
-                            true,
-                            Some(json!({
-                                "level": self.current_level.as_str(),
-                                "thinking": thinking,
-                                "reasoning_effort": reasoning_effort.map(|e| e.as_str()),
-                            })),
-                            None,
-                        )) { break; }
-                    }
-                    Err(e) => if !self.emit(response(
-                        id,
-                        "cycle_thinking_level",
-                        false,
-                        None,
-                        Some(&e.to_string())
-                    )) { break; },
-                }
-            }
-            "set_auto_compaction" => match cmd.get("enabled").and_then(Value::as_bool) {
-                Some(enabled) => {
-                    self.current_auto_compaction = enabled;
-                    // Track L26 (pi-parity fix): previously mutated only this in-process local, so a
-                    // restarted `serve` (with neither `--no-compaction` nor its env var given) silently
-                    // reverted to the built-in enabled-by-default behavior — surviving a restart is the
-                    // whole point of `agent settings`' persisted-default tier (same as
-                    // `default_project_trust`). Best-effort: a failed write still applies for the rest
-                    // of *this* process (the in-memory toggle above already took effect), it just won't
-                    // survive a restart.
-                    persist_setting(&mut self.settings_store, "auto-compaction", |store| store.set_compaction_enabled(Some(enabled)));
-                    self.agent = build_agent(
-                        &self.exec_cell,
-                        self.client.clone(),
-                        &full_system(&self.static_system, &self.cwd, &self.mcp_skills),
-                        &self.cfg,
-                        &self.current_model,
-                        self.current_thinking,
-                        self.current_level,
-                        self.current_auto_compaction,
-                        self.current_auto_retry,
-                        self.current_block_images,
-                        self.current_image_auto_resize,
-                        self.persistence.session_id(),
-                        &self.write_locks,
-                        &self.checkpoint,
-                        self.subagent_ctx.as_ref(),
-                        self.structured_output.as_ref(),
-                        self.memory_tool.as_ref(),
-                        self.approval.as_ref(),
-                        &self.mcp_enabled,
-                        &self.skills,
-                    );
-                    if !self.emit(response(
-                        id,
-                        "set_auto_compaction",
-                        true,
-                        Some(json!({ "auto_compaction": self.current_auto_compaction })),
-                        None,
-                    )) { break; }
-                }
-                None => if !self.emit(response(
-                    id,
-                    "set_auto_compaction",
-                    false,
-                    None,
-                    Some("missing boolean `enabled`")
-                )) { break; },
-            },
-            "set_auto_retry" => match cmd.get("enabled").and_then(Value::as_bool) {
-                Some(enabled) => {
-                    self.current_auto_retry = enabled;
-                    self.agent = build_agent(
-                        &self.exec_cell,
-                        self.client.clone(),
-                        &full_system(&self.static_system, &self.cwd, &self.mcp_skills),
-                        &self.cfg,
-                        &self.current_model,
-                        self.current_thinking,
-                        self.current_level,
-                        self.current_auto_compaction,
-                        self.current_auto_retry,
-                        self.current_block_images,
-                        self.current_image_auto_resize,
-                        self.persistence.session_id(),
-                        &self.write_locks,
-                        &self.checkpoint,
-                        self.subagent_ctx.as_ref(),
-                        self.structured_output.as_ref(),
-                        self.memory_tool.as_ref(),
-                        self.approval.as_ref(),
-                        &self.mcp_enabled,
-                        &self.skills,
-                    );
-                    if !self.emit(response(
-                        id,
-                        "set_auto_retry",
-                        true,
-                        Some(json!({ "auto_retry": self.current_auto_retry })),
-                        None,
-                    )) { break; }
-                }
-                None => if !self.emit(response(
-                    id,
-                    "set_auto_retry",
-                    false,
-                    None,
-                    Some("missing boolean `enabled`")
-                )) { break; },
-            },
-            // Pass 20 (pi-parity fix): `build_agent` already threaded `cfg.block_images` into
-            // `Agent::with_block_images` (Task #34) and `cfg.image_auto_resize` into `build_tools`'s
-            // registry (Task #34), but neither had a live RPC toggle the way `auto_compaction`/
-            // `auto_retry` just above do — an operator could only change either by restarting `serve`
-            // with a different `--block-images`/`--no-image-auto-resize` flag or persisted `agent
-            // settings` default. Mirrors `set_auto_compaction`'s exact shape: mutate the runtime-mutable
-            // local, persist best-effort (survives a restart, same as `set_auto_compaction`), rebuild
-            // `agent` so the very next turn actually sees it, then ack over RPC.
-            "set_block_images" => match cmd.get("enabled").and_then(Value::as_bool) {
-                Some(enabled) => {
-                    self.current_block_images = enabled;
-                    persist_setting(&mut self.settings_store, "block-images", |store| store.set_block_images(Some(enabled)));
-                    self.agent = build_agent(
-                        &self.exec_cell,
-                        self.client.clone(),
-                        &full_system(&self.static_system, &self.cwd, &self.mcp_skills),
-                        &self.cfg,
-                        &self.current_model,
-                        self.current_thinking,
-                        self.current_level,
-                        self.current_auto_compaction,
-                        self.current_auto_retry,
-                        self.current_block_images,
-                        self.current_image_auto_resize,
-                        self.persistence.session_id(),
-                        &self.write_locks,
-                        &self.checkpoint,
-                        self.subagent_ctx.as_ref(),
-                        self.structured_output.as_ref(),
-                        self.memory_tool.as_ref(),
-                        self.approval.as_ref(),
-                        &self.mcp_enabled,
-                        &self.skills,
-                    );
-                    if !self.emit(response(
-                        id,
-                        "set_block_images",
-                        true,
-                        Some(json!({ "block_images": self.current_block_images })),
-                        None,
-                    )) { break; }
-                }
-                None => if !self.emit(response(
-                    id,
-                    "set_block_images",
-                    false,
-                    None,
-                    Some("missing boolean `enabled`")
-                )) { break; },
-            },
-            // Same shape as `set_block_images` just above, for `image_auto_resize`.
-            "set_image_auto_resize" => match cmd.get("enabled").and_then(Value::as_bool) {
-                Some(enabled) => {
-                    self.current_image_auto_resize = enabled;
-                    persist_setting(&mut self.settings_store, "image-auto-resize", |store| store.set_image_auto_resize(Some(enabled)));
-                    self.agent = build_agent(
-                        &self.exec_cell,
-                        self.client.clone(),
-                        &full_system(&self.static_system, &self.cwd, &self.mcp_skills),
-                        &self.cfg,
-                        &self.current_model,
-                        self.current_thinking,
-                        self.current_level,
-                        self.current_auto_compaction,
-                        self.current_auto_retry,
-                        self.current_block_images,
-                        self.current_image_auto_resize,
-                        self.persistence.session_id(),
-                        &self.write_locks,
-                        &self.checkpoint,
-                        self.subagent_ctx.as_ref(),
-                        self.structured_output.as_ref(),
-                        self.memory_tool.as_ref(),
-                        self.approval.as_ref(),
-                        &self.mcp_enabled,
-                        &self.skills,
-                    );
-                    if !self.emit(response(
-                        id,
-                        "set_image_auto_resize",
-                        true,
-                        Some(json!({ "image_auto_resize": self.current_image_auto_resize })),
-                        None,
-                    )) { break; }
-                }
-                None => if !self.emit(response(
-                    id,
-                    "set_image_auto_resize",
-                    false,
-                    None,
-                    Some("missing boolean `enabled`")
-                )) { break; },
-            },
-            // Toggle how much of the steer lane a single mid-run drain point consumes (see
-            // `agent_core::QueueMode`) — pi's default is `"one_at_a_time"`, one queued message per
-            // drain, leaving the rest queued for the next one; `"all"` folds everything queued into a
-            // single injection (this crate's original behavior). Independent of `set_follow_up_mode`
-            // below — pi carries the same split (`steeringMode`/`followUpMode`). Owned entirely by the
-            // `Steering` handle itself (shared with the loop, no `Agent` rebuild needed), so this takes
-            // effect immediately, including mid-run.
-            "set_steering_mode" => match cmd.get("mode").and_then(Value::as_str) {
-                Some(mode @ ("one_at_a_time" | "all")) => {
-                    self.steering.set_steering_mode(if mode == "all" {
-                        agent_core::QueueMode::All
-                    } else {
-                        agent_core::QueueMode::OneAtATime
-                    });
-                    // Same "best-effort, in-memory toggle already took effect either way" persistence
-                    // `set_auto_compaction` above uses — a failed write just won't survive a restart.
-                    // See `settings::Settings::steering_mode`'s own doc comment: this RPC handler is
-                    // exactly where that persistence is expected to happen.
-                    persist_setting(&mut self.settings_store, "steering_mode", |store| store.set_steering_mode(Some(mode.to_string())));
-                    if !self.emit(response(
-                        id,
-                        "set_steering_mode",
-                        true,
-                        Some(json!({ "mode": mode })),
-                        None,
-                    )) { break; }
-                }
-                _ => if !self.emit(response(
-                    id,
-                    "set_steering_mode",
-                    false,
-                    None,
-                    Some("missing `mode`; expected \"one_at_a_time\" or \"all\"")
-                )) { break; },
-            },
-            // Same idea, for the follow-up lane drained at a stop boundary (plus any stranded steer
-            // messages swept in there — see `Steering::drain_at_stop`).
-            "set_follow_up_mode" => match cmd.get("mode").and_then(Value::as_str) {
-                Some(mode @ ("one_at_a_time" | "all")) => {
-                    self.steering.set_follow_up_mode(if mode == "all" {
-                        agent_core::QueueMode::All
-                    } else {
-                        agent_core::QueueMode::OneAtATime
-                    });
-                    persist_setting(&mut self.settings_store, "follow_up_mode", |store| store.set_follow_up_mode(Some(mode.to_string())));
-                    if !self.emit(response(
-                        id,
-                        "set_follow_up_mode",
-                        true,
-                        Some(json!({ "mode": mode })),
-                        None,
-                    )) { break; }
-                }
-                _ => if !self.emit(response(
-                    id,
-                    "set_follow_up_mode",
-                    false,
-                    None,
-                    Some("missing `mode`; expected \"one_at_a_time\" or \"all\"")
-                )) { break; },
-            },
-            "get_available_models" => {
-                // Deliberately the full known-model hint list, not `cycle_models` — `--models` scopes
-                // what `cycle_model` steps through, not what a client's model *picker* can see. pi's
-                // own `/model` selector defaults its view to the scope but still lets the operator Tab
-                // to the full catalog; since this RPC has no such secondary toggle, it always answers
-                // with the unscoped list and leaves any scoped-vs-all UI distinction to the client.
-                let models: Vec<Value> = listed_models().iter().map(|m| model_info(m)).collect();
-                if !self.emit(response(
-                    id,
-                    "get_available_models",
-                    true,
-                    Some(json!({ "models": models })),
-                    None,
-                )) { break; }
-            }
-            "list_branches" => {
-                if !self.emit(response(
-                    id,
-                    "list_branches",
-                    true,
-                    Some(json!({ "branches": self.persistence.list_branches() })),
-                    None,
-                )) { break; }
-            }
-            "get_tree" => {
-                // `since` (Task #48, pi-parity gap): return only entries appended after a tree id the
-                // client already has, across every entry type — see [`nodes_since`]. Unmatched is an
-                // error, not a silent full re-fetch, mirroring `get_messages`'s own `since` above.
-                let nodes = match cmd.get("since").and_then(Value::as_str) {
-                    Some(since) => match nodes_since(self.persistence.tree(), since) {
-                        Ok(nodes) => nodes,
-                        Err(e) => {
-                            if !self.emit(response(id, "get_tree", false, None, Some(&e))) { break; }
-                            continue;
-                        }
-                    },
-                    None => self.persistence.tree(),
-                };
-                if !self.emit(response(
-                    id,
-                    "get_tree",
-                    true,
-                    Some(json!({ "nodes": nodes, "leaf_id": self.persistence.active_ids().last() })),
-                    None,
-                )) { break; }
-            }
-            "switch_branch" => match cmd.get("target_id").and_then(Value::as_str) {
-                Some(target_id) => {
-                    // When set, switches to `target_id`'s own parent instead — the tree's root (before
-                    // any message) when `target_id` is the very first one, letting a client redo it in
-                    // place. Mirrors `fork`'s identical `before` flag.
-                    let before = cmd.get("before").and_then(Value::as_bool).unwrap_or(false);
-                    // Defaults to summarizing the abandoned branch's activity (mirroring pi's
-                    // `navigateTree`); a client can pass `summarize:false` for a quick, cheap switch.
-                    let summarize = cmd
-                        .get("summarize")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(true);
-                    // Steers what the abandoned branch's recap emphasizes — the same "Additional
-                    // focus" framing the `compact` command already supports (see its own
-                    // `custom_instructions` handling above). Ignored when `summarize` is false, since
-                    // no summarization call happens at all in that case.
-                    let custom_instructions =
-                        cmd.get("custom_instructions").and_then(Value::as_str);
-                    // Task #17 (pi-parity fix): `true` uses `custom_instructions` as the *entire*
-                    // instruction section instead of appending it after the default structured
-                    // template — see `Agent::summarize_branch`'s own doc comment for the exact
-                    // semantics. Read the same way `custom_instructions` itself is, just above; a no-op
-                    // when `custom_instructions` is absent, or when `summarize` is false (no
-                    // summarization call happens at all in that case).
-                    let replace_instructions = cmd
-                        .get("replace_instructions")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    let target_id = target_id.to_string();
-                    // Branch summarization is one LLM call, but it's still a real network round trip
-                    // — potentially the slowest single operation this loop ever awaits outside a
-                    // `prompt` run. Racing it against stdin (mirroring `prompt`'s own busy-select
-                    // below, scaled down to this operation's much narrower surface — pi exposes only
-                    // `abortBranchSummary` here, nothing like steer/follow_up) keeps an `abort` able to
-                    // interrupt it instead of the whole RPC loop going unresponsive until the call
-                    // either lands or times out. A stdin close/shutdown mid-call also cancels, so the
-                    // loop can still unwind and exit cleanly instead of hanging on this one `.await`.
-                    let branch_cancel = CancellationToken::new();
-                    let mut branch_stdin_open = true;
-                    let switch_result = {
-                        let fut = self.persistence.switch_branch(
-                            &self.agent,
-                            &target_id,
-                            before,
-                            summarize,
-                            custom_instructions,
-                            replace_instructions,
-                            &branch_cancel,
-                        );
-                        tokio::pin!(fut);
-                        loop {
-                            tokio::select! {
-                                biased;
-                                r = &mut fut => break r,
-                                sig = self.shutdown.wait() => {
-                                    self.shutdown_cause = Some(sig);
-                                    branch_stdin_open = false;
-                                    branch_cancel.cancel();
-                                }
-                                maybe_line = self.input_rx.recv(), if branch_stdin_open => match maybe_line {
-                                    Some(l) => {
-                                        let l = l.trim();
-                                        if l.is_empty() {
-                                            continue;
+                            let life_beat = life.clone();
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    r = &mut run => break r,
+                                    // A `/skill:` steer's expansion finished: queue it, and anything that
+                                    // arrived after it, in order.
+                                    Some(done) = self.steer_done_rx.recv() => {
+                                        self.pending_steers.expanded(done, &self.mcp_skills, &self.steering, &self.out_tx);
+                                    }
+                                    // A shutdown request mid-run gets the same treatment as stdin closing:
+                                    // cancel and let the run unwind so the code below can persist before we
+                                    // fall out of the outer loop (`!stdin_open` breaks it, further down).
+                                    sig = self.shutdown.wait() => {
+                                        self.shutdown_cause = Some(sig);
+                                        stdin_open = false;
+                                        cancel.cancel();
+                                    }
+                                    // Drain and persist each mid-run checkpoint as it arrives (see
+                                    // `ChannelCheckpoint`). `persistence` isn't touched by `run` itself (only
+                                    // `session` is borrowed there), so reassigning it here is safe exactly like
+                                    // `stdin_open`/`cancel` being mutated from a sibling branch above. Any
+                                    // checkpoint still left undrained once the run ends is explicitly swept up
+                                    // right after this loop, below, before it can leak into some later, unrelated
+                                    // turn — see that drain's own comment for why "harmless, the final persist
+                                    // is a superset" isn't quite true on its own.
+                                    Some((messages, provenance, edited, cuts, ack)) = self.checkpoint_rx.recv() => {
+                                        // The agent is waiting on the acknowledgement before it dispatches
+                                        // the next tool, and acts on a failure — the tool does not run (see
+                                        // `ChannelCheckpoint`). Sent only once the write is done.
+                                        let (p, r) = write_then_ack(
+                                            persist_messages_blocking(self.persistence.take_for_blocking(), messages, provenance, edited, cuts),
+                                            ack,
+                                        )
+                                        .await;
+                                        self.persistence = p;
+                                        // Note this deliberately does *not* republish the fanout's catch-up
+                                        // history, even though a perfectly good snapshot is right here. The
+                                        // catch-up's contract is base-plus-frames: `history` is the transcript
+                                        // as of this run's start and `OutFanout::turn` is every frame since, so
+                                        // a reconnecting client reconstructs exactly what a never-dropped one
+                                        // saw. Advancing `history` here would put a mid-turn-committed message
+                                        // in the catch-up *and* again in the replayed frames — rendered twice.
+                                        // See `sync_history!`, which republishes once the run is over.
+                                        //
+                                        // Logged, not tracked in `persist_error`: the unconditional final
+                                        // persist below re-persists the whole session fresh regardless, so
+                                        // this checkpoint's own outcome never affects what's reported to the
+                                        // client — only worth knowing about here for operational visibility.
+                                        if let Err(e) = r {
+                                            tracing::warn!(error = %e, "mid-run checkpoint failed to persist");
                                         }
-                                        let c: Value = match serde_json::from_str(l) {
-                                            Ok(v) => v,
-                                            Err(e) => {
-                                                let _ = self.out_tx.send(response(None, "parse", false, None, Some(&format!("invalid JSON: {e}"))));
+                                    }
+                                    // After the checkpoint arm (`biased`), so the assistant's `tool_use` is on
+                                    // disk before the task record that answers it.
+                                    Some((kind, data)) = self.mcp_task_rx.recv() => {
+                                        journal_mcp(&mut self.persistence, &kind, data);
+                                    }
+                                    maybe_line = self.input_rx.recv(), if stdin_open => match maybe_line {
+                                        Some(l) => {
+                                            let l = l.trim();
+                                            if l.is_empty() {
                                                 continue;
                                             }
-                                        };
-                                        let cid = c.get("id").and_then(Value::as_str).map(str::to_string);
-                                        match c.get("type").and_then(Value::as_str).unwrap_or("") {
-                                            "abort" => {
-                                                branch_cancel.cancel();
-                                                let _ = self.out_tx.send(response(cid, "abort", true, None, None));
+                                            let c: Value = match serde_json::from_str(l) {
+                                                Ok(v) => v,
+                                                Err(e) => {
+                                                    let _ = self.out_tx.send(response(None, "parse", false, None, Some(&format!("invalid JSON: {e}"))));
+                                                    continue;
+                                                }
+                                            };
+                                            let cid = c.get("id").and_then(Value::as_str).map(str::to_string);
+                                            let ctype = c.get("type").and_then(Value::as_str).unwrap_or("");
+                                            // Service mode gates here too, *ahead* of the self-abort arm
+                                            // below: `fork`/`clone`/`new_session`/`switch_session` cancel
+                                            // the running prompt before they defer, so refusing them only
+                                            // at the idle dispatch would let a refused command kill a run.
+                                            if let Some(why) = self.mode.refused_command(ctype)
+                                            {
+                                                let _ = self.out_tx.send(response(cid, ctype, false, None, Some(why)));
+                                                continue;
                                             }
-                                            "prompt" if crate::tools::mcp_events::is_injection(&c) => {
-                                                self.deferred_events.push_back(l.to_string());
+                                            // In service mode `fork`/`clone` derive a *new* session and
+                                            // leave this one running (see `fork_detached`), so there is
+                                            // nothing here worth a run for: "busy" costs the client a
+                                            // retry, cancelling would cost it the turn.
+                                            if let Some(why) = self.mode.busy_refusal_for_fork_clone(ctype, "running") {
+                                                let _ = self.out_tx.send(response(cid, ctype, false, None, Some(&why)));
+                                                continue;
                                             }
-                                            events_cmd if events_cmd.starts_with("mcp_events_") => dispatch_events(&self.events_cmds, &self.out_tx, cid, events_cmd, &c),
-                                            other => {
-                                                let _ = self.out_tx.send(response(cid, other, false, None, Some("busy: a branch switch is summarizing; only `abort` is accepted until it settles")));
+                                            match ctype {
+                                                // Fix 4 (pi-parity gap): the ack is *not* sent here — see
+                                                // the flush right after this busy-loop exits, below. Sending
+                                                // it immediately (the instant `cancel.cancel()` is called)
+                                                // let a client that — correctly, per this RPC's own contract
+                                                // — treats the ack as "safe to send the next command" get
+                                                // rejected as busy: this same busy-loop keeps rejecting every
+                                                // non-abort command as busy until `run` itself actually
+                                                // resolves, which can lag well behind the cancellation
+                                                // request while in-flight tool calls/HTTP streams unwind.
+                                                // Matches pi's `agent-session.ts`, which awaits
+                                                // `waitForIdle()` before acking `abort`.
+                                                "abort" => {
+                                                    cancel.cancel();
+                                                    // A view's bridge requests are the user's work too.
+                                                    crate::tools::mcp_apps::cancel_requests(&self.mcp_enabled);
+                                                    pending_abort_acks.push(cid);
+                                                }
+                                                "stop_after_turn" => {
+                                                    // Graceful, not a cancel: the current turn's tool calls (if
+                                                    // any) still finish and their results are committed; the run
+                                                    // just doesn't start another model call afterward. See
+                                                    // `agent_core::Steering::request_stop`.
+                                                    self.steering.request_stop();
+                                                    let _ = self.out_tx.send(response(cid, "stop_after_turn", true, None, None));
+                                                }
+                                                "switch_model" => {
+                                                    // Pi-parity gap (pi's `prepareNextTurn`): unlike `set_model`
+                                                    // (which only takes effect on the *next* `prompt`), this
+                                                    // retargets the run already in flight — the current turn's
+                                                    // own request is unaffected, but every subsequent turn of
+                                                    // this same run targets the new model. See
+                                                    // `agent_core::Steering::request_model_switch`.
+                                                    match c.get("model").and_then(Value::as_str) {
+                                                        Some(model) => {
+                                                            let thinking = c
+                                                                .get("thinking")
+                                                                .and_then(Value::as_u64)
+                                                                .map(|t| t as u32);
+                                                            self.steering.request_model_switch(model, thinking);
+                                                            let _ = self.out_tx.send(response(cid, "switch_model", true, None, None));
+                                                        }
+                                                        None => {
+                                                            let _ = self.out_tx.send(response(cid, "switch_model", false, None, Some("missing `model`")));
+                                                        }
+                                                    }
+                                                }
+                                                cmd @ ("steer" | "follow_up") => {
+                                                    match c.get("message").and_then(Value::as_str) {
+                                                        Some(m) => {
+                                                            // Same expansion (and the same optional
+                                                            // `images` attachments) a fresh `prompt` gets —
+                                                            // a `/skill:name`/`/name` invocation, or an
+                                                            // image, steered or queued this way must not
+                                                            // reach the model unexpanded/dropped just
+                                                            // because it arrived on a different command
+                                                            // type.
+                                                            // `steer` redirects mid-run (injected at the next
+                                                            // tool turn); `follow_up` waits for the stop
+                                                            // boundary. Two separate lanes. The pushing
+                                                            // client learns what's actually queued from its
+                                                            // own ack (Fix 5), including a full lane's
+                                                            // refusal. See `PendingSteers` for why an
+                                                            // MCP `/skill:` is expanded off this loop.
+                                                            let lane = if cmd == "steer" { SteerLane::Steer } else { SteerLane::FollowUp };
+                                                            self.pending_steers.receive(cid, m, parse_images(c.get("images")), lane, SteerAck::Command(if cmd == "steer" { "steer" } else { "follow_up" }), &self.skills, &self.prompt_templates, &self.mcp_skills, &self.steering, &self.out_tx);
+                                                        }
+                                                        None => {
+                                                            let _ = self.out_tx.send(response(cid, cmd, false, None, Some("missing `message`")));
+                                                        }
+                                                    }
+                                                }
+                                                // A `prompt` sent while busy is rejected by default (the
+                                                // session is borrowed by the in-flight run) — *unless* it
+                                                // carries `streaming_behavior: "steer"|"follow_up"`, in which
+                                                // case its `message` is routed through the same `Steering`
+                                                // queue as an explicit `steer`/`follow_up` command, rather than
+                                                // forcing the client to re-encode it as a different command type.
+                                                // An injected event follow-up runs as its own prompt once this run is
+                                                // over (it is what the coalescer would have sent then anyway).
+                                                "prompt" if crate::tools::mcp_events::is_injection(&c)
+                                                    && c.get("streaming_behavior").and_then(Value::as_str) != Some("steer") =>
+                                                {
+                                                    self.deferred_events.push_back(l.to_string());
+                                                }
+                                                "prompt" => {
+                                                    match (
+                                                        c.get("streaming_behavior").and_then(Value::as_str),
+                                                        c.get("message").and_then(Value::as_str),
+                                                    ) {
+                                                        (Some("steer"), Some(m)) => {
+                                                            // An MCP Events injection is host-authored text, never a
+                                                            // `/skill:`: queued at once, so its delivery bookkeeping
+                                                            // (and deferral on a full lane) stays exact.
+                                                            if let Some(batch) = crate::tools::mcp_events::injection_batch(&c) {
+                                                                let text = crate::skills::expand_if_skill_invocation(m, &self.skills);
+                                                                let text = crate::prompts::expand_if_slash(&text, &self.prompt_templates);
+                                                                let m = agent_core::SteeringMessage::new(text, parse_images(c.get("images")))
+                                                                    .with_tag(batch);
+                                                                let queued = self.steering.push_steer(m);
+                                                                if !queued {
+                                                                    self.deferred_events.push_back(l.to_string());
+                                                                    continue;
+                                                                }
+                                                                steered_injections.push(batch);
+                                                                let mut data = queue_content(&self.steering);
+                                                                data["queued_as"] = json!("steer");
+                                                                let _ = self.out_tx.send(response(cid, "prompt", true, Some(data), None));
+                                                                continue;
+                                                            }
+                                                            // Fix 5 (pi-parity gap): same queue-content
+                                                            // visibility the dedicated `steer`/`follow_up`
+                                                            // commands' own acks carry, plus `queued_as`.
+                                                            self.pending_steers.receive(cid, m, parse_images(c.get("images")), SteerLane::Steer, SteerAck::Prompt, &self.skills, &self.prompt_templates, &self.mcp_skills, &self.steering, &self.out_tx);
+                                                        }
+                                                        (Some("follow_up"), Some(m)) => {
+                                                            self.pending_steers.receive(cid, m, parse_images(c.get("images")), SteerLane::FollowUp, SteerAck::Prompt, &self.skills, &self.prompt_templates, &self.mcp_skills, &self.steering, &self.out_tx);
+                                                        }
+                                                        _ => {
+                                                            let _ = self.out_tx.send(response(cid, "prompt", false, None, Some("busy: a prompt is running; only `abort`/`steer`/`follow_up`, or a `prompt` with `streaming_behavior: \"steer\"|\"follow_up\"`, are accepted")));
+                                                        }
+                                                    }
+                                                }
+                                                // Read-only commands that don't need the `&mut Session` this
+                                                // run holds — answered live instead of rejected as busy, so a
+                                                // client polling for progress (tokens/steps so far) during a
+                                                // long tool-heavy turn isn't left with nothing until it ends.
+                                                // `get_state`/`get_session_stats` read `live_stats` (mirrored
+                                                // from this run's own events, see above) instead of `session`
+                                                // directly; `message_count` is `null` here specifically — it's
+                                                // the one `get_state` field that genuinely needs `&session` to
+                                                // report exactly, and a stale/guessed number would be worse
+                                                // than an honest "not available mid-run".
+                                                "get_state" => {
+                                                    // Resolved before the borrow below: in service mode it
+                                                    // is a round trip into the sandbox, which cannot happen
+                                                    // while `data` is mutably borrowed.
+                                                    let branch = self.mode.git_branch(&self.exec_cell, &self.cwd).await;
+                                                    let mut data = live_stats.snapshot();
+                                                    if let Value::Object(m) = &mut data {
+                                                        insert_session_identity(m, &self.persistence, &self.mode);
+                                                        m.insert("model".into(), json!(self.current_model));
+                                                        m.insert("message_count".into(), Value::Null);
+                                                        m.insert("title".into(), json!(self.persistence.meta.title));
+                                                        m.insert("cwd_stale".into(), json!(self.mode.cwd_is_stale(&self.persistence.meta.cwd, &self.cwd)));
+                                                        // Task #25 (pi-parity fix): same fields, same reasoning, as the idle `get_state` arm below.
+                                                        m.insert("cwd".into(), json!(self.cwd.display().to_string()));
+                                                        m.insert("git_branch".into(), json!(branch));
+                                                        m.insert("is_streaming".into(), json!(true));
+                                                        m.insert("is_compacting".into(), json!(is_compacting.load(Ordering::Relaxed)));
+                                                        if let Value::Object(rt) = runtime_settings(self.current_level, self.current_auto_compaction, self.current_auto_retry, self.current_block_images, self.current_image_auto_resize, &self.steering) {
+                                                            m.extend(rt);
+                                                        }
+                                                    }
+                                                    let _ = self.out_tx.send(response(cid, "get_state", true, Some(data), None));
+                                                }
+                                                // Answered from the fanout's committed-history snapshot — the
+                                                // same source an attach-time catch-up is seeded from — rather
+                                                // than from `session`, which this run holds `&mut` for its whole
+                                                // duration. Rejecting this as busy (as it was) left a client that
+                                                // re-attached mid-run unable to fetch the history it had missed
+                                                // for as long as the run lasted, having already been shown that
+                                                // run's live output: it rendered the tail of a turn whose earlier
+                                                // messages it had never seen, and could only reconcile once the
+                                                // run finally ended.
+                                                //
+                                                // The snapshot is the transcript as of this run's start (see
+                                                // `sync_history!` for why it deliberately doesn't advance
+                                                // mid-run). The turn in flight is carried by the event frames the
+                                                // client is concurrently receiving — replayed from `OutFanout::
+                                                // turn` if it attached partway in — so base-plus-frames still
+                                                // adds up to the whole picture. Its messages land here the moment
+                                                // the run ends.
+                                                "get_messages" => {
+                                                    let (msgs, ids) = {
+                                                        let f = lock_ignoring_poison(&self.out_conn);
+                                                        f.history_snapshot()
+                                                    };
+                                                    match messages_payload(&msgs, &ids, c.get("since").and_then(Value::as_str)) {
+                                                        Ok(data) => { let _ = self.out_tx.send(response(cid, "get_messages", true, Some(data), None)); }
+                                                        Err(e) => { let _ = self.out_tx.send(response(cid, "get_messages", false, None, Some(&e))); }
+                                                    }
+                                                }
+                                                "get_session_stats" => {
+                                                    // Fix 8 (pi-parity gap): previously the raw
+                                                    // `LiveStats::snapshot()` verbatim — dropping
+                                                    // session_id/session_file (this process's own live
+                                                    // sources, same as `get_state`'s busy arm just above)
+                                                    // and user_messages/assistant_messages/tool_calls/
+                                                    // tool_results/total_messages/context_usage (genuinely
+                                                    // unavailable mid-run: `&session` is exclusively
+                                                    // borrowed by the in-flight turn, the same reason
+                                                    // `get_state`'s own `message_count` is `null` here) —
+                                                    // present as `null` rather than silently absent, so a
+                                                    // client sees the same field *set* idle or busy, values
+                                                    // aside.
+                                                    let mut data = live_stats.snapshot();
+                                                    if let Value::Object(m) = &mut data {
+                                                        insert_session_identity(m, &self.persistence, &self.mode);
+                                                        for field in [
+                                                            "context_usage",
+                                                            "user_messages",
+                                                            "assistant_messages",
+                                                            "tool_calls",
+                                                            "tool_results",
+                                                            "total_messages",
+                                                        ] {
+                                                            m.insert(field.to_string(), Value::Null);
+                                                        }
+                                                    }
+                                                    let _ = self.out_tx.send(response(cid, "get_session_stats", true, Some(data), None));
+                                                }
+                                                "get_commands" => {
+                                                    let mut commands: Vec<Value> = self.skills.iter().map(|s| {
+                                                        json!({ "name": format!("skill:{}", s.name), "source": "skill", "description": s.description, "scope": s.scope, "path": s.path })
+                                                    }).collect();
+                                                    commands.extend(self.mcp_skills.commands());
+                                                    commands.extend(self.prompt_templates.iter().map(|t| {
+                                                        json!({ "name": t.name, "source": "prompt", "description": t.description, "scope": t.scope, "path": t.path })
+                                                    }));
+                                                    let mcp_diagnostics = self.mcp_skills.diagnostics(&self.skills);
+                                                    let collisions: Vec<&crate::skills::Collision> = self.skill_collisions.iter().chain(self.prompt_collisions.iter()).chain(mcp_diagnostics.iter()).collect();
+                                                    let _ = self.out_tx.send(response(cid, "get_commands", true, Some(json!({ "commands": commands, "collisions": collisions })), None));
+                                                }
+                                                "list_branches" => {
+                                                    let _ = self.out_tx.send(response(cid, "list_branches", true, Some(json!({ "branches": self.persistence.list_branches() })), None));
+                                                }
+                                                "get_todos" => {
+                                                    // From the live mirror: `&session` is exclusively borrowed by
+                                                    // the in-flight turn. See `LiveStats::todos`.
+                                                    let _ = self.out_tx.send(response(cid, "get_todos", true, Some(json!({ "todos": live_stats.todos() })), None));
+                                                }
+                                                // The arm that matters: an approval question is only ever
+                                                // outstanding *while a run is blocked inside the gate*, so this
+                                                // must be answerable mid-run. `accepted:false` tells the losing
+                                                // client in a multi-attach race that its answer arrived too late.
+                                                "approve" => {
+                                                    let _ = self.out_tx.send(handle_approve(cid, &c, &self.pending_approvals, self.approval.is_some()));
+                                                }
+                                                "elicit" => {
+                                                    let _ = self.out_tx.send(handle_elicit(cid, &c, Some(&self.pending_elicitations)));
+                                                }
+                                                "sample" => {
+                                                    let _ = self.out_tx.send(handle_sample(cid, &c, &self.pending_samplings));
+                                                }
+                                                // A view is interactive while the model runs, too.
+                                                "mcp_app_request" => spawn_app_request(cid, c.clone(), &self.out_tx, &self.mcp_enabled, &self.app_filter, &self.approval, &self.app_detached, &self.mode, &self.mcp_host),
+                                                "get_tree" => {
+                                                    // Same `since` handling as the idle-loop arm below — see
+                                                    // `nodes_since`'s own doc comment (Task #48, pi-parity gap).
+                                                    match c.get("since").and_then(Value::as_str) {
+                                                        Some(since) => match nodes_since(self.persistence.tree(), since) {
+                                                            Ok(nodes) => {
+                                                                let _ = self.out_tx.send(response(cid, "get_tree", true, Some(json!({ "nodes": nodes, "leaf_id": self.persistence.active_ids().last() })), None));
+                                                            }
+                                                            Err(e) => {
+                                                                let _ = self.out_tx.send(response(cid, "get_tree", false, None, Some(&e)));
+                                                            }
+                                                        },
+                                                        None => {
+                                                            let _ = self.out_tx.send(response(cid, "get_tree", true, Some(json!({ "nodes": self.persistence.tree(), "leaf_id": self.persistence.active_ids().last() })), None));
+                                                        }
+                                                    }
+                                                }
+                                                "list_sessions" => {
+                                                    let progress_id = cid.clone();
+                                                    let progress_tx = self.out_tx.clone();
+                                                    let sessions = self.persistence
+                                                        .list_with_progress(&self.mode, move |scanned, total| {
+                                                            if should_report_scan_progress(scanned, total) {
+                                                                let _ = progress_tx.send(list_progress_frame(progress_id.clone(), "list_sessions", scanned, total));
+                                                            }
+                                                        })
+                                                        .await;
+                                                    let _ = self.out_tx.send(response(cid, "list_sessions", true, Some(listing_page(sessions, &c)), None));
+                                                }
+                                                "list_all_sessions" => {
+                                                    let progress_id = cid.clone();
+                                                    let progress_tx = self.out_tx.clone();
+                                                    match self.persistence.list_all_with_progress(&self.mode, move |scanned, total| {
+                                                        if should_report_scan_progress(scanned, total) {
+                                                            let _ = progress_tx.send(list_progress_frame(progress_id.clone(), "list_all_sessions", scanned, total));
+                                                        }
+                                                    }).await {
+                                                        Ok(sessions) => {
+                                                            let _ = self.out_tx.send(response(cid, "list_all_sessions", true, Some(listing_page(sessions, &c)), None));
+                                                        }
+                                                        Err(e) => {
+                                                            let _ = self.out_tx.send(response(cid, "list_all_sessions", false, None, Some(&e.to_string())));
+                                                        }
+                                                    }
+                                                }
+                                                "get_available_models" => {
+                                                    // Always the full known-model hint list, never scoped by `--models` — see the
+                                                    // idle-mode handler's identical comment for why.
+                                                    let models: Vec<Value> = listed_models().iter().map(|m| model_info(m)).collect();
+                                                    let _ = self.out_tx.send(response(cid, "get_available_models", true, Some(json!({ "models": models })), None));
+                                                }
+                                                // A run is actively in flight — no retry backoff is pending yet
+                                                // (that only happens after an attempt fails, outside this loop),
+                                                // so there's nothing to cancel. Acknowledge idempotently, same
+                                                // as `abort`'s own idle-mode no-op below.
+                                                "abort_retry" => {
+                                                    let _ = self.out_tx.send(response(cid, "abort_retry", true, None, None));
+                                                }
+                                                // pi-parity (Task 4): pi's real product has no busy/idle
+                                                // gating at all for these — `compact()`/`switchSession`/
+                                                // `newSession`/`fork` all call `abort()` unconditionally
+                                                // before replacing the session, with no check for whether a
+                                                // prompt is currently streaming. Mirrored here: cancel this
+                                                // run exactly like an explicit `abort` (same token), then
+                                                // queue the raw command to run its ordinary idle-path logic
+                                                // once the run has actually gone idle — see
+                                                // `pending_deferred`'s own doc comment above. No ack is sent
+                                                // here; the command's own idle-path response (sent once
+                                                // idle, below) doubles as it, same as `abort`'s own deferred
+                                                // ack just above.
+                                                "compact" | "switch_session" | "fork" | "clone"
+                                                | "new_session" => {
+                                                    cancel.cancel();
+                                                    pending_deferred.push((cid, c.clone()));
+                                                }
+                                                events_cmd if events_cmd.starts_with("mcp_events_") => dispatch_events(&self.events_cmds, &self.out_tx, cid, events_cmd, &c),
+                                                other => {
+                                                    let _ = self.out_tx.send(response(cid, other, false, None, Some("busy: a prompt is running; only `abort`/`abort_retry`/`steer`/`follow_up`, `compact`/`switch_session`/`fork`/`clone`/`new_session` (which self-abort-and-proceed), or a handful of read-only commands (get_state/get_session_stats/get_messages/get_commands/list_branches/get_tree/list_sessions/list_all_sessions/get_available_models), are accepted")));
+                                                }
+                                            }
+                                        }
+                                        // stdin closed (or errored) mid-run: cancel and let the run unwind, then
+                                        // we'll fall out of the outer loop below.
+                                        None => {
+                                            stdin_open = false;
+                                            cancel.cancel();
+                                        }
+                                    },
+                                    _ = async {
+                                        match heartbeat.as_mut() {
+                                            Some(h) => {
+                                                h.tick().await;
+                                            }
+                                            None => std::future::pending::<()>().await,
+                                        }
+                                    } => {
+                                        if let Some(life) = &life_beat {
+                                            life.heartbeat();
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        // Do **not** clear `running` here. The attempt's future has resolved, but the
+                        // prompt may still retry (backoff below) or emit its terminal response; an HTTP
+                        // POST that already unpinned on the ack would otherwise be reapable in that gap.
+                        // Cleared after `emit!(frame)` once the command is actually done.
+
+                        // Fix 4: the run has now actually gone idle — `run_events_steered`'s future only
+                        // resolves once the whole run (including tool cleanup) has stopped touching
+                        // `session` — so it's safe to tell a client-issued `abort` it can now send its next
+                        // command without racing this busy-loop's own "still draining" rejection above.
+                        for cid in pending_abort_acks.drain(..) {
+                            let _ = self.out_tx.send(response(cid, "abort", true, None, None));
+                        }
+                        // Steers still waiting on a skill belong to this run, which is over: cancel them
+                        // (before any `new_session`/`switch_session`/`fork`/`clone` waiting behind it runs)
+                        // and say so; anything ready behind them is queued in order.
+                        self.pending_steers
+                            .end_run(
+                                matches!(&attempt_result, Err(agent_core::Error::Cancelled)),
+                                &self.mcp_skills,
+                                &self.steering,
+                                &self.out_tx,
+                            )
+                            .await;
+                        while self.steer_done_rx.try_recv().is_ok() {}
+
+                        // A checkpoint sent right as the run above ended (see `agent_core::Agent`'s final,
+                        // unconditional post-run `checkpoint.checkpoint(session)`) races the `r = &mut run`
+                        // arm above under `biased` select: whichever is ready first wins, so a checkpoint
+                        // that arrived in the same instant the run itself completed can be left sitting in
+                        // `checkpoint_rx`'s buffer, undrained. Track (pi-parity fix, found via this crate's
+                        // own test suite going red): left alone, that stale message would only ever get
+                        // drained during some *later*, unrelated prompt's own inner loop — by which point an
+                        // intervening `new_session`/`switch_session`/`fork`/`switch_branch` may have already
+                        // swapped `persistence` onto a *different* session's store, so draining it there
+                        // would silently write *this* turn's content into that other session's file (and,
+                        // via `append_new`'s `messages.len() <= self.persisted` dedup guard, could mask that
+                        // later turn's own real content entirely). Discarded here, not persisted: the
+                        // unconditional `persist_blocking` right below is a strict superset of it for this
+                        // turn's own final state, and this must run *before* any later command gets a chance
+                        // to swap `persistence` out from under it.
+                        while self.checkpoint_rx.try_recv().is_ok() {}
+                        // MCP journal writes still queued belong to *this* session: persist them now,
+                        // before a deferred command can swap `persistence` (they would be dropped by the
+                        // session-id check, but this session would lose them).
+                        while let Ok((kind, data)) = self.mcp_task_rx.try_recv() {
+                            journal_mcp(&mut self.persistence, &kind, data);
+                        }
+
+                        // Whether this attempt is about to be retried. Decided *here*, before the persist
+                        // below, and reused verbatim as the retry arm's own guard — the two must not be
+                        // able to disagree, because the closing error record has to be dropped on the same
+                        // side of the persist in memory as it is on disk.
+                        if self.session.steps > steps_at_start {
+                            stalled_retries = 0;
+                        }
+                        let will_retry = matches!(&attempt_result, Err(e)
+                        if self.current_auto_retry
+                            && stdin_open
+                            && !cancel.is_cancelled()
+                            && stalled_retries < self.run_retry_policy.max_retries
+                            && crate::retry::is_retryable_whole_run(e));
+
+                        // The failed attempt's closing error record (`run_events_steered` always pushes one
+                        // on an `Err`-ending run) must not survive into the retry — this is the *same* run
+                        // resuming from scratch, not a client's own fresh prompt, so it has to be genuinely
+                        // invisible in the transcript rather than stacked under the retry's real response.
+                        //
+                        // Popped *before* the persist below, not after it. `SessionStore::append_new` is
+                        // keyed on a count (`messages.len() <= self.persisted` skips, and each append sets
+                        // `persisted = messages.len()`), so it has no way to notice the message list got
+                        // *shorter*: persisting N+1 messages and then shrinking to N desynced the two for
+                        // the rest of the session. The retry re-produced the assistant message, `len` was
+                        // back to N+1, the append early-returned, and that message was silently **never
+                        // written** — with the following `tool_result` then chaining onto the error record's
+                        // node instead. Nothing reconciles a shrink (`rewrite` is only reachable via
+                        // compaction/fork/branch), and the existing e2e coverage missed it entirely by
+                        // asserting against the live in-memory transcript rather than a reload.
+                        //
+                        // Kept rather than dropped: if the retry is cancelled during its backoff below, this
+                        // run ends here after all, and the record has to go back — it is the only thing
+                        // keeping the session's role alternation valid for whatever prompt comes next (see
+                        // `a_prompt_after_a_failed_run_does_not_double_push_a_user_turn` in `agent_core`;
+                        // there is no guard against a double-pushed `user` turn anywhere else).
+                        let mut withheld_error_record = None;
+                        if will_retry {
+                            withheld_error_record = self
+                                .session
+                                .messages
+                                .last()
+                                .filter(|m| m.error_message.is_some())
+                                .cloned();
+                            self.session.pop_error_record();
+                        }
+
+                        // Persist whatever this attempt produced (even a failed one may have committed a tool
+                        // round-trip or two before the error) before deciding whether to retry.
+                        {
+                            let (p, r) = persist_blocking(
+                                self.persistence.take_for_blocking(),
+                                self.session.clone(),
+                            )
+                            .await;
+                            self.persistence = p;
+                            persist_error = r.err().map(|e| e.to_string());
+                        }
+
+                        match &attempt_result {
+                            Err(e) if will_retry => {
+                                retry_attempt += 1;
+                                stalled_retries += 1;
+                                let delay = self.run_retry_policy.backoff(stalled_retries);
+                                let _ = self.out_tx.send(auto_retry_frame(
+                                    id.clone(),
+                                    stalled_retries,
+                                    self.run_retry_policy.max_retries,
+                                    delay.as_millis() as u64,
+                                    &e.to_string(),
+                                ));
+                                // Race the backoff itself against `abort`/`abort_retry`/shutdown, instead
+                                // of a bare `sleep` no command can interrupt — no run is in flight during
+                                // this wait, so only those two commands (plus stdin closing) are accepted;
+                                // anything else is rejected as busy, the same shape the live-run busy-loop
+                                // uses. A cancelled retry surfaces the *real* underlying error that
+                                // triggered it (`attempt_result`, set below), not a synthetic
+                                // `Error::Cancelled` — nothing was actually cancelled mid-flight, the
+                                // automatic retry was just declined.
+                                let mut retry_cancelled = false;
+                                let sleep = tokio::time::sleep(delay);
+                                tokio::pin!(sleep);
+                                loop {
+                                    tokio::select! {
+                                        biased;
+                                        () = &mut sleep => break,
+                                        sig = self.shutdown.wait() => {
+                                            self.shutdown_cause = Some(sig);
+                                            stdin_open = false;
+                                            retry_cancelled = true;
+                                            break;
+                                        }
+                                        maybe_line = self.input_rx.recv(), if stdin_open => match maybe_line {
+                                            Some(l) => {
+                                                let l = l.trim();
+                                                if l.is_empty() {
+                                                    continue;
+                                                }
+                                                let c: Value = match serde_json::from_str(l) {
+                                                    Ok(v) => v,
+                                                    Err(e) => {
+                                                        let _ = self.out_tx.send(response(None, "parse", false, None, Some(&format!("invalid JSON: {e}"))));
+                                                        continue;
+                                                    }
+                                                };
+                                                let cid = c.get("id").and_then(Value::as_str).map(str::to_string);
+                                                let cmd_type = c.get("type").and_then(Value::as_str).unwrap_or("");
+                                                // Same gate as the live-run loop above: a refused command
+                                                // must not end the retry sequence a run is waiting on.
+                                                if let Some(why) = self.mode.refused_command(cmd_type)
+                                                {
+                                                    let _ = self.out_tx.send(response(cid, cmd_type, false, None, Some(why)));
+                                                    continue;
+                                                }
+                                                // Same as the live-run loop: in service mode a
+                                                // `fork`/`clone` has no reason to end the retry
+                                                // sequence this run is waiting on.
+                                                if let Some(why) = self.mode.busy_refusal_for_fork_clone(cmd_type, "retrying") {
+                                                    let _ = self.out_tx.send(response(cid, cmd_type, false, None, Some(&why)));
+                                                    continue;
+                                                }
+                                                match cmd_type {
+                                                    "abort" | "abort_retry" => {
+                                                        retry_cancelled = true;
+                                                        let _ = self.out_tx.send(response(cid, cmd_type, true, None, None));
+                                                        break;
+                                                    }
+                                                    // pi-parity (Task 4): same self-abort-and-proceed
+                                                    // treatment as the live-run busy-loop's own arm above —
+                                                    // this backoff wait is still "a prompt is running" from
+                                                    // the client's point of view. Ends the retry sequence
+                                                    // (like `abort_retry`) and queues the command to run
+                                                    // once idle, via the same `pending_deferred` drained
+                                                    // right after this whole retry loop.
+                                                    "compact" | "switch_session" | "fork" | "clone"
+                                                    | "new_session" => {
+                                                        retry_cancelled = true;
+                                                        pending_deferred.push((cid, c.clone()));
+                                                        break;
+                                                    }
+                                                    "prompt" if crate::tools::mcp_events::is_injection(&c) => {
+                                                        self.deferred_events.push_back(l.to_string());
+                                                    }
+                                                    events_cmd if events_cmd.starts_with("mcp_events_") => dispatch_events(&self.events_cmds, &self.out_tx, cid, events_cmd, &c),
+                                                    other => {
+                                                        let _ = self.out_tx.send(response(cid, other, false, None, Some("busy: retrying after a transient error; only `abort`/`abort_retry`/`compact`/`switch_session`/`fork`/`clone`/`new_session` are accepted")));
+                                                    }
+                                                }
+                                            }
+                                            None => {
+                                                stdin_open = false;
+                                                retry_cancelled = true;
+                                                break;
                                             }
                                         }
                                     }
-                                    None => {
-                                        branch_stdin_open = false;
-                                        branch_cancel.cancel();
-                                    }
                                 }
+                                if retry_cancelled {
+                                    // No retry after all — this run ends on the attempt that just failed,
+                                    // so the closing error record withheld above has to go back, in memory
+                                    // *and* on disk. Without it the session's last message is the user's own
+                                    // unanswered prompt, and the next `prompt` would stack a second
+                                    // consecutive `user` turn, a shape no dialect accepts. A plain append
+                                    // (never a compacted rewrite): any compaction this attempt performed was
+                                    // already written by the persist above, and this only adds one message
+                                    // on top of it.
+                                    if let Some(record) = withheld_error_record.take() {
+                                        self.session.push(record);
+                                        let (p, r) = persist_blocking(
+                                            self.persistence.take_for_blocking(),
+                                            self.session.clone(),
+                                        )
+                                        .await;
+                                        self.persistence = p;
+                                        if let Err(e) = r {
+                                            persist_error = Some(e.to_string());
+                                        }
+                                    }
+                                    let _ = self.out_tx.send(auto_retry_end_frame(
+                                        id.clone(),
+                                        false,
+                                        retry_attempt,
+                                        Some("retry cancelled"),
+                                    ));
+                                    break 'retry attempt_result;
+                                }
+                                continue 'retry;
+                            }
+                            _ => {
+                                // A terminal notice only for a sequence that actually retried at least
+                                // once — a first-attempt success or an immediately-non-retryable failure
+                                // never emitted `auto_retry`, so it needs no "the retries ended" notice
+                                // either. Mirrors pi's own `this._retryAttempt > 0` guard.
+                                if retry_attempt > 0 {
+                                    let (success, final_error) = match &attempt_result {
+                                        Ok(_) => (true, None),
+                                        Err(e) => (false, Some(e.to_string())),
+                                    };
+                                    let _ = self.out_tx.send(auto_retry_end_frame(
+                                        id.clone(),
+                                        success,
+                                        retry_attempt,
+                                        final_error.as_deref(),
+                                    ));
+                                }
+                                break 'retry attempt_result;
                             }
                         }
                     };
-                    match switch_result {
-                        Ok((s, resolved_target)) => {
-                            self.session = s;
-                            self.steering.clear();
-                            // Restore whichever model/thinking-level was actually active on this
-                            // branch, rather than silently continuing with the process's current
-                            // global setting (which may have since moved on via a `set_model`/
-                            // `cycle_thinking_level` made on a *different* branch — that's the bleed
-                            // this guards against). Both always resolve to something real: the model
-                            // falls back to the session's own creation-time model, the level to the
-                            // process's own starting level (`starting_level`) — see
-                            // `model_and_level_at`'s doc comment. Queried against `resolved_target`
-                            // (`None` when `before` landed on the tree's own root), not the raw
-                            // `target_id` argument, which names the entry navigated *relative to*, not
-                            // necessarily where the session actually ended up.
-                            let (restored_model, restored_level) = self.persistence
-                                .model_and_level_at_opt(resolved_target.as_deref(), self.starting_level);
-                            // Clamp against the *restored* model's capabilities, not the model that
-                            // was active before the switch — a branch recorded at `Off` on a model
-                            // that's since been superseded by a non-disable-capable one must not
-                            // resurrect an illegal `Off` state.
-                            let restored_level = agent_core::clamp_thinking_level(
-                                &agent_core::capabilities(&restored_model),
-                                restored_level,
+
+                    // The turn is over, however it ended: its yielded `bash` jobs (a foreground command
+                    // that went quiet or kept printing) stop with it, as the stop reminder told the model
+                    // — an idle session must not accumulate hung loops. Intended jobs keep running. Said
+                    // to the client before the terminal response, like `run`'s `--json` line.
+                    let stopped_jobs = {
+                        let jobs = self.bash_jobs.clone();
+                        tokio::task::spawn_blocking(move || jobs.end_turn())
+                            .await
+                            .unwrap_or_default()
+                    };
+                    if !stopped_jobs.is_empty()
+                        && !self.emit(OutFrame::Value(json!({
+                            "type": "bash_jobs_stopped",
+                            "jobs": stopped_jobs,
+                        })))
+                    {
+                        break;
+                    }
+
+                    let frame = match result {
+                        Ok(()) => {
+                            let mut data = session_stats(
+                                &self.session,
+                                &compaction_config(&self.cfg, &self.current_model),
                             );
-                            if restored_model != self.current_model {
-                                self.session.scrub_cross_model_state(&restored_model);
-                                // The restored model can be on a different OAuth provider than whatever was
-                                // active before this switch — best-effort, matching this restore path's existing
-                                // "recorded state wins" philosophy: a failure here leaves `client` on the previous
-                                // (now-wrong-for-`current_model`) credential rather than aborting the whole switch,
-                                // so the next `prompt` surfaces its own clear transport-level error instead.
-                                match build_gateway_client(&self.cfg, &restored_model) {
-                                    Ok(new_client) => self.client = Arc::new(new_client),
-                                    Err(e) => eprintln!(
-                                        "serve: could not resolve a gateway credential for restored model {restored_model:?}: \
-                                         {e} — keeping the previous client"
-                                    ),
+                            if let Value::Object(m) = &mut data {
+                                m.insert("refused".into(), json!(refused.load(Ordering::Relaxed)));
+                                // Present exactly when this prompt asked for typed output, so a client can
+                                // tell "the model never produced a payload" (`null`) apart from "this run
+                                // wasn't asked for one" (field absent) — the same reason `refused` is always
+                                // present rather than only when true. Read after the run has fully drained,
+                                // so a mixed batch (`structured_output` + `edit` in one turn, which the
+                                // loop's unanimous-terminate rule lets continue) reports the final value.
+                                if self.current_output_spec.is_some() {
+                                    m.insert(
+                                        "structured_output".into(),
+                                        self.output_slot.get().unwrap_or(Value::Null),
+                                    );
                                 }
-                                self.current_model = restored_model;
                             }
-                            if restored_level != self.current_level {
-                                self.current_level = restored_level;
-                                self.current_thinking = None;
+                            match &persist_error {
+                                // The run itself succeeded, but its transcript failed to durably persist —
+                                // report failure rather than a false success (still with `data`: the run
+                                // did produce a real result, just not one safely on disk yet).
+                                Some(e) => response(
+                                    id.clone(),
+                                    "prompt",
+                                    false,
+                                    Some(data),
+                                    Some(&format!("run completed but failed to persist: {e}")),
+                                ),
+                                None => response(id.clone(), "prompt", true, Some(data), None),
                             }
-                            // MCP kit was reset to all-enabled with the session switch — rebuild so the
-                            // advertised tool set cannot keep the previous session's allowlist.
-                            // always rebuild (MCP kit may have reset; model/level may have changed)
-                            {
-                                self.agent = build_agent(
-                                    &self.exec_cell,
-                                    self.client.clone(),
-                                    &full_system(&self.static_system, &self.cwd, &self.mcp_skills),
-                                    &self.cfg,
-                                    &self.current_model,
-                                    self.current_thinking,
-                                    self.current_level,
-                                    self.current_auto_compaction,
-                                    self.current_auto_retry,
-                                    self.current_block_images,
-                                    self.current_image_auto_resize,
-                                    self.persistence.session_id(),
-                                    &self.write_locks,
-                                    &self.checkpoint,
-                                    self.subagent_ctx.as_ref(),
-                                    self.structured_output.as_ref(),
-                                    self.memory_tool.as_ref(),
-                                    self.approval.as_ref(),
-                                    &self.mcp_enabled,
-                                    &self.skills,
+                        }
+                        Err(ref e) => {
+                            response(id.clone(), "prompt", false, None, Some(&e.to_string()))
+                        }
+                    };
+                    if let Some(life) = &life {
+                        let summary = crate::lifecycle::closing_summary(&self.session);
+                        let structured = self
+                            .current_output_spec
+                            .is_some()
+                            .then(|| self.output_slot.get().unwrap_or(Value::Null));
+                        let refused_now = refused.load(Ordering::Relaxed);
+                        match &result {
+                            Ok(()) => match &persist_error {
+                                Some(e) => life.failed(
+                                    self.session.steps,
+                                    format!("run completed but failed to persist: {e}"),
+                                    refused_now,
+                                    summary,
+                                    structured,
+                                ),
+                                None => life.succeeded(
+                                    self.session.steps,
+                                    refused_now,
+                                    summary,
+                                    structured,
+                                ),
+                            },
+                            Err(agent_core::Error::Cancelled) => {
+                                life.aborted(self.session.steps, summary);
+                            }
+                            Err(e) => {
+                                life.failed(
+                                    self.session.steps,
+                                    e.to_string(),
+                                    false,
+                                    summary,
+                                    structured,
                                 );
                             }
-                            if !self.emit(response(
-                                id,
-                                "switch_branch",
-                                true,
-                                Some(json!({
-                                    "target_id": target_id,
-                                    "model": self.current_model,
-                                    "reasoning_effort": self.current_level.as_str(),
-                                })),
-                                None,
-                            )) { break; }
                         }
-                        // Not a failure — the client asked to abort, and the session is left exactly
-                        // as it was (no partial summary, no switch): mirrors pi's `navigateTree`
-                        // result shape (`{cancelled:true, aborted:true}`) rather than surfacing this as
-                        // an RPC-level error.
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                            if !self.emit(response(
-                                id,
-                                "switch_branch",
-                                true,
-                                Some(json!({
-                                    "target_id": target_id,
-                                    "cancelled": true,
-                                    "aborted": true,
-                                })),
-                                None,
-                            )) { break; }
+                    }
+                    if !self.emit(frame) {
+                        break;
+                    }
+
+                    // Name the session, once, from the exchange that just happened.
+                    //
+                    // **After `emit!(frame)`**, deliberately: this is a second model call, and running
+                    // it before the response would charge its latency to the client's first turn for a
+                    // decoration. The `SessionNamed` lifecycle event is its own event rather than a
+                    // field on the terminal one precisely so it can arrive a moment later without
+                    // anything depending on the order.
+                    //
+                    // Only after a run that succeeded *and* persisted: a title describes what a session
+                    // turned out to be about, and there is nothing to describe about a first turn that
+                    // failed. Generated once and never regenerated — a session is about what it was
+                    // opened for, and re-titling it later would make it change names underneath whoever
+                    // was looking for it.
+                    //
+                    // Best-effort at every step. A session that works without a name is worth more than
+                    // one that fails because a decoration could not be generated, so a model error, a
+                    // refusal, or an unusable reply all leave the title exactly as it was: absent.
+                    // No store means `set_title` is a no-op, so the call could only ever be waste.
+                    if self.persistence.store.is_some()
+                        && matches!(result, Ok(()))
+                        && persist_error.is_none()
+                        && self.persistence.meta.title.is_none()
+                        && self.title_attempted_for.as_deref()
+                            != Some(self.persistence.meta.id.as_str())
+                        && !self.session.messages.is_empty()
+                    {
+                        self.title_attempted_for = Some(self.persistence.meta.id.clone());
+                        match self.agent.title_for(&self.session.messages, &cancel).await {
+                            Ok(Some(title)) => {
+                                if let Err(e) = self.persistence.set_title(&title) {
+                                    eprintln!(
+                                        "serve: could not persist the generated session title: {e}"
+                                    );
+                                }
+                                // Announced whether or not it persisted: the consumer's catalog is a
+                                // separate copy, and a title that reached one of the two is better than
+                                // a title that reached neither.
+                                if let Some(life) = &life {
+                                    life.named(title);
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => eprintln!("serve: could not generate a session title: {e}"),
                         }
-                        Err(e) => if !self.emit(response(
-                            id,
-                            "switch_branch",
-                            false,
-                            None,
-                            Some(&e.to_string())
-                        )) { break; },
+                    }
+
+                    // A batch is delivered only once the model has it in a transcript that persisted:
+                    // the run's own prompt when the run did not fail (an abort still leaves the prompt
+                    // in the transcript the next run reads); a steered one exactly when the run's
+                    // `Steered` event reported it (already recorded then — see the `Steered` arm above)
+                    // — an abort clears the steer lane (`clear_run_scoped`) before the model sees what
+                    // is queued there. Everything else goes back to pending, to be injected again.
+                    if let Some(hub) = &self.mcp_events
+                        && (own_injection.is_some() || !steered_injections.is_empty())
+                    {
+                        let run_ok = persist_error.is_none()
+                            && matches!(result, Ok(()) | Err(agent_core::Error::Cancelled));
+                        let (mut delivered, mut returned) = (Vec::new(), Vec::new());
+                        if let Some(b) = own_injection {
+                            if run_ok {
+                                delivered.push(b)
+                            } else {
+                                returned.push(b)
+                            }
+                        }
+                        // A steered batch the model received has already left the pending queue (see
+                        // `receipts_sink`); returning it is a no-op. One it never received — an abort
+                        // cleared the steer lane — goes back to pending.
+                        returned.append(&mut steered_injections);
+                        hub.finish_run(&delivered, &returned).await;
+                    }
+                    if self.running.swap(false, Ordering::Relaxed)
+                        && let Some(m) = &self.cfg.metrics
+                    {
+                        m.runs_in_flight.dec();
+                    }
+                    // pi-parity (Task 4): this run has now actually gone idle (same guarantee
+                    // `pending_abort_acks` relies on above) and its own terminal response has just been
+                    // sent — run each command that arrived mid-run and self-aborted-and-proceeded through
+                    // its ordinary idle-path logic now, in the order received. Exactly what a client
+                    // manually sending `abort`, waiting for the response, then retrying the command would
+                    // have produced, minus the extra round trip.
+                    for (dcid, dcmd) in pending_deferred.drain(..) {
+                        match dcmd.get("type").and_then(Value::as_str).unwrap_or("") {
+                            "new_session" => self.cmd_new_session(&dcmd, dcid).await,
+                            "switch_session" => self.cmd_switch_session(&dcmd, dcid).await,
+                            "fork" => self.cmd_fork(&dcmd, dcid).await,
+                            "clone" => self.cmd_clone(dcid).await,
+                            "compact" => {
+                                if !self.cmd_compact(&dcmd, dcid).await {
+                                    stdin_open = false;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !stdin_open {
+                        break;
                     }
                 }
-                None => if !self.emit(response(
-                    id,
-                    "switch_branch",
-                    false,
-                    None,
-                    Some("missing `target_id`")
-                )) { break; },
-            },
-            "bash" => {
-                let Some(command) = cmd.get("command").and_then(Value::as_str) else {
-                    if !self.emit(response(id, "bash", false, None, Some("missing `command`"))) { break; }
-                    continue;
-                };
-                let Some(tool) = self.bash_tool.clone() else {
+                // Reachable while idle (a mid-run `steer`/`follow_up` is handled inside the `prompt` arm's
+                // own busy-loop above, which shares this same persistent `steering` handle) — queues for
+                // whichever `prompt` runs next, rather than being rejected as an unknown command just
+                // because nothing is in flight *yet*.
+                cmd_type @ ("steer" | "follow_up") => {
+                    match cmd.get("message").and_then(Value::as_str) {
+                        Some(m) => {
+                            let m = expand_message(
+                                m,
+                                &self.skills,
+                                &self.prompt_templates,
+                                &self.mcp_skills,
+                            )
+                            .await;
+                            let m = agent_core::SteeringMessage::new(
+                                m,
+                                parse_images(cmd.get("images")),
+                            );
+                            let queued = if cmd_type == "steer" {
+                                self.steering.push_steer(m)
+                            } else {
+                                self.steering.push(m)
+                            };
+                            // Fix 5 (pi-parity gap): see `queue_content`'s own doc comment. A lane at its
+                            // cap refuses the message; the ack reports that rather than claiming it queued.
+                            if !self.emit(response(
+                                id,
+                                cmd_type,
+                                queued,
+                                Some(queue_content(&self.steering)),
+                                (!queued).then_some(STEERING_QUEUE_FULL),
+                            )) {
+                                break;
+                            }
+                        }
+                        None => {
+                            if !self.emit(response(
+                                id,
+                                cmd_type,
+                                false,
+                                None,
+                                Some("missing `message`"),
+                            )) {
+                                break;
+                            }
+                        }
+                    }
+                }
+                "abort" => {
+                    // No run is in flight (a mid-run abort is handled inside the `prompt` arm above), so
+                    // the only work to cancel is a view's bridge requests — acknowledge idempotently.
+                    crate::tools::mcp_apps::cancel_requests(&self.mcp_enabled);
+                    if !self.emit(response(id, "abort", true, None, None)) {
+                        break;
+                    }
+                }
+                "abort_retry" => {
+                    // Same idea as `abort` above: interrupting a pending whole-run-retry backoff only
+                    // means something while a `prompt` is between attempts (handled inside that arm's own
+                    // retry loop) — idle, there's no backoff in progress to cancel.
+                    if !self.emit(response(id, "abort_retry", true, None, None)) {
+                        break;
+                    }
+                }
+                "stop_after_turn" => {
+                    // No run is in flight, so there is no turn boundary to stop at. Unlike `steer`/
+                    // `follow_up`, deliberately *not* forwarded to `steering.request_stop()` here: that
+                    // would silently cut the *next* `prompt` off after its first turn, surprising a client
+                    // that sent this expecting to affect a run that no longer exists. Acknowledge as a
+                    // no-op instead, matching `abort`'s idle behavior.
+                    if !self.emit(response(id, "stop_after_turn", true, None, None)) {
+                        break;
+                    }
+                }
+                "switch_model" => {
+                    // No run is in flight, so there is no next turn to retarget — changing the model while
+                    // idle is `set_model`'s job (it takes effect immediately, on the very next `prompt`).
+                    // Acknowledge as a no-op rather than silently queuing a switch that would surprise a
+                    // later, unrelated run, matching `stop_after_turn`'s idle behavior.
                     if !self.emit(response(
                         id,
-                        "bash",
-                        false,
+                        "switch_model",
+                        true,
+                        Some(json!({ "note": "no run in flight; use set_model instead" })),
                         None,
-                        Some(
-                            "the `bash` tool is not registered for this process \
-                             (excluded via --exclude-tools/--no-tools)"
-                        ),
-                    )) { break; }
-                    continue;
-                };
-                // Nobody reads the client's table for notices, so its ended jobs are dropped here
-                // rather than kept for a `bash_job` that cannot reach them.
-                self.host_bash_jobs.forget_ended();
-                let mut input = json!({ "command": command });
-                if let Some(cwd) = cmd.get("cwd").and_then(Value::as_str) {
-                    input["cwd"] = json!(cwd);
-                }
-                // The client's own bound on this command, enforced here as a cancel. Not handed to
-                // the tool: its `timeout_ms` only decides when a model's call returns (the command
-                // keeps running as a job), and this instance waits for exit — the client is the one
-                // waiting, and `abort_bash` or this deadline is how it gives up.
-                let deadline = cmd
-                    .get("timeout_ms")
-                    .and_then(Value::as_u64)
-                    .map(std::time::Duration::from_millis);
-                // Track L23 (pi-parity fix): this host command used to call `tool.run_streaming`
-                // directly, bypassing `--deny-tool`/`--deny-bash-pattern`/`--deny-path` entirely (only
-                // `--exclude-tools bash` — the `bash_tool` check above — actually gated it). Checked
-                // before the `ToolStart` event fires, matching the "not registered" early-return just
-                // above: a blocked call never starts, so it never needs a `tool_end` to close it out.
-                if let Some(reason) = self.bash_policy
-                    .before_tool_call("bash", &input, &self.session, &CancellationToken::new())
-                    .await
-                {
-                    if !self.emit(response(id, "bash", false, None, Some(&reason))) { break; }
-                    continue;
-                }
-                // Always recorded into `session`/persisted storage/`export.rs`'s rendered output — pi's
-                // `recordBashResult` (`agent-session.ts`) unconditionally records too. `exclude_from_context`
-                // (Fix 9, pi-parity gap: previously misdescribed here as gating *recording* itself, and
-                // implemented that way too — see the `session.push`/`persist` call below, now unconditional)
-                // instead gates only the separate transform that builds what's actually sent to the model
-                // on its *next* turn (`ServeHooks::before_provider_request`) — pi's identical two-layer split
-                // (`recordBashResult` vs. `convertToLlm`, `messages.ts`). So a diagnostic command run outside
-                // the model's own turn is always visible in history; only whether the model itself sees it
-                // next turn is what this flag controls.
-                let exclude_from_context = cmd
-                    .get("exclude_from_context")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let command = command.to_string();
-                // Busy for the reaper and drain until the result is persisted and answered (see
-                // `BusyGuard`): a detached client's command finishes rather than being cancelled.
-                let _busy = BusyGuard::mark(&self.running);
-                self.host_bash_seq += 1;
-                let call_id = format!("host-bash-{}", self.host_bash_seq);
-                if let Some(frame) = event_frame(AgentEvent::ToolStart {
-                    not_run: false,
-                    id: call_id.clone(),
-                    name: "bash".to_string(),
-                    input: input.clone(),
-                })
-                    && !self.emit(frame) { break; }
-
-                // Independent of the model loop and the session — runs directly against the
-                // registered `bash` tool, reusing its own streaming/truncation/cancellation
-                // machinery. Races the command against continued stdin reads so `abort_bash`/`abort`
-                // (or shutdown) can cancel it; any other command is rejected as busy, the same shape
-                // as the `prompt` arm's own busy-loop, simplified with no session/steering involved.
-                let cancel = CancellationToken::new();
-                let (prog_tx, mut prog_rx) = futures::channel::mpsc::unbounded::<ToolUpdate>();
-                let progress = agent_core::ToolProgress::new(
-                    prog_tx,
-                    call_id.clone(),
-                    "bash".to_string(),
-                    cancel.clone(),
-                );
-                let mut stdin_open = true;
-                // Fix 7 (pi-parity gap): `tools::bash`'s own `truncation_details` (the `{truncation,
-                // full_output_path}` payload — see that module's doc comment) only ever streams on an
-                // interim `ToolUpdate::Progress`, never on the terminal outcome — captured here so the
-                // response built below can carry it as its own structured field instead of only ever
-                // reaching a client via a progress event that a client polling just for the final
-                // result never sees at all.
-                let mut last_bash_details: Option<Value> = None;
-                let mut deadline_hit = false;
-                let outcome = {
-                    let run = tool.run_streaming(input, &progress);
-                    tokio::pin!(run);
-                    let deadline_sleep = sleep_opt(deadline);
-                    tokio::pin!(deadline_sleep);
-                    loop {
-                        tokio::select! {
-                            biased;
-                            r = &mut run => break r,
-                            () = &mut deadline_sleep, if !deadline_hit => {
-                                deadline_hit = true;
-                                cancel.cancel();
-                            }
-                            // `cancel.cancel()` alone (set by `abort_bash`/`abort` below, or by
-                            // shutdown) doesn't, by itself, interrupt an in-flight `run` — but `bash`'s
-                            // own `exec` races the same token internally (see `tools::bash`) and returns
-                            // a graceful "Command cancelled" error carrying whatever output had already
-                            // accumulated, so in practice `r = &mut run` above resolves first and wins
-                            // this biased select on a real cancellation. This arm stays as a fallback for
-                            // a future tool reachable from this same host-command path that *isn't*
-                            // internally cancellation-aware — breaking here drops the pinned `run`
-                            // future, which still kills a `bash` subprocess via its
-                            // `kill_on_drop`/process-group guard even if that tool never noticed.
-                            () = cancel.cancelled() => {
-                                break Err(agent_core::ToolError::Execution("cancelled".to_string()));
-                            }
-                            sig = self.shutdown.wait() => {
-                                self.shutdown_cause = Some(sig);
-                                stdin_open = false;
-                                cancel.cancel();
-                            }
-                            update = prog_rx.next() => {
-                                if let Some(ToolUpdate::Progress { id, name, snapshot, details }) = update {
-                                    if details.is_some() {
-                                        last_bash_details = details.clone();
-                                    }
-                                    if let Some(frame) = event_frame(AgentEvent::ToolProgress { id, name, snapshot, details }) {
-                                        let _ = self.out_tx.send(frame);
-                                    }
-                                }
-                            }
-                            maybe_line = self.input_rx.recv(), if stdin_open => match maybe_line {
-                                Some(l) => {
-                                    let l = l.trim();
-                                    if l.is_empty() {
-                                        continue;
-                                    }
-                                    let c: Value = match serde_json::from_str(l) {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            let _ = self.out_tx.send(response(None, "parse", false, None, Some(&format!("invalid JSON: {e}"))));
-                                            continue;
-                                        }
-                                    };
-                                    let cid = c.get("id").and_then(Value::as_str).map(str::to_string);
-                                    match c.get("type").and_then(Value::as_str).unwrap_or("") {
-                                        "abort_bash" | "abort" => {
-                                            cancel.cancel();
-                                            let _ = self.out_tx.send(response(cid, "abort_bash", true, None, None));
-                                        }
-                                        "prompt" if crate::tools::mcp_events::is_injection(&c) => {
-                                            self.deferred_events.push_back(l.to_string());
-                                        }
-                                        events_cmd if events_cmd.starts_with("mcp_events_") => dispatch_events(&self.events_cmds, &self.out_tx, cid, events_cmd, &c),
-                                        other => {
-                                            let _ = self.out_tx.send(response(cid, other, false, None, Some("busy: a host bash command is running; only `abort_bash`/`abort` are accepted")));
-                                        }
-                                    }
-                                }
-                                None => {
-                                    stdin_open = false;
-                                    cancel.cancel();
-                                }
-                            }
-                        }
+                    )) {
+                        break;
                     }
-                };
-                // Flush anything buffered between the final poll above and the tool's own return.
-                while let Ok(update) = prog_rx.try_recv() {
-                    if let ToolUpdate::Progress {
-                        id,
-                        name,
-                        snapshot,
-                        details,
-                    } = update
+                }
+                "set_exec_endpoint" => {
+                    if !self.cmd_set_exec_endpoint(&cmd, id).await {
+                        break;
+                    }
+                }
+                "set_mcp_enabled" => {
+                    if !self.cmd_set_mcp_enabled(&cmd, id) {
+                        break;
+                    }
+                }
+                "get_mcp" => {
+                    if !self.cmd_get_mcp(id) {
+                        break;
+                    }
+                }
+                "mcp_complete" => {
+                    if !self.cmd_mcp_complete(&cmd, id).await {
+                        break;
+                    }
+                }
+                "elicit" => {
+                    if !self.emit(handle_elicit(id, &cmd, Some(&self.pending_elicitations))) {
+                        break;
+                    }
+                }
+                "sample" => {
+                    if !self.emit(handle_sample(id, &cmd, &self.pending_samplings)) {
+                        break;
+                    }
+                }
+                "mcp_app_request" => spawn_app_request(
+                    id,
+                    cmd.clone(),
+                    &self.out_tx,
+                    &self.mcp_enabled,
+                    &self.app_filter,
+                    &self.approval,
+                    &self.app_detached,
+                    &self.mode,
+                    &self.mcp_host,
+                ),
+                "set_mcp_apps" => {
+                    if !self.cmd_set_mcp_apps(&cmd, id).await {
+                        break;
+                    }
+                }
+                // Test-only, in debug builds and only with `BEYOND_AI_AGENT_TEST_PANICS` set: panic right
+                // here, inside the session loop, so the way a panic leaves `serve` can be tested.
+                #[cfg(debug_assertions)]
+                "__test_panic" if std::env::var_os("BEYOND_AI_AGENT_TEST_PANICS").is_some() => {
+                    #[allow(clippy::panic)]
                     {
-                        if details.is_some() {
-                            last_bash_details = details.clone();
-                        }
-                        if let Some(frame) = event_frame(AgentEvent::ToolProgress {
-                            id,
-                            name,
-                            snapshot,
-                            details,
-                        }) {
-                            let _ = self.out_tx.send(frame);
-                        }
+                        panic!("test panic requested inside serve");
                     }
                 }
-
-                let (result_text, is_error) = match outcome {
-                    Ok(output) => (output.text, false),
-                    Err(e) => (e.to_string(), true),
-                };
-                // Cancelled by the client's deadline rather than an abort: say which.
-                let result_text = match deadline {
-                    Some(d) if deadline_hit && is_error => {
-                        match result_text.strip_suffix("Command cancelled") {
-                            Some(head) => {
-                                format!(
-                                    "{head}Command timed out after {}",
-                                    crate::tools::format_duration(d)
-                                )
-                            }
-                            None => result_text,
-                        }
+                "get_state" => {
+                    if !self.cmd_get_state(id).await {
+                        break;
                     }
-                    _ => result_text,
-                };
-                // Fix 7 (pi-parity gap): pi's own `BashResult{output, exitCode, cancelled, truncated,
-                // fullOutputPath}` (`bash-executor.ts`) alongside the text, not flattened into it — see
-                // `bash_exit_code_from_status_line`/`bash_result_was_cancelled`'s own doc comments for
-                // how each is recovered from what `tools::bash` already reports (its own status-line
-                // text, and the last progress `details` captured above).
-                let exit_code = bash_exit_code_from_status_line(&result_text, is_error);
-                let cancelled = bash_result_was_cancelled(&result_text, is_error);
-                let truncated = last_bash_details
-                    .as_ref()
-                    .and_then(|d| d.get("truncation"))
-                    .and_then(|t| t.get("truncated"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let full_output_path = last_bash_details
-                    .as_ref()
-                    .and_then(|d| d.get("full_output_path"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                // Fix 3 (pi-parity gap): thread these same four fields into the *persisted* message
-                // too, as a leading status line `export.rs`'s host-bash parser now understands — see
-                // `HOST_BASH_STATUS_LINE_PREFIX`'s own doc comment for why this rides on the marker
-                // text rather than a new `agent_core::Message` field. Previously only a bare `is_error`
-                // bool (the `"(error)\n"` marker below) ever reached the persisted message, even though
-                // this RPC response has always reported the real exit code/cancelled/truncated/
-                // full-output-path live, a few lines down.
-                let status_line = format!(
-                    "{HOST_BASH_STATUS_LINE_PREFIX}{}\n",
-                    json!({
-                        "exit_code": exit_code,
-                        "cancelled": cancelled,
-                        "truncated": truncated,
-                        "full_output_path": full_output_path,
-                    })
-                );
-                if let Some(frame) = event_frame(AgentEvent::ToolEnd {
-                    id: call_id,
-                    name: "bash".to_string(),
-                    result: result_text.clone(),
-                    is_error,
-                })
-                    && !self.emit(frame) { break; }
-                // This command has no `tool_use` to pair a `tool_result` against (it never went
-                // through the model), so it's recorded as a plainly-labeled informational user message
-                // instead — structurally impossible to run this arm while a turn is streaming (the
-                // busy-loop above rejects everything but `abort_bash`/`abort` while a host bash command
-                // is in flight, and this command is only reachable from the idle loop to begin with), so
-                // there's no tool_use/tool_result ordering to protect against, unlike pi's own
-                // stream-in-flight deferral.
-                //
-                // Fix 9 (pi-parity gap): always pushed and persisted now, regardless of
-                // `exclude_from_context` — pi's own `recordBashResult` (`agent-session.ts`) unconditionally
-                // records into `agent.state.messages` too; `excludeFromContext` is consulted only later, in
-                // the separate `convertToLlm` transform that builds what's actually sent to the model
-                // (`messages.ts`). This used to skip recording entirely when the flag was set, losing the
-                // command/output outright instead of merely hiding it from the model — it never showed up
-                // in `session.messages`, persisted storage, or `export.rs`'s rendered output either.
-                // `HOST_BASH_EXCLUDED_LABEL` is this crate's stand-in for pi's dedicated
-                // `BashExecutionMessage.excludeFromContext` field (`agent_core::Message` has no such field —
-                // see the label's own doc comment); `ServeHooks::before_provider_request`, installed on
-                // every `build_agent` agent, is the "what's actually sent to the model" transform that
-                // consults it.
-                let label = if exclude_from_context {
-                    HOST_BASH_EXCLUDED_LABEL
-                } else {
-                    HOST_BASH_LABEL
-                };
-                self.session.push(agent_core::Message::user(format!(
-                    "{label}\n$ {command}\n\n{status_line}{}{result_text}",
-                    if is_error { "(error)\n" } else { "" }
-                )));
-                let (p, r) = persist_blocking(self.persistence.take_for_blocking(), self.session.clone()).await;
-                self.persistence = p;
-                if let Err(e) = r {
-                    eprintln!("serve: failed to persist host bash result: {e}");
                 }
-                if !self.emit(response(
-                    id,
-                    "bash",
-                    true,
-                    Some(json!({
-                        "result": result_text,
-                        "is_error": is_error,
-                        "exit_code": exit_code,
-                        "cancelled": cancelled,
-                        "truncated": truncated,
-                        "full_output_path": full_output_path,
-                    })),
-                    None,
-                )) { break; }
-                if !stdin_open {
-                    break;
+                "get_messages" => {
+                    if !self.cmd_get_messages(&cmd, id) {
+                        break;
+                    }
                 }
-            }
-            "abort_bash" => {
-                // No host bash is in flight (a running one is handled inside the `bash` arm above), so
-                // there is nothing to cancel — acknowledge idempotently, matching `abort`'s idle shape.
-                if !self.emit(response(id, "abort_bash", true, None, None)) { break; }
-            }
-            "login" => {
-                let provider_id = cmd
-                    .get("provider")
-                    .and_then(Value::as_str)
-                    .and_then(crate::oauth::OAuthProviderId::parse);
-                match provider_id {
-                    None => {
-                        if !self.emit(response(
-                            id,
-                            "login",
-                            false,
-                            None,
-                            Some("missing or unknown `provider`"),
-                        )) { break; }
+                "new_session" => self.cmd_new_session(&cmd, id).await,
+                "list_sessions" => {
+                    if !self.cmd_list_sessions(&cmd, id).await {
+                        break;
                     }
-                    Some(_) if lock_ignoring_poison(&self.pending_login).is_some() => {
-                        if !self.emit(response(
-                            id,
-                            "login",
-                            false,
-                            None,
-                            Some(
-                                "busy: a login is already in flight; use `abort_login` to cancel it \
-                                 first"
-                            ),
-                        )) { break; }
+                }
+                "list_all_sessions" => {
+                    if !self.cmd_list_all_sessions(&cmd, id).await {
+                        break;
                     }
-                    Some(provider_id) => {
-                        if !self.emit(ack(id.clone(), "login")) { break; }
-                        // Runs as a detached task, not inline like `prompt`'s own busy loop: unlike a
-                        // model turn, a login has nothing to do with `session`/`agent` state, so there's
-                        // no reason every *other* idle command (`list_sessions`, `logout` of a different
-                        // provider, …) should have to wait out however long a user takes to finish a
-                        // browser flow. Only a second concurrent `login` is rejected (above).
-                        let login_cancel = agent_core::CancellationToken::new();
-                        let pending_code: PendingCodeSlot = Arc::new(std::sync::Mutex::new(None));
-                        self.login_generation += 1;
-                        let generation = self.login_generation;
-                        *lock_ignoring_poison(&self.pending_login) = Some(PendingLogin {
-                            generation,
-                            cancel: login_cancel.clone(),
-                            pending_code: pending_code.clone(),
-                        });
-                        let out_tx_bg = self.out_tx.clone();
-                        let pending_login_bg = self.pending_login.clone();
-                        let login_id = id.clone();
-                        tokio::spawn(async move {
-                            // Always clears `pending_login` when this task ends, even on panic — but only
-                            // if the slot still holds *this* login (see `PendingLoginGuard`'s doc comment).
-                            let _reset_pending_login_on_exit = PendingLoginGuard {
-                                slot: pending_login_bg.clone(),
-                                generation,
-                            };
-                            let callbacks = ServeLoginCallbacks {
-                                out_tx: out_tx_bg.clone(),
-                                id: login_id.clone(),
-                                provider: provider_id,
-                                pending_code,
-                                cancel: login_cancel.clone(),
-                            };
-                            let result =
-                                crate::oauth::login(provider_id, &callbacks, &login_cancel).await;
-                            let frame = match result {
-                                Ok(credential) => {
-                                    // `AuthStore::set`'s cross-process `FileLock` can block briefly under
-                                    // contention — kept off this task's own async context the same way
-                                    // `persist_blocking` keeps session persistence off the caller's.
-                                    let saved = tokio::task::spawn_blocking(move || {
-                                        crate::auth_store::AuthStore::open_default()
-                                            .set(provider_id.store_key(), credential)
-                                    })
-                                    .await;
-                                    match saved {
-                                        Ok(Ok(())) => response(
-                                            login_id,
-                                            "login",
-                                            true,
-                                            Some(json!({
-                                                "provider": provider_id.to_string(),
-                                                "status": "logged_in",
-                                            })),
-                                            None,
-                                        ),
-                                        Ok(Err(e)) => response(
-                                            login_id,
-                                            "login",
-                                            false,
-                                            None,
-                                            Some(&format!(
-                                                "logged in but failed to save credential: {e}"
-                                            )),
-                                        ),
-                                        Err(e) => response(
-                                            login_id,
-                                            "login",
-                                            false,
-                                            None,
-                                            Some(&format!(
-                                                "logged in but failed to save credential: {e}"
-                                            )),
-                                        ),
-                                    }
-                                }
-                                Err(e) => {
-                                    response(login_id, "login", false, None, Some(&e.to_string()))
-                                }
-                            };
-                            let _ = out_tx_bg.send(frame);
-                            // `_reset_pending_login_on_exit`'s `Drop` clears `pending_login` here.
-                        });
+                }
+                "switch_session" => self.cmd_switch_session(&cmd, id).await,
+                "delete_session" => {
+                    if !self.cmd_delete_session(&cmd, id).await {
+                        break;
+                    }
+                }
+                "list_trash" => {
+                    if !self.cmd_list_trash(id) {
+                        break;
+                    }
+                }
+                "restore_session" => {
+                    if !self.cmd_restore_session(&cmd, id) {
+                        break;
+                    }
+                }
+                "fork" => self.cmd_fork(&cmd, id).await,
+                // pi's own `clone` — fork the current session at its current tip, with no arguments —
+                // exists there because pi's `fork` *requires* an explicit `entryId`; this crate's `fork`
+                // already defaults to exactly that (no `upto`/`target_id` given), so `clone` is a thin,
+                // deliberately-argument-free alias over the same call for a client speaking pi's protocol
+                // shape, not a second code path.
+                "clone" => self.cmd_clone(id).await,
+                "get_fork_messages" => {
+                    if !self.cmd_get_fork_messages(id) {
+                        break;
+                    }
+                }
+                "preview_fork" => {
+                    if !self.cmd_preview_fork(&cmd, id) {
+                        break;
+                    }
+                }
+                "export_html" => {
+                    if !self.cmd_export_html(&cmd, id) {
+                        break;
+                    }
+                }
+                "set_session_name" => {
+                    if !self.cmd_set_session_name(&cmd, id) {
+                        break;
+                    }
+                }
+                "set_label" => {
+                    if !self.cmd_set_label(&cmd, id) {
+                        break;
+                    }
+                }
+                "get_label" => {
+                    if !self.cmd_get_label(&cmd, id) {
+                        break;
+                    }
+                }
+                "append_custom" => {
+                    if !self.cmd_append_custom(&cmd, id) {
+                        break;
+                    }
+                }
+                "compact" => {
+                    if !self.cmd_compact(&cmd, id).await {
+                        break;
+                    }
+                }
+                "get_last_assistant_text" => {
+                    if !self.cmd_get_last_assistant_text(id) {
+                        break;
+                    }
+                }
+                "approve" => {
+                    if !self.cmd_approve(&cmd, id) {
+                        break;
+                    }
+                }
+                "get_todos" => {
+                    if !self.cmd_get_todos(id) {
+                        break;
+                    }
+                }
+                "get_session_stats" => {
+                    if !self.cmd_get_session_stats(id) {
+                        break;
+                    }
+                }
+                "get_commands" => {
+                    if !self.cmd_get_commands(id) {
+                        break;
+                    }
+                }
+                "reload" => {
+                    if !self.cmd_reload(id).await {
+                        break;
+                    }
+                }
+                "set_model" => {
+                    if !self.cmd_set_model(&cmd, id) {
+                        break;
+                    }
+                }
+                "set_thinking" => {
+                    if !self.cmd_set_thinking(&cmd, id) {
+                        break;
+                    }
+                }
+                "set_reasoning_effort" => {
+                    if !self.cmd_set_reasoning_effort(&cmd, id) {
+                        break;
+                    }
+                }
+                "cycle_model" => {
+                    if !self.cmd_cycle_model(id) {
+                        break;
+                    }
+                }
+                "cycle_thinking_level" => {
+                    if !self.cmd_cycle_thinking_level(id) {
+                        break;
+                    }
+                }
+                "set_auto_compaction" => {
+                    if !self.cmd_set_auto_compaction(&cmd, id) {
+                        break;
+                    }
+                }
+                "set_auto_retry" => {
+                    if !self.cmd_set_auto_retry(&cmd, id) {
+                        break;
+                    }
+                }
+                "set_block_images" => {
+                    if !self.cmd_set_block_images(&cmd, id) {
+                        break;
+                    }
+                }
+                "set_image_auto_resize" => {
+                    if !self.cmd_set_image_auto_resize(&cmd, id) {
+                        break;
+                    }
+                }
+                "set_steering_mode" => {
+                    if !self.cmd_set_steering_mode(&cmd, id) {
+                        break;
+                    }
+                }
+                "set_follow_up_mode" => {
+                    if !self.cmd_set_follow_up_mode(&cmd, id) {
+                        break;
+                    }
+                }
+                "get_available_models" => {
+                    if !self.cmd_get_available_models(id) {
+                        break;
+                    }
+                }
+                "list_branches" => {
+                    if !self.cmd_list_branches(id) {
+                        break;
+                    }
+                }
+                "get_tree" => {
+                    if !self.cmd_get_tree(&cmd, id) {
+                        break;
+                    }
+                }
+                "switch_branch" => {
+                    if !self.cmd_switch_branch(&cmd, id).await {
+                        break;
+                    }
+                }
+                "bash" => {
+                    if !self.cmd_bash(&cmd, id).await {
+                        break;
+                    }
+                }
+                "abort_bash" => {
+                    if !self.cmd_abort_bash(id) {
+                        break;
+                    }
+                }
+                "login" => {
+                    if !self.cmd_login(&cmd, id).await {
+                        break;
+                    }
+                }
+                "submit_code" => {
+                    if !self.cmd_submit_code(&cmd, id) {
+                        break;
+                    }
+                }
+                "abort_login" => {
+                    if !self.cmd_abort_login(id) {
+                        break;
+                    }
+                }
+                "logout" => {
+                    if !self.cmd_logout(&cmd, id) {
+                        break;
+                    }
+                }
+                "auth_status" => {
+                    if !self.cmd_auth_status(&cmd, id) {
+                        break;
+                    }
+                }
+                events_cmd if events_cmd.starts_with("mcp_events_") => {
+                    dispatch_events(&self.events_cmds, &self.out_tx, id, events_cmd, &cmd)
+                }
+                other => {
+                    if !self.emit(response(id, other, false, None, Some("unknown command"))) {
+                        break;
                     }
                 }
             }
-            "submit_code" => {
-                let code = cmd.get("code").and_then(Value::as_str).map(str::to_string);
-                let accepted = match (code, lock_ignoring_poison(&self.pending_login).as_ref()) {
-                    (Some(code), Some(p)) => match lock_ignoring_poison(&p.pending_code).take() {
-                        Some(tx) => tx.send(code).is_ok(),
-                        None => false,
-                    },
-                    _ => false,
-                };
-                if !self.emit(response(
-                    id,
-                    "submit_code",
-                    true,
-                    Some(json!({ "accepted": accepted })),
-                    None,
-                )) { break; }
-            }
-            "abort_login" => {
-                // Idempotent no-op if none is in flight — matches `abort`'s own idle-mode convention.
-                // `take`, not `as_ref`: clear the slot *synchronously* here rather than leaving it for the
-                // detached task's `Drop` guard, so the very next `login` is accepted the instant this abort
-                // is acknowledged. Waiting for the guard raced the next command — a `login` arriving before
-                // the cancelled task wound down was spuriously rejected as "already in flight", hanging a
-                // client that (reasonably) expected `abort_login`'s success to mean the slot was free. The
-                // cancelled task still sends its own terminal `login` response; clearing the slot only frees
-                // the next login, and the guard's generation check keeps that task from wiping the successor.
-                if let Some(p) = lock_ignoring_poison(&self.pending_login).take() {
-                    p.cancel.cancel();
-                }
-                if !self.emit(response(id, "abort_login", true, None, None)) { break; }
-            }
-            "logout" => {
-                let provider_id = cmd
-                    .get("provider")
-                    .and_then(Value::as_str)
-                    .and_then(crate::oauth::OAuthProviderId::parse);
-                match provider_id {
-                    None => if !self.emit(response(
-                        id,
-                        "logout",
-                        false,
-                        None,
-                        Some("missing or unknown `provider`"),
-                    )) { break; },
-                    Some(provider_id) => {
-                        let mut store = crate::auth_store::AuthStore::open_default();
-                        match store.remove(provider_id.store_key()) {
-                            Ok(was_logged_in) => if !self.emit(response(
-                                id,
-                                "logout",
-                                true,
-                                Some(json!({
-                                    "provider": provider_id.to_string(),
-                                    "was_logged_in": was_logged_in,
-                                })),
-                                None,
-                            )) { break; },
-                            Err(e) => {
-                                if !self.emit(response(id, "logout", false, None, Some(&e.to_string()))) { break; }
-                            }
-                        }
-                    }
-                }
-            }
-            "auth_status" => {
-                let store = crate::auth_store::AuthStore::open_default();
-                let status_of = |pid: crate::oauth::OAuthProviderId| {
-                    let status = match store.get(pid.store_key()) {
-                        None => "logged_out",
-                        Some(stored) if stored.last_refresh_error.is_some() => "needs_reauth",
-                        Some(_) => "logged_in",
-                    };
-                    json!({ "provider": pid.to_string(), "status": status })
-                };
-                match cmd.get("provider").and_then(Value::as_str) {
-                    Some(p) => match crate::oauth::OAuthProviderId::parse(p) {
-                        Some(pid) => {
-                            if !self.emit(response(
-                                id,
-                                "auth_status",
-                                true,
-                                Some(status_of(pid)),
-                                None
-                            )) { break; }
-                        }
-                        None => if !self.emit(response(
-                            id,
-                            "auth_status",
-                            false,
-                            None,
-                            Some("unknown `provider`")
-                        )) { break; },
-                    },
-                    None => {
-                        let providers: Vec<Value> = crate::oauth::OAuthProviderId::all()
-                            .iter()
-                            .map(|&pid| status_of(pid))
-                            .collect();
-                        if !self.emit(response(
-                            id,
-                            "auth_status",
-                            true,
-                            Some(json!({ "providers": providers })),
-                            None,
-                        )) { break; }
-                    }
-                }
-            }
-            events_cmd if events_cmd.starts_with("mcp_events_") => {
-                dispatch_events(&self.events_cmds, &self.out_tx, id, events_cmd, &cmd)
-            }
-            other => {
-                if !self.emit(response(id, other, false, None, Some("unknown command"))) { break; }
-            }
-        }
         }
     }
 
