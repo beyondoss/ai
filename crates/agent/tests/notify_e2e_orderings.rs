@@ -377,8 +377,8 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// Whether the job has ended in the sandbox: its process group is gone (native), or its
-    /// supervisor wrote its `end` (baseline).
+    /// Whether the job has ended in the sandbox: its held stream finished or its process group is
+    /// gone (native), or its supervisor wrote its `end` (baseline).
     fn job_ended(&self) -> bool {
         if self.plan.mode == Mode::Baseline {
             let Some(id) = self.job_id() else {
@@ -397,7 +397,10 @@ impl Run<'_> {
             .streams()
             .into_iter()
             .find(|s| s.args.iter().any(|a| a.contains(tag)))
-            .is_some_and(|s| !common::exec_mock::group_alive(s.pgid))
+            .is_some_and(|s| {
+                matches!(s.end, Some((StreamEnd::Finished, _)))
+                    || !common::exec_mock::group_alive(s.pgid)
+            })
     }
 
     /// Note whether any frame the client was sent carries the end's notice.
