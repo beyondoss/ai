@@ -62,7 +62,8 @@
 //! reactively rather than via pi's `readyState`-checked-before-reuse: see [`Attempt`]'s "stale reused
 //! connection" retry, one connect-with-a-fresh-socket retry before the ordinary SSE-fallback path, so
 //! an otherwise-healthy session doesn't stick to SSE for its whole remaining lifetime just because one
-//! connection went idle.
+//! connection went idle. A peer that vanished without a FIN/RST is caught by a 30s deadline on the
+//! first frame of a reused socket ([`REUSED_FIRST_FRAME_TIMEOUT`]) rather than the 600s idle timeout.
 //!
 //! # Delta diffing
 //!
@@ -137,6 +138,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// (600s): the gateway/backend can legitimately go quiet for a long extended-thinking gap, so this
 /// isn't a ceiling on total turn duration, only on "has this socket gone silently dead".
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Cap on the *first* frame of a turn sent on a reused (cached) socket. A cached socket can be dead
+/// without the OS knowing (a network change, a black-holed flow): the send still lands in the kernel
+/// buffer, and the read would then sit the full [`IDLE_TIMEOUT`] before the stale-reuse retry ran.
+/// The backend answers a `response.create` with `response.created` immediately, before any model
+/// thinking, so this isn't a first-token deadline and a slow model doesn't trip it; only later frames
+/// get the long idle allowance. A fresh socket was just proven alive by its handshake and keeps
+/// [`IDLE_TIMEOUT`].
+const REUSED_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap on getting one turn's single outbound `response.create` frame out to the OS. `SinkExt::send` is
 /// feed-then-flush, so it stays pending until the bytes are actually accepted by the socket: a peer
 /// that completes the upgrade and then stops reading (a TCP zero-window, a wedged load balancer, or a
@@ -605,11 +614,18 @@ struct Receiver {
     response_id: Option<String>,
     harvested: Vec<Value>,
     finished: bool,
+    /// Deadline for the next frame while none has arrived yet; [`IDLE_TIMEOUT`] once one has.
+    first_frame_timeout: Duration,
 }
 
 impl Receiver {
-    fn new(socket: WsSocket) -> Self {
+    fn new(socket: WsSocket, reused: bool) -> Self {
         Self {
+            first_frame_timeout: if reused {
+                REUSED_FIRST_FRAME_TIMEOUT
+            } else {
+                IDLE_TIMEOUT
+            },
             socket,
             decoder: CodexDecoder::default(),
             response_id: None,
@@ -628,11 +644,12 @@ impl Receiver {
             return FrameOutcome::Done;
         }
         loop {
-            let message = match tokio::time::timeout(IDLE_TIMEOUT, self.socket.next()).await {
+            let limit = self.first_frame_timeout;
+            let message = match tokio::time::timeout(limit, self.socket.next()).await {
                 Err(_elapsed) => {
                     return FrameOutcome::Failure {
                         error: Error::Transport(format!(
-                            "{MID_STREAM_NETWORK_ERROR}: codex websocket idle timeout after {IDLE_TIMEOUT:?}"
+                            "{MID_STREAM_NETWORK_ERROR}: codex websocket idle timeout after {limit:?}"
                         )),
                         protocol: false,
                     };
@@ -646,6 +663,7 @@ impl Receiver {
                 }
                 Ok(Some(Ok(message))) => message,
             };
+            self.first_frame_timeout = IDLE_TIMEOUT;
 
             // Parse straight off the frame's own bytes — no intermediate owned `String` copy of
             // every stream-event frame. A `Text` frame is already UTF-8; a `Binary` frame is
@@ -820,7 +838,7 @@ async fn attempt_once(
         Ok(Ok(())) => {}
     }
 
-    let mut receiver = Receiver::new(socket);
+    let mut receiver = Receiver::new(socket, reused);
     match receiver.next_events().await {
         FrameOutcome::Events(events) => AttemptOnceOutcome::Started {
             first_events: events,
@@ -1424,5 +1442,29 @@ mod tests {
             (0..MAX_SSE_FALLBACK_KEYS).all(|n| cache.is_fallback_active(&format!("session_{n}"))),
             "refreshing an existing marker doesn't need room made for it"
         );
+    }
+
+    /// A reused socket whose peer vanished without a FIN/RST never answers: its first frame must give
+    /// up at the short reused-socket deadline, not the 600s idle timeout, so the stale-reuse retry
+    /// runs promptly. The deadline is shortened here only so the test doesn't wait 30s.
+    #[tokio::test]
+    async fn a_reused_socket_that_never_answers_fails_at_the_first_frame_deadline() {
+        let mut receiver = Receiver::new(parked_socket().await, true);
+        assert!(REUSED_FIRST_FRAME_TIMEOUT < IDLE_TIMEOUT);
+        receiver.first_frame_timeout = Duration::from_millis(50);
+        let started = Instant::now();
+        match receiver.next_events().await {
+            FrameOutcome::Failure {
+                protocol: false, ..
+            } => {}
+            _ => panic!("a silent reused socket must fail as a connectivity failure"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_fresh_socket_keeps_the_idle_timeout_for_its_first_frame() {
+        let receiver = Receiver::new(parked_socket().await, false);
+        assert_eq!(receiver.first_frame_timeout, IDLE_TIMEOUT);
     }
 }
