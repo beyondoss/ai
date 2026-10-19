@@ -90,7 +90,10 @@ The harness layers several capabilities over the bare tools + loop:
 
   The protocol is byte-identical across all transports;
   all feed the transport-agnostic `serve::serve_session` core, which reads
-  commands from an `mpsc` channel and emits frames to whichever connection is currently attached. The
+  commands from an `mpsc` channel and emits frames to whichever connection is currently attached.
+  `serve_session` is construct, loop, teardown: `SessionLoop::new` builds the state, `run` is the
+  command loop, `finish` stops what the session owns; the session-switching commands
+  (`new_session`, `switch_session`, `fork`, `clone`, `compact`) are methods on `SessionLoop`. The
   key property this buys the WebSocket path: **the session is a view, not owned by the connection** — a
   dropped mobile client does not abort the run (the retained input `Sender` means a dropped socket is
   not an EOF), and a reconnecting client (same `?session_id=`) re-attaches to the same still-running
