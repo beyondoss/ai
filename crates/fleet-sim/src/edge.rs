@@ -104,16 +104,33 @@ fn hash(bytes: &[u8]) -> u64 {
     h ^ (h >> 31)
 }
 
+/// The ring as a callback front reads it: the same members as [`Edge`]'s, kept in step by every
+/// change the edge makes, so a callback is routed by exactly the ring a session's own requests are.
+pub type Ring = std::sync::Arc<std::sync::Mutex<Vec<Target>>>;
+
 pub struct Edge {
     pub minter: Minter,
     targets: Vec<Target>,
+    shared: Ring,
 }
 
 impl Edge {
     pub fn new(key_dir: &Path, targets: Vec<Target>) -> Self {
         Self {
             minter: Minter::new(key_dir),
+            shared: std::sync::Arc::new(std::sync::Mutex::new(targets.clone())),
             targets,
+        }
+    }
+
+    /// The ring, shared with whatever routes callbacks ([`crate::front::Front`]).
+    pub fn ring(&self) -> Ring {
+        std::sync::Arc::clone(&self.shared)
+    }
+
+    fn publish(&self) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.clone_from(&self.targets);
         }
     }
 
@@ -133,6 +150,7 @@ impl Edge {
     /// Replace the routable set — a deploy, a scale-in, a replica that died.
     pub fn set_targets(&mut self, targets: Vec<Target>) {
         self.targets = targets;
+        self.publish();
     }
 
     /// Point an existing target at a new address, leaving the ring's *membership* alone.
@@ -147,6 +165,7 @@ impl Edge {
         if let Some(t) = self.targets.iter_mut().find(|t| t.name == name) {
             t.addr = addr;
         }
+        self.publish();
     }
 
     /// Which replica this session id hashes to.
@@ -335,7 +354,7 @@ pub async fn place_among(
 /// A client walks this during chaos because the replica it belongs on may be down. Starting at the
 /// ring position keeps it sticky to one replica whenever that replica is up, which is what makes the
 /// 503-and-retry behaviour converge instead of oscillating.
-fn ring_order<'a>(targets: &'a [Target], session_id: &str) -> Vec<&'a Target> {
+pub fn ring_order<'a>(targets: &'a [Target], session_id: &str) -> Vec<&'a Target> {
     let point = hash(session_id.as_bytes());
     let mut scored: Vec<(u64, &Target)> = targets
         .iter()

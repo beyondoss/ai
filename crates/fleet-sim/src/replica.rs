@@ -28,6 +28,12 @@ pub struct Launch<'a> {
     pub max_live_sessions: Option<usize>,
     /// `--metrics-listen`, when the scenario reads the scrape.
     pub with_metrics: bool,
+    /// `--notify-origin`: where sandboxes send exec v1.4 job-end callbacks — the fleet's
+    /// callback front ([`crate::front::Front`]).
+    pub notify_origin: Option<&'a str>,
+    /// `--session-idle-timeout`, when the scenario needs a detached session reaped sooner than the
+    /// service default.
+    pub session_idle_timeout: Option<u64>,
 }
 
 /// Every replica this process has spawned and not yet reaped.
@@ -92,6 +98,8 @@ impl Replica {
             drain_grace,
             max_live_sessions,
             with_metrics,
+            notify_origin,
+            session_idle_timeout,
         } = *launch;
         let mut c = Command::new(bin);
         c.args([
@@ -118,6 +126,12 @@ impl Replica {
         }
         if let Some(max) = max_live_sessions {
             c.arg("--max-live-sessions").arg(max.to_string());
+        }
+        if let Some(origin) = notify_origin {
+            c.arg("--notify-origin").arg(origin);
+        }
+        if let Some(secs) = session_idle_timeout {
+            c.arg("--session-idle-timeout").arg(secs.to_string());
         }
         if with_metrics {
             // Loopback only, which the flag enforces — the scrape describes every tenant here.

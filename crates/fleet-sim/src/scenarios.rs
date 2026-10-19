@@ -22,6 +22,14 @@ use crate::replica::Replica;
 use crate::substrate::{Kind, Substrate};
 use crate::workload;
 
+mod notify;
+pub use notify::{
+    job_ended_across_a_ring_change, job_ended_after_takeover, job_ended_after_the_session_closed,
+    job_ended_answers_within_25s, job_ended_classified_exactly, job_ended_forwarded_unchanged,
+    job_ended_rate_limited_per_session, job_ended_routed_as_any_request,
+    job_ended_status_passes_through, job_ended_token_never_logged,
+};
+
 /// What a scenario did.
 pub enum Outcome {
     Passed,
@@ -90,6 +98,56 @@ pub const ALL: &[Scenario] = &[
     Scenario {
         name: "sandbox-job-exit-noticed-once",
         claims: "S2",
+        needs_shared_fs: false,
+    },
+    Scenario {
+        name: "job-ended-classified-exactly",
+        claims: "E1",
+        needs_shared_fs: false,
+    },
+    Scenario {
+        name: "job-ended-forwarded-unchanged",
+        claims: "E2",
+        needs_shared_fs: false,
+    },
+    Scenario {
+        name: "job-ended-routed-as-any-request",
+        claims: "E3",
+        needs_shared_fs: false,
+    },
+    Scenario {
+        name: "job-ended-answers-within-25s",
+        claims: "E4",
+        needs_shared_fs: false,
+    },
+    Scenario {
+        name: "job-ended-status-passes-through",
+        claims: "E5",
+        needs_shared_fs: false,
+    },
+    Scenario {
+        name: "job-ended-rate-limited-per-session",
+        claims: "E6",
+        needs_shared_fs: false,
+    },
+    Scenario {
+        name: "job-ended-token-never-logged",
+        claims: "E7",
+        needs_shared_fs: false,
+    },
+    Scenario {
+        name: "job-ended-after-takeover",
+        claims: "N34, N42",
+        needs_shared_fs: false,
+    },
+    Scenario {
+        name: "job-ended-across-a-ring-change",
+        claims: "E3",
+        needs_shared_fs: false,
+    },
+    Scenario {
+        name: "job-ended-after-the-session-closed",
+        claims: "N24, N34",
         needs_shared_fs: false,
     },
 ];
@@ -212,6 +270,15 @@ fn attached_cannot(
     None
 }
 
+/// Whether a fleet offers exec v1.4 job notify, and the replica knob its scenarios need with it.
+#[derive(Clone, Copy, Default)]
+pub struct Notify {
+    /// Start a callback front and give every replica its origin as `--notify-origin`.
+    pub front: bool,
+    /// `--session-idle-timeout`, in seconds.
+    pub idle_timeout: Option<u64>,
+}
+
 /// Everything a scenario needs standing up: shards, an edge, replicas, a history.
 pub struct Fleet {
     pub substrate: Substrate,
@@ -229,6 +296,13 @@ pub struct Fleet {
     /// How this fleet's faults are performed. Local mechanisms for a fleet it spawned; a
     /// caller-supplied command for one it attached to — see [`crate::faults`].
     pub faults: Faults,
+    /// The edge's front for exec v1.4 job-end callbacks, when the fleet was started to offer
+    /// notify: every replica carries its origin as `--notify-origin`, and it routes over the same
+    /// ring as [`Self::edge`].
+    pub front: Option<crate::front::Front>,
+    /// What every replica (a restarted one too) is launched with beyond the defaults.
+    notify_origin: Option<String>,
+    idle_timeout: Option<u64>,
     _keys: tempfile::TempDir,
     _sandbox: tempfile::TempDir,
 }
@@ -346,6 +420,9 @@ impl Fleet {
             exec,
             metrics,
             faults,
+            front: None,
+            notify_origin: None,
+            idle_timeout: None,
             _keys: keys,
             _sandbox: sandbox,
         })
@@ -462,7 +539,38 @@ impl Fleet {
         with_metrics: bool,
         gateway_url: String,
     ) -> Result<Self, String> {
+        Self::start_against_with(
+            kind,
+            replicas,
+            shards,
+            history_path,
+            max_live_sessions,
+            with_metrics,
+            gateway_url,
+            &Notify::default(),
+        )
+        .await
+    }
+
+    /// As [`start_against`](Self::start_against), with exec v1.4 notify as `notify` says.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_against_with(
+        kind: Kind,
+        replicas: usize,
+        shards: usize,
+        history_path: &std::path::Path,
+        max_live_sessions: Option<usize>,
+        with_metrics: bool,
+        gateway_url: String,
+        notify: &Notify,
+    ) -> Result<Self, String> {
         if let Some(spec) = ATTACHED.get() {
+            if notify.front {
+                return Err(format!(
+                    "{ATTACHED_SKIP}an attached fleet's replicas were started without this \
+                     process's callback front as --notify-origin"
+                ));
+            }
             if let Some(why) = attached_cannot(spec, max_live_sessions, with_metrics) {
                 return Err(format!("{ATTACHED_SKIP}{why}"));
             }
@@ -515,6 +623,18 @@ impl Fleet {
 
         let mut edge = Edge::new(keys.path(), Vec::new());
         let agent = agent_binary()?;
+        let front = if notify.front {
+            Some(
+                crate::front::Front::start(
+                    edge.ring(),
+                    Some(&history_path.with_extension("front.jsonl")),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let notify_origin = front.as_ref().map(|f| f.origin.clone());
 
         let mut started = Vec::new();
         let mut targets = Vec::new();
@@ -531,6 +651,8 @@ impl Fleet {
                 drain_grace: Some(30),
                 max_live_sessions,
                 with_metrics,
+                notify_origin: notify_origin.as_deref(),
+                session_idle_timeout: notify.idle_timeout,
             })?;
             targets.push(Target {
                 name,
@@ -551,6 +673,9 @@ impl Fleet {
             exec,
             metrics,
             faults: Faults::local(),
+            front,
+            notify_origin,
+            idle_timeout: notify.idle_timeout,
             _keys: keys,
             _sandbox: sandbox,
         })
@@ -641,6 +766,8 @@ impl Fleet {
             drain_grace: Some(30),
             max_live_sessions: None,
             with_metrics: false,
+            notify_origin: self.notify_origin.as_deref(),
+            session_idle_timeout: self.idle_timeout,
         })?;
         self.replicas[idx] = replica;
         let targets = self
@@ -1291,6 +1418,8 @@ pub async fn unmounted_shard_is_misdirected(
         drain_grace: None,
         max_live_sessions: None,
         with_metrics: false,
+        notify_origin: None,
+        session_idle_timeout: None,
     }) {
         Ok(r) => r,
         Err(e) => return Outcome::failed_with(e),

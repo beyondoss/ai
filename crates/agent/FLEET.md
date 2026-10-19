@@ -200,6 +200,12 @@ and names the check that tests it. A check not written yet is listed, with its t
   token does not expire, so a copy could keep a session's sandbox from idling for as long as the
   session is open. (check: fleet-sim `job-ended-token-never-logged`)
 
+`crates/fleet-sim/src/front.rs` is a reference implementation of E1–E7. It routes callbacks over
+the same ring as `edge.rs`, and every check named above is a scenario run against it. Three more
+follow a job's end through a takeover (`job-ended-after-takeover`), a ring change
+(`job-ended-across-a-ring-change`), and a session reaped before the end
+(`job-ended-after-the-session-closed`).
+
 The edge SHOULD rate-limit callbacks per source address. A replica already bounds the work a stream of valid callbacks can cause (one
 reconcile at a time per session, at most one a second, at most 16 callbacks waiting), and refuses a
 forged one before it looks for the session.
