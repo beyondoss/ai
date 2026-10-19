@@ -2589,7 +2589,16 @@ after removal. Time and the random draw are inputs; its tests run every `v1.4-re
 through it and walk every short event sequence for its invariants. `exec_mock` is the reference
 endpoint: it validates `notify`, drives the kernel per job, and makes the requests (no redirects, a
 verified server, 30 s at most). It advertises notify only when told its kept jobs survive idling, and it can lose callbacks, answer
-`keep` slowly, run without egress or kill idle jobs (`tests/exec_notify_mock.rs`). The vectors
+`keep` slowly, run without egress or kill idle jobs (`tests/exec_notify_mock.rs`). The grammar
+`keep`'s `notify` must meet is the kernel's too (`check_notify`), and so is its exact retry wait,
+in integer milliseconds so `sh` computes the same number. The baseline (`ShellJobs`) offers notify
+only when the endpoint advertises it for the baseline, its probe finds `curl`, and standard input
+reaches the sandbox: `keep` takes the URL and token on stdin into a 0600 curl config, and the job's
+supervisor sends every attempt with the one pinned `curl` invocation, run by a notifier in its own
+session whose decisions come from the kernel's shell twin (`exec_notify::SH`). A differential test
+runs the same event sequences through `step` and through `SH` under dash and busybox `sh`, and
+`tests/sandbox_jobs_notify.rs` runs the supervisor on this host's tools, on busybox's alone, and
+(in CI's `exec-live` shard) in an Alpine container. The vectors
 are `tests/fixtures/exec/v1.4-*.json`, and `tests/exec_notify_vectors.rs` loads each into a strict
 schema, recomputes what follows from its inputs (the token vectors under a reference verifier, the
 retry timelines), and fails when a tagged requirement names no check (`v1.4-checks.json` lists

@@ -855,7 +855,7 @@ pub struct HttpExecRunner {
     /// an answer.
     streams: tokio::sync::OnceCell<bool>,
     /// Whether the sandbox can run jobs of its own ([`jobs::ShellJobs`]) — probed once, the same way.
-    jobs_probe: Arc<tokio::sync::OnceCell<bool>>,
+    jobs_probe: Arc<tokio::sync::OnceCell<jobs::Baseline>>,
     /// What the endpoint offers for jobs: natively (v1.3, [`jobs_native`]), and `notify` (v1.4) —
     /// probed once, the same way.
     job_offer: tokio::sync::OnceCell<jobs_native::JobOffer>,
@@ -1255,7 +1255,7 @@ impl CommandRunner for HttpExecRunner {
 
     /// Native (v1.3) when the endpoint offers it, the baseline over plain exec commands otherwise.
     fn sandbox_jobs(self: Arc<Self>) -> Option<Arc<dyn jobs::SandboxJobs>> {
-        let shell = jobs::ShellJobs::with_probe(self.clone(), self.jobs_probe.clone());
+        let shell = jobs::ShellJobs::over_endpoint(self.clone(), self.jobs_probe.clone());
         Some(Arc::new(jobs_native::HttpJobs::new(self, shell)))
     }
 }
@@ -1496,7 +1496,7 @@ fn is_ndjson(resp: &reqwest::Response) -> bool {
 pub struct TemplateRunner {
     template: Vec<String>,
     /// Whether the far side can run jobs of its own ([`jobs::ShellJobs`]) — probed once.
-    jobs_probe: Arc<tokio::sync::OnceCell<bool>>,
+    jobs_probe: Arc<tokio::sync::OnceCell<jobs::Baseline>>,
 }
 
 impl TemplateRunner {

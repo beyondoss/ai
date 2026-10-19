@@ -1394,8 +1394,8 @@ pub struct CallbackAttempt {
     pub status: Option<u16>,
 }
 
-/// Check `keep`'s `notify` against the spec's grammar; the rule it breaks, if any (never quoting
-/// the token).
+/// Check `keep`'s `notify`: its members' types here, the grammar by the shared kernel
+/// ([`exec_notify::check_notify`]). The rule it breaks, if any, never quoting the token.
 pub fn parse_notify(v: &Value) -> Result<NotifyTarget, &'static str> {
     let obj = v.as_object().ok_or("notify type")?;
     let url = match obj.get("url") {
@@ -1406,77 +1406,11 @@ pub fn parse_notify(v: &Value) -> Result<NotifyTarget, &'static str> {
         None => return Err("token missing"),
         Some(t) => t.as_str().ok_or("token type")?,
     };
-    check_url(url)?;
-    if token.is_empty() || token.len() > 512 {
-        return Err("token length");
-    }
-    let body = token.trim_end_matches('=');
-    if body.is_empty()
-        || !body
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-._~+/".contains(&b))
-    {
-        return Err("token68");
-    }
+    exec_notify::check_notify(url, token)?;
     Ok(NotifyTarget {
         url: url.to_string(),
         token: token.to_string(),
     })
-}
-
-/// The `url` rules: absolute, at most 2048 bytes, a non-empty host, no userinfo, no fragment, and
-/// `https` — or `http` to `localhost`, `127.0.0.0/8` or `[::1]`. Checked on the bytes as given, since
-/// a URL parser forgives what the grammar does not (surrounding spaces, `https:///x`).
-fn check_url(url: &str) -> Result<(), &'static str> {
-    if url.len() > 2048 {
-        return Err("url length");
-    }
-    if url.bytes().any(|b| b <= b' ' || b == 0x7f) {
-        return Err("absolute");
-    }
-    let (scheme, rest) = url.split_once("://").ok_or("absolute")?;
-    if scheme.is_empty()
-        || !scheme.as_bytes()[0].is_ascii_alphabetic()
-        || !scheme
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
-    {
-        return Err("absolute");
-    }
-    if url.contains('#') {
-        return Err("fragment");
-    }
-    let authority = &rest[..rest.find(['/', '?']).unwrap_or(rest.len())];
-    if authority.contains('@') {
-        return Err("userinfo");
-    }
-    let host = if let Some(v6) = authority.strip_prefix('[') {
-        let end = v6.find(']').ok_or("host")?;
-        &authority[..end + 2]
-    } else {
-        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
-    };
-    if host.is_empty() {
-        return Err("host");
-    }
-    reqwest::Url::parse(url).map_err(|_| "absolute")?;
-    match scheme.to_ascii_lowercase().as_str() {
-        "https" => Ok(()),
-        "http" if loopback(host) => Ok(()),
-        _ => Err("scheme"),
-    }
-}
-
-/// `localhost`, an address in `127.0.0.0/8`, or `[::1]`.
-fn loopback(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-        return v6.parse::<std::net::Ipv6Addr>() == Ok(std::net::Ipv6Addr::LOCALHOST);
-    }
-    host.parse::<std::net::Ipv4Addr>()
-        .is_ok_and(|a| a.octets()[0] == 127)
 }
 
 /// A task the job owns: dropped (by the kernel's `Abandon`, a new timer, or the job's removal), it

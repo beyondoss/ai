@@ -28,6 +28,12 @@
 //!       keep                      "<job number> <kind>": the sandbox owns it now
 //!       seen                      the offset of the output the model has been shown
 //!       o, s                      the FIFOs the output flows through
+//!       notifier                  this supervisor can notify (v1.4); `keep` refuses notify without it
+//!       notify                    0600: the curl config of the latest keep's notify (url, headers, body)
+//!       ngen                      bumped by every keep once one has carried notify
+//!       nlock                     the notifier runs (a directory: `mkdir` is the lock)
+//!       left                      the shell exited with its group alive (a held stream's `shell_exit`)
+//!       n.out                     the status the last callback attempt got
 //! ```
 //!
 //! Every write that a reader could see half-done goes through a temp file and `mv`. The scope is a
@@ -62,6 +68,23 @@
 //! `SIGKILL`, and reports any process still alive after a second more (one the sandbox user may not
 //! signal). The supervisor notices the empty group within half a second and records `end`, after
 //! which nothing ever signals that group number again: `kill` refuses a job whose `end` exists.
+//!
+//! ## Job notify (v1.4)
+//!
+//! Offered only when the endpoint advertises it for the baseline (its deployment's setting that
+//! kept jobs survive idling), the probe finds `curl`, and standard input reaches the sandbox.
+//! `keep` with notify takes the URL and token on **standard input**, never in an argument, and
+//! writes them (escaped) into the 0600 `notify` curl config, then bumps `ngen`. It never sends
+//! anything itself: the supervisor's **notifier** does, a loop the keeper starts (in the
+//! supervisor's session, so outside the group v1.1 kills once `keep` has answered) when `ngen`
+//! first appears, or the supervisor starts just before it records the end. The notifier feeds
+//! what it sees (`ngen` changing, `left`, `end`, the directory's removal, an attempt's status) to
+//! the v1.4 kernel's shell twin ([`exec_notify::SH`]) and does what it says. Each attempt is
+//! exactly `curl -q -sS -K notify -o /dev/null -w '%{http_code}' --max-time 30 --proto
+//! =http,https`, run in the background so a new keep can abandon it, its status read from `n.out`
+//! (`000` is a connection error). The end's status is on disk before the notifier can report it.
+//! The notifier exits once the job has ended and nothing is owed, in flight or waiting, or once the
+//! job is removed.
 //!
 //! ## What is not covered
 //!
@@ -470,9 +493,32 @@ pub async fn poll_follow<J: SandboxJobs + ?Sized>(
 /// The baseline: every operation is one plain exec command running [`JOB_SCRIPT`].
 pub struct ShellJobs {
     runner: Arc<dyn CommandRunner>,
-    /// Whether the sandbox has what the scripts need — shared by every `ShellJobs` over one runner.
-    probed: Arc<tokio::sync::OnceCell<bool>>,
+    /// What the sandbox has — shared by every `ShellJobs` over one runner.
+    probed: Arc<tokio::sync::OnceCell<Baseline>>,
     cap: u64,
+    /// Whether the endpoint offers notify for the baseline (v1.4): its deployment's setting that
+    /// kept jobs survive idling, as its probe answer says. Nothing else enables notify here.
+    advertised: Advertised,
+}
+
+/// What the baseline's probe found in the sandbox.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Baseline {
+    /// Every tool the job scripts need is there.
+    pub jobs: bool,
+    /// `curl` is there and the runner delivers standard input: the supervisor can notify (v1.4).
+    pub notifier: bool,
+}
+
+/// Where the baseline learns whether the endpoint offers it notify.
+#[derive(Clone)]
+enum Advertised {
+    /// No endpoint says so: a template transport, this host.
+    Never,
+    /// Told outright. For tests.
+    Fixed(bool),
+    /// The exec endpoint's answer to the job probe (`{"notify": "v1.4"}` and no `jobs`).
+    Endpoint(Arc<super::HttpExecRunner>),
 }
 
 impl ShellJobs {
@@ -483,13 +529,62 @@ impl ShellJobs {
     /// Over `runner`, sharing its probe result through `probed`.
     pub fn with_probe(
         runner: Arc<dyn CommandRunner>,
-        probed: Arc<tokio::sync::OnceCell<bool>>,
+        probed: Arc<tokio::sync::OnceCell<Baseline>>,
     ) -> Self {
         Self {
             runner,
             probed,
             cap: OUTPUT_CAP,
+            advertised: Advertised::Never,
         }
+    }
+
+    /// Over an exec endpoint, which says (in its job probe's answer) whether it offers notify for
+    /// the baseline.
+    pub(crate) fn over_endpoint(
+        runner: Arc<super::HttpExecRunner>,
+        probed: Arc<tokio::sync::OnceCell<Baseline>>,
+    ) -> Self {
+        let mut me = Self::with_probe(runner.clone(), probed);
+        me.advertised = Advertised::Endpoint(runner);
+        me
+    }
+
+    /// As if the endpoint's deployment said (or denied) that kept jobs survive idling, which is
+    /// what offers notify to the baseline. For tests, and for a transport with no endpoint to say.
+    pub fn with_notify_advertised(mut self, advertised: bool) -> Self {
+        self.advertised = Advertised::Fixed(advertised);
+        self
+    }
+
+    /// What the sandbox has, probing it the first time. A probe that could not reach it finds
+    /// nothing and is retried next time.
+    pub async fn baseline(&self) -> Baseline {
+        self.probed
+            .get_or_try_init(|| async {
+                let argv = Self::argv(&JobScope::under(JOBS_ROOT, "probe"), "probe", Vec::new());
+                let r = self
+                    .runner
+                    .run_with_stdin("sh", &argv, None, OP_TIMEOUT, b"stdin-probe\n")
+                    .await?;
+                let mut lines = r.stdout.lines().map(str::trim);
+                let jobs = r.code == Some(0) && lines.next() == Some("ok");
+                let rest: Vec<&str> = lines.collect();
+                if !jobs {
+                    tracing::info!(
+                        answer = %r.stdout.trim(),
+                        "the sandbox cannot run jobs of its own (a tool is missing); `bash` jobs \
+                         live in their streams there"
+                    );
+                }
+                Ok::<_, std::io::Error>(Baseline {
+                    jobs,
+                    notifier: jobs && rest.contains(&"curl") && rest.contains(&"stdin"),
+                })
+            })
+            .await
+            .copied()
+            .unwrap_or_default()
     }
 
     /// A different output cap than [`OUTPUT_CAP`]. For tests.
@@ -514,8 +609,33 @@ impl ShellJobs {
 
     /// Run one operation; its stdout when it succeeds.
     async fn op(&self, scope: &JobScope, op: &str, args: Vec<String>) -> std::io::Result<String> {
+        self.op_fed(scope, op, args, None).await
+    }
+
+    /// [`Self::op`], with `stdin` fed to the script. Exit 4 is a refusal of the request as written
+    /// ([`std::io::ErrorKind::InvalidInput`]).
+    async fn op_fed(
+        &self,
+        scope: &JobScope,
+        op: &str,
+        args: Vec<String>,
+        stdin: Option<&[u8]>,
+    ) -> std::io::Result<String> {
         let argv = Self::argv(scope, op, args);
-        let r = self.runner.run("sh", &argv, None, OP_TIMEOUT).await?;
+        let r = match stdin {
+            Some(bytes) => {
+                self.runner
+                    .run_with_stdin("sh", &argv, None, OP_TIMEOUT, bytes)
+                    .await?
+            }
+            None => self.runner.run("sh", &argv, None, OP_TIMEOUT).await?,
+        };
+        if r.code == Some(4) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("sandbox job `{op}` refused: this job's supervisor cannot notify"),
+            ));
+        }
         if r.truncated {
             return Err(std::io::Error::other(format!(
                 "sandbox job `{op}`: the answer was cut short by the runner's capture window"
@@ -539,7 +659,7 @@ impl ShellJobs {
             self.cap.to_string(),
             spec.cwd.clone().unwrap_or_default(),
             one_line(&spec.label),
-            SUPERVISOR.to_string(),
+            SUPERVISOR.clone(),
             spec.program.clone(),
         ];
         args.extend(spec.args.iter().cloned());
@@ -558,23 +678,7 @@ fn one_line(label: &str) -> String {
 #[async_trait]
 impl SandboxJobs for ShellJobs {
     async fn available(&self) -> bool {
-        self.probed
-            .get_or_try_init(|| async {
-                let argv = Self::argv(&JobScope::under(JOBS_ROOT, "probe"), "probe", Vec::new());
-                let r = self.runner.run("sh", &argv, None, OP_TIMEOUT).await?;
-                let ok = r.code == Some(0) && r.stdout.trim() == "ok";
-                if !ok {
-                    tracing::info!(
-                        answer = %r.stdout.trim(),
-                        "the sandbox cannot run jobs of its own (a tool is missing); `bash` jobs \
-                         live in their streams there"
-                    );
-                }
-                Ok::<bool, std::io::Error>(ok)
-            })
-            .await
-            .copied()
-            .unwrap_or(false)
+        self.baseline().await.jobs
     }
 
     async fn holds(&self) -> bool {
@@ -699,6 +803,55 @@ impl SandboxJobs for ShellJobs {
                 one_word(kind),
                 seen.to_string(),
             ],
+        )
+        .await
+        .map(drop)
+    }
+
+    async fn offers_notify(&self) -> bool {
+        let advertised = match &self.advertised {
+            Advertised::Never => false,
+            Advertised::Fixed(a) => *a,
+            Advertised::Endpoint(r) => r.job_offer().await.baseline_notify,
+        };
+        advertised && self.baseline().await.notifier
+    }
+
+    /// The `notify` reaches the sandbox on standard input, never in an argument, and is kept in a
+    /// 0600 curl config the job's supervisor reads for each attempt.
+    async fn keep_notify(
+        &self,
+        scope: &JobScope,
+        id: &JobId,
+        num: u64,
+        kind: &str,
+        seen: u64,
+        notify: &JobNotify,
+    ) -> std::io::Result<()> {
+        if let Err(why) = exec_notify::check_notify(&notify.url, &notify.token) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("refused notify: {why}"),
+            ));
+        }
+        if !self.offers_notify().await {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "this sandbox's jobs cannot notify",
+            ));
+        }
+        let stdin = format!("{}\n{}\n", notify.url, notify.token);
+        self.op_fed(
+            scope,
+            "keep",
+            vec![
+                id.0.clone(),
+                num.to_string(),
+                one_word(kind),
+                seen.to_string(),
+                "n".to_string(),
+            ],
+            Some(stdin.as_bytes()),
         )
         .await
         .map(drop)
@@ -1006,6 +1159,9 @@ probe)
     command -v "$c" >/dev/null 2>&1 || m="$m $c"
   done
   if [ -z "$m" ]; then echo ok; else echo "missing$m"; fi
+  command -v curl >/dev/null 2>&1 && echo curl
+  IFS= read -r _s 2>/dev/null && [ "$_s" = stdin-probe ] && echo stdin
+  true
   ;;
 start)
   j=$S/$1 lv=$2 cap=$3 d=$4 lb=$5 sup=$6
@@ -1062,8 +1218,25 @@ list)
 keep)
   j=$S/$1
   [ -d "$j" ] || exit 3
+  if [ "$5" = n ]; then
+    [ -e "$j/notifier" ] || exit 4
+    [ -e "$j/end" ] && [ ! -d "$j/nlock" ] && exit 4
+    IFS= read -r u && IFS= read -r t || exit 4
+    q() { printf '%s' "$1" | sed 's/[\\"]/\\&/g'; }
+    { printf 'url = "%s"\n' "$(q "$u")"
+      printf 'header = "Authorization: Bearer %s"\n' "$(q "$t")"
+      printf 'header = "Content-Type: application/json"\n'
+      printf 'data-binary = "{\\"type\\":\\"job_ended\\",\\"scope\\":\\"%s\\",\\"id\\":\\"%s\\"}"\n' "${S##*/}" "$1"
+    } >"$j/notify.t" || exit 1
+    u= t=
+  fi
   printf '%s\n' "$4" >"$j/seen.t" && mv -f "$j/seen.t" "$j/seen"
   printf '%s %s\n' "$2" "$3" >"$j/keep.t" && mv -f "$j/keep.t" "$j/keep"
+  if [ "$5" = n ]; then mv -f "$j/notify.t" "$j/notify"; elif [ -e "$j/ngen" ]; then rm -f "$j/notify"; fi
+  if [ "$5" = n ] || [ -e "$j/ngen" ]; then
+    n=0; [ -e "$j/ngen" ] && read -r n <"$j/ngen"
+    printf '%s\n' $((n + 1)) >"$j/ngen.t" && mv -f "$j/ngen.t" "$j/ngen"
+  fi
   ;;
 seen)
   j=$S/$1
@@ -1119,11 +1292,16 @@ wipe)
 esac"#;
 
 /// The supervisor, as `setsid sh -c SUPERVISOR sh <dir> <live> <cap> <cwd> <program> <args…>` — see
-/// the module doc. `$PPID` at its start is the holder: the held start that is waiting for it.
-pub const SUPERVISOR: &str = r#"j=$1 lv=$2 cap=$3 d=$4
+/// the module doc. `$PPID` at its start is the holder: the held start that is waiting for it. The
+/// v1.4 kernel's shell twin ([`exec_notify::SH`]) is spliced in for its notifier.
+pub static SUPERVISOR: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| SUPERVISOR_TEMPLATE.replacen("#@kernel\n", exec_notify::SH, 1));
+
+const SUPERVISOR_TEMPLATE: &str = r#"j=$1 lv=$2 cap=$3 d=$4
 shift 4
 w=$PPID
 echo $$ >"$j/sup"
+printf '1\n' >"$j/notifier"
 exec 3>&1 4>&2 >/dev/null 2>/dev/null
 live() {
   kill -0 -"$g" 2>/dev/null || return 1
@@ -1145,6 +1323,46 @@ alive() {
 }
 num() { _n=${1##*.}; _n=${_n#"${_n%%[!0]*}"}; N=${_n:-0}; }
 say() { ( trap '' PIPE; printf '\036job-%s\n' "$1" >&4 ); }
+#@kernel
+kdo() {
+  for _x in $KX; do
+    case $_x in
+      a) if [ -n "$cp" ]; then kill "$cp" 2>/dev/null; wait "$cp" 2>/dev/null; fi; cp= ;;
+      b*) rm -f "$j/n.out"
+        curl -q -sS -K "$j/notify" -o /dev/null -w '%{http_code}' --max-time 30 --proto =http,https >"$j/n.out" 2>/dev/null &
+        cp=$! ;;
+    esac
+  done
+}
+notifier() {
+  mkdir "$j/nlock" 2>/dev/null || return 0
+  exec </dev/null >/dev/null 2>&1 3>&- 4>&-
+  KN=0 KR=0 KO=0 KS=0 KI= KA=0 KW= KX= ng= cp= now=0 sx= se=
+  while :; do
+    if [ ! -d "$j" ]; then kstep r "$now"; kdo; return 0; fi
+    _g=; [ -e "$j/ngen" ] && read -r _g <"$j/ngen"
+    if [ -n "$_g" ] && [ "$_g" != "$ng" ]; then
+      ng=$_g
+      if [ -e "$j/notify" ]; then kstep k1 "$now"; else kstep k0 "$now"; fi
+      kdo
+    fi
+    if [ -z "$sx" ] && [ -e "$j/left" ]; then sx=1; kstep c "$now"; kdo; fi
+    if [ -z "$se" ] && [ -e "$j/end" ]; then se=1; kstep c "$now"; kdo; fi
+    if [ -n "$cp" ] && ! kill -0 "$cp" 2>/dev/null; then
+      wait "$cp" 2>/dev/null; cp= _st=
+      read -r _st <"$j/n.out" 2>/dev/null
+      case $_st in [1-5][0-9][0-9]) ;; *) _st=f ;; esac
+      _d=$(od -An -N4 -tu4 /dev/urandom 2>/dev/null)
+      _d=${_d##* }
+      case $_d in ''|*[!0-9]*) _d=0 ;; esac
+      kstep e "$now" "$_st" "$_d"; kdo
+    fi
+    if [ -n "$KW" ] && [ "$KW" -le "$now" ]; then kstep w "$now"; kdo; fi
+    [ -n "$se" ] && [ -z "$KI$KW" ] && return 0
+    if [ -n "$KI$KW" ]; then _p=0.25 _s=250; else _p=0.5 _s=500; fi
+    if sleep "$_p" 2>/dev/null; then now=$((now + _s)); else sleep 1; now=$((now + 1000)); fi
+  done
+}
 mkfifo "$j/o" || exit 125
 src=$j/o tp=
 if [ "$lv" = 1 ]; then
@@ -1177,6 +1395,7 @@ say "start:$g"
   t=0
   while [ -d "$j" ] && [ ! -e "$j/end" ]; do
     if [ ! -e "$j/keep" ] && ! alive "$w"; then kill -KILL -"$g"; fi
+    if [ -e "$j/ngen" ] && [ ! -d "$j/nlock" ]; then ( notifier ) & fi
     t=$((t + 1))
     if [ $t -ge 8 ]; then
       t=0 z=
@@ -1197,6 +1416,7 @@ wait "$g"
 s=$?
 printf '%s\n' "$s" >"$j/exit.t" && mv -f "$j/exit.t" "$j/exit"
 if live; then
+  : >"$j/left"
   say "shell-exit:$s"
   while live; do sleep 0.5 2>/dev/null || sleep 1; done
 fi
@@ -1204,6 +1424,7 @@ fi
 k=$!
 wait $rp $tp
 kill $k 2>/dev/null
+if [ -e "$j/ngen" ] && [ ! -d "$j/nlock" ]; then ( notifier ) 3>&- 4>&- & fi
 printf '%s %s\n' "$s" "$(date +%s)" >"$j/end.t" && mv -f "$j/end.t" "$j/end"
 say "end:$s"
 exit "$s""#;

@@ -120,7 +120,7 @@ jobs:
             filter: package(beyond-ai-agent) and (kind(lib) or kind(bin) or binary(code_mode_eval))
             extra: "--features code-mode"
           - name: agent-rest
-            filter: package(beyond-ai-agent) and kind(test) and not binary(~serve) and not binary(exec_endpoint_live)
+            filter: package(beyond-ai-agent) and kind(test) and not binary(~serve) and not binary(exec_endpoint_live) and not binary(sandbox_jobs_notify)
             extra: ""
           - name: agent-serve
             filter: package(beyond-ai-agent) and kind(test) and binary(~serve)
@@ -135,7 +135,7 @@ jobs:
           # — and it is what a large share of real sandboxes actually are. Running against a
           # GNU-flavoured image would quietly skip the code path most likely to be wrong.
           - name: exec-live
-            filter: package(beyond-ai-agent) and binary(exec_endpoint_live)
+            filter: package(beyond-ai-agent) and (binary(exec_endpoint_live) or binary(sandbox_jobs_notify))
             extra: ""
     steps:
       - uses: actions/checkout@v7
@@ -159,6 +159,13 @@ jobs:
         if: matrix.name == 'exec-live'
         run: |
           docker run -d --name agent-exec-target --rm alpine:latest sleep 900
+          # A second target for the baseline's job notify (v1.4): on the host network, so its
+          # callbacks reach the test's receiver on 127.0.0.1 (the only host plain `http` may name),
+          # with `curl` added (busybox has none). Never the first target: a container on the host
+          # network reports the host's name, which is exactly what the first one's tests must not
+          # see.
+          docker run -d --name agent-notify-target --rm --network host alpine:latest sleep 900
+          docker exec agent-notify-target apk add --no-cache curl >/dev/null
           docker exec agent-exec-target sh -c '
             mkdir -p /work
             printf "fn one() { NEEDLE }\n" > /work/a.rs
@@ -167,6 +174,8 @@ jobs:
           # The asymmetry the assertions rely on: /work must NOT exist on the runner.
           test ! -e /work
           echo "AGENT_LIVE_EXEC_CMD=docker exec agent-exec-target {}" >> "$GITHUB_ENV"
+          # The baseline's notify needs standard input to reach the target (`sandbox_jobs_notify`).
+          echo "AGENT_LIVE_EXEC_STDIN_CMD=docker exec -i agent-notify-target {}" >> "$GITHUB_ENV"
           echo "AGENT_LIVE_WORKDIR=/work" >> "$GITHUB_ENV"
       # A resource trend that outlives a wedge: memory, swap, PSI, load, pid count, disk and the
       # biggest processes every 5s, appended to a file by a transient *system* unit. It is outside the

@@ -109,10 +109,114 @@ pub fn uniform(draw: u32) -> f64 {
 }
 
 /// The wait after failed attempt `n` (1 … 11), in milliseconds: `d(n) · (1 − u/2)` with
-/// `d(n) = min(2^(n−1), 60)` s (N18), rounded to the nearest millisecond.
-pub fn wait_ms(n: u32, u: f64) -> u64 {
-    let d = 2f64.powi(n.saturating_sub(1).min(16) as i32).min(60.0);
-    (d * 1000.0 * (1.0 - u / 2.0)).round() as u64
+/// `d(n) = min(2^(n−1), 60)` s and `u = draw / 2³²` (N18), rounded to the nearest millisecond
+/// (half up). Integer arithmetic only, so the baseline's `sh` computes exactly the same number:
+/// with `a = d(n)` in ms and `t = a · draw`, it is `a − ⌊t / 2³³⌋`, less one more when the remainder
+/// is over `2³²`.
+pub fn wait_ms(n: u32, draw: u32) -> u64 {
+    let a: u64 = (1u64 << n.saturating_sub(1).min(6)).min(60) * 1000;
+    let t = a * u64::from(draw);
+    a - (t >> 33) - u64::from((t & ((1 << 33) - 1)) > (1 << 32))
+}
+
+/// `keep`'s `notify` grammar (N4): `url` absolute, at most 2048 bytes, a non-empty host, no
+/// userinfo, no fragment, and `https` (or `http` to `localhost`, `127.0.0.0/8` or `[::1]`); `token`
+/// 1 to 512 bytes of `token68`. The rule broken, if any, never quoting the token. Checked on the
+/// bytes as given: a URL parser forgives what the grammar does not (surrounding spaces,
+/// `https:///x`).
+pub fn check_notify(url: &str, token: &str) -> Result<(), &'static str> {
+    check_url(url)?;
+    if token.is_empty() || token.len() > 512 {
+        return Err("token length");
+    }
+    let body = token.trim_end_matches('=');
+    if body.is_empty()
+        || !body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._~+/".contains(&b))
+    {
+        return Err("token68");
+    }
+    Ok(())
+}
+
+fn check_url(url: &str) -> Result<(), &'static str> {
+    if url.len() > 2048 {
+        return Err("url length");
+    }
+    if url.bytes().any(|b| b <= b' ' || b >= 0x7f) {
+        return Err("absolute");
+    }
+    let (scheme, rest) = url.split_once("://").ok_or("absolute")?;
+    if !scheme
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphabetic)
+        || !scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
+    {
+        return Err("absolute");
+    }
+    if url.contains('#') {
+        return Err("fragment");
+    }
+    let authority = &rest[..rest.find(['/', '?']).unwrap_or(rest.len())];
+    if authority.contains('@') {
+        return Err("userinfo");
+    }
+    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+        let end = v6.find(']').ok_or("absolute")?;
+        let addr = &v6[..end];
+        if addr.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err("absolute");
+        }
+        let after = &v6[end + 1..];
+        let port = match after.strip_prefix(':') {
+            Some(p) => Some(p),
+            None if after.is_empty() => None,
+            None => return Err("absolute"),
+        };
+        (&authority[..end + 2], port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() {
+        return Err("host");
+    }
+    if !host.starts_with('[')
+        && !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._~%!$&'()*+,;=".contains(&b))
+    {
+        return Err("absolute");
+    }
+    if let Some(p) = port
+        && !p.is_empty()
+        && !(p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok())
+    {
+        return Err("absolute");
+    }
+    match scheme.to_ascii_lowercase().as_str() {
+        "https" => Ok(()),
+        "http" if loopback(host) => Ok(()),
+        _ => Err("scheme"),
+    }
+}
+
+/// `localhost`, an address in `127.0.0.0/8`, or `[::1]`.
+fn loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return v6.parse::<std::net::Ipv6Addr>() == Ok(std::net::Ipv6Addr::LOCALHOST);
+    }
+    host.parse::<std::net::Ipv4Addr>()
+        .is_ok_and(|a| a.octets()[0] == 127)
 }
 
 /// The callback body (N14): exactly `type`, `scope` and `id`, in that order, as JSON strings.
@@ -200,7 +304,7 @@ pub fn step(job: Job, event: Event, now: u64) -> (Job, Vec<Action>) {
                     j.attempts = 0;
                 }
                 Verdict::Retry => {
-                    let at = now + wait_ms(j.attempts, uniform(draw));
+                    let at = now + wait_ms(j.attempts, draw);
                     j.wake_at = Some(at);
                     out.push(Action::WakeAt(at));
                     return (j, out);
@@ -231,6 +335,70 @@ fn begin(j: &mut Job, out: &mut Vec<Action>) {
         attempt: j.attempts,
     });
 }
+
+/// [`step`] in POSIX `sh` (dash and busybox `ash` alike), for the baseline's job supervisor, which
+/// has no Rust to call. Line for line the same rules; `tests.rs` runs the same event sequences
+/// through both and compares every state and action.
+///
+/// State: `KN` notify (0/1), `KR` removed (0/1), `KO` owed, `KS` settled, `KI` the in-flight
+/// attempt's carried count (empty: none), `KA` attempts, `KW` wake time (empty: none). Start with
+/// `KN=0 KR=0 KO=0 KS=0 KI= KA=0 KW=`. `kstep <event> <now-ms> [<status> <draw>]` with event `k1`
+/// (keep with notify), `k0` (keep without), `c` (a change), `r` (removed), `e` (the attempt ended:
+/// a 3-digit status, or `f` for no status, and a `u32` draw), or `w` (wake). It leaves the actions
+/// in `KX`, space-separated: `b<n>` begin attempt n, `a` abandon, `t<ms>` wake at. Helpers use only
+/// `_k`-prefixed names.
+pub const SH: &str = r#"kverdict() {
+  case $1 in
+    f) _kv=r ;;
+    2[0-9][0-9]) _kv=d ;;
+    401|403|404|410) _kv=s ;;
+    407|408|425|429|5[0-9][0-9]) _kv=r ;;
+    *) _kv=s ;;
+  esac
+}
+kwait() {
+  _ke=$(($1 - 1)); [ "$_ke" -gt 6 ] && _ke=6
+  _ka=$((1 << _ke)); [ "$_ka" -gt 60 ] && _ka=60
+  _ka=$((_ka * 1000)); _kt=$((_ka * $2))
+  _kw=$((_ka - (_kt >> 33)))
+  [ $((_kt & 8589934591)) -gt 4294967296 ] && _kw=$((_kw - 1))
+  return 0
+}
+kbegin() { KW=; KA=$((KA + 1)); KI=$KO; KX="${KX}b$KA "; }
+kstep() {
+  KX=
+  [ "$KR" = 1 ] && return 0
+  case $1 in
+    k1|k0)
+      if [ -n "$KI" ]; then KI=; KX="${KX}a "; fi
+      KW= KA=0
+      if [ "$1" = k1 ]; then KN=1 KO=$((KO + 1)); kbegin; else KN=0 KS=$KO; fi ;;
+    c)
+      [ "$KN" = 1 ] || return 0
+      KO=$((KO + 1))
+      if [ -z "$KI" ]; then KW= KA=0; kbegin; fi ;;
+    r)
+      [ -n "$KI" ] && KX="${KX}a "
+      KN=0 KR=1 KO=0 KS=0 KI= KA=0 KW= ;;
+    e)
+      [ -n "$KI" ] || return 0
+      _kc=$KI KI=
+      kverdict "$3"
+      if [ "$_kv" = r ]; then
+        if [ "$KO" -gt "$_kc" ]; then KA=0
+        elif [ "$KA" -ge 12 ]; then [ "$_kc" -gt "$KS" ] && KS=$_kc; KA=0
+        else kwait "$KA" "$4"; KW=$(($2 + _kw)); KX="${KX}t$KW "; return 0
+        fi
+      else
+        [ "$_kc" -gt "$KS" ] && KS=$_kc; KA=0
+      fi
+      if [ "$KN" = 1 ] && [ "$KO" -gt "$KS" ]; then kbegin; fi ;;
+    w)
+      if [ -z "$KI" ] && [ "$KN" = 1 ] && [ "$KO" -gt "$KS" ] && [ -n "$KW" ] && [ "$KW" -le "$2" ]; then kbegin; fi ;;
+  esac
+  return 0
+}
+"#;
 
 #[cfg(test)]
 mod tests;
