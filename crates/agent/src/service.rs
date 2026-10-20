@@ -571,7 +571,7 @@ impl ServiceSession {
         let (prompt_templates, prompt_collisions) =
             crate::prompts::discover_via(backend, &claude_roots(root, home, "prompts")).await;
         let (agents, _agent_collisions) =
-            crate::agents::discover_via(backend, &claude_roots(root, home, "agents")).await;
+            crate::agents::discover_via(backend, &agent_roots(root, home)).await;
         Resources {
             skills,
             skill_collisions,
@@ -725,6 +725,14 @@ fn claude_roots(root: &Path, home: Option<&Path>, leaf: &str) -> Vec<(PathBuf, &
         roots.push((home.join(".claude").join(leaf), "user"));
     }
     roots.push((root.join(".claude").join(leaf), "project"));
+    roots
+}
+
+/// The sandbox discovery roots for subagent definitions, in the same ascending order as
+/// [`skill_roots`]: `.agents/agents` before `.claude/agents`, as the on-host walk orders them.
+fn agent_roots(root: &Path, home: Option<&Path>) -> Vec<(PathBuf, &'static str)> {
+    let mut roots = claude_roots(root, home, "agents");
+    roots.insert(roots.len() - 1, (root.join(".agents/agents"), "project"));
     roots
 }
 

@@ -108,6 +108,45 @@ async fn the_sandboxs_own_context_skill_agent_and_system_prompt_reach_the_model(
     assert_no_host_markers(&loaded, &markers);
 }
 
+/// The vendor-neutral `.agents/agents` folder is part of "an agent is a folder", hosted as well as
+/// local: a definition there is offered to the model, and `.claude/agents` wins a name clash.
+#[tokio::test]
+async fn the_sandboxs_dot_agents_agents_are_offered_to_the_model() {
+    let (base, requests) = spawn_model_server(vec![turn_text("hi")]);
+    let (svc, _host_home, markers) = service_with_a_stocked_host_home(&base).await;
+
+    svc.write_in_workspace(
+        ".agents/agents/neutral.md",
+        "---\nname: neutral\ndescription: DOT-AGENTS-DESCRIPTION\n---\nChild prompt.",
+    );
+    svc.write_in_workspace(
+        ".agents/agents/clash.md",
+        "---\nname: clash\ndescription: LOSING-DESCRIPTION\n---\nChild prompt.",
+    );
+    svc.write_in_workspace(
+        ".claude/agents/clash.md",
+        "---\nname: clash\ndescription: WINNING-DESCRIPTION\n---\nChild prompt.",
+    );
+
+    let token = svc.token("t1", "s1.alpha");
+    let mut ws = ws_connect_with_headers(svc.port, Some("s1.alpha"), &svc.header(&token))
+        .await
+        .unwrap();
+    ws_send(
+        &mut ws,
+        json!({"type":"prompt","id":"p1","message":"hello"}),
+    )
+    .await;
+    let frames = ws_read_until_response(&mut ws, "prompt").await;
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+
+    let raw = requests.lock().unwrap()[0].clone();
+    assert!(raw.contains("DOT-AGENTS-DESCRIPTION"), "{raw}");
+    assert!(raw.contains("WINNING-DESCRIPTION"), "{raw}");
+    assert!(!raw.contains("LOSING-DESCRIPTION"), "{raw}");
+    assert_no_host_markers(&raw, &markers);
+}
+
 /// A tenant's `~/.claude` inside its *own* sandbox counts too — that home is the tenant's, not the
 /// replica's — and the workspace shadows it on a name collision.
 #[tokio::test]
