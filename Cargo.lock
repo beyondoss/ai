@@ -502,6 +502,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "beyond-ai-demo"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "beyond-ai",
+ "beyond-ai-agent",
+ "beyond-ai-test-support",
+ "clap",
+ "ed25519-dalek",
+ "futures",
+ "getrandom 0.3.4",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "beyond-ai-exec-notify"
 version = "0.1.0"
 dependencies = [

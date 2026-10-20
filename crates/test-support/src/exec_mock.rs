@@ -326,6 +326,17 @@ impl ExecMock {
         )
     }
 
+    /// As [`Self::start_on`], behaving as `opts` says: the endpoint a deployment runs, bound where
+    /// its neighbours can reach it.
+    pub async fn start_on_with(
+        bind: &str,
+        root: &Path,
+        opts: MockOptions,
+    ) -> std::io::Result<Self> {
+        let listener = tokio::net::TcpListener::bind(bind).await?;
+        Ok(Self::serve(listener, root, opts))
+    }
+
     /// Serve on `listener`, which the endpoint holds for as long as it runs.
     fn serve(listener: tokio::net::TcpListener, root: &Path, opts: MockOptions) -> Self {
         let url = format!("http://{}/exec", listener.local_addr().unwrap());
