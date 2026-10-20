@@ -88,7 +88,9 @@ where
     F: Fn(Req, TcpStream) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = beyond_ai_test_support::ports::listener();
+    listener.set_nonblocking(true).unwrap();
+    let listener = TcpListener::from_std(listener).unwrap();
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());
     let handler = Arc::new(handler);
     tokio::spawn(async move {
