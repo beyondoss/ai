@@ -405,7 +405,10 @@ TD_AGENT=$(jq -n --arg family "$P-agent" --arg exec "$(EXEC agent)" --arg taskro
      environment:[{name:"HOME",value:"/tmp"},{name:"GATEWAY_URL",value:$gw},{name:"MODEL",value:$model},
        {name:"NOTIFY_ORIGIN",value:$origin},{name:"GRANT_KEY_FLAG",value:$grant},{name:"TLS_CERT",value:$cert}],
      secrets:[{name:"AI_AGENT_SEAL_KEY_B64",valueFrom:$seal},{name:"TLS_KEY",valueFrom:$tlskey}],
-     logConfiguration:$logs}]} + (if $taskrole == "" then {} else {taskRoleArn:$taskrole} end)' | register "$P-agent")
+     logConfiguration:$logs}]} + (if $taskrole == "" then {} else {taskRoleArn:$taskrole} end)
+  # The use cases scan the agent process'"'"'s memory through ECS Exec, which Linux allows a non-parent
+  # only with CAP_SYS_PTRACE (Yama scope 1 on Fargate): granted for that, in this mode only.
+  | if $taskrole == "" then . else .containerDefinitions[0].linuxParameters = {capabilities:{add:["SYS_PTRACE"]}} end' | register "$P-agent")
 
 if [ "$USE_FARGATE" = 1 ]; then
 SANDBOX_SCRIPT='printf "%s" "$CA_PEM" > /tmp/ca.pem

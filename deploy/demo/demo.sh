@@ -81,7 +81,7 @@ EVENTS=$WORK/events.jsonl           # every frame the client saw
 TIMELINE=$WORK/timeline.ndjson      # one line per key event, any source
 CHECKS_OUT=$WORK/checks.ndjson
 CALLS=$WORK/calls.ndjson            # model calls the agent says it made, per session
-touch "$EVENTS" "$TIMELINE" "$CHECKS_OUT" "$CALLS"
+touch "$EVENTS" "$TIMELINE" "$CHECKS_OUT" "$CALLS" "$WORK/windows.ndjson"
 VMDIR=$WORK/vm                      # one file per session's E2B sandbox (e2b mode)
 mkdir -p "$VMDIR"
 if [ "$USE_E2B" = 1 ]; then
@@ -154,6 +154,8 @@ chat() { # session chat-args...
 }
 note_calls() { # session summary-json: remember how many model calls the agent says the session made
   jq -c --arg s "$1" '{session:$s, assistant_messages: ([.prompt_response.data.assistant_messages, .wake_response.data.assistant_messages]|map(select(.!=null))|max)}' <<<"$2" >> "$CALLS"
+  # when the turn ran: from the prompt sent to its answer (a use case counts sandbox calls inside these)
+  jq -c 'select(.prompt_response != null) | {sent:.sent_at_ms, done:.done_at_ms}' <<<"$2" >> "$WORK/windows.ndjson"
 }
 
 # ---- the runner --------------------------------------------------------------------------------------
@@ -593,7 +595,9 @@ EVENTS=$WORK/events.clean
 # Client frames: the key ones only (the stream's deltas stay out of the record).
 jq -c 'select(.src=="client")|.frame as $f|.session as $s|.ts_ms as $t|
   if $f.type=="demo_prompt_sent" then {t_ms:$t,src:"client",event:"prompt",path:["you","agent"],detail:{session:$s}}
-  elif $f.event.kind=="tool_start" then {t_ms:$t,src:"client",event:"tool_start",path:null,detail:{session:$s,name:$f.event.name}}
+  elif $f.event.kind=="tool_start" then
+    (if ($f.event.name|test("^mcp__deepwiki__")) then ["agent","deepwiki"] elif ($f.event.name|test("^mcp__browser__")) then ["agent","browser"] else null end) as $to
+    | {t_ms:$t,src:"client",event:(if $to then "tool_to_server" else "tool_start" end),path:$to,detail:{session:$s,name:$f.event.name}}
   elif $f.event.kind=="tool_end" then {t_ms:$t,src:"client",event:"tool_end",path:null,detail:{session:$s,name:$f.event.name}}
   elif $f.event.kind=="background" then {t_ms:$t,src:"client",event:("background_"+($f.event.reason//"")),path:null,detail:{session:$s,wake:$f.event.wake}}
   elif $f.type=="response" and $f.command=="prompt" then {t_ms:$t,src:"client",event:"turn_complete",path:["agent","efs"],detail:{session:$s}}

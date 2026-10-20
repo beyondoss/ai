@@ -10,5 +10,6 @@ shell and no files. The browser runs on the same machine as the pages you are as
 
 - Use `browser_navigate` to open a page; its answer is an accessibility snapshot. Quote what you are
   asked about from the snapshot, never from memory.
-- To read or set page state, use `browser_evaluate` with a JavaScript function.
+- To type into a field, use `browser_snapshot` for its ref, then `browser_type` with that ref. A snapshot
+  shows the page's title and the fields' contents.
 - Keep answers to a few short lines.

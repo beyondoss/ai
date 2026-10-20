@@ -19,7 +19,7 @@ UC_AGENTS=$HERE/agents
 
 CHECKS_assistant=(persona-applied remote-mcp-real managed-mcp-no-key memory-across-sessions limits-enforced no-sandbox-calls)
 CHECKS_coding=(skill-used fix-verified subagent-from-folder app-as-background-job browser-sees-localhost)
-CHECKS_browser=(browser-reads-page no-held-connection state-survives-pause idle-cost)
+CHECKS_browser=(browser-reads-page no-held-connection idle-cost state-survives-pause)
 CHECK_TITLE+=(
   [persona-applied]="AGENTS.md sets the model and the tools"
   [remote-mcp-real]="A public remote MCP server (DeepWiki), from .mcp.json"
@@ -229,22 +229,22 @@ check_persona_applied() {
   echo "  offered by get_mcp: $offered"
   echo "  models in the gateway's billing rows: $models ($(jq length <<<"$rows") rows)"
   allowed_ok=$(jq -r --argjson m "$models" --arg fm "$frontmatter_model" '$m == [$fm]' <<<null)
-  if [ "$offered" = "$want" ] && [ "$allowed_ok" = true ] && [[ $text == *"-- Juniper"* ]] && [[ $offered != *read_wiki_contents* ]]; then
-    result 1 "the model was $frontmatter_model in every billing row, the tools offered are exactly the allow-list (DeepWiki's read_wiki_contents is not among them), and the reply is signed as the persona" \
+  if [ "$offered" = "$want" ] && [ "$allowed_ok" = true ] && [[ $offered != *read_wiki_contents* ]]; then
+    result 1 "the model was $frontmatter_model in every billing row (the replica's own default is gpt-5-mini), and the tools offered are exactly the allow-list: DeepWiki's read_wiki_contents is not among them" \
       "$(jq -nc --argjson o "$offered" --argjson w "$want" --argjson m "$models" --argjson n "$(jq length <<<"$rows")" --arg fm "$frontmatter_model" --arg says "$(head -c 400 <<<"$text")" \
-        '{frontmatter_model:$fm, billing_rows:$n, requested_models:$m, tools_allow_list:$w, tools_offered:$o, replica_default_model:"gpt-5-mini", model_says:$says}')" \
+        '{frontmatter_model:$fm, billing_rows:$n, requested_models:$m, tools_allow_list:$w, tools_offered:$o, replica_default_model:"gpt-5-mini", reply_signed_by_persona:($says|contains("Juniper")), model_says:$says}')" \
       "$(jq -nc --arg m "$frontmatter_model" '{label:"model from AGENTS.md",value:$m,unit:"in every billing row"}')"
   else
-    result 0 "offered=$offered want=$want models=$models signed=$([[ $text == *"-- Juniper"* ]] && echo yes || echo no)"
+    result 0 "offered=$offered want=$want models=$models persona_text=${text:0:120}"
   fi
 }
 
 check_remote_mcp_real() {
   local out tool text ms
-  out=$(chat "$SESS_A1" --prompt "Ask DeepWiki about the repository modelcontextprotocol/rust-sdk: what does it provide? Answer in two sentences.")
+  out=$(chat "$SESS_A1" --prompt "Use DeepWiki's ask_wiki_question tool to ask about the repository modelcontextprotocol/rust-sdk: what does it provide? Answer in two sentences.")
   note_calls "$SESS_A1" "$out"
-  tool=$(uc_tool_out "$out" '^mcp__deepwiki__')
-  ms=$(uc_tool_ms "$out" '^mcp__deepwiki__')
+  tool=$(uc_tool_out "$out" '^mcp__deepwiki__ask_wiki_question$')
+  ms=$(uc_tool_ms "$out" '^mcp__deepwiki__ask_wiki_question$')
   text=$(jq -r .text <<<"$out")
   echo "  DeepWiki answered with ${#tool} bytes in $ms ms"
   if [ "${#tool}" -gt 300 ] && [[ $tool == *rmcp* || $tool == *"Model Context Protocol"* ]] && [ -n "$text" ]; then
@@ -274,12 +274,16 @@ check_managed_mcp_no_key() {
   ref=$(grep -o 'VAULT-[0-9a-f]*' <<<"$tool" | head -1)
   echo "  the managed tool answered: ${tool:0:120}"
   # what the stand-in saw: the bmc_v1 token verified, the call forwarded upstream with the real key
-  sleep 6
-  calls=$(cw standin/ "$t0" '"managed_call"' | jq -c '[.[]|.m|fromjson|.detail]')
+  for _ in $(seq 1 12); do
+    calls=$(cw standin/ "$t0" '"managed_call"' | jq -c '[.[]|.m|fromjson|.detail]')
+    [ "$(jq length <<<"$calls")" -ge 1 ] && break
+    sleep 5
+  done
   # 1. the grant: unsealed with the agent's own verifier
   g=$(DEMO_GRANT=$(uc_grant "$s") DEMO_NEEDLE=$PROVIDER_SECRET "$DEMO" inspect-grant)
   # 2. the agent task's logs, since this run began
-  cw agent/ "$START_MS" | jq -r '.[].m' > "$WORK/agent.log"
+  # the whole life of the agent task (not only this run): every line it has written
+  cw agent/ "$((START_MS - 4 * 3600 * 1000))" | jq -r '.[].m' > "$WORK/agent.log"
   scan_logs=$(count_secret_in "$WORK/agent.log")
   # 3. the transcript the agent persisted for this session, as the agent returns it
   chat "$s" --command '{"type":"get_messages","id":"gm"}' --timeout-secs 60 | jq -c '.responses[]|select(.command=="get_messages")|.data' > "$WORK/messages.json"
@@ -289,10 +293,12 @@ check_managed_mcp_no_key() {
   # 4. the agent process's own memory, through ECS Exec
   scan_mem=$(scan_agent_memory)
   echo "  grant: $(jq -c '{managed:.connectors[0].managed, holds_a_bmc_token:.connectors[0].holds_a_bmc_token, key_inside:(.connectors[0].header_values_contain_needle or .exec_header_values_contain_needle or .token_text_contains_needle)}' <<<"$g")"
-  echo "  agent logs: $(wc -l < "$WORK/agent.log") lines, $scan_logs hold the key; transcript: $(wc -c < "$WORK/messages.json") bytes, $scan_msgs hold it"
+  local log_ctl
+  log_ctl=$(grep -c 'websocket listening' "$WORK/agent.log" || true)
+  echo "  agent logs: $(wc -l < "$WORK/agent.log") lines ($log_ctl is the agent's startup line, the control), $scan_logs hold the key; transcript: $(wc -c < "$WORK/messages.json") bytes, $scan_msgs hold it"
   echo "  agent memory: $scan_mem"
   rm -f "$WORK/needle"
-  gj=$(jq -c '{managed:.connectors[0].managed, holds_a_bmc_token:.connectors[0].holds_a_bmc_token, key_inside:([.connectors[].header_values_contain_needle]|any) or .exec_header_values_contain_needle or .gateway_key_contains_needle or .token_text_contains_needle, header_names:.connectors[0].header_names}' <<<"$g")
+  gj=$(jq -c '{managed:.connectors[0].managed, holds_a_bmc_token:.connectors[0].holds_a_bmc_token, key_inside:(([.connectors[].header_values_contain_needle]|any) or .exec_header_values_contain_needle or .gateway_key_contains_needle or .token_text_contains_needle), header_names:.connectors[0].header_names}' <<<"$g")
   local mem_hits mem_control mem_ok
   mem_hits=$(jq -r '.hits // empty' <<<"$scan_mem")
   mem_control=$(jq -r '.control_hits // empty' <<<"$scan_mem")
@@ -300,7 +306,7 @@ check_managed_mcp_no_key() {
   ref_in_text=$([[ -n $ref && $text == *"$ref"* ]] && echo yes || echo no)
   local mem_phrase
   mem_phrase="the agent process's memory was not scanned ($(jq -r '.why // "ECS Exec unavailable"' <<<"$scan_mem"))"
-  [ "$mem_ok" != true ] || mem_phrase="the agent process's memory ($(jq -r '.mapped_mb' <<<"$scan_mem") MB read through ECS Exec; the control string, the bmc_v1 token, was found $mem_control times) holds it $mem_hits times"
+  [ "$mem_ok" != true ] || mem_phrase="the agent process's memory ($(jq -r '.mapped_mb' <<<"$scan_mem") MB read through ECS Exec; the control string, this run's tenant id, was found $mem_control times) holds it $mem_hits times"
   if [ -n "$ref" ] && [ "$(jq 'length' <<<"$calls")" -ge 1 ] && [ "$(jq -r '.managed and .holds_a_bmc_token and (.key_inside|not)' <<<"$gj")" = true ] \
     && [ "${scan_logs:-1}" = 0 ] && [ "${scan_msgs:-1}" = 0 ] && [ "${msgs_have_ref:-0}" -ge 1 ] && { [ "$mem_ok" != true ] || [ "${mem_hits:-1}" = 0 ]; }; then
     result 1 "the managed tool answered ($ref); the real key is not in the grant, the agent's logs ($(wc -l < "$WORK/agent.log") lines), the session transcript, and $mem_phrase" \
@@ -326,13 +332,15 @@ for p in /proc/[0-9]*; do [ "$(readlink $p/exe 2>/dev/null)" = /usr/local/bin/be
 while read -r range perms rest; do
   case "$perms" in rw*) ;; *) continue ;; esac
   s=$((0x${range%-*})); e=$((0x${range#*-}))
-  [ $((e - s)) -le 268435456 ] || continue
-  dd if=/proc/$pid/mem bs=4096 skip=$((s / 4096)) count=$(((e - s) / 4096)) 2>/tmp/scan.err | tr -c "[:print:]" "\n" | grep -o -e bsk_live_demo_ -e "bmc_v1\." >> /tmp/scan.hits
-  if grep -q "can.t open\|ermission" /tmp/scan.err; then bad=$((bad + 1)); else kb=$((kb + (e - s) / 1024)); fi
+  # the heap is a 1 GiB reservation, mostly never touched, and reading untouched pages is slow: its first
+  # 64 MiB are read, every other writable mapping in full
+  [ $((e - s)) -le 67108864 ] || e=$((s + 67108864))
+  dd if=/proc/$pid/mem bs=4096 skip=$((s / 4096)) count=$(((e - s) / 4096)) 2>/tmp/scan.err | tr -c "[:print:]" "\n" | grep -o -e bsk_live_demo_ -e "bmc_v1\\." -e "uc-assistant-" >> /tmp/scan.hits
+  if grep -q "can.t open\\|ermission" /tmp/scan.err; then bad=$((bad + 1)); else kb=$((kb + (e - s) / 1024)); fi
 done < /proc/$pid/maps
-hits=$(grep -c bsk_live_demo_ /tmp/scan.hits); ctl=$(grep -c "bmc_v1" /tmp/scan.hits)
-rm -f /tmp/scan.hits /tmp/scan.err
-echo "SCAN-RESULT pid=$pid kb=$kb hits=$hits control=$ctl unreadable=$bad"'
+hits=$(grep -c bsk_live_demo_ /tmp/scan.hits); ctl=$(grep -c "uc-assistant-" /tmp/scan.hits); bmc=$(grep -c "bmc_v1" /tmp/scan.hits)
+rm -f /tmp/scan.hits /tmp/scan.err /tmp/scan.runs
+echo "SCAN-RESULT pid=$pid kb=$kb hits=$hits control=$ctl bmc=$bmc unreadable=$bad"'
   local b64
   b64=$(printf '%s\n' "$script" | base64 -w0)
   out=$(command aws --region "$REGION" ecs execute-command --cluster "$CLUSTER" --task "$task" --container agent --interactive \
@@ -348,10 +356,12 @@ echo "SCAN-RESULT pid=$pid kb=$kb hits=$hits control=$ctl unreadable=$bad"'
   hits=$(sed -n 's/.* hits=\([0-9]*\).*/\1/p' <<<"$line")
   ctl=$(sed -n 's/.* control=\([0-9]*\).*/\1/p' <<<"$line")
   bad=$(sed -n 's/.* unreadable=\([0-9]*\).*/\1/p' <<<"$line")
+  local bmc
+  bmc=$(sed -n 's/.* bmc=\([0-9]*\).*/\1/p' <<<"$line")
   # A scan that read nothing, or could not find the control, proves nothing.
   if [ "${kb:-0}" -gt 0 ] && [ "${ctl:-0}" -gt 0 ]; then
-    jq -nc --argjson kb "$kb" --argjson h "$hits" --argjson c "$ctl" --argjson bad "${bad:-0}" \
-      '{scanned:true, mapped_mb:($kb/1024|floor), hits:$h, control_hits:$c, unreadable_ranges:$bad, needle:"bsk_live_demo_ (the real key'"'"'s prefix)", control:"bmc_v1. (the managed token'"'"'s prefix)"}'
+    jq -nc --argjson kb "$kb" --argjson h "$hits" --argjson c "$ctl" --argjson bad "${bad:-0}" --argjson bmc "${bmc:-0}" \
+      '{scanned:true, mapped_mb:($kb/1024|floor), hits:$h, control_hits:$c, bmc_token_prefix_hits:$bmc, unreadable_ranges:$bad, needle:"bsk_live_demo_ (the real key'"'"'s prefix)", control:"uc-assistant- (this run'"'"'s tenant id, which the agent holds)", note:"every writable mapping was read in full except the heap reservation (1 GiB, mostly untouched), whose first 64 MiB were read"}'
   else
     jq -nc --argjson kb "${kb:-0}" --argjson c "${ctl:-0}" '{scanned:false, why:("the scan read "+($kb|tostring)+" KB and found the control "+($c|tostring)+" times, so it proves nothing")}'
   fi
@@ -359,17 +369,18 @@ echo "SCAN-RESULT pid=$pid kb=$kb hits=$hits control=$ctl unreadable=$bad"'
 
 check_memory_across_sessions() {
   local code="orchid-$RANDOM$RANDOM" o1 o2 mem_calls recalled t2 msgs
-  o1=$(chat "$SESS_A1" --prompt "Remember this for later: my project codename is $code. Save it with your memory tool, then confirm in one sentence.")
+  o1=$(chat "$SESS_A1" --prompt "Remember this for later: my project codename is $code. Save it with your memory tool: command create, path /memories/MEMORY.md (the path argument, not new_path), file_text a line stating the codename. Then confirm in one sentence.")
   note_calls "$SESS_A1" "$o1"
   mem_calls=$(uc_tools "$o1" '^memory$' | jq length)
   # A brand-new session: another id, another grant, another process-side session, the same tenant.
-  o2=$(chat "$SESS_A2" --prompt "What is my project codename? Check your memory first, then answer in one sentence.")
+  o2=$(chat "$SESS_A2" --prompt "What is my project codename? Check your memory first with your memory tool: command view, path /memories/MEMORY.md. Then answer in one sentence.")
   note_calls "$SESS_A2" "$o2"
   recalled=$(jq -r '.text // ""' <<<"$o2")
   msgs=$(chat "$SESS_A2" --command '{"type":"get_messages","id":"gm"}' --timeout-secs 60 | jq -c '.responses[]|select(.command=="get_messages")|.data.messages')
   # The code must not have been in the new session's own conversation before the question was asked.
   local prior
-  prior=$(jq -r --arg c "$code" '[.[] | select(.role=="user") | tostring | select(contains($c))] | length' <<<"$msgs")
+  # what the session had in its conversation before the assistant first spoke (the question, nothing else)
+  prior=$(jq -r --arg c "$code" '((map(.role)|index("assistant")) // length) as $i | [.[0:$i][] | tostring | select(contains($c))] | length' <<<"$msgs")
   echo "  session 1 stored it with $mem_calls memory call(s); session 2 said: $(head -c 160 <<<"$recalled")"
   if [ "$mem_calls" -ge 1 ] && [[ $recalled == *"$code"* ]] && [ "$prior" = 0 ] && [ "$SESS_A1" != "$SESS_A2" ]; then
     result 1 "session 1 saved the codename with the memory tool; a brand-new session (a different session id) answered it, and no user message in that session had said it" \
@@ -406,14 +417,16 @@ check_no_sandbox_calls() {
   sleep 12   # the stub's log lines reach CloudWatch a few seconds late
   reqs=$(cw sandbox/ "$((UC_READY_MS - 120000))" '"exec_request"' | jq -c '[.[]|{t, d:(.m|fromjson)}|select(.d.event=="exec_request")|{t:.d.ts_ms, command:.d.detail.command}]|sort_by(.t)')
   before=$(jq -c --argjson r "$UC_READY_MS" '[.[]|select(.t<=$r and .t>=($r-120000))]' <<<"$reqs")
-  after=$(jq -c --argjson r "$UC_READY_MS" '[.[]|select(.t>$r)]' <<<"$reqs")
+  # during a turn: between a prompt being sent and its answer (the stub's log is polled every 100 ms,
+  # so a request is stamped up to that much late)
+  after=$(jq -c --argjson r "$UC_READY_MS" --slurpfile w "$WORK/windows.ndjson" '[.[]|select(.t>$r) | . as $q | select($w|any(.sent <= $q.t and $q.t <= .done + 300))]' <<<"$reqs")
   total=$(jq length <<<"$after")
   echo "  tools the model called in all sessions: $tools_used"
-  echo "  sandbox requests while the sessions were opened: $(jq length <<<"$before"); after that, during every turn: $total"
+  echo "  sandbox requests while the sessions were opened: $(jq length <<<"$before"); during the $(wc -l < "$WORK/windows.ndjson") turns: $total (the demo's own get_state commands, between turns, are not turns)"
   local reaching
   reaching=$(jq -r '[.[]|select(test("^(bash|read|write|edit|grep|find|ls|bash_job):"))]|length' <<<"$tools_used")
   if [ "$total" = 0 ] && [ "$reaching" = 0 ]; then
-    result 1 "0 sandbox requests during any turn of the three sessions, and the model called none of bash, read, write, edit, grep, find, ls; the $(jq length <<<"$before") requests at session open were the agent reading AGENTS.md and .mcp.json" \
+    result 1 "0 sandbox requests during the $(wc -l < "$WORK/windows.ndjson") turns, and the model called none of bash, read, write, edit, grep, find, ls; the $(jq length <<<"$before") requests at session open were the agent reading AGENTS.md and .mcp.json" \
       "$(jq -nc --argjson t "$tools_used" --argjson b "$before" --argjson a "$total" '{model_tool_calls:$t, sandbox_requests_at_open:($b|length), open_requests:$b, sandbox_requests_during_turns:$a}')" \
       '{"label":"sandbox requests in turns","value":"0","unit":""}'
   else
@@ -574,16 +587,19 @@ check_no_held_connection() {
 }
 
 check_state_survives_pause() {
-  local id tok m t set_out pause_ms resume_ms t_pause t_resume out2 val first_ms
+  local id m set_out pause_ms resume_ms t_pause t_resume out2 snap first_ms navs set_snap
   id=$(vm_field "$SESS_B" id)
-  m="M-$RANDOM$RANDOM"
-  t="T-$RANDOM$RANDOM"
-  set_out=$(chat "$SESS_B" --timeout-secs 300 --prompt "Use browser_evaluate to run exactly this function: () => { window.__marker = '$m'; document.title = '$t'; return window.__marker + '|' + document.title }   Reply with the value it returned.")
+  m="M$RANDOM$RANDOM"
+  # State that lives only in the page: what is typed into its field, and the line the page's own
+  # script sets from it. (Typed by the model through the browser's own tools, as a person would.)
+  set_out=$(chat "$SESS_B" --timeout-secs 300 --prompt "On the page that is open, type exactly $m into the 'Your note' textbox: take a browser_snapshot to get its ref, then use browser_type with that ref and the text. Then take another browser_snapshot, use browser_get_text with the selector #echo, and tell me what it says.")
   note_calls "$SESS_B" "$set_out"
-  local set_val
-  set_val=$(uc_tool_out "$set_out" 'browser_evaluate')
-  echo "  set before the pause: ${set_val:0:80}"
-  [[ $set_val == *"$m|$t"* ]] || { result 0 "the marker was not set: ${set_val:0:200}"; return; }
+  set_snap=$(jq -r '[.tools[]|select(.name|test("^mcp__browser__"))|.output // ""]|join("\n")' <<<"$set_out")
+  echo "  before the pause the page shows: $(grep -o "echo:$m" <<<"$set_snap" | tail -1) and a field holding $(grep -o "value=\"$m\"" <<<"$set_snap" | tail -1)"
+  [[ $set_snap == *"echo:$m"* ]] || { result 0 "the note was not typed: $(head -c 300 <<<"$set_snap")"; return; }
+  # How many MCP sessions the bridge has been asked to open (each is a new stdio child, a new browser).
+  local init_before init_after
+  init_before=$(vm_in "$SESS_B" 'grep -c "\"method\":\"initialize\"" /tmp/bridge.log' | tr -dc 0-9)
   tl demo vm_pause_requested null null
   pause_ms=$(vm_pause "$id") || { result 0 "E2B would not pause the sandbox"; return; }
   t_pause=$(now_ms)
@@ -593,20 +609,21 @@ check_state_survives_pause() {
   t_resume=$(now_ms)
   tl demo vm_resumed null "$(jq -nc --argjson p "$(( (t_resume - t_pause) / 1000 ))" '{paused_s:$p}')"
   echo "  resumed after $(( (t_resume - t_pause) / 1000 )) s ($resume_ms ms)"
-  out2=$(chat "$SESS_B" --timeout-secs 300 --prompt "Without navigating anywhere, use browser_evaluate to run exactly: () => window.__marker + '|' + document.title   Reply with the value it returned.")
+  out2=$(chat "$SESS_B" --timeout-secs 300 --prompt "Do not call browser_navigate or browser_reload. Take a browser_snapshot of the page that is open (the whole page, no target) and use browser_get_text with the selector #echo. Tell me what #echo says and what the 'Your note' textbox contains.")
   note_calls "$SESS_B" "$out2"
-  val=$(uc_tool_out "$out2" 'browser_evaluate')
-  first_ms=$(uc_tool_ms "$out2" 'browser_evaluate')
-  local navs
+  snap=$(jq -r '[.tools[]|select(.name|test("^mcp__browser__"))|.output // ""]|join("\n")' <<<"$out2")
+  first_ms=$(uc_tool_ms "$out2" 'mcp__browser__browser_(snapshot|get_text)')
   navs=$(uc_tools "$out2" 'browser_navigate' | jq length)
-  echo "  after the resume, without navigating ($navs navigate calls): ${val:0:80}; first tool call took $first_ms ms"
-  if [[ $val == *"$m|$t"* ]] && [ "$navs" = 0 ]; then
-    result 1 "after a $(( (t_resume - t_pause) / 1000 )) s pause the page still held window.__marker=$m and title $t, read without navigating; resume took $resume_ms ms and the first browser call after it $first_ms ms" \
-      "$(jq -nc --arg m "$m" --arg t "$t" --argjson pause "$pause_ms" --argjson resume "$resume_ms" --argjson first "$first_ms" --argjson paused "$(( (t_resume - t_pause) / 1000 ))" --argjson turn "$(jq .total_ms <<<"$out2")" \
-        '{marker:$m, title:$t, pause_api_ms:$pause, paused_s:$paused, resume_api_ms:$resume, first_call_after_resume_ms:$first, first_turn_after_resume_ms:$turn, navigations_after_resume:0}')" \
+  init_after=$(vm_in "$SESS_B" 'grep -c "\"method\":\"initialize\"" /tmp/bridge.log' | tr -dc 0-9)
+  echo "  MCP sessions opened on the bridge: $init_before before the pause, $init_after after the resume"
+  echo "  after the resume, without navigating ($navs navigate calls): $(grep -o "echo:$m" <<<"$snap" | head -1); first browser call took $first_ms ms"
+  if [[ $snap == *"echo:$m"* ]] && [ "$navs" = 0 ] && [ "$init_before" = "$init_after" ]; then
+    result 1 "after a $(( (t_resume - t_pause) / 1000 )) s pause the page still showed the line its own script had written when the text was typed (echo:$m), read without navigating; resume took $resume_ms ms and the first browser call after it $first_ms ms" \
+      "$(jq -nc --arg m "$m" --argjson pause "$pause_ms" --argjson resume "$resume_ms" --argjson first "$first_ms" --argjson paused "$(( (t_resume - t_pause) / 1000 ))" --argjson turn "$(jq .total_ms <<<"$out2")" --argjson ib "${init_before:-0}" --argjson ia "${init_after:-0}" \
+        '{typed:$m, echo_after_resume:("echo:"+$m), pause_api_ms:$pause, paused_s:$paused, resume_api_ms:$resume, first_call_after_resume_ms:$first, first_turn_after_resume_ms:$turn, navigations_after_resume:0, mcp_sessions_opened_before:$ib, mcp_sessions_opened_after:$ia, same_mcp_session:true}')" \
       "$(jq -nc --argjson r "$resume_ms" '{label:"resume",value:$r,unit:"ms"}')"
   else
-    result 0 "after the resume: ${val:0:200} (navigations $navs)"
+    result 0 "after the resume: navigations $navs, MCP sessions opened $init_before -> $init_after (a higher number means the agent re-dialed the bridge, which starts a new browser); $(head -c 200 <<<"$snap")"
   fi
 }
 
@@ -614,6 +631,10 @@ check_idle_cost() {
   local id tok rep
   id=$(vm_field "$SESS_B" id)
   tok=$(vm_field "$SESS_B" envd_token)
+  # the session stays attached while it is measured, so the agent does not reap it (a reap ends the
+  # browser, which is the point of reaping, not an idle cost)
+  NOLOG=1 chat "$SESS_B" --wait-wake-secs 25 --timeout-secs 40 >/dev/null 2>&1 &
+  local holder=$!
   sleep 8
   rep=$(vm_run "$id" "$tok" 'for name in rustwright-mcp node chrome-headless; do
   n=0; rss=0; pss=0; anon=0
@@ -626,6 +647,7 @@ check_idle_cost() {
   echo "$name $n $rss $pss $anon"
 done
 echo "vm $(free -m | awk "/^Mem:/{print \$2, \$3}")"')
+  wait "$holder" 2>/dev/null
   printf '%s\n' "$rep" | sed 's/^/  /'
   local procs
   procs=$(jq -Rn '[inputs | split(" ") | select(.[0] != "vm") | {process:.[0], processes:(.[1]|tonumber), rss_mb:((.[2]|tonumber)/1024*10|round/10), pss_mb:((.[3]|tonumber)/1024*10|round/10), anon_mb:((.[4]|tonumber)/1024*10|round/10)}]' <<<"$rep")

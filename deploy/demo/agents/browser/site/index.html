@@ -6,5 +6,12 @@
   <p>A page served from inside the sandbox, for the browser to read.</p>
   <p id="stamp">stamp STAMP_PLACEHOLDER</p>
   <ul><li>first note</li><li>second note</li><li>third note</li></ul>
+  <label for="note">Your note</label> <input id="note" type="text" aria-label="note">
+  <p id="echo"></p>
+  <script>
+    // State that lives only in this page: what was typed, and the title and the echo line its own script sets from it. Nothing is stored.
+    const note = document.getElementById("note");
+    note.addEventListener("input", () => { window.__marker = note.value; document.title = "note:" + note.value; document.getElementById("echo").textContent = "echo:" + note.value; });
+  </script>
 </body>
 </html>
