@@ -326,6 +326,17 @@ impl ExecMock {
         )
     }
 
+    /// As [`Self::start_on`], behaving as `opts` says: the endpoint a deployment runs, bound where
+    /// its neighbours can reach it.
+    pub async fn start_on_with(
+        bind: &str,
+        root: &Path,
+        opts: MockOptions,
+    ) -> std::io::Result<Self> {
+        let listener = tokio::net::TcpListener::bind(bind).await?;
+        Ok(Self::serve(listener, root, opts))
+    }
+
     /// Serve on `listener`, which the endpoint holds for as long as it runs.
     fn serve(listener: tokio::net::TcpListener, root: &Path, opts: MockOptions) -> Self {
         let url = format!("http://{}/exec", listener.local_addr().unwrap());
@@ -1407,6 +1418,8 @@ pub struct CallbackAttempt {
     pub ended: Instant,
     /// The answer's status; `None` for a connection error, a TLS failure or no answer in 30 s.
     pub status: Option<u16>,
+    /// Why there was no status, when there was none: the client's error and its causes.
+    pub error: Option<String>,
 }
 
 /// Check `keep`'s `notify`: its members' types here, the grammar by the shared kernel
@@ -1535,10 +1548,13 @@ async fn run_attempt(
         _ if lost => exec_notify::Outcome::Status(202),
         Some(target) => {
             let started = Instant::now();
-            let status = if shared.opts.egress {
-                attempt(&shared, &target, &key).await
+            let (status, error) = if shared.opts.egress {
+                match attempt(&shared, &target, &key).await {
+                    Ok(s) => (Some(s), None),
+                    Err(e) => (None, Some(e)),
+                }
             } else {
-                None
+                (None, None)
             };
             shared.callbacks.lock().unwrap().push(CallbackAttempt {
                 scope: key.0.clone(),
@@ -1549,6 +1565,7 @@ async fn run_attempt(
                 started,
                 ended: Instant::now(),
                 status,
+                error,
             });
             match status {
                 Some(404) if faults.retries_refusals => exec_notify::Outcome::Status(503),
@@ -1577,8 +1594,12 @@ async fn run_attempt(
     }
 }
 
-/// One attempt: one `POST`, no redirects, the server verified, 30 s at most. Its status, or `None`.
-async fn attempt(shared: &Shared, target: &NotifyTarget, key: &(String, String)) -> Option<u16> {
+/// One attempt: one `POST`, no redirects, the server verified, 30 s at most. Its status, or why not.
+async fn attempt(
+    shared: &Shared,
+    target: &NotifyTarget,
+    key: &(String, String),
+) -> Result<u16, String> {
     let client = shared
         .client
         .get_or_init(|| async {
@@ -1612,8 +1633,17 @@ async fn attempt(shared: &Shared, target: &NotifyTarget, key: &(String, String))
         })
         .send()
         .await
-        .ok()
         .map(|r| r.status().as_u16())
+        .map_err(|e| {
+            let mut msg = e.to_string();
+            let mut cause = std::error::Error::source(&e);
+            while let Some(c) = cause {
+                msg.push_str(": ");
+                msg.push_str(&c.to_string());
+                cause = c.source();
+            }
+            msg
+        })
 }
 
 /// A stand-in for the fleet's side of a callback: an HTTP/1.1 listener on loopback that records

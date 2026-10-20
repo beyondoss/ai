@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent on AWS: run report</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #14181f; --muted: #5d6675; --line: #dde1e8;
+  --accent: #2f6df6; --ok: #138a4b; --bad: #d12b3a; --warn: #b7791f;
+  --c-you: #2f6df6; --c-model: #c26a00; --c-tool: #138a4b; --c-job: #b0299f; --c-efs: #5d6675; --c-bad: #d12b3a;
+  --node: #eef1f6; --node-line: #b8c0cf; --code: #f0f2f6;
+}
+:root[data-theme="dark"] {
+  --bg: #0e1218; --panel: #161c25; --ink: #e8ecf3; --muted: #93a0b4; --line: #27303d;
+  --accent: #6b9bff; --ok: #3ecf80; --bad: #ff6b7a; --warn: #f0b24a;
+  --c-you: #6b9bff; --c-model: #f0a24a; --c-tool: #3ecf80; --c-job: #e070d0; --c-efs: #93a0b4; --c-bad: #ff6b7a;
+  --node: #1d2531; --node-line: #3a4659; --code: #1b222d;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e1218; --panel: #161c25; --ink: #e8ecf3; --muted: #93a0b4; --line: #27303d;
+    --accent: #6b9bff; --ok: #3ecf80; --bad: #ff6b7a; --warn: #f0b24a;
+    --c-you: #6b9bff; --c-model: #f0a24a; --c-tool: #3ecf80; --c-job: #e070d0; --c-efs: #93a0b4; --c-bad: #ff6b7a;
+    --node: #1d2531; --node-line: #3a4659; --code: #1b222d;
+  }
+}
+* { box-sizing: border-box; }
+html { color-scheme: light dark; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+.wrap { max-width: 1240px; margin: 0 auto; padding: 16px; }
+header { display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: baseline; justify-content: space-between; margin-bottom: 14px; }
+h1 { font-size: 22px; margin: 0; letter-spacing: -0.01em; }
+.sub { color: var(--muted); font-size: 13px; }
+.sub b { color: var(--ink); font-weight: 600; }
+button, select { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+.grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 14px; }
+@media (max-width: 900px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; min-width: 0; }
+.card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+.full { grid-column: 1 / -1; }
+.controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+.controls input[type=range] { flex: 1 1 180px; min-width: 120px; accent-color: var(--accent); }
+.clock { font-variant-numeric: tabular-nums; color: var(--muted); min-width: 96px; text-align: right; }
+svg { width: 100%; height: auto; display: block; }
+.edge { stroke: var(--node-line); stroke-width: 2; fill: none; }
+.edge.hot { stroke: var(--accent); }
+.node rect { fill: var(--node); stroke: var(--node-line); stroke-width: 2; transition: fill .2s, stroke .2s; }
+.node text { fill: var(--ink); font-size: 14px; font-weight: 600; text-anchor: middle; }
+.node text.s { fill: var(--muted); font-size: 11px; font-weight: 400; }
+.node.down rect { fill: var(--bad); stroke: var(--bad); }
+.node.down text { fill: #fff; }
+.node.pulse rect { stroke: var(--accent); }
+.node.busy rect { stroke: var(--c-job); }
+.badge { font-size: 11px; font-weight: 600; text-anchor: middle; }
+.takeover { font-size: 26px; font-weight: 700; fill: var(--bad); text-anchor: middle; font-variant-numeric: tabular-nums; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--muted); margin-top: 8px; }
+.legend i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; }
+.conv { max-height: 560px; overflow: auto; display: flex; flex-direction: column; gap: 8px; scroll-behavior: smooth; }
+.msg { border-radius: 10px; padding: 8px 11px; font-size: 14px; white-space: pre-wrap; word-break: break-word; border: 1px solid var(--line); }
+.msg.user { background: color-mix(in srgb, var(--c-you) 14%, var(--panel)); }
+.msg.assistant { background: var(--panel); }
+.msg.tool { background: var(--code); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px; }
+.msg.notice { background: color-mix(in srgb, var(--c-job) 14%, var(--panel)); border-color: var(--c-job); }
+.msg .who { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 3px; font-family: system-ui, sans-serif; }
+.msg .out { color: var(--muted); margin-top: 4px; max-height: 120px; overflow: auto; }
+.divider { text-align: center; font-size: 12px; font-weight: 700; color: var(--bad); border-top: 1px dashed var(--bad); padding-top: 4px; }
+.divider.ok { color: var(--ok); border-color: var(--ok); }
+.empty { color: var(--muted); font-size: 13px; }
+.board { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
+.chk { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: var(--panel); }
+.chk .v { font-size: 26px; font-weight: 800; letter-spacing: -0.02em; }
+.chk.pass .v { color: var(--ok); } .chk.fail .v { color: var(--bad); } .chk.pending .v { color: var(--muted); }
+.chk .t { font-size: 13px; margin: 2px 0 6px; } .chk .k { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.chk .n { font-family: ui-monospace, monospace; font-size: 11px; color: var(--muted); }
+table { border-collapse: collapse; width: 100%; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+th, td { text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
+th { color: var(--muted); font-weight: 600; }
+.tablewrap { overflow-x: auto; }
+.total { display: flex; gap: 22px; flex-wrap: wrap; margin-bottom: 8px; }
+.total div b { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
+.total div span { font-size: 12px; color: var(--muted); }
+pre { background: var(--code); border-radius: 8px; padding: 10px; margin: 0; overflow: auto; font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-all; }
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 700px) { .two { grid-template-columns: 1fr; } }
+.two h3 { font-size: 13px; margin: 0 0 6px; }
+.tear { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 4px 18px; font-variant-numeric: tabular-nums; }
+.tear div { display: flex; justify-content: space-between; border-bottom: 1px solid var(--line); padding: 3px 0; font-size: 13px; }
+.tear .z { color: var(--ok); font-weight: 700; } .tear .nz { color: var(--warn); font-weight: 700; }
+.log { max-height: 260px; overflow: auto; font: 12px/1.6 ui-monospace, monospace; }
+.log div { display: grid; grid-template-columns: 70px 74px 1fr; gap: 8px; }
+.log .t { color: var(--muted); }
+details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>The whole agent, on AWS</h1>
+      <div class="sub" id="meta"></div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <span class="sub" id="verdict"></span>
+      <button id="theme" title="Light or dark">Theme</button>
+    </div>
+  </header>
+
+  <div class="grid">
+    <section class="card">
+      <h2>System map: this run, replayed</h2>
+      <svg id="map" viewBox="0 0 640 360" role="img" aria-label="you, agent, gateway, model, sandbox and EFS, with packets moving between them as the run happened">
+        <g id="edges"></g>
+        <g id="nodes"></g>
+        <g id="packets"></g>
+        <text id="takeover" class="takeover" x="170" y="40"></text>
+      </svg>
+      <div class="legend">
+        <span><i style="background:var(--c-you)"></i>you / agent</span>
+        <span><i style="background:var(--c-model)"></i>model call</span>
+        <span><i style="background:var(--c-tool)"></i>tool call</span>
+        <span><i style="background:var(--c-job)"></i>job_ended (v1.4 notify)</span>
+        <span><i style="background:var(--c-efs)"></i>sealed session on EFS</span>
+        <span><i style="background:var(--c-bad)"></i>refused / killed</span>
+      </div>
+      <div class="controls">
+        <button class="primary" id="play">Replay</button>
+        <input type="range" id="scrub" min="0" max="1000" value="1000" aria-label="Position in the run">
+        <select id="speed" aria-label="Speed"><option value="1">1× (real time)</option><option value="3" selected>3×</option><option value="10">10×</option></select>
+        <span class="clock" id="clock">0:00</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Conversation</h2>
+      <div class="conv" id="conv"></div>
+    </section>
+
+    <section class="card full">
+      <h2>Check board</h2>
+      <div class="board" id="board"></div>
+    </section>
+
+    <section class="card full">
+      <h2>Billing ledger: one <code>ai.usage</code> row per model call</h2>
+      <div class="total">
+        <div><b id="b-cost">$0.000000</b><span>cost so far</span></div>
+        <div><b id="b-rows">0</b><span>rows written</span></div>
+        <div><b id="b-in">0</b><span>input tokens</span></div>
+        <div><b id="b-out">0</b><span>output tokens</span></div>
+        <div><b id="b-cache">0</b><span>cached tokens</span></div>
+      </div>
+      <div class="tablewrap"><table id="ledger"><thead><tr><th>time</th><th>model → routed / priced as</th><th>input</th><th>cached</th><th>output</th><th>reasoning</th><th>cost µ$</th><th>latency</th></tr></thead><tbody></tbody></table></div>
+    </section>
+
+    <section class="card full">
+      <h2>What's on disk</h2>
+      <div class="two">
+        <div><h3>What you saw</h3><pre id="plain">(not yet)</pre></div>
+        <div><h3>What is on EFS, in the session file</h3><pre id="cipher">(not yet)</pre></div>
+      </div>
+      <div class="sub" id="disk-note" style="margin-top:8px"></div>
+    </section>
+
+    <section class="card full">
+      <h2>Teardown</h2>
+      <div class="tear" id="tear"></div>
+      <div class="sub" id="tear-note" style="margin-top:8px"></div>
+    </section>
+
+    <section class="card full">
+      <details><summary>Timeline of every key event (gateway, agent, sandbox, client)</summary><div class="log" id="log"></div></details>
+    </section>
+  </div>
+</div>
+
+<script id="run-data" type="application/json">
+/*RUN_JSON*/
+</script>
+<script>
+"use strict";
+const run = JSON.parse(document.getElementById("run-data").textContent);
+const T0 = run.run.started_ms;
+const END = Math.max(run.run.ended_ms - T0, ...run.timeline.map(e => e.t_ms - T0), 1) + 1500;
+const $ = id => document.getElementById(id);
+const fmtT = ms => { const s = Math.max(0, Math.floor(ms / 1000)); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
+const esc = s => String(s ?? "").replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+const fmtUsd = micros => "$" + (micros / 1e6).toFixed(6);
+
+/* ---- theme ---- */
+(function () {
+  const root = document.documentElement;
+  try { const t = localStorage.getItem("theme"); if (t) root.dataset.theme = t; } catch (e) {}
+  $("theme").onclick = () => {
+    const dark = getComputedStyle(root).getPropertyValue("--bg").trim() === "#0e1218";
+    root.dataset.theme = dark ? "light" : "dark";
+    try { localStorage.setItem("theme", root.dataset.theme); } catch (e) {}
+  };
+})();
+
+/* ---- header ---- */
+const passed = run.checks.filter(c => c.pass === true).length;
+const failed = run.checks.filter(c => c.pass === false).length;
+$("meta").innerHTML = `<b>${esc(run.model.requested)}</b> via ${esc(run.model.via)} · provider ${esc(run.model.provider)} · ${esc(run.run.region)} · commit <b>${esc(run.run.commit.slice(0, 9))}</b> · run ${esc(run.run.id)} · ${fmtT(END)} long`;
+$("verdict").innerHTML = failed ? `<b style="color:var(--bad)">${failed} failed</b>` : `<b style="color:var(--ok)">${passed} checks passed</b>`;
+
+/* ---- the map ---- */
+const NODES = {
+  you:     { x: 70,  y: 180, w: 96,  h: 54, label: "you",          sub: "demo client" },
+  agent:   { x: 270, y: 180, w: 120, h: 62, label: "agent",        sub: "serve --service" },
+  gateway: { x: 470, y: 70,  w: 112, h: 54, label: "gateway",      sub: "managed key, billing" },
+  model:   { x: 590, y: 70,  w: 80,  h: 54, label: "model",        sub: run.model.requested },
+  sandbox: { x: 490, y: 260, w: 120, h: 62, label: "sandbox",      sub: "exec v1.1 – v1.4" },
+  efs:     { x: 270, y: 318, w: 120, h: 44, label: "EFS",          sub: "sealed sessions" },
+};
+const EDGES = [["you", "agent"], ["agent", "gateway"], ["gateway", "model"], ["agent", "sandbox"], ["agent", "efs"], ["efs", "sandbox"]];
+const svgNS = "http://www.w3.org/2000/svg";
+const mk = (tag, attrs, parent) => { const e = document.createElementNS(svgNS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); (parent || $("map")).appendChild(e); return e; };
+const edgeEls = {};
+for (const [a, b] of EDGES) edgeEls[a + ">" + b] = edgeEls[b + ">" + a] = mk("line", { class: "edge", x1: NODES[a].x, y1: NODES[a].y, x2: NODES[b].x, y2: NODES[b].y }, $("edges"));
+const nodeEls = {}, badgeEls = {};
+for (const id in NODES) {
+  const n = NODES[id];
+  const g = mk("g", { class: "node", id: "n-" + id }, $("nodes"));
+  mk("rect", { x: n.x - n.w / 2, y: n.y - n.h / 2, width: n.w, height: n.h, rx: 10 }, g);
+  mk("text", { x: n.x, y: n.y - 2 }, g).textContent = n.label;
+  mk("text", { class: "s", x: n.x, y: n.y + 15 }, g).textContent = n.sub.length > 22 ? n.sub.slice(0, 21) + "…" : n.sub;
+  badgeEls[id] = mk("text", { class: "badge", x: n.x, y: n.y - n.h / 2 - 6 }, g);
+  nodeEls[id] = g;
+}
+const COLORS = { prompt: "--c-you", first_token: "--c-you", model_request: "--c-model", model_response: "--c-model", exec_start: "--c-tool", exec_end: "--c-tool",
+  job_ended_callback: "--c-job", turn_complete: "--c-efs", session_read_from_efs: "--c-efs", grant_refused: "--c-bad", forged_job_ended: "--c-bad", session_reattached: "--c-you" };
+const sorted = run.timeline.slice().sort((a, b) => a.t_ms - b.t_ms);
+// The first token: the model's reply travelling back to you, one per prompt (the client summary has it as `first_token` via the conversation).
+for (const m of run.conversation) if (m.role === "assistant") sorted.push({ t_ms: m.t_ms, src: "client", event: "first_token", path: ["agent", "you"], detail: { session: m.session } });
+sorted.sort((a, b) => a.t_ms - b.t_ms);
+
+/* ---- derived state: the kill window, job windows ---- */
+const kill = sorted.find(e => e.event === "agent_killed");
+const ready = sorted.find(e => e.event === "agent_ready");
+const reatt = sorted.find(e => e.event === "session_reattached");
+const jobs = [];
+for (const e of sorted) if (e.src === "sandbox" && e.event === "exec_start" && /sleep \d/.test((e.detail && e.detail.command) || "")) jobs.push({ from: e.t_ms, to: null });
+for (const j of jobs) { const end = sorted.find(e => e.event === "job_ended_callback" && e.t_ms > j.from && e.detail && e.detail.kind === "job_end" && e.detail.status === 200); j.to = end ? end.t_ms : run.run.ended_ms; }
+
+/* ---- the clock, packets ---- */
+let t = END;            // virtual ms since T0; starts at the end so the page is complete on load
+let playing = false, last = 0, nextIdx = sorted.length;
+const packets = [];     // {pts:[[x,y]...], start(real ms), dur, color}
+const PKT_MS = 650;
+
+function spawn(e) {
+  const path = e.path; if (!path) return;
+  const col = COLORS[e.event] || "--accent";
+  const pts = path.map(id => [NODES[id].x, NODES[id].y]);
+  packets.push({ pts, start: performance.now(), dur: PKT_MS * (path.length - 1), col, bad: e.event === "grant_refused" || e.event === "forged_job_ended", edge: path });
+}
+function posOn(p, f) {
+  const segs = p.pts.length - 1, x = Math.min(0.9999, Math.max(0, f)) * segs, i = Math.floor(x), r = x - i;
+  const a = p.pts[i], b = p.pts[i + 1];
+  return [a[0] + (b[0] - a[0]) * r, a[1] + (b[1] - a[1]) * r];
+}
+function drawPackets(now) {
+  const g = $("packets");
+  while (g.firstChild) g.removeChild(g.firstChild);
+  Object.values(edgeEls).forEach(e => e.classList.remove("hot"));
+  for (let i = packets.length - 1; i >= 0; i--) {
+    const p = packets[i], f = (now - p.start) / p.dur;
+    if (f >= 1) { packets.splice(i, 1); continue; }
+    const [x, y] = posOn(p, f);
+    mk("circle", { cx: x, cy: y, r: 6, fill: `var(${p.col})`, opacity: 0.95 }, g);
+    if (p.bad && f > 0.8) { mk("text", { x: x + 8, y: y - 6, fill: "var(--c-bad)", "font-size": 18, "font-weight": 800 }, g).textContent = "✕"; }
+    const k = Math.min(p.edge.length - 2, Math.floor(f * (p.edge.length - 1)));
+    const el = edgeEls[p.edge[k] + ">" + p.edge[k + 1]]; if (el) el.classList.add("hot");
+  }
+}
+function nodeState() {
+  const abs = T0 + t;
+  const down = kill && abs >= kill.t_ms && !(reatt && abs >= reatt.t_ms) && !(ready && abs >= ready.t_ms);
+  nodeEls.agent.classList.toggle("down", !!down);
+  badgeEls.agent.textContent = down ? "SIGKILLed" : "";
+  badgeEls.agent.setAttribute("fill", "var(--bad)");
+  const busy = jobs.some(j => abs >= j.from && abs < j.to);
+  nodeEls.sandbox.classList.toggle("busy", busy);
+  badgeEls.sandbox.textContent = busy ? "background job running" : "";
+  badgeEls.sandbox.setAttribute("fill", "var(--c-job)");
+  // The takeover counter runs from the kill until the session is back, then holds its final value.
+  let txt = "";
+  if (kill && abs >= kill.t_ms) {
+    const end = reatt ? Math.min(abs, reatt.t_ms) : abs;
+    txt = "takeover " + ((end - kill.t_ms) / 1000).toFixed(1) + " s";
+  }
+  $("takeover").textContent = txt;
+  $("takeover").setAttribute("fill", down ? "var(--bad)" : "var(--ok)");
+}
+
+/* ---- panels that depend on t ---- */
+function renderConv() {
+  const abs = T0 + t, c = $("conv"); let h = "";
+  const items = run.conversation.map(m => ({ t: m.t_ms, m })).concat(
+    sorted.filter(e => e.event === "agent_killed" || e.event === "session_reattached").map(e => ({ t: e.t_ms, d: e })));
+  items.sort((a, b) => a.t - b.t);
+  for (const it of items) {
+    if (it.t > abs) break;
+    if (it.d) { h += it.d.event === "agent_killed" ? `<div class="divider">agent SIGKILLed — the session is on EFS, the sandbox keeps running</div>` : `<div class="divider ok">session reattached on the replacement agent — same conversation</div>`; continue; }
+    const m = it.m;
+    if (m.role === "tool") h += `<div class="msg tool"><div class="who">tool · ${esc(m.name)}</div>${esc(m.input)}${m.end_ms && m.end_ms <= abs ? `<div class="out">${esc(m.output)}</div>` : ""}</div>`;
+    else h += `<div class="msg ${m.role}"><div class="who">${m.role === "user" ? "you" : m.role === "notice" ? "agent told (job_ended)" : "assistant"}</div>${esc(m.text)}</div>`;
+  }
+  if (!h) h = `<div class="empty">The conversation appears as it happened.</div>`;
+  if (c.dataset.h !== h) { const atEnd = c.scrollTop + c.clientHeight >= c.scrollHeight - 40; c.innerHTML = h; c.dataset.h = h; if (playing || atEnd) c.scrollTop = c.scrollHeight; }
+}
+function renderLedger() {
+  const abs = T0 + t, rows = run.billing.rows.filter(r => r.t_ms + (r.latency_ms || 0) <= abs).sort((a, b) => a.t_ms - b.t_ms);
+  let cost = 0, inT = 0, outT = 0, cache = 0, h = "";
+  for (const r of rows) {
+    cost += r.cost_micros; inT += r.input_tokens; outT += r.output_tokens; cache += r.cache_read_tokens;
+    h += `<tr><td>+${fmtT(r.t_ms - T0)}</td><td>${esc(r.requested_model)} → ${esc(r.routed_model)} / ${esc(r.price_model)}</td><td>${r.input_tokens}</td><td>${r.cache_read_tokens}</td><td>${r.output_tokens}</td><td>${esc(String(r.reasoning_tokens ?? "").replace(/Some\((\d+)\)/, "$1"))}</td><td>${r.cost_micros}</td><td>${r.latency_ms} ms</td></tr>`;
+  }
+  $("ledger").tBodies[0].innerHTML = h || `<tr><td colspan="8" class="empty" style="text-align:left">Rows appear as the gateway writes them.</td></tr>`;
+  $("b-cost").textContent = fmtUsd(cost); $("b-rows").textContent = `${rows.length} / ${run.billing.rows.length}`;
+  $("b-in").textContent = inT; $("b-out").textContent = outT; $("b-cache").textContent = cache;
+}
+function renderBoard() {
+  const abs = T0 + t;
+  $("board").innerHTML = run.checks.map(c => {
+    const done = c.pass !== null && c.ended_ms && c.ended_ms <= abs || (c.pass !== null && !c.ended_ms);
+    const st = !done ? "pending" : c.pass ? "pass" : "fail";
+    const h = c.headline && c.headline.label ? `${esc(c.headline.label)}: <b>${esc(c.headline.value)}</b> ${esc(c.headline.unit || "")}` : "&nbsp;";
+    return `<div class="chk ${st}"><div class="v">${st === "pass" ? "PASS" : st === "fail" ? "FAIL" : c.status === "pending" || c.pass === null ? "…" : "…"}</div><div class="t">${esc(c.title)}</div><div class="k">${done ? h : "waiting"}</div><div class="n">${esc(c.name)}${done && c.duration_ms ? " · " + (c.duration_ms / 1000).toFixed(1) + " s" : ""}</div></div>`;
+  }).join("");
+}
+function renderDisk() {
+  const chk = run.checks.find(c => c.name === "sealed-at-rest");
+  const shown = run.disk && chk && (chk.ended_ms <= T0 + t);
+  if (!run.disk) { $("plain").textContent = "(this run did not include the sealed-at-rest check)"; $("cipher").textContent = ""; return; }
+  $("plain").textContent = shown ? `The phrase the model returned to you:\n\n  ${run.disk.plaintext_seen_by_user}\n\nmatches of it in the session's bytes on EFS: ${run.disk.plaintext_matches}` : "(not yet)";
+  const hex = (run.disk.hex_excerpt || "").split(" ").reduce((a, b, i) => a + b + ((i + 1) % 16 === 0 ? "\n" : " "), "");
+  $("cipher").textContent = shown ? `${run.disk.file_bytes} bytes; line 2 begins "${run.disk.ascii_prefix}"\n\n${hex}` : "(not yet)";
+  $("disk-note").textContent = shown ? "Read from the sandbox, which mounts the same EFS access point read-only. The agent seals each tenant's sessions with a key derived from the grant; the bytes on the share are not the text." : "";
+}
+function renderTear() {
+  const tr = run.teardown;
+  if (!tr) { $("tear").innerHTML = `<div class="empty">Teardown has not been run on this record yet.</div>`; $("tear-note").textContent = "Run ./deploy/demo/down.sh; it fills this in."; return; }
+  const keys = Object.keys(tr.counts);
+  const f = tearFrac;   // 0..1 progress of the little count-down
+  $("tear").innerHTML = keys.map((k, i) => {
+    const before = (tr.before && tr.before[k]) || 0, now = Math.round(before * Math.max(0, 1 - Math.min(1, f * keys.length - i * 0.6 * 0 - i * 0.5)) );
+    const v = f >= 1 ? tr.counts[k] : now;
+    return `<div><span>${esc(k.replace(/_/g, " "))}</span><span class="${v ? "nz" : "z"}">${v}${v ? "" : " ✓"}</span></div>`;
+  }).join("");
+  $("tear-note").textContent = `${tr.verdict === "clean" ? "Verified clean" : "Resources remain"} at ${tr.verified_at}: the tagging API and one listing per resource type, in ${tr.region}.`;
+}
+let tearFrac = 1, tearAnim = 0;
+function animateTear() { tearFrac = 0; cancelAnimationFrame(tearAnim); const s = performance.now(); const step = n => { tearFrac = Math.min(1, (n - s) / 3500); renderTear(); if (tearFrac < 1) tearAnim = requestAnimationFrame(step); }; tearAnim = requestAnimationFrame(step); }
+
+function renderLog() {
+  $("log").innerHTML = sorted.filter(e => e.event !== "first_token").map(e => `<div><span class="t">+${((e.t_ms - T0) / 1000).toFixed(1)}s</span><span>${esc(e.src)}</span><span>${esc(e.event)} ${esc(e.detail ? JSON.stringify(e.detail).slice(0, 140) : "")}</span></div>`).join("");
+}
+
+function renderAll() {
+  nodeState(); renderConv(); renderLedger(); renderBoard(); renderDisk();
+  $("scrub").value = Math.round(t / END * 1000); $("clock").textContent = fmtT(t) + " / " + fmtT(END);
+}
+
+/* ---- the loop ---- */
+function seek(ms) {
+  t = Math.max(0, Math.min(END, ms));
+  nextIdx = sorted.findIndex(e => e.t_ms - T0 > t); if (nextIdx < 0) nextIdx = sorted.length;
+  packets.length = 0;
+  renderAll();
+}
+function frame(now) {
+  if (playing) {
+    const dt = last ? now - last : 0; last = now;
+    t = Math.min(END, t + dt * Number($("speed").value));
+    while (nextIdx < sorted.length && sorted[nextIdx].t_ms - T0 <= t) spawn(sorted[nextIdx++]);
+    renderAll();
+    if (t >= END) { playing = false; $("play").textContent = "Replay"; if (run.teardown) animateTear(); }
+  }
+  drawPackets(now);
+  requestAnimationFrame(frame);
+}
+$("play").onclick = () => {
+  if (!playing) { if (t >= END - 1) seek(0); playing = true; last = 0; $("play").textContent = "Pause"; }
+  else { playing = false; $("play").textContent = "Resume"; }
+};
+$("scrub").oninput = e => { playing = false; $("play").textContent = "Resume"; seek(Number(e.target.value) / 1000 * END); };
+renderLog(); renderTear(); renderAll();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

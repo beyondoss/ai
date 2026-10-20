@@ -6106,6 +6106,19 @@ touches a Dockerfile or the workflow runs the same four builds without pushing.
 
 ---
 
+### A runnable deployment: `deploy/demo`
+
+`deploy/demo/` (`up.sh`, `demo.sh`, `down.sh`, README) stands up a replica end to end on ECS for anyone
+with AWS credentials and a model key: the real gateway (managed key, so every call is an `ai.usage`
+row), the agent as above on EFS, and a sandbox. The sandbox is `ExecMock` from `crates/test-support`, the
+reference exec endpoint the conformance suite grades, served by `crates/demo` (`beyond-ai-demo
+exec-stub`); `crates/demo/tests/stub_conformance.rs` runs the suite against exactly the options it
+serves. The same crate holds the grant minter `demo.sh` uses (the test-side `Minter`, tested against
+`GrantVerifier`), a forged-callback token maker (the right `bjn_v1` kid, a wrong tag) and the WebSocket
+client. Job-end callbacks must be `https` off loopback, so `up.sh` issues a throwaway CA and a
+certificate for the agent's Cloud Map name. Each `demo.sh` run writes a `run.json` and a replayable
+`report.html`; `down.sh` verifies teardown per resource type.
+
 ## Trust Boundaries
 
 **What this crate checks before acting:**

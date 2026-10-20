@@ -415,6 +415,9 @@ EFS storage and ECR are rounding errors at that size.
 - `deploy/efs-proof/` — the proof harness, `up.sh` / `down.sh` / `fault.sh`, and `results/` holding
   the full output of the run these numbers come from: 9 scenarios, 0 skipped, plus a 145,244-turn
   soak through 13 rolling deploys and 7 hard kills.
+- `deploy/demo/` — the whole agent on AWS for anyone to run (`up.sh`, `demo.sh`, `down.sh`): the real
+  gateway, a service-mode agent on EFS and a sandbox exec endpoint, with a record and a replayable
+  report of each run. Its code is `crates/demo` (the sandbox, the grant minter, the chat client).
 - `deploy/attached-local/` — the same nine scenarios against a local NFS fleet, for free, on one box.
 - `crates/fleet-sim/` — the simulator and the reference edge. `fleet-sim list` names every scenario
   and the claim it grades.

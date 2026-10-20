@@ -1,0 +1,45 @@
+[package]
+name = "beyond-ai-demo"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+description = "Tools for deploy/demo: the sandbox exec endpoint, the key and grant minters, and the chat client — not published"
+
+[lib]
+name = "beyond_ai_demo"
+path = "src/lib.rs"
+
+[[bin]]
+name = "beyond-ai-demo"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[features]
+# `keys` mints the gateway's `bai_v1` virtual key, which pulls in the gateway crate (pingora and its
+# cmake-built zlib-ng). The sandbox image builds with `--no-default-features` and so never compiles it.
+default = ["gateway-key", "agent-lib"]
+gateway-key = ["dep:beyond-ai", "dep:ed25519-dalek"]
+# `notify-token` mints a callback token with the agent's own `NotifyKey`, so a forged one is forged
+# the way a real attacker would have to: the right kid, a wrong tag.
+agent-lib = ["dep:beyond-ai-agent"]
+
+[dependencies]
+base64.workspace = true
+beyond-ai = { path = "../gateway", features = ["mint"], optional = true }
+beyond-ai-agent = { path = "../agent", optional = true }
+# The exec endpoint is the repo's reference one, the same code the conformance suite grades.
+beyond-ai-test-support = { path = "../test-support" }
+clap.workspace = true
+ed25519-dalek = { version = "2.2", features = ["rand_core"], optional = true }
+futures.workspace = true
+getrandom = { version = "0.3", features = ["std"] }
+serde_json.workspace = true
+tokio.workspace = true
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }
+
+[dev-dependencies]
+tempfile = "3"
