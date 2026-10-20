@@ -34,6 +34,17 @@ pub struct Claims {
     /// Names of `mcp` connectors minted with `"managed":true`.
     pub mcp_managed: Vec<String>,
     pub exp: u64,
+    /// The optional `limits` claim. `None` mints byte-for-byte as before the claim existed.
+    pub limits: Option<Limits>,
+}
+
+/// The `limits` claim: ceilings a tenant's own `AGENTS.md` and its client's commands cannot exceed.
+/// Each field omitted from the wire when `None`.
+#[derive(Clone, Default)]
+pub struct Limits {
+    pub models: Option<Vec<String>>,
+    pub tools: Option<Vec<String>>,
+    pub max_steps: Option<u32>,
 }
 
 /// The sealed secrets, in wire order. `dek` is 32 raw bytes.
@@ -166,9 +177,24 @@ fn payload_json(c: &Claims, sealed: &str) -> String {
             )
         })
         .collect();
+    let limits = c.limits.as_ref().map_or_else(String::new, |l| {
+        let list = |name: &str, v: &Option<Vec<String>>| {
+            v.as_ref()
+                .map(|v| format!("\"{name}\":{}", serde_json::to_string(v).unwrap()))
+        };
+        let fields: Vec<String> = [
+            list("models", &l.models),
+            list("tools", &l.tools),
+            l.max_steps.map(|n| format!("\"max_steps\":{n}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        format!(",\"limits\":{{{}}}", fields.join(","))
+    });
     format!(
         "{{\"tenant\":{},\"session_id\":{},\"home_shard\":{},\"workspace_root\":{},\"exec_url\":{},\
-         \"mcp\":[{}],\"exp\":{},\"sealed\":{}}}",
+         \"mcp\":[{}],\"exp\":{}{limits},\"sealed\":{}}}",
         q(&c.tenant),
         q(&c.session_id),
         q(&c.home_shard),

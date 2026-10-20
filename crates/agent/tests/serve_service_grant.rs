@@ -66,6 +66,7 @@ fn the_test_minter_reproduces_the_golden_vector_byte_for_byte() {
             .map(|m| m["name"].as_str().unwrap().to_string())
             .collect(),
         exp: c["exp"].as_u64().unwrap(),
+        limits: None,
     };
     let s = &fx["secrets"];
     let headers = |v: &Value| -> Vec<(String, String)> {

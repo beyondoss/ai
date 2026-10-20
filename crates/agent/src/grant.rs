@@ -106,7 +106,92 @@ pub struct Grant {
     /// image built with the `code-mode` feature; without it the interpreter isn't compiled in and the
     /// tool simply isn't registered.
     pub code_mode: bool,
+    /// Ceilings on what the session may be configured to do. Absent claim = no ceiling. See
+    /// [`Limits`].
+    pub limits: Limits,
     pub secrets: GrantSecrets,
+}
+
+/// Ceilings the grant puts on a session, whatever its `AGENTS.md` or its client asks for. Every field is
+/// optional and absent means no ceiling, so a grant minted before the claim existed — or by an issuer
+/// that doesn't set it — behaves exactly as it did.
+///
+/// **A replica must accept this claim before any edge emits it** ([`Payload`] is
+/// `deny_unknown_fields`): agents roll first, the control plane follows. Omitted from the wire when
+/// absent, so a grant without it mints byte-for-byte as before and the golden vectors do not move.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[serde(deny_unknown_fields)]
+pub struct Limits {
+    /// Models the session may run: exact ids, or patterns where `*` matches any run of characters
+    /// (`claude-sonnet-*`). Checked against the effective model at session start (which covers
+    /// `AGENTS.md`, the replica's default and a reattached session's last model), on `set_model`, and
+    /// before every prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<String>>,
+    /// Tools the session may call. Intersected with whatever the session already allows; a session that
+    /// allows everything gets exactly this list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    /// The most model turns one prompt may take; the lower of this and the session's own cap applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_steps: Option<u32>,
+}
+
+impl Limits {
+    /// `Ok` if `model` is allowed, else the refusal to show the client. Never swaps the model.
+    pub fn check_model(&self, model: &str) -> Result<(), String> {
+        match &self.models {
+            Some(allowed) if !allowed.iter().any(|p| glob_match(p, model)) => Err(format!(
+                "model {model:?} is not allowed by this session's grant limits (allowed: {})",
+                allowed.join(", ")
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// `tools` (the session's allow-list, `None` for every tool) narrowed to the ceiling.
+    pub fn narrow_tools(&self, tools: Option<Vec<String>>) -> Option<Vec<String>> {
+        match (&self.tools, tools) {
+            (None, tools) => tools,
+            (Some(ceiling), None) => Some(ceiling.clone()),
+            (Some(ceiling), Some(tools)) => {
+                Some(tools.into_iter().filter(|t| ceiling.contains(t)).collect())
+            }
+        }
+    }
+
+    /// `steps` (the session's own cap, `None` for unbounded) lowered to the ceiling.
+    pub fn cap_steps(&self, steps: Option<u32>) -> Option<u32> {
+        match (self.max_steps, steps) {
+            (Some(ceiling), Some(steps)) => Some(ceiling.min(steps)),
+            (ceiling, steps) => ceiling.or(steps),
+        }
+    }
+}
+
+/// `pattern` against `text`, where `*` matches any run of characters (including none) and everything
+/// else matches itself.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or_default();
+    let Some(mut rest) = text.strip_prefix(first) else {
+        return false;
+    };
+    let mut parts = parts.peekable();
+    if parts.peek().is_none() {
+        return rest.is_empty();
+    }
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            return rest.ends_with(part);
+        }
+        match rest.find(part) {
+            Some(i) => rest = &rest[i + part.len()..],
+            None => return false,
+        }
+    }
+    true
 }
 
 /// One MCP server the session may reach. Its credentials, if any, are in
@@ -223,6 +308,10 @@ struct Payload {
     /// against, would have to change to add a field that means "as before".
     #[serde(default, skip_serializing_if = "is_false")]
     code_mode: bool,
+    /// Absent in a grant minted before this claim existed: `default`, and omitted when absent so such a
+    /// grant mints byte-for-byte as before (see [`Limits`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    limits: Option<Limits>,
     sealed: String,
 }
 
@@ -360,6 +449,7 @@ impl GrantVerifier {
             mcp: payload.mcp,
             exp: payload.exp,
             code_mode: payload.code_mode,
+            limits: payload.limits.unwrap_or_default(),
             secrets,
         })
     }
@@ -580,6 +670,8 @@ mod tests {
         exp: u64,
         #[serde(default, skip_serializing_if = "is_false")]
         code_mode: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limits: Option<Limits>,
     }
 
     impl Claims {
@@ -593,6 +685,7 @@ mod tests {
                 mcp: self.mcp,
                 exp: self.exp,
                 code_mode: self.code_mode,
+                limits: self.limits,
                 sealed,
             }
         }
@@ -607,6 +700,7 @@ mod tests {
                 mcp: grant.mcp.clone(),
                 exp: grant.exp,
                 code_mode: grant.code_mode,
+                limits: (grant.limits != Limits::default()).then(|| grant.limits.clone()),
             }
         }
     }
@@ -1079,6 +1173,77 @@ mod tests {
         let fx = fixture();
         assert!(verifier(&fx).verify(&fx.token, fx.now).is_ok());
         assert!(!fx.payload_json.contains("\"managed\""));
+    }
+
+    #[test]
+    fn a_grant_minted_before_the_limits_claim_existed_has_no_ceiling() {
+        let fx = fixture();
+        assert!(!fx.payload_json.contains("limits"));
+        let grant = verifier(&fx).verify(&fx.token, fx.now).unwrap();
+        assert_eq!(grant.limits, Limits::default());
+    }
+
+    #[test]
+    fn a_grant_that_sets_limits_carries_them_and_changes_only_that() {
+        let mut inputs = fixture();
+        inputs.claims.limits = Some(Limits {
+            models: Some(vec!["claude-sonnet-*".into()]),
+            tools: Some(vec!["read".into()]),
+            max_steps: Some(7),
+        });
+        let built = build(&inputs);
+        let grant = verifier(&built).verify(&built.token, built.now).unwrap();
+        assert_eq!(
+            grant.limits.models,
+            Some(vec!["claude-sonnet-*".to_string()])
+        );
+        assert_eq!(grant.limits.tools, Some(vec!["read".to_string()]));
+        assert_eq!(grant.limits.max_steps, Some(7));
+        assert!(
+            built.payload_json.contains("\"limits\":{"),
+            "{}",
+            built.payload_json
+        );
+        // A field the replica doesn't know inside `limits` is refused like any unknown claim.
+        assert!(!built.payload_json.contains("allow_all"));
+    }
+
+    #[test]
+    fn a_ceiling_checks_models_narrows_tools_and_lowers_steps() {
+        let none = Limits::default();
+        assert!(none.check_model("anything").is_ok());
+        assert_eq!(none.narrow_tools(None), None);
+        assert_eq!(none.cap_steps(Some(9)), Some(9));
+        assert_eq!(none.cap_steps(None), None);
+
+        let l = Limits {
+            models: Some(vec![
+                "claude-test".into(),
+                "gpt-*-mini".into(),
+                "*-fast".into(),
+            ]),
+            tools: Some(vec!["read".into(), "bash".into()]),
+            max_steps: Some(5),
+        };
+        for ok in ["claude-test", "gpt-5-mini", "gpt--mini", "x-fast"] {
+            assert!(l.check_model(ok).is_ok(), "{ok}");
+        }
+        for no in ["claude-test2", "gpt-5-mini-x", "gpt-mini", "fast"] {
+            let err = l.check_model(no).unwrap_err();
+            assert!(err.contains(no) && err.contains("limits"), "{err}");
+        }
+        assert_eq!(
+            l.narrow_tools(None),
+            Some(vec!["read".into(), "bash".into()])
+        );
+        assert_eq!(
+            l.narrow_tools(Some(vec!["read".into(), "grep".into()])),
+            Some(vec!["read".into()])
+        );
+        assert_eq!(l.narrow_tools(Some(vec!["grep".into()])), Some(vec![]));
+        assert_eq!(l.cap_steps(None), Some(5));
+        assert_eq!(l.cap_steps(Some(50)), Some(5));
+        assert_eq!(l.cap_steps(Some(2)), Some(2));
     }
 
     #[test]

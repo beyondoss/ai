@@ -39,6 +39,11 @@ impl SessionLoop {
     /// Runs one `prompt` to its terminal response. Returns whether the session goes on (`false` ends the
     /// loop: the writer went away, or stdin closed / a shutdown signal arrived mid-run).
     pub(super) async fn cmd_prompt(&mut self, cmd: &Value, id: Option<String>) -> bool {
+        // Whatever moved the model since the last check — a branch or session restore included — a
+        // prompt never runs on one the grant's `limits` forbid.
+        if let Some(why) = self.mode.model_refusal(&self.current_model) {
+            return self.emit(response(id, "prompt", false, None, Some(&why)));
+        }
         if let Err(alive) = self.install_output_spec(cmd, &id).await {
             return alive;
         }

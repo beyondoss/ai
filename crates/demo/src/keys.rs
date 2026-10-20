@@ -124,6 +124,7 @@ pub fn mint_grant(keys: &GrantKeys, a: &MintArgs) -> Res<String> {
         mcp_sandbox: Vec::new(),
         mcp_managed: Vec::new(),
         exp: now + a.ttl_secs,
+        limits: None,
     };
     let secrets = Secrets {
         gateway_key: keys.gateway_key.clone(),

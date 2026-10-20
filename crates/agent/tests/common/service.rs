@@ -242,6 +242,7 @@ impl Service {
             mcp_sandbox: Vec::new(),
             mcp_managed: Vec::new(),
             exp: far_future(),
+            limits: None,
         }
     }
 

@@ -500,6 +500,8 @@ async fn setup_prompt(
     if project_trusted {
         cfg.apply_agent_settings(&crate::resources::agent_settings_in(&context_files, cwd));
     }
+    // The grant's ceilings come last, so nothing above (a flag, the file) can exceed them.
+    (cfg.tools, cfg.max_steps) = mode.apply_limits(cfg.tools.take(), cfg.max_steps);
     let sandbox_system = discovered.system.take();
     let sandbox_append = discovered.append_system.take();
     timing.mark("discover prompt templates/skills");
@@ -862,6 +864,12 @@ async fn setup_agent(
         session_model,
         session_level,
     );
+    // The grant's model ceiling covers whatever won above — the file's model, the replica's default
+    // or a reattached session's last model. A session that cannot run on an allowed model does not
+    // start; it is never quietly moved to another.
+    if let Some(why) = mode.model_refusal(&current_model) {
+        return Err(why.into());
+    }
     // `cycle_model`'s candidate list: the operator-scoped `--models` set when given (parsed by
     // `resolve_model_scope` — comma-separated patterns, each an exact id, a glob against
     // `available_models()`, or either suffixed with `:<thinking-level>` to pin that entry's depth —
@@ -874,6 +882,10 @@ async fn setup_agent(
     } else {
         scoped_models.iter().map(|m| m.id.clone()).collect()
     };
+    let cycle_models: Vec<String> = cycle_models
+        .into_iter()
+        .filter(|m| mode.model_refusal(m).is_none())
+        .collect();
     let current_thinking = cfg.thinking;
     // The portable thinking-depth level (see `agent_core::ThinkingLevel`) — the runtime-mutable
     // counterpart to `cfg.reasoning_effort` (or, per the Task #5 restoration above, whatever this
