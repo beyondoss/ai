@@ -25,9 +25,10 @@ impl SessionStore {
     /// bytes than the last, a compounding cost over a long session's lifetime that this avoids entirely.
     /// Crash-safety: if the process dies mid-append, the reader's existing torn/partial-line recovery
     /// (see [`Self::open`]) applies exactly as it already does to an interrupted [`append_new`] — and
-    /// since `tip` only moves once the new active-path messages are actually read back, a compaction cut
-    /// short mid-write simply doesn't take effect (the old tip, and everything it points to, is
-    /// completely unaffected by an `Entry::Compaction` record with no messages after it yet).
+    /// since the record names the whole new chain (`chain_ids`) and `open` moves `tip` only when the
+    /// chain's *last* message is read back, a compaction cut short mid-write simply doesn't take effect
+    /// (the old tip, and everything it points to, is completely unaffected, however much of the new
+    /// chain made it to disk).
     ///
     /// `messages` is the new active-path list — by construction (this is only ever called from the
     /// compaction path, right after `agent_core::compaction::apply_summary`) always exactly one
@@ -217,6 +218,7 @@ impl SessionStore {
             todos: meta.provenance.todos,
             memory_notes: meta.provenance.memory_notes,
             user_requests: meta.provenance.user_requests,
+            chain_ids: new_active.clone(),
         };
 
         // An updated header snapshot (the new `compactions`/`dropped_messages` counters) first, then the

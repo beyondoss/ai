@@ -535,7 +535,7 @@ The harness layers several capabilities over the bare tools + loop:
 - **Session persistence** ([`session_store`](src/session_store/mod.rs)) — append-only JSONL with a header
   carrying a collision-resistant id + metadata; a turn appends only its new messages (compaction
   rewrites atomically, folding the compacted prefix into a durable `Entry::Compaction` record —
-  `tokens_before`/`folded_ids`/`summary` — rather than only the flat `compactions`/`dropped_messages`
+  `tokens_before`/`folded_ids`/`summary`, plus `chain_ids`, the new active path, so a torn write reopens at the pre-compaction tip and never on a partial chain — rather than only the flat `compactions`/`dropped_messages`
   counters; a tool-output masking pass, which rewrites old results without changing the message
   count, is written as `Entry::MessageEdit` lines by `SessionStore::record_edits` from
   `Session::edited` — O(edited), the original output left on disk under the edit, only a result's
