@@ -246,9 +246,9 @@ fn client_info(apps: bool) -> ClientInfo {
 /// Routes progress, elicitation, and sampling for one MCP connection.
 ///
 /// Tool calls use [`RunningService::call_tool_once`] (MRTR + SEP-2663 tasks). rmcp injects a
-/// `progressToken` we do not observe. Token-keyed sinks still work when a token is known; otherwise
-/// progress falls back to the LIFO active sink pushed for the in-flight call (covers the normal
-/// model path). Task `statusMessage` updates also emit on that sink while polling.
+/// `progressToken` into each `tools/call`; [`Self::track_progress`] files the call's sink under it,
+/// so a progress notification reaches the call it belongs to and no other. Task `statusMessage`
+/// updates emit on the call's sink directly while polling.
 #[derive(Clone)]
 pub(crate) struct McpHandler {
     server_name: String,
@@ -257,8 +257,6 @@ pub(crate) struct McpHandler {
     /// connectors answers their questions itself instead of whichever session installed a gate last.
     host: Arc<McpHost>,
     sinks: Arc<std::sync::Mutex<HashMap<ProgressToken, ToolProgress>>>,
-    /// In-flight tool-call progress sinks (LIFO). See [`Self::push_active`].
-    active: Arc<std::sync::Mutex<Vec<ToolProgress>>>,
     /// Where this connection's `notifications/events/*` go (MCP Events draft — see
     /// [`crate::tools::mcp_events`]). Empty, and so free, unless a push stream is open.
     events: crate::tools::mcp_events::NotificationRouter,
@@ -292,7 +290,6 @@ impl McpHandler {
             server_name: server_name.into(),
             host,
             sinks: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            active: Arc::new(std::sync::Mutex::new(Vec::new())),
             events: crate::tools::mcp_events::NotificationRouter::default(),
             calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             skills_changed: Arc::default(),
@@ -386,12 +383,21 @@ impl McpHandler {
             .await)
     }
 
-    fn push_active(&self, progress: ToolProgress) -> ActiveProgressGuard {
-        if let Ok(mut active) = self.active.lock() {
-            active.push(progress);
+    /// The sink of the call a progress notification with `token` belongs to. A token no call owns
+    /// (the call ended, or the notification beat its registration) is dropped, never guessed onto
+    /// another call.
+    fn sink_for(&self, token: &ProgressToken) -> Option<ToolProgress> {
+        self.sinks.lock().ok()?.get(token).cloned()
+    }
+
+    /// Route progress carrying `token` to `progress` until the guard drops.
+    fn track_progress(&self, token: ProgressToken, progress: ToolProgress) -> ProgressGuard {
+        if let Ok(mut sinks) = self.sinks.lock() {
+            sinks.insert(token.clone(), progress);
         }
-        ActiveProgressGuard {
-            active: self.active.clone(),
+        ProgressGuard {
+            sinks: self.sinks.clone(),
+            token,
         }
     }
 }
@@ -440,15 +446,16 @@ fn calling_host(connection_host: &Arc<McpHost>) -> Arc<McpHost> {
         .unwrap_or_else(|_| connection_host.clone())
 }
 
-/// Pops the active progress sink pushed for one `call_tool` when the call ends.
-struct ActiveProgressGuard {
-    active: Arc<std::sync::Mutex<Vec<ToolProgress>>>,
+/// Removes one call's progress sink when the call ends.
+struct ProgressGuard {
+    sinks: Arc<std::sync::Mutex<HashMap<ProgressToken, ToolProgress>>>,
+    token: ProgressToken,
 }
 
-impl Drop for ActiveProgressGuard {
+impl Drop for ProgressGuard {
     fn drop(&mut self) {
-        if let Ok(mut active) = self.active.lock() {
-            let _ = active.pop();
+        if let Ok(mut sinks) = self.sinks.lock() {
+            sinks.remove(&self.token);
         }
     }
 }
@@ -485,18 +492,7 @@ impl ClientHandler for McpHandler {
         params: ProgressNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) {
-        let sink = self
-            .sinks
-            .lock()
-            .ok()
-            .and_then(|sinks| sinks.get(&params.progress_token).cloned())
-            .or_else(|| {
-                self.active
-                    .lock()
-                    .ok()
-                    .and_then(|active| active.last().cloned())
-            });
-        let Some(progress) = sink else {
+        let Some(progress) = self.sink_for(&params.progress_token) else {
             return;
         };
         let snapshot = format_progress_snapshot(&params);
@@ -1500,9 +1496,8 @@ impl Tool for McpTool {
 
 impl McpTool {
     /// Shared `tools/call` path. Drives MRTR `input_required` and SEP-2663 task handles via
-    /// [`drive_tool_call`]. When a [`ToolProgress`] sink is provided, it is pushed as the active
-    /// fallback for progress notifications whose token we cannot observe, and for task
-    /// `statusMessage` updates while polling.
+    /// [`drive_tool_call`]. When a [`ToolProgress`] sink is provided, its progress notifications
+    /// are routed to it by token, and task `statusMessage` updates emit on it while polling.
     async fn call_remote(
         &self,
         input: Value,
@@ -1552,7 +1547,6 @@ async fn call_tool_raw(
     // The questions this call raises go to the session that made it (see [`calling_host`]) —
     // tracked per call, so a nested request is attributed to that session or refused.
     let host = calling_host(&client.service().host);
-    let _active = progress.map(|p| client.service().push_active(p.clone()));
     drive_tool_call(
         conn,
         client.clone(),
@@ -1732,7 +1726,7 @@ async fn drive_tool_call(
 ) -> Result<CallToolResult, ToolError> {
     for _round in 0..DEFAULT_MRTR_MAX_ROUNDS {
         let host_arc = calling_host(&client.service().host);
-        match call_tool_tracked(&client, params.clone(), host_arc)
+        match call_tool_tracked(&client, params.clone(), host_arc, progress)
             .await
             .map_err(|e| tool_call_err(server_name, remote_name, &e))?
         {
@@ -1787,6 +1781,7 @@ async fn call_tool_tracked(
     client: &McpClient,
     params: CallToolRequestParams,
     host: Arc<McpHost>,
+    progress: Option<&ToolProgress>,
 ) -> Result<CallToolResponse, ServiceError> {
     let call = client.service().track_call(host);
     let handle = client
@@ -1797,6 +1792,12 @@ async fn call_tool_tracked(
         )
         .await?;
     call.bind(handle.id.clone());
+    // rmcp chose the progress token for this request; progress for it is this call's alone.
+    let _progress = progress.map(|p| {
+        client
+            .service()
+            .track_progress(handle.progress_token.clone(), p.clone())
+    });
     match handle.await_response().await? {
         ServerResult::CallToolResult(result) => Ok(CallToolResponse::Complete(result)),
         ServerResult::InputRequiredResult(result) => Ok(CallToolResponse::InputRequired(result)),
@@ -4188,6 +4189,46 @@ mod tests {
             answered_by(&shared.elicit(params, None).await.unwrap()),
             "process"
         );
+    }
+
+    fn progress_sink(
+        id: &str,
+    ) -> (
+        ToolProgress,
+        futures::channel::mpsc::UnboundedReceiver<agent_core::ToolUpdate>,
+    ) {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let p = ToolProgress::new(
+            tx,
+            id.into(),
+            "mcp".into(),
+            agent_core::CancellationToken::new(),
+        );
+        (p, rx)
+    }
+
+    fn token(n: i64) -> ProgressToken {
+        ProgressToken(rmcp::model::NumberOrString::Number(n))
+    }
+
+    /// Two calls in flight on one connection each get only their own progress: a notification
+    /// carrying call A's token never lands on call B's sink, and one whose token no call owns is
+    /// dropped rather than guessed onto whichever call started last.
+    #[tokio::test]
+    async fn progress_is_routed_by_the_calls_own_token() {
+        let h = McpHandler::new("slow", host());
+        let (a, mut a_rx) = progress_sink("a");
+        let (b, mut b_rx) = progress_sink("b");
+        let ga = h.track_progress(token(1), a);
+        let _gb = h.track_progress(token(2), b);
+
+        h.sink_for(&token(1)).unwrap().emit("for a", None);
+        assert!(a_rx.try_next().is_ok_and(|u| u.is_some()));
+        assert!(b_rx.try_next().is_err());
+        assert!(h.sink_for(&token(99)).is_none());
+        drop(ga);
+        assert!(h.sink_for(&token(1)).is_none());
+        assert!(h.sink_for(&token(2)).is_some());
     }
 
     /// N1: on a connection shared by sessions, a nested request goes to the session whose call is
