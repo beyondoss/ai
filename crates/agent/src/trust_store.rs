@@ -29,7 +29,7 @@ use crate::path_utils::resolved_path as resolved_key_path;
 /// override, project-local skills (`.claude/skills`, or an `.agents/skills` at any ancestor level up
 /// to the enclosing git-repo root), project-local prompt templates (`.claude/prompts`), or a
 /// project-level settings tier (`.beyond/settings.json`, or `.claude/settings.json` read for
-/// compatibility — see
+/// compatibility, or the `.mcp.json` server list — see
 /// `settings::effective_settings_for_cwd`) — see `resources.rs`/`skills.rs`/`prompts.rs`/`settings.rs`
 /// for where each of these is actually read. When none exist, there's nothing an untrusted checkout
 /// could do differently by being trusted, so a caller can treat the directory as trusted without ever
@@ -49,6 +49,8 @@ pub fn has_trust_gated_resources(cwd: &Path) -> bool {
         || cwd.join(".claude/agents").is_dir()
         || cwd.join(".claude/settings.json").is_file()
         || cwd.join(".beyond/settings.json").is_file()
+        // `.mcp.json` entries start processes, so they ride the same gate as a project settings tier.
+        || cwd.join(".mcp.json").is_file()
         // pi-parity fix (Task #45): the operator's own `~/.agents/skills` (pi's documented,
         // always-trusted personal-skills convention) must not itself count as a project-controlled,
         // trust-gated resource — `collect_ancestor_agents_skill_dirs` alone has no notion of "this
@@ -417,6 +419,13 @@ mod tests {
         fs::create_dir_all(&nested).unwrap();
         fs::create_dir_all(dir.path().join("a/.agents/agents")).unwrap();
         assert!(has_trust_gated_resources(&nested));
+    }
+
+    #[test]
+    fn has_trust_gated_resources_is_true_for_a_project_mcp_json() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".mcp.json"), "{}").unwrap();
+        assert!(has_trust_gated_resources(dir.path()));
     }
 
     #[test]

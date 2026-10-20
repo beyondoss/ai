@@ -28,6 +28,7 @@ pub mod grant;
 pub mod lifecycle;
 pub mod managed_mcp_token;
 pub mod mcp_auth_store;
+pub mod mcp_json;
 pub mod mcp_resume;
 pub mod memory;
 pub mod metrics;

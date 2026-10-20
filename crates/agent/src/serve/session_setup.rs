@@ -184,59 +184,6 @@ async fn setup_exec(
     // (`tools::mcp::with_session_host`), so a server's question reaches the session whose call
     // raised it rather than whichever session installed a gate last.
     let mcp_host = Arc::new(crate::tools::mcp_host::McpHost::new());
-    // This session's own MCP connectors, named and credentialed by its grant, dialed now — not at
-    // process startup, which is where the *operator's* configured servers would have come from.
-    // Fail-soft per connector (a dead server costs its own tools, not the session), and the
-    // warnings stay on the replica: they name the tenant's own connectors, but the client asked for
-    // a session, not a connect report.
-    if mode
-        .connect_session_mcp(cfg, &mcp_host, persistence.session_id())
-        .await
-    {
-        timing.mark("connect session MCP connectors");
-    }
-    // This session's view of the shared catalog: its non-tool MCP requests are registered under
-    // its own host (see `McpCatalog::for_session`).
-    cfg.mcp_catalog = cfg.mcp_catalog.for_session(mcp_host.clone());
-    // MCP Events (draft extension): only when a server is connected at all, and never in service
-    // mode — a grant connector has no `events` configuration, and the `mcp_events_*` commands are
-    // refused there outright (`service::refused_command`). The hub interposes on `input_rx` so an
-    // arriving event can be injected as an ordinary `prompt` command; with no servers there is
-    // nothing to interpose for, and the channel stays exactly as it was.
-    let mut mcp_events = None;
-    if mode.allows_mcp_events() && !cfg.mcp_catalog.is_empty() {
-        let out = Arc::downgrade(out_conn);
-        let emit: crate::tools::mcp_events::Emitter = Arc::new(move |frame: Value| {
-            if let Some(out) = out.upgrade() {
-                lock_ignoring_poison(&out).broadcast(OutFrame::Value(frame));
-            }
-        });
-        let (rx, hub) = crate::tools::mcp_events::McpEventsHub::attach(
-            input_rx,
-            crate::tools::mcp_events::McpEventsConfig {
-                catalog: cfg.mcp_catalog.clone(),
-                callback_url: cfg.mcp_events_callback_url.clone(),
-                emit,
-                running: running.clone(),
-                keep_alive: (!cfg.mcp_events_reapable).then(|| keep_alive.clone()),
-                owns_configured: cfg.mcp_events_owner,
-                // Beside the transcript, so cursors and undelivered events persist with the
-                // session: a restart resumes from the cursor and delivers what was pending.
-                state_path: persistence
-                    .session_file()
-                    .map(crate::tools::mcp_events::state_path_for),
-                session_id: persistence.session_id().to_string(),
-            },
-        );
-        input_rx = rx;
-        // Started below, once this session's elicitation and sampling gates are installed: a
-        // server may raise a nested request during the very first `events/poll`, and asked before
-        // then it would be declined as having no client.
-        mcp_events = Some(hub);
-    }
-    // SEP-2640 skills from every connected server, seen through this session's MCP gate.
-    let mcp_skills =
-        crate::tools::mcp_skills::McpSkills::new(&cfg.mcp_catalog, mcp_enabled.clone());
     // Where this session's tools run, resolved once at start. The precedence, most specific first:
     //
     //   1. **the grant**, in service mode. It *is* the sandbox; nothing else is consulted.
@@ -314,6 +261,69 @@ async fn setup_exec(
             }
         }
     }
+    // This session's own MCP connectors, named and credentialed by its grant, dialed now — not at
+    // process startup, which is where the *operator's* configured servers would have come from.
+    // Fail-soft per connector (a dead server costs its own tools, not the session), and the
+    // warnings stay on the replica: they name the tenant's own connectors, but the client asked for
+    // a session, not a connect report.
+    //
+    // After the sandbox is attached: the workspace's `.mcp.json` adds connectors, read through it (a
+    // reopened session takes them from its snapshot instead, so it still wakes nothing).
+    let from_file = match &sandbox_snapshot {
+        Some(snapshot) => snapshot.resources.mcp_connectors.clone(),
+        None => {
+            mode.read_workspace_mcp(&exec_cell, persistence.session_id())
+                .await
+        }
+    };
+    if mode
+        .connect_session_mcp(cfg, &mcp_host, persistence.session_id(), &from_file)
+        .await
+    {
+        timing.mark("connect session MCP connectors");
+    }
+    // This session's view of the shared catalog: its non-tool MCP requests are registered under
+    // its own host (see `McpCatalog::for_session`).
+    cfg.mcp_catalog = cfg.mcp_catalog.for_session(mcp_host.clone());
+    // MCP Events (draft extension): only when a server is connected at all, and never in service
+    // mode — a grant connector has no `events` configuration, and the `mcp_events_*` commands are
+    // refused there outright (`service::refused_command`). The hub interposes on `input_rx` so an
+    // arriving event can be injected as an ordinary `prompt` command; with no servers there is
+    // nothing to interpose for, and the channel stays exactly as it was.
+    let mut mcp_events = None;
+    if mode.allows_mcp_events() && !cfg.mcp_catalog.is_empty() {
+        let out = Arc::downgrade(out_conn);
+        let emit: crate::tools::mcp_events::Emitter = Arc::new(move |frame: Value| {
+            if let Some(out) = out.upgrade() {
+                lock_ignoring_poison(&out).broadcast(OutFrame::Value(frame));
+            }
+        });
+        let (rx, hub) = crate::tools::mcp_events::McpEventsHub::attach(
+            input_rx,
+            crate::tools::mcp_events::McpEventsConfig {
+                catalog: cfg.mcp_catalog.clone(),
+                callback_url: cfg.mcp_events_callback_url.clone(),
+                emit,
+                running: running.clone(),
+                keep_alive: (!cfg.mcp_events_reapable).then(|| keep_alive.clone()),
+                owns_configured: cfg.mcp_events_owner,
+                // Beside the transcript, so cursors and undelivered events persist with the
+                // session: a restart resumes from the cursor and delivers what was pending.
+                state_path: persistence
+                    .session_file()
+                    .map(crate::tools::mcp_events::state_path_for),
+                session_id: persistence.session_id().to_string(),
+            },
+        );
+        input_rx = rx;
+        // Started below, once this session's elicitation and sampling gates are installed: a
+        // server may raise a nested request during the very first `events/poll`, and asked before
+        // then it would be declined as having no client.
+        mcp_events = Some(hub);
+    }
+    // SEP-2640 skills from every connected server, seen through this session's MCP gate.
+    let mcp_skills =
+        crate::tools::mcp_skills::McpSkills::new(&cfg.mcp_catalog, mcp_enabled.clone());
     // The jobs this session's sandbox kept running while no replica served it — a reap, a deploy,
     // a failover — are its jobs again, under their old numbers: still running, or ended with their
     // notices due (which wake the idle loop below). What nobody kept is stopped. See
