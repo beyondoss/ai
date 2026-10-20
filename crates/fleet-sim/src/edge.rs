@@ -243,6 +243,7 @@ impl Edge {
             workspace_root: workspace_root.to_string(),
             exec_url: exec_url.to_string(),
             mcp: Vec::new(),
+            mcp_sandbox: Vec::new(),
             exp,
         };
         let secrets = Secrets {
