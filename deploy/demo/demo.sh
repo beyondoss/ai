@@ -637,7 +637,7 @@ jq -n --slurpfile checks "$CHECKS_OUT" --slurpfile tl "$TIMELINE" --argjson conv
   {schema:1,
    use_case:$uc,
    run:{id:$id, mode:$mode, started_ms:$start, ended_ms:$end, commit:$commit, uncommitted_files:$dirty, region:$region, name:$name},
-   model:{requested:$model, provider:$provider, routed:($r|map(.routed_model)|unique), price_model:($r|map(.price_model)|unique), via:"crates/gateway (managed bai_v1 key)"},
+   model:{requested:(($r|map(.requested_model)|unique|join(", ")) as $m | if $m == "" then $model else $m end), replica_default:$model, provider:$provider, routed:($r|map(.routed_model)|unique), price_model:($r|map(.price_model)|unique), via:"crates/gateway (managed bai_v1 key)"},
    checks:($c + [{name:"teardown-zero", title:"Teardown leaves nothing behind", pass:null, status:"pending", detail:"filled in by down.sh", measurements:{}}]),
    timeline:($tl|sort_by(.t_ms)),
    conversation:$conv,

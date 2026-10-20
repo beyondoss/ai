@@ -78,7 +78,7 @@ model through the real gateway, with named checks, a `run.json` and a `report.ht
 | ------------------- | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
 | `demo.sh assistant` | `AGENTS.md` (persona, `model`, `tools`, `max-steps`) and a `.mcp.json` with DeepWiki | `persona-applied`, `remote-mcp-real`, `managed-mcp-no-key`, `memory-across-sessions`, `limits-enforced`, `no-sandbox-calls` |
 | `demo.sh coding`    | a failing Python app, a skill with a script, a `reviewer` subagent, `AGENTS.md`      | `skill-used`, `fix-verified`, `subagent-from-folder`, `app-as-background-job`, `browser-sees-localhost`                     |
-| `demo.sh browser`   | `AGENTS.md`, a `.mcp.json` and a page                                                | `browser-reads-page`, `no-held-connection`, `idle-cost`, `state-survives-pause`                                             |
+| `demo.sh browser`   | `AGENTS.md`, a `.mcp.json` and a page                                                | `browser-reads-page`, `no-held-connection`, `idle-cost`, `state-survives-pause`, `state-survives-idle-reap`                 |
 
 The assistant uses `gpt-4.1-mini` in its `AGENTS.md` while the replica's default is `gpt-5-mini`, so the
 billing rows can tell the file's model from the default. The managed connector's real key lives in SSM,
