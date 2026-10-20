@@ -137,7 +137,7 @@ async fn setup_exec(
     // trust can change mid-process (`agent trust`/`--trust-project` since startup) without a restart.
     if !project_trusted && has_gated_resources {
         eprintln!(
-            "warning: {} has a project-local SYSTEM.md/APPEND_SYSTEM.md, skills, prompt templates, or a \
+            "warning: {} has a project-local SYSTEM.md/APPEND_SYSTEM.md, skills, prompt templates, AGENTS.md frontmatter, or a \
          settings.json on disk, but the project isn't trusted, so they were skipped — pass \
          --trust-project or run `{program} trust {}` to enable them (a project's own settings.json \
          additionally requires a *persisted* `{program} trust`, not just a one-off --trust-project)",
@@ -483,6 +483,13 @@ async fn setup_prompt(
     let prompt_templates = std::mem::take(&mut discovered.prompt_templates);
     let prompt_collisions = std::mem::take(&mut discovered.prompt_collisions);
     let context_files = std::mem::take(&mut discovered.context_files);
+    // The workspace's `AGENTS.md` frontmatter says which model, tools and step cap this agent runs
+    // with. Applied once, here, before anything reads `cfg.model`/`cfg.tools`/`cfg.max_steps`: in
+    // service mode this is the tenant's own file read through its sandbox (trusted by construction),
+    // on this host only a trusted project's.
+    if project_trusted {
+        cfg.apply_agent_settings(&crate::resources::agent_settings_in(&context_files, cwd));
+    }
     let sandbox_system = discovered.system.take();
     let sandbox_append = discovered.append_system.take();
     timing.mark("discover prompt templates/skills");

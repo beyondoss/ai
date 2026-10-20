@@ -475,6 +475,25 @@ impl ServeConfig {
     pub(super) fn mode(&self) -> Mode {
         self.mode.clone()
     }
+
+    /// Fold the workspace's `AGENTS.md` frontmatter in under the operator's flags: a field the flags
+    /// already set (`--model`, `--tools`/`--no-tools`, `--max-steps`) is left alone, one they did not
+    /// is filled from the file. The one exception is a replica's `--model`, which is a fleet-wide
+    /// default and so yields to the tenant's own file. A local session's model is *not* marked
+    /// explicit, so a reopened one keeps the model it was last on, as it does for a stored default.
+    pub(super) fn apply_agent_settings(&mut self, settings: &crate::resources::AgentSettings) {
+        if let Some(model) = &settings.model
+            && (!self.model_explicit || self.mode.model_flag_is_a_default())
+        {
+            self.model = model.clone();
+        }
+        if self.tools.is_none() && !self.no_tools {
+            self.tools = settings.tools.clone();
+        }
+        if self.max_steps.is_none() {
+            self.max_steps = settings.max_steps;
+        }
+    }
 }
 
 /// Resolve whether a project is trusted for this session, from already-gathered inputs — shared by

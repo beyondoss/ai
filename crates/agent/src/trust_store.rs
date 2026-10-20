@@ -39,7 +39,10 @@ use crate::path_utils::resolved_path as resolved_key_path;
 /// gains one of these later (e.g. a fresh `git init` adding `.claude/skills`) simply starts requiring
 /// trust from that point on, the next time this is checked.
 pub fn has_trust_gated_resources(cwd: &Path) -> bool {
-    cwd.join(".claude/SYSTEM.md").is_file()
+    // An `AGENTS.md` is read untrusted (it is only text for the prompt), but its frontmatter picks the
+    // model and the tool set, so a file that carries any is gated like a project settings file.
+    !crate::resources::workspace_agent_settings(cwd).is_empty()
+        || cwd.join(".claude/SYSTEM.md").is_file()
         || cwd.join(".claude/APPEND_SYSTEM.md").is_file()
         || cwd.join(".claude/skills").is_dir()
         || cwd.join(".claude/prompts").is_dir()

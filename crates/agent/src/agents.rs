@@ -388,24 +388,12 @@ fn parse_agent_text(path: &Path, text: &str, diagnostics: &mut Vec<String>) -> O
     // Comma-separated, trimmed, empties dropped — pi's own `tools` frontmatter shape. An explicit but
     // *empty* list (`tools: ""`) is a definition that may call nothing, which is meaningful (a
     // pure-reasoning agent), so it stays `Some(vec![])` rather than collapsing to `None` ("inherit").
-    let tools = fm.get("tools").map(|raw| {
-        raw.split(',')
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(str::to_string)
-            .collect()
-    });
+    let tools = fm.get("tools").map(|raw| parse_name_list(raw));
     let model = fm
         .get("model")
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty());
-    let skills = fm.get("skills").map(|raw| {
-        raw.split(',')
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(str::to_string)
-            .collect()
-    });
+    let skills = fm.get("skills").map(|raw| parse_name_list(raw));
     let memory_index = fm
         .get("memory-index")
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
@@ -427,6 +415,16 @@ fn parse_agent_text(path: &Path, text: &str, diagnostics: &mut Vec<String>) -> O
         // Always overwritten per root group by `discover_with_diagnostics`.
         scope: "user",
     })
+}
+
+/// A frontmatter `tools:`/`skills:` value: comma-separated, trimmed, empties dropped. Shared with the
+/// top-level agent's `AGENTS.md` frontmatter ([`crate::resources::AgentSettings`]).
+pub(crate) fn parse_name_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Cap matching `skills.rs`'s `MAX_SKILL_NAME_LEN`.

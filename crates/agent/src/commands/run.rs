@@ -46,6 +46,9 @@ struct Composed {
     resumed_model: Option<String>,
     selected: RunSession,
     stored_settings: beyond_ai_agent::settings::Settings,
+    has_gated_resources: bool,
+    project_trusted: bool,
+    agent_file: beyond_ai_agent::resources::AgentSettings,
     timing: beyond_ai_agent::timing::StartupTiming,
 }
 
@@ -159,10 +162,32 @@ struct RunSetup {
 /// `run`: one task to completion.
 pub(crate) async fn run_task(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
     let composed = resolve_session(cmd.clone()).await?;
+    let cmd = apply_agent_file(cmd, &composed.agent_file);
     let resolved = resolve_defaults(cmd.clone(), composed)?;
     let assembled = assemble_run(cmd.clone(), resolved).await?;
     let setup = build_agent(cmd.clone(), assembled).await?;
     drive_run(cmd, setup).await
+}
+
+/// Fill the flags the operator left unset from the workspace's `AGENTS.md` frontmatter (the model is
+/// folded in by `resolve_session`, which resolves it): `--tools` unless `--tools`/`--no-tools` was
+/// given, `--max-steps` unless given. An explicit flag always wins.
+fn apply_agent_file(mut cmd: Command, file: &beyond_ai_agent::resources::AgentSettings) -> Command {
+    if let Command::Run {
+        tools,
+        no_tools,
+        max_steps,
+        ..
+    } = &mut cmd
+    {
+        if tools.is_none() && !*no_tools {
+            *tools = file.tools.clone();
+        }
+        if max_steps.is_none() {
+            *max_steps = file.max_steps;
+        }
+    }
+    cmd
 }
 
 /// Validates the flags, selects the session and composes the first message.
@@ -188,6 +213,8 @@ async fn resolve_session(cmd: Command) -> Result<Composed, Box<dyn std::error::E
         r#continue: continue_session,
         session_dir,
         no_session_persistence,
+        trust_project,
+        force_untrusted,
         ..
     } = cmd
     else {
@@ -250,6 +277,30 @@ async fn resolve_session(cmd: Command) -> Result<Composed, Box<dyn std::error::E
     // and `--no-image-auto-resize` was silently ignored for the same reason. Every other
     // `stored_settings`-backed fallback stays resolved in its original place below.
     let stored_settings = beyond_ai_agent::settings::effective_settings_for_cwd(&cwd);
+    // Trust is settled this early because the workspace's `AGENTS.md` frontmatter, which a trusted
+    // project may use to pick the model, is read before the model is resolved just below. Computed
+    // once and reused below (it is a filesystem walk — `has_trust_gated_resources`'s own doc comment).
+    //
+    // `--trust-project`/`--force-untrusted` always win outright when explicitly given; failing that, an
+    // explicit per-path `TrustStore` entry (`agent trust`/`agent untrust <path>`) wins next; only when
+    // neither applies does a persisted `agent settings --default-project-trust` policy take effect —
+    // Fix 1 (pi-parity bug): this used to check the blanket policy *before* the per-path entry, so an
+    // operator's specific exception for one directory could be silently overridden by a coarser
+    // `never`/`always` default. `serve::resolve_project_trust` is the one shared implementation of this
+    // precedence — `run` and `serve` must agree on trust for the same directory under the same
+    // settings, so it isn't duplicated here.
+    let has_gated_resources = beyond_ai_agent::trust_store::has_trust_gated_resources(&cwd);
+    let project_trusted = serve::resolve_project_trust(
+        trust_project,
+        force_untrusted,
+        stored_settings.default_project_trust,
+        beyond_ai_agent::trust_store::TrustStore::open_default().lookup(&cwd),
+        has_gated_resources,
+    );
+    let agent_file = match project_trusted {
+        true => beyond_ai_agent::resources::workspace_agent_settings(&cwd),
+        false => Default::default(),
+    };
     // Task #26 (pi-parity feature): an explicit `--block-images` always wins; otherwise fall back to a
     // persisted `agent settings --block-images` default before finally defaulting to images allowed —
     // same "explicit flag, then stored setting, then built-in default" precedence every other
@@ -288,6 +339,7 @@ async fn resolve_session(cmd: Command) -> Result<Composed, Box<dyn std::error::E
     // non-vision-image explanatory note the way an equivalent model-issued call would have.
     let model_explicit = model.is_some();
     let model = model
+        .or_else(|| agent_file.model.clone())
         .or_else(|| stored_settings.default_model.clone())
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     // Fix 10 (pi-parity feature): resolve a partial/fuzzy `--model` id against the known-model hint list
@@ -392,6 +444,9 @@ async fn resolve_session(cmd: Command) -> Result<Composed, Box<dyn std::error::E
         resumed_model,
         selected,
         stored_settings,
+        has_gated_resources,
+        project_trusted,
+        agent_file,
         timing,
     })
 }
@@ -407,8 +462,6 @@ fn resolve_defaults(
         reasoning_effort,
         steering_mode,
         follow_up_mode,
-        trust_project,
-        force_untrusted,
         compaction_reserve_tokens,
         compaction_keep_recent_tokens,
         branch_summary_reserve_tokens,
@@ -440,6 +493,9 @@ fn resolve_defaults(
         resumed_model,
         selected,
         stored_settings,
+        has_gated_resources,
+        project_trusted,
+        agent_file: _,
         mut timing,
     } = composed;
 
@@ -592,31 +648,13 @@ fn resolve_defaults(
     steering.set_steering_mode(steering_mode);
     steering.set_follow_up_mode(follow_up_mode);
 
-    // Computed once and reused below (rather than called again inside the warning check) — it's a
-    // filesystem walk (`has_trust_gated_resources`'s own doc comment), not free.
-    let has_gated_resources = beyond_ai_agent::trust_store::has_trust_gated_resources(&cwd);
-    // `--trust-project`/`--force-untrusted` always win outright when explicitly given; failing that, an
-    // explicit per-path `TrustStore` entry (`agent trust`/`agent untrust <path>`) wins next; only when
-    // neither applies does a persisted `agent settings --default-project-trust` policy take effect —
-    // Fix 1 (pi-parity bug): this used to check the blanket policy *before* the per-path entry, so an
-    // operator's specific exception for one directory could be silently overridden by a coarser
-    // `never`/`always` default. `serve::resolve_project_trust` is the one shared implementation of this
-    // precedence — `run` and `serve` must agree on trust for the same directory under the same
-    // settings, so it isn't duplicated here.
-    let project_trusted = serve::resolve_project_trust(
-        trust_project,
-        force_untrusted,
-        stored_settings.default_project_trust,
-        beyond_ai_agent::trust_store::TrustStore::open_default().lookup(&cwd),
-        has_gated_resources,
-    );
     // pi-parity fix: an untrusted project with a `SYSTEM.md`/skills/prompts on disk silently skipped all
     // of them with no signal at all that anything was there — an operator debugging "why isn't my
     // SYSTEM.md taking effect" had nothing to go on. One line, matching this function's existing
     // `warning: ...` convention (see the `cwd_is_stale` check further down).
     if !project_trusted && has_gated_resources {
         eprintln!(
-            "warning: {} has a project-local SYSTEM.md/APPEND_SYSTEM.md, skills, prompt templates, or a \
+            "warning: {} has a project-local SYSTEM.md/APPEND_SYSTEM.md, skills, prompt templates, AGENTS.md frontmatter, or a \
              settings.json on disk, but the project isn't trusted, so they were skipped — pass \
              --trust-project or run `{program} trust {}` to enable them (a project's own \
              settings.json additionally requires a *persisted* `{program} trust`, not just a one-off \
