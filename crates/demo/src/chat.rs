@@ -12,6 +12,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -22,10 +23,14 @@ pub struct Args {
     pub prompt: Option<String>,
     /// A raw protocol command to send instead of a prompt; its `response` is the summary.
     pub command: Option<String>,
-    /// After the first turn, keep listening this long for a woken turn (a background job's end).
+    /// Keep listening this long for a turn a background job's end wakes. After the prompt's own
+    /// turn, or, with no prompt and no command, from the moment of connecting.
     pub wait_wake_secs: u64,
     pub events: Option<PathBuf>,
     pub timeout_secs: u64,
+    /// Run `true` in the sandbox once connected. A replica reaches a session's sandbox lazily, and a
+    /// reopened session learns what its jobs did when it does; this is the touch that makes it.
+    pub touch_sandbox: bool,
 }
 
 pub fn now_ms() -> u64 {
@@ -37,12 +42,12 @@ pub fn now_ms() -> u64 {
 struct Log(Option<std::fs::File>);
 
 impl Log {
-    fn frame(&mut self, frame: &Value) {
+    fn frame(&mut self, session: &str, frame: &Value) {
         if let Some(f) = &mut self.0 {
             let _ = writeln!(
                 f,
                 "{}",
-                json!({"ts_ms": now_ms(), "src": "client", "frame": frame})
+                json!({"ts_ms": now_ms(), "src": "client", "session": session, "frame": frame})
             );
         }
     }
@@ -57,10 +62,8 @@ pub async fn run(a: Args) -> Res<Value> {
         a.host, a.port, a.session
     );
     let mut req = url.into_client_request()?;
-    req.headers_mut().insert(
-        "x-beyond-grant",
-        grant.parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()?,
-    );
+    req.headers_mut()
+        .insert("x-beyond-grant", grant.parse::<HeaderValue>()?);
     let t0 = Instant::now();
     let mut ws = match tokio_tungstenite::connect_async(req).await {
         Ok((ws, _)) => ws,
@@ -70,6 +73,7 @@ pub async fn run(a: Args) -> Res<Value> {
         Err(e) => return Err(e.into()),
     };
     let connected_ms = t0.elapsed().as_millis() as u64;
+    let connected_at_ms = now_ms();
     let mut log = Log(match &a.events {
         Some(p) => Some(
             std::fs::OpenOptions::new()
@@ -80,7 +84,7 @@ pub async fn run(a: Args) -> Res<Value> {
         None => None,
     });
 
-    let (mut sent_at, mut first_token_ms) = (Instant::now(), None::<u64>);
+    let (mut sent_at, mut sent_at_ms, mut first_token_ms) = (Instant::now(), now_ms(), None::<u64>);
     if let Some(p) = &a.prompt {
         eprintln!("  you      > {p}");
         ws.send(Message::text(
@@ -88,41 +92,44 @@ pub async fn run(a: Args) -> Res<Value> {
         ))
         .await?;
         sent_at = Instant::now();
+        sent_at_ms = now_ms();
+        log.frame(&a.session, &json!({"type": "demo_prompt_sent", "message": p}));
     } else if let Some(c) = &a.command {
         ws.send(Message::text(c.clone())).await?;
     }
 
-    let mut turns_done = 0usize;
-    let want_turns = if a.prompt.is_some() || a.wait_wake_secs > 0 {
-        1
-    } else {
-        0
-    };
+    if a.touch_sandbox {
+        ws.send(Message::text(
+            json!({"type": "bash", "id": "touch", "command": "true"}).to_string(),
+        ))
+        .await?;
+    }
     let mut deadline = Instant::now() + Duration::from_secs(a.timeout_secs);
+    // With no prompt of our own, the only turn there is to wait for is the one a job's end wakes.
+    let mut wake_wait = a.prompt.is_none() && a.command.is_none() && a.wait_wake_secs > 0;
+    if wake_wait {
+        deadline = Instant::now() + Duration::from_secs(a.wait_wake_secs);
+    }
     let (mut text, mut cur_line) = (String::new(), String::new());
     let (mut tools, mut background) = (Vec::<Value>::new(), Vec::<Value>::new());
     let mut responses = Vec::<Value>::new();
-    let (mut woke_at_ms, mut wake_done_ms) = (None::<u64>, None::<u64>);
-    let mut wake_wait = false;
+    let (mut turns_done, mut woke_at_ms, mut wake_done_ms) = (0usize, None::<u64>, None::<u64>);
 
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         let msg = match tokio::time::timeout(left, ws.next()).await {
-            Err(_) => break,
-            Ok(None) => break,
+            Err(_) | Ok(None) => break,
             Ok(Some(m)) => m?,
         };
         let Message::Text(raw) = msg else { continue };
         let Ok(frame) = serde_json::from_str::<Value>(&raw) else {
             continue;
         };
-        log.frame(&frame);
-        let kind = frame["type"].as_str().unwrap_or("");
-        match kind {
+        log.frame(&a.session, &frame);
+        match frame["type"].as_str().unwrap_or("") {
             "event" => {
                 let ev = &frame["event"];
-                let evk = ev["kind"].as_str().unwrap_or("");
-                match evk {
+                match ev["kind"].as_str().unwrap_or("") {
                     "stream" if ev["type"] == "text_delta" => {
                         let d = ev["text"].as_str().unwrap_or("");
                         if !d.is_empty() && first_token_ms.is_none() {
@@ -158,7 +165,8 @@ pub async fn run(a: Args) -> Res<Value> {
                             "  notice   > {}",
                             short(ev["text"].as_str().unwrap_or(""), 160)
                         );
-                        background.push(json!({"reason": ev["reason"], "text": ev["text"], "wake": ev["wake"], "t_ms": now_ms()}));
+                        background.push(json!({"reason": ev["reason"], "text": ev["text"],
+                            "wake": ev["wake"], "t_ms": now_ms()}));
                         if ev["wake"] == json!(true) && woke_at_ms.is_none() {
                             woke_at_ms = Some(now_ms());
                         }
@@ -171,14 +179,14 @@ pub async fn run(a: Args) -> Res<Value> {
                 if frame["command"] == "prompt" {
                     flush(&mut cur_line);
                     turns_done += 1;
-                    if turns_done == want_turns && a.wait_wake_secs > 0 {
-                        // The first turn is over; now wait for the job's end to wake the session.
-                        wake_wait = true;
-                        deadline = Instant::now() + Duration::from_secs(a.wait_wake_secs);
-                    } else if wake_wait {
+                    if wake_wait {
                         wake_done_ms = Some(now_ms());
                         break;
-                    } else if turns_done >= want_turns {
+                    } else if a.wait_wake_secs > 0 {
+                        // The prompt's own turn is over; now wait for the job's end to wake the session.
+                        wake_wait = true;
+                        deadline = Instant::now() + Duration::from_secs(a.wait_wake_secs);
+                    } else {
                         break;
                     }
                 } else if a.command.is_some() {
@@ -195,10 +203,19 @@ pub async fn run(a: Args) -> Res<Value> {
         .find(|r| r["command"] == "prompt")
         .cloned()
         .unwrap_or(Value::Null);
+    let wake_response = responses
+        .iter()
+        .filter(|r| r["command"] == "prompt")
+        .nth(usize::from(a.prompt.is_some()))
+        .cloned()
+        .unwrap_or(Value::Null);
     Ok(json!({
         "refused": false,
         "session": a.session,
         "connected_ms": connected_ms,
+        "connected_at_ms": connected_at_ms,
+        "sent_at_ms": sent_at_ms,
+        "done_at_ms": now_ms(),
         "first_token_ms": first_token_ms,
         "total_ms": sent_at.elapsed().as_millis() as u64,
         "turns": turns_done,
@@ -208,6 +225,7 @@ pub async fn run(a: Args) -> Res<Value> {
         "woke_at_ms": woke_at_ms,
         "wake_done_ms": wake_done_ms,
         "prompt_response": prompt_response,
+        "wake_response": wake_response,
         "responses": responses,
     }))
 }

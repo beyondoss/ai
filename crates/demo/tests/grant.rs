@@ -113,3 +113,25 @@ fn generated_gateway_key_verifies_under_its_public_key() {
         32
     );
 }
+
+/// A forged callback token has the real kid and a wrong tag, so the agent's key refuses it for the
+/// tag (a 401), not for an unknown kid (a 503); the unforged one verifies.
+#[cfg(feature = "agent-lib")]
+#[test]
+fn a_forged_notify_token_fails_on_its_tag_and_a_real_one_verifies() {
+    use beyond_ai_agent::notify_token::{NotifyKey, Verdict};
+
+    let k = keys();
+    // SAFETY-free: the minter reads the secret from the environment, so give it one through the
+    // key type it wraps instead.
+    let key = NotifyKey::from_secret_bytes(&k.fleet_secret);
+    let (tenant, session, job) = ("demo-tenant", "demo.abc", "0123456789abcdef");
+    let scope = beyond_ai_agent::exec_endpoint::jobs::JobScope::for_session(Some(tenant), session);
+    let id = beyond_ai_agent::exec_endpoint::jobs::JobId::parse(job).unwrap();
+    let real = key.mint(tenant, session, &id);
+    assert!(matches!(key.verify(&real, tenant, session, scope.name(), job), Verdict::Valid));
+    let mut forged = real.clone();
+    let at = forged.rfind('.').unwrap() + 1;
+    forged.replace_range(at..=at, if &real[at..=at] == "A" { "B" } else { "A" });
+    assert!(matches!(key.verify(&forged, tenant, session, scope.name(), job), Verdict::BadMac));
+}

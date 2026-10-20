@@ -134,3 +134,24 @@ pub fn mint_grant(keys: &GrantKeys, a: &MintArgs) -> Res<String> {
     sig[0] ^= 1;
     Ok(format!("{signed}.{}", URL_SAFE_NO_PAD.encode(sig)))
 }
+
+/// A `bjn_v1` job-end callback token for `job` of `session`, minted with the fleet key from
+/// `DEMO_FLEET_SECRET`. With `forge`, its tag's first character is changed: the kid is the real
+/// one, the tag is not, which is what a forger who knows the format but not the key can make.
+/// Returns `(token, scope)`; the scope is the session's own, as the body of a real callback names it.
+#[cfg(feature = "agent-lib")]
+pub fn notify_token(tenant: &str, session: &str, job: &str, forge: bool) -> Res<(String, String)> {
+    use beyond_ai_agent::exec_endpoint::jobs::{JobId, JobScope};
+    use beyond_ai_agent::notify_token::NotifyKey;
+
+    let key = NotifyKey::from_secret_bytes(&b32("DEMO_FLEET_SECRET")?);
+    let id = JobId::parse(job).ok_or("job id must be lowercase hex")?;
+    let mut token = key.mint(tenant, session, &id);
+    if forge {
+        let at = token.rfind('.').ok_or("malformed token")? + 1;
+        let swapped = if token.as_bytes()[at] == b'A' { "B" } else { "A" };
+        token.replace_range(at..=at, swapped);
+    }
+    let scope = JobScope::for_session(Some(tenant), session).name().to_string();
+    Ok((token, scope))
+}

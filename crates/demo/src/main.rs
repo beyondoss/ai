@@ -51,6 +51,20 @@ enum Cmd {
         #[arg(long)]
         tamper: bool,
     },
+    /// Print a job-end callback token and its scope as JSON (secret from DEMO_FLEET_SECRET).
+    #[cfg(feature = "agent-lib")]
+    NotifyToken {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        session: String,
+        /// A lowercase-hex job id.
+        #[arg(long)]
+        job: String,
+        /// Corrupt the tag: the right kid, a wrong MAC.
+        #[arg(long)]
+        forge: bool,
+    },
     /// One conversation step; the grant is in DEMO_GRANT. Prints a JSON summary.
     Chat {
         #[arg(long)]
@@ -72,6 +86,9 @@ enum Cmd {
         events: Option<PathBuf>,
         #[arg(long, default_value_t = 180)]
         timeout_secs: u64,
+        /// Run `true` in the sandbox after connecting (a reopened session reconciles its jobs then).
+        #[arg(long)]
+        touch_sandbox: bool,
     },
 }
 
@@ -117,6 +134,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             );
             Ok(())
         }
+        #[cfg(feature = "agent-lib")]
+        Cmd::NotifyToken {
+            tenant,
+            session,
+            job,
+            forge,
+        } => {
+            let (token, scope) = keys::notify_token(&tenant, &session, &job, forge)?;
+            println!("{}", serde_json::json!({"token": token, "scope": scope}));
+            Ok(())
+        }
         Cmd::Chat {
             host,
             port,
@@ -126,6 +154,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             wait_wake_secs,
             events,
             timeout_secs,
+            touch_sandbox,
         } => {
             let summary = chat::run(chat::Args {
                 host,
@@ -136,6 +165,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 wait_wake_secs,
                 events,
                 timeout_secs,
+                touch_sandbox,
             })
             .await?;
             println!("{summary}");

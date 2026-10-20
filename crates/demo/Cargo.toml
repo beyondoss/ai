@@ -21,11 +21,15 @@ workspace = true
 [features]
 # `keys` mints the gateway's `bai_v1` virtual key, which pulls in the gateway crate (pingora and its
 # cmake-built zlib-ng). The sandbox image builds with `--no-default-features` and so never compiles it.
-default = ["gateway-key"]
+default = ["gateway-key", "agent-lib"]
 gateway-key = ["dep:beyond-ai", "dep:ed25519-dalek"]
+# `notify-token` mints a callback token with the agent's own `NotifyKey`, so a forged one is forged
+# the way a real attacker would have to: the right kid, a wrong tag.
+agent-lib = ["dep:beyond-ai-agent"]
 
 [dependencies]
 base64.workspace = true
+beyond-ai-agent = { path = "../agent", optional = true }
 beyond-ai = { path = "../gateway", features = ["mint"], optional = true }
 # The exec endpoint is the repo's reference one, the same code the conformance suite grades.
 beyond-ai-test-support = { path = "../test-support" }
@@ -38,5 +42,4 @@ tokio.workspace = true
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }
 
 [dev-dependencies]
-beyond-ai-agent = { path = "../agent" }
 tempfile = "3"
