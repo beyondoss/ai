@@ -71,8 +71,6 @@ fn an_abort_during_a_bash_job_wait_keeps_the_job() {
     let (base, _bodies) = spawn_model_server(vec![
         turn_tool_use("t1", "bash", &start.to_string()),
         turn_text("started"),
-        // The one stop reminder.
-        turn_text("ok, it runs"),
         // p2: wait on it (aborted).
         turn_tool_use("t2", "bash_job", &json!({ "job": 1 }).to_string()),
         // p3: peek at it.

@@ -71,8 +71,6 @@ fn new_session_stops_the_jobs(make: impl FnOnce(&str) -> Command) {
     let (base, bodies) = spawn_model_server(vec![
         turn_tool_use("t1", "bash", &json!({ "command": command }).to_string()),
         turn_text("started it"),
-        // The one stop reminder.
-        turn_text("ok, it can run"),
         // Spares: a wake (the defect) would take one instead of starving.
         turn_text("spare"),
         turn_text("spare"),

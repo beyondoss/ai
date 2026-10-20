@@ -13,7 +13,8 @@
 //!   the run continues; the model may wait for a result it still needs, or end again. Like the
 //!   step-budget wrap-up ([`crate::step_budget`]), the loop asks at most once per run — work started
 //!   or waited on after it does not earn a second — so a model that ends again ends; and a source
-//!   never lists the same work twice, so a later run (a `serve` prompt) is reminded only of new work.
+//!   never lists the same work twice, so a later run (a `serve` prompt) is reminded only of new work. A
+//!   source skips work the model already knows outlives the turn and will announce its own end.
 //! - **Compaction carry** ([`Background::carry`]): the work in flight at each compaction rides the
 //!   summary message as a `<background-jobs>` block, outside anything the summarizer can drop, so
 //!   a compacted model does not relaunch a job it forgot. Rendered from live state at each

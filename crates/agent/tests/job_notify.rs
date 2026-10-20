@@ -404,8 +404,6 @@ async fn a_call_lets_go_again() {
     let mut turns = vec![
         bash_bg("echo up; sleep 2; echo while-unheld-q7; sleep 300"),
         turn_text("started"),
-        // The stop reminder (a job still runs) asks once more.
-        turn_text("it keeps running"),
         turn_tool_use(
             "t2",
             "bash_job",
@@ -449,8 +447,6 @@ async fn a_reaped_session_reads_its_jobs_back_on_reopen() {
     let mut turns = vec![
         bash_bg("echo up; sleep 5; printf 'fin-%s\\n' r4"),
         turn_text("started"),
-        // The stop reminder (a job still runs) asks once more.
-        turn_text("it keeps running"),
         turn_tool_use("t2", "bash", &json!({"command": "true"}).to_string()),
         turn_text("checked"),
     ];

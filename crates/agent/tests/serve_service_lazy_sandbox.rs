@@ -272,8 +272,6 @@ async fn a_job_that_ended_while_detached_is_reported_once_it_is_checked() {
                 .to_string(),
         ),
         turn_text("started"),
-        // The stop reminder ("you are ending your turn with jobs still running") asks once more.
-        turn_text("it keeps running"),
         // After the restart:
         turn_text("noted"),
         turn_tool_use("t2", "bash_job", r#"{"job": 1, "timeout_ms": 0}"#),

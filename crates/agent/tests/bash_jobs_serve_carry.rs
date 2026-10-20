@@ -31,8 +31,6 @@ fn a_restarted_session_is_not_told_dead_jobs_are_running() {
     let (base, _bodies) = spawn_model_server(vec![
         turn_tool_use("t1", "bash", &start.to_string()),
         turn_text("the server is up"),
-        // The one stop reminder.
-        turn_text("ok"),
         // The summarization call `compact` makes.
         turn_text("## Goal\nStarted a server."),
     ]);

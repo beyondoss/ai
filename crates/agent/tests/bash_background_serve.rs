@@ -1,5 +1,5 @@
-//! `serve` e2e: a `run_in_background` job outlives the turn that started it — the reminder says it
-//! keeps running — and its exit wakes the idle session. The host `bash` command's `timeout_ms` is
+//! `serve` e2e: a `run_in_background` job outlives the turn that started it — the start result says it
+//! keeps running, so ending the turn earns no reminder — and its exit wakes the idle session. The host `bash` command's `timeout_ms` is
 //! the client's own bound, enforced as a cancel.
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -40,8 +40,6 @@ fn a_background_job_outlives_the_turn_and_its_exit_wakes_the_session() {
                 .to_string(),
         ),
         turn_text("started it"),
-        // The one stop reminder.
-        turn_text("ok, it can run"),
         // The wake.
         turn_text("noted: it finished"),
     ]);
@@ -66,11 +64,10 @@ fn a_background_job_outlives_the_turn_and_its_exit_wakes_the_session() {
             "the start result: {}",
             recorded[1]
         );
+        assert_eq!(recorded.len(), 2, "no reminder turn: the job outlives it");
         assert!(
-            recorded[2]
-                .contains("If you end your turn now, job 1 keeps running and you will be told"),
-            "the serve reminder: {}",
-            recorded[2]
+            !recorded.iter().any(|b| b.contains("[background jobs]")),
+            "an intended job earns no reminder"
         );
     }
 
@@ -87,9 +84,9 @@ fn a_background_job_outlives_the_turn_and_its_exit_wakes_the_session() {
             .starts_with("[job 1 exited with code 0 after")
     );
     let recorded = bodies.lock().unwrap();
-    assert_eq!(recorded.len(), 4);
+    assert_eq!(recorded.len(), 3);
     assert!(
-        recorded[3].contains("bg-done"),
+        recorded[2].contains("bg-done"),
         "the notice is the turn's input"
     );
     drop(recorded);
@@ -97,8 +94,9 @@ fn a_background_job_outlives_the_turn_and_its_exit_wakes_the_session() {
 }
 
 #[test]
-fn after_the_one_reminder_ending_again_applies_each_kinds_rule() {
-    // Reminded once per run: a job started after the reminder does not earn another, and the second
+fn the_reminder_names_only_the_yielded_job_and_ending_applies_each_kinds_rule() {
+    // A background job and a yielded one in the same turn: the reminder is for the one the end
+    // stops, and says nothing of the one that keeps running. Reminded once per run, so the next
     // stop ends the prompt — the yielded job stopped with the turn, the background one kept.
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
@@ -108,13 +106,14 @@ fn after_the_one_reminder_ending_again_applies_each_kinds_rule() {
             "bash",
             &json!({ "command": "echo serving; sleep 96", "run_in_background": true }).to_string(),
         ),
-        turn_text("started it"),
-        // The reminder's reply: a foreground command that outlives its timeout_ms (yielded).
+        // A foreground command that outlives its timeout_ms (yielded).
         turn_tool_use(
             "t2",
             "bash",
             &json!({ "command": "echo checking; sleep 97", "timeout_ms": 300 }).to_string(),
         ),
+        turn_text("started both"),
+        // The reminder's reply.
         turn_text("done"),
     ]);
     let mut child = serve_cmd(BIN, &base, &session_file).spawn_guarded();
@@ -139,6 +138,16 @@ fn after_the_one_reminder_ending_again_applies_each_kinds_rule() {
                 .matches("You are ending your turn with jobs")
                 .count(),
             1
+        );
+        let reminder = &recorded[3][recorded[3].find("[background jobs]").unwrap()..];
+        assert!(
+            reminder.contains("- job 2: `echo checking; sleep 97`")
+                && !reminder.contains("- job 1:"),
+            "only the yielded job is named: {reminder}"
+        );
+        assert!(
+            reminder.contains("If you end your turn now, job 2 is stopped for you"),
+            "{reminder}"
         );
     }
     let stopped = frames

@@ -993,16 +993,19 @@ impl BashJobs {
 
     fn reminder(&self) -> Option<String> {
         let mut table = lock(&self.table);
+        // Under `serve` an intended job outlives the turn and its exit wakes the session: its
+        // start already said so, and a reminder would only buy a model turn. A yielded job is
+        // stopped with the turn, so the model must be told. Under `run` the end stops both.
+        let keep = *lock(&self.policy) == EndPolicy::KeepRunning;
         let running: Vec<(&u64, &mut Parked)> = table
             .iter_mut()
-            .filter(|(_, p)| !p.job.shared.ended())
+            .filter(|(_, p)| !p.job.shared.ended() && (!keep || !p.job.kind.intended()))
             .collect();
         if running.iter().all(|(_, p)| p.job.reminded) {
             return None;
         }
-        let keep = *lock(&self.policy) == EndPolicy::KeepRunning;
         let mut lines = Vec::new();
-        let (mut stopped, mut kept) = (Vec::new(), Vec::new());
+        let mut stopped = Vec::new();
         for (id, p) in running {
             p.job.reminded = true;
             lines.push(format!(
@@ -1010,41 +1013,22 @@ impl BashJobs {
                 p.job.command,
                 describe_running(&p.job)
             ));
-            // A yielded job never outlives the turn; an intended one follows the host's policy.
-            if keep && p.job.kind.intended() {
-                kept.push(id.to_string());
-            } else {
-                stopped.push(id.to_string());
-            }
+            stopped.push(id.to_string());
         }
         // What ending does to each, then the one reason not to end yet: a result still needed. No
         // "wait for one" offered unconditionally — read as an instruction, it sent models to wait
         // out a server's silence — and no kill for a job the end stops anyway.
-        let mut fates = Vec::new();
-        if !stopped.is_empty() {
-            fates.push(format!(
-                "{} {} {} stopped for you (no need to kill {})",
-                plural(stopped.len(), "job", "jobs"),
-                stopped.join(", "),
-                plural(stopped.len(), "is", "are"),
-                plural(stopped.len(), "it", "them"),
-            ));
-        }
-        if !kept.is_empty() {
-            fates.push(format!(
-                "{} {} {} running and you will be told when {} exits (bash_job {{\"job\": N, \
-                 \"kill\": true}} stops one you no longer need)",
-                plural(kept.len(), "job", "jobs"),
-                kept.join(", "),
-                plural(kept.len(), "keeps", "keep"),
-                plural(kept.len(), "it", "each"),
-            ));
-        }
+        let fates = format!(
+            "{} {} {} stopped for you (no need to kill {})",
+            plural(stopped.len(), "job", "jobs"),
+            stopped.join(", "),
+            plural(stopped.len(), "is", "are"),
+            plural(stopped.len(), "it", "them"),
+        );
         Some(format!(
             "{REMINDER_PREFIX} You are ending your turn with jobs still running:\n{}\nIf you end \
-             your turn now, {}. {REMINDER_ASK}",
-            lines.join("\n"),
-            fates.join("; ")
+             your turn now, {fates}. {REMINDER_ASK}",
+            lines.join("\n")
         ))
     }
 
