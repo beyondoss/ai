@@ -440,6 +440,7 @@ pub async fn post(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use beyond_ai_agent::managed_mcp_token::Claims;
 

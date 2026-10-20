@@ -66,6 +66,29 @@ remain (`e2b_sandboxes` in the teardown table). It does this whenever `E2B_API_K
 refuses to run without it when `SANDBOX=e2b`. E2B's cost is whatever your plan charges for the minutes
 the VMs live; a full `demo.sh all` keeps them for about fifteen.
 
+## The three use cases
+
+An agent is a folder. `SANDBOX=both ./deploy/demo/up.sh` brings up everything the three folders under
+`agents/` need (the Fargate sandbox as the assistant's workspace host, E2B for the other two, a stand-in
+managed-MCP endpoint, and ECS Exec on the agent); each folder is then run for real, against the real
+model through the real gateway, with named checks, a `run.json` and a `report.html` of its own in
+`results/<timestamp>-<name>/`:
+
+| command             | the folder                                                                           | checks                                                                                                                      |
+| ------------------- | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| `demo.sh assistant` | `AGENTS.md` (persona, `model`, `tools`, `max-steps`) and a `.mcp.json` with DeepWiki | `persona-applied`, `remote-mcp-real`, `managed-mcp-no-key`, `memory-across-sessions`, `limits-enforced`, `no-sandbox-calls` |
+| `demo.sh coding`    | a failing Python app, a skill with a script, a `reviewer` subagent, `AGENTS.md`      | `skill-used`, `fix-verified`, `subagent-from-folder`, `app-as-background-job`, `browser-sees-localhost`                     |
+| `demo.sh browser`   | `AGENTS.md`, a `.mcp.json` and a page                                                | `browser-reads-page`, `no-held-connection`, `idle-cost`, `state-survives-pause`                                             |
+
+The assistant uses `gpt-4.1-mini` in its `AGENTS.md` while the replica's default is `gpt-5-mini`, so the
+billing rows can tell the file's model from the default. The managed connector's real key lives in SSM,
+readable by the stand-in's task role only; the checks look for it in the grant (unsealed with the agent's
+verifier), the agent's logs and the session transcript, and read the agent process's memory through ECS
+Exec as far as that is feasible (the report says what was read). The coding and browser agents run in
+private E2B VMs; the browser is `rustwright-mcp` behind supergateway, started by the demo because hosted
+mode skips `command` entries in `.mcp.json`, and named in the grant as a connector with `sandbox: true`.
+Their checks are in `usecases.sh`, added the same way as any other (see "Adding a check").
+
 ## What you will see
 
 `demo.sh` runs a list of named checks and prints each as it goes:

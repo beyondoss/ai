@@ -6287,6 +6287,18 @@ its own public address (as a `<ip>.sslip.io` name, which the throwaway CA certif
 origin, recomputed at every start, so job-end notify reaches a replacement agent too. `down.sh` kills
 every sandbox carrying the demo's metadata and verifies through E2B's list API that none remain.
 
+`SANDBOX=both` adds the three use-case agents (`deploy/demo/agents/<name>/`, each an agent folder run for
+real by `demo.sh <name>`, with its own `run.json` and report). The `assistant` has no shell: its grant
+names one **managed** connector whose URL is a stand-in managed-MCP endpoint (`beyond-ai-demo
+managed-endpoint`, on Fargate), which verifies the `bmc_v1` token with the agent crate's own
+`ManagedKey` and forwards to a "third party" that wants a real key only that task's role can read from
+SSM; the grant minter takes `--mcp`/`--mcp-sandbox`/`--mcp-managed`/`--limits-*` and never sees that key,
+and `inspect-grant` unseals a grant with the agent's verifier to look for it. The `coding` and `browser`
+agents each get a private E2B microVM (ports answer only the VM's traffic token, which the grant carries
+as an exec header and a connector header); `rustwright-mcp` is served there as streamable HTTP by
+supergateway (hosted sessions skip `command` entries in `.mcp.json`) and named in the grant as a
+`sandbox: true` connector, so the agent keeps no connection to it between calls.
+
 ## Trust Boundaries
 
 **What this crate checks before acting:**

@@ -191,7 +191,6 @@ pub fn mint_grant(keys: &GrantKeys, a: &MintArgs) -> Res<String> {
             .map(|b| ("Authorization".to_string(), format!("Bearer {b}")))
             .chain(a.exec_headers.iter().cloned())
             .collect(),
-        ..Secrets::default()
     };
     let token = minter.mint(&claims, &secrets);
     if !a.tamper {

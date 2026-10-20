@@ -47,7 +47,8 @@ td_arns() { # status
 survey() {
   VPC_NOW=$(q ec2 describe-vpcs --filters "$FILTER" --query 'Vpcs[0].VpcId' 2>/dev/null || true)
   NS_NOW=$(q servicediscovery list-namespaces --query "Namespaces[?Name=='$DNS'].Id|[0]" 2>/dev/null || true)
-  LEFT[ssm_parameters]=$(n "aws ssm get-parameters-by-path --path '$SSM' --recursive --query 'length(Parameters)'")
+  # The listing is paged (ten a page), and each page prints its own count: add them up.
+  LEFT[ssm_parameters]=$(n "aws ssm get-parameters-by-path --path '$SSM' --recursive --query 'length(Parameters)' | tr '\\t' '\\n' | awk '{s += \$1} END {print s + 0}'")
   LEFT[iam_roles]=$(n "aws iam list-roles --query \"length(Roles[?starts_with(RoleName,'$P-')])\"")
   LEFT[log_groups]=$(n "aws logs describe-log-groups --log-group-name-prefix '$LOG_GROUP' --query 'length(logGroups)'")
   LEFT[ecs_clusters]=$(n "aws ecs describe-clusters --clusters '$CLUSTER' --query 'length(clusters[?status!=\`INACTIVE\`])'")
@@ -83,7 +84,14 @@ survey() {
 counts_json() {
   local json='{}' k
   for k in $(printf '%s\n' "${!LEFT[@]}" | sort); do
-    json=$(jq -c --arg k "$k" --argjson v "${LEFT[$k]}" '. + {($k): $v}' <<<"$json")
+    v=${LEFT[$k]}
+    if ! [[ $v =~ ^[0-9]+$ ]]; then
+      # a listing that answered with more than one number: say so, and count the first
+      echo "down: $k counted as: $(printf '%q' "$v")" >&2
+      v=$(grep -o '[0-9]\+' <<<"$v" | head -1)
+      v=${v:-0}
+    fi
+    json=$(jq -c --arg k "$k" --argjson v "$v" '. + {($k): $v}' <<<"$json")
   done
   echo "$json"
 }

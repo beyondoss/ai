@@ -2,7 +2,9 @@
   "mcpServers": {
     "browser": {
       "command": "rustwright-mcp",
-      "env": { "RUSTWRIGHT_CHROMIUM": "/home/user/chrome-headless-shell-linux64/chrome-headless-shell" }
+      "env": {
+        "RUSTWRIGHT_CHROMIUM": "/home/user/chrome-headless-shell-linux64/chrome-headless-shell"
+      }
     }
   }
 }
