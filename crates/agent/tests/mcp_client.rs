@@ -108,6 +108,10 @@ fn run_against(
             "--max-steps",
             "6",
             "--no-session-persistence",
+            // Every test here reads the tools off the request body; pin loading so a larger
+            // fixture catalog can't flip `auto` into deferring them behind `tool_search`.
+            "--mcp-tool-loading",
+            "eager",
         ])
         .current_dir(cwd)
         .output()
