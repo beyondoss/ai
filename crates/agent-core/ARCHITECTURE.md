@@ -1279,6 +1279,7 @@ Dispatch also stamps one schema-undocumented key onto every call's coerced input
 downgrade an image to a text placeholder. Every other tool ignores extra keys — except one that cannot:
 a tool validating its input against a caller-supplied JSON Schema must strip the key first, or a schema
 with `"additionalProperties": false` would reject every call the loop ever makes to it.
+The MCP tools (`McpTool`, `McpPromptTool`) strip it before the arguments go to the remote server, which sees only what the model sent.
 
 Any **steer** messages a
 client queued mid-run (`Steering::push_steer`) are folded onto this same tool-results user turn as

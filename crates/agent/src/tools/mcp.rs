@@ -1509,7 +1509,12 @@ impl McpTool {
         progress: Option<&ToolProgress>,
     ) -> Result<ToolOutput, ToolError> {
         let arguments = match input {
-            Value::Object(map) => Some(map),
+            Value::Object(mut map) => {
+                // Dispatch stamps its internal vision flag onto every tool input; a remote server
+                // must see only the model's arguments (strict servers reject unknown ones).
+                map.remove(agent_core::tool::MODEL_SUPPORTS_VISION_KEY);
+                Some(map)
+            }
             Value::Null => None,
             other => {
                 return Err(ToolError::InvalidInput(format!(
@@ -3321,7 +3326,12 @@ impl Tool for McpPromptTool {
 
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
         let arguments = match input {
-            Value::Object(map) => Some(map),
+            Value::Object(mut map) => {
+                // Dispatch stamps its internal vision flag onto every tool input; a remote server
+                // must see only the model's arguments (strict servers reject unknown ones).
+                map.remove(agent_core::tool::MODEL_SUPPORTS_VISION_KEY);
+                Some(map)
+            }
             Value::Null => None,
             other => {
                 return Err(ToolError::InvalidInput(format!(
