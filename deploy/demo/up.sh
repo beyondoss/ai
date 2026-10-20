@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016,SC2018,SC2019  # JMESPath and the container scripts are single-quoted on purpose
 # Bring the whole demo up on AWS: gateway, agent and sandbox on ECS Fargate, sessions on EFS.
 #
 #     OPENAI_API_KEY=… ./deploy/demo/up.sh            # or OPENROUTER_API_KEY=…

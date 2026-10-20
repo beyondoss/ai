@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2129,SC2016,SC2034  # a redirect per jq program; single-quoted queries; the check lists are read through a nameref
 # A scripted conversation with the agent running on AWS, as a list of named checks.
 #
 #     ./deploy/demo/demo.sh         the core checks: a real model turn, a command in the sandbox, a
@@ -76,7 +77,7 @@ say "the deployment ($NAME, $REGION)"
 wait_agent() {
   local ip
   for _ in $(seq 1 90); do
-    ip=$(agent_ip)
+    ip=$(agent_ip "${1:-}")
     if [ -n "$ip" ] && curl -fsS -m 3 "http://$ip:$AGENT_PORT/readyz" >/dev/null 2>&1; then
       echo "$ip"
       return 0
@@ -111,7 +112,12 @@ grant() { # session [tamper]
 chat() { # session chat-args...
   local s=$1
   shift
-  DEMO_GRANT=$(grant "$s") "$DEMO" chat --host "$IP" --port "$AGENT_PORT" --session "$s" --events "$EVENTS" "$@"
+  # A connection that only asks something (`--command`), or only holds the session open (NOLOG), gets
+  # the session's last turn replayed on attach; recording that would show the turn twice.
+  local ev=(--events "$EVENTS")
+  case " $* " in *" --command "*) ev=() ;; esac
+  [ -z "${NOLOG:-}" ] || ev=()
+  DEMO_GRANT=$(grant "$s") "$DEMO" chat --host "$IP" --port "$AGENT_PORT" --session "$s" "${ev[@]}" "$@"
 }
 note_calls() { # session summary-json: remember how many model calls the agent says the session made
   jq -c --arg s "$1" '{session:$s, assistant_messages: ([.prompt_response.data.assistant_messages, .wake_response.data.assistant_messages]|map(select(.!=null))|max)}' <<<"$2" >> "$CALLS"
@@ -194,10 +200,20 @@ check_sandbox_exec() {
   fi
 }
 
+# The model decides whether to wait on a job it was told not to wait on; if it does, there is no
+# wake to observe, and that is the model's wording, not notify. Try once more in a fresh session.
 check_background_job_notify() {
+
+  for _ in 1 2; do
+    _job_notify_once && return
+    echo "  (the model polled the job instead of waiting to be told; trying again in a fresh session)"
+    SESS_JOB=${SESS_JOB}x
+  done
+}
+_job_notify_once() {
   local m2 out bg cb job_cb woke
   m2="job-$RANDOM$RANDOM"
-  out=$(chat "$SESS_JOB" --wait-wake-secs 120 --prompt "Use the bash tool with run_in_background=true to run exactly: sleep 20; echo finished-$m2 . Then reply with just the word started and end your turn. Never poll, wait on or kill the job: you will be told when it ends, and then you must reply with the job's exact output line and its exit code.")
+  out=$(chat "$SESS_JOB" --wait-wake-secs 120 --prompt "Use the bash tool with run_in_background=true to run exactly: sleep 20; echo finished-$m2 . Then reply with just the word started and end your turn. Never call bash_job: do not poll, wait on or kill the job; you will be told when it ends, and then you must reply with the job's exact output line and its exit code.")
   note_calls "$SESS_JOB" "$out"
   FORGE_SESSION=$SESS_JOB
   woke=$(jq -r '.woke_at_ms // empty' <<<"$out")
@@ -225,6 +241,7 @@ check_background_job_notify() {
       "$(jq -nc --argjson l "$((woke - cb_t))" '{label:"notify latency",value:$l,unit:"ms"}')"
   else
     result 0 "job end not reported as expected (woke=$woke callback=$cb_t bg=$bg)"
+    [ -n "$woke" ]   # no wake at all: the model polled, so try again; anything else is a real failure
   fi
 }
 
@@ -233,7 +250,7 @@ check_notify_forged_refused() {
   before=$(chat "$s" --command '{"type":"get_state","id":"g"}' --timeout-secs 30 | jq -c '.responses[0].data|{steps,message_count}')
   # A connection is held open meanwhile, so the session is live on the agent: the callback is
   # refused for its token, not merely for finding no session.
-  chat "$s" --wait-wake-secs 25 --timeout-secs 40 >/dev/null 2>&1 &
+  NOLOG=1 chat "$s" --wait-wake-secs 25 --timeout-secs 40 >/dev/null 2>&1 &
   local holder=$!
   sleep 4
   # The right kid and scope, a wrong tag: what someone who knows the format but not the key can make.
@@ -256,57 +273,75 @@ check_notify_forged_refused() {
 }
 
 check_kill_and_recover() {
-  local m3 out msgs_before old new t_kill t_stopped t_new t_ready resumed msgs_after re st bg
+  local m3 out msgs_before old new t_kill t_exit t_new t_ready resumed msgs_after re st bg exit_iso
   m3="kill-$RANDOM$RANDOM"
-  out=$(chat "$SESS_KILL" --prompt "Use the bash tool with run_in_background=true to run exactly: sleep 70; echo finished-$m3 . Then reply with just the word started and end your turn. Never poll, wait on or kill the job: you will be told when it ends, and then you must reply with the job's exact output line and its exit code.")
+  out=$(chat "$SESS_KILL" --prompt "Use the bash tool with run_in_background=true to run exactly: sleep 140; echo finished-$m3 . Then reply with just the word started and end your turn. Never call bash_job: do not poll, wait on or kill the job; you will be told when it ends, and then you must reply with the job's exact output line and its exit code.")
   note_calls "$SESS_KILL" "$out"
   FORGE_SESSION=${FORGE_SESSION:-$SESS_KILL}
   msgs_before=$(chat "$SESS_KILL" --command '{"type":"get_state","id":"g"}' --timeout-secs 30 | jq -r '.responses[0].data.message_count')
   old=$(q ecs list-tasks --cluster "$CLUSTER" --service-name "$P-agent" --desired-status RUNNING --query 'taskArns[0]')
   echo
-  echo "  >>> SIGKILL the agent task now (message_count before: $msgs_before)"
+  echo "  >>> stop the agent task now: ECS SIGKILLs it (message_count before: $msgs_before)"
   t_kill=$(now_ms)
-  tl demo agent_killed null "$(jq -nc --arg t "$old" '{task:$t}')" "$t_kill"
-  # stop-task sends SIGTERM to pid 1, which is a shell that ignores it; the container is SIGKILLed two seconds later.
+  tl demo stop_requested null "$(jq -nc --arg t "$old" '{task:$t}')" "$t_kill"
+  # stop-task sends SIGTERM to pid 1, a shell that ignores it, so the container is SIGKILLed (exit 137)
+  # when ECS's stop timeout runs out: measured below, not assumed.
   aws ecs stop-task --cluster "$CLUSTER" --task "$old" --reason "demo kill" --query task.lastStatus >/dev/null
-  t_stopped=""
+  t_exit=""
   t_new=""
+  # Watch until the old container has exited and a replacement is running; ECS's own timestamps say
+  # when the process really died.
   for _ in $(seq 1 240); do
-    if [ -z "$t_stopped" ]; then
-      st=$(q ecs describe-tasks --cluster "$CLUSTER" --tasks "$old" --query 'tasks[0].lastStatus')
-      [ "$st" = STOPPED ] && { t_stopped=$(now_ms); echo "  agent task stopped after $(((t_stopped - t_kill) / 1000)) s"; tl demo agent_stopped null null "$t_stopped"; }
+    if [ -z "$t_exit" ]; then
+      exit_iso=$(q ecs describe-tasks --cluster "$CLUSTER" --tasks "$old" --query 'tasks[0].executionStoppedAt')
+      if [ -n "$exit_iso" ]; then
+        t_exit=$(date -d "$exit_iso" +%s%3N)
+        echo "  the agent process was SIGKILLed $(((t_exit - t_kill) / 1000)) s after the stop request"
+        tl demo agent_killed null "$(jq -nc --arg t "$old" '{task:$t, signal:"SIGKILL"}')" "$t_exit"
+      fi
     fi
-    new=$(q ecs list-tasks --cluster "$CLUSTER" --service-name "$P-agent" --desired-status RUNNING --query 'taskArns[0]')
-    if [ -n "$new" ] && [ "$new" != "$old" ]; then
-      t_new=$(now_ms)
-      echo "  ECS started a replacement after $(((t_new - t_kill) / 1000)) s"
-      tl demo agent_replacement_running null null "$t_new"
-      break
+    if [ -z "$t_new" ]; then
+      new=$(q ecs list-tasks --cluster "$CLUSTER" --service-name "$P-agent" --desired-status RUNNING --query 'taskArns[0]')
+      if [ -n "$new" ] && [ "$new" != "$old" ]; then
+        t_new=$(now_ms)
+        echo "  ECS started a replacement after $(((t_new - t_kill) / 1000)) s"
+        tl demo agent_replacement_running null null "$t_new"
+      fi
     fi
+    [ -n "$t_exit" ] && [ -n "$t_new" ] && break
     sleep 1
   done
-  [ -n "$t_new" ] || { result 0 "ECS did not replace the agent task"; return; }
-  IP=$(wait_agent) || { result 0 "the replacement agent never became ready"; return; }
+  [ -n "$t_new" ] && [ -n "$t_exit" ] || { result 0 "ECS did not kill and replace the agent task"; return; }
+  IP=$(wait_agent "$new") || { result 0 "the replacement agent never became ready"; return; }
   t_ready=$(now_ms)
+  [ "$t_ready" -ge "$t_exit" ] || t_ready=$t_exit
   tl demo agent_ready null "$(jq -nc --arg ip "$IP" '{ip:$ip}')" "$t_ready"
-  echo "  replacement answers /readyz at $IP after $(((t_ready - t_kill) / 1000)) s"
+  echo "  replacement answers /readyz at $IP, $(((t_ready - t_exit) / 1000)) s after the old process died"
   # Same session id, a fresh grant: the new agent opens the session from EFS and learns the job's fate.
-  re=$(chat "$SESS_KILL" --touch-sandbox --wait-wake-secs 150 --timeout-secs 200)
+  re=$(chat "$SESS_KILL" --touch-sandbox --wait-wake-secs 260 --timeout-secs 300)
   resumed=$(jq -r .connected_at_ms <<<"$re")
   tl demo session_reattached '["you","agent"]' null "$resumed"
   msgs_after=$(chat "$SESS_KILL" --command '{"type":"get_state","id":"g"}' --timeout-secs 30 | jq -r '.responses[0].data.message_count')
   bg=$(jq -c '[.background[]|select(.reason=="finished")][0] // null' <<<"$re")
+  # The sandbox's callbacks since the kill. A new agent's name can take a while to resolve (Cloud Map's
+  # private zone lags the registration), so some attempts fail on DNS; the schedule retries them.
+  sleep 8
+  local cbs cb_dns cb_ok
+  cbs=$(cw sandbox/ "$t_kill" '"job_ended_callback"' | jq -c '[.[]|{t, d:(.m|fromjson).detail}]')
+  cb_dns=$(jq '[.[]|select((.d.error // "")|test("dns error"))]|length' <<<"$cbs")
+  cb_ok=$(jq '[.[]|select(.d.status==200)|.t]|max // 0' <<<"$cbs")
+  echo "  callbacks since the kill: $cb_dns failed on DNS while the new agent's name propagated; the end callback was answered 200"
   note_calls "$SESS_KILL" "$re"
   [ "$(jq -r '.turns // 0' <<<"$re")" -gt 0 ] && echo '{"title_retry":1}' >> "$CALLS"
   if [ "$(jq -r .refused <<<"$re")" = false ] && [[ $(jq -r '.text // ""' <<<"$re") == *"finished-$m3"* || $(jq -r '.text // ""' <<<"$bg") == *"finished-$m3"* ]] \
     && [ "${msgs_after:-0}" -ge "${msgs_before:-1}" ] 2>/dev/null; then
-    result 1 "session reattached $(((resumed - t_kill) / 1000)) s after the kill with $msgs_before -> $msgs_after messages, and the job's real output was reported" \
-      "$(jq -nc --argjson k "$t_kill" --argjson s "${t_stopped:-0}" --argjson n "$t_new" --argjson r "$t_ready" --argjson a "$resumed" \
-        --argjson mb "$msgs_before" --argjson ma "$msgs_after" --argjson woke "$(jq '.woke_at_ms // 0' <<<"$re")" \
-        '{kill_issued_ms:$k, task_stopped_ms:$s, replacement_running_ms:$n, agent_ready_ms:$r, session_reattached_ms:$a,
-          kill_to_stopped_s:(if $s>0 then (($s-$k)/1000) else null end), kill_to_replacement_s:(($n-$k)/1000), kill_to_ready_s:(($r-$k)/1000),
-          takeover_s:(($a-$k)/1000), messages_before:$mb, messages_after:$ma, job_end_reported_ms:$woke}')" \
-      "$(jq -nc --argjson t "$(((resumed - t_kill) / 1000))" '{label:"takeover",value:$t,unit:"s"}')"
+    result 1 "session reattached $(((resumed - t_exit) / 1000)) s after the agent process died, with $msgs_before -> $msgs_after messages, and the job's real output was reported" \
+      "$(jq -nc --argjson k "$t_kill" --argjson s "$t_exit" --argjson n "$t_new" --argjson r "$t_ready" --argjson a "$resumed" \
+        --argjson mb "$msgs_before" --argjson ma "$msgs_after" --argjson dns "$cb_dns" --argjson ok "$cb_ok" --argjson woke "$(jq '.woke_at_ms // 0' <<<"$re")" \
+        '{stop_requested_ms:$k, agent_killed_ms:$s, replacement_running_ms:$n, agent_ready_ms:$r, session_reattached_ms:$a,
+          stop_to_sigkill_s:(($s-$k)/1000), replacement_running_after_stop_s:(($n-$k)/1000), takeover_s:(($a-$s)/1000), stop_to_reattached_s:(($a-$k)/1000), messages_before:$mb, messages_after:$ma, job_end_reported_ms:$woke,
+          callback_dns_failures:$dns, end_callback_answered_200_ms:$ok}')" \
+      "$(jq -nc --argjson t "$(((resumed - t_exit) / 1000))" '{label:"takeover",value:$t,unit:"s"}')"
   else
     result 0 "did not recover: re=$(jq -c '{refused,text,background}' <<<"$re") before=$msgs_before after=$msgs_after"
   fi
@@ -344,7 +379,7 @@ check_billing_rows() {
   # again by the next process that runs a turn in it: one more call after a restart.
   expected=$(jq -s '([.[]|select(.session)]|group_by(.session)|map(max_by(.assistant_messages)|.assistant_messages)|(add // 0) + length) + ([.[]|select(.title_retry)]|length)' "$CALLS")
   rows='[]'
-  for tries in $(seq 1 40); do
+  for _ in $(seq 1 40); do
     rows=$(cw gateway/ "$((START_MS - 5000))" '"ai.usage"' | jq -c '[.[]|.m|fromjson?|select(.target=="ai.usage")|.fields]')
     n=$(jq length <<<"$rows")
     [ "$n" -ge "$expected" ] && { sleep 6; rows=$(cw gateway/ "$((START_MS - 5000))" '"ai.usage"' | jq -c '[.[]|.m|fromjson?|select(.target=="ai.usage")|.fields]'); n=$(jq length <<<"$rows"); break; }
@@ -393,16 +428,28 @@ echo "writing the run record…"
 sleep 8   # CloudWatch lags a few seconds; the sandbox and gateway lines for the last step
 LOGS=$(cw "" "$((START_MS - 5000))")
 # Gateway rows and sandbox events join the timeline; the agent's own startup lines mark restarts.
-# A job's first callback is the one `keep` triggers (the proof); the later one is its end.
+# A job's callbacks come in rounds (attempt 1 starts a round): the first proves its `keep`, the last
+# is its end, and any between are the proof made again when a new agent reopens the session.
 jq -c '[.[]|select(.m|startswith("{"))|{t, d:(.m|fromjson? // empty)}|select(.d.src=="sandbox")|
   {t_ms:.d.ts_ms, src:"sandbox", event:.d.event, path:(if .d.event=="exec_start" then ["agent","sandbox"] elif .d.event=="exec_end" or .d.event=="job_ended_callback" then ["sandbox","agent"] else null end), detail:.d.detail}]
-  | sort_by(.t_ms) | reduce .[] as $e ({seen:{},out:[]};
-      if $e.event=="job_ended_callback" then ($e.detail.job) as $j | (if .seen[$j] then "job_end" else "keep_time" end) as $k | .seen[$j]=true | .out += [$e|.detail.kind=$k]
-      else .out += [$e] end) | .out[]' <<<"$LOGS" >> "$TIMELINE"
+  | sort_by(.t_ms)
+  | reduce .[] as $e ({round:{},out:[]};
+      if $e.event=="job_ended_callback" then ($e.detail.job) as $j
+        | (if $e.detail.attempt==1 then ((.round[$j] // 0) + 1) else (.round[$j] // 1) end) as $r
+        | .round[$j]=$r | .out += [$e | .detail.round=$r]
+      else .out += [$e] end)
+  | .out as $all
+  | ($all | map(select(.event=="job_ended_callback")) | group_by(.detail.job) | map({key:.[0].detail.job, value:(map(.detail.round)|max)}) | from_entries) as $last
+  | $all[] | if .event=="job_ended_callback" then .detail.kind = (if .detail.round==1 then "keep_proof" elif .detail.round==$last[.detail.job] then "job_end" else "re_keep_proof" end) | del(.detail.round) else . end' <<<"$LOGS" >> "$TIMELINE"
 jq -c '.[]|{t, d:(.m|fromjson? // empty)}|select(.d.target=="ai.usage")|.d.fields|
   ({t_ms:((.start_unix_secs*1000)), src:"gateway", event:"model_request", path:["agent","gateway","model"], detail:{request_id, model:.requested_model, input_tokens}},
    {t_ms:((.start_unix_secs*1000)+.latency_ms), src:"gateway", event:"model_response", path:["model","gateway","agent"], detail:{request_id, output_tokens, cost_micros}})' <<<"$LOGS" >> "$TIMELINE"
 jq -c '.[]|select(.m|startswith("serve: websocket listening"))|{t_ms:.t, src:"agent", event:"agent_listening", path:null, detail:{line:.m}}' <<<"$LOGS" >> "$TIMELINE"
+# A line that did not arrive whole is dropped rather than failing the record.
+jq -cR 'fromjson?' "$EVENTS" > "$WORK/events.clean"
+# DEMO_KEEP_EVENTS=1 keeps every frame the client saw next to the record (large, and not committed).
+[ -z "${DEMO_KEEP_EVENTS:-}" ] || cp "$WORK/events.clean" "$RUN_DIR/events.jsonl"
+EVENTS=$WORK/events.clean
 # Client frames: the key ones only (the stream's deltas stay out of the record).
 jq -c 'select(.src=="client")|.frame as $f|.session as $s|.ts_ms as $t|
   if $f.type=="demo_prompt_sent" then {t_ms:$t,src:"client",event:"prompt",path:["you","agent"],detail:{session:$s}}
@@ -420,13 +467,13 @@ CONV=$(jq -s '
     if $f.type=="demo_prompt_sent" then .msgs += [{t_ms:$t,session:$s,role:"user",text:$f.message}] | .open=false
     elif ($f.event.kind=="stream" and $f.event.type=="text_delta") then
       (if .open then .msgs[-1].text += $f.event.text else .msgs += [{t_ms:$t,session:$s,role:"assistant",text:$f.event.text}] | .open=true end)
+    elif $f.event.kind=="turn_start" then .open=false
     elif $f.event.kind=="tool_start" then .msgs += [{t_ms:$t,session:$s,role:"tool",name:$f.event.name,input:$f.event.input}] | .open=false
     elif $f.event.kind=="tool_end" then (.msgs[-1] |= (if .role=="tool" then .output=($f.event.result|tostring|.[0:600]) | .end_ms=$t else . end)) | .open=false
     elif $f.event.kind=="background" and ($f.event.reason=="finished") then .msgs += [{t_ms:$t,session:$s,role:"notice",text:$f.event.text}] | .open=false
     else . end) | .msgs
   | map(if .input then .input=(.input|tostring|.[0:300]) else . end)' "$EVENTS")
 
-TOTAL_COST=$(jq -r '.total_cost_micros // 0' <<<"${BILLING:-null}" 2>/dev/null || echo 0)
 COMMIT=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
 DIRTY=$(git -C "$ROOT" status --porcelain 2>/dev/null | grep -c . || true)
 ROWS_JSON=$(cw gateway/ "$((START_MS - 5000))" '"ai.usage"' | jq -c '[.[]|.m|fromjson?|select(.target=="ai.usage")|.fields]')
@@ -448,6 +495,8 @@ jq -n --slurpfile checks "$CHECKS_OUT" --slurpfile tl "$TIMELINE" --argjson conv
             output_tokens:($r|map(.output_tokens)|add // 0), cache_read_tokens:($r|map(.cache_read_tokens)|add // 0)},
    disk:$disk,
    teardown:null}' > "$RUN_DIR/run.json"
+# The account id is not part of the record.
+sed -i "s/$(account)/123456789012/g" "$RUN_DIR/run.json"
 "$HERE/report.sh" "$RUN_DIR" > /dev/null
 
 rule

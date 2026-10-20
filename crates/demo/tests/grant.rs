@@ -129,9 +129,15 @@ fn a_forged_notify_token_fails_on_its_tag_and_a_real_one_verifies() {
     let scope = beyond_ai_agent::exec_endpoint::jobs::JobScope::for_session(Some(tenant), session);
     let id = beyond_ai_agent::exec_endpoint::jobs::JobId::parse(job).unwrap();
     let real = key.mint(tenant, session, &id);
-    assert!(matches!(key.verify(&real, tenant, session, scope.name(), job), Verdict::Valid));
+    assert!(matches!(
+        key.verify(&real, tenant, session, scope.name(), job),
+        Verdict::Valid
+    ));
     let mut forged = real.clone();
     let at = forged.rfind('.').unwrap() + 1;
     forged.replace_range(at..=at, if &real[at..=at] == "A" { "B" } else { "A" });
-    assert!(matches!(key.verify(&forged, tenant, session, scope.name(), job), Verdict::BadMac));
+    assert!(matches!(
+        key.verify(&forged, tenant, session, scope.name(), job),
+        Verdict::BadMac
+    ));
 }

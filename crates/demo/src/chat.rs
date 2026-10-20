@@ -44,11 +44,13 @@ struct Log(Option<std::fs::File>);
 impl Log {
     fn frame(&mut self, session: &str, frame: &Value) {
         if let Some(f) = &mut self.0 {
-            let _ = writeln!(
-                f,
-                "{}",
+            // One write per line: two chats append to the same file at once (a connection held open
+            // while another asks), and a line written in pieces would interleave.
+            let line = format!(
+                "{}\n",
                 json!({"ts_ms": now_ms(), "src": "client", "session": session, "frame": frame})
             );
+            let _ = f.write_all(line.as_bytes());
         }
     }
 }
@@ -93,7 +95,10 @@ pub async fn run(a: Args) -> Res<Value> {
         .await?;
         sent_at = Instant::now();
         sent_at_ms = now_ms();
-        log.frame(&a.session, &json!({"type": "demo_prompt_sent", "message": p}));
+        log.frame(
+            &a.session,
+            &json!({"type": "demo_prompt_sent", "message": p}),
+        );
     } else if let Some(c) = &a.command {
         ws.send(Message::text(c.clone())).await?;
     }
@@ -137,6 +142,13 @@ pub async fn run(a: Args) -> Res<Value> {
                         }
                         text.push_str(d);
                         cur_line.push_str(d);
+                    }
+                    // Each model call is its own message: keep them apart in the text.
+                    "turn_start" => {
+                        flush(&mut cur_line);
+                        if !text.is_empty() && !text.ends_with('\n') {
+                            text.push('\n');
+                        }
                     }
                     "tool_start" => {
                         flush(&mut cur_line);

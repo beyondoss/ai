@@ -10,6 +10,7 @@ use beyond_ai_test_support::grant::{Claims, Minter, Secrets};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
+#[cfg(feature = "gateway-key")]
 fn random32() -> Res<[u8; 32]> {
     let mut b = [0u8; 32];
     getrandom::fill(&mut b)?;
@@ -149,9 +150,15 @@ pub fn notify_token(tenant: &str, session: &str, job: &str, forge: bool) -> Res<
     let mut token = key.mint(tenant, session, &id);
     if forge {
         let at = token.rfind('.').ok_or("malformed token")? + 1;
-        let swapped = if token.as_bytes()[at] == b'A' { "B" } else { "A" };
+        let swapped = if token.as_bytes()[at] == b'A' {
+            "B"
+        } else {
+            "A"
+        };
         token.replace_range(at..=at, swapped);
     }
-    let scope = JobScope::for_session(Some(tenant), session).name().to_string();
+    let scope = JobScope::for_session(Some(tenant), session)
+        .name()
+        .to_string();
     Ok((token, scope))
 }

@@ -65,7 +65,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         for c in callbacks.iter().skip(callbacks_seen) {
             line(
                 "job_ended_callback",
-                json!({"job": c.id, "attempt": c.n, "status": c.status,
+                json!({"job": c.id, "attempt": c.n, "status": c.status, "error": c.error,
                        "took_ms": c.ended.duration_since(c.started).as_millis() as u64}),
             );
         }

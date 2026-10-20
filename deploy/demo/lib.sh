@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034,SC2016  # a sourced library: its variables are the callers, and queries are single-quoted on purpose
 # Shared by up.sh, down.sh and demo.sh. Source it; it runs nothing.
 #
 # Everything the demo creates carries the tag `beyond-ai-demo=<name>`, and every name starts with
@@ -23,7 +24,6 @@ AGENT_TLS_PORT=8443              # https: where the sandbox calls back (job_ende
 GATEWAY_PORT=8080
 SANDBOX_PORT=8081
 TAGSPEC="{Key=$TAG_KEY,Value=$NAME}"
-TAGS_SERVICE_FMT="key=$TAG_KEY,value=$NAME"
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -52,9 +52,9 @@ ssm_get() { command aws --region "$REGION" --output text ssm get-parameter --wit
 account() { aws sts get-caller-identity --query Account; }
 
 # The agent's current public address, or empty. Looked up every time: a replaced task is a new IP.
-agent_ip() {
-  local task eni
-  task=$(q ecs list-tasks --cluster "$CLUSTER" --service-name "$P-agent" --desired-status RUNNING --query 'taskArns[0]') || return 0
+agent_ip() { # [task arn: a specific task, else the first running one]
+  local task=${1:-} eni
+  [ -n "$task" ] || task=$(q ecs list-tasks --cluster "$CLUSTER" --service-name "$P-agent" --desired-status RUNNING --query 'taskArns[0]') || return 0
   [ -n "$task" ] || return 0
   eni=$(q ecs describe-tasks --cluster "$CLUSTER" --tasks "$task" \
     --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value|[0]') || return 0

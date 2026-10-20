@@ -29,8 +29,8 @@ agent-lib = ["dep:beyond-ai-agent"]
 
 [dependencies]
 base64.workspace = true
-beyond-ai-agent = { path = "../agent", optional = true }
 beyond-ai = { path = "../gateway", features = ["mint"], optional = true }
+beyond-ai-agent = { path = "../agent", optional = true }
 # The exec endpoint is the repo's reference one, the same code the conformance suite grades.
 beyond-ai-test-support = { path = "../test-support" }
 clap.workspace = true

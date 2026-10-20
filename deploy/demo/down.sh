@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016,SC2018,SC2019  # JMESPath and the container scripts are single-quoted on purpose
 # Delete everything the demo made, in dependency order, tolerating whatever is already gone, and then
 # VERIFY: the tagging API and an explicit listing per service for every type `up.sh` creates (several
 # of which the tagging API misses or reports late). Exits non-zero, naming what remains, if anything
@@ -243,7 +244,9 @@ record=$(jq -nc --argjson counts "$json" --argjson before "$BEFORE" --arg v "$ve
 # Into the latest run record, so the report's teardown panel has it.
 RESULTS=${DEMO_RESULTS:-$HERE/results}
 latest=$(find "$RESULTS" -mindepth 2 -maxdepth 2 -name run.json 2>/dev/null | sort | tail -1)
-if [ -n "$latest" ] && [ "$verdict" = clean ]; then
+# A second run over an already clean record would overwrite what the first one counted down from.
+if [ -n "$latest" ] && [ "$verdict" = clean ] \
+  && { [ "$(jq -r '.teardown.verdict // ""' "$latest")" != clean ] || [ "$(jq '[.[]]|add' <<<"$BEFORE")" != 0 ]; }; then
   jq --argjson t "$record" '.teardown = $t
     | .checks |= map(if .name == "teardown-zero" then
         .pass = true | .status = "pass" | .started_ms = null | .ended_ms = null

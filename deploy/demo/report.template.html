@@ -115,7 +115,7 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
         <g id="edges"></g>
         <g id="nodes"></g>
         <g id="packets"></g>
-        <text id="takeover" class="takeover" x="320" y="196"></text>
+        <text id="takeover" class="takeover" x="170" y="40"></text>
       </svg>
       <div class="legend">
         <span><i style="background:var(--c-you)"></i>you / agent</span>
@@ -243,7 +243,7 @@ const ready = sorted.find(e => e.event === "agent_ready");
 const reatt = sorted.find(e => e.event === "session_reattached");
 const jobs = [];
 for (const e of sorted) if (e.src === "sandbox" && e.event === "exec_start" && /sleep \d/.test((e.detail && e.detail.command) || "")) jobs.push({ from: e.t_ms, to: null });
-for (const j of jobs) { const end = sorted.find(e => e.event === "job_ended_callback" && e.t_ms > j.from + 8000); j.to = end ? end.t_ms : run.run.ended_ms; }
+for (const j of jobs) { const end = sorted.find(e => e.event === "job_ended_callback" && e.t_ms > j.from && e.detail && e.detail.kind === "job_end" && e.detail.status === 200); j.to = end ? end.t_ms : run.run.ended_ms; }
 
 /* ---- the clock, packets ---- */
 let t = END;            // virtual ms since T0; starts at the end so the page is complete on load
