@@ -85,8 +85,6 @@ async fn a_reaped_session_stops_its_jobs() {
     let (base, _bodies) = spawn_model_server(vec![
         turn_tool_use("t1", "bash", &json!({ "command": command }).to_string()),
         turn_text("it is up"),
-        // The one stop reminder.
-        turn_text("ok"),
     ]);
     let dir = tempfile::tempdir().unwrap();
     let (mut child, port) = daemon(&base, dir.path().to_str().unwrap(), 1);

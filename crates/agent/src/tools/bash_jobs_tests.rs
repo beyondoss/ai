@@ -368,13 +368,26 @@ async fn the_stop_reminder_lists_running_jobs_once_and_says_what_ending_does_per
     );
     bash.jobs()
         .set_policy(super::super::bash_jobs::EndPolicy::KeepRunning);
+    // Under serve a job the command left running outlives the turn and its exit wakes the
+    // session: it earns no reminder.
     ok(bash.run(json!({ "command": "sleep 74 & echo bg" })).await);
-    let serve = bash.jobs().stop_reminder().expect("a new job");
+    assert!(
+        bash.jobs().stop_reminder().is_none(),
+        "an intended job needs no reminder"
+    );
+    // A yielded job is stopped with the turn: the reminder lists the yielded jobs, not the intended ones.
+    ok(bash.run(json!({ "command": "sleep 75" })).await);
+    let serve = bash.jobs().stop_reminder().expect("a new yielded job");
+    assert!(
+        serve.contains("- job 4: `sleep 75`")
+            && !serve.contains("- job 3:")
+            && !serve.contains("- job 2:"),
+        "{serve}"
+    );
     assert!(
         serve.ends_with(&format!(
-            "If you end your turn now, job 1 is stopped for you (no need to kill it); jobs 2, 3 \
-             keep running and you will be told when each exits (bash_job {{\"job\": N, \"kill\": \
-             true}} stops one you no longer need). {REMINDER_ASK}"
+            "If you end your turn now, jobs 1, 4 are stopped for you (no need to kill them). \
+             {REMINDER_ASK}"
         )),
         "{serve}"
     );

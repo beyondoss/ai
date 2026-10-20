@@ -64,8 +64,6 @@ fn an_idle_session_wakes_when_a_job_ends() {
     let (base, bodies) = spawn_model_server(vec![
         bash_turn("t1", "(sleep 1; echo bg-done) & echo launched"),
         turn_text("started it"),
-        // The one stop reminder.
-        turn_text("ok, it can run"),
         // The wake.
         turn_text("noted: it finished"),
     ]);
@@ -79,13 +77,15 @@ fn an_idle_session_wakes_when_a_job_ends() {
     );
     let frames = read_until_response(&mut stdout, "prompt");
     assert_eq!(frames.last().unwrap()["success"], true);
-    // Ending in serve leaves the job running — and the reminder said so.
-    assert!(
-        bodies.lock().unwrap()[2].contains(
-            "If you end your turn now, job 1 keeps running and you will be told when it exits ("
-        ),
-        "the serve reminder"
-    );
+    // Ending in serve leaves the job running and its exit wakes the session: no reminder turn.
+    {
+        let recorded = bodies.lock().unwrap();
+        assert_eq!(recorded.len(), 2, "no reminder turn");
+        assert!(
+            !recorded.iter().any(|b| b.contains("[background jobs]")),
+            "an intended job earns no reminder"
+        );
+    }
 
     // Nobody sends anything: the job's end starts a turn of its own.
     let woke = read_until_response(&mut stdout, "prompt");
@@ -107,12 +107,12 @@ fn an_idle_session_wakes_when_a_job_ends() {
     );
     assert_eq!(woke.last().unwrap()["success"], true);
     let recorded = bodies.lock().unwrap();
-    assert_eq!(recorded.len(), 4);
+    assert_eq!(recorded.len(), 3);
     assert!(
-        recorded[3].contains("[job 1 ended after"),
+        recorded[2].contains("[job 1 ended after"),
         "the notice is the turn's input"
     );
-    assert!(recorded[3].contains("bg-done"));
+    assert!(recorded[2].contains("bg-done"));
     drop(recorded);
     close(child, stdin);
 }
@@ -124,7 +124,6 @@ fn a_client_prompt_racing_a_wake_carries_the_notice_and_no_extra_turn_runs() {
     let (base, bodies) = spawn_model_server(vec![
         bash_turn("t1", "(sleep 1; echo bg-done) & echo launched"),
         turn_text("started it"),
-        turn_text("ok"),
         // The client's next prompt is in flight when the job ends.
         bash_turn("t2", "sleep 2; echo fg"),
         turn_text("saw both"),
@@ -165,8 +164,8 @@ fn a_client_prompt_racing_a_wake_carries_the_notice_and_no_extra_turn_runs() {
         }
     }
     let recorded = bodies.lock().unwrap();
-    assert_eq!(recorded.len(), 5, "no extra model call");
-    assert_eq!(recorded[4].matches("[job 1 ended after").count(), 1);
+    assert_eq!(recorded.len(), 4, "no extra model call");
+    assert_eq!(recorded[3].matches("[job 1 ended after").count(), 1);
     drop(recorded);
     close(child, stdin);
 }
@@ -186,7 +185,6 @@ fn a_compaction_carries_the_job_table_and_the_session_exit_stops_the_job() {
             ),
         ),
         turn_text("the server is up"),
-        turn_text("ok"),
         // The summarization call `compact` makes; it never mentions the job.
         turn_text("## Goal\nStarted a server."),
         turn_text("it is still up"),

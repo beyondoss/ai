@@ -335,12 +335,24 @@ async fn the_reminder_says_what_ending_does_to_a_background_job_per_host() {
         "{run}"
     );
     bash.jobs().set_policy(EndPolicy::KeepRunning);
+    // Under serve a background job outlives the turn and its exit wakes the session: no reminder.
     ok(bash.run(background("sleep 73")).await);
-    let serve = bash.jobs().stop_reminder().expect("a new job");
+    assert!(
+        bash.jobs().stop_reminder().is_none(),
+        "an intended job needs no reminder"
+    );
+    // A yielded job is stopped with the turn: the reminder names only it.
+    ok(bash.run(json!({ "command": "sleep 74" })).await);
+    let serve = bash.jobs().stop_reminder().expect("a new yielded job");
+    assert!(
+        serve.contains("- job 4: `sleep 74`")
+            && !serve.contains("- job 3:")
+            && !serve.contains("- job 2:"),
+        "{serve}"
+    );
     assert!(
         serve.contains(
-            "If you end your turn now, job 1 is stopped for you (no need to kill it); jobs 2, 3 \
-             keep running and you will be told when each exits"
+            "If you end your turn now, jobs 1, 4 are stopped for you (no need to kill them)."
         ),
         "{serve}"
     );

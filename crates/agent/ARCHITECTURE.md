@@ -3176,11 +3176,15 @@ separate host `bash` instance (`build_tools` with `bash_waits_for_exit`) over th
     for one (bash_job {"job": N}), stop it (…), or end your turn": in the background A/B 3 of the 8
     waits on never-exiting servers came right after it, and in 2 of 24 runs it fired again after the
     model waited or started a job (one run 3 times). A stopped job is said to be "stopped for you (no
-    need to kill it)" — most of that A/B's 44 kills were cleanup the end did anyway — and in `serve` a
-    kept job's line says how to stop one no longer needed. Yielded jobs are stopped; intended ones
-    follow the host's `EndPolicy` — `run` stops them
+    need to kill it)" — most of that A/B's 44 kills were cleanup the end did anyway. Yielded jobs are
+    stopped; intended ones follow the host's `EndPolicy` — `run` stops them
     with the process (`BashJobs::stop_all` after the last turn), `serve` leaves them running and wakes
-    the idle session when one ends (see the `serve` data flow). Every stopped job is reported with its
+    the idle session when one ends (see the `serve` data flow). So under `serve` an intended job
+    earns no reminder: its start result already said it keeps running, its exit wakes the session, and
+    a reminder would only cost a model turn and a duplicate reply. Only yielded jobs — the ones the
+    end stops without telling anyone — are listed there, all "stopped for you"; a turn that ends
+    with only intended jobs running ends with no reminder turn at all. `run` still reminds for both kinds, since its end
+    stops both. Every stopped job is reported with its
     `kind`: in `run` as one `bash_jobs_stopped` line in `--json` (before any structured output) and on
     stderr; in `serve` as a `bash_jobs_stopped` frame before the prompt's terminal response. Every
     stop (`end_turn`, `stop_all`, in `run` and `serve` alike) runs on the blocking pool, never the

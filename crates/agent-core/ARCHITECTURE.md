@@ -1014,7 +1014,9 @@ into the tool-results turn after any steer, as the wrap-up does. At a would-stop
 delivered first — pushed as a user turn after any drained follow-ups, checkpointed, and the run
 continues — so a run never ends without a result that already arrived; with none, `stop_reminder`
 lists work still running that no earlier reminder covered, once per piece of work and at most once
-per run, so a model that ends again ends. A pending stop request still wins over both, and so does the step limit: once
+per run, so a model that ends again ends. A source may leave out work whose end it knows the model
+has been told about (`bash` under `serve`: an intended job outlives the turn and its exit wakes the
+session), and with nothing left to list there is no reminder turn. A pending stop request still wins over both, and so does the step limit: once
 the run has used its steps (or the wrap-up's extended ones), neither is delivered — the step they
 would start is one the run cannot take, and a clean final answer used to become a `MaxSteps`
 failure. The run ends `Ok`; notices stay unconsumed for the next run. Each delivery is reported as

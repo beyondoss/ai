@@ -55,8 +55,6 @@ fn a_restarted_serve_session_is_told_its_jobs_stopped_and_numbers_past_them() {
         vec![
             background("t1", "echo up; sleep 90"),
             turn_text("the server is up"),
-            // The one stop reminder.
-            turn_text("ok"),
         ],
         "start the server",
     );
