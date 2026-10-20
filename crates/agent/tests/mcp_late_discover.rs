@@ -15,7 +15,9 @@ mod common;
 
 use std::time::Duration;
 
-use common::mcp_fixture::spawn_http_mcp_fixture_slow_discover;
+use common::mcp_fixture::{
+    spawn_http_mcp_fixture_rejecting_discover, spawn_http_mcp_fixture_slow_discover,
+};
 use common::{body_json, run_cmd, spawn_model_server, turn_text};
 use serde_json::{Value, json};
 
@@ -85,5 +87,16 @@ fn a_late_answer_to_an_abandoned_discover_does_not_lose_an_http_server() {
     assert_connects(
         json!({ "name": "slowhttp", "transport": "http", "url": fixture.url }),
         "mcp__slowhttp__echo",
+    );
+}
+
+#[test]
+fn a_server_that_rejects_the_discover_probe_with_http_400_still_connects() {
+    // DeepWiki's answer: HTTP 400, code -32600, an id that is not the request's. Any error to the
+    // probe means "not a 2026-07-28 server", and the client falls back to `initialize`.
+    let fixture = spawn_http_mcp_fixture_rejecting_discover();
+    assert_connects(
+        json!({ "name": "strict", "transport": "http", "url": fixture.url }),
+        "mcp__strict__echo",
     );
 }

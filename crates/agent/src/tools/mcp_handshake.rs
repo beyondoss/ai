@@ -13,9 +13,20 @@
 //! transport queues them, which matters over streamable HTTP, where the worker posts `initialize`
 //! only once the slow discover POST has returned — and drops that one answer. It tracks nothing
 //! once the handshake is over.
+//!
+//! The other half of the same fallback: rmcp only drops back to `initialize` when the discover is
+//! answered by a *correlated* JSON-RPC error that is not a modern-era rejection. Public servers that
+//! predate `2026-07-28` reject the probe in their own way — DeepWiki answers HTTP 400 with code
+//! -32600 and the made-up id `"server-error"` — and rmcp treats that as a fatal "uncorrelated error
+//! response", so the server and its tools were gone. Any error that arrives while the discover is
+//! the only request in flight can only be its answer, so [`Guard::probe_rejected`] makes it one:
+//! the discover's id, and "method not found" in place of a modern-era code. Transport failures
+//! (refused, timed out, a 5xx with no JSON-RPC body) produce no error message and stay errors.
 
 use rmcp::RoleClient;
-use rmcp::model::{ClientJsonRpcMessage, ClientRequest, RequestId, ServerJsonRpcMessage};
+use rmcp::model::{
+    ClientJsonRpcMessage, ClientRequest, ErrorCode, RequestId, ServerJsonRpcMessage,
+};
 use rmcp::transport::Transport;
 
 /// A client transport with the handshake's stale discover answer filtered out — see the module doc.
@@ -50,6 +61,23 @@ impl<T> Guard<T> {
                 self.initialize = Some(request.id.clone());
             }
             _ => {}
+        }
+    }
+
+    /// Turn any JSON-RPC error that arrives while only the discover is outstanding into the
+    /// correlated "method not found" rmcp falls back to `initialize` on — see the module doc. A
+    /// version-negotiation error (`UNSUPPORTED_PROTOCOL_VERSION`) keeps its code: rmcp retries
+    /// those itself.
+    fn probe_rejected(&self, message: &mut ServerJsonRpcMessage) {
+        let (Some(discover), ServerJsonRpcMessage::Error(error)) = (&self.discover, message) else {
+            return;
+        };
+        if error.id.as_ref() != Some(discover) {
+            tracing::debug!(id = ?error.id, "MCP `server/discover` rejected with an uncorrelated error");
+            error.id = Some(discover.clone());
+        }
+        if error.error.code != ErrorCode::UNSUPPORTED_PROTOCOL_VERSION {
+            error.error.code = ErrorCode::METHOD_NOT_FOUND;
         }
     }
 
@@ -92,7 +120,8 @@ impl<T: Transport<RoleClient>> Transport<RoleClient> for Guard<T> {
 
     async fn receive(&mut self) -> Option<ServerJsonRpcMessage> {
         loop {
-            let message = self.inner.receive().await?;
+            let mut message = self.inner.receive().await?;
+            self.probe_rejected(&mut message);
             if !self.stale(&message) {
                 return Some(message);
             }
@@ -146,6 +175,53 @@ mod tests {
 
     fn quiet(g: &Guard<()>) -> bool {
         g.discover.is_none() && g.abandoned.is_none() && g.initialize.is_none()
+    }
+
+    #[test]
+    fn any_error_answering_the_discover_becomes_method_not_found() {
+        for (code, id) in [
+            (-32600, json!("server-error")),
+            (-32602, json!(0)),
+            (-32000, json!(7)),
+            (-32001, json!(0)),
+        ] {
+            let mut g = Guard::new(());
+            g.sent(&discover());
+            let mut m = server(json!({ "jsonrpc": "2.0", "id": id,
+                "error": { "code": code, "message": "no" } }));
+            g.probe_rejected(&mut m);
+            let ServerJsonRpcMessage::Error(e) = &m else {
+                panic!("not an error")
+            };
+            assert_eq!(e.id, Some(RequestId::Number(0)));
+            assert_eq!(e.error.code, ErrorCode::METHOD_NOT_FOUND);
+        }
+
+        // Negotiation keeps its code; an id-less error is correlated.
+        let mut g = Guard::new(());
+        g.sent(&discover());
+        let mut m = server(json!({ "jsonrpc": "2.0",
+            "error": { "code": ErrorCode::UNSUPPORTED_PROTOCOL_VERSION.0, "message": "v" } }));
+        g.probe_rejected(&mut m);
+        let ServerJsonRpcMessage::Error(e) = &m else {
+            panic!("not an error")
+        };
+        assert_eq!(e.id, Some(RequestId::Number(0)));
+        assert_eq!(e.error.code, ErrorCode::UNSUPPORTED_PROTOCOL_VERSION);
+
+        // Not while the discover is outstanding: untouched (an `initialize` error stays one).
+        let mut g = Guard::new(());
+        g.sent(&discover());
+        g.sent(&initialize());
+        g.discover = None;
+        let mut m = server(json!({ "jsonrpc": "2.0", "id": "x",
+            "error": { "code": -32600, "message": "no" } }));
+        g.probe_rejected(&mut m);
+        let ServerJsonRpcMessage::Error(e) = &m else {
+            panic!("not an error")
+        };
+        assert_eq!(e.id, Some(RequestId::String("x".into())));
+        assert_eq!(e.error.code, ErrorCode(-32600));
     }
 
     #[test]
