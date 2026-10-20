@@ -43,6 +43,7 @@ pub fn has_trust_gated_resources(cwd: &Path) -> bool {
         || cwd.join(".claude/APPEND_SYSTEM.md").is_file()
         || cwd.join(".claude/skills").is_dir()
         || cwd.join(".claude/prompts").is_dir()
+        || cwd.join(".claude/agents").is_dir()
         || cwd.join(".claude/settings.json").is_file()
         || cwd.join(".beyond/settings.json").is_file()
         // pi-parity fix (Task #45): the operator's own `~/.agents/skills` (pi's documented,
@@ -55,6 +56,11 @@ pub fn has_trust_gated_resources(cwd: &Path) -> bool {
         // skill-*loading* path already applies (`skills::discover_with_diagnostics_impl`) and pi's own
         // `hasTrustRequiringProjectResources` (`trust-manager.ts:184-206`).
         || crate::skills::collect_ancestor_agents_skill_dirs_excluding_user_dir(cwd)
+            .iter()
+            .any(|dir| dir.is_dir())
+        // Agent definitions are gated like skills (`agents::discover_with_diagnostics`): a body is
+        // injected verbatim as a child's system prompt. Same user-dir exclusion as above.
+        || crate::skills::collect_ancestor_agents_dirs_excluding_user_dir(cwd, ".agents/agents")
             .iter()
             .any(|dir| dir.is_dir())
 }
@@ -395,6 +401,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".claude/prompts")).unwrap();
         assert!(has_trust_gated_resources(dir.path()));
+    }
+
+    #[test]
+    fn has_trust_gated_resources_is_true_for_project_agent_definitions() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".claude/agents")).unwrap();
+        assert!(has_trust_gated_resources(dir.path()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a/b");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(dir.path().join("a/.agents/agents")).unwrap();
+        assert!(has_trust_gated_resources(&nested));
     }
 
     #[test]
