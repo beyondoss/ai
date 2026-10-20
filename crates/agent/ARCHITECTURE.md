@@ -5651,7 +5651,9 @@ that `GET` locally as unsupported (rmcp's `ServerDoesNotSupportSse`, the same pa
 answers 405), so no request leaves, and the connector dials through a second client with
 `pool_max_idle_per_host(0)`, so no idle connection lingers between calls. The cost is that such a
 connector hears no server-pushed notifications (tools-changed); the next call still works.
-Default connectors keep the stream, which those notifications rely on.
+Default connectors keep the stream, which those notifications rely on. A sandbox connector is also
+exempt from the MCP idle reap: closing its session would end the server's state (an open browser
+page) inside a VM that costs nothing while asleep, so the session lives until the agent session ends.
 `tests/mcp_sandbox_connector.rs` counts `GET`s and open connections at a session-id-issuing fixture.
 
 **The workspace's `.mcp.json`.** A tenant's folder can carry its connectors too: after the sandbox is

@@ -27,6 +27,16 @@ async fn within(limit: Duration, mut f: impl FnMut() -> bool) -> bool {
 
 /// Connect `fixture` as a grant connector and make three tool calls with pauses between them.
 async fn call_three_times(fixture: &SessionMcpFixture, sandbox: bool) {
+    call_with_idle_gap(fixture, sandbox, Duration::ZERO, Duration::from_millis(150)).await;
+}
+
+/// Connect `fixture` with an idle window of `reap_after`, then make three tool calls `gap` apart.
+async fn call_with_idle_gap(
+    fixture: &SessionMcpFixture,
+    sandbox: bool,
+    reap_after: Duration,
+    gap: Duration,
+) {
     let egress = McpEgress::new(EgressPolicy::new(true, &[])).unwrap();
     let connector = McpConnector {
         name: "c".into(),
@@ -39,7 +49,7 @@ async fn call_three_times(fixture: &SessionMcpFixture, sandbox: bool) {
         &BTreeMap::new(),
         &egress,
         mcp::host(),
-        Duration::ZERO,
+        reap_after,
     )
     .await;
     assert!(warnings.is_empty(), "{warnings:?}");
@@ -55,7 +65,7 @@ async fn call_three_times(fixture: &SessionMcpFixture, sandbox: bool) {
             .await
             .unwrap();
         assert!(out.text.contains(&format!("call {i}")), "{out:?}");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(gap).await;
     }
 }
 
@@ -81,4 +91,46 @@ async fn a_default_connector_still_opens_the_standalone_stream() {
         "tools-changed notifications ride this stream"
     );
     assert!(fixture.open_connections() >= 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sandbox_connector_keeps_its_session_through_an_idle_pause() {
+    let fixture = spawn_session_mcp_fixture().await;
+    call_with_idle_gap(
+        &fixture,
+        true,
+        Duration::from_secs(1),
+        Duration::from_secs(3),
+    )
+    .await;
+    assert_eq!(
+        fixture.deletes(),
+        0,
+        "the idle reaper ended the MCP session"
+    );
+    assert_eq!(
+        fixture.initializes(),
+        1,
+        "the idle reaper redialed a new session"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_default_connector_is_still_reaped_when_idle() {
+    let fixture = spawn_session_mcp_fixture().await;
+    call_with_idle_gap(
+        &fixture,
+        false,
+        Duration::from_secs(1),
+        Duration::from_secs(3),
+    )
+    .await;
+    assert!(
+        fixture.deletes() >= 1,
+        "an idle default connector ends its session"
+    );
+    assert!(
+        fixture.initializes() >= 2,
+        "and the next call dials a new one"
+    );
 }

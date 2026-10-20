@@ -21,12 +21,24 @@ pub struct SessionMcpFixture {
     pub url: String,
     gets: Arc<AtomicUsize>,
     open: Arc<AtomicUsize>,
+    inits: Arc<AtomicUsize>,
+    deletes: Arc<AtomicUsize>,
 }
 
 impl SessionMcpFixture {
     /// Standalone-stream `GET`s received so far.
     pub fn gets(&self) -> usize {
         self.gets.load(Ordering::SeqCst)
+    }
+
+    /// `initialize` requests received: one per MCP session the client opened.
+    pub fn initializes(&self) -> usize {
+        self.inits.load(Ordering::SeqCst)
+    }
+
+    /// Session-ending `DELETE`s received.
+    pub fn deletes(&self) -> usize {
+        self.deletes.load(Ordering::SeqCst)
     }
 
     /// TCP connections open at this instant.
@@ -44,6 +56,8 @@ pub async fn spawn_session_mcp_fixture() -> SessionMcpFixture {
         url: format!("http://{addr}/mcp"),
         gets: Arc::default(),
         open: Arc::default(),
+        inits: Arc::default(),
+        deletes: Arc::default(),
     };
     let state = fixture.clone();
     tokio::spawn(async move {
@@ -106,8 +120,11 @@ async fn serve(mut stream: TcpStream, state: &SessionMcpFixture) {
                 while matches!(stream.read(&mut tmp).await, Ok(n) if n > 0) {}
                 return;
             }
-            "DELETE" => respond(&mut stream, "200 OK", &[], b"").await,
-            _ => post(&mut stream, &body).await,
+            "DELETE" => {
+                state.deletes.fetch_add(1, Ordering::SeqCst);
+                respond(&mut stream, "200 OK", &[], b"").await
+            }
+            _ => post(&mut stream, state, &body).await,
         };
         if !ok {
             return;
@@ -115,7 +132,7 @@ async fn serve(mut stream: TcpStream, state: &SessionMcpFixture) {
     }
 }
 
-async fn post(stream: &mut TcpStream, body: &[u8]) -> bool {
+async fn post(stream: &mut TcpStream, state: &SessionMcpFixture, body: &[u8]) -> bool {
     let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let Some(id) = request.get("id").cloned() else {
         return respond(stream, "202 Accepted", &[], b"").await;
@@ -124,6 +141,7 @@ async fn post(stream: &mut TcpStream, body: &[u8]) -> bool {
     let mut extra = Vec::new();
     let result = match method {
         "initialize" => {
+            state.inits.fetch_add(1, Ordering::SeqCst);
             extra.push(("Mcp-Session-Id", "fixture-session"));
             json!({
                 "protocolVersion": "2025-11-25",
