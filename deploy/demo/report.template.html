@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Agent on AWS: run report</title>
 <style>
+[hidden]{display:none!important}
 :root {
   --bg: #f6f7f9; --panel: #ffffff; --ink: #14181f; --muted: #5d6675; --line: #dde1e8;
   --accent: #2f6df6; --ok: #138a4b; --bad: #d12b3a; --warn: #b7791f;
@@ -138,6 +139,12 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
       <div class="conv" id="conv"></div>
     </section>
 
+    <section class="card full" id="sandboxes" hidden>
+      <h2 id="sandboxes-h">Sandboxes</h2>
+      <div class="sub" id="sandboxes-note"></div>
+      <div class="tablewrap"><table id="vms"><thead><tr><th>session</th><th>E2B sandbox</th><th>commands run</th><th>job_ended callbacks</th></tr></thead><tbody></tbody></table></div>
+    </section>
+
     <section class="card full">
       <h2>Check board</h2>
       <div class="board" id="board"></div>
@@ -203,19 +210,30 @@ const fmtUsd = micros => "$" + (micros / 1e6).toFixed(6);
 /* ---- header ---- */
 const passed = run.checks.filter(c => c.pass === true).length;
 const failed = run.checks.filter(c => c.pass === false).length;
-$("meta").innerHTML = `<b>${esc(run.model.requested)}</b> via ${esc(run.model.via)} · provider ${esc(run.model.provider)} · ${esc(run.run.region)} · commit <b>${esc(run.run.commit.slice(0, 9))}</b> · run ${esc(run.run.id)} · ${fmtT(END)} long`;
+$("meta").innerHTML = `<b>${esc(run.model.requested)}</b> via ${esc(run.model.via)} · provider ${esc(run.model.provider)} · sandbox ${run.sandbox && run.sandbox.provider === "e2b" ? "E2B microVM × " + run.sandbox.vms.length + (run.sandbox.region ? " (" + esc(run.sandbox.region) + ")" : "") : "Fargate"} · ${esc(run.run.region)} · commit <b>${esc(run.run.commit.slice(0, 9))}</b> · run ${esc(run.run.id)} · ${fmtT(END)} long`;
 $("verdict").innerHTML = failed ? `<b style="color:var(--bad)">${failed} failed</b>` : `<b style="color:var(--ok)">${passed} checks passed</b>`;
 
 /* ---- the map ---- */
+const SB = run.sandbox || { provider: "fargate", vms: [] };
+const E2B = SB.provider === "e2b";
 const NODES = {
   you:     { x: 70,  y: 180, w: 96,  h: 54, label: "you",          sub: "demo client" },
   agent:   { x: 270, y: 180, w: 120, h: 62, label: "agent",        sub: "serve --service" },
   gateway: { x: 470, y: 70,  w: 112, h: 54, label: "gateway",      sub: "managed key, billing" },
   model:   { x: 590, y: 70,  w: 80,  h: 54, label: "model",        sub: run.model.requested },
-  sandbox: { x: 490, y: 260, w: 120, h: 62, label: "sandbox",      sub: "exec v1.1 – v1.4" },
+  sandbox: { x: 490, y: 260, w: 120, h: 62, label: E2B ? "E2B microVM × " + SB.vms.length : "sandbox", sub: E2B ? "one per session" : "exec v1.1 – v1.4" },
   efs:     { x: 270, y: 318, w: 120, h: 44, label: "EFS",          sub: "sealed sessions" },
 };
-const EDGES = [["you", "agent"], ["agent", "gateway"], ["gateway", "model"], ["agent", "sandbox"], ["agent", "efs"], ["efs", "sandbox"]];
+const EDGES = [["you", "agent"], ["agent", "gateway"], ["gateway", "model"], ["agent", "sandbox"], ["agent", "efs"]].concat(E2B ? [] : [["efs", "sandbox"]]);
+if (E2B) {
+  $("sandboxes").hidden = false;
+  $("sandboxes-note").textContent = "Each session has its own E2B microVM (public port URL, the grant's bearer required). The sandbox node above is all of them; this is the breakdown.";
+  const tb = $("vms").querySelector("tbody");
+  for (const v of SB.vms) {
+    const mine = run.timeline.filter(e => e.src === "sandbox" && e.vm === v.sandbox_id);
+    tb.insertAdjacentHTML("beforeend", `<tr><td><code>${esc(v.session)}</code></td><td><code>${esc(v.sandbox_id)}</code></td><td>${mine.filter(e => e.event === "exec_start").length}</td><td>${mine.filter(e => e.event === "job_ended_callback").length}</td></tr>`);
+  }
+}
 const svgNS = "http://www.w3.org/2000/svg";
 const mk = (tag, attrs, parent) => { const e = document.createElementNS(svgNS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); (parent || $("map")).appendChild(e); return e; };
 const edgeEls = {};
@@ -339,7 +357,7 @@ function renderDisk() {
   $("plain").textContent = shown ? `The phrase the model returned to you:\n\n  ${run.disk.plaintext_seen_by_user}\n\nmatches of it in the session's bytes on EFS: ${run.disk.plaintext_matches}` : "(not yet)";
   const hex = (run.disk.hex_excerpt || "").split(" ").reduce((a, b, i) => a + b + ((i + 1) % 16 === 0 ? "\n" : " "), "");
   $("cipher").textContent = shown ? `${run.disk.file_bytes} bytes; line 2 begins "${run.disk.ascii_prefix}"\n\n${hex}` : "(not yet)";
-  $("disk-note").textContent = shown ? "Read from the sandbox, which mounts the same EFS access point read-only. The agent seals each tenant's sessions with a key derived from the grant; the bytes on the share are not the text." : "";
+  $("disk-note").textContent = shown ? (E2B ? "Read by a one-off task of the agent's image that mounts the same EFS access point (the E2B microVMs have no EFS)." : "Read from the sandbox, which mounts the same EFS access point read-only.") + " The agent seals each tenant's sessions with a key derived from the grant; the bytes on the share are not the text." : "";
 }
 function renderTear() {
   const tr = run.teardown;

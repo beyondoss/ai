@@ -130,6 +130,9 @@ pub struct MockOptions {
     /// Ways to get v1.4 wrong, one per conformance check, for the suite that proves the verifier
     /// catches each. All off by default.
     pub faults: NotifyFaults,
+    /// Answer 401 to any request that does not carry `Authorization: Bearer <this>`: an endpoint on
+    /// the public internet, reached with the bearer its grant's exec headers carry. `None` accepts all.
+    pub require_bearer: Option<String>,
 }
 
 /// One way per v1.4 conformance check for an endpoint to get the spec wrong. Each is a change to
@@ -198,6 +201,7 @@ impl Default for MockOptions {
             lose_callbacks: LoseCallbacks::None,
             keep_delay: Duration::ZERO,
             faults: NotifyFaults::default(),
+            require_bearer: None,
         }
     }
 }
@@ -515,6 +519,15 @@ async fn serve_one(mut sock: tokio::net::TcpStream, shared: Shared) {
     let Some((headers, req)) = read_request(&mut sock).await else {
         return;
     };
+    if let Some(want) = &shared.opts.require_bearer {
+        let ok = headers
+            .iter()
+            .any(|(n, v)| n == "authorization" && v.strip_prefix("Bearer ") == Some(want.as_str()));
+        if !ok {
+            respond_json(sock, 401, &json!({ "error": "unauthorized" })).await;
+            return;
+        }
+    }
     shared.requests.lock().unwrap().push(ExecRequest {
         headers,
         body: req.clone(),

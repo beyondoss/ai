@@ -50,6 +50,9 @@ enum Cmd {
         /// Flip a signature bit: a grant the agent must refuse.
         #[arg(long)]
         tamper: bool,
+        /// Carry `Authorization: Bearer $DEMO_EXEC_BEARER` in the grant's exec headers.
+        #[arg(long)]
+        exec_bearer: bool,
     },
     /// Print a job-end callback token and its scope as JSON (secret from DEMO_FLEET_SECRET).
     #[cfg(feature = "agent-lib")]
@@ -116,7 +119,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             workspace,
             ttl_secs,
             tamper,
+            exec_bearer,
         } => {
+            let exec_bearer = if exec_bearer {
+                Some(std::env::var("DEMO_EXEC_BEARER").map_err(|_| "DEMO_EXEC_BEARER is not set")?)
+            } else {
+                None
+            };
             println!(
                 "{}",
                 keys::mint_grant(
@@ -129,6 +138,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         workspace,
                         ttl_secs,
                         tamper,
+                        exec_bearer,
                     }
                 )?
             );

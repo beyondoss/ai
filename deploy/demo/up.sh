@@ -37,6 +37,11 @@ fi
 for tool in aws jq docker openssl cargo curl; do
   command -v "$tool" >/dev/null || { echo "up: $tool is required" >&2; exit 2; }
 done
+if [ "$SANDBOX" = e2b ]; then
+  e2b_need_key || exit 2
+  # The key works. (VMs are made per session by demo.sh, so there is nothing to create here.)
+  e2b_count >/dev/null || { echo "up: E2B's API did not accept E2B_API_KEY" >&2; exit 2; }
+fi
 ACCOUNT=$(account)
 ECR="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com"
 WORK=$(mktemp -d)
@@ -93,7 +98,7 @@ if ! param_exists generated; then
     -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign" 2>/dev/null
   openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$WORK/leaf.key" \
     -out "$WORK/leaf.csr" -subj "/CN=agent.$DNS" 2>/dev/null
-  printf 'subjectAltName=DNS:agent.%s\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' "$DNS" > "$WORK/ext.cnf"
+  printf 'subjectAltName=DNS:agent.%s,DNS:*.sslip.io\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' "$DNS" > "$WORK/ext.cnf"
   openssl x509 -req -in "$WORK/leaf.csr" -CA "$WORK/ca.pem" -CAkey "$WORK/ca.key" -CAcreateserial \
     -out "$WORK/leaf.pem" -days 30 -extfile "$WORK/ext.cnf" 2>/dev/null
   jq -r .grant_seed "$WORK/keys.json" | tr -d '\n' | put_param grant-seed SecureString
@@ -142,7 +147,7 @@ ensure_image() { # repo, dockerfile
 IMAGES_CHANGED=
 ensure_image "$P-gateway" Dockerfile
 ensure_image "$P-agent" Dockerfile.agent
-ensure_image "$P-sandbox" deploy/demo/Dockerfile.sandbox
+[ "$SANDBOX" = e2b ] || ensure_image "$P-sandbox" deploy/demo/Dockerfile.sandbox
 
 # ---------------------------------------------------------------------------------------------
 say "network"
@@ -213,6 +218,9 @@ if [ -z "$CALLER" ]; then
   CALLER="$(curl -fsS https://checkip.amazonaws.com | tr -d '[:space:]')/32"
 fi
 sg_rule "$SG_TASKS" --protocol tcp --port "$AGENT_PORT" --cidr "$CALLER"
+# E2B's microVMs call back (job_ended) from addresses nobody can list, so the https port is open to
+# the world in that mode: it accepts only a callback token the agent's fleet key minted.
+[ "$SANDBOX" != e2b ] || sg_rule "$SG_TASKS" --protocol tcp --port "$AGENT_TLS_PORT" --cidr 0.0.0.0/0
 
 # ---------------------------------------------------------------------------------------------
 say "efs"
@@ -263,7 +271,7 @@ role() { # suffix, space-separated parameter names it may read (empty: none)
 # reads its own seal and TLS keys; the sandbox's reads nothing. No role can read the whole prefix.
 role gateway-exec "$PROVIDER-key id-signing-key"
 role agent-exec "fleet-secret tls-key"
-role sandbox-exec ""
+[ "$SANDBOX" = e2b ] || role sandbox-exec ""
 EXEC() { echo "arn:aws:iam::$ACCOUNT:role/$P-$1-exec"; }
 
 # ---------------------------------------------------------------------------------------------
@@ -350,6 +358,14 @@ AGENT_SCRIPT='printf "%s" "$TLS_CERT" > /tmp/leaf.pem; printf "%s" "$TLS_KEY" > 
   --tls-cert /tmp/leaf.pem --tls-key /tmp/leaf.key --gateway-url "$GATEWAY_URL" --model "$MODEL" \
   --notify-origin "$NOTIFY_ORIGIN" --grant-key "$GRANT_KEY_FLAG" --shard demo=/mnt/efs &
 wait $!'
+# With E2B the sandbox is on the public internet: the callback origin is this task's own public
+# address, as a name the demo's CA has a certificate for (<a-b-c-d>.sslip.io resolves to a.b.c.d).
+# Computed at every start, so a replacement task announces its new address.
+if [ "$SANDBOX" = e2b ]; then
+  AGENT_SCRIPT='until IP=$(wget -q -T 5 -O - http://checkip.amazonaws.com 2>/dev/null | tr -d "[:space:]") && [ -n "$IP" ]; do sleep 1; done
+NOTIFY_ORIGIN="https://$(printf %s "$IP" | tr . -).sslip.io:8443"; echo "notify origin: $NOTIFY_ORIGIN"
+'"$AGENT_SCRIPT"
+fi
 TD_AGENT=$(jq -n --arg family "$P-agent" --arg exec "$(EXEC agent)" --argjson logs "$(LOGS agent)" \
   --arg img "$ECR/$P-agent:latest" --argjson vol "$EFSVOL" --arg script "$AGENT_SCRIPT" \
   --arg gw "http://gateway.$DNS:$GATEWAY_PORT" --arg model "$MODEL" --arg origin "https://agent.$DNS:$AGENT_TLS_PORT" \
@@ -365,6 +381,7 @@ TD_AGENT=$(jq -n --arg family "$P-agent" --arg exec "$(EXEC agent)" --argjson lo
      secrets:[{name:"AI_AGENT_SEAL_KEY_B64",valueFrom:$seal},{name:"TLS_KEY",valueFrom:$tlskey}],
      logConfiguration:$logs}]}' | register "$P-agent")
 
+if [ "$SANDBOX" = fargate ]; then
 SANDBOX_SCRIPT='printf "%s" "$CA_PEM" > /tmp/ca.pem
 exec /usr/local/bin/beyond-ai-demo exec-stub --listen 0.0.0.0:8081 --root /workspace --home /home/sandbox'
 TD_SANDBOX=$(jq -n --arg family "$P-sandbox" --arg exec "$(EXEC sandbox)" --argjson logs "$(LOGS sandbox)" \
@@ -377,6 +394,7 @@ TD_SANDBOX=$(jq -n --arg family "$P-sandbox" --arg exec "$(EXEC sandbox)" --argj
      mountPoints:[{sourceVolume:"efs",containerPath:"/mnt/efs",readOnly:true}],
      environment:[{name:"CA_PEM",value:$ca},{name:"SSL_CERT_FILE",value:"/tmp/ca.pem"}],
      logConfiguration:$logs}]}' | register "$P-sandbox")
+fi
 
 # ---------------------------------------------------------------------------------------------
 say "services"
@@ -402,10 +420,14 @@ service() { # name, task definition arn, port
 # are tagged at create.
 service gateway "$TD_GATEWAY"
 service agent "$TD_AGENT"
-service sandbox "$TD_SANDBOX"
+SERVICES=("$P-gateway" "$P-agent")
+if [ "$SANDBOX" = fargate ]; then
+  service sandbox "$TD_SANDBOX"
+  SERVICES+=("$P-sandbox")
+fi
 
-echo "waiting for the three services to be stable..."
-aws ecs wait services-stable --cluster "$CLUSTER" --services "$P-gateway" "$P-agent" "$P-sandbox"
+echo "waiting for the ${#SERVICES[@]} services to be stable..."
+aws ecs wait services-stable --cluster "$CLUSTER" --services "${SERVICES[@]}"
 
 IP=$(agent_ip)
 echo
@@ -413,6 +435,11 @@ created=$(wc -l < "$WORK/made" 2>/dev/null || echo 0)
 echo "up: created $created resource(s) in $REGION (tag $TAG_KEY=$NAME)."
 echo "  agent   ws://$IP:$AGENT_PORT   (open to $CALLER only)"
 echo "  model   $MODEL via the gateway, provider $PROVIDER"
+if [ "$SANDBOX" = e2b ]; then
+  echo "  sandbox E2B: one microVM per session, made by demo.sh (metadata $TAG_KEY=$NAME); down.sh kills them"
+else
+  echo "  sandbox Fargate: one shared exec-stub service"
+fi
 echo "  next    ./deploy/demo/demo.sh        a scripted conversation, with a run record and report"
 echo "          ./deploy/demo/demo.sh kill   kill the agent mid-job; the session survives"
 echo "          ./deploy/demo/down.sh        delete everything, then prove it is gone"

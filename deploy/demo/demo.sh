@@ -32,6 +32,8 @@ declare -A CHECK_TITLE=(
   [grant-refused]="A tampered session grant is refused at connect"
   [real-model-turn]="A real model answers, through the real gateway"
   [sandbox-exec]="The model runs a command in the sandbox"
+  [sandbox-per-session]="Each session has its own E2B microVM"
+  [sandbox-auth-required]="The public sandbox refuses a caller without the grant's bearer"
   [background-job-notify]="A background job ends and the agent is told (exec v1.4)"
   [notify-forged-refused]="A forged job_ended is refused and changes nothing"
   [kill-and-recover]="The agent is SIGKILLed mid-job; the session survives"
@@ -40,6 +42,11 @@ declare -A CHECK_TITLE=(
   [teardown-zero]="Teardown leaves nothing behind"
 )
 
+# With SANDBOX=e2b each session gets its own E2B microVM, and two checks about that join the list.
+if [ "$SANDBOX" = e2b ]; then
+  CHECKS_core=(grant-refused real-model-turn sandbox-exec sandbox-per-session sandbox-auth-required background-job-notify notify-forged-refused sealed-at-rest billing-rows)
+  CHECKS_all=(grant-refused real-model-turn sandbox-exec sandbox-per-session sandbox-auth-required background-job-notify notify-forged-refused kill-and-recover sealed-at-rest billing-rows)
+fi
 MODE=${1:-core}
 case "$MODE" in
   core | kill | all) ;;
@@ -65,6 +72,13 @@ TIMELINE=$WORK/timeline.ndjson      # one line per key event, any source
 CHECKS_OUT=$WORK/checks.ndjson
 CALLS=$WORK/calls.ndjson            # model calls the agent says it made, per session
 touch "$EVENTS" "$TIMELINE" "$CHECKS_OUT" "$CALLS"
+VMDIR=$WORK/vm                      # one file per session's E2B sandbox (e2b mode)
+mkdir -p "$VMDIR"
+if [ "$SANDBOX" = e2b ]; then
+  e2b_need_key || exit 2
+  STUB=$(stub_bin) || { echo "demo: could not build the static exec-stub" >&2; exit 1; }
+  CA_FILE=$WORK/ca.pem
+fi
 
 tl() { # src event [path-json] [detail-json] [t_ms]
   jq -nc --arg s "$1" --arg e "$2" --argjson p "${3:-null}" --argjson d "${4:-null}" --argjson t "${5:-$(now_ms)}" \
@@ -103,10 +117,18 @@ DEMO_FLEET_SECRET=$(ssm_get fleet-secret)
 DEMO_DEK=$(ssm_get dek)
 DEMO_GATEWAY_KEY=$(ssm_get gateway-key)
 export DEMO_GRANT_SEED DEMO_FLEET_SECRET DEMO_DEK DEMO_GATEWAY_KEY
+[ "$SANDBOX" != e2b ] || ssm_get public | jq -r .ca_pem > "$CA_FILE"
 
 grant() { # session [tamper]
-  "$DEMO" mint-grant --tenant "$TENANT" --session "$1" --shard demo --workspace /workspace \
-    --exec-url "http://sandbox.$DNS:$SANDBOX_PORT/exec" ${2:+--tamper}
+  if [ "$SANDBOX" = e2b ]; then
+    # This session's own VM (made on first need), its public URL, and the bearer it requires.
+    vm_for "$1" || return 1
+    DEMO_EXEC_BEARER=$(vm_field "$1" bearer) "$DEMO" mint-grant --tenant "$TENANT" --session "$1" --shard demo \
+      --workspace "$VM_HOME/workspace" --exec-url "$(vm_field "$1" url)" --exec-bearer ${2:+--tamper}
+  else
+    "$DEMO" mint-grant --tenant "$TENANT" --session "$1" --shard demo --workspace /workspace \
+      --exec-url "http://sandbox.$DNS:$SANDBOX_PORT/exec" ${2:+--tamper}
+  fi
 }
 # One conversation step; the JSON summary on stdout, the live view on stderr.
 chat() { # session chat-args...
@@ -145,6 +167,21 @@ run_check() {
 
 # CloudWatch, filtered: [{t, m}] for a stream prefix since a time.
 cw() { # stream-prefix since-ms [filter-pattern]
+  if [ "$SANDBOX" = e2b ]; then
+    # The sandboxes' own logs are in their VMs, not CloudWatch.
+    local a b
+    case "${1:-}" in
+      sandbox/*) vm_logs "${3//\"/}" "$2"; return ;;
+      "")
+        a=$(cw_aws "$@")
+        b=$(vm_logs "" "$2")
+        jq -nc --argjson a "$a" --argjson b "$b" '$a + $b'
+        return ;;
+    esac
+  fi
+  cw_aws "$@"
+}
+cw_aws() {
   command aws --region "$REGION" --output json logs filter-log-events --log-group-name "$LOG_GROUP" \
     ${1:+--log-stream-name-prefix "$1"} --start-time "$2" ${3:+--filter-pattern "$3"} \
     --query 'events[].{t:timestamp,m:message}' 2>/dev/null || echo '[]'
@@ -190,13 +227,62 @@ check_sandbox_exec() {
   note_calls "$SESS_MAIN" "$out"
   tool=$(jq -c '[.tools[]|select(.name=="bash")][0]' <<<"$out")
   output=$(jq -r '.output // ""' <<<"$tool")
-  # Only the sandbox container has /workspace and /mnt/efs; the agent's own container has neither.
-  if [[ $output == *Linux* && $output == *workspace* && $output == *mnt* ]]; then
-    result 1 "ran in the sandbox container (it lists /workspace and /mnt/efs)" \
+  # Only the sandbox has /workspace and /mnt/efs (Fargate) or the host name e2b (E2B); the agent's own
+  # container has neither.
+  if [[ $output == *Linux* && ( ( $SANDBOX == fargate && $output == *workspace* && $output == *mnt* ) || ( $SANDBOX == e2b && $output == *e2b* ) ) ]]; then
+    result 1 "ran in the sandbox ($SANDBOX), not on the agent" \
       "$(jq -c --argjson t "$tool" '{tool_ms: (($t.end_ms // 0) - $t.t_ms), total_ms, first_token_ms}' <<<"$out")" \
       "$(jq -c --argjson t "$tool" '{label:"tool round trip",value:(($t.end_ms // 0) - $t.t_ms),unit:"ms"}' <<<"$out")"
   else
     result 0 "the command did not run in the sandbox: $output"
+  fi
+}
+
+# A raw `bash` command in a session's sandbox (no model call); its output.
+raw_bash() { # session script
+  local out res
+  out=$(chat "$1" --command "$(jq -nc --arg c "$2" '{type:"bash",id:"b",command:$c}')" --timeout-secs 60)
+  res=$(jq -r '[.responses[]|select(.command=="bash")][0].data // {} | (.output // .stdout // .result // "")' <<<"$out")
+  [ -n "$res" ] || res=$(jq -r '[.tools[]?|.output // ""]|join("\n")' <<<"$out")
+  printf '%s' "$res"
+}
+
+check_sandbox_per_session() {
+  local a=$SESS_MAIN b=demo.r${SID}c ra rb self_a self_b sees_a_in_b sees_a_in_a id_a id_b
+  ra=$(raw_bash "$a" "echo SANDBOX=\$(cat /run/e2b/.E2B_SANDBOX_ID); echo only-in-a > $VM_HOME/workspace/marker-$SID; ls $VM_HOME/workspace")
+  rb=$(raw_bash "$b" "echo SANDBOX=\$(cat /run/e2b/.E2B_SANDBOX_ID); ls $VM_HOME/workspace")
+  self_a=$(sed -n 's/^SANDBOX=//p' <<<"$ra" | head -1)
+  self_b=$(sed -n 's/^SANDBOX=//p' <<<"$rb" | head -1)
+  sees_a_in_a=$(grep -c "marker-$SID" <<<"$ra" || true)
+  sees_a_in_b=$(grep -c "marker-$SID" <<<"$rb" || true)
+  id_a=$(vm_field "$a" id)
+  id_b=$(vm_field "$b" id)
+  echo "  session A: sandbox $id_a, which reports itself as $self_a, sees its own file: $sees_a_in_a"
+  echo "  session B: sandbox $id_b, which reports itself as $self_b, sees A's file: $sees_a_in_b"
+  if [ "$self_a" = "$id_a" ] && [ "$self_b" = "$id_b" ] && [ "$id_a" != "$id_b" ] && [ "$sees_a_in_a" -ge 1 ] && [ "$sees_a_in_b" = 0 ]; then
+    result 1 "two sessions, two microVMs (each command ran in the VM made for its session, and the ids differ); a file written in one is not visible in the other" \
+      "$(jq -nc --arg a "$id_a" --arg b "$id_b" '{sandbox_a:$a, sandbox_b:$b, each_in_its_own_vm:true, file_visible_across_sessions:false}')" \
+      '{"label":"sandboxes","value":"2 for 2 sessions","unit":""}'
+  else
+    result 0 "A: $id_a/$self_a sees own $sees_a_in_a; B: $id_b/$self_b sees A's $sees_a_in_b"
+  fi
+}
+
+check_sandbox_auth_required() {
+  local s=$SESS_MAIN url bearer none wrong right
+  url=$(vm_field "$s" url)
+  bearer=$(vm_field "$s" bearer)
+  none=$(curl -s -m 15 -o /dev/null -w '%{http_code}' -X POST -d '{"command":"true"}' "$url")
+  wrong=$(curl -s -m 15 -o /dev/null -w '%{http_code}' -X POST -H 'Authorization: Bearer not-the-token' -d '{"command":"true"}' "$url")
+  right=$(curl -s -m 15 -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $bearer" -d '{"command":"true"}' "$url")
+  echo "  no bearer -> HTTP $none; wrong bearer -> HTTP $wrong; the grant's bearer -> HTTP $right"
+  tl you unauthenticated_exec '["you","sandbox"]' "$(jq -nc --arg s "$none" '{status:$s}')"
+  if [ "$none" = 401 ] && [ "$wrong" = 401 ] && [ "$right" = 200 ]; then
+    result 1 "the endpoint on the public internet answers 401 without the bearer and 200 with the grant's" \
+      "$(jq -nc --arg n "$none" --arg w "$wrong" --arg r "$right" '{without_bearer:($n|tonumber), wrong_bearer:($w|tonumber), with_grant_bearer:($r|tonumber)}')" \
+      '{"label":"unauthenticated exec","value":"401","unit":""}'
+  else
+    result 0 "without bearer $none, wrong bearer $wrong, grant's bearer $right"
   fi
 }
 
@@ -329,8 +415,10 @@ check_kill_and_recover() {
   local cbs cb_dns cb_ok
   cbs=$(cw sandbox/ "$t_kill" '"job_ended_callback"' | jq -c '[.[]|{t, d:(.m|fromjson).detail}]')
   cb_dns=$(jq '[.[]|select((.d.error // "")|test("dns error"))]|length' <<<"$cbs")
+  # E2B calls an address, not a name: the failures before the new agent is reachable are timeouts or refusals.
+  [ "$SANDBOX" != e2b ] || cb_dns=$(jq '[.[]|select(.d.error != null)]|length' <<<"$cbs")
   cb_ok=$(jq '[.[]|select(.d.status==200)|.t]|max // 0' <<<"$cbs")
-  echo "  callbacks since the kill: $cb_dns failed on DNS while the new agent's name propagated; the end callback was answered 200"
+  echo "  callbacks since the kill: $cb_dns failed while the new agent became reachable; the end callback was answered 200"
   note_calls "$SESS_KILL" "$re"
   [ "$(jq -r '.turns // 0' <<<"$re")" -gt 0 ] && echo '{"title_retry":1}' >> "$CALLS"
   if [ "$(jq -r .refused <<<"$re")" = false ] && [[ $(jq -r '.text // ""' <<<"$re") == *"finished-$m3"* || $(jq -r '.text // ""' <<<"$bg") == *"finished-$m3"* ]] \
@@ -347,13 +435,39 @@ check_kill_and_recover() {
   fi
 }
 
+# Run a shell script in a one-off task of the agent's image, which mounts the sessions' EFS, and print
+# its output (from CloudWatch). Only the script is overridden: the agent itself is not started.
+efs_task_output() { # script
+  local td subnet sg task id since lines
+  td=$(q ecs describe-task-definition --task-definition "$P-agent" --query taskDefinition.taskDefinitionArn)
+  subnet=$(q ec2 describe-subnets --filters "Name=tag:$TAG_KEY,Values=$NAME" --query 'Subnets[0].SubnetId')
+  sg=$(q ec2 describe-security-groups --filters "Name=tag:$TAG_KEY,Values=$NAME" "Name=group-name,Values=$P-tasks" --query 'SecurityGroups[0].GroupId')
+  since=$(now_ms)
+  task=$(q ecs run-task --cluster "$CLUSTER" --task-definition "$td" --launch-type FARGATE --count 1 \
+    --network-configuration "awsvpcConfiguration={subnets=[$subnet],securityGroups=[$sg],assignPublicIp=ENABLED}" \
+    --overrides "$(jq -nc --arg c "$1; echo EFS-READ-DONE" '{containerOverrides:[{name:"agent",command:[$c]}]}')" \
+    --tags "key=$TAG_KEY,value=$NAME" --query 'tasks[0].taskArn') || return 1
+  id=${task##*/}
+  tl demo efs_reader_task_started null "$(jq -nc --arg t "$id" '{task:$t}')"
+  aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$task" >&2
+  for _ in $(seq 1 20); do
+    lines=$(cw_aws "agent/agent/$id" "$since" | jq -r 'sort_by(.t)|.[].m')
+    [[ $lines == *EFS-READ-DONE* ]] && break
+    sleep 3
+  done
+  printf '%s\n' "$lines"
+}
+
 check_sealed_at_rest() {
   local s=${1:-$SESS_MAIN} cmd out res hex plain bytes line
   cmd="d=/mnt/efs/$TENANT/sessions/$s; f=\$(ls \$d/*.jsonl | head -1); echo FILE=\$f; echo BYTES=\$(wc -c < \$f); \
 echo PLAINTEXT_MATCHES=\$(cat \$d/* | grep -c 'SEALED-$M1'); echo LINE2_PREFIX=\$(sed -n 2p \$f | head -c 24); echo HEX; sed -n 2p \$f | head -c 96 | od -An -tx1"
-  out=$(chat "$s" --command "$(jq -nc --arg c "$cmd" '{type:"bash",id:"b",command:$c}')" --timeout-secs 60)
-  res=$(jq -r '[.responses[]|select(.command=="bash")][0].data // {} | (.output // .stdout // .result // "")' <<<"$out")
-  [ -n "$res" ] || res=$(jq -r '[.tools[]?|.output // ""]|join("\n")' <<<"$out")
+  if [ "$SANDBOX" = e2b ]; then
+    # The E2B VMs have no EFS. A one-off task of the agent's image mounts it and reads the same bytes.
+    res=$(efs_task_output "$cmd")
+  else
+    res=$(raw_bash "$s" "$cmd")
+  fi
   plain=$(sed -n 's/^PLAINTEXT_MATCHES=//p' <<<"$res" | head -1)
   bytes=$(sed -n 's/^BYTES=//p' <<<"$res" | head -1)
   line=$(sed -n 's/^LINE2_PREFIX=//p' <<<"$res" | head -1)
@@ -431,7 +545,7 @@ LOGS=$(cw "" "$((START_MS - 5000))")
 # A job's callbacks come in rounds (attempt 1 starts a round): the first proves its `keep`, the last
 # is its end, and any between are the proof made again when a new agent reopens the session.
 jq -c '[.[]|select(.m|startswith("{"))|{t, d:(.m|fromjson? // empty)}|select(.d.src=="sandbox")|
-  {t_ms:.d.ts_ms, src:"sandbox", event:.d.event, path:(if .d.event=="exec_start" then ["agent","sandbox"] elif .d.event=="exec_end" or .d.event=="job_ended_callback" then ["sandbox","agent"] else null end), detail:.d.detail}]
+  {t_ms:.d.ts_ms, src:"sandbox", event:.d.event, vm:.d.vm, path:(if .d.event=="exec_start" then ["agent","sandbox"] elif .d.event=="exec_end" or .d.event=="job_ended_callback" then ["sandbox","agent"] else null end), detail:.d.detail}]
   | sort_by(.t_ms)
   | reduce .[] as $e ({round:{},out:[]};
       if $e.event=="job_ended_callback" then ($e.detail.job) as $j
@@ -476,8 +590,14 @@ CONV=$(jq -s '
 
 COMMIT=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
 DIRTY=$(git -C "$ROOT" status --porcelain 2>/dev/null | grep -c . || true)
+if [ "$SANDBOX" = e2b ]; then
+  SANDBOX_JSON=$(jq -sc '{provider:"e2b", label:"E2B microVM", per_session:true, region:null,
+    vms: map({session, sandbox_id:.id, created_ms})}' "$VMDIR"/*.json)
+else
+  SANDBOX_JSON='{"provider":"fargate","label":"Fargate task","per_session":false,"vms":[]}'
+fi
 ROWS_JSON=$(cw gateway/ "$((START_MS - 5000))" '"ai.usage"' | jq -c '[.[]|.m|fromjson?|select(.target=="ai.usage")|.fields]')
-jq -n --slurpfile checks "$CHECKS_OUT" --slurpfile tl "$TIMELINE" --argjson conv "$CONV" --argjson disk "${DISK:-null}" \
+jq -n --slurpfile checks "$CHECKS_OUT" --slurpfile tl "$TIMELINE" --argjson conv "$CONV" --argjson disk "${DISK:-null}" --argjson sandbox "$SANDBOX_JSON" \
   --argjson rows "$ROWS_JSON" --arg id "$RUN_ID" --arg mode "$MODE" --arg commit "$COMMIT" --argjson dirty "${DIRTY:-0}" \
   --arg region "$REGION" --arg name "$NAME" --arg model "$MODEL" --arg provider "$PROVIDER" \
   --argjson start "$START_MS" --argjson end "$END_MS" '
@@ -493,6 +613,7 @@ jq -n --slurpfile checks "$CHECKS_OUT" --slurpfile tl "$TIMELINE" --argjson conv
    billing:{rows:$r, rows_found:($r|length), total_cost_micros:($r|map(.cost_micros)|add // 0), total_price_micros:($r|map(.price_micros)|add // 0),
             total_cost_usd:(($r|map(.cost_micros)|add // 0)/1000000), input_tokens:($r|map(.input_tokens)|add // 0),
             output_tokens:($r|map(.output_tokens)|add // 0), cache_read_tokens:($r|map(.cache_read_tokens)|add // 0)},
+   sandbox:$sandbox,
    disk:$disk,
    teardown:null}' > "$RUN_DIR/run.json"
 # The account id is not part of the record.

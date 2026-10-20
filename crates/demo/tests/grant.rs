@@ -26,6 +26,7 @@ fn args(tamper: bool) -> MintArgs {
         workspace: "/workspace".into(),
         ttl_secs: 600,
         tamper,
+        exec_bearer: None,
     }
 }
 
@@ -62,6 +63,23 @@ fn the_agent_accepts_a_minted_grant_with_everything_in_it() {
     assert_eq!(grant.workspace_root, "/workspace");
     assert_eq!(grant.exec_url, "http://sandbox.demo.local:8081/exec");
     assert_eq!(grant.secrets.dek.expose(), &[0x33; 32]);
+}
+
+/// The bearer the public sandbox requires travels in the grant's sealed exec headers.
+#[test]
+fn the_exec_bearer_travels_in_the_grants_sealed_exec_headers() {
+    let k = keys();
+    let a = MintArgs {
+        exec_bearer: Some("s3cret-token".into()),
+        ..args(false)
+    };
+    let grant = verifier(&k)
+        .verify(&mint_grant(&k, &a).unwrap(), now())
+        .unwrap();
+    let h = &grant.secrets.exec_headers;
+    assert_eq!(h.len(), 1);
+    assert_eq!(h[0].name, "Authorization");
+    assert_eq!(h[0].value.expose(), "Bearer s3cret-token");
 }
 
 #[test]
