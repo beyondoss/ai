@@ -249,6 +249,13 @@ impl Mode {
         self.is_local()
     }
 
+    /// Whether a `--model` flag is only this process's default rather than the operator's choice for
+    /// the session. On a replica it is the former: one flag serves every tenant, so a tenant's own
+    /// `AGENTS.md` model outranks it.
+    pub(crate) fn model_flag_is_a_default(&self) -> bool {
+        !self.is_local()
+    }
+
     /// Whether to reap subagent worktrees orphaned by a crash. Not in service mode: the only repo
     /// that could sweep is the replica's own checkout.
     pub(crate) fn sweeps_worktrees(&self) -> bool {

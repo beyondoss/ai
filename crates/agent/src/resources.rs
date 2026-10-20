@@ -334,6 +334,12 @@ pub(crate) fn build_static_system_prompt_with_context(
         s.push_str("\n\n<project_context>\n\n");
         s.push_str("Project-specific instructions and guidelines:\n\n");
         for (path, body) in context_files {
+            // An `AGENTS.md`'s frontmatter configures the agent (see [`AgentSettings`]); the model
+            // reads only the instructions below it.
+            let body = match is_agents_md(Path::new(path)) {
+                true => split_agent_frontmatter(body).1,
+                false => std::borrow::Cow::Borrowed(body.as_str()),
+            };
             s.push_str(&format!(
                 "<project_instructions path=\"{path}\">\n{}\n</project_instructions>\n\n",
                 body.trim()
@@ -692,6 +698,98 @@ fn load_context_file_from_dir(dir: &Path) -> Option<(String, String)> {
         }
     }
     None
+}
+
+/// What the top-level `AGENTS.md`'s YAML frontmatter says about the agent itself: which model it
+/// runs, which tools it may call, how many model turns one prompt may take. The field names and the
+/// `tools` shape are a subagent definition's (see [`crate::agents`]), so one file format describes
+/// an agent whether it is the top-level one or a delegated child.
+///
+/// ```text
+/// ---
+/// model: claude-sonnet-5
+/// tools: read, grep, bash
+/// max-steps: 40
+/// ---
+/// <the instructions, as before>
+/// ```
+///
+/// Every field is optional and absent means "no opinion". An explicit CLI flag beats the file, and
+/// the file beats the stored settings and the built-in defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentSettings {
+    /// `model:` — the model a fresh session starts on. A session that already ran keeps the model it
+    /// was last on, exactly as with a stored `default_model`.
+    pub model: Option<String>,
+    /// `tools:` — comma-separated allow-list, applied with [`crate::tools::apply_filter`].
+    pub tools: Option<Vec<String>>,
+    /// `max-steps:` — the cap on model turns per prompt (`--max-steps`).
+    pub max_steps: Option<u32>,
+}
+
+impl AgentSettings {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn from_frontmatter(fm: &std::collections::HashMap<String, String>) -> Self {
+        let max_steps = fm.get("max-steps").and_then(|raw| {
+            let parsed = raw.trim().parse::<u32>().ok().filter(|n| *n > 0);
+            if parsed.is_none() {
+                tracing::warn!(max_steps = %raw, "AGENTS.md: ignoring max-steps (expected a positive integer)");
+            }
+            parsed
+        });
+        Self {
+            model: fm
+                .get("model")
+                .map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty()),
+            tools: fm
+                .get("tools")
+                .map(|raw| crate::agents::parse_name_list(raw)),
+            max_steps,
+        }
+    }
+}
+
+fn is_agents_md(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("agents.md"))
+}
+
+/// Split an `AGENTS.md` into its [`AgentSettings`] and the instructions below the frontmatter. A file
+/// whose leading `---` block is not a YAML mapping (a horizontal rule, say) has no frontmatter and
+/// comes back whole.
+fn split_agent_frontmatter(text: &str) -> (AgentSettings, std::borrow::Cow<'_, str>) {
+    let (fm, body) = skills::parse_frontmatter(text);
+    match fm.is_empty() {
+        true => (AgentSettings::default(), std::borrow::Cow::Borrowed(text)),
+        false => (
+            AgentSettings::from_frontmatter(&fm),
+            std::borrow::Cow::Owned(body),
+        ),
+    }
+}
+
+/// The settings in `workspace`'s own `AGENTS.md`, found among already-loaded `context_files` (this
+/// host's or a sandbox's). An ancestor's or the home directory's file configures nothing: only the
+/// directory the agent works in defines the agent.
+pub fn agent_settings_in(context_files: &[(String, String)], workspace: &Path) -> AgentSettings {
+    context_files
+        .iter()
+        .find(|(path, _)| {
+            let path = Path::new(path);
+            is_agents_md(path) && path.parent() == Some(workspace)
+        })
+        .map(|(_, body)| split_agent_frontmatter(body).0)
+        .unwrap_or_default()
+}
+
+/// [`agent_settings_in`] for this host's `cwd`, reading only that one file.
+pub fn workspace_agent_settings(cwd: &Path) -> AgentSettings {
+    let found: Vec<(String, String)> = load_context_file_from_dir(cwd).into_iter().collect();
+    agent_settings_in(&found, cwd)
 }
 
 /// Today's date as `YYYY-MM-DD` in the host's local timezone, without pulling in a date crate. Local
@@ -1981,6 +2079,78 @@ mod tests {
         let found = load_context_files_via(&backend, &ws, None).await;
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].1, "THE FALLBACK");
+    }
+
+    #[test]
+    fn agents_md_frontmatter_is_parsed_with_a_subagents_field_names() {
+        let (settings, body) = split_agent_frontmatter(
+            "---\nmodel: m1\ntools: read, bash ,\nmax-steps: 7\n---\nThe instructions.\n",
+        );
+        assert_eq!(settings.model.as_deref(), Some("m1"));
+        assert_eq!(settings.tools, Some(vec!["read".into(), "bash".into()]));
+        assert_eq!(settings.max_steps, Some(7));
+        assert_eq!(body, "The instructions.\n");
+    }
+
+    #[test]
+    fn a_bad_max_steps_is_ignored_and_a_leading_rule_is_not_frontmatter() {
+        let (settings, _) = split_agent_frontmatter("---\nmax-steps: lots\nmodel: m\n---\nx");
+        assert_eq!(settings.max_steps, None);
+        assert_eq!(settings.model.as_deref(), Some("m"));
+
+        let text = "---\n\nNot yaml mapping, just a rule.\n---\nrest";
+        let (settings, body) = split_agent_frontmatter(text);
+        assert!(settings.is_empty());
+        assert_eq!(body, text);
+    }
+
+    #[test]
+    fn only_the_workspaces_own_agents_md_configures_the_agent() {
+        let files = vec![
+            (
+                "/h/.claude/AGENTS.md".to_string(),
+                "---\nmodel: home\n---\n".to_string(),
+            ),
+            (
+                "/w/AGENTS.md".to_string(),
+                "---\nmodel: ws\n---\n".to_string(),
+            ),
+            (
+                "/w/sub/CLAUDE.md".to_string(),
+                "---\nmodel: sub\n---\n".to_string(),
+            ),
+        ];
+        let found = agent_settings_in(&files, Path::new("/w"));
+        assert_eq!(found.model.as_deref(), Some("ws"));
+        assert!(agent_settings_in(&files, Path::new("/w/sub")).is_empty());
+    }
+
+    #[test]
+    fn the_prompt_carries_an_agents_md_without_its_frontmatter() {
+        let files = vec![(
+            "/w/AGENTS.md".to_string(),
+            "---\nmodel: ws\n---\nBe brief.".to_string(),
+        )];
+        let opts = PromptOptions {
+            base: None,
+            default_base: "IDENTITY",
+            append: None,
+            cwd: Path::new("/w"),
+            include_context_files: true,
+            skills: &[],
+            context_window: 200_000,
+            has_read: true,
+            has_todo: false,
+            has_structured_output: false,
+            has_memory: false,
+            memory_sections: &[],
+            project_trusted: false,
+            agents: &[],
+            disk_overrides: false,
+        };
+        let prompt = build_static_system_prompt_with_context(&opts, &files);
+        assert!(prompt.contains("Be brief."), "{prompt}");
+        assert!(!prompt.contains("model: ws"), "{prompt}");
     }
 
     #[tokio::test]
