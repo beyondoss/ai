@@ -303,3 +303,24 @@ async fn cancelling_a_detachable_call_kills_the_command_and_keeps_its_output() {
     );
     drop(rx);
 }
+
+#[tokio::test]
+async fn a_background_start_ignores_timeout_ms_of_any_value() {
+    // `run_in_background` returns control at once, so `timeout_ms` has nothing to bound; a model
+    // that sends `0` alongside it must still get its job, not an error.
+    let (bash, jobs) = detaching(60_000);
+    let out = text(
+        bash.run(json!({
+            "command": "sleep 30", "run_in_background": true, "timeout_ms": 0
+        }))
+        .await,
+    );
+    assert!(out.contains("bash_job"), "{out}");
+    let _ = jobs.run(json!({ "job": 1, "kill": true })).await;
+    // Foreground, where 0 means nothing, stays rejected.
+    let err = bash
+        .run(json!({ "command": "echo hi", "timeout_ms": 0 }))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ToolError::InvalidInput(_)), "{err:?}");
+}
