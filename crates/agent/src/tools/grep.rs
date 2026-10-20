@@ -78,7 +78,8 @@ impl Tool for Grep {
                  are sorted by path and truncated to at most {DEFAULT_LIMIT} matches or {}, whichever \
                  is hit first, with individual lines truncated to {MAX_LINE} characters (centered \
                  on the match when it is further in); when \
-                 truncated, the lexicographically-smallest matches are reported. Paths are relative \
+                 truncated, the search stopped early, so the matches shown are sorted but are not \
+                 necessarily the first by path. Paths are relative \
                  to the working directory (absolute outside it), so `read` opens them as printed.",
                 super::output::format_size(super::output::MAX_LISTING_BYTES as u64)
             )
