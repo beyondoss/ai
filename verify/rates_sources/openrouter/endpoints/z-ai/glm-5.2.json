@@ -278,10 +278,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000006",
+          "completion": "0.0000044",
           "discount": 0,
-          "input_cache_read": "0.000000025",
-          "prompt": "0.00000004"
+          "input_cache_read": "0.000000047",
+          "prompt": "0.000000188"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -337,6 +337,19 @@
         "provider_name": "Phala",
         "quantization": "fp8",
         "tag": "phala/fp8"
+      },
+      {
+        "context_length": 1048576,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000004",
+          "discount": 0,
+          "input_cache_read": "0.00000008",
+          "prompt": "0.0000004"
+        },
+        "provider_name": "Relace",
+        "quantization": "unknown",
+        "tag": "relace"
       },
       {
         "context_length": 1048576,

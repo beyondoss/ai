@@ -136,6 +136,19 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
+          "completion": "0.0000105",
+          "discount": 0,
+          "input_cache_read": "0.00000021",
+          "prompt": "0.0000021"
+        },
+        "provider_name": "Fireworks",
+        "quantization": "unknown",
+        "tag": "fireworks/flex"
+      },
+      {
+        "context_length": 1048576,
+        "max_prompt_tokens": null,
+        "pricing": {
           "completion": "0.0000225",
           "discount": 0,
           "input_cache_read": "0.00000045",
@@ -149,10 +162,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000015",
+          "completion": "0.000014519",
           "discount": 0,
           "input_cache_read": "0.00000035",
-          "prompt": "0.00000249"
+          "prompt": "0.00000224"
         },
         "provider_name": "InferenceNet",
         "quantization": "fp4",
@@ -175,10 +188,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00001275",
+          "completion": "0.000015",
           "discount": 0,
-          "input_cache_read": "0.000000204",
-          "prompt": "0.00000153"
+          "input_cache_read": "0.00000023",
+          "prompt": "0.00000065"
         },
         "provider_name": "Makora",
         "quantization": "fp4",
@@ -216,8 +229,8 @@
         "pricing": {
           "completion": "0.0000149",
           "discount": 0,
-          "input_cache_read": "0.000000212",
-          "prompt": "0.000000243"
+          "input_cache_read": "0.000000441",
+          "prompt": "0.000000922"
         },
         "provider_name": "Morph",
         "quantization": "fp8",

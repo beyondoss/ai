@@ -123,10 +123,10 @@
         "context_length": 262144,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000235",
+          "completion": "0.00000195",
           "discount": 0,
-          "input_cache_read": "0.000000085",
-          "prompt": "0.0000000893"
+          "input_cache_read": "0.00000002",
+          "prompt": "0.00000004"
         },
         "provider_name": "Ionstream",
         "quantization": "fp8",
@@ -143,6 +143,19 @@
         "provider_name": "Mancer 2",
         "quantization": "fp8",
         "tag": "mancer/fp8"
+      },
+      {
+        "context_length": 262144,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000023",
+          "discount": 0,
+          "input_cache_read": "0.00000002",
+          "prompt": "0.00000004"
+        },
+        "provider_name": "Modal",
+        "quantization": "unknown",
+        "tag": "modal"
       },
       {
         "context_length": 262144,
@@ -253,8 +266,8 @@
         "pricing": {
           "completion": "0.0000023",
           "discount": 0,
-          "input_cache_read": "0.000000039",
-          "prompt": "0.00000004"
+          "input_cache_read": "0.000000059",
+          "prompt": "0.00000006"
         },
         "provider_name": "Wafer",
         "quantization": "fp8",

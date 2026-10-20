@@ -135,10 +135,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000003",
-          "discount": 0.4,
-          "input_cache_read": "0.000000018",
-          "prompt": "0.00000009"
+          "completion": "0.00000025",
+          "discount": 0.5,
+          "input_cache_read": "0.000000015",
+          "prompt": "0.000000075"
         },
         "provider_name": "GMICloud",
         "quantization": "fp8",
@@ -202,8 +202,8 @@
         "pricing": {
           "completion": "0.00000065",
           "discount": 0,
-          "input_cache_read": "0.000000011",
-          "prompt": "0.000000055"
+          "input_cache_read": "0.000000041",
+          "prompt": "0.000000148"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -226,10 +226,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000007",
+          "completion": "0.0000004",
           "discount": 0,
-          "input_cache_read": "0.000000075",
-          "prompt": "0.00000025"
+          "input_cache_read": "0.00000004",
+          "prompt": "0.00000012"
         },
         "provider_name": "NextBit",
         "quantization": "fp4",
@@ -252,10 +252,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000002",
+          "completion": "0.00000016",
           "discount": 0,
           "input_cache_read": "0.000000006",
-          "prompt": "0.000000044"
+          "prompt": "0.000000047076"
         },
         "provider_name": "OpenInference",
         "quantization": "fp4",
@@ -382,10 +382,10 @@
         "context_length": 1024000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000002495",
-          "discount": 0.501,
-          "input_cache_read": "0.00000001497",
-          "prompt": "0.00000007485"
+          "completion": "0.00000019615",
+          "discount": 0.6077,
+          "input_cache_read": "0.000000011769",
+          "prompt": "0.000000058845"
         },
         "provider_name": "StreamLake",
         "quantization": "fp8",
@@ -421,10 +421,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000025",
+          "completion": "0.0000002",
           "discount": 0,
-          "input_cache_read": "0.00000006",
-          "prompt": "0.00000008"
+          "input_cache_read": "0.000000058",
+          "prompt": "0.000000059"
         },
         "provider_name": "Wafer",
         "quantization": "nvfp4",

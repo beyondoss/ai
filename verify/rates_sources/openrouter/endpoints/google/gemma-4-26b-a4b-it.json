@@ -94,10 +94,10 @@
         "context_length": 256000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000018",
+          "completion": "0.00000024",
           "discount": 0,
-          "input_cache_read": "0.00000005",
-          "prompt": "0.0000001"
+          "input_cache_read": "0.000000046",
+          "prompt": "0.00000007"
         },
         "provider_name": "Makora",
         "quantization": "unknown",
