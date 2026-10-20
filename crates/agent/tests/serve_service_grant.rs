@@ -57,6 +57,7 @@ fn the_test_minter_reproduces_the_golden_vector_byte_for_byte() {
                 )
             })
             .collect(),
+        mcp_managed: Vec::new(),
         mcp_sandbox: c["mcp"]
             .as_array()
             .unwrap()

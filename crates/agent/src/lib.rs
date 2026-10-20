@@ -26,6 +26,7 @@ pub mod file_lock;
 pub mod gateway_credential;
 pub mod grant;
 pub mod lifecycle;
+pub mod managed_mcp_token;
 pub mod mcp_auth_store;
 pub mod mcp_resume;
 pub mod memory;
