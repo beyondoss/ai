@@ -168,3 +168,26 @@ async fn reading_a_locked_session_through_any_public_api_leaves_it_locked() {
         Some(false)
     );
 }
+
+/// A single-file session whose writer lock is held is not deleted out from under its writer: the
+/// delete is refused, and once the writer lets go it goes through.
+#[test]
+fn deleting_a_single_file_session_its_writer_holds_is_refused() {
+    let dir = tmpdir();
+    let repo = SessionRepo::open(dir.path()).unwrap();
+    let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+    let id = store.meta().id.clone();
+    let path = repo.find_path(&id).unwrap().unwrap();
+    let lock = lock_session_writer(&path).unwrap().unwrap();
+
+    let err = repo.delete(&id).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    assert!(path.is_file(), "the held session must stay where it is");
+    let mut session = Session::new();
+    session.user("still saves");
+    store.append_new(&session.messages).unwrap();
+
+    drop(lock);
+    repo.delete(&id).unwrap();
+    assert!(!path.exists());
+}

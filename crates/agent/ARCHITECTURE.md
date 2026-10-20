@@ -5014,6 +5014,7 @@ directory renamed into `.trash/` between the open and the lock.
 `SessionRepo::delete` on a segmented repo takes that lock first and refuses if it is held, then
 renames `<id>/` → `.trash/<id>.<unix_ns>`. The timestamp suffix is what makes repeated deletes of one
 id work, and the rename carries `memory/` along with the segments.
+A single-file `delete` refuses a held writer lock (`lock_session_writer`) the same way, so a session another process is writing is never trashed under it.
 
 ### Listings
 
