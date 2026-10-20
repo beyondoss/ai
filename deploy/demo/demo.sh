@@ -9,6 +9,11 @@
 #                                   see the same session, and the job's end, come back
 #     ./deploy/demo/demo.sh all     both, in one run record
 #
+#     ./deploy/demo/demo.sh assistant | coding | browser
+#                                   the three use cases: an agent is a folder under deploy/demo/agents/,
+#                                   run for real, with its own checks and its own record
+#                                   (needs `SANDBOX=both ./deploy/demo/up.sh`; see usecases.sh)
+#
 # Every run writes results/<UTC timestamp>/run.json (the record) and report.html (one self-contained
 # page rendered from it, replaying the run). Neither ever holds a key or a grant.
 #
@@ -19,7 +24,8 @@
 #     step's JSON summary on stdout. `result` takes 1 for pass, 0 for fail.
 #  2. Give it a title in CHECK_TITLE, and add its name to the list(s) below.
 #
-# That is all: the runner times it, records it, and the report draws it.
+# That is all: the runner times it, records it, and the report draws it. (A use case's checks live in
+# usecases.sh and are added the same way.)
 set -uo pipefail
 # shellcheck source=lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -47,11 +53,15 @@ if [ "$SANDBOX" = e2b ]; then
   CHECKS_core=(grant-refused real-model-turn sandbox-exec sandbox-per-session sandbox-auth-required background-job-notify notify-forged-refused sealed-at-rest billing-rows)
   CHECKS_all=(grant-refused real-model-turn sandbox-exec sandbox-per-session sandbox-auth-required background-job-notify notify-forged-refused kill-and-recover sealed-at-rest billing-rows)
 fi
+# shellcheck source=usecases.sh
+. "$HERE/usecases.sh"
 MODE=${1:-core}
 case "$MODE" in
   core | kill | all) ;;
-  *) echo "usage: demo.sh [core|kill|all]" >&2; exit 2 ;;
+  assistant | coding | browser) USECASE=1 ;;
+  *) echo "usage: demo.sh [core|kill|all|assistant|coding|browser]" >&2; exit 2 ;;
 esac
+USECASE=${USECASE:-}
 declare -n CHECKS="CHECKS_$MODE"
 
 for tool in aws jq curl cargo; do
@@ -59,7 +69,7 @@ for tool in aws jq curl cargo; do
 done
 now_ms() { date +%s%3N; }
 RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)
-RUN_DIR=${DEMO_RESULTS:-$HERE/results}/$RUN_ID
+RUN_DIR=${DEMO_RESULTS:-$HERE/results}/$RUN_ID${USECASE:+-$MODE}
 mkdir -p "$RUN_DIR"
 WORK=$(mktemp -d)
 chmod 700 "$WORK"
@@ -71,10 +81,10 @@ EVENTS=$WORK/events.jsonl           # every frame the client saw
 TIMELINE=$WORK/timeline.ndjson      # one line per key event, any source
 CHECKS_OUT=$WORK/checks.ndjson
 CALLS=$WORK/calls.ndjson            # model calls the agent says it made, per session
-touch "$EVENTS" "$TIMELINE" "$CHECKS_OUT" "$CALLS"
+touch "$EVENTS" "$TIMELINE" "$CHECKS_OUT" "$CALLS" "$WORK/windows.ndjson"
 VMDIR=$WORK/vm                      # one file per session's E2B sandbox (e2b mode)
 mkdir -p "$VMDIR"
-if [ "$SANDBOX" = e2b ]; then
+if [ "$USE_E2B" = 1 ]; then
   e2b_need_key || exit 2
   STUB=$(stub_bin) || { echo "demo: could not build the static exec-stub" >&2; exit 1; }
   CA_FILE=$WORK/ca.pem
@@ -117,7 +127,7 @@ DEMO_FLEET_SECRET=$(ssm_get fleet-secret)
 DEMO_DEK=$(ssm_get dek)
 DEMO_GATEWAY_KEY=$(ssm_get gateway-key)
 export DEMO_GRANT_SEED DEMO_FLEET_SECRET DEMO_DEK DEMO_GATEWAY_KEY
-[ "$SANDBOX" != e2b ] || ssm_get public | jq -r .ca_pem > "$CA_FILE"
+[ "$USE_E2B" = 0 ] || ssm_get public | jq -r .ca_pem > "$CA_FILE"
 
 grant() { # session [tamper]
   if [ "$SANDBOX" = e2b ]; then
@@ -130,7 +140,8 @@ grant() { # session [tamper]
       --exec-url "http://sandbox.$DNS:$SANDBOX_PORT/exec" ${2:+--tamper}
   fi
 }
-# One conversation step; the JSON summary on stdout, the live view on stderr.
+# One conversation step; the JSON summary on stdout, the live view on stderr. A use case sets GRANT_FN
+# to its own minter.
 chat() { # session chat-args...
   local s=$1
   shift
@@ -139,10 +150,12 @@ chat() { # session chat-args...
   local ev=(--events "$EVENTS")
   case " $* " in *" --command "*) ev=() ;; esac
   [ -z "${NOLOG:-}" ] || ev=()
-  DEMO_GRANT=$(grant "$s") "$DEMO" chat --host "$IP" --port "$AGENT_PORT" --session "$s" "${ev[@]}" "$@"
+  DEMO_GRANT=$("${GRANT_FN:-grant}" "$s") "$DEMO" chat --host "$IP" --port "$AGENT_PORT" --session "$s" "${ev[@]}" "$@"
 }
 note_calls() { # session summary-json: remember how many model calls the agent says the session made
   jq -c --arg s "$1" '{session:$s, assistant_messages: ([.prompt_response.data.assistant_messages, .wake_response.data.assistant_messages]|map(select(.!=null))|max)}' <<<"$2" >> "$CALLS"
+  # when the turn ran: from the prompt sent to its answer (a use case counts sandbox calls inside these)
+  jq -c 'select(.prompt_response != null) | {sent:.sent_at_ms, done:.done_at_ms}' <<<"$2" >> "$WORK/windows.ndjson"
 }
 
 # ---- the runner --------------------------------------------------------------------------------------
@@ -167,11 +180,16 @@ run_check() {
 
 # CloudWatch, filtered: [{t, m}] for a stream prefix since a time.
 cw() { # stream-prefix since-ms [filter-pattern]
-  if [ "$SANDBOX" = e2b ]; then
-    # The sandboxes' own logs are in their VMs, not CloudWatch.
+  if [ "$USE_E2B" = 1 ]; then
+    # An E2B sandbox's own log is in its VM, not CloudWatch; a Fargate one (the use cases' workspace
+    # host) is in CloudWatch. Both, merged by time.
     local a b
     case "${1:-}" in
-      sandbox/*) vm_logs "${3//\"/}" "$2"; return ;;
+      sandbox/*)
+        a=$(cw_aws "$@")
+        b=$(vm_logs "${3//\"/}" "$2")
+        jq -nc --argjson a "$a" --argjson b "$b" '($a + $b)|sort_by(.t)'
+        return ;;
       "")
         a=$(cw_aws "$@")
         b=$(vm_logs "" "$2")
@@ -530,6 +548,13 @@ tl demo run_started null null "$START_MS"
 FORGE_SESSION=""
 DISK=null
 BILLING=null
+UC_JSON=null
+if [ -n "$USECASE" ]; then
+  rule
+  echo "▶ the agent folder: deploy/demo/agents/$MODE"
+  (cd "$UC_AGENTS/$MODE" && find . -type f ! -name '*.pyc' | sort | sed 's|^\./|    |')
+  uc_prepare
+fi
 for c in "${CHECKS[@]}"; do
   run_check "$c"
 done
@@ -555,6 +580,9 @@ jq -c '[.[]|select(.m|startswith("{"))|{t, d:(.m|fromjson? // empty)}|select(.d.
   | .out as $all
   | ($all | map(select(.event=="job_ended_callback")) | group_by(.detail.job) | map({key:.[0].detail.job, value:(map(.detail.round)|max)}) | from_entries) as $last
   | $all[] | if .event=="job_ended_callback" then .detail.kind = (if .detail.round==1 then "keep_proof" elif .detail.round==$last[.detail.job] then "job_end" else "re_keep_proof" end) | del(.detail.round) else . end' <<<"$LOGS" >> "$TIMELINE"
+# The stand-in managed endpoint's lines: one per request it verified, refused or forwarded.
+jq -c '.[]|select(.m|startswith("{"))|{t, d:(.m|fromjson? // empty)}|select(.d.src=="standin" and (.d.event|test("managed_call|managed_refused")))|
+  {t_ms:.d.ts_ms, src:"standin", event:.d.event, path:(if .d.event=="managed_call" then ["agent","standin"] else null end), detail:.d.detail}' <<<"$LOGS" >> "$TIMELINE"
 jq -c '.[]|{t, d:(.m|fromjson? // empty)}|select(.d.target=="ai.usage")|.d.fields|
   ({t_ms:((.start_unix_secs*1000)), src:"gateway", event:"model_request", path:["agent","gateway","model"], detail:{request_id, model:.requested_model, input_tokens}},
    {t_ms:((.start_unix_secs*1000)+.latency_ms), src:"gateway", event:"model_response", path:["model","gateway","agent"], detail:{request_id, output_tokens, cost_micros}})' <<<"$LOGS" >> "$TIMELINE"
@@ -567,7 +595,9 @@ EVENTS=$WORK/events.clean
 # Client frames: the key ones only (the stream's deltas stay out of the record).
 jq -c 'select(.src=="client")|.frame as $f|.session as $s|.ts_ms as $t|
   if $f.type=="demo_prompt_sent" then {t_ms:$t,src:"client",event:"prompt",path:["you","agent"],detail:{session:$s}}
-  elif $f.event.kind=="tool_start" then {t_ms:$t,src:"client",event:"tool_start",path:null,detail:{session:$s,name:$f.event.name}}
+  elif $f.event.kind=="tool_start" then
+    (if ($f.event.name|test("^mcp__deepwiki__")) then ["agent","deepwiki"] elif ($f.event.name|test("^mcp__browser__")) then ["agent","browser"] else null end) as $to
+    | {t_ms:$t,src:"client",event:(if $to then "tool_to_server" else "tool_start" end),path:$to,detail:{session:$s,name:$f.event.name}}
   elif $f.event.kind=="tool_end" then {t_ms:$t,src:"client",event:"tool_end",path:null,detail:{session:$s,name:$f.event.name}}
   elif $f.event.kind=="background" then {t_ms:$t,src:"client",event:("background_"+($f.event.reason//"")),path:null,detail:{session:$s,wake:$f.event.wake}}
   elif $f.type=="response" and $f.command=="prompt" then {t_ms:$t,src:"client",event:"turn_complete",path:["agent","efs"],detail:{session:$s}}
@@ -590,7 +620,7 @@ CONV=$(jq -s '
 
 COMMIT=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
 DIRTY=$(git -C "$ROOT" status --porcelain 2>/dev/null | grep -c . || true)
-if [ "$SANDBOX" = e2b ]; then
+if compgen -G "$VMDIR/*.json" >/dev/null; then
   SANDBOX_JSON=$(jq -sc '{provider:"e2b", label:"E2B microVM", per_session:true, region:null,
     vms: map({session, sandbox_id:.id, created_ms})}' "$VMDIR"/*.json)
 else
@@ -599,12 +629,13 @@ fi
 ROWS_JSON=$(cw gateway/ "$((START_MS - 5000))" '"ai.usage"' | jq -c '[.[]|.m|fromjson?|select(.target=="ai.usage")|.fields]')
 jq -n --slurpfile checks "$CHECKS_OUT" --slurpfile tl "$TIMELINE" --argjson conv "$CONV" --argjson disk "${DISK:-null}" --argjson sandbox "$SANDBOX_JSON" \
   --argjson rows "$ROWS_JSON" --arg id "$RUN_ID" --arg mode "$MODE" --arg commit "$COMMIT" --argjson dirty "${DIRTY:-0}" \
-  --arg region "$REGION" --arg name "$NAME" --arg model "$MODEL" --arg provider "$PROVIDER" \
+  --arg region "$REGION" --arg name "$NAME" --arg model "$MODEL" --arg provider "$PROVIDER" --argjson uc "$UC_JSON" \
   --argjson start "$START_MS" --argjson end "$END_MS" '
   ($checks) as $c |
   ($rows | map({request_id, t_ms:((.start_unix_secs // 0)*1000), tenant_id, provider, model, requested_model, routed_model, price_model, outcome, price_status,
       input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, cost_micros, price_micros, latency_ms})) as $r |
   {schema:1,
+   use_case:$uc,
    run:{id:$id, mode:$mode, started_ms:$start, ended_ms:$end, commit:$commit, uncommitted_files:$dirty, region:$region, name:$name},
    model:{requested:$model, provider:$provider, routed:($r|map(.routed_model)|unique), price_model:($r|map(.price_model)|unique), via:"crates/gateway (managed bai_v1 key)"},
    checks:($c + [{name:"teardown-zero", title:"Teardown leaves nothing behind", pass:null, status:"pending", detail:"filled in by down.sh", measurements:{}}]),

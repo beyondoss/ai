@@ -53,6 +53,45 @@ enum Cmd {
         /// Carry `Authorization: Bearer $DEMO_EXEC_BEARER` in the grant's exec headers.
         #[arg(long)]
         exec_bearer: bool,
+        /// A header the exec endpoint needs, `name=Header-Name`; the value is read from the
+        /// environment variable `DEMO_EXEC_HEADER_<NAME>` (upper case, `-` as `_`), never argv.
+        #[arg(long = "exec-header")]
+        exec_header: Vec<String>,
+        /// An MCP connector: `name=url`. Repeatable.
+        #[arg(long = "mcp")]
+        mcp: Vec<String>,
+        /// Mark the named connector `sandbox`: no standing stream, no pooled idle connection.
+        #[arg(long = "mcp-sandbox")]
+        mcp_sandbox: Vec<String>,
+        /// Mark the named connector managed: it holds a `bmc_v1` token (secret `DEMO_MANAGED_SECRET`).
+        #[arg(long = "mcp-managed")]
+        mcp_managed: Vec<String>,
+        /// A header the named connector sends, `name=Header-Name`; the value is read from the
+        /// environment variable `DEMO_MCP_HEADER_<NAME>` (upper case, `-` as `_`), never argv.
+        #[arg(long = "mcp-header")]
+        mcp_header: Vec<String>,
+        /// The grant's `limits.models` ceiling (comma-separated ids or `*` patterns).
+        #[arg(long, value_delimiter = ',')]
+        limits_models: Option<Vec<String>>,
+        /// The grant's `limits.tools` ceiling.
+        #[arg(long, value_delimiter = ',')]
+        limits_tools: Option<Vec<String>>,
+        /// The grant's `limits.max_steps` ceiling.
+        #[arg(long)]
+        limits_max_steps: Option<u32>,
+    },
+    /// Unseal the grant in DEMO_GRANT and print what it holds, without the secrets: connector names,
+    /// header names, and whether the string in DEMO_NEEDLE is anywhere inside.
+    #[cfg(feature = "agent-lib")]
+    InspectGrant,
+    /// Run the stand-in managed-MCP endpoint and its provider (secrets from DEMO_MANAGED_SECRET and
+    /// DEMO_PROVIDER_SECRET).
+    #[cfg(feature = "agent-lib")]
+    ManagedEndpoint {
+        #[arg(long, default_value = "0.0.0.0:8082")]
+        listen: String,
+        #[arg(long, default_value = "127.0.0.1:8083")]
+        provider_listen: String,
     },
     /// Print a job-end callback token and its scope as JSON (secret from DEMO_FLEET_SECRET).
     #[cfg(feature = "agent-lib")]
@@ -120,7 +159,37 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             ttl_secs,
             tamper,
             exec_bearer,
+            exec_header,
+            mcp,
+            mcp_sandbox,
+            mcp_managed,
+            mcp_header,
+            limits_models,
+            limits_tools,
+            limits_max_steps,
         } => {
+            let connectors = connectors(&mcp, &mcp_sandbox, &mcp_managed, &mcp_header)?;
+            let exec_headers = exec_header
+                .iter()
+                .map(|h| {
+                    let (name, header_name) = h
+                        .split_once('=')
+                        .ok_or("--exec-header takes name=Header-Name")?;
+                    let var = format!(
+                        "DEMO_EXEC_HEADER_{}",
+                        name.to_ascii_uppercase().replace('-', "_")
+                    );
+                    let value = std::env::var(&var).map_err(|_| format!("{var} is not set"))?;
+                    Ok::<_, String>((header_name.to_string(), value))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let limits =
+                (limits_models.is_some() || limits_tools.is_some() || limits_max_steps.is_some())
+                    .then_some(keys::Limits {
+                        models: limits_models,
+                        tools: limits_tools,
+                        max_steps: limits_max_steps,
+                    });
             let exec_bearer = if exec_bearer {
                 Some(std::env::var("DEMO_EXEC_BEARER").map_err(|_| "DEMO_EXEC_BEARER is not set")?)
             } else {
@@ -139,9 +208,35 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         ttl_secs,
                         tamper,
                         exec_bearer,
+                        exec_headers,
+                        connectors,
+                        limits,
                     }
                 )?
             );
+            Ok(())
+        }
+        #[cfg(feature = "agent-lib")]
+        Cmd::InspectGrant => {
+            let token = std::env::var("DEMO_GRANT").map_err(|_| "DEMO_GRANT is not set")?;
+            let needle = std::env::var("DEMO_NEEDLE").unwrap_or_default();
+            println!(
+                "{}",
+                keys::inspect_grant(&keys::GrantKeys::from_env()?, &token, &needle)?
+            );
+            Ok(())
+        }
+        #[cfg(feature = "agent-lib")]
+        Cmd::ManagedEndpoint {
+            listen,
+            provider_listen,
+        } => {
+            beyond_ai_demo::managed::run(beyond_ai_demo::managed::Args {
+                listen,
+                provider_listen,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
             Ok(())
         }
         #[cfg(feature = "agent-lib")]
@@ -182,4 +277,48 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
     }
+}
+
+/// The `--mcp*` flags as connectors. A flag naming a connector `--mcp` never declared is an error.
+fn connectors(
+    mcp: &[String],
+    sandbox: &[String],
+    managed: &[String],
+    header: &[String],
+) -> Result<Vec<keys::Connector>, Box<dyn std::error::Error>> {
+    let mut out: Vec<keys::Connector> = Vec::new();
+    for m in mcp {
+        let (name, url) = m.split_once('=').ok_or("--mcp takes name=url")?;
+        out.push(keys::Connector {
+            name: name.into(),
+            url: url.into(),
+            ..Default::default()
+        });
+    }
+    let find = |out: &[keys::Connector], name: &str| -> Result<usize, String> {
+        out.iter()
+            .position(|c| c.name == name)
+            .ok_or_else(|| format!("no --mcp connector named {name}"))
+    };
+    for n in sandbox {
+        let i = find(&out, n)?;
+        out[i].sandbox = true;
+    }
+    for n in managed {
+        let i = find(&out, n)?;
+        out[i].managed = true;
+    }
+    for h in header {
+        let (name, header_name) = h
+            .split_once('=')
+            .ok_or("--mcp-header takes name=Header-Name")?;
+        let i = find(&out, name)?;
+        let var = format!(
+            "DEMO_MCP_HEADER_{}",
+            name.to_ascii_uppercase().replace('-', "_")
+        );
+        let value = std::env::var(&var).map_err(|_| format!("{var} is not set"))?;
+        out[i].headers.push((header_name.into(), value));
+    }
+    Ok(out)
 }

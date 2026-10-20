@@ -16,8 +16,8 @@ set -uo pipefail
 FILTER="Name=tag:$TAG_KEY,Values=$NAME"
 # E2B sandboxes are part of the deployment whenever E2B_API_KEY is there to look for them. In e2b
 # mode a missing key is an error: "nothing left" could not be proven.
-if [ -z "${E2B_API_KEY:-}" ] && [ "$SANDBOX" = e2b ]; then
-  echo "down: SANDBOX=e2b needs E2B_API_KEY to find and kill the sandboxes" >&2
+if [ -z "${E2B_API_KEY:-}" ] && [ "$USE_E2B" = 1 ]; then
+  echo "down: SANDBOX=e2b or both needs E2B_API_KEY to find and kill the sandboxes" >&2
   exit 2
 fi
 quiet() { "$@" >/dev/null 2>&1; }
@@ -47,7 +47,8 @@ td_arns() { # status
 survey() {
   VPC_NOW=$(q ec2 describe-vpcs --filters "$FILTER" --query 'Vpcs[0].VpcId' 2>/dev/null || true)
   NS_NOW=$(q servicediscovery list-namespaces --query "Namespaces[?Name=='$DNS'].Id|[0]" 2>/dev/null || true)
-  LEFT[ssm_parameters]=$(n "aws ssm get-parameters-by-path --path '$SSM' --recursive --query 'length(Parameters)'")
+  # The listing is paged (ten a page), and each page prints its own count: add them up.
+  LEFT[ssm_parameters]=$(n "aws ssm get-parameters-by-path --path '$SSM' --recursive --query 'length(Parameters)' | tr '\\t' '\\n' | awk '{s += \$1} END {print s + 0}'")
   LEFT[iam_roles]=$(n "aws iam list-roles --query \"length(Roles[?starts_with(RoleName,'$P-')])\"")
   LEFT[log_groups]=$(n "aws logs describe-log-groups --log-group-name-prefix '$LOG_GROUP' --query 'length(logGroups)'")
   LEFT[ecs_clusters]=$(n "aws ecs describe-clusters --clusters '$CLUSTER' --query 'length(clusters[?status!=\`INACTIVE\`])'")
@@ -83,7 +84,14 @@ survey() {
 counts_json() {
   local json='{}' k
   for k in $(printf '%s\n' "${!LEFT[@]}" | sort); do
-    json=$(jq -c --arg k "$k" --argjson v "${LEFT[$k]}" '. + {($k): $v}' <<<"$json")
+    v=${LEFT[$k]}
+    if ! [[ $v =~ ^[0-9]+$ ]]; then
+      # a listing that answered with more than one number: say so, and count the first
+      echo "down: $k counted as: $(printf '%q' "$v")" >&2
+      v=$(grep -o '[0-9]\+' <<<"$v" | head -1)
+      v=${v:-0}
+    fi
+    json=$(jq -c --arg k "$k" --argjson v "$v" '. + {($k): $v}' <<<"$json")
   done
   echo "$json"
 }
@@ -263,20 +271,32 @@ verdict=$([ "$total" = 0 ] && echo clean || echo remains)
 record=$(jq -nc --argjson counts "$json" --argjson before "$BEFORE" --arg v "$verdict" --arg name "$NAME" --arg region "$REGION" \
   --argjson stale "$TAG_INDEX" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{tagging_index_stale:$stale,name:$name,region:$region,verified_at:$at,verdict:$v,before:$before,counts:$counts}')
 
-# Into the latest run record, so the report's teardown panel has it.
+# Into the run records still waiting for it (every use case's run since the last teardown), so each
+# report's teardown panel has it; with none waiting, into the latest one.
 RESULTS=${DEMO_RESULTS:-$HERE/results}
-latest=$(find "$RESULTS" -mindepth 2 -maxdepth 2 -name run.json 2>/dev/null | sort | tail -1)
-# A second run over an already clean record would overwrite what the first one counted down from.
-if [ -n "$latest" ] && [ "$verdict" = clean ] \
-  && { [ "$(jq -r '.teardown.verdict // ""' "$latest")" != clean ] || [ "$(jq '[.[]]|add' <<<"$BEFORE")" != 0 ]; }; then
-  jq --argjson t "$record" '.teardown = $t
-    | .checks |= map(if .name == "teardown-zero" then
-        .pass = true | .status = "pass" | .started_ms = null | .ended_ms = null
-        | .detail = ("every resource type counted 0 at " + $t.verified_at)
-        | .headline = {label: "left behind", value: "0", unit: "resources"}
-        | .measurements = {resource_types: ($t.counts | length), remaining: ($t.counts | add)}
-      else . end)' "$latest" >"$latest.tmp" && mv "$latest.tmp" "$latest"
-  "$HERE/report.sh" "$(dirname "$latest")" >/dev/null 2>&1 || true
+records=$(find "$RESULTS" -mindepth 2 -maxdepth 2 -name run.json 2>/dev/null | sort)
+targets=
+for r in $records; do
+  [ "$(jq -r '.teardown == null' "$r")" = true ] && targets="$targets $r"
+done
+if [ -z "$targets" ]; then
+  latest=$(printf '%s\n' "$records" | tail -1)
+  # A second run over an already clean record would overwrite what the first one counted down from.
+  if [ -n "$latest" ] && { [ "$(jq -r '.teardown.verdict // ""' "$latest")" != clean ] || [ "$(jq '[.[]]|add' <<<"$BEFORE")" != 0 ]; }; then
+    targets=$latest
+  fi
+fi
+if [ "$verdict" = clean ]; then
+  for rec in $targets; do
+    jq --argjson t "$record" '.teardown = $t
+      | .checks |= map(if .name == "teardown-zero" then
+          .pass = true | .status = "pass" | .started_ms = null | .ended_ms = null
+          | .detail = ("every resource type counted 0 at " + $t.verified_at)
+          | .headline = {label: "left behind", value: "0", unit: "resources"}
+          | .measurements = {resource_types: ($t.counts | length), remaining: ($t.counts | add)}
+        else . end)' "$rec" >"$rec.tmp" && mv "$rec.tmp" "$rec"
+    "$HERE/report.sh" "$(dirname "$rec")" >/dev/null 2>&1 || true
+  done
 fi
 echo "$record" > "${DEMO_TEARDOWN_OUT:-/dev/null}"
 

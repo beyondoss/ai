@@ -94,13 +94,25 @@ pre { background: var(--code); border-radius: 8px; padding: 10px; margin: 0; ove
 .log div { display: grid; grid-template-columns: 70px 74px 1fr; gap: 8px; }
 .log .t { color: var(--muted); }
 details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+.uc { margin-bottom: 14px; }
+.uc .lede { font-size: 15px; margin: 0 0 10px; max-width: 80ch; }
+.tree { list-style: none; margin: 0; padding: 0; font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace; }
+.tree li { border-bottom: 1px solid var(--line); padding: 2px 0; }
+.tree li > details > summary { color: var(--ink); font: inherit; display: flex; justify-content: space-between; gap: 12px; }
+.tree .sz { color: var(--muted); font-variant-numeric: tabular-nums; }
+.tree pre { margin: 6px 0 8px; max-height: 260px; }
+.dir { color: var(--muted); }
+.chk .d { font-size: 12px; margin: 6px 0 0; color: var(--ink); }
+.chk details { margin-top: 6px; }
+.chk details pre { max-height: 200px; margin-top: 4px; font-size: 11px; }
+.chk .v.small { font-size: 22px; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
     <div>
-      <h1>The whole agent, on AWS</h1>
+      <h1 id="title">The whole agent, on AWS</h1>
       <div class="sub" id="meta"></div>
     </div>
     <div style="display:flex;gap:8px;align-items:center">
@@ -108,6 +120,13 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
       <button id="theme" title="Light or dark">Theme</button>
     </div>
   </header>
+
+  <section class="card uc" id="uc" hidden>
+    <h2>Use case</h2>
+    <p class="lede" id="uc-summary"></p>
+    <h2 id="uc-folder-h" style="margin-top:12px">The agent is this folder</h2>
+    <ul class="tree" id="uc-tree"></ul>
+  </section>
 
   <div class="grid">
     <section class="card">
@@ -162,7 +181,7 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
       <div class="tablewrap"><table id="ledger"><thead><tr><th>time</th><th>model → routed / priced as</th><th>input</th><th>cached</th><th>output</th><th>reasoning</th><th>cost µ$</th><th>latency</th></tr></thead><tbody></tbody></table></div>
     </section>
 
-    <section class="card full">
+    <section class="card full" id="disk-card">
       <h2>What's on disk</h2>
       <div class="two">
         <div><h3>What you saw</h3><pre id="plain">(not yet)</pre></div>
@@ -207,6 +226,21 @@ const fmtUsd = micros => "$" + (micros / 1e6).toFixed(6);
   };
 })();
 
+/* ---- the use case: a title, what it shows, and the folder ---- */
+const UC = run.use_case || null;
+if (UC) {
+  $("title").textContent = UC.title;
+  document.title = UC.name + ": agent folder run report";
+  $("uc").hidden = false;
+  $("uc-summary").textContent = UC.summary;
+  const rows = UC.tree.map(f => {
+    const parts = f.path.split("/"), name = parts.pop(), dir = parts.length ? parts.join("/") + "/" : "";
+    const label = `<span><span class="dir">${esc(dir)}</span>${esc(name)}</span><span class="sz">${f.bytes} B</span>`;
+    return `<li><details><summary>${label}</summary><pre>${esc(f.text)}${f.bytes > (f.text || "").length ? "\n…" : ""}</pre></details></li>`;
+  });
+  $("uc-tree").innerHTML = rows.join("");
+}
+
 /* ---- header ---- */
 const passed = run.checks.filter(c => c.pass === true).length;
 const failed = run.checks.filter(c => c.pass === false).length;
@@ -224,10 +258,20 @@ const NODES = {
   sandbox: { x: 490, y: 260, w: 120, h: 62, label: E2B ? "E2B microVM × " + SB.vms.length : "sandbox", sub: E2B ? "one per session" : "exec v1.1 – v1.4" },
   efs:     { x: 270, y: 318, w: 120, h: 44, label: "EFS",          sub: "sealed sessions" },
 };
-const EDGES = [["you", "agent"], ["agent", "gateway"], ["gateway", "model"], ["agent", "sandbox"], ["agent", "efs"]].concat(E2B ? [] : [["efs", "sandbox"]]);
+const EDGES = [["you", "agent"], ["agent", "gateway"], ["gateway", "model"], ["agent", "sandbox"], ["agent", "efs"]].concat(E2B || UC ? [] : [["efs", "sandbox"]]);
+// What a use case adds to the picture: the servers its agent reaches besides the sandbox.
+if (UC && UC.name === "assistant") {
+  NODES.standin = { x: 130, y: 62, w: 118, h: 54, label: "managed endpoint", sub: "holds the real key" };
+  NODES.deepwiki = { x: 330, y: 36, w: 104, h: 40, label: "DeepWiki", sub: "public MCP server" };
+  NODES.sandbox.label = "workspace host"; NODES.sandbox.sub = "reads AGENTS.md only";
+  EDGES.push(["agent", "standin"], ["agent", "deepwiki"]);
+} else if (UC) {
+  NODES.browser = { x: 600, y: 190, w: 80, h: 50, label: "browser", sub: "in the VM" };
+  EDGES.push(["sandbox", "browser"]);
+}
 if (E2B) {
   $("sandboxes").hidden = false;
-  $("sandboxes-note").textContent = "Each session has its own E2B microVM (public port URL, the grant's bearer required). The sandbox node above is all of them; this is the breakdown.";
+  $("sandboxes-note").textContent = UC ? "This agent's own E2B microVM. Its ports answer only a request carrying the VM's traffic token, which the grant holds." : "Each session has its own E2B microVM (public port URL, the grant's bearer required). The sandbox node above is all of them; this is the breakdown.";
   const tb = $("vms").querySelector("tbody");
   for (const v of SB.vms) {
     const mine = run.timeline.filter(e => e.src === "sandbox" && e.vm === v.sandbox_id);
@@ -249,7 +293,7 @@ for (const id in NODES) {
   nodeEls[id] = g;
 }
 const COLORS = { prompt: "--c-you", first_token: "--c-you", model_request: "--c-model", model_response: "--c-model", exec_start: "--c-tool", exec_end: "--c-tool",
-  job_ended_callback: "--c-job", turn_complete: "--c-efs", session_read_from_efs: "--c-efs", grant_refused: "--c-bad", forged_job_ended: "--c-bad", session_reattached: "--c-you" };
+  managed_call: "--c-tool", tool_to_server: "--c-tool", job_ended_callback: "--c-job", turn_complete: "--c-efs", session_read_from_efs: "--c-efs", grant_refused: "--c-bad", forged_job_ended: "--c-bad", session_reattached: "--c-you" };
 const sorted = run.timeline.slice().sort((a, b) => a.t_ms - b.t_ms);
 // The first token: the model's reply travelling back to you, one per prompt (the client summary has it as `first_token` via the conversation).
 for (const m of run.conversation) if (m.role === "assistant") sorted.push({ t_ms: m.t_ms, src: "client", event: "first_token", path: ["agent", "you"], detail: { session: m.session } });
@@ -315,6 +359,7 @@ function nodeState() {
 }
 
 /* ---- panels that depend on t ---- */
+const sessions = new Set(run.conversation.map(m => m.session));
 function renderConv() {
   const abs = T0 + t, c = $("conv"); let h = "";
   const items = run.conversation.map(m => ({ t: m.t_ms, m })).concat(
@@ -325,7 +370,7 @@ function renderConv() {
     if (it.d) { h += it.d.event === "agent_killed" ? `<div class="divider">agent SIGKILLed — the session is on EFS, the sandbox keeps running</div>` : `<div class="divider ok">session reattached on the replacement agent — same conversation</div>`; continue; }
     const m = it.m;
     if (m.role === "tool") h += `<div class="msg tool"><div class="who">tool · ${esc(m.name)}</div>${esc(m.input)}${m.end_ms && m.end_ms <= abs ? `<div class="out">${esc(m.output)}</div>` : ""}</div>`;
-    else h += `<div class="msg ${m.role}"><div class="who">${m.role === "user" ? "you" : m.role === "notice" ? "agent told (job_ended)" : "assistant"}</div>${esc(m.text)}</div>`;
+    else h += `<div class="msg ${m.role}"><div class="who">${m.role === "user" ? "you" : m.role === "notice" ? "agent told (job_ended)" : "assistant"}${sessions.size > 1 ? " · " + esc(String(m.session).slice(-3)) : ""}</div>${esc(m.text)}</div>`;
   }
   if (!h) h = `<div class="empty">The conversation appears as it happened.</div>`;
   if (c.dataset.h !== h) { const atEnd = c.scrollTop + c.clientHeight >= c.scrollHeight - 40; c.innerHTML = h; c.dataset.h = h; if (playing || atEnd) c.scrollTop = c.scrollHeight; }
@@ -347,13 +392,15 @@ function renderBoard() {
     const done = c.pass !== null && c.ended_ms && c.ended_ms <= abs || (c.pass !== null && !c.ended_ms);
     const st = !done ? "pending" : c.pass ? "pass" : "fail";
     const h = c.headline && c.headline.label ? `${esc(c.headline.label)}: <b>${esc(c.headline.value)}</b> ${esc(c.headline.unit || "")}` : "&nbsp;";
-    return `<div class="chk ${st}"><div class="v">${st === "pass" ? "PASS" : st === "fail" ? "FAIL" : c.status === "pending" || c.pass === null ? "…" : "…"}</div><div class="t">${esc(c.title)}</div><div class="k">${done ? h : "waiting"}</div><div class="n">${esc(c.name)}${done && c.duration_ms ? " · " + (c.duration_ms / 1000).toFixed(1) + " s" : ""}</div></div>`;
+    const ev = done && UC && c.measurements && Object.keys(c.measurements).length ? `<details><summary>evidence</summary><pre>${esc(JSON.stringify(c.measurements, null, 1))}</pre></details>` : "";
+    const why = done && UC && c.detail ? `<div class="d">${esc(c.detail)}</div>` : "";
+    return `<div class="chk ${st}"><div class="v">${st === "pass" ? "PASS" : st === "fail" ? "FAIL" : c.status === "pending" || c.pass === null ? "…" : "…"}</div><div class="t">${esc(c.title)}</div><div class="k">${done ? h : "waiting"}</div>${why}${ev}<div class="n">${esc(c.name)}${done && c.duration_ms ? " · " + (c.duration_ms / 1000).toFixed(1) + " s" : ""}</div></div>`;
   }).join("");
 }
 function renderDisk() {
   const chk = run.checks.find(c => c.name === "sealed-at-rest");
   const shown = run.disk && chk && (chk.ended_ms <= T0 + t);
-  if (!run.disk) { $("plain").textContent = "(this run did not include the sealed-at-rest check)"; $("cipher").textContent = ""; return; }
+  if (!run.disk) { $("disk-card").hidden = true; return; }
   $("plain").textContent = shown ? `The phrase the model returned to you:\n\n  ${run.disk.plaintext_seen_by_user}\n\nmatches of it in the session's bytes on EFS: ${run.disk.plaintext_matches}` : "(not yet)";
   const hex = (run.disk.hex_excerpt || "").split(" ").reduce((a, b, i) => a + b + ((i + 1) % 16 === 0 ? "\n" : " "), "");
   $("cipher").textContent = shown ? `${run.disk.file_bytes} bytes; line 2 begins "${run.disk.ascii_prefix}"\n\n${hex}` : "(not yet)";
