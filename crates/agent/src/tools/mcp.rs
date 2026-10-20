@@ -1346,6 +1346,12 @@ impl McpConnection {
         }
     }
 
+    /// Mark the server used now: the idle window counts from here.
+    fn touch(&self) {
+        self.last_used
+            .store(now_secs(), std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The live client, connecting first if the process was reaped — or has died.
     ///
     /// A server that crashed (an OOM kill, an unhandled exception, `kill -9`) leaves its client
@@ -1356,8 +1362,7 @@ impl McpConnection {
     /// per-caller retry. A call already in flight when the server died still fails: whether it
     /// reached the server is unknowable, and re-sending a `tools/call` could do its work twice.
     pub(crate) async fn client(&self) -> Result<Arc<McpClient>, String> {
-        self.last_used
-            .store(now_secs(), std::sync::atomic::Ordering::Relaxed);
+        self.touch();
         let mut guard = self.client.lock().await;
         if let Some(live) = guard.as_ref() {
             if !live.client.is_transport_closed() {
@@ -1528,6 +1533,17 @@ impl McpTool {
     }
 }
 
+/// Marks a connection used again when a call ends, so the idle window counts from the call's end as
+/// well as its start: a call longer than the window must not leave the server idle the moment it
+/// returns, or the next reaper pass kills the process and the state the call built with it.
+struct UsedOnDrop<'a>(&'a McpConnection);
+
+impl Drop for UsedOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.touch();
+    }
+}
+
 /// One `tools/call` on `conn`, returning the server's whole result — `structuredContent` and
 /// `_meta` included, which the model never sees but an MCP App view does.
 async fn call_tool_raw(
@@ -1544,6 +1560,7 @@ async fn call_tool_raw(
     let client = conn.client().await.map_err(|e| {
         ToolError::Execution(format!("mcp server `{server_name}` is not reachable: {e}"))
     })?;
+    let _used = UsedOnDrop(conn);
     // The questions this call raises go to the session that made it (see [`calling_host`]) —
     // tracked per call, so a nested request is attributed to that session or refused.
     let host = calling_host(&client.service().host);
@@ -2394,6 +2411,73 @@ async fn dial_with_backoff(conn: &McpConnection) -> Result<Arc<McpClient>, Strin
     Err(last)
 }
 
+/// The longest embedded-resource text, in bytes, shown in a placeholder rather than only counted.
+const PLACEHOLDER_TEXT_MAX: usize = 1024;
+
+/// A short stand-in for a content block `ToolOutput` cannot carry: its type, mime type and size
+/// (and the uri, and the text when small), never the payload — a 4 MiB audio block must not become
+/// a 4 MiB tool result.
+fn unsupported_block_placeholder(block: &ContentBlock) -> String {
+    /// A server-chosen string, bounded and escaped so it can't bloat or reshape the line.
+    fn short(s: &str) -> String {
+        let end = s.char_indices().nth(200).map_or(s.len(), |(i, _)| i);
+        format!("{:?}", &s[..end])
+    }
+    /// Decoded size of a base64 payload, from its length.
+    fn b64_bytes(s: &str) -> usize {
+        s.len() / 4 * 3
+    }
+    let detail = match block {
+        ContentBlock::Audio(a) => format!(
+            "audio, mime {}, {} bytes",
+            short(&a.mime_type),
+            b64_bytes(&a.data)
+        ),
+        ContentBlock::Resource(r) => match &r.resource {
+            ResourceContents::TextResourceContents {
+                uri,
+                mime_type,
+                text,
+                ..
+            } => {
+                let mime = short(mime_type.as_deref().unwrap_or(""));
+                if text.len() <= PLACEHOLDER_TEXT_MAX {
+                    format!(
+                        "embedded resource {}, mime {mime}, text {text:?}",
+                        short(uri)
+                    )
+                } else {
+                    format!(
+                        "embedded resource {}, mime {mime}, {} bytes of text",
+                        short(uri),
+                        text.len()
+                    )
+                }
+            }
+            ResourceContents::BlobResourceContents {
+                uri,
+                mime_type,
+                blob,
+                ..
+            } => format!(
+                "embedded resource {}, mime {}, {} bytes",
+                short(uri),
+                short(mime_type.as_deref().unwrap_or("")),
+                b64_bytes(blob)
+            ),
+            _ => "embedded resource".to_string(),
+        },
+        ContentBlock::ResourceLink(l) => format!(
+            "resource link {}, mime {}",
+            short(&l.uri),
+            short(l.mime_type.as_deref().unwrap_or(""))
+        ),
+        // Text and image are handled by the caller.
+        _ => "content".to_string(),
+    };
+    format!("[unsupported MCP content block: {detail}]")
+}
+
 pub(crate) fn tool_output_from_result(
     server_name: &str,
     remote_name: &str,
@@ -2420,7 +2504,7 @@ pub(crate) fn tool_output_from_result(
                 if !text.is_empty() {
                     text.push('\n');
                 }
-                text.push_str(&format!("[unsupported MCP content block: {other:?}]"));
+                text.push_str(&unsupported_block_placeholder(&other));
             }
         }
     }
@@ -4188,6 +4272,59 @@ mod tests {
         assert_eq!(
             answered_by(&shared.elicit(params, None).await.unwrap()),
             "process"
+        );
+    }
+
+    /// Audio and embedded resources are summarized, never printed whole: a 4 MiB audio block must
+    /// not become a 4 MiB tool result.
+    #[test]
+    fn unsupported_content_blocks_become_short_placeholders() {
+        use rmcp::model::{AudioContent, EmbeddedResource};
+        let run = |block| {
+            let result = CallToolResult::success(vec![block]);
+            tool_output_from_result("s", "t", result).unwrap().text
+        };
+
+        let audio = run(ContentBlock::Audio(AudioContent::new(
+            "A".repeat(4 * 1024 * 1024),
+            "audio/wav",
+        )));
+        assert!(audio.len() < 200, "{}", audio.len());
+        assert!(
+            audio.contains("audio") && audio.contains("audio/wav"),
+            "{audio}"
+        );
+        assert!(audio.contains("3145728 bytes"), "{audio}");
+
+        let blob = run(ContentBlock::Resource(EmbeddedResource::new(
+            ResourceContents::BlobResourceContents {
+                uri: "file:///a.bin".into(),
+                mime_type: Some("application/octet-stream".into()),
+                blob: "A".repeat(1024 * 1024),
+                meta: None,
+            },
+        )));
+        assert!(blob.len() < 200, "{}", blob.len());
+        assert!(
+            blob.contains("file:///a.bin") && blob.contains("786432 bytes"),
+            "{blob}"
+        );
+
+        let small = run(ContentBlock::Resource(EmbeddedResource::new(
+            ResourceContents::text("hello", "file:///a.txt"),
+        )));
+        assert!(
+            small.contains("file:///a.txt") && small.contains("hello"),
+            "{small}"
+        );
+
+        let big = run(ContentBlock::Resource(EmbeddedResource::new(
+            ResourceContents::text("x".repeat(1_000_000), "file:///big.txt"),
+        )));
+        assert!(
+            big.len() < 200 && big.contains("1000000 bytes"),
+            "{}",
+            big.len()
         );
     }
 

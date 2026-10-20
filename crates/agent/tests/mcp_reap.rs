@@ -144,6 +144,40 @@ async fn an_idle_server_is_reaped_and_reconnects_on_the_next_call() {
     );
 }
 
+/// The idle clock counts from when a call ends, not only from when it starts: a call that runs
+/// longer than the window must not leave its server looking idle the moment it returns, or the next
+/// reaper pass kills the process and the state the call just built goes with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_longer_than_the_window_does_not_leave_the_server_idle() {
+    let tag = &unique_tag("reap-long-call-jkl012");
+    let (tools, _catalog, warnings) =
+        mcp::connect_all(&[fixture_config(tag)], Duration::from_secs(2), None).await;
+    let tools = owned(tools);
+    assert!(
+        warnings.is_empty(),
+        "fixture failed to connect: {warnings:?}"
+    );
+    let hold = tools
+        .iter()
+        .find(|t| t.name() == "mcp__fixture__hold")
+        .expect("fixture advertised no `hold` tool")
+        .clone();
+
+    // Three seconds against a two-second window; the reaper's own cadence is one second.
+    let out = hold.run(json!({ "ms": 3000 })).await;
+    assert!(out.is_ok(), "hold failed: {out:?}");
+
+    // Well inside a fresh window (the call just ended), across at least one reaper pass.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        fixture_processes(tag),
+        1,
+        "the server was reaped right after a call that outlasted the idle window"
+    );
+    drop(hold);
+    drop(tools);
+}
+
 /// A window of zero disables reaping entirely — the escape hatch for an operator who would rather pay
 /// the memory than ever re-spawn. Asserted because "0 means off" is exactly the kind of contract that
 /// silently becomes "0 means reap instantly".

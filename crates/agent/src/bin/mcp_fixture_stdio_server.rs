@@ -8,6 +8,7 @@
 //!
 //! Tools:
 //! - `echo` / `add` / `ping` / `fail` / `echo_env` / `image` / `slow_progress` — see prior docs.
+//! - `hold`: sleeps `ms` milliseconds, then returns `held` (a call that outlasts an idle window).
 //! - `ask_user`: nested `elicitation/create` mid-`tools/call` — classic server→client elicitation.
 //! - `ask_user_mrtr`: returns SEP-2322 `input_required` with an elicitation input request; on retry
 //!   with `inputResponses` completes — proves MRTR under protocol `2026-07-28`.
@@ -174,6 +175,21 @@ async fn main() {
             && params.get("name").and_then(Value::as_str) == Some("slow_progress")
         {
             if write_slow_progress(&mut stdout, id, &params).await.is_err() {
+                break;
+            }
+            continue;
+        }
+
+        // `hold`: a call that takes `ms` milliseconds, to outlast an idle window.
+        if method == "tools/call" && params.get("name").and_then(Value::as_str) == Some("hold") {
+            let ms = params.pointer("/arguments/ms").and_then(Value::as_u64);
+            tokio::time::sleep(std::time::Duration::from_millis(ms.unwrap_or(0))).await;
+            let result = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "content": [{ "type": "text", "text": "held" }], "isError": false }
+            });
+            if write_json_line(&mut stdout, &result).await.is_err() {
                 break;
             }
             continue;
@@ -572,6 +588,11 @@ fn tool_defs() -> Value {
             "name": "image",
             "description": "Returns a tiny embedded PNG as image content.",
             "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
+            "name": "hold",
+            "description": "Waits `ms` milliseconds, then returns `held`.",
+            "inputSchema": { "type": "object", "properties": { "ms": { "type": "integer" } } },
         },
         {
             "name": "slow_progress",
