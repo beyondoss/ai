@@ -36,7 +36,9 @@ impl SessionMcpFixture {
 }
 
 pub async fn spawn_session_mcp_fixture() -> SessionMcpFixture {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = beyond_ai_test_support::ports::listener();
+    listener.set_nonblocking(true).unwrap();
+    let listener = TcpListener::from_std(listener).unwrap();
     let addr = listener.local_addr().unwrap();
     let fixture = SessionMcpFixture {
         url: format!("http://{addr}/mcp"),
