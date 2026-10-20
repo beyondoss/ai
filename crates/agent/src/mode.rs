@@ -256,6 +256,28 @@ impl Mode {
         !self.is_local()
     }
 
+    /// The grant's ceilings narrowing `tools` and `max_steps`. Outside service mode there is no grant,
+    /// so both come back as given.
+    pub(crate) fn apply_limits(
+        &self,
+        tools: Option<Vec<String>>,
+        max_steps: Option<u32>,
+    ) -> (Option<Vec<String>>, Option<u32>) {
+        match self.service() {
+            Some(service) => (
+                service.limits().narrow_tools(tools),
+                service.limits().cap_steps(max_steps),
+            ),
+            None => (tools, max_steps),
+        }
+    }
+
+    /// Why `model` may not run in this session, if the grant's `limits` forbid it. The model is
+    /// refused, never swapped for another.
+    pub(crate) fn model_refusal(&self, model: &str) -> Option<String> {
+        self.service()?.limits().check_model(model).err()
+    }
+
     /// Whether to reap subagent worktrees orphaned by a crash. Not in service mode: the only repo
     /// that could sweep is the replica's own checkout.
     pub(crate) fn sweeps_worktrees(&self) -> bool {

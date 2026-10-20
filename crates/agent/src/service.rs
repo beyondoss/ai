@@ -319,6 +319,11 @@ impl ServiceSession {
         self.grant.code_mode
     }
 
+    /// The ceilings the grant puts on this session (none, when it carries no `limits` claim).
+    pub fn limits(&self) -> &crate::grant::Limits {
+        &self.grant.limits
+    }
+
     /// The tenant's workspace inside the sandbox — this session's `cwd` everywhere `serve` reports
     /// or records one.
     pub fn workspace_root(&self) -> &str {
@@ -1150,6 +1155,7 @@ mod tests {
             mcp: Vec::new(),
             exp: 0,
             code_mode: false,
+            limits: Default::default(),
             secrets: serde_json::from_str(
                 r#"{"exec_headers":[],"mcp_headers":{},"gateway_key":"k","dek":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}"#,
             )

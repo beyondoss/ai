@@ -25,6 +25,9 @@ impl SessionLoop {
         {
             Some(Ok((model, thinking_level))) => {
                 let model = model.as_str();
+                if let Some(why) = self.mode.model_refusal(model) {
+                    return self.emit(response(id, "set_model", false, None, Some(&why)));
+                }
                 // Re-derive the gateway credential/routing for `model` before touching any other
                 // state — a switch can cross OAuth providers (or `models.json` overrides), and
                 // this must fail closed (leaving `current_model`/the persisted lineage untouched)
@@ -344,6 +347,15 @@ impl SessionLoop {
         // hint list when unscoped), wrapping — a quick way for a client to step through the
         // candidate list without needing its own copy of it. An id outside the list (a custom
         // `set_model` the client issued directly) wraps to the first entry, same as "not found".
+        if self.cycle_models.is_empty() {
+            return self.emit(response(
+                id,
+                "cycle_model",
+                false,
+                None,
+                Some("no model to cycle to: this session's grant limits allow none of them"),
+            ));
+        }
         let next_idx = self
             .cycle_models
             .iter()

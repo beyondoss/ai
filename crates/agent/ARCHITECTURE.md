@@ -4716,7 +4716,8 @@ signed      ASCII "bsg_v1.{kid}.{payload_b64}"   (version and kid are signed: no
 sig         Ed25519(signed)
 payload     compact JSON, keys in this order:
             {"tenant":str,"session_id":str,"home_shard":str,"workspace_root":str,"exec_url":str,
-             "mcp":[{"name":str,"url":str,"sandbox":true,"managed":true},...],"exp":u64,"code_mode":true,"sealed":str}
+             "mcp":[{"name":str,"url":str,"sandbox":true,"managed":true},...],"exp":u64,"code_mode":true,
+             "limits":{"models":[str,...],"tools":[str,...],"max_steps":u32},"sealed":str}
 exp         unix seconds; the grant is valid while now < exp (no leeway: the minter's TTL absorbs skew)
 sandbox     optional per connector; present only as true (omitted otherwise, so existing grants mint
             byte-for-byte as before); absent means false. A replica must accept it before any minter
@@ -4726,6 +4727,12 @@ managed     optional per connector, same rules as `sandbox`: present only as tru
             token names this grant's tenant and session and the connector (below), else `BadClaims`
 code_mode   optional; present only as true (a grant that doesn't ask for Code Mode omits it, so it mints
             byte-for-byte as before the claim existed); absent means off
+limits      optional object of ceilings; every field optional, and a missing claim or field means no
+            ceiling. Omitted when absent, so a grant without it mints byte-for-byte as before and the
+            golden vectors do not move. Unknown fields inside it are refused like any unknown claim.
+            models     allow-list of model ids; `*` in an entry matches any run of characters
+            tools      allow-list of tool names (the `--tools` vocabulary)
+            max_steps  cap on model turns per prompt
 
 sealed      eph_pk (32) ‖ nonce (24) ‖ XChaCha20-Poly1305 ciphertext ‖ tag (16)
 shared      X25519(eph_sk, fleet_pk)          — an all-zero result (low-order eph_pk) is rejected
@@ -6067,6 +6074,29 @@ leaves it off by default (QuickJS is ~1 MB of `.text` resident in every replica 
 session uses it) and takes `--build-arg AGENT_FEATURES=code-mode` for a fleet that offers it. Without
 the feature the interpreter is not compiled in and the tool is never registered, so the claim is inert
 rather than wrong.
+
+### Grant ceilings — `limits`
+
+A tenant's `AGENTS.md` frontmatter and its client's commands configure the session; the grant's
+optional `limits` claim bounds both (`grant::Limits`). The edge sets what the tenant's plan allows, and
+nothing the tenant writes can exceed it.
+
+- **Models.** The effective model must match an entry of `limits.models` or the request is refused with
+  an error naming the model and the allowed list — never silently swapped for another. It is checked
+  at session start (after the file, the replica's `--model` default and a reattached session's last
+  model have settled, so a session that cannot run on an allowed model does not start and the client
+  gets an `error` frame), on `set_model`, before every `prompt` (which also covers a branch or
+  session restore that moves the model), and `cycle_model` steps only through allowed models.
+- **Tools.** The session's allow-list (from `--tools` or the file) is intersected with `limits.tools`;
+  a session that allowed every tool gets exactly the ceiling. It is the same filter as `--tools`, so
+  the tools that filter does not govern (`memory`) are not governed here either.
+- **Steps.** `max_steps` is the lower of the session's own cap and the ceiling; with no cap of its own
+  the session gets the ceiling.
+- **Absent means as before.** A grant without `limits`, or with only some fields, ceilings only those.
+  The claim is applied in `setup_prompt` (`Mode::apply_limits`) after the `AGENTS.md` frontmatter, so
+  nothing earlier can exceed it.
+
+Like `code_mode`, replicas must accept `limits` before any edge emits it.
 
 ### The idle window is shorter on a replica
 
