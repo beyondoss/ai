@@ -19,7 +19,7 @@ UC_AGENTS=$HERE/agents
 
 CHECKS_assistant=(persona-applied remote-mcp-real managed-mcp-no-key memory-across-sessions limits-enforced no-sandbox-calls)
 CHECKS_coding=(skill-used fix-verified subagent-from-folder app-as-background-job browser-sees-localhost)
-CHECKS_browser=(browser-reads-page no-held-connection idle-cost state-survives-pause)
+CHECKS_browser=(browser-reads-page no-held-connection idle-cost state-survives-pause state-survives-idle-reap)
 CHECK_TITLE+=(
   [persona-applied]="AGENTS.md sets the model and the tools"
   [remote-mcp-real]="A public remote MCP server (DeepWiki), from .mcp.json"
@@ -35,6 +35,7 @@ CHECK_TITLE+=(
   [browser-reads-page]="The browser reads a page served inside the sandbox"
   [no-held-connection]="No connection is held to a sleeping sandbox"
   [state-survives-pause]="Page state survives a paused sandbox"
+  [state-survives-idle-reap]="Page state survives the agent's MCP idle window"
   [idle-cost]="What an idle browser costs"
 )
 
@@ -81,6 +82,13 @@ uc_rows_since() { # since-ms min-rows
     sleep 3
   done
   echo "$rows"
+}
+
+# Optional string arguments the model sent as "" to browser tools, over every frame recorded so far:
+# [{tool, arg}]. A schema that makes optional arguments required pushes the model to fill them with "".
+uc_empty_args() {
+  jq -cR 'fromjson?' "$EVENTS" | jq -sc '[.[] | select(.frame.event.kind == "tool_start" and (.frame.event.name | test("^mcp__browser__")))
+    | .frame.event as $e | ($e.input | to_entries[] | select(.value == "")) | {tool: $e.name, arg: .key}]'
 }
 
 uc_grant() { "$GRANT_FN" "$@"; }
@@ -554,8 +562,10 @@ check_browser_reads_page() {
   text=$(jq -r .text <<<"$out")
   echo "  snapshot: $(tr '\n' ' ' <<<"${nav:0:300}")"
   if [[ $nav == *"Field Notes"* && $nav == *"$PAGE_STAMP"* && $nav == *heading* ]] && [[ $text == *"$PAGE_STAMP"* ]]; then
-    result 1 "navigate to the in-VM page plus its accessibility snapshot took $ms ms; the snapshot held the heading and this run's stamp ($PAGE_STAMP), and the reply quoted it" \
-      "$(jq -nc --arg s "${nav:0:700}" --argjson ms "$ms" --argjson tb "${#nav}" --argjson turn "$(jq .total_ms <<<"$out")" '{navigate_ms:$ms, snapshot_bytes:$tb, snapshot:$s, turn_ms:$turn}')" \
+    local empties
+    empties=$(uc_empty_args)
+    result 1 "navigate to the in-VM page plus its accessibility snapshot took $ms ms; the snapshot held the heading and this run's stamp ($PAGE_STAMP), and the reply quoted it. Browser tool calls with an empty-string optional argument so far: $(jq length <<<"$empties")" \
+      "$(jq -nc --arg s "${nav:0:700}" --argjson ms "$ms" --argjson tb "${#nav}" --argjson turn "$(jq .total_ms <<<"$out")" --argjson e "$empties" '{navigate_ms:$ms, snapshot_bytes:$tb, snapshot:$s, turn_ms:$turn, empty_string_args:{count:($e|length), calls:$e}}')" \
       "$(jq -nc --argjson ms "$ms" '{label:"navigate + snapshot",value:$ms,unit:"ms"}')"
   else
     result 0 "snapshot=${nav:0:300} reply=${text:0:200}"
@@ -624,6 +634,45 @@ check_state_survives_pause() {
       "$(jq -nc --argjson r "$resume_ms" '{label:"resume",value:$r,unit:"ms"}')"
   else
     result 0 "after the resume: navigations $navs, MCP sessions opened $init_before -> $init_after (a higher number means the agent re-dialed the bridge, which starts a new browser); $(head -c 200 <<<"$snap")"
+  fi
+}
+
+# A sandbox connector is never idle-reaped. The agent's window for an unused MCP server is 120 s
+# (BEYOND_AI_AGENT_MCP_IDLE_SECS, unset on this replica, so the default); the session is held attached
+# and idle for longer than that, and the page must still hold what was typed, through the same MCP
+# session. The window is not lowered for the run.
+IDLE_REAP_HOLD_S=${IDLE_REAP_HOLD_S:-150}
+check_state_survives_idle_reap() {
+  local m set_out set_snap init_before init_after out2 snap navs holder empties
+  m="R$RANDOM$RANDOM"
+  set_out=$(chat "$SESS_B" --timeout-secs 300 --prompt "On the page that is open, replace the contents of the 'Your note' textbox with exactly $m: take a browser_snapshot to get its ref, then use browser_type with that ref and the text. Then use browser_get_text with the selector #echo and tell me what it says.")
+  note_calls "$SESS_B" "$set_out"
+  set_snap=$(jq -r '[.tools[]|select(.name|test("^mcp__browser__"))|.output // ""]|join("\n")' <<<"$set_out")
+  [[ $set_snap == *"echo:$m"* ]] || { result 0 "the note was not typed: $(head -c 300 <<<"$set_snap")"; return; }
+  init_before=$(vm_in "$SESS_B" 'grep -c "\"method\":\"initialize\"" /tmp/bridge.log' | tr -dc 0-9)
+  tl demo idle_reap_hold_started null null
+  # attached the whole time, so the session is not simply gone; no prompt, no call
+  NOLOG=1 chat "$SESS_B" --wait-wake-secs "$IDLE_REAP_HOLD_S" --timeout-secs "$((IDLE_REAP_HOLD_S + 20))" >/dev/null 2>&1 &
+  holder=$!
+  echo "  holding the session idle for $IDLE_REAP_HOLD_S s (the agent's MCP idle window is 120 s)"
+  wait "$holder" 2>/dev/null
+  tl demo idle_reap_hold_ended null null
+  out2=$(chat "$SESS_B" --timeout-secs 300 --prompt "Do not call browser_navigate or browser_reload. Use browser_get_text with the selector #echo on the page that is open, and tell me what it says.")
+  note_calls "$SESS_B" "$out2"
+  snap=$(jq -r '[.tools[]|select(.name|test("^mcp__browser__"))|.output // ""]|join("\n")' <<<"$out2")
+  navs=$(uc_tools "$out2" 'browser_navigate' | jq length)
+  init_after=$(vm_in "$SESS_B" 'grep -c "\"method\":\"initialize\"" /tmp/bridge.log' | tr -dc 0-9)
+  empties=$(uc_empty_args)
+  echo "  MCP sessions opened on the bridge: $init_before before the hold, $init_after after"
+  echo "  after the hold, without navigating ($navs navigate calls): $(grep -o "echo:$m" <<<"$snap" | head -1)"
+  echo "  browser tool calls with an empty-string argument in this run: $(jq length <<<"$empties")"
+  if [[ $snap == *"echo:$m"* ]] && [ "$navs" = 0 ] && [ -n "$init_before" ] && [ "$init_before" = "$init_after" ]; then
+    result 1 "after $IDLE_REAP_HOLD_S s idle (the agent's MCP idle window is 120 s) the page still showed what had been typed (echo:$m), read without navigating, and the bridge saw no new initialize ($init_before before, $init_after after): the connector was not reaped. Browser tool calls carrying an empty-string optional argument in this run: $(jq length <<<"$empties")" \
+      "$(jq -nc --arg m "$m" --argjson hold "$IDLE_REAP_HOLD_S" --argjson ib "$init_before" --argjson ia "$init_after" --argjson e "$empties" \
+        '{typed:$m, idle_hold_s:$hold, agent_mcp_idle_window_s:120, window_lowered:false, echo_after_hold:("echo:"+$m), navigations_after_hold:0, mcp_sessions_opened_before:$ib, mcp_sessions_opened_after:$ia, same_mcp_session:true, empty_string_args:{count:($e|length), calls:$e}}')" \
+      "$(jq -nc --argjson h "$IDLE_REAP_HOLD_S" '{label:"idle, page state kept",value:$h,unit:"s"}')"
+  else
+    result 0 "after the hold: navigations $navs, MCP sessions opened $init_before -> $init_after; $(head -c 200 <<<"$snap")"
   fi
 }
 

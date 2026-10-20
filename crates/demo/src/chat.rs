@@ -33,6 +33,14 @@ pub struct Args {
     pub touch_sandbox: bool,
 }
 
+/// Whether `frame` is the agent's `ack` (or an early `response`) to the prompt sent with `id`: the
+/// first frame of the connection that is about that prompt rather than an earlier run's replay.
+fn answers_prompt(frame: &Value, id: &str) -> bool {
+    matches!(frame["type"].as_str(), Some("ack" | "response"))
+        && frame["command"] == "prompt"
+        && frame["id"] == id
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -87,10 +95,12 @@ pub async fn run(a: Args) -> Res<Value> {
     });
 
     let (mut sent_at, mut sent_at_ms, mut first_token_ms) = (Instant::now(), now_ms(), None::<u64>);
+    // Unique per connection, so a replayed run's own ack for an earlier prompt cannot be mistaken for ours.
+    let prompt_id = format!("p{}", now_ms());
     if let Some(p) = &a.prompt {
         eprintln!("  you      > {p}");
         ws.send(Message::text(
-            json!({"type": "prompt", "id": "p1", "message": p}).to_string(),
+            json!({"type": "prompt", "id": prompt_id, "message": p}).to_string(),
         ))
         .await?;
         sent_at = Instant::now();
@@ -120,6 +130,10 @@ pub async fn run(a: Args) -> Res<Value> {
     let mut responses = Vec::<Value>::new();
     let (mut turns_done, mut woke_at_ms, mut wake_done_ms) = (0usize, None::<u64>, None::<u64>);
 
+    // Attaching to a session whose run is still in flight replays that run's frames ahead of
+    // everything else (`catchup`, then the turn so far). They belong to an earlier prompt, so with a
+    // prompt of our own nothing counts, or is logged, until the agent acknowledges it.
+    let mut replaying = a.prompt.is_some();
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         let msg = match tokio::time::timeout(left, ws.next()).await {
@@ -130,6 +144,12 @@ pub async fn run(a: Args) -> Res<Value> {
         let Ok(frame) = serde_json::from_str::<Value>(&raw) else {
             continue;
         };
+        if replaying {
+            replaying = !answers_prompt(&frame, &prompt_id);
+            if replaying {
+                continue;
+            }
+        }
         log.frame(&a.session, &frame);
         match frame["type"].as_str().unwrap_or("") {
             "event" => {
@@ -255,5 +275,21 @@ fn short(s: &str, n: usize) -> String {
         one
     } else {
         format!("{}…", one.chars().take(n).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_prompts_own_ack_ends_the_replay() {
+        let tool = json!({"type": "event", "event": {"kind": "tool_start"}});
+        assert!(!answers_prompt(&tool, "p2"));
+        // The replayed run answers its own prompt, under another id.
+        let earlier = json!({"type": "response", "command": "prompt", "id": "p1"});
+        assert!(!answers_prompt(&earlier, "p2"));
+        let ack = json!({"type": "ack", "command": "prompt", "id": "p2"});
+        assert!(answers_prompt(&ack, "p2"));
     }
 }

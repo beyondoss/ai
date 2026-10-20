@@ -19,17 +19,18 @@
     ]
   },
   "run": {
-    "id": "20261020T195519Z",
+    "id": "20261020T230210Z",
     "mode": "assistant",
-    "started_ms": 1792526119317,
-    "ended_ms": 1792526430407,
-    "commit": "a52772e7d38164a263e1d85aac6a53716f45c52d",
-    "uncommitted_files": 7,
+    "started_ms": 1792537330742,
+    "ended_ms": 1792537818091,
+    "commit": "f2156b5d92910e1136d907e8ca12d35c69f0a37c",
+    "uncommitted_files": 4,
     "region": "us-west-2",
     "name": "demo"
   },
   "model": {
-    "requested": "gpt-5-mini",
+    "requested": "gpt-4.1-mini",
+    "replica_default": "gpt-5-mini",
     "provider": "openai",
     "routed": [
       "gpt-4.1-mini"
@@ -44,9 +45,9 @@
       "name": "persona-applied",
       "title": "AGENTS.md sets the model and the tools",
       "pass": true,
-      "started_ms": 1792526135612,
-      "ended_ms": 1792526142562,
-      "duration_ms": 6950,
+      "started_ms": 1792537567790,
+      "ended_ms": 1792537578169,
+      "duration_ms": 10379,
       "detail": "the model was gpt-4.1-mini in every billing row (the replica's own default is gpt-5-mini), and the tools offered are exactly the allow-list: DeepWiki's read_wiki_contents is not among them",
       "headline": {
         "label": "model from AGENTS.md",
@@ -71,44 +72,44 @@
         ],
         "replica_default_model": "gpt-5-mini",
         "reply_signed_by_persona": true,
-        "model_says": "I am Juniper, your research assistant specializing in codebases and project knowledge; the tools I can call are functions.mcp__deepwiki__ask_wiki_question, functions.mcp__deepwiki__read_wiki_structure, functions.mcp__vault__account_status, functions.memory."
+        "model_says": "I am Juniper, your succinct research assistant specialized in codebases, equipped to answer questions about open-source projects, manage memory, and access customer accounts using AI-powered tools. The tools I can call are: functions.mcp__deepwiki__ask_wiki_question, functions.mcp__deepwiki__read_wiki_structure, functions.mcp__vault__account_status, functions.memory.parallel"
       }
     },
     {
       "name": "remote-mcp-real",
       "title": "A public remote MCP server (DeepWiki), from .mcp.json",
       "pass": true,
-      "started_ms": 1792526142565,
-      "ended_ms": 1792526157121,
-      "duration_ms": 14556,
-      "detail": "mcp.deepwiki.com answered 2689 bytes of real documentation about the repository, in 12448 ms; the server came from .mcp.json",
+      "started_ms": 1792537578180,
+      "ended_ms": 1792537591573,
+      "duration_ms": 13393,
+      "detail": "mcp.deepwiki.com answered 3099 bytes of real documentation about the repository, in 10399 ms; the server came from .mcp.json",
       "headline": {
         "label": "DeepWiki answer",
-        "value": 2689,
+        "value": 3099,
         "unit": "bytes"
       },
       "measurements": {
         "server_url": "https://mcp.deepwiki.com/mcp",
-        "answer_bytes": 2689,
-        "tool_round_trip_ms": 12448,
-        "excerpt": "The `modelcontextprotocol/rust-sdk` repository provides the official Rust implementation of the Model Context Protocol (MCP) specification, known as RMCP . It is designed to help developers build both MCP servers and clients .\n\n## Core Components and Features\n\nThe SDK is structured into two main cra"
+        "answer_bytes": 3099,
+        "tool_round_trip_ms": 10399,
+        "excerpt": "The `modelcontextprotocol/rust-sdk` repository provides the official Rust implementation of the Model Context Protocol (MCP) specification, known as RMCP . This SDK enables developers to build both MCP servers and clients, offering features such as type-safe protocol implementation, flexible archite"
       }
     },
     {
       "name": "managed-mcp-no-key",
       "title": "A managed connector works, and no key is in the agent",
       "pass": true,
-      "started_ms": 1792526157124,
-      "ended_ms": 1792526364999,
-      "duration_ms": 207875,
-      "detail": "the managed tool answered (VAULT-cb3ccd1b77fb); the real key is not in the grant, the agent's logs (26 lines), the session transcript, and the agent process's memory was not scanned (the scan read 84496 KB and found the control 0 times, so it proves nothing)",
+      "started_ms": 1792537591577,
+      "ended_ms": 1792537798829,
+      "duration_ms": 207252,
+      "detail": "the managed tool answered (VAULT-bc8ee1550f84); the real key is not in the grant, the agent's logs (6 lines), the session transcript, and the agent process's memory was not scanned (the scan read 84488 KB and found the control 0 times, so it proves nothing)",
       "headline": {
         "label": "copies of the key in the agent",
         "value": 0,
         "unit": "found"
       },
       "measurements": {
-        "vault_ref": "VAULT-cb3ccd1b77fb",
+        "vault_ref": "VAULT-bc8ee1550f84",
         "reply_quotes_it": true,
         "grant": {
           "managed": true,
@@ -122,20 +123,20 @@
           {
             "connector": "vault",
             "method": "tools/call",
-            "session": "demo.u1020195519a",
-            "tenant": "uc-assistant-1020195519",
+            "session": "demo.u1020230210a",
+            "tenant": "uc-assistant-1020230210",
             "upstream_status": 200
           }
         ],
         "scanned": {
           "grant": "unsealed with the agent verifier",
-          "agent_log_lines": 26,
+          "agent_log_lines": 6,
           "agent_log_hits": 0,
-          "transcript_bytes": 6896,
+          "transcript_bytes": 7551,
           "transcript_hits": 0,
           "agent_memory": {
             "scanned": false,
-            "why": "the scan read 84496 KB and found the control 0 times, so it proves nothing"
+            "why": "the scan read 84488 KB and found the control 0 times, so it proves nothing"
           }
         }
       }
@@ -144,9 +145,9 @@
       "name": "memory-across-sessions",
       "title": "A brand-new session remembers",
       "pass": true,
-      "started_ms": 1792526365009,
-      "ended_ms": 1792526371473,
-      "duration_ms": 6464,
+      "started_ms": 1792537798832,
+      "ended_ms": 1792537803997,
+      "duration_ms": 5165,
       "detail": "session 1 saved the codename with the memory tool; a brand-new session (a different session id) answered it, and no user message in that session had said it",
       "headline": {
         "label": "recalled in a new session",
@@ -154,8 +155,8 @@
         "unit": ""
       },
       "measurements": {
-        "session_one": "demo.u1020195519a",
-        "session_two": "demo.u1020195519b",
+        "session_one": "demo.u1020230210a",
+        "session_two": "demo.u1020230210b",
         "memory_calls_in_session_one": 1,
         "memory_calls_in_session_two": 1,
         "code_in_session_two_user_messages": 0
@@ -165,9 +166,9 @@
       "name": "limits-enforced",
       "title": "A grant's ceiling refuses a model outside it",
       "pass": true,
-      "started_ms": 1792526371478,
-      "ended_ms": 1792526372418,
-      "duration_ms": 940,
+      "started_ms": 1792537804000,
+      "ended_ms": 1792537804678,
+      "duration_ms": 678,
       "detail": "the grant allows gpt-4.1-mini and gpt-5-mini: set_model to gpt-5-nano was refused by name and the model stayed gpt-4.1-mini; gpt-5-mini was accepted",
       "headline": {
         "label": "set_model gpt-5-nano",
@@ -189,9 +190,9 @@
       "name": "no-sandbox-calls",
       "title": "No sandbox call during any turn",
       "pass": true,
-      "started_ms": 1792526372423,
-      "ended_ms": 1792526430402,
-      "duration_ms": 57979,
+      "started_ms": 1792537804682,
+      "ended_ms": 1792537818087,
+      "duration_ms": 13405,
       "detail": "0 sandbox requests during the 5 turns, and the model called none of bash, read, write, edit, grep, find, ls; the 129 requests at session open were the agent reading AGENTS.md and .mcp.json",
       "headline": {
         "label": "sandbox requests in turns",
@@ -207,519 +208,519 @@
         "sandbox_requests_at_open": 129,
         "open_requests": [
           {
-            "t": 1792526133502,
+            "t": 1792537564220,
             "command": "sh [\"-c\",\"printf %s \\\"$HOME\\\"\"]"
           },
           {
-            "t": 1792526133502,
+            "t": 1792537564221,
             "command": "command [\"-v\",\"bash\"]"
           },
           {
-            "t": 1792526133502,
+            "t": 1792537564221,
             "command": "rg [\"--version\"]"
           },
           {
-            "t": 1792526133503,
+            "t": 1792537564221,
             "command": "grep [\"-rnZ\",\"-e\",\"__cap_probe__\",\"--\",\"/dev/null\"]"
           },
           {
-            "t": 1792526133503,
+            "t": 1792537564221,
             "command": "find [\"/dev/null\",\"-maxdepth\",\"0\",\"-printf\",\"%y\"]"
           },
           {
-            "t": 1792526133503,
+            "t": 1792537564323,
             "command": "cat []"
           },
           {
-            "t": 1792526133503,
+            "t": 1792537564323,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526133503,
+            "t": 1792537564323,
             "command": "sh [\"-c\",\"printf exec-v1.2\"]"
           },
           {
-            "t": 1792526133503,
+            "t": 1792537564323,
             "command": "true []"
           },
           {
-            "t": 1792526133503,
+            "t": 1792537564323,
             "command": "find [\"/home/sandbox/.claude/skills\",\"-printf\",\"%y\\\\t%p\\\\0\"]"
           },
           {
-            "t": 1792526133503,
+            "t": 1792537564323,
             "command": "find [\"/workspace/.agents/skills\",\"-printf\",\"%y\\\\t%p\\\\0\"]"
           },
           {
-            "t": 1792526133503,
+            "t": 1792537564323,
             "command": "find [\"/workspace/.claude/skills\",\"-printf\",\"%y\\\\t%p\\\\0\"]"
           },
           {
-            "t": 1792526133503,
+            "t": 1792537564323,
             "command": "find [\"/home/sandbox/.claude/prompts\",\"-mindepth\",\"1\",\"-maxdepth\",\"1\",\"-printf\",\"%Y\\\\t%s\\\\t%f\\\\0\"]"
           },
           {
-            "t": 1792526133503,
+            "t": 1792537564425,
             "command": "find [\"/workspace/.claude/prompts\",\"-mindepth\",\"1\",\"-maxdepth\",\"1\",\"-printf\",\"%Y\\\\t%s\\\\t%f\\\\0\"]"
           },
           {
-            "t": 1792526133503,
+            "t": 1792537564425,
             "command": "find [\"/home/sandbox/.claude/agents\",\"-mindepth\",\"1\",\"-maxdepth\",\"1\",\"-printf\",\"%Y\\\\t%s\\\\t%f\\\\0\"]"
           },
           {
-            "t": 1792526133503,
+            "t": 1792537564425,
             "command": "find [\"/workspace/.agents/agents\",\"-mindepth\",\"1\",\"-maxdepth\",\"1\",\"-printf\",\"%Y\\\\t%s\\\\t%f\\\\0\"]"
           },
           {
-            "t": 1792526133503,
+            "t": 1792537564526,
             "command": "find [\"/workspace/.claude/agents\",\"-mindepth\",\"1\",\"-maxdepth\",\"1\",\"-printf\",\"%Y\\\\t%s\\\\t%f\\\\0\"]"
           },
           {
-            "t": 1792526133608,
+            "t": 1792537564526,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526133608,
+            "t": 1792537564526,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526133608,
+            "t": 1792537564526,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526133608,
+            "t": 1792537564526,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526133608,
+            "t": 1792537564526,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526133608,
+            "t": 1792537564526,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526133608,
+            "t": 1792537564526,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526133608,
+            "t": 1792537564526,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526133608,
+            "t": 1792537564527,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526133608,
+            "t": 1792537564527,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526133608,
+            "t": 1792537564527,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526133712,
+            "t": 1792537564627,
             "command": "sh [\"-c\",\"printf a; sleep 0.3 2>/dev/null || sleep 1; printf b\"]"
           },
           {
-            "t": 1792526134024,
-            "command": "sh [\"-c\",\"rm -rf /workspace/assistant && mkdir -p /workspace/assistant && echo 'H4sIAAAAAAAAA+1WTW/bOBD1Wb9i4MsmgCRbrj8WuQVoWqBAd9FtgSInk5HGNROJVDlkHKPof98hbfW7"
+            "t": 1792537564930,
+            "command": "sh [\"-c\",\"rm -rf /workspace/assistant && mkdir -p /workspace/assistant && echo 'H4sIAAAAAAAAA+1VTW/bMAzN2b+CyGUtYDtJkTRDbwXaDRjQDVsHDD1Fqs0sam3JE6WmwdD/PkqJ99F9"
           },
           {
-            "t": 1792526134233,
+            "t": 1792537565134,
             "command": "sh [\"-c\",\"printf %s \\\"$HOME\\\"\"]"
           },
           {
-            "t": 1792526134233,
+            "t": 1792537565134,
             "command": "command [\"-v\",\"bash\"]"
           },
           {
-            "t": 1792526134233,
+            "t": 1792537565134,
             "command": "rg [\"--version\"]"
           },
           {
-            "t": 1792526134233,
+            "t": 1792537565134,
             "command": "grep [\"-rnZ\",\"-e\",\"__cap_probe__\",\"--\",\"/dev/null\"]"
           },
           {
-            "t": 1792526134233,
+            "t": 1792537565134,
             "command": "find [\"/dev/null\",\"-maxdepth\",\"0\",\"-printf\",\"%y\"]"
           },
           {
-            "t": 1792526134233,
+            "t": 1792537565134,
             "command": "cat []"
           },
           {
-            "t": 1792526134233,
+            "t": 1792537565134,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526134233,
+            "t": 1792537565134,
             "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
           },
           {
-            "t": 1792526134233,
+            "t": 1792537566519,
             "command": "sh [\"-c\",\"printf exec-v1.2\"]"
           },
           {
-            "t": 1792526134233,
+            "t": 1792537566519,
             "command": "true []"
           },
           {
-            "t": 1792526134233,
+            "t": 1792537566519,
             "command": "find [\"/home/sandbox/.claude/skills\",\"-printf\",\"%y\\\\t%p\\\\0\"]"
           },
           {
-            "t": 1792526134233,
+            "t": 1792537566519,
             "command": "find [\"/workspace/assistant/.agents/skills\",\"-printf\",\"%y\\\\t%p\\\\0\"]"
           },
           {
-            "t": 1792526134233,
+            "t": 1792537566519,
             "command": "find [\"/workspace/assistant/.claude/skills\",\"-printf\",\"%y\\\\t%p\\\\0\"]"
           },
           {
-            "t": 1792526134233,
+            "t": 1792537566519,
             "command": "find [\"/home/sandbox/.claude/prompts\",\"-mindepth\",\"1\",\"-maxdepth\",\"1\",\"-printf\",\"%Y\\\\t%s\\\\t%f\\\\0\"]"
           },
           {
-            "t": 1792526134402,
+            "t": 1792537566519,
             "command": "find [\"/workspace/assistant/.claude/prompts\",\"-mindepth\",\"1\",\"-maxdepth\",\"1\",\"-printf\",\"%Y\\\\t%s\\\\t%f\\\\0\"]"
           },
           {
-            "t": 1792526134402,
+            "t": 1792537566519,
             "command": "find [\"/home/sandbox/.claude/agents\",\"-mindepth\",\"1\",\"-maxdepth\",\"1\",\"-printf\",\"%Y\\\\t%s\\\\t%f\\\\0\"]"
           },
           {
-            "t": 1792526134402,
+            "t": 1792537566519,
             "command": "find [\"/workspace/assistant/.agents/agents\",\"-mindepth\",\"1\",\"-maxdepth\",\"1\",\"-printf\",\"%Y\\\\t%s\\\\t%f\\\\0\"]"
           },
           {
-            "t": 1792526134402,
+            "t": 1792537566519,
             "command": "find [\"/workspace/assistant/.claude/agents\",\"-mindepth\",\"1\",\"-maxdepth\",\"1\",\"-printf\",\"%Y\\\\t%s\\\\t%f\\\\0\"]"
           },
           {
-            "t": 1792526134402,
+            "t": 1792537566621,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526134505,
+            "t": 1792537566621,
             "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
           },
           {
-            "t": 1792526134505,
+            "t": 1792537566621,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526134505,
+            "t": 1792537566621,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526134505,
+            "t": 1792537566622,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526134505,
+            "t": 1792537566622,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526134505,
+            "t": 1792537566622,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526134505,
+            "t": 1792537566622,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526134505,
+            "t": 1792537566622,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526134505,
+            "t": 1792537566622,
             "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
           },
           {
-            "t": 1792526134505,
+            "t": 1792537566622,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526134505,
+            "t": 1792537566723,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526134505,
+            "t": 1792537566723,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526134505,
+            "t": 1792537566723,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526134505,
+            "t": 1792537566723,
             "command": "git [\"symbolic-ref\",\"--short\",\"HEAD\"]"
           },
           {
-            "t": 1792526134800,
+            "t": 1792537566925,
             "command": "sh [\"-c\",\"printf %s \\\"$HOME\\\"\"]"
           },
           {
-            "t": 1792526134800,
+            "t": 1792537566925,
             "command": "command [\"-v\",\"bash\"]"
           },
           {
-            "t": 1792526134800,
+            "t": 1792537566925,
             "command": "rg [\"--version\"]"
           },
           {
-            "t": 1792526134800,
+            "t": 1792537566926,
             "command": "grep [\"-rnZ\",\"-e\",\"__cap_probe__\",\"--\",\"/dev/null\"]"
           },
           {
-            "t": 1792526134800,
+            "t": 1792537566926,
             "command": "find [\"/dev/null\",\"-maxdepth\",\"0\",\"-printf\",\"%y\"]"
           },
           {
-            "t": 1792526134800,
+            "t": 1792537566926,
             "command": "cat []"
           },
           {
-            "t": 1792526134800,
+            "t": 1792537566926,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526134800,
+            "t": 1792537566926,
             "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
           },
           {
-            "t": 1792526134800,
+            "t": 1792537566926,
             "command": "sh [\"-c\",\"printf exec-v1.2\"]"
           },
           {
-            "t": 1792526134800,
+            "t": 1792537566926,
             "command": "true []"
           },
           {
-            "t": 1792526134800,
+            "t": 1792537566926,
             "command": "find [\"/home/sandbox/.claude/skills\",\"-printf\",\"%y\\\\t%p\\\\0\"]"
           },
           {
-            "t": 1792526134800,
+            "t": 1792537566926,
             "command": "find [\"/workspace/assistant/.agents/skills\",\"-printf\",\"%y\\\\t%p\\\\0\"]"
           },
           {
-            "t": 1792526134905,
+            "t": 1792537567028,
             "command": "find [\"/workspace/assistant/.claude/skills\",\"-printf\",\"%y\\\\t%p\\\\0\"]"
           },
           {
-            "t": 1792526134906,
+            "t": 1792537567028,
             "command": "find [\"/home/sandbox/.claude/prompts\",\"-mindepth\",\"1\",\"-maxdepth\",\"1\",\"-printf\",\"%Y\\\\t%s\\\\t%f\\\\0\"]"
           },
           {
-            "t": 1792526134906,
+            "t": 1792537567028,
             "command": "find [\"/workspace/assistant/.claude/prompts\",\"-mindepth\",\"1\",\"-maxdepth\",\"1\",\"-printf\",\"%Y\\\\t%s\\\\t%f\\\\0\"]"
           },
           {
-            "t": 1792526134906,
+            "t": 1792537567028,
             "command": "find [\"/home/sandbox/.claude/agents\",\"-mindepth\",\"1\",\"-maxdepth\",\"1\",\"-printf\",\"%Y\\\\t%s\\\\t%f\\\\0\"]"
           },
           {
-            "t": 1792526135014,
+            "t": 1792537567130,
             "command": "find [\"/workspace/assistant/.agents/agents\",\"-mindepth\",\"1\",\"-maxdepth\",\"1\",\"-printf\",\"%Y\\\\t%s\\\\t%f\\\\0\"]"
           },
           {
-            "t": 1792526135014,
+            "t": 1792537567130,
             "command": "find [\"/workspace/assistant/.claude/agents\",\"-mindepth\",\"1\",\"-maxdepth\",\"1\",\"-printf\",\"%Y\\\\t%s\\\\t%f\\\\0\"]"
           },
           {
-            "t": 1792526135014,
+            "t": 1792537567130,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135014,
+            "t": 1792537567131,
             "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
           },
           {
-            "t": 1792526135014,
+            "t": 1792537567131,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135015,
+            "t": 1792537567131,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135015,
+            "t": 1792537567131,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135015,
+            "t": 1792537567131,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135118,
+            "t": 1792537567131,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135118,
+            "t": 1792537567131,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135118,
+            "t": 1792537567131,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135118,
+            "t": 1792537567233,
             "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
           },
           {
-            "t": 1792526135118,
+            "t": 1792537567233,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135118,
+            "t": 1792537567233,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135118,
+            "t": 1792537567233,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135118,
+            "t": 1792537567233,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135118,
+            "t": 1792537567233,
             "command": "git [\"symbolic-ref\",\"--short\",\"HEAD\"]"
           },
           {
-            "t": 1792526135327,
+            "t": 1792537567436,
             "command": "sh [\"-c\",\"printf %s \\\"$HOME\\\"\"]"
           },
           {
-            "t": 1792526135327,
+            "t": 1792537567436,
             "command": "command [\"-v\",\"bash\"]"
           },
           {
-            "t": 1792526135327,
+            "t": 1792537567436,
             "command": "rg [\"--version\"]"
           },
           {
-            "t": 1792526135327,
+            "t": 1792537567436,
             "command": "grep [\"-rnZ\",\"-e\",\"__cap_probe__\",\"--\",\"/dev/null\"]"
           },
           {
-            "t": 1792526135327,
+            "t": 1792537567436,
             "command": "find [\"/dev/null\",\"-maxdepth\",\"0\",\"-printf\",\"%y\"]"
           },
           {
-            "t": 1792526135327,
+            "t": 1792537567436,
             "command": "cat []"
           },
           {
-            "t": 1792526135327,
+            "t": 1792537567436,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135327,
+            "t": 1792537567436,
             "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
           },
           {
-            "t": 1792526135327,
+            "t": 1792537567538,
             "command": "sh [\"-c\",\"printf exec-v1.2\"]"
           },
           {
-            "t": 1792526135328,
+            "t": 1792537567538,
             "command": "true []"
           },
           {
-            "t": 1792526135328,
+            "t": 1792537567538,
             "command": "find [\"/home/sandbox/.claude/skills\",\"-printf\",\"%y\\\\t%p\\\\0\"]"
           },
           {
-            "t": 1792526135328,
+            "t": 1792537567538,
             "command": "find [\"/workspace/assistant/.agents/skills\",\"-printf\",\"%y\\\\t%p\\\\0\"]"
           },
           {
-            "t": 1792526135328,
+            "t": 1792537567538,
             "command": "find [\"/workspace/assistant/.claude/skills\",\"-printf\",\"%y\\\\t%p\\\\0\"]"
           },
           {
-            "t": 1792526135328,
+            "t": 1792537567538,
             "command": "find [\"/home/sandbox/.claude/prompts\",\"-mindepth\",\"1\",\"-maxdepth\",\"1\",\"-printf\",\"%Y\\\\t%s\\\\t%f\\\\0\"]"
           },
           {
-            "t": 1792526135502,
+            "t": 1792537567538,
             "command": "find [\"/workspace/assistant/.claude/prompts\",\"-mindepth\",\"1\",\"-maxdepth\",\"1\",\"-printf\",\"%Y\\\\t%s\\\\t%f\\\\0\"]"
           },
           {
-            "t": 1792526135502,
+            "t": 1792537567538,
             "command": "find [\"/home/sandbox/.claude/agents\",\"-mindepth\",\"1\",\"-maxdepth\",\"1\",\"-printf\",\"%Y\\\\t%s\\\\t%f\\\\0\"]"
           },
           {
-            "t": 1792526135502,
+            "t": 1792537567538,
             "command": "find [\"/workspace/assistant/.agents/agents\",\"-mindepth\",\"1\",\"-maxdepth\",\"1\",\"-printf\",\"%Y\\\\t%s\\\\t%f\\\\0\"]"
           },
           {
-            "t": 1792526135502,
+            "t": 1792537567640,
             "command": "find [\"/workspace/assistant/.claude/agents\",\"-mindepth\",\"1\",\"-maxdepth\",\"1\",\"-printf\",\"%Y\\\\t%s\\\\t%f\\\\0\"]"
           },
           {
-            "t": 1792526135502,
+            "t": 1792537567640,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135606,
+            "t": 1792537567640,
             "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
           },
           {
-            "t": 1792526135606,
+            "t": 1792537567640,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135606,
+            "t": 1792537567640,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135606,
+            "t": 1792537567640,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135606,
+            "t": 1792537567640,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135606,
+            "t": 1792537567640,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135606,
+            "t": 1792537567640,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135606,
+            "t": 1792537567640,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135606,
+            "t": 1792537567640,
             "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
           },
           {
-            "t": 1792526135606,
+            "t": 1792537567742,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135606,
+            "t": 1792537567742,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135606,
+            "t": 1792537567742,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135606,
+            "t": 1792537567742,
             "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
           },
           {
-            "t": 1792526135606,
+            "t": 1792537567742,
             "command": "git [\"symbolic-ref\",\"--short\",\"HEAD\"]"
           }
         ],
@@ -731,7 +732,7 @@
       "title": "Teardown leaves nothing behind",
       "pass": true,
       "status": "pass",
-      "detail": "every resource type counted 0 at 2026-10-20T20:31:59Z",
+      "detail": "every resource type counted 0 at 2026-10-20T23:24:52Z",
       "measurements": {
         "resource_types": 22,
         "remaining": 0
@@ -747,14 +748,14 @@
   ],
   "timeline": [
     {
-      "t_ms": 1792526119317,
+      "t_ms": 1792537330742,
       "src": "demo",
       "event": "run_started",
       "path": null,
       "detail": null
     },
     {
-      "t_ms": 1792526131517,
+      "t_ms": 1792537561237,
       "src": "standin",
       "event": "managed_refused",
       "path": null,
@@ -764,7 +765,7 @@
       }
     },
     {
-      "t_ms": 1792526133502,
+      "t_ms": 1792537564220,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -774,7 +775,7 @@
       }
     },
     {
-      "t_ms": 1792526133502,
+      "t_ms": 1792537564221,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -784,7 +785,7 @@
       }
     },
     {
-      "t_ms": 1792526133502,
+      "t_ms": 1792537564221,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -794,7 +795,7 @@
       }
     },
     {
-      "t_ms": 1792526133503,
+      "t_ms": 1792537564221,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -804,7 +805,7 @@
       }
     },
     {
-      "t_ms": 1792526133503,
+      "t_ms": 1792537564221,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -814,7 +815,7 @@
       }
     },
     {
-      "t_ms": 1792526133503,
+      "t_ms": 1792537564323,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -824,7 +825,7 @@
       }
     },
     {
-      "t_ms": 1792526133503,
+      "t_ms": 1792537564323,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -834,7 +835,7 @@
       }
     },
     {
-      "t_ms": 1792526133503,
+      "t_ms": 1792537564323,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -844,7 +845,7 @@
       }
     },
     {
-      "t_ms": 1792526133503,
+      "t_ms": 1792537564323,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -854,7 +855,7 @@
       }
     },
     {
-      "t_ms": 1792526133503,
+      "t_ms": 1792537564323,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -864,7 +865,7 @@
       }
     },
     {
-      "t_ms": 1792526133503,
+      "t_ms": 1792537564323,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -874,7 +875,7 @@
       }
     },
     {
-      "t_ms": 1792526133503,
+      "t_ms": 1792537564323,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -884,7 +885,7 @@
       }
     },
     {
-      "t_ms": 1792526133503,
+      "t_ms": 1792537564323,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -894,7 +895,7 @@
       }
     },
     {
-      "t_ms": 1792526133503,
+      "t_ms": 1792537564425,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -904,7 +905,7 @@
       }
     },
     {
-      "t_ms": 1792526133503,
+      "t_ms": 1792537564425,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -914,7 +915,7 @@
       }
     },
     {
-      "t_ms": 1792526133503,
+      "t_ms": 1792537564425,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -924,7 +925,7 @@
       }
     },
     {
-      "t_ms": 1792526133503,
+      "t_ms": 1792537564526,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -934,7 +935,7 @@
       }
     },
     {
-      "t_ms": 1792526133608,
+      "t_ms": 1792537564526,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -944,7 +945,7 @@
       }
     },
     {
-      "t_ms": 1792526133608,
+      "t_ms": 1792537564526,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -954,7 +955,7 @@
       }
     },
     {
-      "t_ms": 1792526133608,
+      "t_ms": 1792537564526,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -964,7 +965,7 @@
       }
     },
     {
-      "t_ms": 1792526133608,
+      "t_ms": 1792537564526,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -974,7 +975,7 @@
       }
     },
     {
-      "t_ms": 1792526133608,
+      "t_ms": 1792537564526,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -984,7 +985,7 @@
       }
     },
     {
-      "t_ms": 1792526133608,
+      "t_ms": 1792537564526,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -994,7 +995,7 @@
       }
     },
     {
-      "t_ms": 1792526133608,
+      "t_ms": 1792537564526,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1004,7 +1005,7 @@
       }
     },
     {
-      "t_ms": 1792526133608,
+      "t_ms": 1792537564526,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1014,7 +1015,7 @@
       }
     },
     {
-      "t_ms": 1792526133608,
+      "t_ms": 1792537564527,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1024,7 +1025,7 @@
       }
     },
     {
-      "t_ms": 1792526133608,
+      "t_ms": 1792537564527,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1034,7 +1035,7 @@
       }
     },
     {
-      "t_ms": 1792526133608,
+      "t_ms": 1792537564527,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1044,7 +1045,7 @@
       }
     },
     {
-      "t_ms": 1792526133712,
+      "t_ms": 1792537564627,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1054,7 +1055,7 @@
       }
     },
     {
-      "t_ms": 1792526133712,
+      "t_ms": 1792537564627,
       "src": "sandbox",
       "event": "exec_start",
       "vm": null,
@@ -1067,17 +1068,17 @@
       }
     },
     {
-      "t_ms": 1792526134024,
+      "t_ms": 1792537564930,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
       "path": null,
       "detail": {
-        "command": "sh [\"-c\",\"rm -rf /workspace/assistant && mkdir -p /workspace/assistant && echo 'H4sIAAAAAAAAA+1WTW/bOBD1Wb9i4MsmgCRbrj8WuQVoWqBAd9FtgSInk5HGNROJVDlkHKPof98hbfW7"
+        "command": "sh [\"-c\",\"rm -rf /workspace/assistant && mkdir -p /workspace/assistant && echo 'H4sIAAAAAAAAA+1VTW/bMAzN2b+CyGUtYDtJkTRDbwXaDRjQDVsHDD1Fqs0sam3JE6WmwdD/PkqJ99F9"
       }
     },
     {
-      "t_ms": 1792526134024,
+      "t_ms": 1792537564931,
       "src": "sandbox",
       "event": "exec_start",
       "vm": null,
@@ -1086,11 +1087,11 @@
         "sandbox"
       ],
       "detail": {
-        "command": "sh -c rm -rf /workspace/assistant && mkdir -p /workspace/assistant && echo 'H4sIAAAAAAAAA+1WTW/bOBD1Wb9i4MsmgCRbrj8WuQVoWqBAd9FtgSInk5HGNROJVDlkHKPof98hbfW725Nb"
+        "command": "sh -c rm -rf /workspace/assistant && mkdir -p /workspace/assistant && echo 'H4sIAAAAAAAAA+1VTW/bMAzN2b+CyGUtYDtJkTRDbwXaDRjQDVsHDD1Fqs0sam3JE6WmwdD/PkqJ99F9nbJh"
       }
     },
     {
-      "t_ms": 1792526134024,
+      "t_ms": 1792537564931,
       "src": "sandbox",
       "event": "exec_end",
       "vm": null,
@@ -1099,11 +1100,11 @@
         "agent"
       ],
       "detail": {
-        "ended": 16
+        "ended": 2
       }
     },
     {
-      "t_ms": 1792526134175,
+      "t_ms": 1792537565106,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -1113,13 +1114,13 @@
       "detail": {
         "connector": "vault",
         "method": "server/discover",
-        "session": "demo.u1020195519a",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210a",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526134177,
+      "t_ms": 1792537565107,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -1129,13 +1130,13 @@
       "detail": {
         "connector": "vault",
         "method": "initialize",
-        "session": "demo.u1020195519a",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210a",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526134178,
+      "t_ms": 1792537565108,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -1145,13 +1146,13 @@
       "detail": {
         "connector": "vault",
         "method": "notifications/initialized",
-        "session": "demo.u1020195519a",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210a",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 202
       }
     },
     {
-      "t_ms": 1792526134179,
+      "t_ms": 1792537565110,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -1161,13 +1162,13 @@
       "detail": {
         "connector": "vault",
         "method": "tools/list",
-        "session": "demo.u1020195519a",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210a",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526134180,
+      "t_ms": 1792537565111,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -1177,13 +1178,13 @@
       "detail": {
         "connector": "vault",
         "method": "resources/list",
-        "session": "demo.u1020195519a",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210a",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526134181,
+      "t_ms": 1792537565112,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -1193,13 +1194,13 @@
       "detail": {
         "connector": "vault",
         "method": "prompts/list",
-        "session": "demo.u1020195519a",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210a",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526134233,
+      "t_ms": 1792537565134,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1209,7 +1210,7 @@
       }
     },
     {
-      "t_ms": 1792526134233,
+      "t_ms": 1792537565134,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1219,7 +1220,7 @@
       }
     },
     {
-      "t_ms": 1792526134233,
+      "t_ms": 1792537565134,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1229,7 +1230,7 @@
       }
     },
     {
-      "t_ms": 1792526134233,
+      "t_ms": 1792537565134,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1239,7 +1240,7 @@
       }
     },
     {
-      "t_ms": 1792526134233,
+      "t_ms": 1792537565134,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1249,7 +1250,7 @@
       }
     },
     {
-      "t_ms": 1792526134233,
+      "t_ms": 1792537565134,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1259,7 +1260,7 @@
       }
     },
     {
-      "t_ms": 1792526134233,
+      "t_ms": 1792537565134,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1269,7 +1270,7 @@
       }
     },
     {
-      "t_ms": 1792526134233,
+      "t_ms": 1792537565134,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1279,7 +1280,7 @@
       }
     },
     {
-      "t_ms": 1792526134233,
+      "t_ms": 1792537566519,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1289,7 +1290,7 @@
       }
     },
     {
-      "t_ms": 1792526134233,
+      "t_ms": 1792537566519,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1299,7 +1300,7 @@
       }
     },
     {
-      "t_ms": 1792526134233,
+      "t_ms": 1792537566519,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1309,7 +1310,7 @@
       }
     },
     {
-      "t_ms": 1792526134233,
+      "t_ms": 1792537566519,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1319,7 +1320,7 @@
       }
     },
     {
-      "t_ms": 1792526134233,
+      "t_ms": 1792537566519,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1329,7 +1330,7 @@
       }
     },
     {
-      "t_ms": 1792526134233,
+      "t_ms": 1792537566519,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1339,7 +1340,7 @@
       }
     },
     {
-      "t_ms": 1792526134402,
+      "t_ms": 1792537566519,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1349,7 +1350,7 @@
       }
     },
     {
-      "t_ms": 1792526134402,
+      "t_ms": 1792537566519,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1359,7 +1360,7 @@
       }
     },
     {
-      "t_ms": 1792526134402,
+      "t_ms": 1792537566519,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1369,7 +1370,7 @@
       }
     },
     {
-      "t_ms": 1792526134402,
+      "t_ms": 1792537566519,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1379,7 +1380,7 @@
       }
     },
     {
-      "t_ms": 1792526134402,
+      "t_ms": 1792537566621,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1389,7 +1390,7 @@
       }
     },
     {
-      "t_ms": 1792526134505,
+      "t_ms": 1792537566621,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1399,7 +1400,7 @@
       }
     },
     {
-      "t_ms": 1792526134505,
+      "t_ms": 1792537566621,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1409,7 +1410,7 @@
       }
     },
     {
-      "t_ms": 1792526134505,
+      "t_ms": 1792537566621,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1419,7 +1420,7 @@
       }
     },
     {
-      "t_ms": 1792526134505,
+      "t_ms": 1792537566622,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1429,7 +1430,7 @@
       }
     },
     {
-      "t_ms": 1792526134505,
+      "t_ms": 1792537566622,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1439,7 +1440,7 @@
       }
     },
     {
-      "t_ms": 1792526134505,
+      "t_ms": 1792537566622,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1449,7 +1450,7 @@
       }
     },
     {
-      "t_ms": 1792526134505,
+      "t_ms": 1792537566622,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1459,7 +1460,7 @@
       }
     },
     {
-      "t_ms": 1792526134505,
+      "t_ms": 1792537566622,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1469,7 +1470,7 @@
       }
     },
     {
-      "t_ms": 1792526134505,
+      "t_ms": 1792537566622,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1479,7 +1480,7 @@
       }
     },
     {
-      "t_ms": 1792526134505,
+      "t_ms": 1792537566622,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1489,7 +1490,7 @@
       }
     },
     {
-      "t_ms": 1792526134505,
+      "t_ms": 1792537566723,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1499,7 +1500,7 @@
       }
     },
     {
-      "t_ms": 1792526134505,
+      "t_ms": 1792537566723,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1509,7 +1510,7 @@
       }
     },
     {
-      "t_ms": 1792526134505,
+      "t_ms": 1792537566723,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1519,7 +1520,7 @@
       }
     },
     {
-      "t_ms": 1792526134505,
+      "t_ms": 1792537566723,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1529,7 +1530,7 @@
       }
     },
     {
-      "t_ms": 1792526134673,
+      "t_ms": 1792537566884,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -1539,13 +1540,13 @@
       "detail": {
         "connector": "vault",
         "method": "server/discover",
-        "session": "demo.u1020195519b",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210b",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526134675,
+      "t_ms": 1792537566885,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -1555,13 +1556,13 @@
       "detail": {
         "connector": "vault",
         "method": "initialize",
-        "session": "demo.u1020195519b",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210b",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526134676,
+      "t_ms": 1792537566886,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -1571,13 +1572,13 @@
       "detail": {
         "connector": "vault",
         "method": "notifications/initialized",
-        "session": "demo.u1020195519b",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210b",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 202
       }
     },
     {
-      "t_ms": 1792526134677,
+      "t_ms": 1792537566888,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -1587,13 +1588,13 @@
       "detail": {
         "connector": "vault",
         "method": "tools/list",
-        "session": "demo.u1020195519b",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210b",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526134678,
+      "t_ms": 1792537566889,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -1603,13 +1604,13 @@
       "detail": {
         "connector": "vault",
         "method": "resources/list",
-        "session": "demo.u1020195519b",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210b",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526134679,
+      "t_ms": 1792537566890,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -1619,13 +1620,13 @@
       "detail": {
         "connector": "vault",
         "method": "prompts/list",
-        "session": "demo.u1020195519b",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210b",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526134800,
+      "t_ms": 1792537566925,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1635,7 +1636,7 @@
       }
     },
     {
-      "t_ms": 1792526134800,
+      "t_ms": 1792537566925,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1645,7 +1646,7 @@
       }
     },
     {
-      "t_ms": 1792526134800,
+      "t_ms": 1792537566925,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1655,7 +1656,7 @@
       }
     },
     {
-      "t_ms": 1792526134800,
+      "t_ms": 1792537566926,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1665,7 +1666,7 @@
       }
     },
     {
-      "t_ms": 1792526134800,
+      "t_ms": 1792537566926,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1675,7 +1676,7 @@
       }
     },
     {
-      "t_ms": 1792526134800,
+      "t_ms": 1792537566926,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1685,7 +1686,7 @@
       }
     },
     {
-      "t_ms": 1792526134800,
+      "t_ms": 1792537566926,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1695,7 +1696,7 @@
       }
     },
     {
-      "t_ms": 1792526134800,
+      "t_ms": 1792537566926,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1705,7 +1706,7 @@
       }
     },
     {
-      "t_ms": 1792526134800,
+      "t_ms": 1792537566926,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1715,7 +1716,7 @@
       }
     },
     {
-      "t_ms": 1792526134800,
+      "t_ms": 1792537566926,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1725,7 +1726,7 @@
       }
     },
     {
-      "t_ms": 1792526134800,
+      "t_ms": 1792537566926,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1735,7 +1736,7 @@
       }
     },
     {
-      "t_ms": 1792526134800,
+      "t_ms": 1792537566926,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1745,7 +1746,7 @@
       }
     },
     {
-      "t_ms": 1792526134905,
+      "t_ms": 1792537567028,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1755,7 +1756,7 @@
       }
     },
     {
-      "t_ms": 1792526134906,
+      "t_ms": 1792537567028,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1765,7 +1766,7 @@
       }
     },
     {
-      "t_ms": 1792526134906,
+      "t_ms": 1792537567028,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1775,7 +1776,7 @@
       }
     },
     {
-      "t_ms": 1792526134906,
+      "t_ms": 1792537567028,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1785,22 +1786,7 @@
       }
     },
     {
-      "t_ms": 1792526135000,
-      "src": "gateway",
-      "event": "model_request",
-      "path": [
-        "agent",
-        "gateway",
-        "model"
-      ],
-      "detail": {
-        "request_id": "c9659edefeae3e81-118",
-        "model": "gpt-4.1-mini",
-        "input_tokens": 1339
-      }
-    },
-    {
-      "t_ms": 1792526135014,
+      "t_ms": 1792537567130,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1810,7 +1796,7 @@
       }
     },
     {
-      "t_ms": 1792526135014,
+      "t_ms": 1792537567130,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1820,7 +1806,7 @@
       }
     },
     {
-      "t_ms": 1792526135014,
+      "t_ms": 1792537567130,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1830,7 +1816,7 @@
       }
     },
     {
-      "t_ms": 1792526135014,
+      "t_ms": 1792537567131,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1840,7 +1826,7 @@
       }
     },
     {
-      "t_ms": 1792526135014,
+      "t_ms": 1792537567131,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1850,7 +1836,7 @@
       }
     },
     {
-      "t_ms": 1792526135015,
+      "t_ms": 1792537567131,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1860,7 +1846,7 @@
       }
     },
     {
-      "t_ms": 1792526135015,
+      "t_ms": 1792537567131,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1870,7 +1856,7 @@
       }
     },
     {
-      "t_ms": 1792526135015,
+      "t_ms": 1792537567131,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1880,7 +1866,7 @@
       }
     },
     {
-      "t_ms": 1792526135118,
+      "t_ms": 1792537567131,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1890,7 +1876,7 @@
       }
     },
     {
-      "t_ms": 1792526135118,
+      "t_ms": 1792537567131,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1900,7 +1886,7 @@
       }
     },
     {
-      "t_ms": 1792526135118,
+      "t_ms": 1792537567131,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1910,7 +1896,7 @@
       }
     },
     {
-      "t_ms": 1792526135118,
+      "t_ms": 1792537567233,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1920,7 +1906,7 @@
       }
     },
     {
-      "t_ms": 1792526135118,
+      "t_ms": 1792537567233,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1930,7 +1916,7 @@
       }
     },
     {
-      "t_ms": 1792526135118,
+      "t_ms": 1792537567233,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1940,7 +1926,7 @@
       }
     },
     {
-      "t_ms": 1792526135118,
+      "t_ms": 1792537567233,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1950,7 +1936,7 @@
       }
     },
     {
-      "t_ms": 1792526135118,
+      "t_ms": 1792537567233,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1960,7 +1946,7 @@
       }
     },
     {
-      "t_ms": 1792526135118,
+      "t_ms": 1792537567233,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -1970,7 +1956,7 @@
       }
     },
     {
-      "t_ms": 1792526135277,
+      "t_ms": 1792537567427,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -1980,13 +1966,13 @@
       "detail": {
         "connector": "vault",
         "method": "server/discover",
-        "session": "demo.u1020195519c",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210c",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526135278,
+      "t_ms": 1792537567428,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -1996,13 +1982,13 @@
       "detail": {
         "connector": "vault",
         "method": "initialize",
-        "session": "demo.u1020195519c",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210c",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526135279,
+      "t_ms": 1792537567429,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -2012,13 +1998,13 @@
       "detail": {
         "connector": "vault",
         "method": "notifications/initialized",
-        "session": "demo.u1020195519c",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210c",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 202
       }
     },
     {
-      "t_ms": 1792526135280,
+      "t_ms": 1792537567431,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -2028,13 +2014,13 @@
       "detail": {
         "connector": "vault",
         "method": "tools/list",
-        "session": "demo.u1020195519c",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210c",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526135281,
+      "t_ms": 1792537567432,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -2044,13 +2030,13 @@
       "detail": {
         "connector": "vault",
         "method": "resources/list",
-        "session": "demo.u1020195519c",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210c",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526135282,
+      "t_ms": 1792537567433,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -2060,13 +2046,13 @@
       "detail": {
         "connector": "vault",
         "method": "prompts/list",
-        "session": "demo.u1020195519c",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210c",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526135327,
+      "t_ms": 1792537567436,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2076,7 +2062,7 @@
       }
     },
     {
-      "t_ms": 1792526135327,
+      "t_ms": 1792537567436,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2086,7 +2072,7 @@
       }
     },
     {
-      "t_ms": 1792526135327,
+      "t_ms": 1792537567436,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2096,7 +2082,7 @@
       }
     },
     {
-      "t_ms": 1792526135327,
+      "t_ms": 1792537567436,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2106,7 +2092,7 @@
       }
     },
     {
-      "t_ms": 1792526135327,
+      "t_ms": 1792537567436,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2116,7 +2102,7 @@
       }
     },
     {
-      "t_ms": 1792526135327,
+      "t_ms": 1792537567436,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2126,7 +2112,7 @@
       }
     },
     {
-      "t_ms": 1792526135327,
+      "t_ms": 1792537567436,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2136,7 +2122,7 @@
       }
     },
     {
-      "t_ms": 1792526135327,
+      "t_ms": 1792537567436,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2146,7 +2132,7 @@
       }
     },
     {
-      "t_ms": 1792526135327,
+      "t_ms": 1792537567538,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2156,7 +2142,7 @@
       }
     },
     {
-      "t_ms": 1792526135328,
+      "t_ms": 1792537567538,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2166,7 +2152,7 @@
       }
     },
     {
-      "t_ms": 1792526135328,
+      "t_ms": 1792537567538,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2176,7 +2162,7 @@
       }
     },
     {
-      "t_ms": 1792526135328,
+      "t_ms": 1792537567538,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2186,7 +2172,7 @@
       }
     },
     {
-      "t_ms": 1792526135328,
+      "t_ms": 1792537567538,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2196,7 +2182,7 @@
       }
     },
     {
-      "t_ms": 1792526135328,
+      "t_ms": 1792537567538,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2206,7 +2192,7 @@
       }
     },
     {
-      "t_ms": 1792526135502,
+      "t_ms": 1792537567538,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2216,7 +2202,7 @@
       }
     },
     {
-      "t_ms": 1792526135502,
+      "t_ms": 1792537567538,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2226,7 +2212,7 @@
       }
     },
     {
-      "t_ms": 1792526135502,
+      "t_ms": 1792537567538,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2236,7 +2222,7 @@
       }
     },
     {
-      "t_ms": 1792526135502,
+      "t_ms": 1792537567640,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2246,7 +2232,7 @@
       }
     },
     {
-      "t_ms": 1792526135502,
+      "t_ms": 1792537567640,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2256,7 +2242,7 @@
       }
     },
     {
-      "t_ms": 1792526135606,
+      "t_ms": 1792537567640,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2266,7 +2252,7 @@
       }
     },
     {
-      "t_ms": 1792526135606,
+      "t_ms": 1792537567640,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2276,7 +2262,7 @@
       }
     },
     {
-      "t_ms": 1792526135606,
+      "t_ms": 1792537567640,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2286,7 +2272,7 @@
       }
     },
     {
-      "t_ms": 1792526135606,
+      "t_ms": 1792537567640,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2296,7 +2282,7 @@
       }
     },
     {
-      "t_ms": 1792526135606,
+      "t_ms": 1792537567640,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2306,7 +2292,7 @@
       }
     },
     {
-      "t_ms": 1792526135606,
+      "t_ms": 1792537567640,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2316,7 +2302,7 @@
       }
     },
     {
-      "t_ms": 1792526135606,
+      "t_ms": 1792537567640,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2326,7 +2312,7 @@
       }
     },
     {
-      "t_ms": 1792526135606,
+      "t_ms": 1792537567640,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2336,7 +2322,7 @@
       }
     },
     {
-      "t_ms": 1792526135606,
+      "t_ms": 1792537567640,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2346,7 +2332,7 @@
       }
     },
     {
-      "t_ms": 1792526135606,
+      "t_ms": 1792537567742,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2356,7 +2342,7 @@
       }
     },
     {
-      "t_ms": 1792526135606,
+      "t_ms": 1792537567742,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2366,7 +2352,7 @@
       }
     },
     {
-      "t_ms": 1792526135606,
+      "t_ms": 1792537567742,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2376,7 +2362,7 @@
       }
     },
     {
-      "t_ms": 1792526135606,
+      "t_ms": 1792537567742,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2386,7 +2372,7 @@
       }
     },
     {
-      "t_ms": 1792526135606,
+      "t_ms": 1792537567742,
       "src": "sandbox",
       "event": "exec_request",
       "vm": null,
@@ -2396,7 +2382,7 @@
       }
     },
     {
-      "t_ms": 1792526135608,
+      "t_ms": 1792537567785,
       "src": "demo",
       "event": "sessions_opened",
       "path": [
@@ -2406,7 +2392,7 @@
       "detail": null
     },
     {
-      "t_ms": 1792526135706,
+      "t_ms": 1792537567891,
       "src": "client",
       "event": "prompt",
       "path": [
@@ -2414,26 +2400,26 @@
         "agent"
       ],
       "detail": {
-        "session": "demo.u1020195519a"
+        "session": "demo.u1020230210a"
       }
     },
     {
-      "t_ms": 1792526136080,
+      "t_ms": 1792537568000,
       "src": "gateway",
-      "event": "model_response",
+      "event": "model_request",
       "path": [
-        "model",
+        "agent",
         "gateway",
-        "agent"
+        "model"
       ],
       "detail": {
-        "request_id": "c9659edefeae3e81-118",
-        "output_tokens": 60,
-        "cost_micros": 632
+        "request_id": "1cc56df1227f687d-0",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1421
       }
     },
     {
-      "t_ms": 1792526136860,
+      "t_ms": 1792537571260,
       "src": "client",
       "event": "turn_complete",
       "path": [
@@ -2441,26 +2427,11 @@
         "efs"
       ],
       "detail": {
-        "session": "demo.u1020195519a"
+        "session": "demo.u1020230210a"
       }
     },
     {
-      "t_ms": 1792526137000,
-      "src": "gateway",
-      "event": "model_request",
-      "path": [
-        "agent",
-        "gateway",
-        "model"
-      ],
-      "detail": {
-        "request_id": "c9659edefeae3e81-119",
-        "model": "gpt-4.1-mini",
-        "input_tokens": 192
-      }
-    },
-    {
-      "t_ms": 1792526137566,
+      "t_ms": 1792537571289,
       "src": "gateway",
       "event": "model_response",
       "path": [
@@ -2469,25 +2440,13 @@
         "agent"
       ],
       "detail": {
-        "request_id": "c9659edefeae3e81-119",
-        "output_tokens": 7,
-        "cost_micros": 88
+        "request_id": "1cc56df1227f687d-0",
+        "output_tokens": 67,
+        "cost_micros": 292
       }
     },
     {
-      "t_ms": 1792526142654,
-      "src": "client",
-      "event": "prompt",
-      "path": [
-        "you",
-        "agent"
-      ],
-      "detail": {
-        "session": "demo.u1020195519a"
-      }
-    },
-    {
-      "t_ms": 1792526143000,
+      "t_ms": 1792537572000,
       "src": "gateway",
       "event": "model_request",
       "path": [
@@ -2496,13 +2455,55 @@
         "model"
       ],
       "detail": {
-        "request_id": "c9659edefeae3e81-11a",
+        "request_id": "1cc56df1227f687d-1",
         "model": "gpt-4.1-mini",
-        "input_tokens": 1436
+        "input_tokens": 213
       }
     },
     {
-      "t_ms": 1792526143568,
+      "t_ms": 1792537572813,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "1cc56df1227f687d-1",
+        "output_tokens": 7,
+        "cost_micros": 96
+      }
+    },
+    {
+      "t_ms": 1792537578282,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1020230210a"
+      }
+    },
+    {
+      "t_ms": 1792537579000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "1cc56df1227f687d-2",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1456
+      }
+    },
+    {
+      "t_ms": 1792537579133,
       "src": "client",
       "event": "tool_to_server",
       "path": [
@@ -2510,12 +2511,12 @@
         "deepwiki"
       ],
       "detail": {
-        "session": "demo.u1020195519a",
+        "session": "demo.u1020230210a",
         "name": "mcp__deepwiki__ask_wiki_question"
       }
     },
     {
-      "t_ms": 1792526143839,
+      "t_ms": 1792537579765,
       "src": "gateway",
       "event": "model_response",
       "path": [
@@ -2524,13 +2525,23 @@
         "agent"
       ],
       "detail": {
-        "request_id": "c9659edefeae3e81-11a",
+        "request_id": "1cc56df1227f687d-2",
         "output_tokens": 44,
-        "cost_micros": 261
+        "cost_micros": 269
       }
     },
     {
-      "t_ms": 1792526156000,
+      "t_ms": 1792537589532,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1020230210a",
+        "name": "mcp__deepwiki__ask_wiki_question"
+      }
+    },
+    {
+      "t_ms": 1792537590000,
       "src": "gateway",
       "event": "model_request",
       "path": [
@@ -2539,38 +2550,13 @@
         "model"
       ],
       "detail": {
-        "request_id": "c9659edefeae3e81-11b",
+        "request_id": "1cc56df1227f687d-3",
         "model": "gpt-4.1-mini",
-        "input_tokens": 2079
+        "input_tokens": 2213
       }
     },
     {
-      "t_ms": 1792526156016,
-      "src": "client",
-      "event": "tool_end",
-      "path": null,
-      "detail": {
-        "session": "demo.u1020195519a",
-        "name": "mcp__deepwiki__ask_wiki_question"
-      }
-    },
-    {
-      "t_ms": 1792526157066,
-      "src": "gateway",
-      "event": "model_response",
-      "path": [
-        "model",
-        "gateway",
-        "agent"
-      ],
-      "detail": {
-        "request_id": "c9659edefeae3e81-11b",
-        "output_tokens": 65,
-        "cost_micros": 513
-      }
-    },
-    {
-      "t_ms": 1792526157098,
+      "t_ms": 1792537591399,
       "src": "client",
       "event": "turn_complete",
       "path": [
@@ -2578,11 +2564,26 @@
         "efs"
       ],
       "detail": {
-        "session": "demo.u1020195519a"
+        "session": "demo.u1020230210a"
       }
     },
     {
-      "t_ms": 1792526157219,
+      "t_ms": 1792537591824,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "1cc56df1227f687d-3",
+        "output_tokens": 89,
+        "cost_micros": 605
+      }
+    },
+    {
+      "t_ms": 1792537591944,
       "src": "client",
       "event": "prompt",
       "path": [
@@ -2590,11 +2591,11 @@
         "agent"
       ],
       "detail": {
-        "session": "demo.u1020195519a"
+        "session": "demo.u1020230210a"
       }
     },
     {
-      "t_ms": 1792526158000,
+      "t_ms": 1792537592000,
       "src": "gateway",
       "event": "model_request",
       "path": [
@@ -2603,13 +2604,13 @@
         "model"
       ],
       "detail": {
-        "request_id": "c9659edefeae3e81-11c",
+        "request_id": "1cc56df1227f687d-4",
         "model": "gpt-4.1-mini",
-        "input_tokens": 2166
+        "input_tokens": 2324
       }
     },
     {
-      "t_ms": 1792526158000,
+      "t_ms": 1792537593000,
       "src": "gateway",
       "event": "model_request",
       "path": [
@@ -2618,13 +2619,13 @@
         "model"
       ],
       "detail": {
-        "request_id": "c9659edefeae3e81-11d",
+        "request_id": "1cc56df1227f687d-5",
         "model": "gpt-4.1-mini",
-        "input_tokens": 2227
+        "input_tokens": 2385
       }
     },
     {
-      "t_ms": 1792526158112,
+      "t_ms": 1792537593046,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -2634,33 +2635,48 @@
       "detail": {
         "connector": "vault",
         "method": "tools/call",
-        "session": "demo.u1020195519a",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210a",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526158150,
+      "t_ms": 1792537593058,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "1cc56df1227f687d-4",
+        "output_tokens": 21,
+        "cost_micros": 310
+      }
+    },
+    {
+      "t_ms": 1792537593073,
       "src": "client",
       "event": "tool_start",
       "path": null,
       "detail": {
-        "session": "demo.u1020195519a",
+        "session": "demo.u1020230210a",
         "name": "mcp__vault__account_status"
       }
     },
     {
-      "t_ms": 1792526158150,
+      "t_ms": 1792537593073,
       "src": "client",
       "event": "tool_end",
       "path": null,
       "detail": {
-        "session": "demo.u1020195519a",
+        "session": "demo.u1020230210a",
         "name": "mcp__vault__account_status"
       }
     },
     {
-      "t_ms": 1792526158822,
+      "t_ms": 1792537593778,
       "src": "gateway",
       "event": "model_response",
       "path": [
@@ -2669,28 +2685,13 @@
         "agent"
       ],
       "detail": {
-        "request_id": "c9659edefeae3e81-11d",
-        "output_tokens": 25,
-        "cost_micros": 316
+        "request_id": "1cc56df1227f687d-5",
+        "output_tokens": 38,
+        "cost_micros": 362
       }
     },
     {
-      "t_ms": 1792526158848,
-      "src": "gateway",
-      "event": "model_response",
-      "path": [
-        "model",
-        "gateway",
-        "agent"
-      ],
-      "detail": {
-        "request_id": "c9659edefeae3e81-11c",
-        "output_tokens": 21,
-        "cost_micros": 286
-      }
-    },
-    {
-      "t_ms": 1792526158972,
+      "t_ms": 1792537593866,
       "src": "client",
       "event": "turn_complete",
       "path": [
@@ -2698,26 +2699,11 @@
         "efs"
       ],
       "detail": {
-        "session": "demo.u1020195519a"
+        "session": "demo.u1020230210a"
       }
     },
     {
-      "t_ms": 1792526365000,
-      "src": "gateway",
-      "event": "model_request",
-      "path": [
-        "agent",
-        "gateway",
-        "model"
-      ],
-      "detail": {
-        "request_id": "c9659edefeae3e81-11e",
-        "model": "gpt-4.1-mini",
-        "input_tokens": 2317
-      }
-    },
-    {
-      "t_ms": 1792526365144,
+      "t_ms": 1792537798945,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -2727,13 +2713,13 @@
       "detail": {
         "connector": "vault",
         "method": "server/discover",
-        "session": "demo.u1020195519a",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210a",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526365145,
+      "t_ms": 1792537798946,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -2743,13 +2729,13 @@
       "detail": {
         "connector": "vault",
         "method": "initialize",
-        "session": "demo.u1020195519a",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210a",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526365146,
+      "t_ms": 1792537798947,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -2759,13 +2745,13 @@
       "detail": {
         "connector": "vault",
         "method": "notifications/initialized",
-        "session": "demo.u1020195519a",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210a",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 202
       }
     },
     {
-      "t_ms": 1792526365147,
+      "t_ms": 1792537798948,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -2775,13 +2761,13 @@
       "detail": {
         "connector": "vault",
         "method": "tools/list",
-        "session": "demo.u1020195519a",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210a",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526365147,
+      "t_ms": 1792537798948,
       "src": "client",
       "event": "prompt",
       "path": [
@@ -2789,11 +2775,11 @@
         "agent"
       ],
       "detail": {
-        "session": "demo.u1020195519a"
+        "session": "demo.u1020230210a"
       }
     },
     {
-      "t_ms": 1792526365148,
+      "t_ms": 1792537798950,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -2803,13 +2789,13 @@
       "detail": {
         "connector": "vault",
         "method": "resources/list",
-        "session": "demo.u1020195519a",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210a",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526365149,
+      "t_ms": 1792537798951,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -2819,48 +2805,13 @@
       "detail": {
         "connector": "vault",
         "method": "prompts/list",
-        "session": "demo.u1020195519a",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210a",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526366164,
-      "src": "gateway",
-      "event": "model_response",
-      "path": [
-        "model",
-        "gateway",
-        "agent"
-      ],
-      "detail": {
-        "request_id": "c9659edefeae3e81-11e",
-        "output_tokens": 65,
-        "cost_micros": 378
-      }
-    },
-    {
-      "t_ms": 1792526366391,
-      "src": "client",
-      "event": "tool_start",
-      "path": null,
-      "detail": {
-        "session": "demo.u1020195519a",
-        "name": "memory"
-      }
-    },
-    {
-      "t_ms": 1792526366431,
-      "src": "client",
-      "event": "tool_end",
-      "path": null,
-      "detail": {
-        "session": "demo.u1020195519a",
-        "name": "memory"
-      }
-    },
-    {
-      "t_ms": 1792526367000,
+      "t_ms": 1792537799000,
       "src": "gateway",
       "event": "model_request",
       "path": [
@@ -2869,13 +2820,78 @@
         "model"
       ],
       "detail": {
-        "request_id": "c9659edefeae3e81-11f",
+        "request_id": "1cc56df1227f687d-6",
         "model": "gpt-4.1-mini",
-        "input_tokens": 2394
+        "input_tokens": 2488
       }
     },
     {
-      "t_ms": 1792526367406,
+      "t_ms": 1792537799888,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "1cc56df1227f687d-6",
+        "output_tokens": 38,
+        "cost_micros": 365
+      }
+    },
+    {
+      "t_ms": 1792537799930,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1020230210a",
+        "name": "memory"
+      }
+    },
+    {
+      "t_ms": 1792537799977,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1020230210a",
+        "name": "memory"
+      }
+    },
+    {
+      "t_ms": 1792537800000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "1cc56df1227f687d-7",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 2542
+      }
+    },
+    {
+      "t_ms": 1792537800707,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "1cc56df1227f687d-7",
+        "output_tokens": 24,
+        "cost_micros": 1055
+      }
+    },
+    {
+      "t_ms": 1792537800719,
       "src": "client",
       "event": "turn_complete",
       "path": [
@@ -2883,26 +2899,119 @@
         "efs"
       ],
       "detail": {
-        "session": "demo.u1020195519a"
+        "session": "demo.u1020230210a"
       }
     },
     {
-      "t_ms": 1792526367937,
-      "src": "gateway",
-      "event": "model_response",
+      "t_ms": 1792537800827,
+      "src": "standin",
+      "event": "managed_call",
       "path": [
-        "model",
-        "gateway",
+        "agent",
+        "standin"
+      ],
+      "detail": {
+        "connector": "vault",
+        "method": "server/discover",
+        "session": "demo.u1020230210b",
+        "tenant": "uc-assistant-1020230210",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792537800829,
+      "src": "standin",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "standin"
+      ],
+      "detail": {
+        "connector": "vault",
+        "method": "initialize",
+        "session": "demo.u1020230210b",
+        "tenant": "uc-assistant-1020230210",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792537800830,
+      "src": "standin",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "standin"
+      ],
+      "detail": {
+        "connector": "vault",
+        "method": "notifications/initialized",
+        "session": "demo.u1020230210b",
+        "tenant": "uc-assistant-1020230210",
+        "upstream_status": 202
+      }
+    },
+    {
+      "t_ms": 1792537800832,
+      "src": "standin",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "standin"
+      ],
+      "detail": {
+        "connector": "vault",
+        "method": "tools/list",
+        "session": "demo.u1020230210b",
+        "tenant": "uc-assistant-1020230210",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792537800833,
+      "src": "standin",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "standin"
+      ],
+      "detail": {
+        "connector": "vault",
+        "method": "resources/list",
+        "session": "demo.u1020230210b",
+        "tenant": "uc-assistant-1020230210",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792537800834,
+      "src": "standin",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "standin"
+      ],
+      "detail": {
+        "connector": "vault",
+        "method": "prompts/list",
+        "session": "demo.u1020230210b",
+        "tenant": "uc-assistant-1020230210",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792537800836,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
         "agent"
       ],
       "detail": {
-        "request_id": "c9659edefeae3e81-11f",
-        "output_tokens": 24,
-        "cost_micros": 343
+        "session": "demo.u1020230210b"
       }
     },
     {
-      "t_ms": 1792526368000,
+      "t_ms": 1792537801000,
       "src": "gateway",
       "event": "model_request",
       "path": [
@@ -2911,121 +3020,48 @@
         "model"
       ],
       "detail": {
-        "request_id": "c9659edefeae3e81-120",
+        "request_id": "1cc56df1227f687d-8",
         "model": "gpt-4.1-mini",
         "input_tokens": 1369
       }
     },
     {
-      "t_ms": 1792526368336,
-      "src": "standin",
-      "event": "managed_call",
-      "path": [
-        "agent",
-        "standin"
-      ],
-      "detail": {
-        "connector": "vault",
-        "method": "server/discover",
-        "session": "demo.u1020195519b",
-        "tenant": "uc-assistant-1020195519",
-        "upstream_status": 200
-      }
-    },
-    {
-      "t_ms": 1792526368337,
-      "src": "standin",
-      "event": "managed_call",
-      "path": [
-        "agent",
-        "standin"
-      ],
-      "detail": {
-        "connector": "vault",
-        "method": "initialize",
-        "session": "demo.u1020195519b",
-        "tenant": "uc-assistant-1020195519",
-        "upstream_status": 200
-      }
-    },
-    {
-      "t_ms": 1792526368338,
-      "src": "standin",
-      "event": "managed_call",
-      "path": [
-        "agent",
-        "standin"
-      ],
-      "detail": {
-        "connector": "vault",
-        "method": "notifications/initialized",
-        "session": "demo.u1020195519b",
-        "tenant": "uc-assistant-1020195519",
-        "upstream_status": 202
-      }
-    },
-    {
-      "t_ms": 1792526368339,
-      "src": "standin",
-      "event": "managed_call",
-      "path": [
-        "agent",
-        "standin"
-      ],
-      "detail": {
-        "connector": "vault",
-        "method": "tools/list",
-        "session": "demo.u1020195519b",
-        "tenant": "uc-assistant-1020195519",
-        "upstream_status": 200
-      }
-    },
-    {
-      "t_ms": 1792526368339,
+      "t_ms": 1792537802584,
       "src": "client",
-      "event": "prompt",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1020230210b",
+        "name": "memory"
+      }
+    },
+    {
+      "t_ms": 1792537802584,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1020230210b",
+        "name": "memory"
+      }
+    },
+    {
+      "t_ms": 1792537802633,
+      "src": "gateway",
+      "event": "model_response",
       "path": [
-        "you",
+        "model",
+        "gateway",
         "agent"
       ],
       "detail": {
-        "session": "demo.u1020195519b"
+        "request_id": "1cc56df1227f687d-8",
+        "output_tokens": 31,
+        "cost_micros": 597
       }
     },
     {
-      "t_ms": 1792526368341,
-      "src": "standin",
-      "event": "managed_call",
-      "path": [
-        "agent",
-        "standin"
-      ],
-      "detail": {
-        "connector": "vault",
-        "method": "resources/list",
-        "session": "demo.u1020195519b",
-        "tenant": "uc-assistant-1020195519",
-        "upstream_status": 200
-      }
-    },
-    {
-      "t_ms": 1792526368342,
-      "src": "standin",
-      "event": "managed_call",
-      "path": [
-        "agent",
-        "standin"
-      ],
-      "detail": {
-        "connector": "vault",
-        "method": "prompts/list",
-        "session": "demo.u1020195519b",
-        "tenant": "uc-assistant-1020195519",
-        "upstream_status": 200
-      }
-    },
-    {
-      "t_ms": 1792526369000,
+      "t_ms": 1792537803000,
       "src": "gateway",
       "event": "model_request",
       "path": [
@@ -3034,63 +3070,28 @@
         "model"
       ],
       "detail": {
-        "request_id": "c9659edefeae3e81-121",
+        "request_id": "1cc56df1227f687d-9",
         "model": "gpt-4.1-mini",
-        "input_tokens": 1440
+        "input_tokens": 1414
       }
     },
     {
-      "t_ms": 1792526369019,
+      "t_ms": 1792537803000,
       "src": "gateway",
-      "event": "model_response",
+      "event": "model_request",
       "path": [
-        "model",
+        "agent",
         "gateway",
-        "agent"
+        "model"
       ],
       "detail": {
-        "request_id": "c9659edefeae3e81-120",
-        "output_tokens": 57,
-        "cost_micros": 639
+        "request_id": "1cc56df1227f687d-a",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 157
       }
     },
     {
-      "t_ms": 1792526369446,
-      "src": "client",
-      "event": "tool_start",
-      "path": null,
-      "detail": {
-        "session": "demo.u1020195519b",
-        "name": "memory"
-      }
-    },
-    {
-      "t_ms": 1792526369446,
-      "src": "client",
-      "event": "tool_end",
-      "path": null,
-      "detail": {
-        "session": "demo.u1020195519b",
-        "name": "memory"
-      }
-    },
-    {
-      "t_ms": 1792526370326,
-      "src": "gateway",
-      "event": "model_response",
-      "path": [
-        "model",
-        "gateway",
-        "agent"
-      ],
-      "detail": {
-        "request_id": "c9659edefeae3e81-121",
-        "output_tokens": 17,
-        "cost_micros": 219
-      }
-    },
-    {
-      "t_ms": 1792526370760,
+      "t_ms": 1792537803423,
       "src": "client",
       "event": "turn_complete",
       "path": [
@@ -3098,26 +3099,41 @@
         "efs"
       ],
       "detail": {
-        "session": "demo.u1020195519b"
+        "session": "demo.u1020230210b"
       }
     },
     {
-      "t_ms": 1792526371000,
+      "t_ms": 1792537803580,
       "src": "gateway",
-      "event": "model_request",
+      "event": "model_response",
       "path": [
-        "agent",
+        "model",
         "gateway",
-        "model"
+        "agent"
       ],
       "detail": {
-        "request_id": "c9659edefeae3e81-122",
-        "model": "gpt-4.1-mini",
-        "input_tokens": 157
+        "request_id": "1cc56df1227f687d-a",
+        "output_tokens": 5,
+        "cost_micros": 71
       }
     },
     {
-      "t_ms": 1792526371638,
+      "t_ms": 1792537803824,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "1cc56df1227f687d-9",
+        "output_tokens": 17,
+        "cost_micros": 209
+      }
+    },
+    {
+      "t_ms": 1792537804097,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -3127,13 +3143,13 @@
       "detail": {
         "connector": "vault",
         "method": "server/discover",
-        "session": "demo.u1020195519c",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210c",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526371639,
+      "t_ms": 1792537804099,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -3143,13 +3159,13 @@
       "detail": {
         "connector": "vault",
         "method": "initialize",
-        "session": "demo.u1020195519c",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210c",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526371640,
+      "t_ms": 1792537804100,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -3159,13 +3175,13 @@
       "detail": {
         "connector": "vault",
         "method": "notifications/initialized",
-        "session": "demo.u1020195519c",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210c",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 202
       }
     },
     {
-      "t_ms": 1792526371642,
+      "t_ms": 1792537804101,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -3175,13 +3191,13 @@
       "detail": {
         "connector": "vault",
         "method": "tools/list",
-        "session": "demo.u1020195519c",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210c",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526371643,
+      "t_ms": 1792537804102,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -3191,13 +3207,13 @@
       "detail": {
         "connector": "vault",
         "method": "resources/list",
-        "session": "demo.u1020195519c",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210c",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526371644,
+      "t_ms": 1792537804104,
       "src": "standin",
       "event": "managed_call",
       "path": [
@@ -3207,28 +3223,13 @@
       "detail": {
         "connector": "vault",
         "method": "prompts/list",
-        "session": "demo.u1020195519c",
-        "tenant": "uc-assistant-1020195519",
+        "session": "demo.u1020230210c",
+        "tenant": "uc-assistant-1020230210",
         "upstream_status": 200
       }
     },
     {
-      "t_ms": 1792526371656,
-      "src": "gateway",
-      "event": "model_response",
-      "path": [
-        "model",
-        "gateway",
-        "agent"
-      ],
-      "detail": {
-        "request_id": "c9659edefeae3e81-122",
-        "output_tokens": 7,
-        "cost_micros": 74
-      }
-    },
-    {
-      "t_ms": 1792526430407,
+      "t_ms": 1792537818091,
       "src": "demo",
       "event": "run_finished",
       "path": null,
@@ -3237,107 +3238,107 @@
   ],
   "conversation": [
     {
-      "t_ms": 1792526135706,
-      "session": "demo.u1020195519a",
+      "t_ms": 1792537567891,
+      "session": "demo.u1020230210a",
       "role": "user",
       "text": "Introduce yourself in one sentence. Then list, comma separated, the exact names of every tool you can call (function names only)."
     },
     {
-      "t_ms": 1792526136518,
-      "session": "demo.u1020195519a",
+      "t_ms": 1792537569375,
+      "session": "demo.u1020230210a",
       "role": "assistant",
-      "text": "I am Juniper, your research assistant specializing in codebases and project knowledge; the tools I can call are functions.mcp__deepwiki__ask_wiki_question, functions.mcp__deepwiki__read_wiki_structure, functions.mcp__vault__account_status, functions.memory."
+      "text": "I am Juniper, your succinct research assistant specialized in codebases, equipped to answer questions about open-source projects, manage memory, and access customer accounts using AI-powered tools. The tools I can call are: functions.mcp__deepwiki__ask_wiki_question, functions.mcp__deepwiki__read_wiki_structure, functions.mcp__vault__account_status, functions.memory.parallel"
     },
     {
-      "t_ms": 1792526142654,
-      "session": "demo.u1020195519a",
+      "t_ms": 1792537578282,
+      "session": "demo.u1020230210a",
       "role": "user",
       "text": "Use DeepWiki's ask_wiki_question tool to ask about the repository modelcontextprotocol/rust-sdk: what does it provide? Answer in two sentences."
     },
     {
-      "t_ms": 1792526143568,
-      "session": "demo.u1020195519a",
+      "t_ms": 1792537579133,
+      "session": "demo.u1020230210a",
       "role": "tool",
       "name": "mcp__deepwiki__ask_wiki_question",
       "input": "{\"question\":\"What does the repository modelcontextprotocol/rust-sdk provide?\",\"repoName\":\"modelcontextprotocol/rust-sdk\"}",
-      "output": "The `modelcontextprotocol/rust-sdk` repository provides the official Rust implementation of the Model Context Protocol (MCP) specification, known as RMCP . It is designed to help developers build both MCP servers and clients .\n\n## Core Components and Features\n\nThe SDK is structured into two main crates:\n*   `rmcp`: This is the core runtime library that implements the MCP protocol . It provides type-safe protocol implementation, modern lifecycle support (including `initialize` and `server/discover` modes), and flexible architecture for both server and client roles .\n*   `rmcp-macros`: This crat",
-      "end_ms": 1792526156016
+      "output": "The `modelcontextprotocol/rust-sdk` repository provides the official Rust implementation of the Model Context Protocol (MCP) specification, known as RMCP . This SDK enables developers to build both MCP servers and clients, offering features such as type-safe protocol implementation, flexible architecture, multiple transport options, and developer ergonomics through procedural macros .\n\n## Core Components\n\nThe repository is structured as a Cargo monorepo, containing two primary crates:\n*   **`rmcp`**: This is the core crate that provides the RMCP protocol implementation, handling the protocol l",
+      "end_ms": 1792537589532
     },
     {
-      "t_ms": 1792526156619,
-      "session": "demo.u1020195519a",
+      "t_ms": 1792537590591,
+      "session": "demo.u1020230210a",
       "role": "assistant",
-      "text": "The modelcontextprotocol/rust-sdk repository provides the official Rust implementation of the Model Context Protocol (MCP) specification, helping developers build both MCP servers and clients. It includes core runtime libraries, procedural macros for code generation, support for various transports, advanced protocol features, and developer ergonomics enhancements. -- Juniper"
+      "text": "The repository modelcontextprotocol/rust-sdk provides the official Rust implementation of the Model Context Protocol (MCP) called RMCP, enabling developers to build MCP servers and clients with type-safe protocol implementation and multiple transport options. It also offers procedural macros for defining MCP tools, supports OAuth 2.0, long-running tasks, and unified error handling, built as a production-ready async-first SDK on the tokio runtime. -- Juniper"
     },
     {
-      "t_ms": 1792526157219,
-      "session": "demo.u1020195519a",
+      "t_ms": 1792537591944,
+      "session": "demo.u1020230210a",
       "role": "user",
       "text": "Look up the account status for the customer acme and quote its vault_ref."
     },
     {
-      "t_ms": 1792526158150,
-      "session": "demo.u1020195519a",
+      "t_ms": 1792537593073,
+      "session": "demo.u1020230210a",
       "role": "tool",
       "name": "mcp__vault__account_status",
       "input": "{\"customer\":\"acme\"}",
-      "output": "customer acme: plan=pro, seats=12, vault_ref=VAULT-cb3ccd1b77fb, upstream_auth=verified",
-      "end_ms": 1792526158150
+      "output": "customer acme: plan=pro, seats=12, vault_ref=VAULT-bc8ee1550f84, upstream_auth=verified",
+      "end_ms": 1792537593073
     },
     {
-      "t_ms": 1792526158633,
-      "session": "demo.u1020195519a",
+      "t_ms": 1792537593562,
+      "session": "demo.u1020230210a",
       "role": "assistant",
-      "text": "The vault_ref for the customer acme is VAULT-cb3ccd1b77fb. -- Juniper"
+      "text": "The account status for the customer acme shows a pro plan with 12 seats, and its vault_ref is VAULT-bc8ee1550f84. -- Juniper"
     },
     {
-      "t_ms": 1792526365147,
-      "session": "demo.u1020195519a",
+      "t_ms": 1792537798948,
+      "session": "demo.u1020230210a",
       "role": "user",
-      "text": "Remember this for later: my project codename is orchid-2182620051. Save it with your memory tool: command create, path /memories/MEMORY.md (the path argument, not new_path), file_text a line stating the codename. Then confirm in one sentence."
+      "text": "Remember this for later: my project codename is orchid-2976126686. Save it with your memory tool: command create, path /memories/MEMORY.md (the path argument, not new_path), file_text a line stating the codename. Then confirm in one sentence."
     },
     {
-      "t_ms": 1792526366391,
-      "session": "demo.u1020195519a",
+      "t_ms": 1792537799930,
+      "session": "demo.u1020230210a",
       "role": "tool",
       "name": "memory",
-      "input": "{\"command\":\"create\",\"file_text\":\"project codename is orchid-2182620051\",\"insert_line\":0,\"insert_text\":\"\",\"new_path\":\"\",\"new_str\":\"\",\"old_str\":\"\",\"path\":\"/memories/MEMORY.md\",\"query\":\"\",\"view_range\":[]}",
+      "input": "{\"command\":\"create\",\"file_text\":\"project codename is orchid-2976126686\",\"path\":\"/memories/MEMORY.md\"}",
       "output": "Created /memories/MEMORY.md (37 bytes).",
-      "end_ms": 1792526366431
+      "end_ms": 1792537799977
     },
     {
-      "t_ms": 1792526367113,
-      "session": "demo.u1020195519a",
+      "t_ms": 1792537800489,
+      "session": "demo.u1020230210a",
       "role": "assistant",
-      "text": "I have saved your project codename as orchid-2182620051 in memory for later. -- Juniper"
+      "text": "I have saved that your project codename is orchid-2976126686 for later reference. -- Juniper"
     },
     {
-      "t_ms": 1792526368339,
-      "session": "demo.u1020195519b",
+      "t_ms": 1792537800836,
+      "session": "demo.u1020230210b",
       "role": "user",
       "text": "What is my project codename? Check your memory first with your memory tool: command view, path /memories/MEMORY.md. Then answer in one sentence."
     },
     {
-      "t_ms": 1792526369446,
-      "session": "demo.u1020195519b",
+      "t_ms": 1792537802584,
+      "session": "demo.u1020230210b",
       "role": "tool",
       "name": "memory",
-      "input": "{\"command\":\"view\",\"file_text\":\"\",\"insert_line\":0,\"insert_text\":\"\",\"new_path\":\"\",\"new_str\":\"\",\"old_str\":\"\",\"path\":\"/memories/MEMORY.md\",\"query\":\"project codename\",\"view_range\":[1,20]}",
-      "output": "project codename is orchid-2182620051",
-      "end_ms": 1792526369446
+      "input": "{\"command\":\"view\",\"path\":\"/memories/MEMORY.md\",\"view_range\":[1,10]}",
+      "output": "project codename is orchid-2976126686",
+      "end_ms": 1792537802584
     },
     {
-      "t_ms": 1792526370538,
-      "session": "demo.u1020195519b",
+      "t_ms": 1792537803162,
+      "session": "demo.u1020230210b",
       "role": "assistant",
-      "text": "Your project codename is orchid-2182620051. -- Juniper"
+      "text": "Your project codename is orchid-2976126686. -- Juniper"
     }
   ],
   "billing": {
     "rows": [
       {
-        "request_id": "c9659edefeae3e81-118",
-        "t_ms": 1792526135000,
+        "request_id": "1cc56df1227f687d-0",
+        "t_ms": 1792537568000,
         "tenant_id": 1,
         "provider": "openai",
         "model": "gpt-4.1-mini-2025-04-14",
@@ -3346,18 +3347,18 @@
         "price_model": "gpt-4.1-mini",
         "outcome": "ok",
         "price_status": "priced",
-        "input_tokens": 1339,
-        "output_tokens": 60,
-        "cache_read_tokens": 0,
+        "input_tokens": 1421,
+        "output_tokens": 67,
+        "cache_read_tokens": 1280,
         "cache_write_tokens": 0,
         "reasoning_tokens": "Some(0)",
-        "cost_micros": 632,
-        "price_micros": 632,
-        "latency_ms": 1080
+        "cost_micros": 292,
+        "price_micros": 292,
+        "latency_ms": 3289
       },
       {
-        "request_id": "c9659edefeae3e81-119",
-        "t_ms": 1792526137000,
+        "request_id": "1cc56df1227f687d-1",
+        "t_ms": 1792537572000,
         "tenant_id": 1,
         "provider": "openai",
         "model": "gpt-4.1-mini-2025-04-14",
@@ -3366,18 +3367,18 @@
         "price_model": "gpt-4.1-mini",
         "outcome": "ok",
         "price_status": "priced",
-        "input_tokens": 192,
+        "input_tokens": 213,
         "output_tokens": 7,
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
         "reasoning_tokens": "Some(0)",
-        "cost_micros": 88,
-        "price_micros": 88,
-        "latency_ms": 566
+        "cost_micros": 96,
+        "price_micros": 96,
+        "latency_ms": 813
       },
       {
-        "request_id": "c9659edefeae3e81-11a",
-        "t_ms": 1792526143000,
+        "request_id": "1cc56df1227f687d-2",
+        "t_ms": 1792537579000,
         "tenant_id": 1,
         "provider": "openai",
         "model": "gpt-4.1-mini-2025-04-14",
@@ -3386,18 +3387,18 @@
         "price_model": "gpt-4.1-mini",
         "outcome": "ok",
         "price_status": "priced",
-        "input_tokens": 1436,
+        "input_tokens": 1456,
         "output_tokens": 44,
         "cache_read_tokens": 1280,
         "cache_write_tokens": 0,
         "reasoning_tokens": "Some(0)",
-        "cost_micros": 261,
-        "price_micros": 261,
-        "latency_ms": 839
+        "cost_micros": 269,
+        "price_micros": 269,
+        "latency_ms": 765
       },
       {
-        "request_id": "c9659edefeae3e81-11b",
-        "t_ms": 1792526156000,
+        "request_id": "1cc56df1227f687d-3",
+        "t_ms": 1792537590000,
         "tenant_id": 1,
         "provider": "openai",
         "model": "gpt-4.1-mini-2025-04-14",
@@ -3406,18 +3407,18 @@
         "price_model": "gpt-4.1-mini",
         "outcome": "ok",
         "price_status": "priced",
-        "input_tokens": 2079,
-        "output_tokens": 65,
+        "input_tokens": 2213,
+        "output_tokens": 89,
         "cache_read_tokens": 1408,
         "cache_write_tokens": 0,
         "reasoning_tokens": "Some(0)",
-        "cost_micros": 513,
-        "price_micros": 513,
-        "latency_ms": 1066
+        "cost_micros": 605,
+        "price_micros": 605,
+        "latency_ms": 1824
       },
       {
-        "request_id": "c9659edefeae3e81-11c",
-        "t_ms": 1792526158000,
+        "request_id": "1cc56df1227f687d-4",
+        "t_ms": 1792537592000,
         "tenant_id": 1,
         "provider": "openai",
         "model": "gpt-4.1-mini-2025-04-14",
@@ -3426,58 +3427,18 @@
         "price_model": "gpt-4.1-mini",
         "outcome": "ok",
         "price_status": "priced",
-        "input_tokens": 2166,
+        "input_tokens": 2324,
         "output_tokens": 21,
-        "cache_read_tokens": 2048,
-        "cache_write_tokens": 0,
-        "reasoning_tokens": "Some(0)",
-        "cost_micros": 286,
-        "price_micros": 286,
-        "latency_ms": 848
-      },
-      {
-        "request_id": "c9659edefeae3e81-11d",
-        "t_ms": 1792526158000,
-        "tenant_id": 1,
-        "provider": "openai",
-        "model": "gpt-4.1-mini-2025-04-14",
-        "requested_model": "gpt-4.1-mini",
-        "routed_model": "gpt-4.1-mini",
-        "price_model": "gpt-4.1-mini",
-        "outcome": "ok",
-        "price_status": "priced",
-        "input_tokens": 2227,
-        "output_tokens": 25,
-        "cache_read_tokens": 2048,
-        "cache_write_tokens": 0,
-        "reasoning_tokens": "Some(0)",
-        "cost_micros": 316,
-        "price_micros": 316,
-        "latency_ms": 822
-      },
-      {
-        "request_id": "c9659edefeae3e81-11e",
-        "t_ms": 1792526365000,
-        "tenant_id": 1,
-        "provider": "openai",
-        "model": "gpt-4.1-mini-2025-04-14",
-        "requested_model": "gpt-4.1-mini",
-        "routed_model": "gpt-4.1-mini",
-        "price_model": "gpt-4.1-mini",
-        "outcome": "ok",
-        "price_status": "priced",
-        "input_tokens": 2317,
-        "output_tokens": 65,
         "cache_read_tokens": 2176,
         "cache_write_tokens": 0,
         "reasoning_tokens": "Some(0)",
-        "cost_micros": 378,
-        "price_micros": 378,
-        "latency_ms": 1164
+        "cost_micros": 310,
+        "price_micros": 310,
+        "latency_ms": 1058
       },
       {
-        "request_id": "c9659edefeae3e81-11f",
-        "t_ms": 1792526367000,
+        "request_id": "1cc56df1227f687d-5",
+        "t_ms": 1792537593000,
         "tenant_id": 1,
         "provider": "openai",
         "model": "gpt-4.1-mini-2025-04-14",
@@ -3486,18 +3447,58 @@
         "price_model": "gpt-4.1-mini",
         "outcome": "ok",
         "price_status": "priced",
-        "input_tokens": 2394,
+        "input_tokens": 2385,
+        "output_tokens": 38,
+        "cache_read_tokens": 2176,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 362,
+        "price_micros": 362,
+        "latency_ms": 778
+      },
+      {
+        "request_id": "1cc56df1227f687d-6",
+        "t_ms": 1792537799000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 2488,
+        "output_tokens": 38,
+        "cache_read_tokens": 2304,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 365,
+        "price_micros": 365,
+        "latency_ms": 888
+      },
+      {
+        "request_id": "1cc56df1227f687d-7",
+        "t_ms": 1792537800000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 2542,
         "output_tokens": 24,
-        "cache_read_tokens": 2176,
+        "cache_read_tokens": 0,
         "cache_write_tokens": 0,
         "reasoning_tokens": "Some(0)",
-        "cost_micros": 343,
-        "price_micros": 343,
-        "latency_ms": 937
+        "cost_micros": 1055,
+        "price_micros": 1055,
+        "latency_ms": 707
       },
       {
-        "request_id": "c9659edefeae3e81-120",
-        "t_ms": 1792526368000,
+        "request_id": "1cc56df1227f687d-8",
+        "t_ms": 1792537801000,
         "tenant_id": 1,
         "provider": "openai",
         "model": "gpt-4.1-mini-2025-04-14",
@@ -3507,17 +3508,17 @@
         "outcome": "ok",
         "price_status": "priced",
         "input_tokens": 1369,
-        "output_tokens": 57,
+        "output_tokens": 31,
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
         "reasoning_tokens": "Some(0)",
-        "cost_micros": 639,
-        "price_micros": 639,
-        "latency_ms": 1019
+        "cost_micros": 597,
+        "price_micros": 597,
+        "latency_ms": 1633
       },
       {
-        "request_id": "c9659edefeae3e81-121",
-        "t_ms": 1792526369000,
+        "request_id": "1cc56df1227f687d-9",
+        "t_ms": 1792537803000,
         "tenant_id": 1,
         "provider": "openai",
         "model": "gpt-4.1-mini-2025-04-14",
@@ -3526,18 +3527,18 @@
         "price_model": "gpt-4.1-mini",
         "outcome": "ok",
         "price_status": "priced",
-        "input_tokens": 1440,
+        "input_tokens": 1414,
         "output_tokens": 17,
         "cache_read_tokens": 1280,
         "cache_write_tokens": 0,
         "reasoning_tokens": "Some(0)",
-        "cost_micros": 219,
-        "price_micros": 219,
-        "latency_ms": 1326
+        "cost_micros": 209,
+        "price_micros": 209,
+        "latency_ms": 824
       },
       {
-        "request_id": "c9659edefeae3e81-122",
-        "t_ms": 1792526371000,
+        "request_id": "1cc56df1227f687d-a",
+        "t_ms": 1792537803000,
         "tenant_id": 1,
         "provider": "openai",
         "model": "gpt-4.1-mini-2025-04-14",
@@ -3547,22 +3548,22 @@
         "outcome": "ok",
         "price_status": "priced",
         "input_tokens": 157,
-        "output_tokens": 7,
+        "output_tokens": 5,
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
         "reasoning_tokens": "Some(0)",
-        "cost_micros": 74,
-        "price_micros": 74,
-        "latency_ms": 656
+        "cost_micros": 71,
+        "price_micros": 71,
+        "latency_ms": 580
       }
     ],
     "rows_found": 11,
-    "total_cost_micros": 3749,
-    "total_price_micros": 3749,
-    "total_cost_usd": 0.003749,
-    "input_tokens": 17116,
-    "output_tokens": 392,
-    "cache_read_tokens": 12416
+    "total_cost_micros": 4231,
+    "total_price_micros": 4231,
+    "total_cost_usd": 0.004231,
+    "input_tokens": 17982,
+    "output_tokens": 381,
+    "cache_read_tokens": 11904
   },
   "sandbox": {
     "provider": "fargate",
@@ -3572,33 +3573,33 @@
   },
   "disk": null,
   "teardown": {
-    "tagging_index_stale": 14,
+    "tagging_index_stale": 13,
     "name": "demo",
     "region": "us-west-2",
-    "verified_at": "2026-10-20T20:31:59Z",
+    "verified_at": "2026-10-20T23:24:52Z",
     "verdict": "clean",
     "before": {
-      "cloudmap_namespaces": 0,
-      "cloudmap_services": 0,
-      "e2b_sandboxes": 0,
+      "cloudmap_namespaces": 1,
+      "cloudmap_services": 4,
+      "e2b_sandboxes": 2,
       "ec2_internet_gateways": 1,
-      "ec2_network_interfaces": 1,
+      "ec2_network_interfaces": 5,
       "ec2_route_tables": 1,
       "ec2_security_groups": 2,
       "ec2_subnets": 1,
       "ec2_vpcs": 1,
       "ecr_repositories": 4,
-      "ecs_clusters": 0,
-      "ecs_services": 0,
-      "ecs_task_definitions": 0,
-      "ecs_tasks": 0,
-      "efs_access_points": 0,
+      "ecs_clusters": 1,
+      "ecs_services": 4,
+      "ecs_task_definitions": 4,
+      "ecs_tasks": 4,
+      "efs_access_points": 1,
       "efs_file_systems": 1,
       "efs_mount_targets": 1,
-      "iam_roles": 0,
-      "log_groups": 0,
-      "route53_hosted_zones": 0,
-      "ssm_parameters": 10
+      "iam_roles": 5,
+      "log_groups": 1,
+      "route53_hosted_zones": 1,
+      "ssm_parameters": 11
     },
     "counts": {
       "cloudmap_namespaces": 0,
