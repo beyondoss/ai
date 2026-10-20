@@ -60,17 +60,24 @@ impl HttpMcpFixture {
 
 /// Start one fixture on a loopback port. The thread runs for the test process's life.
 pub fn spawn_http_mcp_fixture() -> HttpMcpFixture {
-    spawn(None)
+    spawn(None, false)
+}
+
+/// A public legacy server that rejects the `2026-07-28` probe the way DeepWiki does: `server/discover`
+/// gets an HTTP 400 whose JSON-RPC error is code -32600 with a made-up string id instead of the
+/// request's. Every other request is served normally.
+pub fn spawn_http_mcp_fixture_rejecting_discover() -> HttpMcpFixture {
+    spawn(None, true)
 }
 
 /// A legacy server slow to answer `server/discover`: it holds that request `delay` — past the
 /// client's discover timeout — then answers it "method not found", while serving every other
 /// request at once (one thread per connection). A cold-start serverless MCP host looks like this.
 pub fn spawn_http_mcp_fixture_slow_discover(delay: Duration) -> HttpMcpFixture {
-    spawn(Some(delay))
+    spawn(Some(delay), false)
 }
 
-fn spawn(slow_discover: Option<Duration>) -> HttpMcpFixture {
+fn spawn(slow_discover: Option<Duration>, reject_discover: bool) -> HttpMcpFixture {
     let listener = beyond_ai_test_support::ports::listener();
     let addr = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -81,9 +88,9 @@ fn spawn(slow_discover: Option<Duration>) -> HttpMcpFixture {
             let recorder = recorder.clone();
             match slow_discover {
                 Some(delay) => {
-                    thread::spawn(move || serve(stream, &recorder, Some(delay)));
+                    thread::spawn(move || serve(stream, &recorder, Some(delay), reject_discover));
                 }
-                None => serve(stream, &recorder, None),
+                None => serve(stream, &recorder, None, reject_discover),
             }
         }
     });
@@ -98,6 +105,7 @@ fn serve(
     mut stream: std::net::TcpStream,
     recorder: &Mutex<Vec<RequestHeaders>>,
     slow_discover: Option<Duration>,
+    reject_discover: bool,
 ) {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 8192];
@@ -158,6 +166,21 @@ fn serve(
             "error": { "code": -32601, "message": "Method not found: server/discover" },
         });
         write_json(&mut stream, &envelope);
+        return;
+    }
+    if reject_discover && method == "server/discover" {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": "server-error",
+            "error": { "code": -32600, "message": "Unsupported protocol version: 2026-07-28" },
+        });
+        let encoded = serde_json::to_vec(&body).unwrap();
+        let header = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            encoded.len()
+        );
+        let _ = stream.write_all(header.as_bytes());
+        let _ = stream.write_all(&encoded);
         return;
     }
     let result = match method {

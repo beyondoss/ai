@@ -5476,6 +5476,14 @@ or `BEYOND_AI_AGENT_MCP_HANDSHAKE_SECS`. On timeout the dial is dropped (a stdio
 its transport) and handled like any failed connect: a warning, the server dormant, the rest loaded
 (`tests/mcp_handshake_timeout.rs`).
 
+The handshake opens with `server/discover` (`2026-07-28`) and falls back to a legacy `initialize` on the same
+connection. **Any** JSON-RPC error answering the probe means "not a `2026-07-28` server" and takes that
+fallback: rmcp itself only does so for a correlated, non-modern-code error, so `mcp_handshake::Guard` rewrites
+whatever error arrives while the discover is the only request in flight into one (the discover's id,
+"method not found"). That covers a public server such as DeepWiki, which rejects the probe with HTTP 400, code
+-32600 and the id `"server-error"` (`tests/mcp_late_discover.rs`). Transport failures (refused, timeout, a 5xx
+with no JSON-RPC body) produce no error message and still fail the dial.
+
 ### A server's tools can change
 
 A server's tool list is not fixed at its first boot: one may add tools on request (an

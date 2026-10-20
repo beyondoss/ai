@@ -202,8 +202,8 @@ fn redact_url(url: &str) -> String {
 
 fn client_lifecycle() -> ClientLifecycleMode {
     // Prefer `server/discover` so peers that speak `2026-07-28` negotiate MRTR (SEP-2322). Auto
-    // falls back to legacy `initialize` within 10s when discover is unsupported (-32601) or times
-    // out — our fixture answers discover so the fallback is never taken in tests.
+    // falls back to legacy `initialize` within 10s when discover is rejected (any JSON-RPC error, see
+    // `mcp_handshake`) or times out — our fixture answers discover so the fallback is never taken in tests.
     ClientLifecycleMode::Auto {
         preferred_versions: vec![ProtocolVersion::V_2026_07_28],
         legacy_version: Some(ProtocolVersion::V_2025_11_25),
