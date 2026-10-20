@@ -153,6 +153,7 @@ pub fn hosted_connectors(text: &str) -> (Vec<McpConnector>, Vec<String>) {
                     name,
                     url,
                     sandbox: false,
+                    managed: false,
                 });
             }
         }

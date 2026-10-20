@@ -1065,6 +1065,7 @@ mod snapshot {
                             name,
                             url,
                             sandbox: false,
+                            managed: false,
                         })
                         .collect(),
                     context_files: self.context,
@@ -1297,6 +1298,7 @@ mod tests {
                 name: "docs".into(),
                 url: "https://e.example/mcp".into(),
                 sandbox: false,
+                managed: false,
             }],
             context_files: vec![("/w/AGENTS.md".into(), "CONTEXT-MARKER".into())],
             system: Some("SYSTEM".into()),
