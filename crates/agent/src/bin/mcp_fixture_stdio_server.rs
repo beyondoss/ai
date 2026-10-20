@@ -8,6 +8,7 @@
 //!
 //! Tools:
 //! - `echo` / `add` / `ping` / `fail` / `echo_env` / `image` / `slow_progress` — see prior docs.
+//! - `echo_args`: returns the exact `arguments` object it received, as JSON text.
 //! - `hold`: sleeps `ms` milliseconds, then returns `held` (a call that outlasts an idle window).
 //! - `ask_user`: nested `elicitation/create` mid-`tools/call` — classic server→client elicitation.
 //! - `ask_user_mrtr`: returns SEP-2322 `input_required` with an elicitation input request; on retry
@@ -554,6 +555,11 @@ fn tool_defs() -> Value {
             },
         },
         {
+            "name": "echo_args",
+            "description": "Returns the exact JSON `arguments` object it received.",
+            "inputSchema": { "type": "object", "properties": { "text": { "type": "string" } } },
+        },
+        {
             "name": "add",
             "description": "Adds two numbers, `a` and `b`.",
             "inputSchema": {
@@ -735,6 +741,7 @@ fn call_tool(params: Value) -> Value {
                 .unwrap_or_default();
             text_result(text, false)
         }
+        "echo_args" => text_result(&arguments.to_string(), false),
         "add" => {
             let a = arguments.get("a").and_then(Value::as_f64).unwrap_or(0.0);
             let b = arguments.get("b").and_then(Value::as_f64).unwrap_or(0.0);

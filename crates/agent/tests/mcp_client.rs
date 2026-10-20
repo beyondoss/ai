@@ -187,6 +187,34 @@ fn mcp_stdio_tool_call_round_trips_text_back_to_the_model() {
     );
 }
 
+#[test]
+fn mcp_stdio_tool_receives_exactly_the_models_arguments() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    write_global_settings(
+        home.path(),
+        json!([stdio_server_config("fixture", json!({}))]),
+    );
+
+    let turn1 = turn_tool_use(
+        "toolu_1",
+        "mcp__fixture__echo_args",
+        &json!({ "text": "args-marker-5521" }).to_string(),
+    );
+    let (ok, _stdout, stderr, bodies) = run_against(
+        home.path(),
+        cwd.path(),
+        "call the echo_args tool",
+        vec![turn1, turn_text("done")],
+    );
+    assert!(ok, "run failed: {stderr}");
+    let result = tool_result_text(&bodies[1], "toolu_1").expect("tool_result for toolu_1");
+    let received: Value = serde_json::from_str(&result).expect("fixture returns JSON");
+    // Dispatch's internal `_`-prefixed keys (the vision flag) must never reach a remote server: a
+    // strict one (FastMCP/pydantic) rejects the unknown argument and the call fails.
+    assert_eq!(received, json!({ "text": "args-marker-5521" }));
+}
+
 /// An Anthropic SSE turn calling *two* tools in the same batch (two `tool_use` content blocks, indices
 /// 0 and 1) — `common::turn_tool_use` only builds a single-tool-call turn, and the concurrency test
 /// below specifically needs two calls landing in the same turn's dispatch batch.
