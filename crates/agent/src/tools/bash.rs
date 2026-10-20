@@ -425,11 +425,14 @@ impl Bash {
                 return Err(ToolError::InvalidInput(msg));
             }
         }
-        // A present `timeout_ms` must be a positive integer (pi's `resolveTimeoutMs` bounds): 0 would
-        // return before the command had a chance to print anything.
-        let timeout_ms = parse_timeout_ms(&input, 1)?;
         let start = match input.get("run_in_background") {
-            None | Some(Value::Null) | Some(Value::Bool(false)) => Start::Foreground(timeout_ms),
+            // A present `timeout_ms` must be a positive integer (pi's `resolveTimeoutMs` bounds): 0
+            // would return before the command had a chance to print anything.
+            None | Some(Value::Null) | Some(Value::Bool(false)) => {
+                Start::Foreground(parse_timeout_ms(&input, 1)?)
+            }
+            // A background start returns by itself, so `timeout_ms` has nothing to bound: ignored,
+            // not validated (models send `0` alongside it).
             Some(Value::Bool(true)) => Start::Background,
             Some(v) => {
                 return Err(ToolError::InvalidInput(format!(
@@ -1251,7 +1254,7 @@ impl Tool for Bash {
                 },
                 "run_in_background": {
                     "type": "boolean",
-                    "description": "Start the command and return immediately with a job number instead of waiting for it."
+                    "description": "Start the command and return immediately with a job number instead of waiting for it. `timeout_ms` is ignored with it."
                 }
             },
             "required": ["command"]
@@ -1752,7 +1755,7 @@ mod tests {
             schema["properties"]["run_in_background"],
             json!({
                 "type": "boolean",
-                "description": "Start the command and return immediately with a job number instead of waiting for it."
+                "description": "Start the command and return immediately with a job number instead of waiting for it. `timeout_ms` is ignored with it."
             })
         );
         assert_eq!(schema["required"], json!(["command"]));
