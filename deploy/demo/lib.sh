@@ -23,13 +23,21 @@ AGENT_PORT=8080                  # plain ws: the demo client; the only port open
 AGENT_TLS_PORT=8443              # https: where the sandbox calls back (job_ended)
 GATEWAY_PORT=8080
 SANDBOX_PORT=8081
-# Where the sandbox runs: `fargate` (default, one shared sandbox service) or `e2b` (one E2B microVM per
-# session, made by demo.sh). The same exec-stub either way.
+# Where the sandbox runs: `fargate` (default, one shared sandbox service), `e2b` (one E2B microVM per
+# session, made by demo.sh) or `both`: everything the three use-case agents need (the Fargate sandbox
+# as the assistant's workspace host, E2B for the coding and browser agents, the stand-in managed-MCP
+# endpoint, and ECS exec on the agent). The same exec-stub either way.
 SANDBOX=${SANDBOX:-fargate}
 case "$SANDBOX" in
-  fargate | e2b) ;;
-  *) echo "SANDBOX must be fargate or e2b" >&2; exit 2 ;;
+  fargate | e2b | both) ;;
+  *) echo "SANDBOX must be fargate, e2b or both" >&2; exit 2 ;;
 esac
+USE_FARGATE=0 USE_E2B=0 USECASES=0
+[ "$SANDBOX" = e2b ] || USE_FARGATE=1
+[ "$SANDBOX" = fargate ] || USE_E2B=1
+[ "$SANDBOX" != both ] || USECASES=1
+STANDIN_PORT=8082                # the stand-in managed-MCP endpoint (public: it checks bmc_v1 tokens)
+PROVIDER_PORT=8083               # its "third party", loopback only
 TAGSPEC="{Key=$TAG_KEY,Value=$NAME}"
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -61,13 +69,14 @@ ssm_get() { command aws --region "$REGION" --output text ssm get-parameter --wit
 
 account() { aws sts get-caller-identity --query Account; }
 
-# The agent's current public address, or empty. Looked up every time: a replaced task is a new IP.
-agent_ip() { # [task arn: a specific task, else the first running one]
-  local task=${1:-} eni
-  [ -n "$task" ] || task=$(q ecs list-tasks --cluster "$CLUSTER" --service-name "$P-agent" --desired-status RUNNING --query 'taskArns[0]') || return 0
+# A service's current public address, or empty. Looked up every time: a replaced task is a new IP.
+svc_ip() { # service [task arn: a specific task, else the first running one]
+  local svc=$1 task=${2:-} eni
+  [ -n "$task" ] || task=$(q ecs list-tasks --cluster "$CLUSTER" --service-name "$P-$svc" --desired-status RUNNING --query 'taskArns[0]') || return 0
   [ -n "$task" ] || return 0
   eni=$(q ecs describe-tasks --cluster "$CLUSTER" --tasks "$task" \
     --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value|[0]') || return 0
   [ -n "$eni" ] || return 0
   q ec2 describe-network-interfaces --network-interface-ids "$eni" --query 'NetworkInterfaces[0].Association.PublicIp'
 }
+agent_ip() { svc_ip agent "${1:-}"; }

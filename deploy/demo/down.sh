@@ -16,8 +16,8 @@ set -uo pipefail
 FILTER="Name=tag:$TAG_KEY,Values=$NAME"
 # E2B sandboxes are part of the deployment whenever E2B_API_KEY is there to look for them. In e2b
 # mode a missing key is an error: "nothing left" could not be proven.
-if [ -z "${E2B_API_KEY:-}" ] && [ "$SANDBOX" = e2b ]; then
-  echo "down: SANDBOX=e2b needs E2B_API_KEY to find and kill the sandboxes" >&2
+if [ -z "${E2B_API_KEY:-}" ] && [ "$USE_E2B" = 1 ]; then
+  echo "down: SANDBOX=e2b or both needs E2B_API_KEY to find and kill the sandboxes" >&2
   exit 2
 fi
 quiet() { "$@" >/dev/null 2>&1; }
@@ -263,20 +263,32 @@ verdict=$([ "$total" = 0 ] && echo clean || echo remains)
 record=$(jq -nc --argjson counts "$json" --argjson before "$BEFORE" --arg v "$verdict" --arg name "$NAME" --arg region "$REGION" \
   --argjson stale "$TAG_INDEX" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{tagging_index_stale:$stale,name:$name,region:$region,verified_at:$at,verdict:$v,before:$before,counts:$counts}')
 
-# Into the latest run record, so the report's teardown panel has it.
+# Into the run records still waiting for it (every use case's run since the last teardown), so each
+# report's teardown panel has it; with none waiting, into the latest one.
 RESULTS=${DEMO_RESULTS:-$HERE/results}
-latest=$(find "$RESULTS" -mindepth 2 -maxdepth 2 -name run.json 2>/dev/null | sort | tail -1)
-# A second run over an already clean record would overwrite what the first one counted down from.
-if [ -n "$latest" ] && [ "$verdict" = clean ] \
-  && { [ "$(jq -r '.teardown.verdict // ""' "$latest")" != clean ] || [ "$(jq '[.[]]|add' <<<"$BEFORE")" != 0 ]; }; then
-  jq --argjson t "$record" '.teardown = $t
-    | .checks |= map(if .name == "teardown-zero" then
-        .pass = true | .status = "pass" | .started_ms = null | .ended_ms = null
-        | .detail = ("every resource type counted 0 at " + $t.verified_at)
-        | .headline = {label: "left behind", value: "0", unit: "resources"}
-        | .measurements = {resource_types: ($t.counts | length), remaining: ($t.counts | add)}
-      else . end)' "$latest" >"$latest.tmp" && mv "$latest.tmp" "$latest"
-  "$HERE/report.sh" "$(dirname "$latest")" >/dev/null 2>&1 || true
+records=$(find "$RESULTS" -mindepth 2 -maxdepth 2 -name run.json 2>/dev/null | sort)
+targets=
+for r in $records; do
+  [ "$(jq -r '.teardown == null' "$r")" = true ] && targets="$targets $r"
+done
+if [ -z "$targets" ]; then
+  latest=$(printf '%s\n' "$records" | tail -1)
+  # A second run over an already clean record would overwrite what the first one counted down from.
+  if [ -n "$latest" ] && { [ "$(jq -r '.teardown.verdict // ""' "$latest")" != clean ] || [ "$(jq '[.[]]|add' <<<"$BEFORE")" != 0 ]; }; then
+    targets=$latest
+  fi
+fi
+if [ "$verdict" = clean ]; then
+  for rec in $targets; do
+    jq --argjson t "$record" '.teardown = $t
+      | .checks |= map(if .name == "teardown-zero" then
+          .pass = true | .status = "pass" | .started_ms = null | .ended_ms = null
+          | .detail = ("every resource type counted 0 at " + $t.verified_at)
+          | .headline = {label: "left behind", value: "0", unit: "resources"}
+          | .measurements = {resource_types: ($t.counts | length), remaining: ($t.counts | add)}
+        else . end)' "$rec" >"$rec.tmp" && mv "$rec.tmp" "$rec"
+    "$HERE/report.sh" "$(dirname "$rec")" >/dev/null 2>&1 || true
+  done
 fi
 echo "$record" > "${DEMO_TEARDOWN_OUT:-/dev/null}"
 

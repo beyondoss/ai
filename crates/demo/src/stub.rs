@@ -61,7 +61,19 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let (mut streams_seen, mut ended_seen, mut callbacks_seen) = (0usize, 0usize, 0usize);
+    let mut requests_seen = 0usize;
     loop {
+        // Every request the endpoint answered, streamed or not: how a run can say which calls the
+        // sandbox saw, and when.
+        let requests = mock.requests();
+        for r in requests.iter().skip(requests_seen) {
+            let cmd: String = format!("{} {}", r.command(), r.body["args"])
+                .chars()
+                .take(160)
+                .collect();
+            line("exec_request", json!({"command": cmd}));
+        }
+        requests_seen = requests.len();
         let streams = mock.streams();
         for s in streams.iter().skip(streams_seen) {
             let cmd: String = format!("{} {}", s.command, s.args.join(" "))

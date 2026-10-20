@@ -14,6 +14,7 @@ fn keys() -> GrantKeys {
         fleet_secret: [0x32; 32],
         gateway_key: "bai_v1.demo-gateway-key".into(),
         dek: [0x33; 32],
+        managed_secret: Some([0x34; 32]),
     }
 }
 
@@ -27,6 +28,9 @@ fn args(tamper: bool) -> MintArgs {
         ttl_secs: 600,
         tamper,
         exec_bearer: None,
+        exec_headers: vec![],
+        connectors: vec![],
+        limits: None,
     }
 }
 
@@ -158,4 +162,117 @@ fn a_forged_notify_token_fails_on_its_tag_and_a_real_one_verifies() {
         key.verify(&forged, tenant, session, scope.name(), job),
         Verdict::BadMac
     ));
+}
+
+fn connector(name: &str, url: &str) -> beyond_ai_demo::keys::Connector {
+    beyond_ai_demo::keys::Connector {
+        name: name.into(),
+        url: url.into(),
+        ..Default::default()
+    }
+}
+
+/// Connectors, a sandbox flag, a sealed header and a `limits` claim all reach the verifier, and a
+/// managed connector holds exactly its own `bmc_v1` token: the agent's verifier would refuse a
+/// grant that gave it anything else.
+#[test]
+fn connectors_limits_and_a_managed_token_are_accepted_by_the_agents_verifier() {
+    let k = keys();
+    let a = MintArgs {
+        connectors: vec![
+            connector("deepwiki", "https://mcp.deepwiki.com/mcp"),
+            beyond_ai_demo::keys::Connector {
+                sandbox: true,
+                headers: vec![("e2b-traffic-access-token".into(), "tt".into())],
+                ..connector("browser", "https://8931-x.e2b.app/mcp")
+            },
+            beyond_ai_demo::keys::Connector {
+                managed: true,
+                ..connector("vault", "http://1.2.3.4:8082/managed/vault/mcp")
+            },
+        ],
+        limits: Some(beyond_ai_demo::keys::Limits {
+            models: Some(vec!["gpt-5-mini".into()]),
+            tools: Some(vec!["read".into()]),
+            max_steps: Some(9),
+        }),
+        ..args(false)
+    };
+    let grant = verifier(&k)
+        .verify(&mint_grant(&k, &a).unwrap(), now())
+        .unwrap();
+    let flags: Vec<_> = grant
+        .mcp
+        .iter()
+        .map(|c| (c.name.as_str(), c.sandbox, c.managed))
+        .collect();
+    assert_eq!(
+        flags,
+        [
+            ("deepwiki", false, false),
+            ("browser", true, false),
+            ("vault", false, true)
+        ]
+    );
+    assert_eq!(
+        grant.limits.models.as_deref(),
+        Some(&["gpt-5-mini".to_string()][..])
+    );
+    assert_eq!(grant.limits.max_steps, Some(9));
+    let vault = &grant.secrets.mcp_headers["vault"];
+    assert_eq!(vault.len(), 1);
+    assert!(vault[0].value.expose().starts_with("Bearer bmc_v1."));
+    assert_eq!(
+        grant.secrets.mcp_headers["browser"][0].name,
+        "e2b-traffic-access-token"
+    );
+}
+
+#[test]
+fn a_managed_connector_without_the_shared_secret_is_not_minted() {
+    let k = GrantKeys {
+        managed_secret: None,
+        ..keys()
+    };
+    let a = MintArgs {
+        connectors: vec![beyond_ai_demo::keys::Connector {
+            managed: true,
+            ..connector("vault", "http://x/managed/vault/mcp")
+        }],
+        ..args(false)
+    };
+    assert!(mint_grant(&k, &a).is_err());
+}
+
+/// `inspect-grant` unseals with the agent's own verifier and can find a needle where it is, and say
+/// it is not where it is not: the managed token is inside, the third party's key is not, and the
+/// sealed bytes never show up in the token's own text.
+#[cfg(feature = "agent-lib")]
+#[test]
+fn inspecting_a_managed_grant_finds_the_token_and_not_a_third_party_key() {
+    use beyond_ai_demo::keys::inspect_grant;
+
+    let k = keys();
+    let a = MintArgs {
+        connectors: vec![beyond_ai_demo::keys::Connector {
+            managed: true,
+            ..connector("vault", "http://1.2.3.4:8082/managed/vault/mcp")
+        }],
+        ..args(false)
+    };
+    let token = mint_grant(&k, &a).unwrap();
+    let real = inspect_grant(&k, &token, "bsk_live_demo_").unwrap();
+    let c = &real["connectors"][0];
+    assert_eq!(c["managed"], true);
+    assert_eq!(c["holds_a_bmc_token"], true);
+    assert_eq!(c["header_values_contain_needle"], false);
+    assert_eq!(real["token_text_contains_needle"], false);
+    // The control: the needle that is there is found.
+    let ctl = inspect_grant(&k, &token, "bmc_v1.").unwrap();
+    assert_eq!(ctl["connectors"][0]["header_values_contain_needle"], true);
+    assert_eq!(
+        ctl["token_text_contains_needle"], false,
+        "sealed, not in clear"
+    );
+    assert!(inspect_grant(&k, &token[..token.len() - 3], "x").is_err());
 }

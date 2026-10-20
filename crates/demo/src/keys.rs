@@ -73,6 +73,28 @@ pub fn generate() -> Res<serde_json::Value> {
     }))
 }
 
+/// One MCP connector the grant names.
+#[derive(Clone, Debug, Default)]
+pub struct Connector {
+    pub name: String,
+    pub url: String,
+    /// The server sleeps when idle: the agent holds no standing connection to it.
+    pub sandbox: bool,
+    /// The URL is a managed-MCP endpoint: the grant carries a `bmc_v1` token for it and no other key.
+    pub managed: bool,
+    /// Headers the connector needs, sealed in the grant (never for a managed connector).
+    pub headers: Vec<(String, String)>,
+}
+
+/// The grant's `limits` claim: ceilings on the model, tools and steps of a session.
+#[derive(Clone, Debug, Default)]
+pub struct Limits {
+    pub models: Option<Vec<String>>,
+    pub tools: Option<Vec<String>>,
+    pub max_steps: Option<u32>,
+}
+
+#[derive(Default)]
 pub struct MintArgs {
     pub tenant: String,
     pub session: String,
@@ -83,6 +105,10 @@ pub struct MintArgs {
     pub tamper: bool,
     /// A bearer the exec endpoint requires: carried in the grant's sealed exec headers.
     pub exec_bearer: Option<String>,
+    /// More headers for the exec endpoint, sealed in the grant (E2B's traffic token, for one).
+    pub exec_headers: Vec<(String, String)>,
+    pub connectors: Vec<Connector>,
+    pub limits: Option<Limits>,
 }
 
 /// The secrets a grant is minted from: what `up.sh` put in SSM and `demo.sh` hands over.
@@ -91,6 +117,8 @@ pub struct GrantKeys {
     pub fleet_secret: [u8; 32],
     pub gateway_key: String,
     pub dek: [u8; 32],
+    /// The secret a managed-MCP endpoint shares with the minter; only managed connectors need it.
+    pub managed_secret: Option<[u8; 32]>,
 }
 
 impl GrantKeys {
@@ -101,6 +129,10 @@ impl GrantKeys {
             fleet_secret: b32("DEMO_FLEET_SECRET")?,
             gateway_key: env("DEMO_GATEWAY_KEY")?,
             dek: b32("DEMO_DEK")?,
+            managed_secret: match std::env::var("DEMO_MANAGED_SECRET") {
+                Ok(_) => Some(b32("DEMO_MANAGED_SECRET")?),
+                Err(_) => None,
+            },
         })
     }
 }
@@ -120,19 +152,44 @@ pub fn mint_grant(keys: &GrantKeys, a: &MintArgs) -> Res<String> {
         home_shard: a.shard.clone(),
         workspace_root: a.workspace.clone(),
         exec_url: a.exec_url.clone(),
-        mcp: Vec::new(),
-        mcp_sandbox: Vec::new(),
-        mcp_managed: Vec::new(),
+        mcp: a
+            .connectors
+            .iter()
+            .map(|c| (c.name.clone(), c.url.clone()))
+            .collect(),
+        mcp_sandbox: names(&a.connectors, |c| c.sandbox),
+        mcp_managed: names(&a.connectors, |c| c.managed),
         exp: now + a.ttl_secs,
-        limits: None,
+        limits: a
+            .limits
+            .as_ref()
+            .map(|l| beyond_ai_test_support::grant::Limits {
+                models: l.models.clone(),
+                tools: l.tools.clone(),
+                max_steps: l.max_steps,
+            }),
     };
+    let mut mcp_headers = std::collections::BTreeMap::new();
+    for c in &a.connectors {
+        let mut headers = c.headers.clone();
+        if c.managed {
+            let exp = now + a.ttl_secs;
+            let token = managed_token(keys, &a.tenant, &a.session, &c.name, exp)?;
+            headers.push(("Authorization".to_string(), format!("Bearer {token}")));
+        }
+        if !headers.is_empty() {
+            mcp_headers.insert(c.name.clone(), headers);
+        }
+    }
     let secrets = Secrets {
+        mcp_headers,
         gateway_key: keys.gateway_key.clone(),
         dek: keys.dek,
         exec_headers: a
             .exec_bearer
             .iter()
             .map(|b| ("Authorization".to_string(), format!("Bearer {b}")))
+            .chain(a.exec_headers.iter().cloned())
             .collect(),
         ..Secrets::default()
     };
@@ -144,6 +201,40 @@ pub fn mint_grant(keys: &GrantKeys, a: &MintArgs) -> Res<String> {
     let mut sig = URL_SAFE_NO_PAD.decode(sig)?;
     sig[0] ^= 1;
     Ok(format!("{signed}.{}", URL_SAFE_NO_PAD.encode(sig)))
+}
+
+fn names(cs: &[Connector], pick: impl Fn(&Connector) -> bool) -> Vec<String> {
+    cs.iter()
+        .filter(|c| pick(c))
+        .map(|c| c.name.clone())
+        .collect()
+}
+
+/// The `bmc_v1` token a managed connector holds in place of the third party's key: bound to this
+/// tenant, session and connector, minted with the agent crate's own minter.
+#[cfg(feature = "agent-lib")]
+fn managed_token(
+    keys: &GrantKeys,
+    tenant: &str,
+    session: &str,
+    connector: &str,
+    exp: u64,
+) -> Res<String> {
+    use beyond_ai_agent::managed_mcp_token::{Claims, ManagedKey};
+    let secret = keys
+        .managed_secret
+        .ok_or("DEMO_MANAGED_SECRET is not set (a managed connector needs it)")?;
+    Ok(ManagedKey::from_secret_bytes(&secret).mint(&Claims {
+        tenant: tenant.into(),
+        session_id: session.into(),
+        connector: connector.into(),
+        exp,
+    }))
+}
+
+#[cfg(not(feature = "agent-lib"))]
+fn managed_token(_: &GrantKeys, _: &str, _: &str, _: &str, _: u64) -> Res<String> {
+    Err("this build has no managed-connector minter (feature agent-lib)".into())
 }
 
 /// A `bjn_v1` job-end callback token for `job` of `session`, minted with the fleet key from
@@ -171,4 +262,61 @@ pub fn notify_token(tenant: &str, session: &str, job: &str, forge: bool) -> Res<
         .name()
         .to_string();
     Ok((token, scope))
+}
+
+/// What a grant holds, without its secrets: the demo unseals a grant it minted (with the same keys
+/// the agent unseals with) and looks for `needle` in everything sealed inside, in the claims and in
+/// the token's own text. Header and key values are never printed; only their names and whether the
+/// needle is in any of them.
+#[cfg(feature = "agent-lib")]
+pub fn inspect_grant(keys: &GrantKeys, token: &str, needle: &str) -> Res<serde_json::Value> {
+    use beyond_ai_agent::grant::{GrantVerifier, SealKeySource};
+    use serde_json::json;
+
+    let dir = scratch("inspect")?;
+    let flag = Minter::with_keys(&dir, 1, keys.grant_seed, keys.fleet_secret).grant_key_flag();
+    std::fs::remove_dir_all(&dir)?;
+    let seal = STANDARD.encode(keys.fleet_secret);
+    let verifier = GrantVerifier::from_flags(
+        &[flag],
+        Some(SealKeySource::pick(None, Some(&seal))?.ok_or("no seal key")?),
+    )?
+    .ok_or("no verifier")?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let grant = verifier
+        .verify(token, now)
+        .map_err(|e| format!("the grant does not verify: {e:?}"))?;
+    let has = |s: &str| !needle.is_empty() && s.contains(needle);
+    let connectors: Vec<_> = grant
+        .mcp
+        .iter()
+        .map(|c| {
+            let headers = grant.secrets.mcp_headers.get(&c.name);
+            json!({
+                "name": c.name,
+                "url": c.url,
+                "sandbox": c.sandbox,
+                "managed": c.managed,
+                "header_names": headers.map(|h| h.iter().map(|x| x.name.clone()).collect::<Vec<_>>()).unwrap_or_default(),
+                "holds_a_bmc_token": headers.is_some_and(|h| h.iter().any(|x| x.value.expose().starts_with("Bearer bmc_v1."))),
+                "header_values_contain_needle": headers.is_some_and(|h| h.iter().any(|x| has(x.value.expose()))),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "tenant": grant.tenant,
+        "session_id": grant.session_id,
+        "connectors": connectors,
+        "exec_header_names": grant.secrets.exec_headers.iter().map(|h| h.name.clone()).collect::<Vec<_>>(),
+        "exec_header_values_contain_needle": grant.secrets.exec_headers.iter().any(|h| has(h.value.expose())),
+        "gateway_key_contains_needle": has(grant.secrets.gateway_key.expose()),
+        "token_text_contains_needle": has(token),
+        "limits": {
+            "models": grant.limits.models,
+            "tools": grant.limits.tools,
+            "max_steps": grant.limits.max_steps,
+        },
+    }))
 }

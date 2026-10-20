@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1.7-labs
+#
+# The demo's stand-in for Beyond's managed-MCP endpoint and the "third party" behind it:
+# `beyond-ai-demo managed-endpoint`, a static musl binary on a bare Alpine. It verifies `bmc_v1`
+# tokens with the agent crate's own code, so the image builds with the `agent-lib` feature; the
+# gateway-key minter (pingora, cmake) stays out.
+#
+#     docker build -f deploy/demo/Dockerfile.standin -t beyond-ai-demo-standin .
+ARG RUST_VERSION=1.92
+ARG ALPINE_VERSION=3.22
+
+FROM rust:${RUST_VERSION}-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/*
+RUN rustup target add x86_64-unknown-linux-musl
+WORKDIR /app
+# The agent image's flag, for the same musl reason: a static-pie musl binary segfaults at startup here.
+ENV RUSTFLAGS="-C relocation-model=static"
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    CC_x86_64_unknown_linux_musl=musl-gcc CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+    cargo build --release --target x86_64-unknown-linux-musl -p beyond-ai-demo \
+        --no-default-features --features agent-lib \
+    && cp target/x86_64-unknown-linux-musl/release/beyond-ai-demo /usr/local/bin/beyond-ai-demo
+
+FROM alpine:${ALPINE_VERSION} AS runtime
+COPY --from=build /usr/local/bin/beyond-ai-demo /usr/local/bin/beyond-ai-demo
+ENTRYPOINT ["/usr/local/bin/beyond-ai-demo", "managed-endpoint"]

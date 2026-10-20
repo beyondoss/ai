@@ -37,7 +37,7 @@ fi
 for tool in aws jq docker openssl cargo curl; do
   command -v "$tool" >/dev/null || { echo "up: $tool is required" >&2; exit 2; }
 done
-if [ "$SANDBOX" = e2b ]; then
+if [ "$USE_E2B" = 1 ]; then
   e2b_need_key || exit 2
   # The key works. (VMs are made per session by demo.sh, so there is nothing to create here.)
   e2b_count >/dev/null || { echo "up: E2B's API did not accept E2B_API_KEY" >&2; exit 2; }
@@ -86,6 +86,13 @@ if param_exists openrouter-key && ! param_exists openai-key; then
   MODEL=${DEMO_MODEL:-openai/gpt-5-mini}
 else
   PROVIDER=openai
+fi
+
+# For the use cases: the secret the stand-in managed-MCP endpoint shares with the grant minter, and the
+# "third party's" real key, which only the stand-in's task can read. Created once, and kept by reruns.
+if [ "$USECASES" = 1 ]; then
+  param_exists managed-secret || openssl rand -base64 32 | tr -d '\n' | put_param managed-secret SecureString
+  param_exists provider-secret || printf 'bsk_live_demo_%s' "$(openssl rand -hex 24)" | put_param provider-secret SecureString
 fi
 
 # Generated once. The marker goes in last, so an interrupted run regenerates the lot instead of
@@ -147,7 +154,8 @@ ensure_image() { # repo, dockerfile
 IMAGES_CHANGED=
 ensure_image "$P-gateway" Dockerfile
 ensure_image "$P-agent" Dockerfile.agent
-[ "$SANDBOX" = e2b ] || ensure_image "$P-sandbox" deploy/demo/Dockerfile.sandbox
+[ "$USE_FARGATE" = 0 ] || ensure_image "$P-sandbox" deploy/demo/Dockerfile.sandbox
+[ "$USECASES" = 0 ] || ensure_image "$P-standin" deploy/demo/Dockerfile.standin
 
 # ---------------------------------------------------------------------------------------------
 say "network"
@@ -220,7 +228,10 @@ fi
 sg_rule "$SG_TASKS" --protocol tcp --port "$AGENT_PORT" --cidr "$CALLER"
 # E2B's microVMs call back (job_ended) from addresses nobody can list, so the https port is open to
 # the world in that mode: it accepts only a callback token the agent's fleet key minted.
-[ "$SANDBOX" != e2b ] || sg_rule "$SG_TASKS" --protocol tcp --port "$AGENT_TLS_PORT" --cidr 0.0.0.0/0
+[ "$USE_E2B" = 0 ] || sg_rule "$SG_TASKS" --protocol tcp --port "$AGENT_TLS_PORT" --cidr 0.0.0.0/0
+# The stand-in managed-MCP endpoint is a public service, like Beyond's would be: it answers only a
+# request carrying a valid bmc_v1 token. (Public, so the agent's MCP egress policy needs no exception.)
+[ "$USECASES" = 0 ] || sg_rule "$SG_TASKS" --protocol tcp --port "$STANDIN_PORT" --cidr 0.0.0.0/0
 
 # ---------------------------------------------------------------------------------------------
 say "efs"
@@ -271,7 +282,20 @@ role() { # suffix, space-separated parameter names it may read (empty: none)
 # reads its own seal and TLS keys; the sandbox's reads nothing. No role can read the whole prefix.
 role gateway-exec "$PROVIDER-key id-signing-key"
 role agent-exec "fleet-secret tls-key"
-[ "$SANDBOX" = e2b ] || role sandbox-exec ""
+[ "$USE_FARGATE" = 0 ] || role sandbox-exec ""
+# The stand-in's role is the only one that can read the "third party's" key.
+[ "$USECASES" = 0 ] || role standin-exec "managed-secret provider-secret"
+# ECS Exec on the agent (`demo.sh assistant` scans the agent process's memory through it): the task
+# role may open the SSM message channel and nothing else.
+if [ "$USECASES" = 1 ]; then
+  if ! aws iam get-role --role-name "$P-agent-task" >/dev/null 2>&1; then
+    aws iam create-role --role-name "$P-agent-task" --assume-role-policy-document "$TRUST" --tags "Key=$TAG_KEY,Value=$NAME" >/dev/null
+    made "role $P-agent-task"
+    sleep 10
+  fi
+  aws iam put-role-policy --role-name "$P-agent-task" --policy-name ecs-exec --policy-document \
+    '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ssmmessages:CreateControlChannel","ssmmessages:CreateDataChannel","ssmmessages:OpenControlChannel","ssmmessages:OpenDataChannel"],"Resource":"*"}]}'
+fi
 EXEC() { echo "arn:aws:iam::$ACCOUNT:role/$P-$1-exec"; }
 
 # ---------------------------------------------------------------------------------------------
@@ -361,12 +385,14 @@ wait $!'
 # With E2B the sandbox is on the public internet: the callback origin is this task's own public
 # address, as a name the demo's CA has a certificate for (<a-b-c-d>.sslip.io resolves to a.b.c.d).
 # Computed at every start, so a replacement task announces its new address.
-if [ "$SANDBOX" = e2b ]; then
+if [ "$USE_E2B" = 1 ]; then
   AGENT_SCRIPT='until IP=$(wget -q -T 5 -O - http://checkip.amazonaws.com 2>/dev/null | tr -d "[:space:]") && [ -n "$IP" ]; do sleep 1; done
 NOTIFY_ORIGIN="https://$(printf %s "$IP" | tr . -).sslip.io:8443"; echo "notify origin: $NOTIFY_ORIGIN"
 '"$AGENT_SCRIPT"
 fi
-TD_AGENT=$(jq -n --arg family "$P-agent" --arg exec "$(EXEC agent)" --argjson logs "$(LOGS agent)" \
+AGENT_TASK_ROLE=
+[ "$USECASES" = 0 ] || AGENT_TASK_ROLE="arn:aws:iam::$ACCOUNT:role/$P-agent-task"
+TD_AGENT=$(jq -n --arg family "$P-agent" --arg exec "$(EXEC agent)" --arg taskrole "$AGENT_TASK_ROLE" --argjson logs "$(LOGS agent)" \
   --arg img "$ECR/$P-agent:latest" --argjson vol "$EFSVOL" --arg script "$AGENT_SCRIPT" \
   --arg gw "http://gateway.$DNS:$GATEWAY_PORT" --arg model "$MODEL" --arg origin "https://agent.$DNS:$AGENT_TLS_PORT" \
   --arg grant "$GRANT_KEY_FLAG" --arg cert "$TLS_CERT" --arg seal "$(param_arn fleet-secret)" --arg tlskey "$(param_arn tls-key)" '{
@@ -379,9 +405,9 @@ TD_AGENT=$(jq -n --arg family "$P-agent" --arg exec "$(EXEC agent)" --argjson lo
      environment:[{name:"HOME",value:"/tmp"},{name:"GATEWAY_URL",value:$gw},{name:"MODEL",value:$model},
        {name:"NOTIFY_ORIGIN",value:$origin},{name:"GRANT_KEY_FLAG",value:$grant},{name:"TLS_CERT",value:$cert}],
      secrets:[{name:"AI_AGENT_SEAL_KEY_B64",valueFrom:$seal},{name:"TLS_KEY",valueFrom:$tlskey}],
-     logConfiguration:$logs}]}' | register "$P-agent")
+     logConfiguration:$logs}]} + (if $taskrole == "" then {} else {taskRoleArn:$taskrole} end)' | register "$P-agent")
 
-if [ "$SANDBOX" = fargate ]; then
+if [ "$USE_FARGATE" = 1 ]; then
 SANDBOX_SCRIPT='printf "%s" "$CA_PEM" > /tmp/ca.pem
 exec /usr/local/bin/beyond-ai-demo exec-stub --listen 0.0.0.0:8081 --root /workspace --home /home/sandbox'
 TD_SANDBOX=$(jq -n --arg family "$P-sandbox" --arg exec "$(EXEC sandbox)" --argjson logs "$(LOGS sandbox)" \
@@ -396,6 +422,17 @@ TD_SANDBOX=$(jq -n --arg family "$P-sandbox" --arg exec "$(EXEC sandbox)" --argj
      logConfiguration:$logs}]}' | register "$P-sandbox")
 fi
 
+if [ "$USECASES" = 1 ]; then
+TD_STANDIN=$(jq -n --arg family "$P-standin" --arg exec "$(EXEC standin)" --argjson logs "$(LOGS standin)" \
+  --arg img "$ECR/$P-standin:latest" --arg ms "$(param_arn managed-secret)" --arg ps "$(param_arn provider-secret)" '{
+  family:$family, networkMode:"awsvpc", requiresCompatibilities:["FARGATE"], cpu:"256", memory:"512",
+  executionRoleArn:$exec,
+  containerDefinitions:[
+    {name:"standin", image:$img, essential:true, portMappings:[{containerPort:8082}],
+     secrets:[{name:"DEMO_MANAGED_SECRET",valueFrom:$ms},{name:"DEMO_PROVIDER_SECRET",valueFrom:$ps}],
+     logConfiguration:$logs}]}' | register "$P-standin")
+fi
+
 # ---------------------------------------------------------------------------------------------
 say "services"
 service() { # name, task definition arn, port
@@ -405,7 +442,7 @@ service() { # name, task definition arn, port
   cur=$(q ecs describe-services --cluster "$CLUSTER" --services "$name" --query 'services[?status==`ACTIVE`].taskDefinition|[0]')
   if [ -z "$cur" ]; then
     aws ecs create-service --cluster "$CLUSTER" --service-name "$name" --task-definition "$td" --desired-count 1 \
-      --launch-type FARGATE --platform-version LATEST \
+      --launch-type FARGATE --platform-version LATEST ${EXEC_FLAG:+--enable-execute-command} \
       --network-configuration "awsvpcConfiguration={subnets=[$SUBNET],securityGroups=[$SG_TASKS],assignPublicIp=ENABLED}" \
       --service-registries "registryArn=$reg" --propagate-tags SERVICE --enable-ecs-managed-tags \
       --tags "key=$TAG_KEY,value=$NAME" >/dev/null
@@ -419,11 +456,18 @@ service() { # name, task definition arn, port
 # An ECS service tag cannot be added after create when the service already has none; fine here, ours
 # are tagged at create.
 service gateway "$TD_GATEWAY"
+EXEC_FLAG=
+[ "$USECASES" = 0 ] || EXEC_FLAG=1
 service agent "$TD_AGENT"
+EXEC_FLAG=
 SERVICES=("$P-gateway" "$P-agent")
-if [ "$SANDBOX" = fargate ]; then
+if [ "$USE_FARGATE" = 1 ]; then
   service sandbox "$TD_SANDBOX"
   SERVICES+=("$P-sandbox")
+fi
+if [ "$USECASES" = 1 ]; then
+  service standin "$TD_STANDIN"
+  SERVICES+=("$P-standin")
 fi
 
 echo "waiting for the ${#SERVICES[@]} services to be stable..."
@@ -435,11 +479,13 @@ created=$(wc -l < "$WORK/made" 2>/dev/null || echo 0)
 echo "up: created $created resource(s) in $REGION (tag $TAG_KEY=$NAME)."
 echo "  agent   ws://$IP:$AGENT_PORT   (open to $CALLER only)"
 echo "  model   $MODEL via the gateway, provider $PROVIDER"
-if [ "$SANDBOX" = e2b ]; then
-  echo "  sandbox E2B: one microVM per session, made by demo.sh (metadata $TAG_KEY=$NAME); down.sh kills them"
-else
-  echo "  sandbox Fargate: one shared exec-stub service"
-fi
+case "$SANDBOX" in
+  e2b) echo "  sandbox E2B: one microVM per session, made by demo.sh (metadata $TAG_KEY=$NAME); down.sh kills them" ;;
+  both) echo "  sandbox the use cases: a Fargate workspace host, E2B microVMs (metadata $TAG_KEY=$NAME; down.sh kills them),"
+    echo "          and the stand-in managed-MCP endpoint at $(svc_ip standin):$STANDIN_PORT" ;;
+  *) echo "  sandbox Fargate: one shared exec-stub service" ;;
+esac
 echo "  next    ./deploy/demo/demo.sh        a scripted conversation, with a run record and report"
 echo "          ./deploy/demo/demo.sh kill   kill the agent mid-job; the session survives"
+[ "$USECASES" = 0 ] || echo "          ./deploy/demo/demo.sh assistant | coding | browser    the three use cases"
 echo "          ./deploy/demo/down.sh        delete everything, then prove it is gone"
