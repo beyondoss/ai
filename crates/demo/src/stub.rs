@@ -24,9 +24,13 @@ fn now_ms() -> u64 {
 
 /// The options a deployment runs: a conforming v1.4 endpoint (kept jobs survive idling, which is
 /// what lets it advertise notify) with the spec's heartbeat.
-pub fn options(home: PathBuf) -> MockOptions {
+///
+/// With `bearer` the endpoint answers 401 to any request without it: an endpoint on the public
+/// internet, reached with the bearer its session's grant carries.
+pub fn options(home: PathBuf, bearer: Option<String>) -> MockOptions {
     MockOptions {
         home: Some(home),
+        require_bearer: bearer,
         ..MockOptions::notifying()
     }
 }
@@ -41,9 +45,20 @@ fn line(event: &str, detail: serde_json::Value) {
 pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&args.root)?;
     std::fs::create_dir_all(&args.home)?;
-    let mock =
-        ExecMock::start_on_with(&args.listen, &args.root, options(args.home.clone())).await?;
-    line("listening", json!({"listen": args.listen, "url": mock.url}));
+    // From the environment, not an argument: a command line is visible to every process on the host.
+    let bearer = std::env::var("DEMO_EXEC_BEARER")
+        .ok()
+        .filter(|b| !b.is_empty());
+    let mock = ExecMock::start_on_with(
+        &args.listen,
+        &args.root,
+        options(args.home.clone(), bearer.clone()),
+    )
+    .await?;
+    line(
+        "listening",
+        json!({"listen": args.listen, "url": mock.url, "bearer_required": bearer.is_some()}),
+    );
 
     let (mut streams_seen, mut ended_seen, mut callbacks_seen) = (0usize, 0usize, 0usize);
     loop {

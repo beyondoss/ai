@@ -14,6 +14,12 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 FILTER="Name=tag:$TAG_KEY,Values=$NAME"
+# E2B sandboxes are part of the deployment whenever E2B_API_KEY is there to look for them. In e2b
+# mode a missing key is an error: "nothing left" could not be proven.
+if [ -z "${E2B_API_KEY:-}" ] && [ "$SANDBOX" = e2b ]; then
+  echo "down: SANDBOX=e2b needs E2B_API_KEY to find and kill the sandboxes" >&2
+  exit 2
+fi
 quiet() { "$@" >/dev/null 2>&1; }
 # Retry a delete that fails while something it depends on is still going away.
 retry() { # attempts, command...
@@ -68,6 +74,10 @@ survey() {
   else
     LEFT[ec2_network_interfaces]=0
   fi
+  if [ -n "${E2B_API_KEY:-}" ]; then
+    # A listing that cannot be read is not a zero.
+    LEFT[e2b_sandboxes]=$(e2b_count 2>/dev/null) || { echo "down: could not list E2B sandboxes" >&2; LEFT[e2b_sandboxes]=1; }
+  fi
   LEFT[ecr_repositories]=$(n "aws ecr describe-repositories --query \"length(repositories[?starts_with(repositoryName,'$P-')])\"")
 }
 counts_json() {
@@ -82,6 +92,18 @@ survey
 BEFORE=$(counts_json)
 
 # ------------------------------------------------------------------------------------------------
+if [ -n "${E2B_API_KEY:-}" ]; then
+  say "e2b sandboxes"
+  for _ in 1 2 3; do
+    ids=$(e2b_ids 2>/dev/null) || ids=""
+    [ -n "$ids" ] || break
+    for id in $ids; do
+      echo "killing E2B sandbox $id (HTTP $(e2b_kill "$id"))"
+    done
+    sleep 3
+  done
+fi
+
 say "ecs services and tasks"
 if [ -n "$(q ecs describe-clusters --clusters "$CLUSTER" --query 'clusters[?status==`ACTIVE`].clusterName|[0]')" ]; then
   for svc in $(aws ecs list-services --cluster "$CLUSTER" --query 'serviceArns' 2>/dev/null); do

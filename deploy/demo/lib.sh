@@ -23,10 +23,20 @@ AGENT_PORT=8080                  # plain ws: the demo client; the only port open
 AGENT_TLS_PORT=8443              # https: where the sandbox calls back (job_ended)
 GATEWAY_PORT=8080
 SANDBOX_PORT=8081
+# Where the sandbox runs: `fargate` (default, one shared sandbox service) or `e2b` (one E2B microVM per
+# session, made by demo.sh). The same exec-stub either way.
+SANDBOX=${SANDBOX:-fargate}
+case "$SANDBOX" in
+  fargate | e2b) ;;
+  *) echo "SANDBOX must be fargate or e2b" >&2; exit 2 ;;
+esac
 TAGSPEC="{Key=$TAG_KEY,Value=$NAME}"
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
+
+# shellcheck source=e2b.sh
+. "$HERE/e2b.sh"
 
 aws() { command aws --region "$REGION" --output text "$@"; }
 awsj() { command aws --region "$REGION" --output json "$@"; }

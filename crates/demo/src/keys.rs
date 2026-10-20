@@ -81,6 +81,8 @@ pub struct MintArgs {
     pub workspace: String,
     pub ttl_secs: u64,
     pub tamper: bool,
+    /// A bearer the exec endpoint requires: carried in the grant's sealed exec headers.
+    pub exec_bearer: Option<String>,
 }
 
 /// The secrets a grant is minted from: what `up.sh` put in SSM and `demo.sh` hands over.
@@ -124,6 +126,11 @@ pub fn mint_grant(keys: &GrantKeys, a: &MintArgs) -> Res<String> {
     let secrets = Secrets {
         gateway_key: keys.gateway_key.clone(),
         dek: keys.dek,
+        exec_headers: a
+            .exec_bearer
+            .iter()
+            .map(|b| ("Authorization".to_string(), format!("Bearer {b}")))
+            .collect(),
         ..Secrets::default()
     };
     let token = minter.mint(&claims, &secrets);

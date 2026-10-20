@@ -6123,6 +6123,14 @@ client. Job-end callbacks must be `https` off loopback, so `up.sh` issues a thro
 certificate for the agent's Cloud Map name. Each `demo.sh` run writes a `run.json` and a replayable
 `report.html`; `down.sh` verifies teardown per resource type.
 
+`SANDBOX=e2b` runs the sandbox as one E2B microVM per session instead of the shared Fargate service:
+`demo.sh` creates each VM through E2B's REST API and envd, uploads the same static `exec-stub`, and
+mints the session's grant with that VM's public port URL and a bearer in its exec headers. The stub
+then runs with `MockOptions::require_bearer` and answers 401 to any other caller. The agent announces
+its own public address (as a `<ip>.sslip.io` name, which the throwaway CA certifies) as the callback
+origin, recomputed at every start, so job-end notify reaches a replacement agent too. `down.sh` kills
+every sandbox carrying the demo's metadata and verifies through E2B's list API that none remain.
+
 ## Trust Boundaries
 
 **What this crate checks before acting:**
