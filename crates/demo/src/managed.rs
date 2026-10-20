@@ -80,6 +80,18 @@ impl Standin {
         managed_secret_b64: &str,
         provider_secret: String,
     ) -> Res<Self> {
+        let managed_l = TcpListener::bind(managed).await?;
+        let provider_l = TcpListener::bind(provider).await?;
+        Self::serve(managed_l, provider_l, managed_secret_b64, provider_secret)
+    }
+
+    /// Serve on listeners the caller already holds.
+    pub fn serve(
+        managed_l: TcpListener,
+        provider_l: TcpListener,
+        managed_secret_b64: &str,
+        provider_secret: String,
+    ) -> Res<Self> {
         use base64::Engine as _;
         let secret: [u8; 32] = base64::engine::general_purpose::STANDARD
             .decode(managed_secret_b64.trim())?
@@ -87,8 +99,6 @@ impl Standin {
             .map_err(|_| "DEMO_MANAGED_SECRET is not base64 of 32 bytes")?;
         let mut nonce = [0u8; 6];
         getrandom::fill(&mut nonce)?;
-        let managed_l = TcpListener::bind(managed).await?;
-        let provider_l = TcpListener::bind(provider).await?;
         let shared = Arc::new(Shared {
             key: ManagedKey::from_secret_bytes(&secret),
             provider_secret,
@@ -448,9 +458,14 @@ mod tests {
     const REAL: &str = "psk_live_not_for_the_agent";
 
     async fn up() -> Standin {
-        Standin::start("127.0.0.1:0", "127.0.0.1:0", SECRET_B64, REAL.into())
-            .await
-            .unwrap()
+        use beyond_ai_test_support::ports;
+        Standin::serve(
+            ports::tokio_listener().await,
+            ports::tokio_listener().await,
+            SECRET_B64,
+            REAL.into(),
+        )
+        .unwrap()
     }
 
     fn token(connector: &str, exp: u64) -> String {

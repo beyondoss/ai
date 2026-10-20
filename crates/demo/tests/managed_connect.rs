@@ -14,6 +14,7 @@ use beyond_ai_agent::tools::web::ssrf::EgressPolicy;
 use beyond_ai_demo::keys::{Connector, GrantKeys, MintArgs, mint_grant};
 use beyond_ai_demo::managed::Standin;
 use beyond_ai_test_support::grant::Minter;
+use beyond_ai_test_support::ports;
 use serde_json::json;
 
 const REAL_SECRET: &str = "psk_live_must_never_reach_the_agent";
@@ -21,13 +22,12 @@ const REAL_SECRET: &str = "psk_live_must_never_reach_the_agent";
 #[tokio::test(flavor = "multi_thread")]
 async fn a_managed_connector_calls_through_the_endpoint_holding_no_third_party_key() {
     let managed_secret = [0x35u8; 32];
-    let standin = Standin::start(
-        "127.0.0.1:0",
-        "127.0.0.1:0",
+    let standin = Standin::serve(
+        ports::tokio_listener().await,
+        ports::tokio_listener().await,
         &STANDARD.encode(managed_secret),
         REAL_SECRET.into(),
     )
-    .await
     .unwrap();
 
     let keys = GrantKeys {
