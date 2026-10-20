@@ -29,6 +29,14 @@ retry() { # attempts, command...
 # and again after them (the gate).
 declare -A LEFT
 n() { local v; v=$(eval "$1" 2>/dev/null) || v=0; [ -z "$v" ] || [ "$v" = None ] && v=0; echo "$v"; }
+# Revision ARNs of this demo's task definitions in one status. `list-task-definitions` filters on a
+# FULL family name, not a prefix, so ask the families first.
+td_arns() { # status
+  local fam
+  for fam in $(aws ecs list-task-definition-families --family-prefix "$P-" --status ALL --query 'families' 2>/dev/null); do
+    aws ecs list-task-definitions --family-prefix "$fam" --status "$1" --query 'taskDefinitionArns' 2>/dev/null
+  done | tr '\t' '\n' | grep -c . || true
+}
 survey() {
   VPC_NOW=$(q ec2 describe-vpcs --filters "$FILTER" --query 'Vpcs[0].VpcId' 2>/dev/null || true)
   NS_NOW=$(q servicediscovery list-namespaces --query "Namespaces[?Name=='$DNS'].Id|[0]" 2>/dev/null || true)
@@ -38,7 +46,7 @@ survey() {
   LEFT[ecs_clusters]=$(n "aws ecs describe-clusters --clusters '$CLUSTER' --query 'length(clusters[?status!=\`INACTIVE\`])'")
   LEFT[ecs_services]=$(n "aws ecs list-services --cluster '$CLUSTER' --query 'length(serviceArns)'")
   LEFT[ecs_tasks]=$(n "aws ecs list-tasks --cluster '$CLUSTER' --query 'length(taskArns)'")
-  LEFT[ecs_task_definitions]=$(( $(n "aws ecs list-task-definitions --family-prefix '$P-' --status ACTIVE --query 'length(taskDefinitionArns)'") + $(n "aws ecs list-task-definitions --family-prefix '$P-' --status INACTIVE --query 'length(taskDefinitionArns)'") ))
+  LEFT[ecs_task_definitions]=$(( $(td_arns ACTIVE) + $(td_arns INACTIVE) ))
   LEFT[cloudmap_namespaces]=$(n "aws servicediscovery list-namespaces --query \"length(Namespaces[?Name=='$DNS'])\"")
   if [ -n "$NS_NOW" ]; then
     LEFT[cloudmap_services]=$(n "aws servicediscovery list-services --filters 'Name=NAMESPACE_ID,Values=$NS_NOW,Condition=EQ' --query 'length(Services)'")
@@ -151,12 +159,13 @@ if [ -n "$VPC" ]; then
 fi
 
 say "task definitions, logs, images, roles, parameters"
-for status in ACTIVE INACTIVE; do
-  for td in $(aws ecs list-task-definitions --family-prefix "$P-" --status "$status" --query 'taskDefinitionArns' 2>/dev/null); do
-    [ "$status" = ACTIVE ] && quiet aws ecs deregister-task-definition --task-definition "$td"
+tds=
+for fam in $(aws ecs list-task-definition-families --family-prefix "$P-" --status ALL --query 'families' 2>/dev/null); do
+  for td in $(aws ecs list-task-definitions --family-prefix "$fam" --status ACTIVE --query 'taskDefinitionArns' 2>/dev/null); do
+    quiet aws ecs deregister-task-definition --task-definition "$td"
   done
+  tds="$tds $(aws ecs list-task-definitions --family-prefix "$fam" --status INACTIVE --query 'taskDefinitionArns' 2>/dev/null)"
 done
-tds=$(aws ecs list-task-definitions --family-prefix "$P-" --status INACTIVE --query 'taskDefinitionArns' 2>/dev/null)
 # delete-task-definitions takes ten at a time.
 # shellcheck disable=SC2086
 set -- $tds
@@ -192,23 +201,44 @@ done
 say "what is left"
 survey
 # The tagging API last, and waited on: it reports a deleted resource for a while after it is gone.
-tagged() { n "aws resourcegroupstaggingapi get-resources --tag-filters 'Key=$TAG_KEY,Values=$NAME' --query 'length(ResourceTagMappingList)'"; }
-LEFT[tagging_api]=$(tagged)
-for _ in $(seq 1 24); do
-  [ "${LEFT[tagging_api]}" = 0 ] && break
-  sleep 5
-  LEFT[tagging_api]=$(tagged)
-done
+# ECS keeps a deleted cluster or service and every stopped task in the tagging index for hours, so an
+# entry only counts if the service's own API cannot show it gone. What was only index lag is reported.
+tagged_live() {
+  local arn st cl
+  for arn in $(aws resourcegroupstaggingapi get-resources --tag-filters "Key=$TAG_KEY,Values=$NAME" --query 'ResourceTagMappingList[].ResourceARN' 2>/dev/null); do
+    case "$arn" in
+      *:ecs:*:cluster/*)
+        st=$(aws ecs describe-clusters --clusters "$arn" --query 'clusters[0].status' 2>/dev/null)
+        [ "$st" = ACTIVE ] || [ "$st" = PROVISIONING ] || [ "$st" = DEPROVISIONING ] && echo "$arn" ;;
+      *:ecs:*:service/*)
+        cl=${arn#*:service/}; cl=${cl%%/*}
+        st=$(aws ecs describe-services --cluster "$cl" --services "$arn" --query 'services[0].status' 2>/dev/null)
+        [ "$st" = ACTIVE ] || [ "$st" = DRAINING ] && echo "$arn" ;;
+      *:ecs:*:task/*)
+        cl=${arn#*:task/}; cl=${cl%%/*}
+        st=$(aws ecs describe-tasks --cluster "$cl" --tasks "$arn" --query 'tasks[0].lastStatus' 2>/dev/null)
+        [ -n "$st" ] && [ "$st" != None ] && [ "$st" != STOPPED ] && echo "$arn" ;;
+      *:ecs:*:task-definition/*)
+        st=$(aws ecs describe-task-definition --task-definition "$arn" --query 'taskDefinition.status' 2>/dev/null)
+        [ "$st" = ACTIVE ] || [ "$st" = INACTIVE ] && echo "$arn" ;;
+      *) echo "$arn" ;;
+    esac
+  done | grep -c . || true
+}
+tagged_all() { n "aws resourcegroupstaggingapi get-resources --tag-filters 'Key=$TAG_KEY,Values=$NAME' --query 'length(ResourceTagMappingList)'"; }
+TAG_INDEX=$(tagged_all)
+LEFT[tagging_api]=$(tagged_live)
 
 total=0
 for k in $(printf '%s\n' "${!LEFT[@]}" | sort); do
   printf '  %-24s %s   (was %s)\n' "$k" "${LEFT[$k]}" "$(jq -r --arg k "$k" '.[$k] // 0' <<<"$BEFORE")"
+  [ "$k" = tagging_api ] && [ "$TAG_INDEX" != 0 ] && printf '  %-24s %s listed by the index, none of them still existing (ECS index lag)\n' "" "$TAG_INDEX"
   total=$((total + ${LEFT[$k]}))
 done
 json=$(counts_json)
 verdict=$([ "$total" = 0 ] && echo clean || echo remains)
 record=$(jq -nc --argjson counts "$json" --argjson before "$BEFORE" --arg v "$verdict" --arg name "$NAME" --arg region "$REGION" \
-  --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{name:$name,region:$region,verified_at:$at,verdict:$v,before:$before,counts:$counts}')
+  --argjson stale "$TAG_INDEX" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{tagging_index_stale:$stale,name:$name,region:$region,verified_at:$at,verdict:$v,before:$before,counts:$counts}')
 
 # Into the latest run record, so the report's teardown panel has it.
 RESULTS=${DEMO_RESULTS:-$HERE/results}
