@@ -1438,9 +1438,12 @@ impl McpConnection {
     /// Never reaps while a call is in flight: an in-flight call holds an `Arc` clone of the client, so
     /// a strong count above one means someone is still using it and the reap is skipped. Without that
     /// check a long-running `browser_navigate` could have the process killed out from under it.
+    ///
+    /// A sandbox connector is never reaped: closing its session ends the server's state (an open
+    /// browser page) inside a VM that sleeps for free, so its session lives as long as the agent's.
     async fn reap_if_idle(&self) -> bool {
         let after = self.idle_after;
-        if after.is_zero() {
+        if after.is_zero() || self.dial.http.as_ref().is_some_and(|h| h.sandbox) {
             return false;
         }
         let idle =
