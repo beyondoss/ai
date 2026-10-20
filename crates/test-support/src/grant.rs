@@ -29,6 +29,8 @@ pub struct Claims {
     pub workspace_root: String,
     pub exec_url: String,
     pub mcp: Vec<(String, String)>,
+    /// Names of `mcp` connectors minted with `"sandbox":true` (omitted from the wire otherwise).
+    pub mcp_sandbox: Vec<String>,
     pub exp: u64,
 }
 
@@ -144,7 +146,14 @@ fn payload_json(c: &Claims, sealed: &str) -> String {
     let mcp: Vec<String> = c
         .mcp
         .iter()
-        .map(|(name, url)| format!("{{\"name\":{},\"url\":{}}}", q(name), q(url)))
+        .map(|(name, url)| {
+            let sandbox = if c.mcp_sandbox.contains(name) {
+                ",\"sandbox\":true"
+            } else {
+                ""
+            };
+            format!("{{\"name\":{},\"url\":{}{sandbox}}}", q(name), q(url))
+        })
         .collect();
     format!(
         "{{\"tenant\":{},\"session_id\":{},\"home_shard\":{},\"workspace_root\":{},\"exec_url\":{},\

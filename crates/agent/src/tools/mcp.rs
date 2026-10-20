@@ -157,6 +157,9 @@ struct HttpDial {
     /// session on the way out of the process (`mcp_http_exit`).
     policy: Arc<crate::tools::web::ssrf::EgressPolicy>,
     headers: Vec<SecretHeader>,
+    /// A sandbox connector ([`crate::grant::McpConnector::sandbox`]): no standalone stream is ever
+    /// requested, and `client` keeps no idle connection pooled.
+    sandbox: bool,
 }
 
 /// Everything about dialing one server that isn't in its [`McpServerConfig`]: which host hub its
@@ -2695,9 +2698,14 @@ fn granted_jobs(
             Dial {
                 host: host.clone(),
                 http: Some(HttpDial {
-                    client: egress.client.clone(),
+                    client: if connector.sandbox {
+                        egress.sandbox_client.clone()
+                    } else {
+                        egress.client.clone()
+                    },
                     policy: egress.policy.clone(),
                     headers,
+                    sandbox: connector.sandbox,
                 }),
                 apps,
                 skills_changed: Arc::default(),
@@ -3103,11 +3111,13 @@ async fn connect_http(
 ) -> Result<McpClient, String> {
     let mut custom_headers: HashMap<HeaderName, HeaderValue> = HashMap::new();
     let mut auth = None;
+    let mut no_standing_stream = false;
     let client = match &dial.http {
         Some(http) => {
             for header in &http.headers {
                 custom_headers.insert(header.name.clone(), header.value.clone());
             }
+            no_standing_stream = http.sandbox;
             http.client.clone()
         }
         None => {
@@ -3160,6 +3170,7 @@ async fn connect_http(
         crate::tools::mcp_oauth::OAuthHttp::new(
             crate::tools::mcp_view_http::ViewCappedHttp::new(crate::tools::mcp_wire::HttpClient {
                 client,
+                no_standing_stream,
             }),
             auth,
         )
@@ -3207,6 +3218,9 @@ async fn connect_http(
 #[derive(Clone)]
 pub struct McpEgress {
     client: reqwest::Client,
+    /// The same client with no idle connection pooled, for sandbox connectors: nothing may linger
+    /// between calls to keep a sleeping VM awake.
+    sandbox_client: reqwest::Client,
     policy: Arc<crate::tools::web::ssrf::EgressPolicy>,
 }
 
@@ -3215,19 +3229,23 @@ impl McpEgress {
         // Before *any* builder call: with reqwest's `rustls-no-provider` a missing process-wide
         // provider panics inside `build()` rather than returning an error.
         agent_core::ensure_provider();
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .pool_idle_timeout(Duration::from_secs(90))
-            .redirect(reqwest::redirect::Policy::none())
-            // The resolver below is the SSRF guard, and a proxy would skip it: the client dials the
-            // proxy and hands it the hostname, so `localhost` would be resolved — and fetched — by
-            // the proxy. An ambient `HTTP(S)_PROXY`/`ALL_PROXY` is ignored here on purpose.
-            .no_proxy()
-            .dns_resolver(crate::tools::web::ssrf::SsrfResolver::new(policy.clone()))
-            .build()
-            .map_err(|e| format!("failed to build the MCP connector client: {e}"))?;
+        let build = |pooled: bool| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .pool_idle_timeout(Duration::from_secs(90))
+                .pool_max_idle_per_host(if pooled { usize::MAX } else { 0 })
+                .redirect(reqwest::redirect::Policy::none())
+                // The resolver below is the SSRF guard, and a proxy would skip it: the client dials the
+                // proxy and hands it the hostname, so `localhost` would be resolved — and fetched — by
+                // the proxy. An ambient `HTTP(S)_PROXY`/`ALL_PROXY` is ignored here on purpose.
+                .no_proxy()
+                .dns_resolver(crate::tools::web::ssrf::SsrfResolver::new(policy.clone()))
+                .build()
+                .map_err(|e| format!("failed to build the MCP connector client: {e}"))
+        };
         Ok(Self {
-            client,
+            client: build(true)?,
+            sandbox_client: build(false)?,
             policy: Arc::new(policy),
         })
     }
@@ -4165,6 +4183,7 @@ mod tests {
             client: reqwest::Client::new(),
             policy: Arc::default(),
             headers: vec![header],
+            sandbox: false,
         };
         assert!(!format!("{dial:?}").contains("tenant-token"));
     }
