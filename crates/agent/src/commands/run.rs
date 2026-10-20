@@ -109,6 +109,8 @@ struct Assembled {
     model_extra_headers: std::collections::HashMap<String, String>,
     output_slot: tools::structured_output::OutputSlot,
     parent_loop: beyond_ai_agent::tools::subagent::ParentCell,
+    /// Which filesystem the tools act on, so `--deny-path` resolves paths in the same one.
+    path_world: tools::fs::PathWorld,
     prompt_templates: Vec<beyond_ai_agent::prompts::PromptTemplate>,
     reasoning_effort: Option<agent_core::ReasoningEffort>,
     registry: agent_core::ToolRegistry,
@@ -774,6 +776,9 @@ async fn assemble_run(
         lifecycle_url,
     )
     .await?;
+    let path_world = fs_backend
+        .as_ref()
+        .map_or(tools::fs::PathWorld::Local, |backend| backend.world());
     let (bash_jobs, mut registry) = build_run_registry(
         &bash_command_prefix,
         &bash_shell_path,
@@ -959,6 +964,7 @@ async fn assemble_run(
         model_extra_headers,
         output_slot,
         parent_loop,
+        path_world,
         prompt_templates,
         reasoning_effort,
         registry,
@@ -1034,6 +1040,7 @@ async fn build_agent(
         model_extra_headers,
         output_slot,
         parent_loop,
+        path_world,
         prompt_templates,
         reasoning_effort,
         registry,
@@ -1179,7 +1186,7 @@ async fn build_agent(
     });
     // Always installed: besides the deny-lists, the hooks carry the SEP-2640 code-execution gate,
     // which must hold even when no deny-list was given.
-    let policy = ToolPolicy::from_lists(&deny_tool, &deny_bash_pattern, &deny_path);
+    let policy = run_policy(&deny_tool, &deny_bash_pattern, &deny_path, path_world);
     agent = agent.with_hooks(Arc::new(tools::mcp_skills::RunHooks {
         policy,
         mcp: mcp_enabled.clone(),
@@ -1223,6 +1230,18 @@ async fn build_agent(
         tool_defs,
         wants_structured_output,
     })
+}
+
+/// `run`'s deny-lists, resolving `--deny-path` in the world the tools act on: with a remote exec
+/// backend a `~` pattern means the target's home, not this host's. (`run`'s tools are rooted at the
+/// process cwd, the policy's default root.)
+fn run_policy(
+    deny_tool: &[String],
+    deny_bash_pattern: &[String],
+    deny_path: &[String],
+    world: tools::fs::PathWorld,
+) -> ToolPolicy {
+    ToolPolicy::from_lists(deny_tool, deny_bash_pattern, deny_path).in_world(world)
 }
 
 /// Runs the turns, then reports.
@@ -2467,5 +2486,32 @@ async fn report_run_outcome(
             None,
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_core::AgentHooks;
+
+    #[tokio::test]
+    async fn a_tilde_target_is_checked_against_the_remote_targets_home() {
+        let policy = run_policy(
+            &[],
+            &[],
+            &["/home/agent/.ssh/*".to_string()],
+            tools::fs::PathWorld::Remote {
+                home: Some("/home/agent".into()),
+            },
+        );
+        let denied = policy
+            .before_tool_call(
+                "write",
+                &serde_json::json!({"path": "~/.ssh/id_rsa", "content": "x"}),
+                &agent_core::Session::new(),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        assert!(denied.is_some(), "the remote home must be what `~` means");
     }
 }
