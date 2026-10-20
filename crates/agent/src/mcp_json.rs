@@ -149,7 +149,11 @@ pub fn hosted_connectors(text: &str) -> (Vec<McpConnector>, Vec<String>) {
                          a hosted connector's headers come from the session grant"
                     ));
                 }
-                connectors.push(McpConnector { name, url });
+                connectors.push(McpConnector {
+                    name,
+                    url,
+                    sandbox: false,
+                });
             }
         }
     }

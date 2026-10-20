@@ -1061,7 +1061,11 @@ mod snapshot {
                     mcp_connectors: self
                         .mcp
                         .into_iter()
-                        .map(|(name, url)| super::McpConnector { name, url })
+                        .map(|(name, url)| super::McpConnector {
+                            name,
+                            url,
+                            sandbox: false,
+                        })
                         .collect(),
                     context_files: self.context,
                     system: self.system,
@@ -1292,6 +1296,7 @@ mod tests {
             mcp_connectors: vec![McpConnector {
                 name: "docs".into(),
                 url: "https://e.example/mcp".into(),
+                sandbox: false,
             }],
             context_files: vec![("/w/AGENTS.md".into(), "CONTEXT-MARKER".into())],
             system: Some("SYSTEM".into()),
