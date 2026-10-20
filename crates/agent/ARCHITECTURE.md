@@ -5266,12 +5266,13 @@ post-reopen refresh and `reload` all call it, which is exactly why `reload` is a
 "re-walk the filesystem" now means the tenant's. A reopened session starts from its saved set
 instead (see "Sandbox snapshot").
 
-| Resource                            | Sandbox roots (ascending specificity — a later one shadows an earlier)              |
-| ----------------------------------- | ----------------------------------------------------------------------------------- |
-| skills                              | `<home>/.claude/skills`, `<workspace>/.agents/skills`, `<workspace>/.claude/skills` |
-| agent definitions, prompt templates | `<home>/.claude/{agents,prompts}`, `<workspace>/.claude/{agents,prompts}`           |
-| `AGENTS.md`/`CLAUDE.md`             | `<home>/.claude`, then every ancestor of `<workspace>`, nearest last                |
-| `SYSTEM.md`/`APPEND_SYSTEM.md`      | `<workspace>/.claude`, else `<home>/.claude`                                        |
+| Resource                       | Sandbox roots (ascending specificity — a later one shadows an earlier)              |
+| ------------------------------ | ----------------------------------------------------------------------------------- |
+| skills                         | `<home>/.claude/skills`, `<workspace>/.agents/skills`, `<workspace>/.claude/skills` |
+| agent definitions              | `<home>/.claude/agents`, `<workspace>/.agents/agents`, `<workspace>/.claude/agents` |
+| prompt templates               | `<home>/.claude/prompts`, `<workspace>/.claude/prompts`                             |
+| `AGENTS.md`/`CLAUDE.md`        | `<home>/.claude`, then every ancestor of `<workspace>`, nearest last                |
+| `SYSTEM.md`/`APPEND_SYSTEM.md` | `<workspace>/.claude`, else `<home>/.claude`                                        |
 
 `<home>` is the sandbox's own `$HOME`, from the startup probe — the tenant's home, not the
 replica's. None of it is trust-gated: on this host that gate protects an operator from a checkout
