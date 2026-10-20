@@ -41,6 +41,8 @@ pub struct Service {
     pub child: ChildGuard,
     /// Everything the replica wrote to stderr (the operator's channel), as it writes it.
     pub stderr_log: PathBuf,
+    /// Everything the replica wrote to stdout, when [`Options::capture_stdout`] asked for it.
+    pub stdout_log: PathBuf,
     /// The model server this replica was pointed at, so a [`Peer`] can share it.
     pub model_base: String,
     /// Held so every directory above outlives the replica.
@@ -70,6 +72,8 @@ pub struct Options {
     /// How the sandbox's exec endpoint behaves (its root and `HOME` are set here); the default
     /// is a conforming v1.3 endpoint that does not advertise notify.
     pub exec: Option<super::exec_mock::MockOptions>,
+    /// Capture the replica's stdout to [`Service::stdout_log`] (it is discarded otherwise).
+    pub capture_stdout: bool,
 }
 
 impl Service {
@@ -123,6 +127,10 @@ impl Service {
             let b64 = std::fs::read_to_string(minter.seal_key()).unwrap();
             cmd.env("AI_AGENT_SEAL_KEY_B64", b64.trim());
         }
+        let stdout_log = dir.path().join("replica.stdout");
+        if opts.capture_stdout {
+            cmd.stdout(std::fs::File::create(&stdout_log).unwrap());
+        }
         let stderr_log = dir.path().join("replica.stderr");
         let log = std::fs::File::create(&stderr_log).unwrap();
         let (child, port) = spawn_listening_logged(&mut cmd, Some(log));
@@ -135,6 +143,7 @@ impl Service {
             shards,
             child,
             stderr_log,
+            stdout_log,
             model_base: model_base.to_string(),
             dir,
         }
@@ -231,6 +240,7 @@ impl Service {
             exec_url: self.exec.url.clone(),
             mcp: Vec::new(),
             mcp_sandbox: Vec::new(),
+            mcp_managed: Vec::new(),
             exp: far_future(),
         }
     }

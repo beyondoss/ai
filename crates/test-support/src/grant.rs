@@ -31,6 +31,8 @@ pub struct Claims {
     pub mcp: Vec<(String, String)>,
     /// Names of `mcp` connectors minted with `"sandbox":true` (omitted from the wire otherwise).
     pub mcp_sandbox: Vec<String>,
+    /// Names of `mcp` connectors minted with `"managed":true`.
+    pub mcp_managed: Vec<String>,
     pub exp: u64,
 }
 
@@ -152,7 +154,16 @@ fn payload_json(c: &Claims, sealed: &str) -> String {
             } else {
                 ""
             };
-            format!("{{\"name\":{},\"url\":{}{sandbox}}}", q(name), q(url))
+            let managed = if c.mcp_managed.contains(name) {
+                ",\"managed\":true"
+            } else {
+                ""
+            };
+            format!(
+                "{{\"name\":{},\"url\":{}{sandbox}{managed}}}",
+                q(name),
+                q(url)
+            )
         })
         .collect();
     format!(

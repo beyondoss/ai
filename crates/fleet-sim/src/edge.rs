@@ -244,6 +244,7 @@ impl Edge {
             exec_url: exec_url.to_string(),
             mcp: Vec::new(),
             mcp_sandbox: Vec::new(),
+            mcp_managed: Vec::new(),
             exp,
         };
         let secrets = Secrets {

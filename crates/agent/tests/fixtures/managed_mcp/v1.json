@@ -1,0 +1,46 @@
+{
+  "authorization_header": "Bearer bmc_v1.a6bb2782.AAAACTAwdGVuYW50MQAAAA9zZXNzXzAxSjhaSzNROVYAAAAGZ2l0aHViAAAAAHE_tCw.q_2YVf4y6OKYgiXwSQGiCyzl7HdopnHvJtYQL93fNSg",
+  "claims": {
+    "connector": "github",
+    "exp": 1900000300,
+    "session_id": "sess_01J8ZK3Q9V",
+    "tenant": "00tenant1"
+  },
+  "claims_hex": "00000009303074656e616e74310000000f736573735f30314a385a4b335139560000000667697468756200000000713fb42c",
+  "kid": "a6bb2782",
+  "negative": [
+    {
+      "error": "Expired",
+      "name": "expired",
+      "now": 1900000300,
+      "token": "bmc_v1.a6bb2782.AAAACTAwdGVuYW50MQAAAA9zZXNzXzAxSjhaSzNROVYAAAAGZ2l0aHViAAAAAHE_tCw.q_2YVf4y6OKYgiXwSQGiCyzl7HdopnHvJtYQL93fNSg"
+    },
+    {
+      "error": "UnknownKid",
+      "name": "unknown kid",
+      "now": 1900000000,
+      "token": "bmc_v1.00000000.AAAACTAwdGVuYW50MQAAAA9zZXNzXzAxSjhaSzNROVYAAAAGZ2l0aHViAAAAAHE_tCw.q_2YVf4y6OKYgiXwSQGiCyzl7HdopnHvJtYQL93fNSg"
+    },
+    {
+      "error": "BadMac",
+      "name": "claims swapped under another session's mac",
+      "now": 1900000000,
+      "token": "bmc_v1.a6bb2782.AAAACTAwdGVuYW50MQAAAApzZXNzX09USEVSAAAABmdpdGh1YgAAAABxP7Qs.q_2YVf4y6OKYgiXwSQGiCyzl7HdopnHvJtYQL93fNSg"
+    },
+    {
+      "error": "Malformed",
+      "name": "wrong version",
+      "now": 1900000000,
+      "token": "bmc_v2.a6bb2782.AAAACTAwdGVuYW50MQAAAA9zZXNzXzAxSjhaSzNROVYAAAAGZ2l0aHViAAAAAHE_tCw.q_2YVf4y6OKYgiXwSQGiCyzl7HdopnHvJtYQL93fNSg"
+    },
+    {
+      "error": "Malformed",
+      "name": "missing mac",
+      "now": 1900000000,
+      "token": "bmc_v1.a6bb2782.AAAACTAwdGVuYW50MQAAAA9zZXNzXzAxSjhaSzNROVYAAAAGZ2l0aHViAAAAAHE_tCw"
+    }
+  ],
+  "now": 1900000000,
+  "secret_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+  "token": "bmc_v1.a6bb2782.AAAACTAwdGVuYW50MQAAAA9zZXNzXzAxSjhaSzNROVYAAAAGZ2l0aHViAAAAAHE_tCw.q_2YVf4y6OKYgiXwSQGiCyzl7HdopnHvJtYQL93fNSg"
+}

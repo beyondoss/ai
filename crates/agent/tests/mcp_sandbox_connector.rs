@@ -32,6 +32,7 @@ async fn call_three_times(fixture: &SessionMcpFixture, sandbox: bool) {
         name: "c".into(),
         url: fixture.url.clone(),
         sandbox,
+        managed: false,
     };
     let (tools, _catalog, warnings) = mcp::connect_granted(
         &[connector],

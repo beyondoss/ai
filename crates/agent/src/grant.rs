@@ -76,7 +76,8 @@ pub enum GrantError {
     #[error("session grant's sealed secrets failed to open")]
     SealOpenFailed,
     /// Authentic, but the signed claims or the opened secrets aren't the `bsg_v1` shape (a missing or
-    /// unknown field, a DEK that isn't 32 bytes). A minter bug, never an attacker.
+    /// unknown field, a DEK that isn't 32 bytes, a managed connector holding anything but its own
+    /// `bmc_v1` token). A minter bug, never an attacker.
     #[error("session grant claims are not the bsg_v1 shape")]
     BadClaims,
 }
@@ -124,6 +125,13 @@ pub struct McpConnector {
     /// any minter emits it** ([`Payload`] is `deny_unknown_fields`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub sandbox: bool,
+    /// The URL is Beyond's managed-MCP endpoint, which holds the real third-party credential and
+    /// injects it upstream, so this session never does. The connector's only credential is a
+    /// session-scoped [`bmc_v1`](crate::managed_mcp_token) token, and [`GrantVerifier::verify`]
+    /// refuses a grant that gives it anything else. Absent means false; omitted when false. Like
+    /// `sandbox`, **a replica must accept it before any minter emits it**.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub managed: bool,
 }
 
 /// What the grant carries sealed. Every value here is a credential; `Debug` shows only structure.
@@ -216,6 +224,31 @@ struct Payload {
     #[serde(default, skip_serializing_if = "is_false")]
     code_mode: bool,
     sealed: String,
+}
+
+/// Whether a managed connector's credentials are exactly one `Authorization: Bearer bmc_v1.…` header
+/// whose token names this grant's tenant, session and the connector, and has not expired. Anything
+/// else is refused, so a third-party key can't ride along. A replica holds no key for the token's
+/// MAC, so this checks what it can: the grammar and the binding; the managed endpoint checks the MAC.
+fn holds_only_its_bmc_token(
+    payload: &Payload,
+    connector: &McpConnector,
+    headers: &[SecretHeader],
+    now: u64,
+) -> bool {
+    let [header] = headers else { return false };
+    if !header.name.eq_ignore_ascii_case("authorization") {
+        return false;
+    }
+    let Some(token) = header.value.expose().strip_prefix("Bearer ") else {
+        return false;
+    };
+    crate::managed_mcp_token::parse(token).is_some_and(|t| {
+        t.claims.tenant == payload.tenant
+            && t.claims.session_id == payload.session_id
+            && t.claims.connector == connector.name
+            && now < t.claims.exp
+    })
 }
 
 /// `true` for the default of a boolean claim, so `skip_serializing_if` can leave it off the wire.
@@ -312,6 +345,12 @@ impl GrantVerifier {
             });
         }
         let secrets = self.unseal(head.as_bytes(), &payload.sealed)?;
+        for connector in payload.mcp.iter().filter(|c| c.managed) {
+            let headers = secrets.mcp_headers.get(&connector.name).map(Vec::as_slice);
+            if !holds_only_its_bmc_token(&payload, connector, headers.unwrap_or_default(), now) {
+                return Err(GrantError::BadClaims);
+            }
+        }
         Ok(Grant {
             tenant: payload.tenant,
             session_id: payload.session_id,
@@ -912,6 +951,134 @@ mod tests {
             [false, true]
         );
         assert!(built.payload_json.contains("\"sandbox\":true"));
+    }
+
+    /// The golden grant with its `linear` connector managed and `headers` as that connector's whole
+    /// credential set.
+    fn managed_inputs(headers: &[(&str, String)]) -> Fixture {
+        let mut inputs = fixture();
+        inputs.claims.mcp[1].managed = true;
+        inputs.secrets.mcp_headers.insert(
+            "linear".into(),
+            headers
+                .iter()
+                .map(|(name, value)| SecretHeader {
+                    name: (*name).into(),
+                    value: Secret::new(value.clone()),
+                })
+                .collect(),
+        );
+        inputs
+    }
+
+    fn bmc(tenant: &str, session: &str, connector: &str, exp: u64) -> String {
+        let key = crate::managed_mcp_token::ManagedKey::from_secret_bytes(&[0x33; 32]);
+        key.mint(&crate::managed_mcp_token::Claims {
+            tenant: tenant.into(),
+            session_id: session.into(),
+            connector: connector.into(),
+            exp,
+        })
+    }
+
+    /// A token bound to the golden grant's own tenant and session, for `connector`.
+    fn own_bmc(connector: &str) -> String {
+        let c = fixture().claims;
+        bmc(&c.tenant, &c.session_id, connector, c.exp)
+    }
+
+    fn verdict(inputs: &Fixture) -> Result<Grant, GrantError> {
+        let built = build(inputs);
+        verifier(&built).verify(&built.token, built.now)
+    }
+
+    #[test]
+    fn a_managed_connector_holding_only_its_own_bmc_token_is_accepted() {
+        let inputs = managed_inputs(&[("Authorization", format!("Bearer {}", own_bmc("linear")))]);
+        let grant = verdict(&inputs).unwrap();
+        assert_eq!(
+            grant.mcp.iter().map(|c| c.managed).collect::<Vec<_>>(),
+            [false, true]
+        );
+        // The header name is case-insensitive, as HTTP's is.
+        let inputs = managed_inputs(&[("authorization", format!("Bearer {}", own_bmc("linear")))]);
+        assert!(verdict(&inputs).is_ok());
+    }
+
+    #[test]
+    fn a_managed_connector_holding_anything_but_its_own_bmc_token_is_refused() {
+        let own = own_bmc("linear");
+        let c = fixture().claims;
+        let cases: Vec<(&str, Vec<(&str, String)>)> = vec![
+            ("no credential at all", vec![]),
+            (
+                "a third-party token",
+                vec![("Authorization", "Bearer lin_real_0000".into())],
+            ),
+            (
+                "the token plus a header that could carry a key",
+                vec![
+                    ("Authorization", format!("Bearer {own}")),
+                    ("X-Workspace", "ws-eng-7f3a".into()),
+                ],
+            ),
+            (
+                "two Authorization headers",
+                vec![
+                    ("Authorization", format!("Bearer {own}")),
+                    ("Authorization", "Bearer lin_real_0000".into()),
+                ],
+            ),
+            ("a token in another header", vec![("X-Token", own.clone())]),
+            (
+                "a non-bearer scheme",
+                vec![("Authorization", format!("Basic {own}"))],
+            ),
+            (
+                "a token followed by a key",
+                vec![("Authorization", format!("Bearer {own} lin_real_0000"))],
+            ),
+            (
+                "another connector's token",
+                vec![("Authorization", format!("Bearer {}", own_bmc("github")))],
+            ),
+            (
+                "another session's token",
+                vec![(
+                    "Authorization",
+                    format!("Bearer {}", bmc(&c.tenant, "sess_other", "linear", c.exp)),
+                )],
+            ),
+            (
+                "another tenant's token",
+                vec![(
+                    "Authorization",
+                    format!("Bearer {}", bmc("tenant2", &c.session_id, "linear", c.exp)),
+                )],
+            ),
+            (
+                "an expired token",
+                vec![(
+                    "Authorization",
+                    format!("Bearer {}", bmc(&c.tenant, &c.session_id, "linear", 1_000)),
+                )],
+            ),
+        ];
+        for (what, headers) in cases {
+            assert_eq!(
+                verdict(&managed_inputs(&headers)).err(),
+                Some(GrantError::BadClaims),
+                "{what} must refuse the grant"
+            );
+        }
+    }
+
+    #[test]
+    fn a_connector_that_is_not_managed_may_still_carry_a_third_party_key() {
+        // Managed is opt-in: the golden grant's own connectors keep verifying as before.
+        let fx = fixture();
+        assert!(verifier(&fx).verify(&fx.token, fx.now).is_ok());
+        assert!(!fx.payload_json.contains("\"managed\""));
     }
 
     #[test]
