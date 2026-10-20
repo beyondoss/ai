@@ -909,6 +909,9 @@ fn function_tool(t: &crate::message::ToolDef) -> Value {
         "name": t.name,
         "description": t.description,
         "parameters": t.input_schema,
+        // The Responses API defaults `strict` to true, which makes the model fill every property
+        // (inventing "" / 0 / [] for optional ones). Our schemas are not strict-shaped, so opt out.
+        "strict": false,
     })
 }
 
@@ -1679,9 +1682,26 @@ mod tests {
                     "name": "mcp__gh__get_issue",
                     "description": "mcp__gh__get_issue tool",
                     "parameters": { "type": "object" },
+                    "strict": false,
                 }],
             })
         );
+    }
+
+    #[test]
+    fn function_tools_opt_out_of_strict_so_optional_args_stay_optional() {
+        let req = ModelRequest::new("gpt-5-mini", vec![Message::user("hi")], 64).with_tools(vec![
+            crate::message::ToolDef {
+                name: "browser_find".into(),
+                description: "find".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "text": {"type": "string"}, "regex": {"type": "string"} },
+                }),
+            },
+        ]);
+        let body = build_body(&req);
+        assert_eq!(body["tools"][0]["strict"], json!(false), "got: {body}");
     }
 
     #[test]
