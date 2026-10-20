@@ -140,7 +140,8 @@ one directory don't silently drive the same transcript. Use `--continue` when yo
 
 Everything the agent writes about itself lives in `~/.beyond` (or `$AI_AGENT_CONFIG_DIR`): settings,
 logins (`auth.json`, `mcp_auth.json`), trust grants, `models.json`, memory, the MCP tool cache and
-sessions. A project's own settings go in `<project>/.beyond/settings.json`.
+sessions. A project's own settings go in `<project>/.beyond/settings.json`, and its MCP servers can go in
+`<project>/.mcp.json` (the Claude Code format; trusted projects only, and settings win a name clash).
 
 `~/.claude` belongs to Claude Code. The agent reads its skills, agents, prompt templates and
 `CLAUDE.md` from there, and a project's `.claude/settings.json` for the keys the agent knows, but it

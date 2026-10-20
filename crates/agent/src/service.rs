@@ -42,7 +42,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use crate::grant::{Grant, GrantVerifier};
+use crate::grant::{Grant, GrantVerifier, McpConnector};
 use crate::session_store::{Layout, RepoOptions, TenantCodec};
 
 /// Cap on the `x-beyond-grant` header's value. The whole header block is capped at 16 KiB
@@ -158,6 +158,12 @@ pub(crate) fn is_safe_segment(s: &str) -> bool {
     s.len() <= 128 && crate::session_store::is_valid_session_id(s)
 }
 
+/// Whether `name` can be a connector's name: the `<server>` in `mcp__<server>__<tool>`, so one that
+/// can't be split back out of it (`a__b`) would credit its tools to another connector.
+pub(crate) fn is_connector_name(name: &str) -> bool {
+    is_safe_segment(name) && crate::tools::mcp::server_name_error(name).is_none()
+}
+
 // ---------------------------------------------------------------------------------------------
 // Authorization
 // ---------------------------------------------------------------------------------------------
@@ -231,9 +237,7 @@ pub fn authorize(
     }
     // A connector name is the `<server>` in `mcp__<server>__<tool>`: one that can't be split back out
     // of it (`a__b`) would credit its tools to another connector.
-    if !grant.mcp.iter().all(|c| {
-        is_safe_segment(&c.name) && crate::tools::mcp::server_name_error(&c.name).is_none()
-    }) {
+    if !grant.mcp.iter().all(|c| is_connector_name(&c.name)) {
         return Err(Refusal::BadRequest(
             "a session grant connector name is invalid",
         ));
@@ -578,6 +582,7 @@ impl ServiceSession {
             prompt_templates,
             prompt_collisions,
             agents,
+            mcp_connectors: workspace_mcp(backend, root).await.0,
             context_files: match context_files {
                 true => crate::resources::load_context_files_via(backend, root, home).await,
                 false => Vec::new(),
@@ -608,6 +613,7 @@ impl ServiceSession {
         &self,
         egress: Option<&crate::tools::mcp::McpEgress>,
         host: Arc<crate::tools::mcp_host::McpHost>,
+        from_file: &[McpConnector],
     ) -> (
         crate::tools::mcp::McpTools,
         crate::tools::mcp::McpCatalog,
@@ -619,7 +625,8 @@ impl ServiceSession {
                 crate::tools::mcp::McpCatalog::default(),
             )
         };
-        if self.grant.mcp.is_empty() {
+        let connectors = self.connectors(from_file);
+        if connectors.is_empty() {
             let (tools, catalog) = empty();
             return (tools, catalog, Vec::new());
         }
@@ -638,13 +645,25 @@ impl ServiceSession {
             );
         };
         crate::tools::mcp::connect_granted(
-            &self.grant.mcp,
+            &connectors,
             &self.grant.secrets.mcp_headers,
             egress,
             host,
             crate::tools::mcp::idle_reap_after_from_env(),
         )
         .await
+    }
+
+    /// The grant's connectors, then those of the workspace's `.mcp.json` the grant doesn't already
+    /// name: on a name clash the grant wins, headers and all.
+    fn connectors(&self, from_file: &[McpConnector]) -> Vec<McpConnector> {
+        let mut all = self.grant.mcp.clone();
+        for c in from_file {
+            if !all.iter().any(|g| g.name == c.name) {
+                all.push(c.clone());
+            }
+        }
+        all
     }
 
     /// This session's connectors dialed again **with MCP Apps advertised**, lazily, the first time
@@ -654,18 +673,21 @@ impl ServiceSession {
         self: &Arc<Self>,
         egress: Option<crate::tools::mcp::McpEgress>,
         host: Arc<crate::tools::mcp_host::McpHost>,
+        from_file: &[McpConnector],
     ) -> crate::tools::mcp_apps::McpAppsPool {
         let session = Arc::clone(self);
+        let connectors = self.connectors(from_file);
         crate::tools::mcp_apps::McpAppsPool::new(move |only: Option<Vec<String>>| {
             let session = Arc::clone(&session);
             let egress = egress.clone();
             let host = host.clone();
+            let connectors = connectors.clone();
             Box::pin(async move {
                 let Some(egress) = egress else {
                     return Vec::new();
                 };
                 crate::tools::mcp::connect_granted_each(
-                    &session.grant.mcp,
+                    &connectors,
                     &session.grant.secrets.mcp_headers,
                     &egress,
                     host,
@@ -728,6 +750,20 @@ fn claude_roots(root: &Path, home: Option<&Path>, leaf: &str) -> Vec<(PathBuf, &
     roots
 }
 
+/// The connectors `<root>/.mcp.json` adds to a session, read through the sandbox backend, plus a
+/// warning for each entry skipped or stripped. Absent, oversized or unreadable is no connectors. Only
+/// `url`s survive (see [`crate::mcp_json`]).
+pub async fn workspace_mcp(
+    backend: &dyn crate::tools::fs::FsBackend,
+    root: &Path,
+) -> (Vec<McpConnector>, Vec<String>) {
+    let path = root.join(crate::mcp_json::FILE);
+    match crate::tools::fs::read_text_capped(backend, &path, crate::mcp_json::MAX_BYTES).await {
+        Ok(text) => crate::mcp_json::hosted_connectors(&text),
+        Err(_) => (Vec::new(), Vec::new()),
+    }
+}
+
 /// The sandbox discovery roots for subagent definitions, in the same ascending order as
 /// [`skill_roots`]: `.agents/agents` before `.claude/agents`, as the on-host walk orders them.
 fn agent_roots(root: &Path, home: Option<&Path>) -> Vec<(PathBuf, &'static str)> {
@@ -747,6 +783,9 @@ pub struct Resources {
     pub prompt_templates: Vec<crate::prompts::PromptTemplate>,
     pub prompt_collisions: Vec<crate::skills::Collision>,
     pub agents: Vec<crate::agents::AgentDef>,
+    /// The `url` servers of `<workspace>/.mcp.json` (see [`workspace_mcp`]). Saved with the snapshot
+    /// so a reopened session connects them without waking the sandbox to read the file again.
+    pub mcp_connectors: Vec<McpConnector>,
     /// The tenant's own `AGENTS.md`/`CLAUDE.md`, already read: `(path, body)` in prompt order.
     pub context_files: Vec<(String, String)>,
     /// `<workspace>/.claude/SYSTEM.md`, else `<sandbox home>/.claude/SYSTEM.md`. Delivered as
@@ -812,6 +851,9 @@ mod snapshot {
         prompt_templates: Vec<Prompt>,
         prompt_collisions: Vec<Collision>,
         agents: Vec<Agent>,
+        /// `(name, url)` of the `.mcp.json` connectors. Absent in a snapshot older than the field.
+        #[serde(default)]
+        mcp: Vec<(String, String)>,
         context: Vec<(String, String)>,
         system: Option<String>,
         append_system: Option<String>,
@@ -943,6 +985,11 @@ mod snapshot {
                         scope: a.scope.to_owned(),
                     })
                     .collect(),
+                mcp: r
+                    .mcp_connectors
+                    .iter()
+                    .map(|c| (c.name.clone(), c.url.clone()))
+                    .collect(),
                 context: r.context_files.clone(),
                 system: r.system.clone(),
                 append_system: r.append_system.clone(),
@@ -1009,6 +1056,16 @@ mod snapshot {
                             memory_index: a.memory_index,
                             system: a.system,
                             path: a.path,
+                        })
+                        .collect(),
+                    mcp_connectors: self
+                        .mcp
+                        .into_iter()
+                        .map(|(name, url)| super::McpConnector {
+                            name,
+                            url,
+                            sandbox: false,
+                            managed: false,
                         })
                         .collect(),
                     context_files: self.context,
@@ -1236,6 +1293,12 @@ mod tests {
                 system: "Review.".into(),
                 path: "/w/.claude/agents/reviewer.md".into(),
                 scope: "user",
+            }],
+            mcp_connectors: vec![McpConnector {
+                name: "docs".into(),
+                url: "https://e.example/mcp".into(),
+                sandbox: false,
+                managed: false,
             }],
             context_files: vec![("/w/AGENTS.md".into(), "CONTEXT-MARKER".into())],
             system: Some("SYSTEM".into()),

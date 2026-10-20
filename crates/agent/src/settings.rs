@@ -869,7 +869,46 @@ fn effective_settings_with_stores(
     }
     let claude = read_store_file(&claude_project_settings_path(cwd));
     let beyond = read_store_file(&project_settings_path(cwd));
-    global.get().merge_over(&claude).merge_over(&beyond)
+    let mut merged = global.get().merge_over(&claude).merge_over(&beyond);
+    add_mcp_json_servers(&mut merged, cwd);
+    merged
+}
+
+/// Add the trusted project's `.mcp.json` servers (see [`crate::mcp_json`]) to `settings.mcp_servers`.
+/// A name already configured — by the global tier or either project tier — wins: the file only fills
+/// names the settings leave free. A bad entry or file is skipped with a warning on stderr.
+fn add_mcp_json_servers(settings: &mut Settings, cwd: &Path) {
+    let path = cwd.join(crate::mcp_json::FILE);
+    let Ok(file) = std::fs::File::open(&path) else {
+        return;
+    };
+    let mut text = String::new();
+    if std::io::Read::read_to_string(
+        &mut std::io::Read::take(file, crate::mcp_json::MAX_BYTES + 1),
+        &mut text,
+    )
+    .is_err()
+        || text.len() as u64 > crate::mcp_json::MAX_BYTES
+    {
+        eprintln!(
+            "warning: {} is unreadable or too large; ignored",
+            path.display()
+        );
+        return;
+    }
+    let (servers, warnings) = crate::mcp_json::local_servers(&text);
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+    let list = settings.mcp_servers.get_or_insert_with(Vec::new);
+    for server in servers {
+        if !list.iter().any(|s| s.name == server.name) {
+            list.push(server);
+        }
+    }
+    if list.is_empty() {
+        settings.mcp_servers = None;
+    }
 }
 
 /// Notes for `agent settings`: one line per field whose value `run`/`serve` would use in `cwd`
@@ -2998,6 +3037,63 @@ mod tests {
         let untrusted = crate::trust_store::TrustStore::open(dir.path().join("none.json"));
         let effective = effective_settings_with_stores(&global, &project_dir, &untrusted);
         assert_eq!(effective.default_model, None);
+    }
+
+    fn mcp_names(s: &Settings) -> Vec<String> {
+        s.mcp_servers
+            .iter()
+            .flatten()
+            .map(|m| m.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_trusted_projects_mcp_json_joins_the_settings_servers_and_settings_win_a_clash() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("project");
+        fs::create_dir_all(project_dir.join(".beyond")).unwrap();
+        fs::write(
+            project_dir.join(".mcp.json"),
+            r#"{"mcpServers": {
+                "from-file": {"command": "file-cmd"},
+                "both": {"url": "https://file.example/mcp"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            project_dir.join(".beyond/settings.json"),
+            r#"{"mcp_servers": [{"name": "both", "transport": "stdio", "command": "settings-cmd"}]}"#,
+        )
+        .unwrap();
+        let global = SettingsStore::open(dir.path().join("settings.json"));
+        let mut trust =
+            crate::trust_store::TrustStore::open(dir.path().join("trusted-projects.json"));
+        trust.trust(&project_dir).unwrap();
+
+        let effective = effective_settings_with_stores(&global, &project_dir, &trust);
+        let servers = effective.mcp_servers.clone().unwrap();
+        assert_eq!(mcp_names(&effective), ["both", "from-file"]);
+        let both = servers.iter().find(|s| s.name == "both").unwrap();
+        assert!(
+            matches!(&both.transport, McpTransport::Stdio { command, .. } if command == "settings-cmd"),
+            "an explicit settings entry wins a name clash: {both:?}"
+        );
+    }
+
+    #[test]
+    fn an_untrusted_projects_mcp_json_starts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join(".mcp.json"),
+            r#"{"mcpServers": {"evil": {"command": "touch", "args": ["pwned"]}}}"#,
+        )
+        .unwrap();
+        let global = SettingsStore::open(dir.path().join("settings.json"));
+        let trust = crate::trust_store::TrustStore::open(dir.path().join("none.json"));
+
+        let effective = effective_settings_with_stores(&global, &project_dir, &trust);
+        assert_eq!(effective.mcp_servers, None);
     }
 
     #[test]

@@ -455,18 +455,42 @@ impl Mode {
         cfg: &mut ServeConfig,
         host: &Arc<crate::tools::mcp_host::McpHost>,
         session_id: &str,
+        from_file: &[crate::grant::McpConnector],
     ) -> bool {
         let Some(service) = self.service() else {
             return false;
         };
-        let (tools, catalog, warnings) = service.mcp(cfg.mcp_http.as_ref(), host.clone()).await;
-        cfg.mcp_apps = Some(service.mcp_apps_pool(cfg.mcp_http.clone(), host.clone()));
+        let (tools, catalog, warnings) = service
+            .mcp(cfg.mcp_http.as_ref(), host.clone(), from_file)
+            .await;
+        cfg.mcp_apps = Some(service.mcp_apps_pool(cfg.mcp_http.clone(), host.clone(), from_file));
         for warning in &warnings {
             eprintln!("warning: session {session_id}: {warning}");
         }
         cfg.mcp_tools = tools;
         cfg.mcp_catalog = catalog;
         true
+    }
+
+    /// The connectors the workspace's `.mcp.json` adds, for a session that has just probed its
+    /// sandbox (a reopened one takes them from its snapshot instead). Empty outside service mode.
+    pub(crate) async fn read_workspace_mcp(
+        &self,
+        exec: &ExecCell,
+        session_id: &str,
+    ) -> Vec<crate::grant::McpConnector> {
+        let Some(service) = self.service() else {
+            return Vec::new();
+        };
+        let (connectors, warnings) = crate::service::workspace_mcp(
+            exec.backend().as_ref(),
+            std::path::Path::new(service.workspace_root()),
+        )
+        .await;
+        for warning in &warnings {
+            eprintln!("warning: session {session_id}: {warning}");
+        }
+        connectors
     }
 
     /// Whether a sandbox snapshot sits beside the transcript. When the saved one is behind what the
