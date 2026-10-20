@@ -116,6 +116,14 @@ pub struct Grant {
 pub struct McpConnector {
     pub name: String,
     pub url: String,
+    /// The server runs inside a sandbox that sleeps when idle. Any connection the agent holds open
+    /// to it keeps the VM awake, so the replica never opens the standalone event stream for this
+    /// connector and keeps no idle connection pooled between calls (the cost: it hears no
+    /// tools-changed notifications). Absent means false, and is omitted when false, so a grant that
+    /// does not ask for it mints byte-for-byte as before. **A replica must accept this field before
+    /// any minter emits it** ([`Payload`] is `deny_unknown_fields`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sandbox: bool,
 }
 
 /// What the grant carries sealed. Every value here is a credential; `Debug` shows only structure.
@@ -885,6 +893,25 @@ mod tests {
             "the signed payload must carry the claim: {}",
             built.payload_json
         );
+    }
+
+    #[test]
+    fn a_sandbox_connector_flag_defaults_off_and_rides_the_signed_claims_when_set() {
+        // The golden vectors predate the flag: their connectors verify with it off.
+        let fx = fixture();
+        let grant = verifier(&fx).verify(&fx.token, fx.now).unwrap();
+        assert!(grant.mcp.iter().all(|c| !c.sandbox));
+        assert!(!fx.payload_json.contains("\"sandbox\""));
+
+        let mut inputs = fixture();
+        inputs.claims.mcp[1].sandbox = true;
+        let built = build(&inputs);
+        let grant = verifier(&built).verify(&built.token, built.now).unwrap();
+        assert_eq!(
+            grant.mcp.iter().map(|c| c.sandbox).collect::<Vec<_>>(),
+            [false, true]
+        );
+        assert!(built.payload_json.contains("\"sandbox\":true"));
     }
 
     #[test]

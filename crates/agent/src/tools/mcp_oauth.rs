@@ -1025,6 +1025,7 @@ mod tests {
         OAuthHttp::new(
             crate::tools::mcp_view_http::ViewCappedHttp::new(crate::tools::mcp_wire::HttpClient {
                 client: reqwest::Client::new(),
+                no_standing_stream: false,
             }),
             Some(auth),
         )

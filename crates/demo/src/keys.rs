@@ -121,6 +121,7 @@ pub fn mint_grant(keys: &GrantKeys, a: &MintArgs) -> Res<String> {
         workspace_root: a.workspace.clone(),
         exec_url: a.exec_url.clone(),
         mcp: Vec::new(),
+        mcp_sandbox: Vec::new(),
         exp: now + a.ttl_secs,
     };
     let secrets = Secrets {

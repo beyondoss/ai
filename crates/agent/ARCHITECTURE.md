@@ -4664,8 +4664,11 @@ signed      ASCII "bsg_v1.{kid}.{payload_b64}"   (version and kid are signed: no
 sig         Ed25519(signed)
 payload     compact JSON, keys in this order:
             {"tenant":str,"session_id":str,"home_shard":str,"workspace_root":str,"exec_url":str,
-             "mcp":[{"name":str,"url":str},...],"exp":u64,"code_mode":true,"sealed":str}
+             "mcp":[{"name":str,"url":str,"sandbox":true},...],"exp":u64,"code_mode":true,"sealed":str}
 exp         unix seconds; the grant is valid while now < exp (no leeway: the minter's TTL absorbs skew)
+sandbox     optional per connector; present only as true (omitted otherwise, so existing grants mint
+            byte-for-byte as before); absent means false. A replica must accept it before any minter
+            emits it (the payload rejects unknown fields)
 code_mode   optional; present only as true (a grant that doesn't ask for Code Mode omits it, so it mints
             byte-for-byte as before the claim existed); absent means off
 
@@ -5544,6 +5547,16 @@ assumption would otherwise cross a tenant boundary:
 - **The manifest cache.** `mcp_manifest` is keyed by name + url and shared by the whole replica, so
   grant connectors pass `manifest_dir: None` and always discover by connecting.
 - **Transport.** HTTP only. A `stdio` connector would be a process on the replica.
+
+**Sandbox connectors.** A connector whose server runs inside a sleeping sandbox sets `sandbox: true`.
+rmcp opens the standalone `GET` event stream as soon as a server hands out a session id, and that one
+held connection keeps the VM awake forever. For a sandbox connector the `mcp_wire` client answers
+that `GET` locally as unsupported (rmcp's `ServerDoesNotSupportSse`, the same path as a server that
+answers 405), so no request leaves, and the connector dials through a second client with
+`pool_max_idle_per_host(0)`, so no idle connection lingers between calls. The cost is that such a
+connector hears no server-pushed notifications (tools-changed); the next call still works.
+Default connectors keep the stream, which those notifications rely on.
+`tests/mcp_sandbox_connector.rs` counts `GET`s and open connections at a session-id-issuing fixture.
 
 **Egress.** Connectors dial through one process-wide `McpEgress` (`ServeConfig::mcp_http`), built
 once by `main.rs`: its own client, not the gateway's h2c pool (a tenant's connector is not the

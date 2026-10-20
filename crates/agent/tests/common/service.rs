@@ -230,6 +230,7 @@ impl Service {
             workspace_root: self.workspace.to_string_lossy().into_owned(),
             exec_url: self.exec.url.clone(),
             mcp: Vec::new(),
+            mcp_sandbox: Vec::new(),
             exp: far_future(),
         }
     }

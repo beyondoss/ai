@@ -39,12 +39,19 @@ use serde_json::Value;
 #[derive(Clone)]
 pub(crate) struct HttpClient {
     pub(crate) client: reqwest::Client,
+    /// Never open the standalone `GET` stream: it is answered here as unsupported, which rmcp treats
+    /// as a server without one (it skips the stream), so no request leaves. For a connector inside a
+    /// sleeping sandbox, where one held connection keeps the VM awake.
+    pub(crate) no_standing_stream: bool,
 }
 
 impl HttpClient {
     #[cfg(test)]
     pub(crate) fn new(client: reqwest::Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            no_standing_stream: false,
+        }
     }
 }
 
@@ -639,6 +646,9 @@ impl StreamableHttpClient for HttpClient {
         BoxStream<'static, Result<sse_stream::Sse, SseError>>,
         StreamableHttpError<Self::Error>,
     > {
+        if self.no_standing_stream {
+            return Err(StreamableHttpError::ServerDoesNotSupportSse);
+        }
         self.client
             .get_stream_with_max_sse_event_size(
                 uri,
@@ -663,6 +673,9 @@ impl StreamableHttpClient for HttpClient {
         BoxStream<'static, Result<sse_stream::Sse, SseError>>,
         StreamableHttpError<Self::Error>,
     > {
+        if self.no_standing_stream {
+            return Err(StreamableHttpError::ServerDoesNotSupportSse);
+        }
         self.client
             .get_stream_with_max_sse_event_size(
                 uri,
