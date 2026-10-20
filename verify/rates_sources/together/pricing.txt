@@ -1,6 +1,7 @@
+Introducing Together Post-Training: Better models, faster runs, lower costs →
 Introducing Together Link: Run open models inside the harness you already use →
 The Open Source AI Stack: models, inference, routers, harnesses & tools →
-📈 GLM-5.3 vs. GLM 5.3 Flash on DeepSWE →
+GLM-5.3 vs. GLM 5.3 Flash on DeepSWE →
 ⚡ On-demand B200s now available on Together GPU Clusters →
 Inference
 Serverless Inference
@@ -40,10 +41,10 @@ B200
 H200
 H100
 Model Shaping
-Custom Training
-Post-training for frontier quality at scale
+Post-Training
+Define your own RL and SFT loop
 Fine-Tuning
-Shape models with your data
+Launch managed SFT and DPO jobs
 Evaluations
 Measure model quality
 kimi K2.7 Code
@@ -139,10 +140,10 @@ GB200
 B200
 H200
 H100
-Custom Training
-Post-training for frontier quality at scale
+Post-Training
+Define your own RL and SFT loop
 Fine-Tuning
-Shape models with your data
+Launch managed SFT and DPO jobs
 Evaluations
 Measure model quality
 kimi K2.7 Code
@@ -211,6 +212,7 @@ GPU Clusters
 Sandbox
 Managed Storage
 Model Shaping
+Post-Training
 Fine-Tuning
 Need help choosing?
 Our team can help you find the best fit for your needs.
@@ -235,10 +237,6 @@ Batch API price
 Model
 Input
 output
-MiniMax M3
-$0.30
-$0.06 (cached)
-$1.20
 Kimi K3
 $3.00
 $0.30 (cached)
@@ -281,6 +279,10 @@ $1.20
 Gemma 4 31B
 $0.39
 $0.97
+MiniMax M3
+$0.30
+$0.06 (cached)
+$1.20
 Qwen3.7-Plus
 $0.32
 $1.28
@@ -354,10 +356,6 @@ Price per 1M tokens
 Model
 Input
 output
-MiniMax M3
-$0.30
-$0.06 (cached)
-$1.20
 Kimi K3
 $3.00
 $0.30 (cached)
@@ -385,6 +383,10 @@ $1.20
 Gemma 4 31B
 $0.39
 $0.97
+MiniMax M3
+$0.30
+$0.06 (cached)
+$1.20
 Qwen3.7-Plus
 $0.32
 $1.28
@@ -758,6 +760,16 @@ Unit
 Shared Filesystem
 $0.16
 GiB/month
+Post-Training
+On-demand training infrastructure, billed per minute for each active model resource.
+Hardware
+All prices per gpu per hour
+Price per GPU
+NVIDIA HGX B200
+PROMO
+Promotion valid until 12/14/2026
+$11.00
+$9.00
 Fine-Tuning
 Train open-source models for real production use.
 LoRA fine-tuning

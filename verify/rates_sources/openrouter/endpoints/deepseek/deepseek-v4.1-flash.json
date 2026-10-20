@@ -5,26 +5,26 @@
         "context_length": 1000000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000012",
+          "completion": "0.00000132",
           "discount": 0,
-          "input_cache_read": "0.00000003",
+          "input_cache_read": "0.000000033",
           "overrides": [
             {
-              "completion": "0.0000012",
-              "input_cache_read": "0.00000003",
-              "prompt": "0.0000003",
+              "completion": "0.00000132",
+              "input_cache_read": "0.000000033",
+              "prompt": "0.00000033",
               "utc_end": 1400,
               "utc_start": 0
             },
             {
-              "completion": "0.0000006",
-              "input_cache_read": "0.000000015",
-              "prompt": "0.00000015",
+              "completion": "0.00000066",
+              "input_cache_read": "0.0000000165",
+              "prompt": "0.000000165",
               "utc_end": 0,
               "utc_start": 1400
             }
           ],
-          "prompt": "0.0000003"
+          "prompt": "0.00000033"
         },
         "provider_name": "Alibaba",
         "quantization": "unknown",
@@ -177,10 +177,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000078",
+          "completion": "0.0000009",
           "discount": 0,
           "input_cache_read": "0.000000006",
-          "prompt": "0.000000195"
+          "prompt": "0.000000225"
         },
         "provider_name": "DigitalOcean",
         "quantization": "unknown",
@@ -198,6 +198,19 @@
         "provider_name": "Fireworks",
         "quantization": "unknown",
         "tag": "fireworks"
+      },
+      {
+        "context_length": 1048576,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000084",
+          "discount": 0,
+          "input_cache_read": "0.0000000042",
+          "prompt": "0.00000021"
+        },
+        "provider_name": "Fireworks",
+        "quantization": "unknown",
+        "tag": "fireworks/flex"
       },
       {
         "context_length": 1048576,
@@ -255,10 +268,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000115",
+          "completion": "0.00000117",
           "discount": 0,
-          "input_cache_read": "0.000000009",
-          "prompt": "0.00000027"
+          "input_cache_read": "0.0000000058",
+          "prompt": "0.00000026"
         },
         "provider_name": "Makora",
         "quantization": "fp8",
@@ -284,7 +297,7 @@
           "completion": "0.0000006",
           "discount": 0,
           "input_cache_read": "0.000000007",
-          "prompt": "0.000000056"
+          "prompt": "0.000000084"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -319,10 +332,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000008",
+          "completion": "0.00000012",
           "discount": 0,
           "input_cache_read": "0.0000000016",
-          "prompt": "0.0000000448"
+          "prompt": "0.000000056"
         },
         "provider_name": "OpenInference",
         "quantization": "fp4",
@@ -371,10 +384,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000001",
+          "completion": "0.0000005",
           "discount": 0,
-          "input_cache_read": "0.000000016",
-          "prompt": "0.0000002"
+          "input_cache_read": "0.000000008",
+          "prompt": "0.00000007"
         },
         "provider_name": "Relace",
         "quantization": "unknown",
@@ -397,6 +410,19 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
+          "completion": "0.00000015",
+          "discount": 0,
+          "input_cache_read": "0.000000006735",
+          "prompt": "0.000000101"
+        },
+        "provider_name": "Sail Research",
+        "quantization": "fp4",
+        "tag": "sail-research/fp4/us"
+      },
+      {
+        "context_length": 1048576,
+        "max_prompt_tokens": null,
+        "pricing": {
           "completion": "0.0000012",
           "discount": 0,
           "input_cache_read": "0.000000006",
@@ -410,10 +436,10 @@
         "context_length": 1024000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000005988",
-          "discount": 0.501,
-          "input_cache_read": "0.000000002994",
-          "prompt": "0.0000001497"
+          "completion": "0.000000588",
+          "discount": 0.51,
+          "input_cache_read": "0.00000000294",
+          "prompt": "0.000000147"
         },
         "provider_name": "StreamLake",
         "quantization": "fp8",
@@ -452,7 +478,7 @@
           "completion": "0.00000065",
           "discount": 0,
           "input_cache_read": "0.000000006",
-          "prompt": "0.0000001"
+          "prompt": "0.00000016"
         },
         "provider_name": "Wafer",
         "quantization": "mxfp4",

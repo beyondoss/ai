@@ -42,6 +42,7 @@ For rate limits and pricing, see the [Serverless overview](/docs/serverless/over
 | :- | :- | :- | :- | :- | :- | :- | :- | :- | :- |
 | DeepSeek | DeepSeek V4 Pro 0813 | deepseek-ai/DeepSeek-V4-Pro-0813 | 1048576 | \$1.32 | \$0.13 | \$3.96 | NVFP4 | Yes | Yes |
 | DeepSeek | DeepSeek V4.1 Flash | deepseek-ai/DeepSeek-V4.1-Flash | 1000000 | \$0.30 | \$0.006 | \$1.20 | FP8 | Yes | Yes |
+| DeepSeek | DeepSeek V4.1 Flash 1017 | deepseek-ai/DeepSeek-V4.1-Flash-1017 | 1000000 | \$0.30 | \$0.006 | \$1.20 | FP8 | Yes | Yes |
 | Meta | Muse Glimmer 30B | meta-models/Muse-Glimmer-30B | 131072 | \$0.35 | \$0.04 | \$1.50 | FP8 | Yes | Yes |
 | Meta | Muse Spark Open 816B A42B | meta-models/Muse-Spark-Open-816B-A42B | 1048576 | \$1.25 | \$0.15 | \$4.25 | NVFP4 | Yes | Yes |
 | Minimax | Minimax M3 | MiniMaxAI/MiniMax-M3 | 524288 | \$0.30 | \$0.06 | \$1.20 | FP4 | Yes | Yes |
