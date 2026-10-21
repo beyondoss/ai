@@ -624,6 +624,10 @@ enum Command {
         /// With --service, let MCP servers be reached at private addresses (for development only).
         #[usage(long, env = "AI_AGENT_MCP_ALLOW_PRIVATE")]
         mcp_allow_private: bool,
+        /// With --service, how many MiB of unpacked agent bundles to keep on disk; the least
+        /// recently used that no session holds are removed beyond it. Default 1024.
+        #[usage(long, env = "AI_AGENT_BUNDLE_CACHE_MB")]
+        bundle_cache_mb: Option<u64>,
         /// Public base URL of this server, so MCP servers can deliver events by webhook.
         #[usage(long, env = "AI_AGENT_MCP_EVENTS_CALLBACK_URL")]
         mcp_events_callback_url: Option<String>,

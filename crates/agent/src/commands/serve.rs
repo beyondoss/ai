@@ -348,6 +348,7 @@ async fn resolve(cmd: Command, mode: &Mode) -> Result<ServeResolved, Box<dyn std
         session_dir,
         listen_uds_mode,
         mcp_allow_private,
+        bundle_cache_mb,
         no_session_persistence,
         system_prompt,
         append_system_prompt,
@@ -580,6 +581,9 @@ async fn resolve(cmd: Command, mode: &Mode) -> Result<ServeResolved, Box<dyn std
     // connector is an arbitrary third-party endpoint. Its egress policy is fixed at build
     // time, which is why it is a process flag rather than anything a grant can ask for.
     let mcp_http = mode.session_mcp_egress(mcp_allow_private)?;
+    if let Some(mb) = bundle_cache_mb {
+        beyond_ai_agent::bundle::set_budget(mb.saturating_mul(1024 * 1024));
+    }
     // Parse the UDS socket mode from its octal string (`0o660`, `660`, `0660` all work) up
     // front so a bad value fails fast with a clear message rather than deep in the listener.
     let listen_uds_mode: Option<u32> = match &listen_uds_mode {

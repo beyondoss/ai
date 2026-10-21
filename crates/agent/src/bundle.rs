@@ -2,7 +2,7 @@
 //! (`AGENTS.md`, `.mcp.json`, `.agents/skills`, `.agents/agents`, ...), named by the SHA-256 of its
 //! bytes the way an image is named by its digest.
 //!
-//! [`ensure`] fetches it through the replica's egress client, checks the hash **before** a byte is
+//! [`Cache::ensure`] fetches it through the replica's egress client, checks the hash **before** a byte is
 //! unpacked, and unpacks it into a cache directory named by the hash, built beside it and renamed into
 //! place, so a directory that exists is always a complete, verified copy. Every session on the replica
 //! that names the same hash shares that one copy and fetches nothing when it is there. A fetch, hash or
@@ -35,106 +35,285 @@ pub const MAX_BYTES: usize = 64 * 1024 * 1024;
 
 const BLOCK: usize = 512;
 
-/// Where bundles unpack: `agent-bundles` under the replica's temp dir (`TMPDIR`). A cache only: a
-/// missing directory is fetched again.
-pub fn cache_root() -> PathBuf {
-    std::env::temp_dir().join("agent-bundles")
+/// The default cache budget: 1 GiB. A bundle is an agent folder (text, skills, config), usually
+/// kilobytes and at most [`MAX_BYTES`], so this holds thousands of typical versions or sixteen of the
+/// largest, while staying a small share of a replica's disk.
+pub const DEFAULT_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+
+const LOCK: &str = ".lock";
+
+static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Set the process cache budget (`--bundle-cache-mb`) before the first session opens.
+pub fn set_budget(bytes: u64) {
+    let _ = BUDGET.set(bytes);
 }
 
 /// How many bundles this process fetches at once. Each body is buffered whole (up to
 /// [`MAX_BYTES`]), so this bounds the peak at about 256 MiB however many tenants cold-start at once.
 const CONCURRENT_FETCHES: usize = 4;
 
-/// The unpacked bundle under `root`, fetching, verifying and unpacking it first if it is not there.
-pub async fn ensure(
-    root: &Path,
-    bundle: &Bundle,
-    egress: Option<&crate::tools::mcp::McpEgress>,
-) -> Result<PathBuf, String> {
-    static FETCHES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(CONCURRENT_FETCHES);
-    ensure_limited(root, bundle, egress, &FETCHES).await
+/// The replica's bundle cache: a directory of its own under `agent-bundles` in its temp dir
+/// (`TMPDIR`), within the budget. A cache only: a missing directory is fetched again.
+pub fn cache() -> &'static Arc<Cache> {
+    static CACHE: std::sync::LazyLock<Arc<Cache>> = std::sync::LazyLock::new(|| {
+        Cache::new(
+            &std::env::temp_dir().join("agent-bundles"),
+            BUDGET.get().copied().unwrap_or(DEFAULT_BUDGET_BYTES),
+        )
+    });
+    &CACHE
 }
 
-async fn ensure_limited(
-    root: &Path,
-    bundle: &Bundle,
-    egress: Option<&crate::tools::mcp::McpEgress>,
-    fetches: &tokio::sync::Semaphore,
-) -> Result<PathBuf, String> {
-    if !bundle.is_well_formed() {
-        return Err("bundle: the grant's bundle is not a url and a lowercase sha256".into());
-    }
-    let dest = root.join(&bundle.sha256);
-    if dest.is_dir() {
-        return Ok(dest);
-    }
-    let egress = egress.ok_or("bundle: this replica has no egress client to fetch it with")?;
-    // One fetch per hash in flight in this process: the others wait here and find the unpacked copy.
-    // A failed attempt just releases the lock, so the next waiter tries for itself.
-    let flight = flight(&dest);
-    let turn = flight.lock().await;
-    let result = fetch_and_install(root, &dest, bundle, egress, fetches).await;
-    drop(turn);
-    release(&dest, flight);
-    result
+/// Unpacked bundles on disk, one directory per hash, kept within a byte budget by evicting the least
+/// recently released directory nobody holds.
+///
+/// A session holds a [`Pin`] on its bundle for its whole life (it keeps reading skills from the
+/// directory), and a pinned directory is never evicted. So the cache may exceed the budget, but only by
+/// the bytes of pinned bundles. Sizes are recorded as bundles unpack; the disk is never walked.
+///
+/// Each cache owns a fresh subdirectory of the shared base, holding a lock file that stays locked for
+/// the cache's life. Creating a cache removes the subdirectories of caches whose lock it can take: their
+/// process is gone (the kernel releases a crashed process's lock), and no other process's directory is
+/// ever touched. A new process starts with an empty cache, and fetching again is cheap and verified.
+pub struct Cache {
+    /// This cache's own directory.
+    root: PathBuf,
+    budget: u64,
+    fetches: tokio::sync::Semaphore,
+    state: std::sync::Mutex<State>,
+    /// Holds the lock that tells other processes this directory is in use.
+    _lock: Option<std::fs::File>,
 }
 
-/// The lock for fetching the bundle that unpacks to `dest`.
-fn flight(dest: &Path) -> Arc<tokio::sync::Mutex<()>> {
-    FLIGHTS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entry(dest.to_path_buf())
-        .or_default()
-        .clone()
+#[derive(Default)]
+struct State {
+    entries: HashMap<String, Entry>,
+    /// One fetch per hash in flight: the others wait on its lock and find the unpacked copy.
+    flights: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
-/// Forget `dest`'s lock once nobody else holds or waits on it.
-fn release(dest: &Path, flight: Arc<tokio::sync::Mutex<()>>) {
-    let mut flights = FLIGHTS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // The map's handle and ours: no waiter has cloned it.
-    if Arc::strong_count(&flight) == 2 {
-        flights.remove(dest);
+struct Entry {
+    refs: usize,
+    bytes: u64,
+    last_release: std::time::SystemTime,
+}
+
+/// A hold on one unpacked bundle: its directory stays until this is dropped.
+pub struct Pin {
+    cache: Arc<Cache>,
+    sha256: String,
+    dir: PathBuf,
+}
+
+impl Pin {
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 }
 
-type Flights = std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>;
-
-static FLIGHTS: std::sync::LazyLock<Flights> = std::sync::LazyLock::new(Default::default);
-
-async fn fetch_and_install(
-    root: &Path,
-    dest: &Path,
-    bundle: &Bundle,
-    egress: &crate::tools::mcp::McpEgress,
-    fetches: &tokio::sync::Semaphore,
-) -> Result<PathBuf, String> {
-    if dest.is_dir() {
-        return Ok(dest.to_path_buf());
+impl Drop for Pin {
+    fn drop(&mut self) {
+        let mut state = self.cache.lock();
+        if let Some(entry) = state.entries.get_mut(&self.sha256) {
+            entry.refs = entry.refs.saturating_sub(1);
+            entry.last_release = std::time::SystemTime::now();
+        }
     }
-    let _permit = fetches.acquire().await.map_err(|e| e.to_string())?;
-    let bytes = egress
-        .fetch(&bundle.url, MAX_BYTES)
-        .await
-        .map_err(|e| format!("bundle: fetching it failed: {e}"))?;
-    let got = hex::encode(Sha256::digest(&bytes));
-    if got != bundle.sha256 {
-        return Err(format!(
-            "bundle: its bytes hash to sha256 {got}, not the {} the grant names",
-            bundle.sha256
+}
+
+impl Cache {
+    /// A cache in a new subdirectory of `base`, after sweeping the ones their owners have left.
+    pub fn new(base: &Path, budget: u64) -> Arc<Self> {
+        Self::with_fetch_limit(base, budget, CONCURRENT_FETCHES)
+    }
+
+    fn with_fetch_limit(base: &Path, budget: u64, fetches: usize) -> Arc<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let root = base.join(format!(
+            "{}-{nanos:x}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
+        // Lock our own directory before looking at anyone else's, so a sibling starting now sees it
+        // as taken.
+        let lock = std::fs::create_dir_all(&root).ok().and_then(|()| {
+            let file = std::fs::File::create(root.join(LOCK)).ok()?;
+            file.try_lock().ok()?;
+            Some(file)
+        });
+        for item in std::fs::read_dir(base).into_iter().flatten().flatten() {
+            let theirs = item.path();
+            if theirs == root {
+                continue;
+            }
+            // Only a directory whose lock we can take has a dead owner.
+            let dead = std::fs::File::open(theirs.join(LOCK)).is_ok_and(|f| f.try_lock().is_ok());
+            if dead {
+                let _ = std::fs::remove_dir_all(&theirs);
+            }
+        }
+        Arc::new(Self {
+            root,
+            budget,
+            fetches: tokio::sync::Semaphore::new(fetches),
+            state: std::sync::Mutex::new(State::default()),
+            _lock: lock,
+        })
     }
-    let (root, dest) = (root.to_path_buf(), dest.to_path_buf());
-    tokio::task::spawn_blocking(move || install(&root, &dest, &bytes))
-        .await
-        .map_err(|e| format!("bundle: unpacking failed: {e}"))?
+
+    /// The directory this cache unpacks into.
+    pub fn dir(&self) -> &Path {
+        &self.root
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Pin the entry for `sha256` if it is cached and still on disk.
+    fn pin_cached(self: &Arc<Self>, sha256: &str) -> Option<Pin> {
+        let mut state = self.lock();
+        let dir = self.root.join(sha256);
+        // An entry is removed under this lock before its directory is renamed away, so a missing
+        // directory means it was removed from outside: forget the entry.
+        if !dir.is_dir() {
+            state.entries.remove(sha256);
+            return None;
+        }
+        let entry = state.entries.get_mut(sha256)?;
+        entry.refs += 1;
+        Some(Pin {
+            cache: Arc::clone(self),
+            sha256: sha256.to_owned(),
+            dir,
+        })
+    }
+
+    /// The unpacked bundle, pinned, fetching, verifying and unpacking it first if it is not cached.
+    pub async fn ensure(
+        self: &Arc<Self>,
+        bundle: &Bundle,
+        egress: Option<&crate::tools::mcp::McpEgress>,
+    ) -> Result<Pin, String> {
+        if !bundle.is_well_formed() {
+            return Err("bundle: the grant's bundle is not a url and a lowercase sha256".into());
+        }
+        if let Some(pin) = self.pin_cached(&bundle.sha256) {
+            return Ok(pin);
+        }
+        let egress = egress.ok_or("bundle: this replica has no egress client to fetch it with")?;
+        // One fetch per hash in flight in this process: the others wait here and find the unpacked
+        // copy. A failed attempt just releases the lock, so the next waiter tries for itself.
+        let flight = Arc::clone(
+            self.lock()
+                .flights
+                .entry(bundle.sha256.clone())
+                .or_default(),
+        );
+        let turn = flight.lock().await;
+        let result = self.fetch_and_install(bundle, egress).await;
+        drop(turn);
+        let mut state = self.lock();
+        // The map's handle and ours: no waiter has cloned it.
+        if Arc::strong_count(&flight) == 2 {
+            state.flights.remove(&bundle.sha256);
+        }
+        drop(state);
+        result
+    }
+
+    async fn fetch_and_install(
+        self: &Arc<Self>,
+        bundle: &Bundle,
+        egress: &crate::tools::mcp::McpEgress,
+    ) -> Result<Pin, String> {
+        if let Some(pin) = self.pin_cached(&bundle.sha256) {
+            return Ok(pin);
+        }
+        let _permit = self.fetches.acquire().await.map_err(|e| e.to_string())?;
+        let bytes = egress
+            .fetch(&bundle.url, MAX_BYTES)
+            .await
+            .map_err(|e| format!("bundle: fetching it failed: {e}"))?;
+        let got = hex::encode(Sha256::digest(&bytes));
+        if got != bundle.sha256 {
+            return Err(format!(
+                "bundle: its bytes hash to sha256 {got}, not the {} the grant names",
+                bundle.sha256
+            ));
+        }
+        let (root, dest) = (self.root.clone(), self.root.join(&bundle.sha256));
+        let size = tokio::task::spawn_blocking(move || install(&root, &dest, &bytes))
+            .await
+            .map_err(|e| format!("bundle: unpacking failed: {e}"))??;
+        let (pin, doomed) = {
+            let mut state = self.lock();
+            state.entries.insert(
+                bundle.sha256.clone(),
+                Entry {
+                    refs: 1,
+                    bytes: size,
+                    last_release: std::time::SystemTime::now(),
+                },
+            );
+            let pin = Pin {
+                cache: Arc::clone(self),
+                sha256: bundle.sha256.clone(),
+                dir: self.root.join(&bundle.sha256),
+            };
+            (pin, self.evict(&mut state))
+        };
+        if !doomed.is_empty() {
+            let _ = tokio::task::spawn_blocking(move || {
+                for trash in doomed {
+                    let _ = std::fs::remove_dir_all(trash);
+                }
+            })
+            .await;
+        }
+        Ok(pin)
+    }
+
+    /// While over budget, drop the unreferenced entry released longest ago. Each directory is renamed
+    /// to `.trash-*` here, under the lock, so a request that finds no entry fetches afresh and nothing
+    /// can be served from a half-removed directory; the caller deletes the returned paths.
+    fn evict(&self, state: &mut State) -> Vec<PathBuf> {
+        let mut doomed = Vec::new();
+        let mut total: u64 = state.entries.values().map(|e| e.bytes).sum();
+        while total > self.budget {
+            let Some(oldest) = state
+                .entries
+                .iter()
+                .filter(|(_, e)| e.refs == 0)
+                .min_by_key(|(_, e)| e.last_release)
+                .map(|(sha, _)| sha.clone())
+            else {
+                break; // all that is left is pinned
+            };
+            let Some(entry) = state.entries.remove(&oldest) else {
+                break;
+            };
+            total -= entry.bytes;
+            let trash = self
+                .root
+                .join(format!(".trash-{oldest}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&trash); // a crashed eviction's leftover
+            if std::fs::rename(self.root.join(&oldest), &trash).is_ok() {
+                doomed.push(trash);
+            }
+        }
+        doomed
+    }
 }
 
-/// Unpack `bytes` beside `dest` and rename it into place. Losing the rename to another session that
-/// unpacked the same bundle is success: the content is named by its hash.
-fn install(root: &Path, dest: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+/// Unpack `bytes` beside `dest` and rename it into place, returning the bytes of content.
+fn install(root: &Path, dest: &Path, bytes: &[u8]) -> Result<u64, String> {
     let io = |what: &str, e: std::io::Error| format!("bundle: {what}: {e}");
     std::fs::create_dir_all(root).map_err(|e| io("creating the cache", e))?;
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -145,16 +324,15 @@ fn install(root: &Path, dest: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     ));
     let _ = std::fs::remove_dir_all(&tmp); // a crashed process's leftover under a reused pid
     std::fs::create_dir(&tmp).map_err(|e| io("creating a work directory", e))?;
-    if let Err(e) = unpack(bytes, &tmp) {
-        let _ = std::fs::remove_dir_all(&tmp);
-        return Err(e);
-    }
-    match std::fs::rename(&tmp, dest) {
-        Ok(()) => Ok(dest.to_path_buf()),
-        Err(_) if dest.is_dir() => {
+    let size = match unpack(bytes, &tmp) {
+        Ok(size) => size,
+        Err(e) => {
             let _ = std::fs::remove_dir_all(&tmp);
-            Ok(dest.to_path_buf())
+            return Err(e);
         }
+    };
+    match std::fs::rename(&tmp, dest) {
+        Ok(()) => Ok(size),
         Err(e) => {
             let _ = std::fs::remove_dir_all(&tmp);
             Err(io("installing it", e))
@@ -163,13 +341,13 @@ fn install(root: &Path, dest: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
 }
 
 /// Unpack a plain tar into the existing, empty directory `dest`.
-pub fn unpack(bytes: &[u8], dest: &Path) -> Result<(), String> {
+pub fn unpack(bytes: &[u8], dest: &Path) -> Result<u64, String> {
     let mut at = 0;
     let mut total = 0usize;
     while let Some(header) = bytes.get(at..at + BLOCK) {
         at += BLOCK;
         if header.iter().all(|b| *b == 0) {
-            return Ok(());
+            return Ok(total as u64);
         }
         let path = entry_path(header)?;
         if !checksum_ok(header) {
@@ -291,6 +469,8 @@ pub struct BundleFs {
     local: LocalFs,
     workspace: PathBuf,
     dir: PathBuf,
+    /// Keeps the cache from evicting the directory while this filesystem can still be read.
+    _pin: Option<Arc<Pin>>,
 }
 
 impl BundleFs {
@@ -299,6 +479,15 @@ impl BundleFs {
             local: LocalFs::new(),
             workspace: workspace.to_path_buf(),
             dir: dir.to_path_buf(),
+            _pin: None,
+        }
+    }
+
+    /// The pinned bundle as the workspace; it stays cached as long as this does.
+    pub fn pinned(workspace: &Path, pin: &Arc<Pin>) -> Self {
+        Self {
+            _pin: Some(Arc::clone(pin)),
+            ..Self::new(workspace, pin.dir())
         }
     }
 
@@ -406,7 +595,7 @@ mod tests {
 
     fn unpacked(bytes: &[u8]) -> Result<tempfile::TempDir, String> {
         let out = tempfile::tempdir().unwrap();
-        unpack(bytes, out.path()).map(|()| out)
+        unpack(bytes, out.path()).map(|_| out)
     }
 
     fn special(path: &str, kind: u8, link: &str) -> Vec<u8> {
@@ -472,25 +661,6 @@ mod tests {
     }
 
     #[test]
-    fn a_cached_bundle_is_reused_and_a_racing_install_is_not_an_error() {
-        let root = tempfile::tempdir().unwrap();
-        let bytes = tar(&[file("AGENTS.md", "hello")]);
-        let dest = root.path().join("abc");
-        install(root.path(), &dest, &bytes).unwrap();
-        // The same hash unpacked again by a second session: the first copy stays.
-        install(root.path(), &dest, &bytes).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dest.join("AGENTS.md")).unwrap(),
-            "hello"
-        );
-        let leftovers: Vec<_> = std::fs::read_dir(root.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(leftovers.len(), 1, "{leftovers:?}");
-    }
-
-    #[test]
     fn a_failed_unpack_leaves_nothing_in_the_cache() {
         let root = tempfile::tempdir().unwrap();
         let dest = root.path().join("abc");
@@ -514,9 +684,10 @@ mod tests {
         };
         let root = tempfile::tempdir().unwrap();
         let egress = egress();
-        let opens = (0..16).map(|_| ensure(root.path(), &bundle, Some(&egress)));
-        for dir in futures::future::join_all(opens).await {
-            assert!(dir.unwrap().join("AGENTS.md").is_file());
+        let cache = Cache::new(root.path(), u64::MAX);
+        let opens = (0..16).map(|_| cache.ensure(&bundle, Some(&egress)));
+        for pin in futures::future::join_all(opens).await {
+            assert!(pin.unwrap().dir().join("AGENTS.md").is_file());
         }
         assert_eq!(server.hits(), 1, "one fetch for one hash");
     }
@@ -533,11 +704,101 @@ mod tests {
         let egress = egress();
         let good = bundle.url.clone();
         bundle.url = "http://127.0.0.1:1/agent.tar".into();
-        ensure(root.path(), &bundle, Some(&egress))
-            .await
-            .unwrap_err();
+        let cache = Cache::new(root.path(), u64::MAX);
+        assert!(cache.ensure(&bundle, Some(&egress)).await.is_err());
         bundle.url = good;
-        ensure(root.path(), &bundle, Some(&egress)).await.unwrap();
+        cache.ensure(&bundle, Some(&egress)).await.unwrap();
+    }
+
+    /// A ten-byte bundle (distinct per `n`) served from its own loopback server.
+    fn served(n: u8) -> (BundleServer, Bundle) {
+        let bytes = tar(&[file("AGENTS.md", &format!("bundle-{n:03}"))]);
+        let server = BundleServer::start(bytes.clone());
+        let bundle = Bundle {
+            url: server.url.clone(),
+            sha256: sha256_hex(&bytes),
+        };
+        (server, bundle)
+    }
+
+    #[tokio::test]
+    async fn over_budget_evicts_the_oldest_unpinned_bundle_and_never_a_pinned_one() {
+        let root = tempfile::tempdir().unwrap();
+        let egress = egress();
+        // Room for two of the ten-byte bundles.
+        let cache = Cache::new(root.path(), 25);
+        let ((_a, a), (_b, b), (_c, c)) = (served(1), served(2), served(3));
+        let held_oldest = cache.ensure(&a, Some(&egress)).await.unwrap();
+        drop(cache.ensure(&b, Some(&egress)).await.unwrap());
+        drop(cache.ensure(&c, Some(&egress)).await.unwrap());
+        assert!(cache.dir().join(&a.sha256).is_dir(), "pinned: kept");
+        assert!(
+            !cache.dir().join(&b.sha256).exists(),
+            "oldest unpinned: evicted"
+        );
+        assert!(cache.dir().join(&c.sha256).is_dir());
+        assert!(held_oldest.dir().join("AGENTS.md").is_file());
+        let names: Vec<_> = std::fs::read_dir(cache.dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != LOCK)
+            .collect();
+        assert_eq!(names.len(), 2, "no .trash or .unpack leftovers: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn a_bundle_requested_after_its_eviction_is_fetched_again() {
+        let root = tempfile::tempdir().unwrap();
+        let egress = egress();
+        let cache = Cache::new(root.path(), 15);
+        let ((sa, a), (_b, b)) = (served(1), served(2));
+        drop(cache.ensure(&a, Some(&egress)).await.unwrap());
+        drop(cache.ensure(&b, Some(&egress)).await.unwrap());
+        assert!(!cache.dir().join(&a.sha256).exists());
+        let again = cache.ensure(&a, Some(&egress)).await.unwrap();
+        assert_eq!(sa.hits(), 2, "evicted, so fetched again");
+        assert!(again.dir().join("AGENTS.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn caches_sharing_a_base_never_touch_each_others_directories() {
+        let base = tempfile::tempdir().unwrap();
+        let egress = egress();
+        let (_a, a) = served(1);
+        let theirs = Cache::new(base.path(), u64::MAX);
+        let held = theirs.ensure(&a, Some(&egress)).await.unwrap();
+        std::fs::create_dir(theirs.dir().join(".unpack-in-progress")).unwrap();
+        // A second process starts and, with a budget nothing fits in, evicts all it can.
+        let ours = Cache::new(base.path(), 0);
+        let ((_b, b), (_c, c)) = (served(2), served(3));
+        drop(ours.ensure(&b, Some(&egress)).await.unwrap());
+        drop(ours.ensure(&c, Some(&egress)).await.unwrap());
+        assert!(
+            !ours.dir().join(&b.sha256).exists(),
+            "its own entry is evicted"
+        );
+        assert!(
+            held.dir().join("AGENTS.md").is_file(),
+            "the other's pinned dir stays"
+        );
+        assert!(theirs.dir().join(".unpack-in-progress").is_dir());
+    }
+
+    #[tokio::test]
+    async fn a_dead_owners_directory_is_swept_by_the_next_start() {
+        let base = tempfile::tempdir().unwrap();
+        let egress = egress();
+        let (_a, a) = served(1);
+        let dead = Cache::new(base.path(), u64::MAX);
+        let left = dead.dir().to_path_buf();
+        drop(dead.ensure(&a, Some(&egress)).await.unwrap());
+        std::fs::create_dir(left.join(".unpack-9-9")).unwrap();
+        // Dropping the cache closes its lock file, as a crashed process's exit does.
+        drop(dead);
+        assert!(left.is_dir());
+        let next = Cache::new(base.path(), u64::MAX);
+        assert!(!left.exists(), "swept");
+        assert!(next.dir().is_dir());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -545,7 +806,7 @@ mod tests {
         let gauge = Arc::new(Gauge::default());
         let egress = egress();
         let root = tempfile::tempdir().unwrap();
-        let limit = tokio::sync::Semaphore::new(1);
+        let cache = Cache::with_fetch_limit(root.path(), u64::MAX, 1);
         let servers: Vec<_> = (0..4)
             .map(|n| {
                 let bytes = tar(&[file("AGENTS.md", &format!("bundle {n}"))]);
@@ -558,11 +819,9 @@ mod tests {
                 (server, bundle)
             })
             .collect();
-        let opens = servers
-            .iter()
-            .map(|(_, b)| ensure_limited(root.path(), b, Some(&egress), &limit));
-        for dir in futures::future::join_all(opens).await {
-            dir.unwrap();
+        let opens = servers.iter().map(|(_, b)| cache.ensure(b, Some(&egress)));
+        for pin in futures::future::join_all(opens).await {
+            assert!(pin.is_ok());
         }
         assert_eq!(gauge.peak(), 1, "one fetch at a time under a cap of one");
     }

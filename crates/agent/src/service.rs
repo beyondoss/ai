@@ -317,7 +317,7 @@ pub struct ServiceSession {
     /// [`Snapshot`]); read by the tool builds after it.
     sandbox: RwLock<Option<Sandbox>>,
     /// The unpacked [`Bundle`](crate::grant::Bundle), once [`Self::load_bundle`] has put it there.
-    bundle_dir: std::sync::OnceLock<PathBuf>,
+    bundle_dir: std::sync::OnceLock<Arc<crate::bundle::Pin>>,
 }
 
 impl ServiceSession {
@@ -529,8 +529,8 @@ impl ServiceSession {
         let Some(bundle) = self.bundle() else {
             return Ok(());
         };
-        let dir = crate::bundle::ensure(&crate::bundle::cache_root(), bundle, egress).await?;
-        let _ = self.bundle_dir.set(dir);
+        let pin = crate::bundle::cache().ensure(bundle, egress).await?;
+        let _ = self.bundle_dir.set(Arc::new(pin));
         Ok(())
     }
 
@@ -540,7 +540,7 @@ impl ServiceSession {
         if self.has_sandbox() {
             return None;
         }
-        Some(Arc::new(crate::bundle::BundleFs::new(
+        Some(Arc::new(crate::bundle::BundleFs::pinned(
             Path::new(self.workspace_root()),
             self.bundle_dir.get()?,
         )))
@@ -553,9 +553,9 @@ impl ServiceSession {
         sandbox: Arc<dyn crate::tools::fs::FsBackend>,
     ) -> Arc<dyn crate::tools::fs::FsBackend> {
         match self.bundle_dir.get() {
-            Some(dir) => Arc::new(crate::bundle::BundleFs::new(
+            Some(pin) => Arc::new(crate::bundle::BundleFs::pinned(
                 Path::new(self.workspace_root()),
-                dir,
+                pin,
             )),
             None => sandbox,
         }
