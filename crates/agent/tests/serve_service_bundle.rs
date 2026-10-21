@@ -10,8 +10,8 @@ use beyond_ai_test_support::bundle::{BundleServer, Entry, dir, file, sha256_hex,
 use common::grant::Bundle;
 use common::service::{Options, Service};
 use common::{
-    TestWs, advertised_tools, body_json, spawn_model_server, turn_text, ws_connect_with_headers,
-    ws_next_frame, ws_read_until_response, ws_send,
+    TestWs, advertised_tools, body_json, spawn_model_server, turn_text, turn_tool_use,
+    ws_connect_with_headers, ws_next_frame, ws_read_until_response, ws_send,
 };
 use serde_json::json;
 
@@ -103,16 +103,16 @@ async fn a_bundled_agent_with_no_sandbox_answers_from_its_bundle_and_calls_nothi
     assert!(!system.contains("SANDBOX-PERSONA"), "{system}");
     let mut tools = advertised_tools(&seen[0]);
     tools.retain(|t| t != "memory" && t != "todo");
-    assert!(
-        !tools
-            .iter()
-            .any(|t| ["bash", "read", "write", "edit", "grep", "find", "ls"].contains(&t.as_str())),
-        "no sandbox, so no sandbox tools: {tools:?}"
+    assert_eq!(
+        tools,
+        vec!["read".to_string()],
+        "no sandbox: only the read-only `read` over the bundle"
     );
     assert!(svc.exec.requests().is_empty(), "no exec request was made");
     assert!(
-        !seen[0].contains("- greet: "),
-        "skills need `read`, which this session lacks"
+        seen[0].contains("- greet: "),
+        "the bundle's skill is listed: {}",
+        seen[0]
     );
     assert_eq!(server.hits(), 1);
 }
@@ -271,4 +271,79 @@ async fn sessions_naming_the_same_hash_share_one_fetch() {
         1,
         "the second session reuses the unpacked copy"
     );
+}
+
+#[tokio::test]
+async fn a_skill_is_read_from_the_bundle_and_nothing_outside_it_is() {
+    let bytes = tar(&[
+        file("AGENTS.md", AGENTS_MD),
+        file(
+            ".agents/skills/greet/SKILL.md",
+            "---\nname: greet\ndescription: say hello\n---\nSKILL-BODY-MARKER\n",
+        ),
+        file(".agents/skills/greet/extra.md", "SKILL-EXTRA-MARKER"),
+    ]);
+    let server = BundleServer::start(bytes.clone());
+    let (base, requests) = spawn_model_server(vec![
+        turn_tool_use("t1", "read", r#"{"path":"skill:greet"}"#),
+        turn_tool_use("t2", "read", r#"{"path":"skill:greet/extra.md"}"#),
+        turn_tool_use("t3", "read", r#"{"path":"/etc/passwd"}"#),
+        turn_text("done"),
+    ]);
+    let (svc, _cache) = service(&base).await;
+    let mut ws = open(
+        &svc,
+        Bundle {
+            url: server.url.clone(),
+            sha256: sha256_hex(&bytes),
+        },
+        false,
+    )
+    .await;
+    ws_send(&mut ws, json!({"type":"prompt","id":"p1","message":"hi"})).await;
+    let frames = ws_read_until_response(&mut ws, "prompt").await;
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+
+    let seen = requests.lock().unwrap().clone();
+    assert!(seen[1].contains("SKILL-BODY-MARKER"), "{}", seen[1]);
+    assert!(seen[2].contains("SKILL-EXTRA-MARKER"), "{}", seen[2]);
+    assert!(
+        !seen[3].contains("root:"),
+        "a path outside the bundle is refused"
+    );
+    assert!(svc.exec.requests().is_empty(), "no exec request was made");
+}
+
+#[tokio::test]
+async fn an_allow_list_without_read_leaves_a_sandbox_free_session_with_no_skills() {
+    let bytes = tar(&[
+        file("AGENTS.md", "---\ntools: grep\n---\nPERSONA\n"),
+        file(
+            ".agents/skills/greet/SKILL.md",
+            "---\nname: greet\ndescription: say hello\n---\nbody\n",
+        ),
+    ]);
+    let server = BundleServer::start(bytes.clone());
+    let (base, requests) = spawn_model_server(vec![turn_text("ok")]);
+    let (svc, _cache) = service(&base).await;
+    let mut ws = open(
+        &svc,
+        Bundle {
+            url: server.url.clone(),
+            sha256: sha256_hex(&bytes),
+        },
+        false,
+    )
+    .await;
+    ws_send(&mut ws, json!({"type":"prompt","id":"p1","message":"hi"})).await;
+    let frames = ws_read_until_response(&mut ws, "prompt").await;
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+    let seen = requests.lock().unwrap().clone();
+    let mut tools = advertised_tools(&seen[0]);
+    tools.retain(|t| t != "memory");
+    assert!(
+        tools.is_empty(),
+        "the folder's allow-list omits read: {tools:?}"
+    );
+    assert!(!seen[0].contains("- greet: "));
 }

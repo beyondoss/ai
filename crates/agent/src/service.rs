@@ -534,6 +534,18 @@ impl ServiceSession {
         Ok(())
     }
 
+    /// The bundle as the whole filesystem a session without a sandbox can see (read-only): `None`
+    /// when it has a sandbox, or no bundle yet loaded.
+    pub fn bundle_fs(&self) -> Option<Arc<dyn crate::tools::fs::FsBackend>> {
+        if self.has_sandbox() {
+            return None;
+        }
+        Some(Arc::new(crate::bundle::BundleFs::new(
+            Path::new(self.workspace_root()),
+            self.bundle_dir.get()?,
+        )))
+    }
+
     /// What this session's definition is read through: its bundle, served read-only at the workspace
     /// root, or `sandbox` when it has none.
     pub fn definition_fs(
