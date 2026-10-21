@@ -139,6 +139,8 @@ _grant_coding_browser() { # session [tamper]
 
 uc_prepare() { # called by demo.sh once, before the checks
   UC_NAME=$MODE
+  UC_OPENS=$WORK/opens.ndjson
+  : > "$UC_OPENS"
   UC_TENANT=uc-$MODE-$SID
   UC_JSON=$(jq -nc --arg n "$MODE" --arg t "${UC_TITLE[$MODE]}" --arg s "${UC_SUMMARY[$MODE]}" --argjson tree "$(uc_tree "$MODE")" \
     '{name:$n, title:$t, summary:$s, folder:("deploy/demo/agents/"+$n), tree:$tree}')
@@ -213,7 +215,6 @@ uc_bundle() {
 
 # Open a session with no turn and record how long that took (connect + the first answer) and when, so the
 # record can say how many requests the sandbox side saw while it happened.
-UC_OPENS=$WORK/opens.ndjson
 uc_open() { # session
   local out t0 ready
   t0=$(now_ms)

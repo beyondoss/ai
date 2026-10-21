@@ -105,7 +105,20 @@ folder (about 32 round trips at every open without one).
 Every use case's report has a "Session open" section: sandbox requests while each session opened, and
 the time from connecting to the first answer.
 
-BEFORE_AFTER_TABLE
+Before and after, per session, from the committed records (before: `20261020T230210Z-assistant`,
+`20261020T231038Z-coding`, `20261020T231305Z-browser`; after: the records beside them from this change):
+
+| use case  | sandbox requests at open, before | after         | open latency, before (derived) | after (measured)                                                                                                                    |
+| --------- | -------------------------------- | ------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| assistant | 32                               | 0             | about 0.9 s                    | 302 ms (mean of 3)                                                                                                                  |
+| coding    | 38                               | 0             | about 3.0 s                    | 306 ms, with no VM yet; the VM is made 2.7 s later, by the first tool call, and its first result comes 5.4 s after the create began |
+| browser   | 34 (and no others all run)       | 0 (0 all run) | about 3.0 s                    | 1264 ms, which now includes connecting to the browser in the VM                                                                     |
+
+The "before" counts are the exec requests in the old records before the first model call (assistant:
+129 across its setup session and three sessions, less the setup's own command, divided by four). The
+old runs recorded no open latency, so "before" is the span of that burst of requests (the assistant's
+sat on the Fargate host inside the VPC; the coding and browser ones crossed the internet to an E2B VM).
+The new runs time the open itself: connecting, then the first answer.
 
 The assistant uses `gpt-4.1-mini` in its `AGENTS.md` while the replica's default is `gpt-5-mini`, so the
 billing rows can tell the file's model from the default. The managed connector's real key lives in SSM,
