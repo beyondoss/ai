@@ -29,9 +29,11 @@ VMDIR = os.environ.get("FRONT_VMDIR", "/tmp/vm")
 E2B_SH = os.environ.get("FRONT_E2B_SH", "/opt/demo/e2b.sh")
 STUB = os.environ.get("FRONT_STUB", "/usr/local/bin/beyond-ai-demo")
 CA_FILE = os.environ.get("FRONT_CA_FILE", "/tmp/ca.pem")
+# A VM dies on its own after E2B_TIMEOUT (e2b.sh); an entry older than that points at nothing.
+VM_TTL = int(os.environ.get("E2B_TIMEOUT", "1800"))
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "host", "content-length"}
 
-sessions = {}  # session -> {"lock": Lock, "vm": dict | None}
+sessions = {}  # session -> {"lock": Lock, "vm": dict | None, "born": float}
 sessions_lock = threading.Lock()
 
 
@@ -76,14 +78,36 @@ def make_vm(session, bundle):
         return json.load(f)
 
 
+def drop(session, s, kill=True):
+    """Forget a session's VM (and kill it, best effort) so the next request makes a fresh one."""
+    with sessions_lock:
+        if sessions.get(session) is s:
+            del sessions[session]
+    vm, s["vm"] = s["vm"], None
+    try:
+        os.remove(f"{VMDIR}/{session}.json")
+    except FileNotFoundError:
+        pass
+    if kill and vm:
+        env = dict(os.environ, E2B_SH=E2B_SH, VMDIR=VMDIR, VM_PRIVATE="1", SANDBOX_PORT="8081", TAG_KEY="", NAME="")
+        subprocess.run(["bash", "-c", '. "$E2B_SH"; e2b_kill "$1"', "front", vm["id"]], env=env,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
+    log("vm_dropped", session=session)
+
+
 def vm_for(session, bundle):
     with sessions_lock:
-        s = sessions.setdefault(session, {"lock": threading.Lock(), "vm": None})
+        old = [(k, v) for k, v in sessions.items() if v["vm"] and time.time() - v["born"] > VM_TTL]
+    for k, v in old:  # past its timeout: E2B has already killed it
+        drop(k, v, kill=False)
+    with sessions_lock:
+        s = sessions.setdefault(session, {"lock": threading.Lock(), "vm": None, "born": 0.0})
     with s["lock"]:
         if s["vm"] is None:
             log("first_request", session=session)
             s["vm"] = make_vm(session, bundle)
-    return s["vm"]
+            s["born"] = time.time()
+        return s["vm"], s
 
 
 class Front(BaseHTTPRequestHandler):
@@ -112,7 +136,7 @@ class Front(BaseHTTPRequestHandler):
         session = m.group(1)
         bundle = (parse_qs(u.query).get("bundle") or [""])[0]
         try:
-            vm = vm_for(session, bundle)
+            vm, entry = vm_for(session, bundle)
         except Exception as e:  # the next request tries again
             with sessions_lock:
                 sessions.pop(session, None)
@@ -125,6 +149,12 @@ class Front(BaseHTTPRequestHandler):
         if vm.get("traffic_token"):
             headers["e2b-traffic-access-token"] = vm["traffic_token"]
         conn = http.client.HTTPSConnection(up.hostname, timeout=3700)
+        try:
+            conn.connect()
+        except OSError as e:  # the VM is gone (past its timeout, or killed): the next request makes a new one
+            log("proxy_failed", session=session, error=str(e))
+            drop(session, entry)
+            return self.reply(502, {"error": str(e)})
         try:
             conn.request("POST", up.path, body=body, headers=headers)
             resp = conn.getresponse()
