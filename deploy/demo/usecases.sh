@@ -272,7 +272,7 @@ uc_prepare_coding() {
   BUILD_STAMP=build-$SID
   echo "$BUILD_STAMP" > "$STAGE/app/BUILD"
   # The suite as the agent will find it, run here on the same files (no VM exists yet to run it in).
-  TESTS_BEFORE=$(cd "$STAGE/app" && python3 -m unittest 2>&1 | tail -n 3; echo "exit=${PIPESTATUS[0]}")
+  TESTS_BEFORE=$(cd "$STAGE/app" && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest 2>&1 | tail -n 3; echo "exit=${PIPESTATUS[0]}")
   TESTS_ORIG_SUM=$(md5sum "$STAGE/app/test_server.py" | cut -d' ' -f1)
   uc_bundle || { echo "demo: could not publish the bundle" >&2; exit 1; }
   rustwright_bin >/dev/null || { echo "demo: could not build rustwright-mcp" >&2; exit 1; }
