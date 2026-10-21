@@ -194,6 +194,11 @@ impl Mode {
         }
     }
 
+    /// Whether the session's definition comes from a grant bundle rather than its sandbox.
+    pub(crate) fn has_bundle(&self) -> bool {
+        self.service().is_some_and(|s| s.bundle().is_some())
+    }
+
     /// The sandbox's `$HOME` as last seen, once probed.
     pub(crate) fn sandbox_home(&self) -> Option<String> {
         self.service()

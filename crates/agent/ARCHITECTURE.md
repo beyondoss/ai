@@ -5271,8 +5271,13 @@ skill/template paths, memory backend, session directory, model or gateway URL), 
   each call. A grant's credentials are fixed for a
   session task's life, so a refreshed token arrives with a new task, which probes anew; the endpoint
   cannot be re-pointed (`set_exec_endpoint` is refused). A session with no [snapshot](#sandbox-snapshot)
-  (a new one, or one saved by an older binary) connects at start, because building its prompt needs
-  the sandbox anyway, and a probe that fails then ends the session as before.
+  (a new one, or one saved by an older binary) and no bundle connects at start, because building its
+  prompt needs the sandbox anyway, and a probe that fails then ends the session as before. A new
+  session **with** a bundle does not: its definition is a local read, so it makes no exec request
+  until a tool needs the sandbox. The first such call probes once and runs, and a sandbox that is
+  dead then is that call's error ("this session's sandbox is unreachable"), as for a reopened
+  session and for one that dies mid-session. The control plane may therefore create a sandbox VM on
+  the first exec request rather than at session open.
 - **Credentials.** `build_gateway_client` uses the grant's sealed `gateway_key` and skips the whole
   host ladder (`--key`, ambient provider env, `models.json` overrides, the OAuth store). The retry,
   shared-client and idle-timeout chain is unchanged.
