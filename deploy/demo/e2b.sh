@@ -95,10 +95,13 @@ vm_for() { # session
     id=$(jq -r '.sandboxID // empty' <<<"$resp")
     tok=$(jq -r '.envdAccessToken // empty' <<<"$resp")
     traffic=$(jq -r '.trafficAccessToken // empty' <<<"$resp")
+    [ -n "$id" ] && [ -n "$tok" ] || { echo "E2B: the sandbox was not created: $(jq -c 'del(.envdAccessToken)' <<<"$resp" | head -c 300)" >&2; exit 1; }
+    # From here the VM exists and costs until it is killed: any failure below kills it, so a retry does
+    # not leave a live VM behind for the rest of E2B_TIMEOUT.
+    trap 'e2b_kill "$id" >/dev/null 2>&1; rm -f "$f.part"' EXIT
     [ -z "${VM_PRIVATE:-}" ] || [ -n "$traffic" ] || { echo "E2B: a private sandbox came back without a traffic token" >&2; exit 1; }
     [ -z "$traffic" ] || hdr=(-H "e2b-traffic-access-token: $traffic")
-    [ -n "$id" ] && [ -n "$tok" ] || { echo "E2B: the sandbox was not created: $(jq -c 'del(.envdAccessToken)' <<<"$resp" | head -c 300)" >&2; exit 1; }
-    # Recorded at once, so a failure below still leaves a VM that down.sh (and this run) can find.
+    # Recorded at once, so the rest of this function (and its failure trap) can find the VM.
     jq -nc --arg id "$id" --arg tok "$tok" --arg b "$bearer" --arg s "$s" --arg tr "$traffic" --argjson created "$(date +%s%3N)" \
       '{session:$s, id:$id, envd_token:$tok, bearer:$b, traffic_token:$tr, url:("https://'"$VM_PORT"'-"+$id+".e2b.app/exec"), created_ms:$created}' > "$f.part"
     local i
@@ -117,6 +120,7 @@ sleep 1" "$(jq -nc --arg b "$bearer" '{DEMO_EXEC_BEARER:$b, SSL_CERT_FILE:"'"$VM
     done
     [ "$i" -lt 40 ] || { echo "E2B: the stub in $id never answered" >&2; exit 1; }
     mv "$f.part" "$f"
+    trap - EXIT
   ) 9> "$VMDIR/lock" || return 1
 }
 vm_field() { jq -r ".$2" "$VMDIR/$1.json"; }
