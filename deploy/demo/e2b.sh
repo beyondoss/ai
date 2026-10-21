@@ -215,3 +215,24 @@ vm_resume() { # id -> prints resume latency in ms
   jq -e '.sandboxID' <<<"$resp" >/dev/null || { echo "resume: $resp" | head -c 300 >&2; return 1; }
   echo $(($(date +%s%3N) - t0))
 }
+
+# A VM that something else made (the exec front makes a coding session's on its first request), found by
+# the session in its metadata and recorded the way vm_for records its own, so vm_field, vm_run and
+# vm_logs work on it. `connect` returns the VM's tokens. Returns 1 if the session has no VM (yet).
+vm_adopt() { # session
+  local s=$1 f="$VMDIR/$1.json" row id resp
+  row=$(e2b_curl -G "$E2B_API/v2/sandboxes" --data-urlencode "state=running,paused" --data-urlencode "limit=100" \
+    | jq -c --arg k "$TAG_KEY" --arg n "$NAME" --arg s "$s" 'if type=="array" then [.[] | select(.metadata[$k]==$n and .metadata.session==$s)][0] // empty else error("unexpected list answer") end') || return 1
+  [ -n "$row" ] || return 1
+  id=$(jq -r .sandboxID <<<"$row")
+  resp=$(e2b_curl -X POST "$E2B_API/sandboxes/$id/connect" -H 'Content-Type: application/json' -d "{\"timeout\":$E2B_TIMEOUT}")
+  jq -e '.envdAccessToken' <<<"$resp" >/dev/null || return 1
+  jq -nc --arg s "$s" --arg id "$id" --argjson r "$resp" --argjson row "$row" \
+    '{session:$s, id:$id, envd_token:$r.envdAccessToken, bearer:"", traffic_token:($r.trafficAccessToken // ""),
+      url:("https://'"$VM_PORT"'-"+$id+".e2b.app/exec"), created_ms:0, started_at:$row.startedAt, adopted:true}' > "$f.part" && mv "$f.part" "$f"
+}
+# How many VMs this deployment has for a session right now (running or paused).
+vm_count_for() { # session
+  e2b_curl -G "$E2B_API/v2/sandboxes" --data-urlencode "state=running,paused" --data-urlencode "limit=100" \
+    | jq --arg k "$TAG_KEY" --arg n "$NAME" --arg s "$1" 'if type=="array" then [.[] | select(.metadata[$k]==$n and .metadata.session==$s)] | length else error("unexpected list answer") end'
+}

@@ -68,17 +68,57 @@ the VMs live; a full `demo.sh all` keeps them for about fifteen.
 
 ## The three use cases
 
-An agent is a folder. `SANDBOX=both ./deploy/demo/up.sh` brings up everything the three folders under
-`agents/` need (the Fargate sandbox as the assistant's workspace host, E2B for the other two, a stand-in
-managed-MCP endpoint, and ECS Exec on the agent); each folder is then run for real, against the real
-model through the real gateway, with named checks, a `run.json` and a `report.html` of its own in
-`results/<timestamp>-<name>/`:
+An agent is a folder, and here each folder is **deployed as a bundle**. `SANDBOX=both
+./deploy/demo/up.sh` brings up everything the three folders under `agents/` need (E2B for two of them,
+a stand-in managed-MCP endpoint, a private S3 bucket for the bundles, the exec front, and ECS Exec on
+the agent); each folder is then run for real, against the real model through the real gateway, with
+named checks, a `run.json` and a `report.html` of its own in `results/<timestamp>-<name>/`:
 
-| command             | the folder                                                                           | checks                                                                                                                      |
-| ------------------- | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
-| `demo.sh assistant` | `AGENTS.md` (persona, `model`, `tools`, `max-steps`) and a `.mcp.json` with DeepWiki | `persona-applied`, `remote-mcp-real`, `managed-mcp-no-key`, `memory-across-sessions`, `limits-enforced`, `no-sandbox-calls` |
-| `demo.sh coding`    | a failing Python app, a skill with a script, a `reviewer` subagent, `AGENTS.md`      | `skill-used`, `fix-verified`, `subagent-from-folder`, `app-as-background-job`, `browser-sees-localhost`                     |
-| `demo.sh browser`   | `AGENTS.md`, a `.mcp.json` and a page                                                | `browser-reads-page`, `no-held-connection`, `idle-cost`, `state-survives-pause`, `state-survives-idle-reap`                 |
+| command             | the folder                                                                                    | checks                                                                                                                                            |
+| ------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `demo.sh assistant` | `AGENTS.md` (persona, `model`, `tools`, `max-steps`), a `.mcp.json` with DeepWiki and a skill | `persona-applied`, `remote-mcp-real`, `managed-mcp-no-key`, `memory-across-sessions`, `limits-enforced`, `skill-from-bundle`, `no-sandbox-at-all` |
+| `demo.sh coding`    | a failing Python app, a skill with a script, a `reviewer` subagent, `AGENTS.md`               | `vm-created-on-first-tool`, `skill-used`, `fix-verified`, `subagent-from-folder`, `app-as-background-job`, `browser-sees-localhost`               |
+| `demo.sh browser`   | `AGENTS.md`, a `.mcp.json` and a page                                                         | `browser-reads-page`, `no-held-connection`, `idle-cost`, `state-survives-pause`, `state-survives-idle-reap`                                       |
+
+### Bundles, and what opening a session costs
+
+`demo.sh` tars the folder (`tar --format=ustar`, with this run's stamps in it), names the tar by its
+SHA-256, uploads it to a private bucket (`beyond-ai-demo-<name>-bundles-<account>`, tagged, public access
+blocked, emptied and deleted by `down.sh`, which counts it as `s3_buckets`) and mints each grant with
+`--bundle <presigned link>=<sha256>`. The replica fetches and verifies the tar and reads `AGENTS.md`, its
+frontmatter, `.mcp.json`, skills and subagents from it, so a session no longer asks a sandbox for its own
+folder (about 32 round trips at every open without one).
+
+- **assistant**: no sandbox at all. Its grant has an empty `exec_url`; the `read` tool is still there,
+  confined to the bundle, which is how it reads its skill. `no-sandbox-at-all` unseals the grants and
+  counts the requests every sandbox logged over the whole run.
+- **coding**: the grant's `exec_url` is the exec front (`front.py`, a second container in the sandbox
+  task). The front is a stable address that costs nothing: on the first request for a session it makes
+  that session's E2B microVM, seeds it from the bundle (the VM fetches the tar itself) and forwards that
+  request and every later one, streaming. `vm-created-on-first-tool` shows that no VM existed when the
+  session opened, and times open to VM create, and VM create to the first tool result. The browser
+  needs the VM's address, so the browser check opens a second session on the same VM with a grant that
+  names it.
+- **browser**: the browser connector is the sandbox, so its VM is made before the session opens and
+  seeded from the bundle; the agent itself never calls an exec endpoint.
+
+Every use case's report has a "Session open" section: sandbox requests while each session opened, and
+the time from connecting to the first answer.
+
+Before and after, per session, from the committed records (before: `20261020T230210Z-assistant`,
+`20261020T231038Z-coding`, `20261020T231305Z-browser`; after: the records beside them from this change):
+
+| use case  | sandbox requests at open, before | after         | open latency, before (derived) | after (measured)                                                                                                                    |
+| --------- | -------------------------------- | ------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| assistant | 32                               | 0             | about 0.9 s                    | 302 ms (mean of 3)                                                                                                                  |
+| coding    | 38                               | 0             | about 3.0 s                    | 306 ms, with no VM yet; the VM is made 2.7 s later, by the first tool call, and its first result comes 5.4 s after the create began |
+| browser   | 34 (and no others all run)       | 0 (0 all run) | about 3.0 s                    | 1264 ms, which now includes connecting to the browser in the VM                                                                     |
+
+The "before" counts are the exec requests in the old records before the first model call (assistant:
+129 across its setup session and three sessions, less the setup's own command, divided by four). The
+old runs recorded no open latency, so "before" is the span of that burst of requests (the assistant's
+sat on the Fargate host inside the VPC; the coding and browser ones crossed the internet to an E2B VM).
+The new runs time the open itself: connecting, then the first answer.
 
 The assistant uses `gpt-4.1-mini` in its `AGENTS.md` while the replica's default is `gpt-5-mini`, so the
 billing rows can tell the file's model from the default. The managed connector's real key lives in SSM,
@@ -158,10 +198,10 @@ gateway, no load balancer), plus the model: a full `demo.sh all` spends about on
 Everything carries the tag `beyond-ai-demo=<name>` and every create looks the thing up first, so
 `up.sh` twice changes nothing the second time and an interrupted run is simply rerun. `down.sh` deletes
 in dependency order, tolerating what is already gone, then counts what is left: one explicit listing for
-each of 20 resource types (SSM parameters by prefix, IAM roles by name, log groups, ECS clusters,
+each of 21 resource types (SSM parameters by prefix, IAM roles by name, log groups, ECS clusters,
 services, tasks and task definitions in every status, Cloud Map namespaces and services, the Route 53
 zone, EFS file systems, mount targets and access points, the VPC, subnets, gateways, route tables,
-security groups and network interfaces, ECR repositories) and the tagging API. It exits non-zero naming
+security groups and network interfaces, ECR repositories, the bundles bucket) and the tagging API. It exits non-zero naming
 anything that remains. ECS keeps deleted clusters, services and stopped tasks in the tagging index for
 hours, so a tagging-API entry only counts if the service's own API cannot show it gone; the count that
 was only index lag is reported beside it.

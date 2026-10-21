@@ -126,6 +126,13 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
     <p class="lede" id="uc-summary"></p>
     <h2 id="uc-folder-h" style="margin-top:12px">The agent is this folder</h2>
     <ul class="tree" id="uc-tree"></ul>
+    <p class="sub" id="uc-bundle" style="margin-top:10px" hidden></p>
+  </section>
+
+  <section class="card" id="open-card" hidden style="margin-bottom:14px">
+    <h2>Session open</h2>
+    <p class="lede" id="open-lede"></p>
+    <div class="tablewrap"><table id="open-table"><thead><tr><th>session</th><th>open &rarr; ready</th><th>sandbox requests while it opened</th><th>sandbox VMs then</th></tr></thead><tbody></tbody></table></div>
   </section>
 
   <div class="grid">
@@ -241,6 +248,24 @@ if (UC) {
   $("uc-tree").innerHTML = rows.join("");
 }
 
+if (UC && UC.bundle) {
+  $("uc-bundle").hidden = false;
+  $("uc-bundle").innerHTML = `Deployed as a bundle: this folder as one plain tar (${UC.bundle.bytes} bytes, sha256 <code>${esc(UC.bundle.sha256.slice(0, 16))}…</code>) in ${esc(UC.bundle.store)}. The replica fetches it, checks the hash and reads the agent's definition from it, not from a sandbox.`;
+}
+
+/* ---- session open: what opening a session cost the sandbox side ---- */
+const OP = run.session_open;
+if (OP && OP.sessions && OP.sessions.length) {
+  $("open-card").hidden = false;
+  const n = OP.exec_requests_at_open, k = OP.sessions_opened;
+  $("open-lede").innerHTML = `<b>${n}</b> sandbox request${n === 1 ? "" : "s"} in all while ${k} session${k === 1 ? "" : "s"} opened (<b>${OP.per_session}</b> per session), before any model call. Opening took <b>${OP.open_ms_mean} ms</b> on average, from connecting to the first answer.`;
+  const tb = $("open-table").querySelector("tbody");
+  for (const o of OP.sessions) {
+    const fw = o.front_forwarded ? ` (${o.front_forwarded} through the exec front)` : "";
+    tb.insertAdjacentHTML("beforeend", `<tr><td><code>${esc(o.session)}</code></td><td>${o.open_ms} ms</td><td>${o.exec_requests}${fw}</td><td>${OP.vms_at_open === null || OP.vms_at_open === undefined ? "n/a" : (o.session === OP.sessions[0].session ? OP.vms_at_open : "")}</td></tr>`);
+  }
+}
+
 /* ---- header ---- */
 const passed = run.checks.filter(c => c.pass === true).length;
 const failed = run.checks.filter(c => c.pass === false).length;
@@ -263,7 +288,8 @@ const EDGES = [["you", "agent"], ["agent", "gateway"], ["gateway", "model"], ["a
 if (UC && UC.name === "assistant") {
   NODES.standin = { x: 130, y: 62, w: 118, h: 54, label: "managed endpoint", sub: "holds the real key" };
   NODES.deepwiki = { x: 330, y: 36, w: 104, h: 40, label: "DeepWiki", sub: "public MCP server" };
-  NODES.sandbox.label = "workspace host"; NODES.sandbox.sub = "reads AGENTS.md only";
+  NODES.sandbox.label = "no sandbox"; NODES.sandbox.sub = "none in the grant";
+  EDGES.splice(EDGES.findIndex(e => e[0] === "agent" && e[1] === "sandbox"), 1);
   EDGES.push(["agent", "standin"], ["agent", "deepwiki"]);
 } else if (UC) {
   NODES.browser = { x: 600, y: 190, w: 80, h: 50, label: "browser", sub: "in the VM" };

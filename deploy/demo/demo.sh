@@ -569,6 +569,10 @@ LOGS=$(cw "" "$((START_MS - 5000))")
 # Gateway rows and sandbox events join the timeline; the agent's own startup lines mark restarts.
 # A job's callbacks come in rounds (attempt 1 starts a round): the first proves its `keep`, the last
 # is its end, and any between are the proof made again when a new agent reopens the session.
+# The exec front (a coding agent's sandbox that is made on its first request): when it was first asked and
+# when the VM existed.
+jq -c '.[]|select(.m|startswith("{"))|{t, d:(.m|fromjson? // empty)}|select(.d.src=="front" and (.d.event|test("first_request|vm_create_start|vm_ready|vm_seeded|vm_failed")))|
+  {t_ms:.d.ts_ms, src:"front", event:.d.event, path:null, detail:.d.detail}' <<<"$LOGS" >> "$TIMELINE"
 jq -c '[.[]|select(.m|startswith("{"))|{t, d:(.m|fromjson? // empty)}|select(.d.src=="sandbox")|
   {t_ms:.d.ts_ms, src:"sandbox", event:.d.event, vm:.d.vm, path:(if .d.event=="exec_start" then ["agent","sandbox"] elif .d.event=="exec_end" or .d.event=="job_ended_callback" then ["sandbox","agent"] else null end), detail:.d.detail}]
   | sort_by(.t_ms)
@@ -626,9 +630,11 @@ if compgen -G "$VMDIR/*.json" >/dev/null; then
 else
   SANDBOX_JSON='{"provider":"fargate","label":"Fargate task","per_session":false,"vms":[]}'
 fi
+OPEN_JSON=null
+[ -z "$USECASE" ] || OPEN_JSON=$(uc_session_open_json)
 ROWS_JSON=$(cw gateway/ "$((START_MS - 5000))" '"ai.usage"' | jq -c '[.[]|.m|fromjson?|select(.target=="ai.usage")|.fields]')
 jq -n --slurpfile checks "$CHECKS_OUT" --slurpfile tl "$TIMELINE" --argjson conv "$CONV" --argjson disk "${DISK:-null}" --argjson sandbox "$SANDBOX_JSON" \
-  --argjson rows "$ROWS_JSON" --arg id "$RUN_ID" --arg mode "$MODE" --arg commit "$COMMIT" --argjson dirty "${DIRTY:-0}" \
+  --argjson rows "$ROWS_JSON" --argjson open "$OPEN_JSON" --arg id "$RUN_ID" --arg mode "$MODE" --arg commit "$COMMIT" --argjson dirty "${DIRTY:-0}" \
   --arg region "$REGION" --arg name "$NAME" --arg model "$MODEL" --arg provider "$PROVIDER" --argjson uc "$UC_JSON" \
   --argjson start "$START_MS" --argjson end "$END_MS" '
   ($checks) as $c |
@@ -636,6 +642,7 @@ jq -n --slurpfile checks "$CHECKS_OUT" --slurpfile tl "$TIMELINE" --argjson conv
       input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, cost_micros, price_micros, latency_ms})) as $r |
   {schema:1,
    use_case:$uc,
+   session_open:$open,
    run:{id:$id, mode:$mode, started_ms:$start, ended_ms:$end, commit:$commit, uncommitted_files:$dirty, region:$region, name:$name},
    model:{requested:(($r|map(.requested_model)|unique|join(", ")) as $m | if $m == "" then $model else $m end), replica_default:$model, provider:$provider, routed:($r|map(.routed_model)|unique), price_model:($r|map(.price_model)|unique), via:"crates/gateway (managed bai_v1 key)"},
    checks:($c + [{name:"teardown-zero", title:"Teardown leaves nothing behind", pass:null, status:"pending", detail:"filled in by down.sh", measurements:{}}]),

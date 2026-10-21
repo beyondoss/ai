@@ -323,6 +323,8 @@ pub fn inspect_grant(keys: &GrantKeys, token: &str, needle: &str) -> Res<serde_j
         "tenant": grant.tenant,
         "session_id": grant.session_id,
         "connectors": connectors,
+        "exec_url_empty": grant.exec_url.is_empty(),
+        "bundle_sha256": grant.bundle.as_ref().map(|b| b.sha256.clone()),
         "exec_header_names": grant.secrets.exec_headers.iter().map(|h| h.name.clone()).collect::<Vec<_>>(),
         "exec_header_values_contain_needle": grant.secrets.exec_headers.iter().any(|h| has(h.value.expose())),
         "gateway_key_contains_needle": has(grant.secrets.gateway_key.expose()),

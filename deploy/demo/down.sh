@@ -80,6 +80,8 @@ survey() {
     LEFT[e2b_sandboxes]=$(e2b_count 2>/dev/null) || { echo "down: could not list E2B sandboxes" >&2; LEFT[e2b_sandboxes]=1; }
   fi
   LEFT[ecr_repositories]=$(n "aws ecr describe-repositories --query \"length(repositories[?starts_with(repositoryName,'$P-')])\"")
+  # The agent folders' bundles bucket (listing is account-wide; the name carries this deployment's prefix).
+  LEFT[s3_buckets]=$(n "aws s3api list-buckets --query \"length(Buckets[?starts_with(Name,'$P-bundles-')])\"")
 }
 counts_json() {
   local json='{}' k
@@ -111,6 +113,12 @@ if [ -n "${E2B_API_KEY:-}" ]; then
     sleep 3
   done
 fi
+
+say "bundles bucket"
+for b in $(aws s3api list-buckets --query "Buckets[?starts_with(Name,'$P-bundles-')].Name" 2>/dev/null); do
+  quiet aws s3 rm "s3://$b" --recursive
+  quiet aws s3api delete-bucket --bucket "$b" && echo "deleted bucket $b"
+done
 
 say "ecs services and tasks"
 if [ -n "$(q ecs describe-clusters --clusters "$CLUSTER" --query 'clusters[?status==`ACTIVE`].clusterName|[0]')" ]; then
