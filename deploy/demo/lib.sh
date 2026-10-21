@@ -68,6 +68,8 @@ demo_bin() {
 ssm_get() { command aws --region "$REGION" --output text ssm get-parameter --with-decryption --name "$SSM/$1" --query Parameter.Value; }
 
 account() { aws sts get-caller-identity --query Account; }
+# The use cases' agent folders (bundles) live in this private bucket; the account makes the name unique.
+bundle_bucket() { echo "$P-bundles-$(account)"; }
 
 # A service's current public address, or empty. Looked up every time: a replaced task is a new IP.
 svc_ip() { # service [task arn: a specific task, else the first running one]

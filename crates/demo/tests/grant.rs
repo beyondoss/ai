@@ -277,3 +277,27 @@ fn inspecting_a_managed_grant_finds_the_token_and_not_a_third_party_key() {
     );
     assert!(inspect_grant(&k, &token[..token.len() - 3], "x").is_err());
 }
+
+/// A bundle grant with no sandbox is recognisable from the inside: no exec endpoint, the bundle's hash.
+#[cfg(feature = "agent-lib")]
+#[test]
+fn inspecting_a_bundle_grant_shows_no_exec_endpoint_and_the_bundles_hash() {
+    use beyond_ai_demo::keys::{Bundle, inspect_grant};
+
+    let k = keys();
+    let sha = "ab".repeat(32);
+    let bundled = MintArgs {
+        exec_url: String::new(),
+        bundle: Some(Bundle {
+            url: "https://example.invalid/b.tar".into(),
+            sha256: sha.clone(),
+        }),
+        ..args(false)
+    };
+    let got = inspect_grant(&k, &mint_grant(&k, &bundled).unwrap(), "").unwrap();
+    assert_eq!(got["exec_url_empty"], true);
+    assert_eq!(got["bundle_sha256"], sha);
+    let plain = inspect_grant(&k, &mint_grant(&k, &args(false)).unwrap(), "").unwrap();
+    assert_eq!(plain["exec_url_empty"], false);
+    assert!(plain["bundle_sha256"].is_null());
+}

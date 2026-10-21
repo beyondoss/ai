@@ -93,6 +93,9 @@ fi
 if [ "$USECASES" = 1 ]; then
   param_exists managed-secret || openssl rand -base64 32 | tr -d '\n' | put_param managed-secret SecureString
   param_exists provider-secret || printf 'bsk_live_demo_%s' "$(openssl rand -hex 24)" | put_param provider-secret SecureString
+  # The exec front (below) makes a session's E2B microVM on its first request, so it holds the key; only
+  # its task can read it.
+  printf '%s' "$E2B_API_KEY" | put_param e2b-key SecureString
 fi
 
 # Generated once. The marker goes in last, so an interrupted run regenerates the lot instead of
@@ -135,7 +138,7 @@ ecr_repo() {
   made "ecr repository $1"
 }
 LOGGED_IN=
-ensure_image() { # repo, dockerfile
+ensure_image() { # repo, dockerfile, [build target]
   local repo=$1 file=$2
   ecr_repo "$repo"
   if [ -z "${REBUILD:-}" ] && aws ecr describe-images --repository-name "$repo" --image-ids imageTag=latest >/dev/null 2>&1; then
@@ -146,7 +149,7 @@ ensure_image() { # repo, dockerfile
     LOGGED_IN=1
   fi
   echo "  building $repo (first time: several minutes)"
-  docker build --platform linux/amd64 -q -f "$ROOT/$file" -t "$ECR/$repo:latest" "$ROOT" >/dev/null
+  docker build --platform linux/amd64 -q -f "$ROOT/$file" ${3:+--target "$3"} -t "$ECR/$repo:latest" "$ROOT" >/dev/null
   docker push -q "$ECR/$repo:latest" >/dev/null
   made "image $repo:latest"
   IMAGES_CHANGED=1
@@ -156,6 +159,7 @@ ensure_image "$P-gateway" Dockerfile
 ensure_image "$P-agent" Dockerfile.agent
 [ "$USE_FARGATE" = 0 ] || ensure_image "$P-sandbox" deploy/demo/Dockerfile.sandbox
 [ "$USECASES" = 0 ] || ensure_image "$P-standin" deploy/demo/Dockerfile.standin
+[ "$USECASES" = 0 ] || ensure_image "$P-front" deploy/demo/Dockerfile.sandbox front
 
 # ---------------------------------------------------------------------------------------------
 say "network"
@@ -234,6 +238,22 @@ sg_rule "$SG_TASKS" --protocol tcp --port "$AGENT_PORT" --cidr "$CALLER"
 [ "$USECASES" = 0 ] || sg_rule "$SG_TASKS" --protocol tcp --port "$STANDIN_PORT" --cidr 0.0.0.0/0
 
 # ---------------------------------------------------------------------------------------------
+# The use cases' agent folders are deployed as bundles: one tar per folder, named by its hash, in a
+# private bucket that demo.sh uploads to and hands the replica presigned links to. down.sh empties and
+# deletes it.
+if [ "$USECASES" = 1 ]; then
+  say "bundles bucket"
+  BUCKET=$(bundle_bucket)
+  if ! command aws --region "$REGION" s3api head-bucket --bucket "$BUCKET" >/dev/null 2>&1; then
+    aws s3api create-bucket --bucket "$BUCKET" --create-bucket-configuration "LocationConstraint=$REGION" >/dev/null
+    made "bucket $BUCKET"
+  fi
+  aws s3api put-public-access-block --bucket "$BUCKET" \
+    --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+  aws s3api put-bucket-tagging --bucket "$BUCKET" --tagging "TagSet=[{Key=$TAG_KEY,Value=$NAME}]"
+fi
+
+# ---------------------------------------------------------------------------------------------
 say "efs"
 FS=$(q efs describe-file-systems --creation-token "$P" --query 'FileSystems[0].FileSystemId')
 if [ -z "$FS" ]; then
@@ -282,7 +302,7 @@ role() { # suffix, space-separated parameter names it may read (empty: none)
 # reads its own seal and TLS keys; the sandbox's reads nothing. No role can read the whole prefix.
 role gateway-exec "$PROVIDER-key id-signing-key"
 role agent-exec "fleet-secret tls-key"
-[ "$USE_FARGATE" = 0 ] || role sandbox-exec ""
+[ "$USE_FARGATE" = 0 ] || role sandbox-exec "$([ "$USECASES" = 0 ] || echo e2b-key)"
 # The stand-in's role is the only one that can read the "third party's" key.
 [ "$USECASES" = 0 ] || role standin-exec "managed-secret provider-secret"
 # ECS Exec on the agent (`demo.sh assistant` scans the agent process's memory through it): the task
@@ -414,15 +434,22 @@ if [ "$USE_FARGATE" = 1 ]; then
 SANDBOX_SCRIPT='printf "%s" "$CA_PEM" > /tmp/ca.pem
 exec /usr/local/bin/beyond-ai-demo exec-stub --listen 0.0.0.0:8081 --root /workspace --home /home/sandbox'
 TD_SANDBOX=$(jq -n --arg family "$P-sandbox" --arg exec "$(EXEC sandbox)" --argjson logs "$(LOGS sandbox)" \
-  --arg img "$ECR/$P-sandbox:latest" --argjson vol "$EFSVOL" --arg script "$SANDBOX_SCRIPT" --arg ca "$CA_PEM" '{
-  family:$family, networkMode:"awsvpc", requiresCompatibilities:["FARGATE"], cpu:"256", memory:"512",
+  --arg img "$ECR/$P-sandbox:latest" --argjson vol "$EFSVOL" --arg script "$SANDBOX_SCRIPT" --arg ca "$CA_PEM" \
+  --arg usecases "$USECASES" --argjson flogs "$(LOGS front)" --arg fimg "$ECR/$P-front:latest" --arg ek "$(param_arn e2b-key)" --arg name "$NAME" '{
+  family:$family, networkMode:"awsvpc", requiresCompatibilities:["FARGATE"], cpu:"256", memory:(if $usecases == "1" then "1024" else "512" end),
   executionRoleArn:$exec, volumes:$vol,
   containerDefinitions:[
     {name:"sandbox", image:$img, essential:true, entryPoint:["/bin/sh","-c"], command:[$script],
      portMappings:[{containerPort:8081}],
      mountPoints:[{sourceVolume:"efs",containerPath:"/mnt/efs",readOnly:true}],
      environment:[{name:"CA_PEM",value:$ca},{name:"SSL_CERT_FILE",value:"/tmp/ca.pem"}],
-     logConfiguration:$logs}]}' | register "$P-sandbox")
+     logConfiguration:$logs}]}
+  # The use cases'"'"' exec front, beside the sandbox: the address a coding session'"'"'s grant names. It
+  # makes that session'"'"'s E2B microVM when the first request arrives (front.py).
+  | if $usecases == "1" then .containerDefinitions += [
+    {name:"front", image:$fimg, essential:true, portMappings:[{containerPort:8084}],
+     environment:[{name:"CA_PEM",value:$ca},{name:"NAME",value:$name}],
+     secrets:[{name:"E2B_API_KEY",valueFrom:$ek}], logConfiguration:$flogs}] else . end' | register "$P-sandbox")
 fi
 
 if [ "$USECASES" = 1 ]; then

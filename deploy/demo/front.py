@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""The demo's exec front: a session's sandbox that does not exist until the session needs it.
+
+A grant's `exec_url` has to be a stable address, but an E2B microVM costs something from the moment it
+exists. This front is the stable address: `http://<front>:8084/exec/<session>?bundle=<tar url>`. It
+answers nothing itself. On the FIRST request for a session it creates that session's microVM (the same
+`vm_for` the rest of the demo uses: a private E2B sandbox running the exec stub, requiring a bearer),
+seeds the agent folder into it from the bundle, and from then on forwards every request to the VM,
+streaming the answer back as it arrives. A session that never calls a sandbox tool never costs a VM.
+
+One JSON line per event goes to stdout (CloudWatch): `first_request`, `vm_create_start`, `vm_ready`,
+`vm_seeded`, and `exec_request` for every request forwarded. The E2B key comes from the environment
+and is only ever handed to the helper functions in e2b.sh.
+"""
+import http.client
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
+
+PORT = int(os.environ.get("FRONT_PORT", "8084"))
+# Where things are in the image; a test run elsewhere points these at its own copies.
+VMDIR = os.environ.get("FRONT_VMDIR", "/tmp/vm")
+E2B_SH = os.environ.get("FRONT_E2B_SH", "/opt/demo/e2b.sh")
+STUB = os.environ.get("FRONT_STUB", "/usr/local/bin/beyond-ai-demo")
+CA_FILE = os.environ.get("FRONT_CA_FILE", "/tmp/ca.pem")
+HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "host", "content-length"}
+
+sessions = {}  # session -> {"lock": Lock, "vm": dict | None}
+sessions_lock = threading.Lock()
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def log(event, **detail):
+    print(json.dumps({"ts_ms": now_ms(), "src": "front", "event": event, "detail": detail}), flush=True)
+
+
+# Runs in bash so the creation is the demo's own tested code. The folder is fetched by the VM itself
+# (a presigned URL), so the bytes never pass through here.
+SCRIPT = r'''
+. "$E2B_SH"
+vm_for "$1" || exit 1
+id=$(vm_field "$1" id); tok=$(vm_field "$1" envd_token)
+echo READY
+if [ -n "$2" ]; then
+  vm_run "$id" "$tok" "mkdir -p $VM_HOME/workspace && curl -fsS -m 60 -o $VM_HOME/bundle.tar '$2' && tar -xf $VM_HOME/bundle.tar -C $VM_HOME/workspace && rm -f $VM_HOME/bundle.tar && echo seeded" | grep -q seeded || exit 3
+fi
+echo SEEDED
+'''
+
+
+def make_vm(session, bundle):
+    env = dict(os.environ, VMDIR=VMDIR, STUB=STUB, CA_FILE=CA_FILE, E2B_SH=E2B_SH,
+               VM_PRIVATE="1", TAG_KEY="beyond-ai-demo", SANDBOX_PORT="8081")
+    env.setdefault("NAME", os.environ.get("DEMO_NAME", "demo"))
+    log("vm_create_start", session=session)
+    p = subprocess.Popen(["bash", "-c", SCRIPT, "front", session, bundle or ""], env=env,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    for line in p.stdout:
+        if line.strip() == "READY":
+            log("vm_ready", session=session)
+        elif line.strip() == "SEEDED":
+            log("vm_seeded", session=session, bundle=bool(bundle))
+    err = p.stderr.read()
+    if p.wait() != 0:
+        raise RuntimeError(f"creating the sandbox failed ({p.returncode}): {err[-300:]}")
+    with open(f"{VMDIR}/{session}.json") as f:
+        return json.load(f)
+
+
+def vm_for(session, bundle):
+    with sessions_lock:
+        s = sessions.setdefault(session, {"lock": threading.Lock(), "vm": None})
+    with s["lock"]:
+        if s["vm"] is None:
+            log("first_request", session=session)
+            s["vm"] = make_vm(session, bundle)
+    return s["vm"]
+
+
+class Front(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def reply(self, code, body):
+        data = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        self.reply(200, {"ok": True}) if self.path == "/healthz" else self.reply(404, {"error": "not found"})
+
+    def do_POST(self):
+        u = urlsplit(self.path)
+        m = re.fullmatch(r"/exec/([A-Za-z0-9._-]+)", u.path)
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        if not m:
+            return self.reply(404, {"error": "POST /exec/<session>"})
+        session = m.group(1)
+        bundle = (parse_qs(u.query).get("bundle") or [""])[0]
+        try:
+            vm = vm_for(session, bundle)
+        except Exception as e:  # the next request tries again
+            with sessions_lock:
+                sessions.pop(session, None)
+            log("vm_failed", session=session, error=str(e))
+            return self.reply(502, {"error": str(e)})
+        log("exec_request", session=session)
+        up = urlsplit(vm["url"])
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP | {"authorization"}}
+        headers["Authorization"] = "Bearer " + vm["bearer"]
+        if vm.get("traffic_token"):
+            headers["e2b-traffic-access-token"] = vm["traffic_token"]
+        conn = http.client.HTTPSConnection(up.hostname, timeout=3700)
+        try:
+            conn.request("POST", up.path, body=body, headers=headers)
+            resp = conn.getresponse()
+            self.send_response(resp.status)
+            for k, v in resp.getheaders():
+                if k.lower() not in HOP:
+                    self.send_header(k, v)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            while True:
+                chunk = resp.read1(65536)
+                if not chunk:
+                    break
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log("proxy_failed", session=session, error=str(e))
+            try:
+                self.reply(502, {"error": str(e)})
+            except Exception:
+                pass
+        finally:
+            conn.close()
+
+
+def main():
+    os.makedirs(VMDIR, exist_ok=True)
+    with open(CA_FILE, "w") as f:
+        f.write(os.environ.get("CA_PEM", ""))
+    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Front)
+    srv.daemon_threads = True
+    log("listening", port=PORT)
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

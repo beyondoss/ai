@@ -3,7 +3,7 @@
 # The three use cases: an agent is a folder, and each folder here is run for real, against the
 # deployment `up.sh` made, with named checks like the rest of the demo.
 #
-#     ./deploy/demo/demo.sh assistant    no shell, no files: memory, a public MCP server (DeepWiki), a
+#     ./deploy/demo/demo.sh assistant    no sandbox at all: memory, a public MCP server (DeepWiki), a
 #                                        managed connector that holds no key, and a grant's ceilings
 #     ./deploy/demo/demo.sh coding       a sandbox per session: a skill, a subagent, a background app,
 #                                        a browser, all from the folder
@@ -17,8 +17,8 @@
 
 UC_AGENTS=$HERE/agents
 
-CHECKS_assistant=(persona-applied remote-mcp-real managed-mcp-no-key memory-across-sessions limits-enforced no-sandbox-calls)
-CHECKS_coding=(skill-used fix-verified subagent-from-folder app-as-background-job browser-sees-localhost)
+CHECKS_assistant=(persona-applied remote-mcp-real managed-mcp-no-key memory-across-sessions limits-enforced skill-from-bundle no-sandbox-at-all)
+CHECKS_coding=(vm-created-on-first-tool skill-used fix-verified subagent-from-folder app-as-background-job browser-sees-localhost)
 CHECKS_browser=(browser-reads-page no-held-connection idle-cost state-survives-pause state-survives-idle-reap)
 CHECK_TITLE+=(
   [persona-applied]="AGENTS.md sets the model and the tools"
@@ -26,7 +26,9 @@ CHECK_TITLE+=(
   [managed-mcp-no-key]="A managed connector works, and no key is in the agent"
   [memory-across-sessions]="A brand-new session remembers"
   [limits-enforced]="A grant's ceiling refuses a model outside it"
-  [no-sandbox-calls]="No sandbox call during any turn"
+  [skill-from-bundle]="The model reads a skill from the bundle, with no sandbox"
+  [no-sandbox-at-all]="The agent has no sandbox: its grant names none, and none saw a request"
+  [vm-created-on-first-tool]="The sandbox VM is created by the first sandbox tool call"
   [skill-used]="The model reads the folder's skill and runs its script"
   [fix-verified]="The failing test passes, checked in the sandbox"
   [subagent-from-folder]="The reviewer subagent from .agents/agents is called"
@@ -40,14 +42,14 @@ CHECK_TITLE+=(
 )
 
 declare -A UC_TITLE=(
-  [assistant]="assistant: an agent with no shell, no files and no keys"
+  [assistant]="assistant: an agent with no sandbox and no keys"
   [coding]="coding: an agent that fixes, runs and reviews code in its own sandbox"
   [browser]="browser: a real browser in a sandbox that sleeps"
 )
 declare -A UC_SUMMARY=(
-  [assistant]="A folder with an AGENTS.md and a .mcp.json. The agent has memory, a public MCP server and one managed connector (a stand-in endpoint on AWS that holds the real key). It has no shell and no file tools; the grant caps its models."
-  [coding]="A folder with a failing Python app, a skill with a script, a reviewer subagent and an AGENTS.md. The agent gets its own E2B microVM; it fixes the bug, reviews it, runs the app as a background job and looks at the page with a browser in the same VM."
-  [browser]="A folder with an AGENTS.md, a .mcp.json and a page. The browser (rustwright-mcp behind a supergateway bridge) runs inside an E2B microVM that is paused and resumed; the grant names it as a connector that holds no standing stream."
+  [assistant]="A folder with an AGENTS.md, a .mcp.json and a skill, deployed as a bundle. The agent has no sandbox at all: its grant names no exec endpoint. It has memory, a read-only view of its own folder (the skill), a public MCP server and one managed connector (a stand-in endpoint on AWS that holds the real key); the grant caps its models."
+  [coding]="A folder with a failing Python app, a skill with a script, a reviewer subagent and an AGENTS.md, deployed as a bundle. The agent's own E2B microVM does not exist until the first sandbox tool call makes it (and seeds it from the bundle); then it fixes the bug, reviews it, runs the app as a background job and looks at the page with a browser in the same VM."
+  [browser]="A folder with an AGENTS.md, a .mcp.json and a page, deployed as a bundle. The browser (rustwright-mcp behind a supergateway bridge) runs inside an E2B microVM that is paused and resumed; the grant names it as a connector that holds no standing stream."
 )
 
 # ---- helpers shared by the use cases -----------------------------------------------------------------
@@ -95,18 +97,13 @@ uc_grant() { "$GRANT_FN" "$@"; }
 
 # ---- the grants ------------------------------------------------------------------------------------------
 
-_grant_assistant() { # session [tamper]
-  local s=$1 ws=/workspace/assistant extra=()
-  if [ "$s" = "$UC_SETUP" ]; then
-    ws=/workspace   # the throwaway session that puts the folder where the others will find it
-  else
-    # The managed connector: a URL on the stand-in endpoint and a bmc_v1 token for this session. The
-    # third party's key is not an input to the minter.
-    extra=(--mcp "vault=http://$STANDIN_IP:$STANDIN_PORT/managed/vault/mcp" --mcp-managed vault
-      --limits-models "gpt-4.1-mini,gpt-5-mini")
-  fi
-  "$DEMO" mint-grant --tenant "$UC_TENANT" --session "$s" --shard demo --workspace "$ws" \
-    --exec-url "http://sandbox.$DNS:$SANDBOX_PORT/exec" "${extra[@]}" ${2:+--tamper}
+_grant_assistant() { # session [tamper]: no sandbox at all: the folder is the bundle, and the grant names no exec endpoint
+  # The managed connector: a URL on the stand-in endpoint and a bmc_v1 token for this session. The
+  # third party's key is not an input to the minter.
+  "$DEMO" mint-grant --tenant "$UC_TENANT" --session "$1" --shard demo --workspace /workspace/assistant \
+    --exec-url "" --bundle "$BUNDLE_URL=$BUNDLE_SHA" \
+    --mcp "vault=http://$STANDIN_IP:$STANDIN_PORT/managed/vault/mcp" --mcp-managed vault \
+    --limits-models "gpt-4.1-mini,gpt-5-mini" ${2:+--tamper}
 }
 
 _grant_vm() { # session [tamper]: the session's own E2B VM, private (its ports need the traffic token)
@@ -115,7 +112,26 @@ _grant_vm() { # session [tamper]: the session's own E2B VM, private (its ports n
   DEMO_EXEC_BEARER=$(vm_field "$s" bearer) DEMO_EXEC_HEADER_TRAFFIC=$traffic DEMO_MCP_HEADER_BROWSER=$traffic \
     "$DEMO" mint-grant --tenant "$UC_TENANT" --session "$s" --shard demo --workspace "$VM_HOME/workspace" \
     --exec-url "$(vm_field "$s" url)" --exec-bearer --exec-header traffic=e2b-traffic-access-token \
+    --bundle "$BUNDLE_URL=$BUNDLE_SHA" \
     --mcp "browser=$(vm_bridge_url "$s")" --mcp-sandbox browser --mcp-header browser=e2b-traffic-access-token \
+    --limits-models gpt-5-mini ${2:+--tamper}
+}
+
+# The coding agent's exec endpoint is the front, keyed on the first session's name: a VM that does not
+# exist yet is made when the first request arrives, and seeded from the bundle (front.py).
+_front_url() { echo "http://sandbox.$DNS:$FRONT_PORT/exec/$SESS_C?bundle=$(jq -rn --arg u "$BUNDLE_URL" '$u|@uri')"; }
+_grant_coding() { # session [tamper]
+  "$DEMO" mint-grant --tenant "$UC_TENANT" --session "$1" --shard demo --workspace "$VM_HOME/workspace" \
+    --exec-url "$(_front_url)" --bundle "$BUNDLE_URL=$BUNDLE_SHA" --limits-models gpt-5-mini ${2:+--tamper}
+}
+# The same VM, and now the browser in it: a second session whose grant also names the bridge. The
+# bridge's address exists only once the VM does.
+_grant_coding_browser() { # session [tamper]
+  local traffic
+  traffic=$(vm_field "$SESS_C" traffic_token)
+  DEMO_MCP_HEADER_BROWSER=$traffic "$DEMO" mint-grant --tenant "$UC_TENANT" --session "$1" --shard demo --workspace "$VM_HOME/workspace" \
+    --exec-url "$(_front_url)" --bundle "$BUNDLE_URL=$BUNDLE_SHA" \
+    --mcp "browser=$(vm_bridge_url "$SESS_C")" --mcp-sandbox browser --mcp-header browser=e2b-traffic-access-token \
     --limits-models gpt-5-mini ${2:+--tamper}
 }
 
@@ -124,7 +140,6 @@ _grant_vm() { # session [tamper]: the session's own E2B VM, private (its ports n
 uc_prepare() { # called by demo.sh once, before the checks
   UC_NAME=$MODE
   UC_TENANT=uc-$MODE-$SID
-  UC_SETUP=demo.u${SID}s
   UC_JSON=$(jq -nc --arg n "$MODE" --arg t "${UC_TITLE[$MODE]}" --arg s "${UC_SUMMARY[$MODE]}" --argjson tree "$(uc_tree "$MODE")" \
     '{name:$n, title:$t, summary:$s, folder:("deploy/demo/agents/"+$n), tree:$tree}')
   case "$MODE" in
@@ -140,7 +155,7 @@ uc_need() { # what is missing -> exits
 }
 
 uc_prepare_assistant() {
-  [ "$USE_FARGATE" = 1 ] && [ "$USECASES" = 1 ] || uc_need "the Fargate workspace host and the stand-in endpoint"
+  [ "$USECASES" = 1 ] || uc_need "the stand-in endpoint and the bundles bucket"
   STANDIN_IP=$(svc_ip standin)
   [ -n "$STANDIN_IP" ] || uc_need "the stand-in managed-MCP endpoint (not running)"
   for _ in $(seq 1 30); do
@@ -154,33 +169,92 @@ uc_prepare_assistant() {
   # to the minter, never printed and never written to the record.
   PROVIDER_SECRET=$(ssm_get provider-secret)
   GRANT_FN=_grant_assistant
-  # The folder goes where the sessions' workspace is, through a throwaway session with no limits.
-  local tgz
-  tgz=$(tar -C "$UC_AGENTS/assistant" -czf - . | base64 -w0)
-  raw_bash "$UC_SETUP" "rm -rf /workspace/assistant && mkdir -p /workspace/assistant && echo '$tgz' | base64 -d | tar -xzf - -C /workspace/assistant && ls -A /workspace/assistant" \
-    | sed 's/^/  workspace: /' | tr '\n' ' '
-  echo
+  # The folder is the deployment: this run's marker goes into the skill, and the bundle carries it.
+  uc_stage
+  SKILL_MARKER="heron-$SID-$RANDOM"
+  sed -i "s/MARKER_PLACEHOLDER/$SKILL_MARKER/" "$STAGE/.agents/skills/house-style/SKILL.md"
+  uc_bundle || { echo "demo: could not publish the bundle" >&2; exit 1; }
   SESS_A1=demo.u${SID}a
   SESS_A2=demo.u${SID}b
   SESS_A3=demo.u${SID}c
-  # Open each session once without a turn, so what a session does at open (its sandbox probe and the
-  # reads of AGENTS.md and .mcp.json) is over before the first prompt.
+  # Open each session once without a turn: this is where a session without a bundle used to spend ~30
+  # sandbox round trips reading its own folder, and where this one has no sandbox to ask.
   for s in "$SESS_A1" "$SESS_A2" "$SESS_A3"; do
-    chat "$s" --command '{"type":"get_state","id":"w"}' --timeout-secs 60 >/dev/null
+    uc_open "$s"
   done
-  UC_READY_MS=$(now_ms)
-  echo "  three sessions opened; their open-time sandbox reads are over (t=$UC_READY_MS)"
+  echo "  three sessions opened (t=$UC_READY_MS)"
   tl demo sessions_opened '["you","agent"]' null "$UC_READY_MS"
 }
 
-uc_prepare_vm() { # session: the VM, the folder in it, the browser stack
+# The folder as a bundle: a copy with this run's stamps in it, as a plain ustar tar named by its hash,
+# uploaded to the deployment's private bucket and handed to the replica as a presigned link. The
+# tar is also what a sandbox VM is seeded from.
+uc_stage() {
+  STAGE=$WORK/stage/$MODE
+  mkdir -p "$WORK/stage"
+  rm -rf "$STAGE"
+  cp -a "$UC_AGENTS/$MODE" "$STAGE"
+  find "$STAGE" -name __pycache__ -prune -exec rm -rf {} +
+}
+uc_bundle() {
+  BUNDLE_TAR=$WORK/bundle-$MODE.tar
+  (cd "$STAGE" && find . -mindepth 1 | sed 's|^\./||' | LC_ALL=C sort \
+    | tar --format=ustar --owner=0 --group=0 --numeric-owner --mtime=@0 --no-recursion -cf "$BUNDLE_TAR" -T -) || return 1
+  BUNDLE_SHA=$(sha256sum "$BUNDLE_TAR" | cut -d' ' -f1)
+  BUNDLE_BYTES=$(stat -c %s "$BUNDLE_TAR")
+  local bucket
+  bucket=$(bundle_bucket)
+  command aws --region "$REGION" s3 cp "$BUNDLE_TAR" "s3://$bucket/$BUNDLE_SHA.tar" --only-show-errors || return 1
+  BUNDLE_URL=$(command aws --region "$REGION" s3 presign "s3://$bucket/$BUNDLE_SHA.tar" --expires-in 21600) || return 1
+  echo "  bundle  $(tar -tf "$BUNDLE_TAR" | grep -vc '/$') files, $BUNDLE_BYTES bytes, sha256 ${BUNDLE_SHA:0:12}…, in s3://$bucket (presigned link, 6 h)"
+  UC_JSON=$(jq -c --arg sha "$BUNDLE_SHA" --argjson b "$BUNDLE_BYTES" --arg bucket "$bucket" \
+    '.bundle = {sha256:$sha, bytes:$b, store:("a private S3 bucket (" + $bucket + "), fetched with a presigned link")}' <<<"$UC_JSON")
+}
+
+# Open a session with no turn and record how long that took (connect + the first answer) and when, so the
+# record can say how many requests the sandbox side saw while it happened.
+UC_OPENS=$WORK/opens.ndjson
+uc_open() { # session
+  local out t0 ready
+  t0=$(now_ms)
+  out=$(chat "$1" --command '{"type":"get_state","id":"open"}' --timeout-secs 90) || out='{}'
+  ready=$(now_ms)
+  jq -nc --arg s "$1" --argjson t0 "$t0" --argjson ready "$ready" --argjson c "$(jq '.connected_ms // 0' <<<"$out")" --argjson t "$(jq '.total_ms // 0' <<<"$out")" \
+    '{session:$s, started_ms:$t0, ready_ms:$ready, connected_ms:$c, state_ms:$t, open_ms:($c+$t)}' >> "$UC_OPENS"
+  UC_READY_MS=$ready
+  echo "  opened $1 in $(( $(jq '.connected_ms // 0' <<<"$out") + $(jq '.total_ms // 0' <<<"$out") )) ms"
+}
+
+# The record's "session open" section: per session, the open latency and the sandbox requests seen while
+# it was opening (the sandbox's own log, every VM's stub and the Fargate one; for the coding agent also
+# what its exec front forwarded), and whether a VM existed then.
+uc_session_open_json() {
+  local reqs fronts
+  sleep 6   # the stubs' lines reach CloudWatch a few seconds late
+  reqs=$(cw sandbox/ "$((START_MS - 120000))" '"exec_request"' | jq -c '[.[]|(.m|fromjson? // empty)|select(.event=="exec_request")|.ts_ms]')
+  fronts='[]'
+  [ "$MODE" != coding ] || fronts=$(cw front/ "$((START_MS - 120000))" '"exec_request"' | jq -c '[.[]|(.m|fromjson? // empty)|select(.event=="exec_request")|.ts_ms]')
+  jq -sc --argjson r "$reqs" --argjson f "$fronts" --arg mode "$MODE" --argjson vm "${VM_AT_OPEN:-null}" '
+    map(. as $s | $s + {exec_requests: ([$r[] | select(. >= ($s.started_ms - 500) and . <= ($s.ready_ms + 1500))] | length),
+        front_forwarded: ([$f[] | select(. >= ($s.started_ms - 500) and . <= ($s.ready_ms + 1500))] | length)})
+    | {sessions: ., exec_requests_at_open: (map(.exec_requests) | add // 0), sessions_opened: length,
+       per_session: ((map(.exec_requests) | add // 0) / (length | if . == 0 then 1 else . end)),
+       open_ms_mean: ((map(.open_ms) | add // 0) / (length | if . == 0 then 1 else . end) | floor),
+       vms_at_open: $vm}' "$UC_OPENS"
+}
+
+# A browser VM: made before the session opens (the browser connector needs the VM up, so creating it at
+# open is right here), seeded from the bundle, with the browser stack installed in it.
+uc_prepare_vm() { # session
   local s=$1 id tok rw
   rw=$(rustwright_bin) || { echo "demo: could not build rustwright-mcp" >&2; exit 1; }
   VM_PRIVATE=1 vm_for "$s" || { echo "demo: no E2B sandbox for $s" >&2; exit 1; }
   id=$(vm_field "$s" id)
   tok=$(vm_field "$s" envd_token)
   echo "  E2B sandbox $id (private: its ports need the traffic token)"
-  vm_upload_dir "$id" "$tok" "$UC_AGENTS/$MODE" "$VM_HOME/workspace" || { echo "demo: could not upload the folder" >&2; exit 1; }
+  vm_put "$id" "$tok" "$BUNDLE_TAR" "$VM_HOME/bundle.tar" \
+    && vm_run "$id" "$tok" "mkdir -p '$VM_HOME/workspace' && tar -xf $VM_HOME/bundle.tar -C '$VM_HOME/workspace' && rm -f $VM_HOME/bundle.tar" >/dev/null \
+    || { echo "demo: could not seed the folder from the bundle" >&2; exit 1; }
   local t0
   t0=$(now_ms)
   vm_browser_up "$id" "$tok" "$rw" || { echo "demo: the browser stack did not come up" >&2; exit 1; }
@@ -189,31 +263,44 @@ uc_prepare_vm() { # session: the VM, the folder in it, the browser stack
 }
 
 uc_prepare_coding() {
-  [ "$USE_E2B" = 1 ] || uc_need "E2B"
+  [ "$USE_E2B" = 1 ] && [ "$USECASES" = 1 ] || uc_need "E2B and the exec front"
   SESS_C=demo.u${SID}c
-  uc_prepare_vm "$SESS_C"
-  local id tok
-  id=$(vm_field "$SESS_C" id)
-  tok=$(vm_field "$SESS_C" envd_token)
+  SESS_C2=demo.u${SID}e
+  FRONT_PORT=8084
+  # The folder, with this run's build line in it; the VM is seeded from the bundle when it is made.
+  uc_stage
   BUILD_STAMP=build-$SID
-  vm_run "$id" "$tok" "echo $BUILD_STAMP > $VM_HOME/workspace/app/BUILD" >/dev/null
-  vm_bridge_start "$id" "$tok" || { echo "demo: the browser bridge did not start" >&2; exit 1; }
-  TESTS_BEFORE=$(vm_run "$id" "$tok" "cd $VM_HOME/workspace/app && python3 -m unittest 2>&1 | tail -n 3; echo exit=\${PIPESTATUS[0]}")
-  TESTS_ORIG_SUM=$(vm_run "$id" "$tok" "md5sum $VM_HOME/workspace/app/test_server.py" | cut -d' ' -f1)
+  echo "$BUILD_STAMP" > "$STAGE/app/BUILD"
+  # The suite as the agent will find it, run here on the same files (no VM exists yet to run it in).
+  TESTS_BEFORE=$(cd "$STAGE/app" && python3 -m unittest 2>&1 | tail -n 3; echo "exit=${PIPESTATUS[0]}")
+  TESTS_ORIG_SUM=$(md5sum "$STAGE/app/test_server.py" | cut -d' ' -f1)
+  uc_bundle || { echo "demo: could not publish the bundle" >&2; exit 1; }
+  rustwright_bin >/dev/null || { echo "demo: could not build rustwright-mcp" >&2; exit 1; }
+  GRANT_FN=_grant_coding
   echo "  before: $(tr '\n' ' ' <<<"$TESTS_BEFORE")"
+  # Open the session. There is no sandbox VM for it yet, and opening must not make one.
+  VM_AT_OPEN=$(vm_count_for "$SESS_C") || VM_AT_OPEN=null
+  uc_open "$SESS_C"
+  VM_AT_OPEN_AFTER=$(vm_count_for "$SESS_C") || VM_AT_OPEN_AFTER=null
+  echo "  E2B sandboxes for this session before the open: $VM_AT_OPEN, after it: $VM_AT_OPEN_AFTER"
+  VM_AT_OPEN=${VM_AT_OPEN_AFTER}
 }
 
 uc_prepare_browser() {
   [ "$USE_E2B" = 1 ] || uc_need "E2B"
   SESS_B=demo.u${SID}d
+  uc_stage
+  PAGE_STAMP=stamp-$SID-$RANDOM
+  sed -i "s/STAMP_PLACEHOLDER/$PAGE_STAMP/" "$STAGE/site/index.html"
+  uc_bundle || { echo "demo: could not publish the bundle" >&2; exit 1; }
   uc_prepare_vm "$SESS_B"
   local id tok
   id=$(vm_field "$SESS_B" id)
   tok=$(vm_field "$SESS_B" envd_token)
-  PAGE_STAMP=stamp-$SID-$RANDOM
-  vm_run "$id" "$tok" "sed -i 's/STAMP_PLACEHOLDER/$PAGE_STAMP/' $VM_HOME/workspace/site/index.html" >/dev/null
   vm_bridge_start "$id" "$tok" "$VM_HOME/workspace/site" || { echo "demo: the browser bridge did not start" >&2; exit 1; }
   BRIDGE_UP_MS=$(now_ms)
+  VM_AT_OPEN=$(vm_count_for "$SESS_B") || VM_AT_OPEN=null
+  uc_open "$SESS_B"
 }
 
 # ============================================================================================================
@@ -227,7 +314,7 @@ check_persona_applied() {
   note_calls "$s" "$out"
   mcp=$(chat "$s" --command '{"type":"get_mcp","id":"m"}' --timeout-secs 30)
   offered=$(jq -c '[.responses[]|select(.command=="get_mcp")|.data.tools[]]|sort' <<<"$mcp")
-  want=$(sed -n 's/^tools: *//p' "$UC_AGENTS/assistant/AGENTS.md" | tr ',' '\n' | sed 's/ //g' | jq -R . | jq -sc 'sort')
+  want=$(sed -n 's/^tools: *//p' "$UC_AGENTS/assistant/AGENTS.md" | tr ',' '\n' | sed 's/ //g' | grep '^mcp__' | jq -R . | jq -sc 'sort')
   text=$(jq -r .text <<<"$out")
   rows=$(uc_rows_since "$t0" 2)
   models=$(jq -c '[.[].requested_model]|unique' <<<"$rows")
@@ -418,27 +505,49 @@ check_limits_enforced() {
   fi
 }
 
-check_no_sandbox_calls() {
-  local tools_used reqs after before total t_last
-  # the model had no tool that reaches the sandbox, and called none
+check_skill_from_bundle() {
+  local s=$SESS_A3 out reads read_out text ms
+  out=$(chat "$s" --prompt "Your folder has a skill about the team's house style. Read its SKILL.md with the read tool, then quote its HOUSE-STYLE-MARKER line exactly, character for character.")
+  note_calls "$s" "$out"
+  reads=$(jq -c '[.tools[]|select(.name=="read" and ((.input|tostring)|contains("SKILL.md")))]' <<<"$out")
+  read_out=$(jq -r '[.[]|.output // ""]|join("\n")' <<<"$reads")
+  ms=$(jq -r '[.[]|((.end_ms // 0) - .t_ms)]|first // 0' <<<"$reads")
+  text=$(jq -r .text <<<"$out")
+  echo "  read calls on the skill: $(jq length <<<"$reads") ($ms ms); the marker is in the file's text: $([[ $read_out == *"$SKILL_MARKER"* ]] && echo yes || echo no); the reply quotes it: $([[ $text == *"$SKILL_MARKER"* ]] && echo yes || echo no)"
+  if [ "$(jq length <<<"$reads")" -ge 1 ] && [[ $read_out == *"HOUSE-STYLE-MARKER: $SKILL_MARKER"* ]] && [[ $text == *"$SKILL_MARKER"* ]]; then
+    result 1 "the model read .agents/skills/house-style/SKILL.md through the read tool in $ms ms, from the bundle, and quoted this run's marker ($SKILL_MARKER), which exists only in the bundle; the session has no sandbox" \
+      "$(jq -nc --arg m "$SKILL_MARKER" --argjson n "$(jq length <<<"$reads")" --argjson ms "$ms" --arg p "$(jq -r '.[0].input|tostring' <<<"$reads" | head -c 200)" '{marker:$m, read_calls:$n, read_ms:$ms, read_input:$p, marker_in_tool_output:true, marker_in_reply:true}')" \
+      "$(jq -nc --argjson ms "$ms" '{label:"skill read from the bundle",value:$ms,unit:"ms"}')"
+  else
+    result 0 "reads=$(jq length <<<"$reads") tool_output=${read_out:0:200} reply=${text:0:200}"
+  fi
+}
+
+check_no_sandbox_at_all() {
+  local g s grants tools_used reqs listening total used_reaching
+  # 1. The grants: each session's, unsealed with the agent's own verifier.
+  grants='[]'
+  for s in "$SESS_A1" "$SESS_A2" "$SESS_A3"; do
+    g=$(DEMO_GRANT=$(uc_grant "$s") "$DEMO" inspect-grant)
+    grants=$(jq -c --arg s "$s" --argjson g "$g" '. + [{session:$s, exec_url_empty:$g.exec_url_empty, exec_header_names:$g.exec_header_names, bundle_sha256:$g.bundle_sha256}]' <<<"$grants")
+  done
+  # 2. The sandbox side, over the whole run, session open included: every exec request any sandbox
+  # logged. The Fargate workspace host is up (its startup line is the control), so a request would show.
   tools_used=$(jq -cR 'fromjson?' "$EVENTS" | jq -r 'select(.frame.event.kind=="tool_start")|.frame.event.name' | sort | uniq -c | awk '{print $2":"$1}' | jq -R . | jq -sc .)
   sleep 12   # the stub's log lines reach CloudWatch a few seconds late
-  reqs=$(cw sandbox/ "$((UC_READY_MS - 120000))" '"exec_request"' | jq -c '[.[]|{t, d:(.m|fromjson)}|select(.d.event=="exec_request")|{t:.d.ts_ms, command:.d.detail.command}]|sort_by(.t)')
-  before=$(jq -c --argjson r "$UC_READY_MS" '[.[]|select(.t<=$r and .t>=($r-120000))]' <<<"$reqs")
-  # during a turn: between a prompt being sent and its answer (the stub's log is polled every 100 ms,
-  # so a request is stamped up to that much late)
-  after=$(jq -c --argjson r "$UC_READY_MS" --slurpfile w "$WORK/windows.ndjson" '[.[]|select(.t>$r) | . as $q | select($w|any(.sent <= $q.t and $q.t <= .done + 300))]' <<<"$reqs")
-  total=$(jq length <<<"$after")
+  reqs=$(cw sandbox/ "$((START_MS - 120000))" '"exec_request"' | jq -c '[.[]|(.m|fromjson? // empty)|select(.event=="exec_request")|.ts_ms]')
+  listening=$(cw sandbox/ "$((START_MS - 20 * 3600 * 1000))" '"listening"' | jq -c '[.[]|(.m|fromjson? // empty)|select(.event=="listening")]|length')
+  total=$(jq length <<<"$reqs")
+  used_reaching=$(jq -r '[.[]|select(test("^(bash|write|edit|grep|find|ls|bash_job):"))]|length' <<<"$tools_used")
+  echo "  grants: $(jq -c '[.[]|{session, exec_url_empty}]' <<<"$grants")"
   echo "  tools the model called in all sessions: $tools_used"
-  echo "  sandbox requests while the sessions were opened: $(jq length <<<"$before"); during the $(wc -l < "$WORK/windows.ndjson") turns: $total (the demo's own get_state commands, between turns, are not turns)"
-  local reaching
-  reaching=$(jq -r '[.[]|select(test("^(bash|read|write|edit|grep|find|ls|bash_job):"))]|length' <<<"$tools_used")
-  if [ "$total" = 0 ] && [ "$reaching" = 0 ]; then
-    result 1 "0 sandbox requests during the $(wc -l < "$WORK/windows.ndjson") turns, and the model called none of bash, read, write, edit, grep, find, ls; the $(jq length <<<"$before") requests at session open were the agent reading AGENTS.md and .mcp.json" \
-      "$(jq -nc --argjson t "$tools_used" --argjson b "$before" --argjson a "$total" '{model_tool_calls:$t, sandbox_requests_at_open:($b|length), open_requests:$b, sandbox_requests_during_turns:$a}')" \
-      '{"label":"sandbox requests in turns","value":"0","unit":""}'
+  echo "  exec requests any sandbox logged since the run began: $total (the Fargate workspace host was up: $listening startup line(s) in its log)"
+  if [ "$(jq 'all(.[]; .exec_url_empty == true and (.exec_header_names|length) == 0 and .bundle_sha256 != null)' <<<"$grants")" = true ] && [ "$total" = 0 ] && [ "${listening:-0}" -ge 1 ] && [ "$used_reaching" = 0 ]; then
+    result 1 "the three grants name no exec endpoint (and carry the bundle), and the sandbox side logged 0 exec requests over the whole run, session open included; the model's tool calls: $tools_used" \
+      "$(jq -nc --argjson g "$grants" --argjson t "$tools_used" --argjson r "$total" --argjson l "${listening:-0}" '{grants:$g, model_tool_calls:$t, sandbox_exec_requests_whole_run:$r, workspace_host_startup_lines_seen:$l}')" \
+      '{"label":"sandbox requests, whole run","value":"0","unit":""}'
   else
-    result 0 "during turns: $total; tools: $tools_used; after=$(head -c 400 <<<"$after")"
+    result 0 "grants=$grants requests=$total listening=$listening tools=$tools_used"
   fi
 }
 
@@ -448,6 +557,51 @@ check_no_sandbox_calls() {
 
 vm_in() { # session script -> runs it in the session's VM
   vm_run "$(vm_field "$1" id)" "$(vm_field "$1" envd_token)" "$2"
+}
+
+check_vm_created_on_first_tool() {
+  local ready=$UC_READY_MS out tool t_tool t_end t_sent fl first_req create_start vm_up seeded rows model_done vms_after tool_out ok
+  out=$(chat "$SESS_C" --timeout-secs 600 --prompt "Use the bash tool to run: ls app; uname -a   Then tell me in one sentence what you see.")
+  note_calls "$SESS_C" "$out"
+  tool=$(jq -c '[.tools[]|select(.name=="bash")][0] // null' <<<"$out")
+  t_tool=$(jq -r '.t_ms // 0' <<<"$tool")
+  t_end=$(jq -r '.end_ms // 0' <<<"$tool")
+  t_sent=$(jq -r .sent_at_ms <<<"$out")
+  tool_out=$(jq -r '.output // ""' <<<"$tool")
+  # The front's own log is the record of when it was first asked and when the VM existed.
+  for _ in $(seq 1 20); do
+    fl=$(cw front/ "$((ready - 60000))" | jq -c --arg s "$SESS_C" '[.[]|(.m|fromjson? // empty)|select(.src=="front" and .detail.session==$s)]')
+    [ "$(jq '[.[]|select(.event=="vm_seeded")]|length' <<<"$fl")" -ge 1 ] && break
+    sleep 3
+  done
+  _fl() { jq -r --arg e "$1" '[.[]|select(.event==$e)][0].ts_ms // 0' <<<"$fl"; }
+  first_req=$(_fl first_request)
+  create_start=$(_fl vm_create_start)
+  vm_up=$(_fl vm_ready)
+  seeded=$(_fl vm_seeded)
+  vms_after=$(vm_count_for "$SESS_C" || echo -1)
+  # Now that it exists, the demo can reach it too (to run the suite itself, and to start the browser).
+  if vm_adopt "$SESS_C"; then
+    jq --argjson c "$create_start" '.created_ms = $c' "$VMDIR/$SESS_C.json" > "$VMDIR/$SESS_C.json.tmp" && mv "$VMDIR/$SESS_C.json.tmp" "$VMDIR/$SESS_C.json"
+  fi
+  rows=$(uc_rows_since "$t_sent" 1)
+  model_done=$(jq '[.[]|((.start_unix_secs*1000) + .latency_ms)]|min // 0' <<<"$rows")
+  echo "  session ready at $ready; VMs for it at open: ${VM_AT_OPEN:-?}"
+  echo "  first model call answered ~$model_done; the model's bash call started $t_tool"
+  echo "  the front was first asked at $first_req (+$((first_req - ready)) ms after open), VM create began $create_start, VM serving $vm_up (+$((vm_up - create_start)) ms), seeded $seeded (+$((seeded - vm_up)) ms)"
+  echo "  the first tool result arrived at $t_end: $((t_end - create_start)) ms after the VM create began; E2B VMs for it now: $vms_after"
+  ok=0
+  if [ "${VM_AT_OPEN:-1}" = 0 ] && [ "$create_start" -gt "$ready" ] && [ "$first_req" -ge "$((t_tool - 1500))" ] && [ "$create_start" -ge "$((model_done - 1500))" ] \
+    && [ "$vms_after" = 1 ] && [ "$t_end" -gt "$create_start" ] && [[ $tool_out == *Linux* && $tool_out == *server.py* ]]; then ok=1; fi
+  if [ "$ok" = 1 ]; then
+    result 1 "no VM existed when the session opened; the first model call came back, the model called bash, and only then did the front create the VM ($((create_start - ready)) ms after the session was ready), seeded from the bundle; the first tool result came $((t_end - create_start)) ms after the create began" \
+      "$(jq -nc --argjson ready "$ready" --argjson fr "$first_req" --argjson cs "$create_start" --argjson up "$vm_up" --argjson sd "$seeded" --argjson te "$t_end" --argjson tt "$t_tool" --argjson md "$model_done" \
+        '{vms_at_open:0, session_ready_ms:$ready, first_model_call_answered_ms:$md, tool_call_started_ms:$tt, front_first_request_ms:$fr, vm_create_started_ms:$cs, vm_serving_ms:$up, vm_seeded_ms:$sd, first_tool_result_ms:$te,
+          open_to_vm_create_ms:($cs-$ready), vm_provision_ms:($up-$cs), seed_from_bundle_ms:($sd-$up), vm_create_to_first_tool_result_ms:($te-$cs)}')" \
+      "$(jq -nc --argjson a "$((create_start - ready))" '{label:"session open to VM create",value:$a,unit:"ms"}')"
+  else
+    result 0 "vms_at_open=${VM_AT_OPEN:-?} ready=$ready first_req=$first_req create=$create_start tool=$t_tool model_done=$model_done vms_after=$vms_after tool_end=$t_end out=${tool_out:0:120}"
+  fi
 }
 
 check_skill_used() {
@@ -533,9 +687,22 @@ check_app_as_background_job() {
 }
 
 check_browser_sees_localhost() {
-  local out nav snap text ms
-  out=$(chat "$SESS_C" --timeout-secs 400 --prompt "Use the browser tools (find them with tool_search) to open http://localhost:8000/ and tell me the heading and the build line of the page, quoting them from what the browser shows.")
-  note_calls "$SESS_C" "$out"
+  local out nav snap text ms rw id tok t0
+  # The browser connector names the VM's ports, which exist only now: a second session, in the same VM
+  # (the front keys on the first session's name), carries a grant that also names the bridge.
+  rw=$(rustwright_bin)
+  id=$(vm_field "$SESS_C" id)
+  tok=$(vm_field "$SESS_C" envd_token)
+  t0=$(now_ms)
+  if vm_browser_up "$id" "$tok" "$rw" && vm_bridge_start "$id" "$tok"; then
+    echo "  browser stack installed in $(( ($(now_ms) - t0) / 1000 )) s"
+  else
+    result 0 "the browser stack did not come up in the VM"
+    return
+  fi
+  GRANT_FN=_grant_coding_browser uc_open "$SESS_C2"
+  out=$(GRANT_FN=_grant_coding_browser chat "$SESS_C2" --timeout-secs 400 --prompt "Use the browser tools (find them with tool_search) to open http://localhost:8000/ and tell me the heading and the build line of the page, quoting them from what the browser shows.")
+  note_calls "$SESS_C2" "$out"
   nav=$(jq -r '[.tools[]|select(.name|test("browser_navigate"))][0].output // ""' <<<"$out")
   ms=$(uc_tool_ms "$out" 'browser_navigate')
   text=$(jq -r .text <<<"$out")
