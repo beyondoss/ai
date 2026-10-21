@@ -6144,7 +6144,10 @@ fetch it, `bundle.sha256` what it must hash to). `bundle.rs` does the rest:
   definition, through the replica's process-wide SSRF-checked egress client (the one grant MCP
   connectors use: `--mcp-allow-private` opens loopback for a test, and a literal internal address is
   refused otherwise). `http` and `https` are both accepted, because integrity is the hash, not the
-  transport. At most 64 MiB (`bundle::MAX_BYTES`), 120 s.
+  transport. At most 64 MiB (`bundle::MAX_BYTES`), 120 s. One fetch per hash is in flight in the
+  process: sessions opening together on a cold cache wait on a per-hash lock and reuse the first one's
+  unpacked copy (a failed fetch only releases the lock, so the next waiter tries for itself), which
+  holds the peak to one body per distinct hash rather than one per session.
 - **Verify, then unpack.** The hash of the bytes is checked **before** any is unpacked. The cache
   directory is `<TMPDIR>/agent-bundles/<sha256>`, built beside it as `.unpack-*` and renamed into place,
   so a directory that exists is a complete, verified copy; every session naming the same hash shares it

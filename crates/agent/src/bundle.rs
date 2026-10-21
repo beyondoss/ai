@@ -15,8 +15,10 @@
 //! times are ignored. [`BundleFs`] then serves the copy read-only at the grant's `workspace_root`, so
 //! the definition's paths mean what they would in a sandbox that holds the same files.
 
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -53,6 +55,50 @@ pub async fn ensure(
         return Ok(dest);
     }
     let egress = egress.ok_or("bundle: this replica has no egress client to fetch it with")?;
+    // One fetch per hash in flight in this process: the others wait here and find the unpacked copy.
+    // A failed attempt just releases the lock, so the next waiter tries for itself.
+    let flight = flight(&dest);
+    let turn = flight.lock().await;
+    let result = fetch_and_install(root, &dest, bundle, egress).await;
+    drop(turn);
+    release(&dest, flight);
+    result
+}
+
+/// The lock for fetching the bundle that unpacks to `dest`.
+fn flight(dest: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    FLIGHTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(dest.to_path_buf())
+        .or_default()
+        .clone()
+}
+
+/// Forget `dest`'s lock once nobody else holds or waits on it.
+fn release(dest: &Path, flight: Arc<tokio::sync::Mutex<()>>) {
+    let mut flights = FLIGHTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The map's handle and ours: no waiter has cloned it.
+    if Arc::strong_count(&flight) == 2 {
+        flights.remove(dest);
+    }
+}
+
+type Flights = std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>;
+
+static FLIGHTS: std::sync::LazyLock<Flights> = std::sync::LazyLock::new(Default::default);
+
+async fn fetch_and_install(
+    root: &Path,
+    dest: &Path,
+    bundle: &Bundle,
+    egress: &crate::tools::mcp::McpEgress,
+) -> Result<PathBuf, String> {
+    if dest.is_dir() {
+        return Ok(dest.to_path_buf());
+    }
     let bytes = egress
         .fetch(&bundle.url, MAX_BYTES)
         .await
@@ -64,7 +110,7 @@ pub async fn ensure(
             bundle.sha256
         ));
     }
-    let root = root.to_path_buf();
+    let (root, dest) = (root.to_path_buf(), dest.to_path_buf());
     tokio::task::spawn_blocking(move || install(&root, &dest, &bytes))
         .await
         .map_err(|e| format!("bundle: unpacking failed: {e}"))?
@@ -435,6 +481,49 @@ mod tests {
         install(root.path(), &dest, &special("l", b'2', "/etc")).unwrap_err();
         assert!(!dest.exists());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    fn egress() -> crate::tools::mcp::McpEgress {
+        crate::tools::mcp::McpEgress::new(crate::tools::web::ssrf::EgressPolicy::new(true, &[]))
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sessions_opening_together_on_a_cold_cache_fetch_the_bundle_once() {
+        use beyond_ai_test_support::bundle::{BundleServer, sha256_hex};
+        let bytes = tar(&[file("AGENTS.md", "hello")]);
+        let server = BundleServer::start(bytes.clone());
+        let bundle = Bundle {
+            url: server.url.clone(),
+            sha256: sha256_hex(&bytes),
+        };
+        let root = tempfile::tempdir().unwrap();
+        let egress = egress();
+        let opens = (0..16).map(|_| ensure(root.path(), &bundle, Some(&egress)));
+        for dir in futures::future::join_all(opens).await {
+            assert!(dir.unwrap().join("AGENTS.md").is_file());
+        }
+        assert_eq!(server.hits(), 1, "one fetch for one hash");
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_does_not_poison_the_next_attempt() {
+        use beyond_ai_test_support::bundle::{BundleServer, sha256_hex};
+        let bytes = tar(&[file("AGENTS.md", "hello")]);
+        let server = BundleServer::start(bytes.clone());
+        let mut bundle = Bundle {
+            url: server.url.clone(),
+            sha256: sha256_hex(&bytes),
+        };
+        let root = tempfile::tempdir().unwrap();
+        let egress = egress();
+        let good = bundle.url.clone();
+        bundle.url = "http://127.0.0.1:1/agent.tar".into();
+        ensure(root.path(), &bundle, Some(&egress))
+            .await
+            .unwrap_err();
+        bundle.url = good;
+        ensure(root.path(), &bundle, Some(&egress)).await.unwrap();
     }
 
     #[tokio::test]
