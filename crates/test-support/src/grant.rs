@@ -36,6 +36,15 @@ pub struct Claims {
     pub exp: u64,
     /// The optional `limits` claim. `None` mints byte-for-byte as before the claim existed.
     pub limits: Option<Limits>,
+    /// The optional `bundle` claim. `None` mints byte-for-byte as before the claim existed.
+    pub bundle: Option<Bundle>,
+}
+
+/// The `bundle` claim: where the agent's definition is fetched from and the hash it must have.
+#[derive(Clone)]
+pub struct Bundle {
+    pub url: String,
+    pub sha256: String,
 }
 
 /// The `limits` claim: ceilings a tenant's own `AGENTS.md` and its client's commands cannot exceed.
@@ -192,9 +201,16 @@ fn payload_json(c: &Claims, sealed: &str) -> String {
         .collect();
         format!(",\"limits\":{{{}}}", fields.join(","))
     });
+    let bundle = c.bundle.as_ref().map_or_else(String::new, |b| {
+        format!(
+            ",\"bundle\":{{\"url\":{},\"sha256\":{}}}",
+            q(&b.url),
+            q(&b.sha256)
+        )
+    });
     format!(
         "{{\"tenant\":{},\"session_id\":{},\"home_shard\":{},\"workspace_root\":{},\"exec_url\":{},\
-         \"mcp\":[{}],\"exp\":{}{limits},\"sealed\":{}}}",
+         \"mcp\":[{}],\"exp\":{}{limits}{bundle},\"sealed\":{}}}",
         q(&c.tenant),
         q(&c.session_id),
         q(&c.home_shard),

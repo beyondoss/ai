@@ -31,6 +31,9 @@ pub enum Mode {
     Service(Arc<ServiceSession>),
 }
 
+/// The built-in tools that act in the session's sandbox (`bash_job` rides with `bash`).
+const SANDBOX_TOOLS: &[&str] = &["bash", "read", "write", "edit", "ls", "grep", "find"];
+
 impl Mode {
     /// The process's mode, from whether `--service` was given.
     pub fn process(service: bool) -> Self {
@@ -159,7 +162,36 @@ impl Mode {
         max_response_bytes: usize,
     ) -> Option<crate::exec_endpoint::Connect> {
         self.service()
+            .filter(|service| service.has_sandbox())
             .map(|service| service.lazy_exec(max_response_bytes))
+    }
+
+    /// `exclude` plus every tool that acts in a sandbox, for a session whose grant names none (a
+    /// bundle with no `exec_url`): those tools are not offered, rather than offered to fail.
+    pub(crate) fn without_sandbox_tools(
+        &self,
+        exclude: Option<Vec<String>>,
+    ) -> Option<Vec<String>> {
+        match self.service() {
+            Some(service) if !service.has_sandbox() => {
+                let mut exclude = exclude.unwrap_or_default();
+                exclude.extend(SANDBOX_TOOLS.iter().map(|t| (*t).to_owned()));
+                Some(exclude)
+            }
+            _ => exclude,
+        }
+    }
+
+    /// Fetch, verify and unpack the grant's bundle before the session reads its definition. Only
+    /// the first session to name a hash pays for it.
+    pub(crate) async fn load_bundle(
+        &self,
+        egress: Option<&crate::tools::mcp::McpEgress>,
+    ) -> Result<(), String> {
+        match self.service() {
+            Some(service) => service.load_bundle(egress).await,
+            None => Ok(()),
+        }
     }
 
     /// The sandbox's `$HOME` as last seen, once probed.
@@ -505,7 +537,7 @@ impl Mode {
             return Vec::new();
         };
         let (connectors, warnings) = crate::service::workspace_mcp(
-            exec.backend().as_ref(),
+            service.definition_fs(exec.backend()).as_ref(),
             std::path::Path::new(service.workspace_root()),
         )
         .await;
@@ -517,8 +549,13 @@ impl Mode {
 
     /// Whether a sandbox snapshot sits beside the transcript. When the saved one is behind what the
     /// session knows it is rewritten at the top of the loop, once the session's directory exists.
+    /// Never for a bundle session: its definition is a local read, and it is never behind.
     pub(crate) fn keeps_sandbox_snapshot(&self) -> bool {
-        !self.is_local()
+        match self {
+            Mode::Local => false,
+            Mode::Replica => true,
+            Mode::Service(service) => service.bundle().is_none(),
+        }
     }
 
     /// What the session last learned about its sandbox, if it reopens one.
@@ -529,7 +566,7 @@ impl Mode {
         context_files: bool,
     ) -> Option<Snapshot> {
         match (self, session_file) {
-            (Mode::Service(service), Some(file)) => {
+            (Mode::Service(service), Some(file)) if service.bundle().is_none() => {
                 service.load_snapshot(file, session_id, context_files)
             }
             _ => None,
@@ -546,7 +583,10 @@ impl Mode {
         let service = self.service()?;
         Some(
             service
-                .resources(exec.backend().as_ref(), context_files)
+                .resources(
+                    service.definition_fs(exec.backend()).as_ref(),
+                    context_files,
+                )
                 .await,
         )
     }
@@ -561,6 +601,9 @@ impl Mode {
         resources: &Resources,
     ) -> Option<std::io::Result<()>> {
         let service = self.service()?;
+        if service.bundle().is_some() {
+            return None;
+        }
         let sandbox = service.sandbox()?;
         Some(service.save_snapshot(session_file, session_id, context_files, &sandbox, resources))
     }

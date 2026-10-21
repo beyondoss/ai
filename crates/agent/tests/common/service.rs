@@ -243,6 +243,7 @@ impl Service {
             mcp_managed: Vec::new(),
             exp: far_future(),
             limits: None,
+            bundle: None,
         }
     }
 

@@ -31,6 +31,7 @@ fn args(tamper: bool) -> MintArgs {
         exec_headers: vec![],
         connectors: vec![],
         limits: None,
+        bundle: None,
     }
 }
 

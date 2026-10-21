@@ -34,6 +34,12 @@
 //! attaches its exec target lazily ([`ServiceSession::lazy_exec`]), builds its prompt from the saved
 //! set, and sends nothing until a tool needs the sandbox; the probe then runs first, once.
 //!
+//! **Or from its bundle.** A grant that carries a [`Bundle`](crate::grant::Bundle) makes the agent a
+//! deployment: [`ServiceSession::load_bundle`] fetches, verifies and unpacks it
+//! ([`crate::bundle`]), and everything above is read from that copy instead, with no exec request.
+//! A bundle grant with an empty `exec_url` has no sandbox at all
+//! ([`ServiceSession::has_sandbox`]): no probe, and no tool that would need one.
+//!
 //! **Its connectors come from its grant.** [`ServiceSession::mcp`] dials the grant's MCP list with the
 //! sealed per-connector headers, per session, so one tenant's servers — and one tenant's elicitations
 //! — never reach another's.
@@ -243,6 +249,10 @@ pub fn authorize(
         ));
     }
 
+    if grant.bundle.as_ref().is_some_and(|b| !b.is_well_formed()) {
+        return Err(Refusal::BadRequest("the session grant's bundle is invalid"));
+    }
+
     let shard = shard_of(session_id, &grant.home_shard);
     if !is_shard_name(shard) {
         return Err(Refusal::BadRequest("the session id's shard is invalid"));
@@ -266,6 +276,7 @@ pub fn authorize(
         memory_dir,
         codec,
         sandbox: RwLock::new(None),
+        bundle_dir: std::sync::OnceLock::new(),
     })
 }
 
@@ -305,6 +316,8 @@ pub struct ServiceSession {
     /// Filled by [`Self::connect_exec`] (or, until it runs, seeded from the session's
     /// [`Snapshot`]); read by the tool builds after it.
     sandbox: RwLock<Option<Sandbox>>,
+    /// The unpacked [`Bundle`](crate::grant::Bundle), once [`Self::load_bundle`] has put it there.
+    bundle_dir: std::sync::OnceLock<PathBuf>,
 }
 
 impl ServiceSession {
@@ -495,6 +508,47 @@ impl ServiceSession {
         })
     }
 
+    /// Whether the grant names a sandbox. Only a bundle grant may omit it: without one there is
+    /// nothing to read the definition from, so an empty `exec_url` stays a probe that fails.
+    pub fn has_sandbox(&self) -> bool {
+        self.bundle().is_none() || !self.grant.exec_url.is_empty()
+    }
+
+    /// The grant's bundle, if the agent is a deployment.
+    pub fn bundle(&self) -> Option<&crate::grant::Bundle> {
+        self.grant.bundle.as_ref()
+    }
+
+    /// Fetch, verify and unpack the grant's bundle (a no-op without one, and a cache hit when another
+    /// session already unpacked the same hash). An error ends the session's open: there is no other
+    /// definition to fall back to.
+    pub async fn load_bundle(
+        &self,
+        egress: Option<&crate::tools::mcp::McpEgress>,
+    ) -> Result<(), String> {
+        let Some(bundle) = self.bundle() else {
+            return Ok(());
+        };
+        let dir = crate::bundle::ensure(&crate::bundle::cache_root(), bundle, egress).await?;
+        let _ = self.bundle_dir.set(dir);
+        Ok(())
+    }
+
+    /// What this session's definition is read through: its bundle, served read-only at the workspace
+    /// root, or `sandbox` when it has none.
+    pub fn definition_fs(
+        &self,
+        sandbox: Arc<dyn crate::tools::fs::FsBackend>,
+    ) -> Arc<dyn crate::tools::fs::FsBackend> {
+        match self.bundle_dir.get() {
+            Some(dir) => Arc::new(crate::bundle::BundleFs::new(
+                Path::new(self.workspace_root()),
+                dir,
+            )),
+            None => sandbox,
+        }
+    }
+
     /// Where this session's [`Snapshot`] lives: beside its transcript — inside a segmented
     /// session's own directory, which moves, trashes and deletes whole.
     fn snapshot_path(session_file: &Path) -> PathBuf {
@@ -573,7 +627,8 @@ impl ServiceSession {
         context_files: bool,
     ) -> Resources {
         let root = Path::new(self.workspace_root());
-        let sandbox = self.sandbox();
+        // A bundle holds the whole definition: the sandbox's `$HOME` is not part of it.
+        let sandbox = self.sandbox().filter(|_| self.bundle_dir.get().is_none());
         let home = sandbox.as_ref().map(|s| Path::new(s.home.as_str()));
         let (skills, skill_collisions) =
             crate::skills::discover_via(backend, &skill_roots(root, home)).await;
@@ -1213,6 +1268,7 @@ mod tests {
             exp: 0,
             code_mode: false,
             limits: Default::default(),
+            bundle: None,
             secrets: serde_json::from_str(
                 r#"{"exec_headers":[],"mcp_headers":{},"gateway_key":"k","dek":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}"#,
             )
@@ -1226,6 +1282,7 @@ mod tests {
             memory_dir: PathBuf::from("/mnt/efs/a/t1/memory"),
             codec,
             sandbox: RwLock::new(None),
+            bundle_dir: std::sync::OnceLock::new(),
         }
     }
 

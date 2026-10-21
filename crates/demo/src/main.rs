@@ -79,6 +79,10 @@ enum Cmd {
         /// The grant's `limits.max_steps` ceiling.
         #[arg(long)]
         limits_max_steps: Option<u32>,
+        /// The grant's `bundle` claim, `url=sha256hex`: the agent folder as a plain tar the replica
+        /// fetches and verifies. With it, `--exec-url` may be empty (a session with no sandbox).
+        #[arg(long)]
+        bundle: Option<String>,
     },
     /// Unseal the grant in DEMO_GRANT and print what it holds, without the secrets: connector names,
     /// header names, and whether the string in DEMO_NEEDLE is anywhere inside.
@@ -167,6 +171,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             limits_models,
             limits_tools,
             limits_max_steps,
+            bundle,
         } => {
             let connectors = connectors(&mcp, &mcp_sandbox, &mcp_managed, &mcp_header)?;
             let exec_headers = exec_header
@@ -190,6 +195,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         tools: limits_tools,
                         max_steps: limits_max_steps,
                     });
+            let bundle = bundle
+                .map(|b| {
+                    let (url, sha256) = b.rsplit_once('=').ok_or("--bundle takes url=sha256hex")?;
+                    Ok::<_, String>(keys::Bundle {
+                        url: url.to_string(),
+                        sha256: sha256.to_string(),
+                    })
+                })
+                .transpose()?;
             let exec_bearer = if exec_bearer {
                 Some(std::env::var("DEMO_EXEC_BEARER").map_err(|_| "DEMO_EXEC_BEARER is not set")?)
             } else {
@@ -211,6 +225,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         exec_headers,
                         connectors,
                         limits,
+                        bundle,
                     }
                 )?
             );
