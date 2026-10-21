@@ -76,8 +76,31 @@ pub struct BundleServer {
     hits: Arc<AtomicUsize>,
 }
 
+/// How many responses are being held across all the servers sharing it, and the most at once.
+#[derive(Default)]
+pub struct Gauge {
+    now: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl Gauge {
+    pub fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+}
+
 impl BundleServer {
     pub fn start(bytes: Vec<u8>) -> Self {
+        Self::serve(bytes, None)
+    }
+
+    /// Like [`Self::start`], but each response is held for `hold` after its request arrives, counted
+    /// in `gauge`: a way to see how many fetches are in flight at once.
+    pub fn start_held(bytes: Vec<u8>, gauge: Arc<Gauge>, hold: std::time::Duration) -> Self {
+        Self::serve(bytes, Some((gauge, hold)))
+    }
+
+    fn serve(bytes: Vec<u8>, held: Option<(Arc<Gauge>, std::time::Duration)>) -> Self {
         let listener = crate::ports::listener();
         let url = format!("http://{}/agent.tar", listener.local_addr().unwrap());
         let hits = Arc::new(AtomicUsize::new(0));
@@ -87,6 +110,7 @@ impl BundleServer {
                 let Ok(mut stream) = conn else { break };
                 counter.fetch_add(1, Ordering::SeqCst);
                 let bytes = bytes.clone();
+                let held = held.clone();
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 4096];
                     let mut seen = Vec::new();
@@ -95,6 +119,12 @@ impl BundleServer {
                             Ok(0) | Err(_) => return,
                             Ok(n) => seen.extend_from_slice(&buf[..n]),
                         }
+                    }
+                    if let Some((gauge, hold)) = &held {
+                        let now = gauge.now.fetch_add(1, Ordering::SeqCst) + 1;
+                        gauge.peak.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(*hold);
+                        gauge.now.fetch_sub(1, Ordering::SeqCst);
                     }
                     let head = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/x-tar\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",

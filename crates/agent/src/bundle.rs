@@ -41,11 +41,25 @@ pub fn cache_root() -> PathBuf {
     std::env::temp_dir().join("agent-bundles")
 }
 
+/// How many bundles this process fetches at once. Each body is buffered whole (up to
+/// [`MAX_BYTES`]), so this bounds the peak at about 256 MiB however many tenants cold-start at once.
+const CONCURRENT_FETCHES: usize = 4;
+
 /// The unpacked bundle under `root`, fetching, verifying and unpacking it first if it is not there.
 pub async fn ensure(
     root: &Path,
     bundle: &Bundle,
     egress: Option<&crate::tools::mcp::McpEgress>,
+) -> Result<PathBuf, String> {
+    static FETCHES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(CONCURRENT_FETCHES);
+    ensure_limited(root, bundle, egress, &FETCHES).await
+}
+
+async fn ensure_limited(
+    root: &Path,
+    bundle: &Bundle,
+    egress: Option<&crate::tools::mcp::McpEgress>,
+    fetches: &tokio::sync::Semaphore,
 ) -> Result<PathBuf, String> {
     if !bundle.is_well_formed() {
         return Err("bundle: the grant's bundle is not a url and a lowercase sha256".into());
@@ -59,7 +73,7 @@ pub async fn ensure(
     // A failed attempt just releases the lock, so the next waiter tries for itself.
     let flight = flight(&dest);
     let turn = flight.lock().await;
-    let result = fetch_and_install(root, &dest, bundle, egress).await;
+    let result = fetch_and_install(root, &dest, bundle, egress, fetches).await;
     drop(turn);
     release(&dest, flight);
     result
@@ -95,10 +109,12 @@ async fn fetch_and_install(
     dest: &Path,
     bundle: &Bundle,
     egress: &crate::tools::mcp::McpEgress,
+    fetches: &tokio::sync::Semaphore,
 ) -> Result<PathBuf, String> {
     if dest.is_dir() {
         return Ok(dest.to_path_buf());
     }
+    let _permit = fetches.acquire().await.map_err(|e| e.to_string())?;
     let bytes = egress
         .fetch(&bundle.url, MAX_BYTES)
         .await
@@ -384,7 +400,7 @@ impl FsBackend for BundleFs {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use beyond_ai_test_support::bundle::{Entry, dir, file, tar};
+    use beyond_ai_test_support::bundle::{BundleServer, Entry, Gauge, dir, file, sha256_hex, tar};
 
     use super::*;
 
@@ -490,7 +506,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sessions_opening_together_on_a_cold_cache_fetch_the_bundle_once() {
-        use beyond_ai_test_support::bundle::{BundleServer, sha256_hex};
         let bytes = tar(&[file("AGENTS.md", "hello")]);
         let server = BundleServer::start(bytes.clone());
         let bundle = Bundle {
@@ -508,7 +523,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_fetch_does_not_poison_the_next_attempt() {
-        use beyond_ai_test_support::bundle::{BundleServer, sha256_hex};
         let bytes = tar(&[file("AGENTS.md", "hello")]);
         let server = BundleServer::start(bytes.clone());
         let mut bundle = Bundle {
@@ -524,6 +538,33 @@ mod tests {
             .unwrap_err();
         bundle.url = good;
         ensure(root.path(), &bundle, Some(&egress)).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn distinct_bundles_are_fetched_no_more_than_the_cap_at_a_time() {
+        let gauge = Arc::new(Gauge::default());
+        let egress = egress();
+        let root = tempfile::tempdir().unwrap();
+        let limit = tokio::sync::Semaphore::new(1);
+        let servers: Vec<_> = (0..4)
+            .map(|n| {
+                let bytes = tar(&[file("AGENTS.md", &format!("bundle {n}"))]);
+                let held = std::time::Duration::from_millis(100);
+                let server = BundleServer::start_held(bytes.clone(), gauge.clone(), held);
+                let bundle = Bundle {
+                    url: server.url.clone(),
+                    sha256: sha256_hex(&bytes),
+                };
+                (server, bundle)
+            })
+            .collect();
+        let opens = servers
+            .iter()
+            .map(|(_, b)| ensure_limited(root.path(), b, Some(&egress), &limit));
+        for dir in futures::future::join_all(opens).await {
+            dir.unwrap();
+        }
+        assert_eq!(gauge.peak(), 1, "one fetch at a time under a cap of one");
     }
 
     #[tokio::test]
