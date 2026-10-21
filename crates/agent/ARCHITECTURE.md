@@ -5681,7 +5681,10 @@ file is trusted, because it is the tenant's text and this is the replica: a `hea
 ignored with a warning (a name's headers come only from `secrets.mcp_headers`, so an entry the grant
 has no headers for connects without any), and `${VAR}` or `!cmd` is never expanded. A `command`
 entry is skipped with a warning (it would be a process on the replica; running it in the sandbox is
-not built). When the grant and the file name the same connector, the grant's wins, headers
+not built). The file contributes at most `mcp_json::MAX_HOSTED_CONNECTORS` (16) connectors, in
+file order: each is an outbound handshake from the shared replica dialed together at session start,
+and the rest are dropped with one warning; the grant's own connectors are not counted. When the
+grant and the file name the same connector, the grant's wins, headers
 included. The connectors are saved in the [snapshot](#sandbox-snapshot), so a reopened session
 dials them without waking the sandbox to read the file again; a changed file is picked up by the
 next session start, not by `reload`. Warnings go to the replica's log, like the rest of a

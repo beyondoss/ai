@@ -35,6 +35,13 @@ pub const FILE: &str = ".mcp.json";
 /// Larger than any real config; a bigger file is ignored rather than read whole.
 pub const MAX_BYTES: u64 = 256 * 1024;
 
+/// Most connectors a hosted session takes from the file. Each is an outbound handshake from the
+/// shared replica, dialed together at session start, and every tool it lists lands in the prompt;
+/// a real project config names a handful, so 16 leaves room without letting a tenant's file fan a
+/// session out to thousands of dials. Connectors from the session grant are not counted: those are
+/// the control plane's call.
+pub const MAX_HOSTED_CONNECTORS: usize = 16;
+
 enum Entry {
     Stdio {
         command: String,
@@ -133,6 +140,7 @@ pub fn local_servers(text: &str) -> (Vec<McpServerConfig>, Vec<String>) {
 pub fn hosted_connectors(text: &str) -> (Vec<McpConnector>, Vec<String>) {
     let (entries, mut warnings) = parse(text);
     let mut connectors = Vec::new();
+    let mut over_cap = 0usize;
     for (name, entry) in entries {
         if !crate::service::is_connector_name(&name) {
             warnings.push(format!("{FILE}: server `{name}` skipped: invalid name"));
@@ -142,6 +150,7 @@ pub fn hosted_connectors(text: &str) -> (Vec<McpConnector>, Vec<String>) {
             Entry::Stdio { .. } => warnings.push(format!(
                 "{FILE}: server `{name}` skipped: a `command` server is not run in a hosted session"
             )),
+            Entry::Http { .. } if connectors.len() >= MAX_HOSTED_CONNECTORS => over_cap += 1,
             Entry::Http { url, headers } => {
                 if !headers.is_empty() {
                     warnings.push(format!(
@@ -157,6 +166,12 @@ pub fn hosted_connectors(text: &str) -> (Vec<McpConnector>, Vec<String>) {
                 });
             }
         }
+    }
+    if over_cap > 0 {
+        warnings.push(format!(
+            "{FILE}: {over_cap} server(s) skipped: a hosted session takes at most \
+             {MAX_HOSTED_CONNECTORS} from the file"
+        ));
     }
     (connectors, warnings)
 }
@@ -263,5 +278,18 @@ mod tests {
         assert_eq!(connectors.len(), 1);
         assert_eq!(connectors[0].name, "fine");
         assert_eq!(warnings.len(), 2, "{warnings:?}");
+    }
+
+    #[test]
+    fn hosted_connectors_stop_at_the_cap_and_say_so() {
+        let n = MAX_HOSTED_CONNECTORS + 5;
+        let servers: Vec<String> = (0..n)
+            .map(|i| format!(r#""s{i}": {{"url": "https://a/{i}"}}"#))
+            .collect();
+        let (connectors, warnings) =
+            hosted_connectors(&format!(r#"{{"mcpServers": {{{}}}}}"#, servers.join(",")));
+        assert_eq!(connectors.len(), MAX_HOSTED_CONNECTORS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("5 server(s) skipped"), "{warnings:?}");
     }
 }
