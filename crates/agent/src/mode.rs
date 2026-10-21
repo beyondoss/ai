@@ -32,7 +32,8 @@ pub enum Mode {
 }
 
 /// The built-in tools that act in the session's sandbox (`bash_job` rides with `bash`).
-const SANDBOX_TOOLS: &[&str] = &["bash", "read", "write", "edit", "ls", "grep", "find"];
+/// `read` is not among them: with no sandbox it reads the bundle (see [`Mode::bundle_fs`]).
+const SANDBOX_TOOLS: &[&str] = &["bash", "write", "edit", "ls", "grep", "find"];
 
 impl Mode {
     /// The process's mode, from whether `--service` was given.
@@ -180,6 +181,12 @@ impl Mode {
             }
             _ => exclude,
         }
+    }
+
+    /// The read-only filesystem of a session with a bundle and no sandbox: what `read` sees instead
+    /// of the (absent) sandbox, confined to the bundle.
+    pub(crate) fn bundle_fs(&self) -> Option<Arc<dyn crate::tools::fs::FsBackend>> {
+        self.service()?.bundle_fs()
     }
 
     /// Fetch, verify and unpack the grant's bundle before the session reads its definition. Only

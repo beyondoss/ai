@@ -6145,8 +6145,9 @@ fetch it, `bundle.sha256` what it must hash to). `bundle.rs` does the rest:
   so a directory that exists is a complete, verified copy; every session naming the same hash shares it
   and fetches nothing, and a session that loses the rename race to another one succeeds with theirs.
   Unpacking writes regular files and directories only. An absolute path, a `..` component, a
-  backslash, a symlink, a hardlink, a device or FIFO, a pax/GNU extension header (use `ustar`, names up
-  to 100 bytes plus a 155-byte prefix), a corrupt header checksum, a truncated archive or more than
+  backslash, a symlink, a hardlink, a device or FIFO, a pax or GNU extension header (long-name records are not
+  interpreted: build the bundle with `tar --format=ustar`, names up to 100 bytes plus a 155-byte
+  prefix, which the error says), a corrupt header checksum, a truncated archive or more than
   64 MiB of content refuses the **whole** bundle; modes, owners and times are ignored.
 - **Fails closed.** A fetch, hash or unpack failure is the session's open failing (an `error` frame
   naming the cause, as an unreachable sandbox does). There is no fallback to the sandbox's copy or to
@@ -6160,11 +6161,17 @@ fetch it, `bundle.sha256` what it must hash to). `bundle.rs` does the rest:
   connectors win over `.mcp.json`, and `limits` and the CLI/fleet rules apply to the frontmatter as
   before.
 - **No sandbox.** A bundle grant whose `exec_url` is empty has no sandbox
-  (`ServiceSession::has_sandbox`): no probe is sent, and `bash`, `read`, `write`, `edit`, `ls`, `grep`
-  and `find` are excluded (`Mode::without_sandbox_tools`, applied beside `apply_limits`) rather than
-  offered to fail. `web`, `todo`, `memory`, the grant's MCP connectors and subagents remain. Skills
-  are not advertised in such a session: they are read with `read`, which it does not have. An empty
-  `exec_url` without a bundle is still a sandbox that fails its probe.
+  (`ServiceSession::has_sandbox`): no probe is sent, and `bash`, `write`, `edit`, `ls`, `grep` and
+  `find` are excluded (`Mode::without_sandbox_tools`, applied beside `apply_limits`) rather than
+  offered to fail. `read` stays, scoped to the bundle: `build_tools` hands it (and a subagent's
+  copy) `Mode::bundle_fs` instead of the exec cell's backend, so it reads the bundle read-only at the
+  workspace root and a path outside it, or one climbing out with `..`, does not exist. That is what
+  lets skills work: they are advertised as `skill:<name>`, and `read skill:<name>[/<file>]` opens the
+  `SKILL.md` and the files it references from the bundle, with no exec request. `web`, `todo`,
+  `memory`, the grant's MCP connectors and subagents remain. The folder's own `tools:` allow-list
+  still governs: one that omits `read` leaves the session without it, and without skills (they are
+  only advertised when `read` is registered), exactly as in a sandbox session. An empty `exec_url`
+  without a bundle is still a sandbox that fails its probe.
 - **Skill scripts.** When a sandbox does exist, how the bundle's files reach it (so a skill's script
   can run there) is the control plane's job; the replica never copies the bundle into a sandbox. The
   demo's `mint-grant --bundle url=sha256` carries the claim.

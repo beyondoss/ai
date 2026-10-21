@@ -24,7 +24,8 @@ use sha2::{Digest, Sha256};
 use crate::grant::Bundle;
 use crate::tools::fs::local::LocalFs;
 use crate::tools::fs::{
-    DirEntry, FsBackend, FsError, GlobOutcome, GlobQuery, Meta, SearchOutcome, SearchQuery,
+    DirEntry, FsBackend, FsError, GlobOutcome, GlobQuery, Meta, PathWorld, SearchOutcome,
+    SearchQuery,
 };
 
 /// The most a bundle may weigh, as fetched and as unpacked.
@@ -142,6 +143,12 @@ pub fn unpack(bytes: &[u8], dest: &Path) -> Result<(), String> {
                     std::fs::create_dir_all(dest.join(rel))
                         .map_err(|e| format!("bundle: creating {path}: {e}"))?;
                 }
+            }
+            b'x' | b'g' | b'L' | b'K' => {
+                return Err(format!(
+                    "bundle: unsafe entry {path}: pax and GNU extension headers are not accepted; \
+                     build the bundle with `tar --format=ustar`"
+                ));
             }
             other => {
                 return Err(format!(
@@ -301,6 +308,11 @@ impl FsBackend for BundleFs {
         }
     }
 
+    fn world(&self) -> PathWorld {
+        // Not this host's filesystem: paths resolve lexically, and `~` means nothing here.
+        PathWorld::Remote { home: None }
+    }
+
     async fn glob(&self, q: &GlobQuery) -> Result<GlobOutcome, FsError> {
         let Some(real) = self.inside(&q.root) else {
             return Ok(GlobOutcome::default());
@@ -380,6 +392,10 @@ mod tests {
         ] {
             let err = unpacked(&bytes).unwrap_err();
             assert!(err.contains("unsafe entry"), "{name}: {err}");
+        }
+        for kind in [b'x', b'g', b'L', b'K'] {
+            let err = unpacked(&special("p", kind, "")).unwrap_err();
+            assert!(err.contains("tar --format=ustar"), "{err}");
         }
     }
 

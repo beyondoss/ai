@@ -181,7 +181,7 @@ pub(super) fn build_subagent_ctx(
             // pointed at *now*. Handing down `None` here was a sandbox escape — the parent's tools
             // ran in the sandbox while any `subagent` it spawned ran on the host, so the model could
             // reach around the isolation simply by delegating.
-            fs_backend: Some(exec.backend()),
+            fs_backend: Some(cfg.mode().bundle_fs().unwrap_or_else(|| exec.backend())),
             command_runner: Some(exec.runner()),
             code_mode: cfg.code_mode,
             mcp_loading: cfg.mcp_loading,
@@ -589,7 +589,7 @@ pub(super) fn build_tools(
         // a target captured here would leave the incoming session on the previous one's machine —
         // in a multi-tenant server, one tenant's tools inside another tenant's sandbox. The tools read
         // the cell per call, so a re-point cannot be missed by a rebuild that never happens.
-        fs_backend: Some(exec.backend()),
+        fs_backend: Some(cfg.mode().bundle_fs().unwrap_or_else(|| exec.backend())),
         command_runner: Some(exec.runner()),
         skills,
         // The session's, not this registry's: a rebuild (`set_model`) keeps the jobs, and the idle
