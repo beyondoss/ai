@@ -247,6 +247,7 @@ impl Edge {
             mcp_managed: Vec::new(),
             exp,
             limits: None,
+            bundle: None,
         };
         let secrets = Secrets {
             exec_headers: Vec::new(),

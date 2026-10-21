@@ -94,6 +94,13 @@ pub struct Limits {
     pub max_steps: Option<u32>,
 }
 
+/// The grant's `bundle` claim: the agent folder, as an immutable tar named by its hash.
+#[derive(Clone, Debug)]
+pub struct Bundle {
+    pub url: String,
+    pub sha256: String,
+}
+
 #[derive(Default)]
 pub struct MintArgs {
     pub tenant: String,
@@ -109,6 +116,7 @@ pub struct MintArgs {
     pub exec_headers: Vec<(String, String)>,
     pub connectors: Vec<Connector>,
     pub limits: Option<Limits>,
+    pub bundle: Option<Bundle>,
 }
 
 /// The secrets a grant is minted from: what `up.sh` put in SSM and `demo.sh` hands over.
@@ -167,6 +175,13 @@ pub fn mint_grant(keys: &GrantKeys, a: &MintArgs) -> Res<String> {
                 models: l.models.clone(),
                 tools: l.tools.clone(),
                 max_steps: l.max_steps,
+            }),
+        bundle: a
+            .bundle
+            .as_ref()
+            .map(|b| beyond_ai_test_support::grant::Bundle {
+                url: b.url.clone(),
+                sha256: b.sha256.clone(),
             }),
     };
     let mut mcp_headers = std::collections::BTreeMap::new();

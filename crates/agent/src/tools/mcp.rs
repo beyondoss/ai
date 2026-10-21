@@ -3253,6 +3253,38 @@ impl McpEgress {
         })
     }
 
+    /// GET `url` through this egress and return its body, refusing one over `max` bytes. For the
+    /// agent bundle a grant names; its integrity is the caller's hash check, not the transport's.
+    pub(crate) async fn fetch(&self, url: &str, max: usize) -> Result<Vec<u8>, String> {
+        self.check(url)?;
+        let mut response = self
+            .client
+            .get(url)
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await
+            .map_err(|e| e.without_url().to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("HTTP {}", response.status()));
+        }
+        let too_big = || format!("more than {max} bytes");
+        if response.content_length().is_some_and(|n| n > max as u64) {
+            return Err(too_big());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| e.without_url().to_string())?
+        {
+            if body.len() + chunk.len() > max {
+                return Err(too_big());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
     /// Whether a connector URL may be dialed at all. The message names the URL without its query
     /// string and never mentions the `web` tool's own flags, which have no effect here.
     fn check(&self, url: &str) -> Result<(), String> {

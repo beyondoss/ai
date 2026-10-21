@@ -205,6 +205,11 @@ async fn setup_exec(
     // sandbox for its prompt anyway, and one that doesn't answer **ends the session** rather than
     // leaving it running with nowhere for its tools to go. That error propagates out of
     // `serve_session`, which the daemon turns into an error frame on every attached connection.
+    // A bundle grant's definition is fetched, verified and unpacked before anything reads it; a
+    // failure ends the open, as an unreachable sandbox does.
+    mode.load_bundle(cfg.mcp_http.as_ref()).await.map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> { format!("service: {e}").into() },
+    )?;
     let sandbox_snapshot = mode.load_sandbox_snapshot(
         persistence.session_file(),
         persistence.session_id(),
@@ -502,6 +507,7 @@ async fn setup_prompt(
     }
     // The grant's ceilings come last, so nothing above (a flag, the file) can exceed them.
     (cfg.tools, cfg.max_steps) = mode.apply_limits(cfg.tools.take(), cfg.max_steps);
+    cfg.exclude_tools = mode.without_sandbox_tools(cfg.exclude_tools.take());
     let sandbox_system = discovered.system.take();
     let sandbox_append = discovered.append_system.take();
     timing.mark("discover prompt templates/skills");

@@ -109,7 +109,41 @@ pub struct Grant {
     /// Ceilings on what the session may be configured to do. Absent claim = no ceiling. See
     /// [`Limits`].
     pub limits: Limits,
+    /// Where this session's agent definition comes from, when it is a deployment rather than a folder
+    /// in the sandbox. See [`Bundle`].
+    pub bundle: Option<Bundle>,
     pub secrets: GrantSecrets,
+}
+
+/// The agent as a deployment: an immutable plain tar of the agent folder, named by the SHA-256 of its
+/// bytes the way an image is named by its digest. The replica fetches `url`, refuses bytes whose hash
+/// is not `sha256`, and reads the session's definition (`AGENTS.md`, `.mcp.json`, skills, subagents)
+/// from the unpacked copy instead of through the sandbox; see [`crate::bundle`].
+///
+/// With a bundle, `exec_url` may be empty: the session then has no sandbox and offers no sandbox tools.
+///
+/// **A replica must accept this claim before any edge emits it** ([`Payload`] is
+/// `deny_unknown_fields`). Omitted from the wire when absent, so a grant without it mints byte-for-byte
+/// as before and the golden vectors do not move.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[serde(deny_unknown_fields)]
+pub struct Bundle {
+    pub url: String,
+    /// 64 lowercase hex digits.
+    pub sha256: String,
+}
+
+impl Bundle {
+    /// Whether `sha256` is the shape of a digest: it names a cache directory, so nothing else may.
+    pub fn is_well_formed(&self) -> bool {
+        !self.url.is_empty()
+            && self.sha256.len() == 64
+            && self
+                .sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
 }
 
 /// Ceilings the grant puts on a session, whatever its `AGENTS.md` or its client asks for. Every field is
@@ -312,6 +346,9 @@ struct Payload {
     /// grant mints byte-for-byte as before (see [`Limits`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     limits: Option<Limits>,
+    /// Absent unless the agent is a deployment; omitted when absent (see [`Bundle`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bundle: Option<Bundle>,
     sealed: String,
 }
 
@@ -450,6 +487,7 @@ impl GrantVerifier {
             exp: payload.exp,
             code_mode: payload.code_mode,
             limits: payload.limits.unwrap_or_default(),
+            bundle: payload.bundle,
             secrets,
         })
     }
@@ -672,6 +710,8 @@ mod tests {
         code_mode: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limits: Option<Limits>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bundle: Option<Bundle>,
     }
 
     impl Claims {
@@ -686,6 +726,7 @@ mod tests {
                 exp: self.exp,
                 code_mode: self.code_mode,
                 limits: self.limits,
+                bundle: self.bundle,
                 sealed,
             }
         }
@@ -701,6 +742,7 @@ mod tests {
                 exp: grant.exp,
                 code_mode: grant.code_mode,
                 limits: (grant.limits != Limits::default()).then(|| grant.limits.clone()),
+                bundle: grant.bundle.clone(),
             }
         }
     }
@@ -1206,6 +1248,69 @@ mod tests {
         );
         // A field the replica doesn't know inside `limits` is refused like any unknown claim.
         assert!(!built.payload_json.contains("allow_all"));
+    }
+
+    #[test]
+    fn a_grant_minted_before_the_bundle_claim_existed_has_no_bundle() {
+        let fx = fixture();
+        assert!(!fx.payload_json.contains("bundle"));
+        assert_eq!(
+            verifier(&fx).verify(&fx.token, fx.now).unwrap().bundle,
+            None
+        );
+    }
+
+    #[test]
+    fn a_bundle_rides_the_signed_claims_and_refuses_unknown_fields() {
+        let bundle = Bundle {
+            url: "https://bundles.example/agent.tar".into(),
+            sha256: "ab".repeat(32),
+        };
+        let mut inputs = fixture();
+        inputs.claims.bundle = Some(bundle.clone());
+        let built = build(&inputs);
+        let grant = verifier(&built).verify(&built.token, built.now).unwrap();
+        assert_eq!(grant.bundle, Some(bundle.clone()));
+        assert!(bundle.is_well_formed());
+        assert!(
+            built.payload_json.contains(
+                "\"bundle\":{\"url\":\"https://bundles.example/agent.tar\",\"sha256\":\"abab"
+            ),
+            "{}",
+            built.payload_json
+        );
+        // A field the replica doesn't know inside `bundle` is refused like any unknown claim.
+        let unknown = built
+            .payload_json
+            .replace("\"sha256\"", "\"mirror\":\"x\",\"sha256\"");
+        let signing_key = SigningKey::from_bytes(&hex32(&built.signing_seed_hex));
+        let token = sign(&signing_key, built.kid, unknown.as_bytes());
+        assert!(matches!(
+            verifier(&built).verify(&token, built.now),
+            Err(GrantError::BadClaims)
+        ));
+    }
+
+    #[test]
+    fn only_a_lowercase_sha256_digest_names_a_bundle() {
+        let ok = |sha256: &str| {
+            Bundle {
+                url: "https://x.test/a.tar".into(),
+                sha256: sha256.into(),
+            }
+            .is_well_formed()
+        };
+        assert!(ok(&"0f".repeat(32)));
+        for bad in [
+            "",
+            "abc",
+            &"0F".repeat(32),
+            &"0g".repeat(32),
+            &"0f".repeat(33),
+            "../../etc",
+        ] {
+            assert!(!ok(bad), "{bad}");
+        }
     }
 
     #[test]

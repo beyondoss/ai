@@ -15,6 +15,7 @@
 // `publish = false` and reachable only from tests and the simulator.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod bundle;
 pub mod exec_mock;
 pub mod grant;
 pub mod ports;
