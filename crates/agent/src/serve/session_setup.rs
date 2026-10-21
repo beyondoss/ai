@@ -201,7 +201,8 @@ async fn setup_exec(
     // needs it, once however many ask at the same time (`ExecCell::set_lazy`). A sandbox sleeps when
     // idle and any exec request wakes it, so a session that reopens with a snapshot of what it last
     // learned (below) sends nothing at all until it is used, and a probe that fails then is that
-    // tool call's error. A session with no snapshot — a new one — probes now, as it needs the
+    // tool call's error. A new session with a bundle does the same: its definition is a local read.
+    // A new session without one — no snapshot — probes now, as it needs the
     // sandbox for its prompt anyway, and one that doesn't answer **ends the session** rather than
     // leaving it running with nowhere for its tools to go. That error propagates out of
     // `serve_session`, which the daemon turns into an error frame on every attached connection.
@@ -223,6 +224,9 @@ async fn setup_exec(
             );
             match &sandbox_snapshot {
                 Some(snapshot) => mode.seed_sandbox(snapshot.sandbox.clone()),
+                // A bundle holds the whole definition, so nothing at open needs the sandbox:
+                // the first tool that does connects it, and a dead one is that call's error.
+                None if mode.has_bundle() => {}
                 None => {
                     exec_cell.connect().await.map_err(
                         |e| -> Box<dyn std::error::Error + Send + Sync> {
