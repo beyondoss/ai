@@ -5256,8 +5256,13 @@ skill/template paths, memory backend, session directory, model or gateway URL), 
   (`Sandbox`: home and shell). It is thrown away, and the next call probes again, when the target
   turns **suspect** — its runner raises a flag shared with the target (`HttpExecRunner::
   with_suspect_flag`, `ExecTarget::watching`) on a request the endpoint did not answer or refused
-  with a non-2xx status, the signs of a replaced sandbox; a timeout does not count — and on a session
-  switch (`reset_exec_endpoint!` installs a fresh connector). A grant's credentials are fixed for a
+  with a non-2xx status, the signs of a replaced sandbox — and on a session switch
+  (`reset_exec_endpoint!` installs a fresh connector). A timeout does not count, and neither does a
+  `400`/`422`, which declines this request as written (a strict front refusing the `stream` or `job`
+  extension) and says nothing of the sandbox; a refused streaming or jobs probe is an answer too
+  (the endpoint offers neither) and is cached like one, so only a probe that could not reach the
+  endpoint is asked again. Counting those refusals would rebuild the target, every probe again, on
+  each call. A grant's credentials are fixed for a
   session task's life, so a refreshed token arrives with a new task, which probes anew; the endpoint
   cannot be re-pointed (`set_exec_endpoint` is refused). A session with no [snapshot](#sandbox-snapshot)
   (a new one, or one saved by an older binary) connects at start, because building its prompt needs

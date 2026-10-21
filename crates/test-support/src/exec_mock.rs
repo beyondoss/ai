@@ -133,6 +133,9 @@ pub struct MockOptions {
     /// Answer 401 to any request that does not carry `Authorization: Bearer <this>`: an endpoint on
     /// the public internet, reached with the bearer its grant's exec headers carry. `None` accepts all.
     pub require_bearer: Option<String>,
+    /// Answer 400 to a request carrying `stream` or `job`: a front that validates strictly and
+    /// refuses the protocol's extensions instead of ignoring them as the spec says to.
+    pub refuses_extensions: bool,
 }
 
 /// One way per v1.4 conformance check for an endpoint to get the spec wrong. Each is a change to
@@ -202,6 +205,7 @@ impl Default for MockOptions {
             keep_delay: Duration::ZERO,
             faults: NotifyFaults::default(),
             require_bearer: None,
+            refuses_extensions: false,
         }
     }
 }
@@ -532,6 +536,12 @@ async fn serve_one(mut sock: tokio::net::TcpStream, shared: Shared) {
         headers,
         body: req.clone(),
     });
+    if shared.opts.refuses_extensions
+        && (req["stream"].as_bool() == Some(true) || req.get("job").is_some_and(Value::is_object))
+    {
+        respond_json(sock, 400, &json!({ "error": "unknown field" })).await;
+        return;
+    }
     if shared.opts.jobs && req.get("job").is_some_and(Value::is_object) {
         serve_job(sock, req, shared).await;
         return;

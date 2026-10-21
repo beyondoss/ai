@@ -1017,8 +1017,17 @@ impl HttpExecRunner {
         let status = resp.status();
         if !status.is_success() {
             // The endpoint refused the *request* — a bad URL, auth, a dead sandbox. Distinct from the
-            // command running and exiting non-zero, which is an ordinary result.
-            self.suspect();
+            // command running and exiting non-zero, which is an ordinary result. A `400`/`422` is
+            // the exception: the endpoint answered, and it is this request it declines as written
+            // (a strict front refusing the `stream`, `job` or `notify` extension it does not
+            // know). That says nothing of the sandbox, and treating it as if it did would rebuild
+            // the target — every probe again — on the very next call, forever.
+            if !matches!(
+                status,
+                reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+            ) {
+                self.suspect();
+            }
             let (body, _) = self.read_capped(resp).await?;
             // A `400` refuses the request as written (v1.4's refused `notify` among others), which
             // a caller may answer by sending another; anything else is an error of the endpoint's.
@@ -1290,7 +1299,14 @@ impl HttpExecRunner {
     pub async fn job_offer(&self) -> jobs_native::JobOffer {
         self.job_offer
             .get_or_try_init(|| async {
-                let offer = jobs_native::probe(self).await?;
+                let offer = match jobs_native::probe(self).await {
+                    Ok(offer) => offer,
+                    // A front that refuses the `job` field has answered: it offers nothing.
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                        jobs_native::JobOffer::default()
+                    }
+                    Err(e) => return Err(e),
+                };
                 if offer.native_jobs {
                     tracing::info!(url = %self.url, notify = offer.notify, "exec endpoint offers sandbox jobs (v1.3)");
                 } else if offer.baseline_notify {
@@ -1356,7 +1372,7 @@ impl HttpExecRunner {
     pub async fn streams(&self) -> bool {
         self.streams
             .get_or_try_init(|| async {
-                let resp = self
+                let resp = match self
                     .send(
                         "sh",
                         &["-c".to_string(), stream::PROBE_SCRIPT.to_string()],
@@ -1365,7 +1381,16 @@ impl HttpExecRunner {
                         None,
                         true,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(resp) => resp,
+                    // A front that refuses `stream` has answered: it does not stream. Only a probe
+                    // that could not reach it is asked again.
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                        return Ok::<bool, std::io::Error>(false);
+                    }
+                    Err(e) => return Err(e),
+                };
                 if !is_ndjson(&resp) {
                     return Ok::<bool, std::io::Error>(false);
                 }
