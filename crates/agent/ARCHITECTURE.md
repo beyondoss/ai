@@ -6150,7 +6150,9 @@ fetch it, `bundle.sha256` what it must hash to). `bundle.rs` does the rest:
   transport. At most 64 MiB (`bundle::MAX_BYTES`), 120 s. One fetch per hash is in flight in the
   process: sessions opening together on a cold cache wait on a per-hash lock and reuse the first one's
   unpacked copy (a failed fetch only releases the lock, so the next waiter tries for itself), which
-  holds the peak to one body per distinct hash rather than one per session.
+  holds the peak to one body per distinct hash rather than one per session. Distinct hashes are
+  limited too: at most 4 fetches run at once in the process (a semaphore around fetch and unpack), so
+  cold-starting many tenants buffers about 256 MiB at the worst, and the rest queue.
 - **Verify, then unpack.** The hash of the bytes is checked **before** any is unpacked. The cache
   directory is `<TMPDIR>/agent-bundles/<sha256>`, built beside it as `.unpack-*` and renamed into place,
   so a directory that exists is a complete, verified copy; every session naming the same hash shares it
