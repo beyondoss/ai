@@ -31,6 +31,14 @@ STUB = os.environ.get("FRONT_STUB", "/usr/local/bin/beyond-ai-demo")
 CA_FILE = os.environ.get("FRONT_CA_FILE", "/tmp/ca.pem")
 # A VM dies on its own after E2B_TIMEOUT (e2b.sh); an entry older than that points at nothing.
 VM_TTL = int(os.environ.get("E2B_TIMEOUT", "1800"))
+# An idle or stalled client holds a thread until it speaks; this bounds it. The agent's exec calls are
+# short requests (the long wait is the upstream stream, which this does not time), so two minutes is
+# generous.
+CLIENT_TIMEOUT = float(os.environ.get("FRONT_CLIENT_TIMEOUT", "120"))
+# Requests in flight at once, VM creation and streaming included. A demo runs a handful of sessions;
+# 64 leaves room for retries and refuses a flood instead of spawning a thread and a VM for each.
+MAX_INFLIGHT = int(os.environ.get("FRONT_MAX_INFLIGHT", "64"))
+inflight = threading.BoundedSemaphore(MAX_INFLIGHT)
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "host", "content-length"}
 
 sessions = {}  # session -> {"lock": Lock, "vm": dict | None, "born": float}
@@ -112,6 +120,7 @@ def vm_for(session, bundle):
 
 class Front(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = CLIENT_TIMEOUT
 
     def log_message(self, *a):
         pass
@@ -128,6 +137,15 @@ class Front(BaseHTTPRequestHandler):
         self.reply(200, {"ok": True}) if self.path == "/healthz" else self.reply(404, {"error": "not found"})
 
     def do_POST(self):
+        if not inflight.acquire(blocking=False):
+            self.close_connection = True  # the body is unread
+            return self.reply(503, {"error": "too many requests in flight"})
+        try:
+            self.forward()
+        finally:
+            inflight.release()
+
+    def forward(self):
         u = urlsplit(self.path)
         m = re.fullmatch(r"/exec/([A-Za-z0-9._-]+)", u.path)
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0))

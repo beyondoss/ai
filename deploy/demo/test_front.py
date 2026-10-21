@@ -6,6 +6,7 @@
 import http.client
 import os
 import stat
+import socket
 import subprocess
 import sys
 import tempfile
@@ -92,6 +93,30 @@ class FrontTest(unittest.TestCase):
         post(srv, "other")
         self.assertNotIn("old", front.sessions)
         self.assertFalse(os.path.exists(f"{VMDIR}/old.json"))
+        srv.shutdown()
+
+
+class CapsTest(unittest.TestCase):
+    def test_a_silent_client_is_disconnected(self):
+        self.assertEqual(front.Front.timeout, front.CLIENT_TIMEOUT)
+        front.Front.timeout = 0.5
+        srv = serve()
+        c = socket.create_connection(("127.0.0.1", srv.server_port))
+        c.settimeout(5)
+        self.assertEqual(c.recv(1), b"", "the server must close an idle connection")
+        c.close()
+        srv.shutdown()
+
+    def test_requests_past_the_cap_get_503(self):
+        os.environ["STUB_SLOW"] = "3"
+        front.inflight = threading.BoundedSemaphore(1)
+        srv = serve()
+        first = threading.Thread(target=post, args=(srv, "a"))
+        first.start()
+        time.sleep(1)  # "a" is now inside vm_for, holding the only slot
+        self.assertEqual(post(srv, "b"), 503)
+        first.join()
+        self.assertNotEqual(post(srv, "c"), 503, "the slot is released when a request ends")
         srv.shutdown()
 
 
