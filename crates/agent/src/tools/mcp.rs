@@ -180,6 +180,10 @@ struct Dial {
     /// Where a fresh `tools/list` from this server lands — see [`Relist`]. Shared by every handler
     /// the connection dials, so a redial's notifications reach the same place.
     relist: Relist,
+    /// The tools a bundle saved for this sandbox connector (`service::MCP_TOOLS_FILE`): advertised
+    /// at connect without dialing, then checked against the live list at the first real start. Held
+    /// for the session's life, within `service::MAX_SAVED_TOOLS`.
+    saved: Option<Arc<Vec<crate::tools::mcp_manifest::CachedTool>>>,
 }
 
 impl Default for Dial {
@@ -190,6 +194,7 @@ impl Default for Dial {
             apps: false,
             skills_changed: Arc::default(),
             relist: Relist::default(),
+            saved: None,
         }
     }
 }
@@ -2623,9 +2628,10 @@ pub async fn connect_granted(
     egress: &McpEgress,
     host: Arc<McpHost>,
     idle_reap_after: Duration,
+    saved: &BTreeMap<String, Vec<crate::tools::mcp_manifest::CachedTool>>,
 ) -> (McpTools, McpCatalog, Vec<String>) {
     let (jobs, refused, mut warnings) =
-        granted_jobs(connectors, secrets, egress, host, false, None);
+        granted_jobs(connectors, secrets, egress, host, false, None, saved);
     warnings.extend(
         refused
             .into_iter()
@@ -2647,7 +2653,15 @@ pub(crate) async fn connect_granted_each(
     idle_reap_after: Duration,
     only: Option<&[String]>,
 ) -> Vec<ServerConnect> {
-    let (jobs, refused, warnings) = granted_jobs(connectors, secrets, egress, host, true, only);
+    let (jobs, refused, warnings) = granted_jobs(
+        connectors,
+        secrets,
+        egress,
+        host,
+        true,
+        only,
+        &BTreeMap::new(),
+    );
     for warning in &warnings {
         tracing::warn!(%warning, "MCP Apps: a connector header was refused");
     }
@@ -2665,6 +2679,7 @@ fn granted_jobs(
     host: Arc<McpHost>,
     apps: bool,
     only: Option<&[String]>,
+    saved: &BTreeMap<String, Vec<crate::tools::mcp_manifest::CachedTool>>,
 ) -> (
     Vec<(McpServerConfig, Dial)>,
     Vec<(String, String)>,
@@ -2713,6 +2728,11 @@ fn granted_jobs(
                 apps,
                 skills_changed: Arc::default(),
                 relist: Relist::default(),
+                // Not for an apps dial: its tools carry view metadata a saved list does not.
+                saved: saved
+                    .get(&connector.name)
+                    .filter(|_| connector.sandbox && !apps)
+                    .map(|tools| Arc::new(tools.clone())),
             },
         ));
     }
@@ -2863,7 +2883,7 @@ fn tools_from_manifest(
     dial: &Dial,
     manifest: crate::tools::mcp_manifest::ServerManifest,
     idle_reap_after: Duration,
-    manifest_dir: &crate::tools::mcp_manifest::ManifestDir,
+    manifest_dir: Option<&crate::tools::mcp_manifest::ManifestDir>,
 ) -> (Vec<Arc<dyn Tool>>, McpServerCatalog) {
     let conn = Arc::new(McpConnection::dormant(
         config.clone(),
@@ -2955,12 +2975,12 @@ fn tools_from_manifest(
             &conn,
             crate::tools::mcp_skills::Listing::cached(entries, diagnostics),
             &mut tools,
-            Some(manifest_dir),
+            manifest_dir,
         )
     });
     if let Some(listed) = listed {
         dial.relist
-            .bind(&conn, Some(manifest_dir), listed, &tools, tool_names);
+            .bind(&conn, manifest_dir, listed, &tools, tool_names);
     }
     let catalog = McpServerCatalog {
         name: config.name.clone(),
@@ -2994,7 +3014,31 @@ async fn connect_one(
             dial,
             manifest,
             idle_reap_after,
-            dir,
+            Some(dir),
+        ));
+    }
+    // A bundle's saved list for a sandbox connector: the same, except nothing is written back (a
+    // session has no manifest cache) and the key is not checked (the bundle is the session's own).
+    if let Some(saved) = &dial.saved {
+        tracing::debug!(
+            server = %config.name,
+            tools = saved.len(),
+            "advertising MCP tools saved in the bundle; not dialing the server"
+        );
+        let manifest = crate::tools::mcp_manifest::ServerManifest {
+            key: String::new(),
+            tools: saved.to_vec(),
+            resources: Vec::new(),
+            prompts: Vec::new(),
+            skills: None,
+            skill_diagnostics: Vec::new(),
+        };
+        return Ok(tools_from_manifest(
+            config,
+            dial,
+            manifest,
+            idle_reap_after,
+            None,
         ));
     }
     let (client, proc) = connect_one_client(config, dial).await?;

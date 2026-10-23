@@ -50,6 +50,7 @@ async fn call_with_idle_gap(
         &egress,
         mcp::host(),
         reap_after,
+        &BTreeMap::new(),
     )
     .await;
     assert!(warnings.is_empty(), "{warnings:?}");

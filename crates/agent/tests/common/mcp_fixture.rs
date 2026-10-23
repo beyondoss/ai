@@ -156,6 +156,10 @@ fn serve(
     }
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+    // The JSON-RPC method rides with the request's headers, so a test can count `tools/call`s.
+    if let Some(last) = recorder.lock().unwrap().last_mut() {
+        last.push(("x-rpc-method".to_string(), method.to_string()));
+    }
     if let Some(delay) = slow_discover
         && method == "server/discover"
     {
