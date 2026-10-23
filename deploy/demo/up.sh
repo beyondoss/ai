@@ -422,10 +422,13 @@ TD_AGENT=$(jq -n --arg family "$P-agent" --arg exec "$(EXEC agent)" --arg taskro
     {name:"agent", image:$img, essential:true, stopTimeout:2, entryPoint:["/bin/sh","-c"], command:[$script],
      portMappings:[{containerPort:8080},{containerPort:8443}],
      mountPoints:[{sourceVolume:"efs",containerPath:"/mnt/efs",readOnly:false}],
-     environment:[{name:"HOME",value:"/tmp"},{name:"GATEWAY_URL",value:$gw},{name:"MODEL",value:$model},
-       {name:"NOTIFY_ORIGIN",value:$origin},{name:"GRANT_KEY_FLAG",value:$grant},{name:"TLS_CERT",value:$cert}],
+     environment:([{name:"HOME",value:"/tmp"},{name:"GATEWAY_URL",value:$gw},{name:"MODEL",value:$model},
+       {name:"NOTIFY_ORIGIN",value:$origin},{name:"GRANT_KEY_FLAG",value:$grant},{name:"TLS_CERT",value:$cert}]
+       + (if $taskrole == "" then [] else [{name:"AI_AGENT_MCP_ALLOW_PRIVATE",value:"1"}] end)),
      secrets:[{name:"AI_AGENT_SEAL_KEY_B64",valueFrom:$seal},{name:"TLS_KEY",valueFrom:$tlskey}],
      logConfiguration:$logs}]} + (if $taskrole == "" then {} else {taskRoleArn:$taskrole} end)
+  # AI_AGENT_MCP_ALLOW_PRIVATE (use cases only): the browser agent MCP address is the exec front, a
+  # private address in this VPC (a VM that does not exist yet has no public one). Demo only.
   # The use cases scan the agent process'"'"'s memory through ECS Exec, which Linux allows a non-parent
   # only with CAP_SYS_PTRACE (Yama scope 1 on Fargate): granted for that, in this mode only.
   | if $taskrole == "" then . else .containerDefinitions[0].linuxParameters = {capabilities:{add:["SYS_PTRACE"]}} end' | register "$P-agent")

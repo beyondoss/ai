@@ -1,0 +1,2260 @@
+{
+  "schema": 1,
+  "use_case": {
+    "name": "browser",
+    "title": "browser: a real browser in a sandbox that sleeps",
+    "summary": "A folder with an AGENTS.md, a .mcp.json and a page, deployed as a bundle together with the browser server's tool list (saved by running the server once at bundle build). The browser (rustwright-mcp behind a supergateway bridge) runs inside an E2B microVM that does not exist until the model first calls a browser tool, and is then paused and resumed; the grant names it as a connector that holds no standing stream.",
+    "folder": "deploy/demo/agents/browser",
+    "tree": [
+      {
+        "path": "AGENTS.md",
+        "bytes": 660,
+        "text": "---\nmodel: gpt-5-mini\ntools: tool_search\nmax-steps: 20\n---\n\nYou operate a real web browser through the `browser` tools (reach them with `tool_search`). You have no\nshell and no files. The browser runs on the same machine as the pages you are asked to open, so\n`http://localhost:8000/` is a page on this machine.\n\n- Use `browser_navigate` to open a page; its answer is an accessibility snapshot. Quote what you are\n  asked about from the snapshot, never from memory.\n- To type into a field, use `browser_snapshot` for its ref, then `browser_type` with that ref. A snapshot\n  shows the page's title and the fields' contents.\n- Keep answers to a few short lines.\n"
+      },
+      {
+        "path": ".mcp.json",
+        "bytes": 203,
+        "text": "{\n  \"mcpServers\": {\n    \"browser\": {\n      \"command\": \"rustwright-mcp\",\n      \"env\": {\n        \"RUSTWRIGHT_CHROMIUM\": \"/home/user/chrome-headless-shell-linux64/chrome-headless-shell\"\n      }\n    }\n  }\n}\n"
+      },
+      {
+        "path": "site/index.html",
+        "bytes": 830,
+        "text": "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><title>Field Notes</title></head>\n<body>\n  <h1>Field Notes</h1>\n  <p>A page served from inside the sandbox, for the browser to read.</p>\n  <p id=\"stamp\">stamp STAMP_PLACEHOLDER</p>\n  <ul><li>first note</li><li>second note</li><li>third note</li></ul>\n  <label for=\"note\">Your note</label> <input id=\"note\" type=\"text\" aria-label=\"note\">\n  <p id=\"echo\"></p>\n  <script>\n    // State that lives only in this page: what was typed, and the title and the echo line its own script sets from it. Nothing is stored.\n    const note = document.getElementById(\"note\");\n    note.addEventListener(\"input\", () => { window.__marker = note.value; document.title = \"note:\" + note.value; document.getElementById(\"echo\").textContent = \"echo:\" + note.value; });\n  </script>\n</body>\n</html>\n"
+      }
+    ],
+    "bundle": {
+      "sha256": "2eceaf9cd911cb84518d0249cab4bf79ce41852668094af7ef0d378f012d1d01",
+      "bytes": 20480,
+      "store": "a private S3 bucket (beyond-ai-demo-demo-bundles-123456789012), fetched with a presigned link"
+    }
+  },
+  "session_open": {
+    "sessions": [
+      {
+        "session": "demo.u1023234200d",
+        "started_ms": 1792798940201,
+        "ready_ms": 1792798940518,
+        "connected_ms": 117,
+        "state_ms": 175,
+        "open_ms": 292,
+        "exec_requests": 0,
+        "front_forwarded": 0
+      }
+    ],
+    "exec_requests_at_open": 0,
+    "sessions_opened": 1,
+    "per_session": 0,
+    "open_ms_mean": 292,
+    "vms_at_open": 0
+  },
+  "run": {
+    "id": "20261023T234200Z",
+    "mode": "browser",
+    "started_ms": 1792798920841,
+    "ended_ms": 1792799247495,
+    "commit": "af79325f939b379df66a8d66e5ea9c44e4fb8671",
+    "uncommitted_files": 1,
+    "region": "us-west-2",
+    "name": "demo"
+  },
+  "model": {
+    "requested": "gpt-5-mini",
+    "replica_default": "gpt-5-mini",
+    "provider": "openai",
+    "routed": [
+      "gpt-5-mini"
+    ],
+    "price_model": [
+      "gpt-5-mini"
+    ],
+    "via": "crates/gateway (managed bai_v1 key)"
+  },
+  "checks": [
+    {
+      "name": "vm-created-on-first-tool",
+      "title": "The sandbox VM is created by the first sandbox tool call",
+      "pass": true,
+      "started_ms": 1792798940753,
+      "ended_ms": 1792798973309,
+      "duration_ms": 32556,
+      "detail": "no VM existed when the session opened, yet the model had the browser tools (from the list saved in the bundle); only when it called browser_navigate did the front make the VM (6144 ms after the session was ready), seed it, install the browser stack and forward the call; the first browser result came 18203 ms after the call started",
+      "headline": {
+        "label": "first browser call to its result (VM made inside it)",
+        "value": 18203,
+        "unit": "ms"
+      },
+      "measurements": {
+        "vms_at_open": 0,
+        "session_ready_ms": 1792798940518,
+        "first_model_call_answered_ms": 1792798944535,
+        "tool_call_started_ms": 1792798946705,
+        "front_first_request_ms": 1792798946662,
+        "vm_create_started_ms": 1792798946662,
+        "vm_serving_ms": 1792798948851,
+        "vm_seeded_ms": 1792798949202,
+        "browser_ready_ms": 1792798963943,
+        "first_tool_result_ms": 1792798964908,
+        "open_to_vm_create_ms": 6144,
+        "vm_provision_ms": 2189,
+        "seed_from_bundle_ms": 351,
+        "browser_stack_ms": 14741,
+        "first_tool_call_to_result_ms": 18203
+      }
+    },
+    {
+      "name": "browser-reads-page",
+      "title": "The browser reads a page served inside the sandbox",
+      "pass": true,
+      "started_ms": 1792798973314,
+      "ended_ms": 1792798977574,
+      "duration_ms": 4260,
+      "detail": "navigate to the in-VM page plus its accessibility snapshot took 64 ms; the snapshot held the heading and this run's stamp (stamp-1023234200-25963), and the reply quoted it. Browser tool calls with an empty-string optional argument so far: 0",
+      "headline": {
+        "label": "navigate + snapshot",
+        "value": 64,
+        "unit": "ms"
+      },
+      "measurements": {
+        "navigate_ms": 64,
+        "snapshot_bytes": 378,
+        "snapshot": "- generic\n  - heading [level=1]\n    - text: Field Notes\n  - generic \"A page served from inside the sandbox, for the browser to read.\"\n  - generic \"stamp stamp-1023234200-25963\"\n  - list\n    - listitem\n      - text: first note\n    - listitem\n      - text: second note\n    - listitem\n      - text: third note\n  - label\n    - text: Your note\n  - textbox \"note\" [ref=e2]\n  - generic",
+        "turn_ms": 4117,
+        "empty_string_args": {
+          "count": 0,
+          "calls": []
+        }
+      }
+    },
+    {
+      "name": "no-held-connection",
+      "title": "No connection is held to a sleeping sandbox",
+      "pass": true,
+      "started_ms": 1792798977578,
+      "ended_ms": 1792799017699,
+      "duration_ms": 40121,
+      "detail": "0 established connections to the bridge port in all 6 samples across a 30 s idle gap, with the session attached and the browser holding a page",
+      "headline": {
+        "label": "connections held while idle",
+        "value": "0",
+        "unit": ""
+      },
+      "measurements": {
+        "samples": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "gap_s": 30,
+        "port": 8931
+      }
+    },
+    {
+      "name": "idle-cost",
+      "title": "What an idle browser costs",
+      "pass": true,
+      "started_ms": 1792799017703,
+      "ended_ms": 1792799042854,
+      "duration_ms": 25151,
+      "detail": "idle, with a page open: rustwright-mcp 1 MB anon, the bridge (node) 49.4 MB, Chromium (6 processes) 66.5 MB; 116.9 MB anonymous in all, of a 473 MB VM",
+      "headline": {
+        "label": "idle anon, browser stack",
+        "value": 116.9,
+        "unit": "MB"
+      },
+      "measurements": {
+        "processes": [
+          {
+            "process": "rustwright-mcp",
+            "processes": 1,
+            "rss_mb": 7.1,
+            "pss_mb": 7.1,
+            "anon_mb": 1
+          },
+          {
+            "process": "node",
+            "processes": 1,
+            "rss_mb": 85,
+            "pss_mb": 83.2,
+            "anon_mb": 49.4
+          },
+          {
+            "process": "chrome-headless",
+            "processes": 6,
+            "rss_mb": 390.8,
+            "pss_mb": 169.1,
+            "anon_mb": 66.5
+          }
+        ],
+        "anon_total_mb": 116.9,
+        "vm_memory_mb": 473,
+        "vm_used_mb": 186,
+        "note": "measured, not compared: no threshold is claimed"
+      }
+    },
+    {
+      "name": "state-survives-pause",
+      "title": "Page state survives a paused sandbox",
+      "pass": true,
+      "started_ms": 1792799042857,
+      "ended_ms": 1792799087871,
+      "duration_ms": 45014,
+      "detail": "after a 30 s pause the page still showed the line its own script had written when the text was typed (echo:M323186232), read without navigating; resume took 280 ms and the first browser call after it 46 ms",
+      "headline": {
+        "label": "resume",
+        "value": 280,
+        "unit": "ms"
+      },
+      "measurements": {
+        "typed": "M323186232",
+        "echo_after_resume": "echo:M323186232",
+        "pause_api_ms": 427,
+        "paused_s": 30,
+        "resume_api_ms": 280,
+        "first_call_after_resume_ms": 46,
+        "first_turn_after_resume_ms": 5805,
+        "navigations_after_resume": 0,
+        "mcp_sessions_opened_before": 1,
+        "mcp_sessions_opened_after": 1,
+        "same_mcp_session": true
+      }
+    },
+    {
+      "name": "state-survives-idle-reap",
+      "title": "Page state survives the agent's MCP idle window",
+      "pass": true,
+      "started_ms": 1792799087875,
+      "ended_ms": 1792799247489,
+      "duration_ms": 159614,
+      "detail": "after 150 s idle (the agent's MCP idle window is 120 s) the page still showed what had been typed (echo:R68552306), read without navigating, and the bridge saw no new initialize (1 before, 1 after): the connector was not reaped. Browser tool calls carrying an empty-string optional argument in this run: 0",
+      "headline": {
+        "label": "idle, page state kept",
+        "value": 150,
+        "unit": "s"
+      },
+      "measurements": {
+        "typed": "R68552306",
+        "idle_hold_s": 150,
+        "agent_mcp_idle_window_s": 120,
+        "window_lowered": false,
+        "echo_after_hold": "echo:R68552306",
+        "navigations_after_hold": 0,
+        "mcp_sessions_opened_before": 1,
+        "mcp_sessions_opened_after": 1,
+        "same_mcp_session": true,
+        "empty_string_args": {
+          "count": 0,
+          "calls": []
+        }
+      }
+    },
+    {
+      "name": "teardown-zero",
+      "title": "Teardown leaves nothing behind",
+      "pass": true,
+      "status": "pass",
+      "detail": "every resource type counted 0 at 2026-10-23T23:52:53Z",
+      "measurements": {
+        "resource_types": 23,
+        "remaining": 0
+      },
+      "started_ms": null,
+      "ended_ms": null,
+      "headline": {
+        "label": "left behind",
+        "value": "0",
+        "unit": "resources"
+      }
+    }
+  ],
+  "timeline": [
+    {
+      "t_ms": 1792798920841,
+      "src": "demo",
+      "event": "run_started",
+      "path": null,
+      "detail": null
+    },
+    {
+      "t_ms": 1792798940859,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d"
+      }
+    },
+    {
+      "t_ms": 1792798941000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-4",
+        "model": "gpt-5-mini",
+        "input_tokens": 1377
+      }
+    },
+    {
+      "t_ms": 1792798944000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-5",
+        "model": "gpt-5-mini",
+        "input_tokens": 3502
+      }
+    },
+    {
+      "t_ms": 1792798944455,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "tool_search"
+      }
+    },
+    {
+      "t_ms": 1792798944471,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "tool_search"
+      }
+    },
+    {
+      "t_ms": 1792798944535,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-4",
+        "output_tokens": 364,
+        "cost_micros": 784
+      }
+    },
+    {
+      "t_ms": 1792798946205,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-5",
+        "output_tokens": 125,
+        "cost_micros": 780
+      }
+    },
+    {
+      "t_ms": 1792798946662,
+      "src": "front",
+      "event": "first_request",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d"
+      }
+    },
+    {
+      "t_ms": 1792798946662,
+      "src": "front",
+      "event": "vm_create_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d"
+      }
+    },
+    {
+      "t_ms": 1792798946705,
+      "src": "client",
+      "event": "tool_to_server",
+      "path": [
+        "agent",
+        "browser"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_navigate"
+      }
+    },
+    {
+      "t_ms": 1792798947706,
+      "src": "sandbox",
+      "event": "listening",
+      "vm": "ip4eh07tqskf2lp4rzvjr",
+      "path": null,
+      "detail": {
+        "bearer_required": true,
+        "listen": "0.0.0.0:8081",
+        "url": "http://0.0.0.0:8081/exec"
+      }
+    },
+    {
+      "t_ms": 1792798948851,
+      "src": "front",
+      "event": "vm_ready",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d"
+      }
+    },
+    {
+      "t_ms": 1792798949202,
+      "src": "front",
+      "event": "vm_seeded",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d",
+        "bundle": true
+      }
+    },
+    {
+      "t_ms": 1792798963943,
+      "src": "front",
+      "event": "browser_ready",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d"
+      }
+    },
+    {
+      "t_ms": 1792798964908,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_navigate"
+      }
+    },
+    {
+      "t_ms": 1792798965000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-6",
+        "model": "gpt-5-mini",
+        "input_tokens": 3789
+      }
+    },
+    {
+      "t_ms": 1792798967175,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d"
+      }
+    },
+    {
+      "t_ms": 1792798967238,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-6",
+        "output_tokens": 211,
+        "cost_micros": 563
+      }
+    },
+    {
+      "t_ms": 1792798968000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-7",
+        "model": "gpt-5-mini",
+        "input_tokens": 182
+      }
+    },
+    {
+      "t_ms": 1792798968955,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-7",
+        "output_tokens": 0,
+        "cost_micros": 46
+      }
+    },
+    {
+      "t_ms": 1792798973000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-8",
+        "model": "gpt-5-mini",
+        "input_tokens": 3443
+      }
+    },
+    {
+      "t_ms": 1792798973421,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d"
+      }
+    },
+    {
+      "t_ms": 1792798975381,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-8",
+        "output_tokens": 189,
+        "cost_micros": 893
+      }
+    },
+    {
+      "t_ms": 1792798975890,
+      "src": "client",
+      "event": "tool_to_server",
+      "path": [
+        "agent",
+        "browser"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_navigate"
+      }
+    },
+    {
+      "t_ms": 1792798975955,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_navigate"
+      }
+    },
+    {
+      "t_ms": 1792798976000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-9",
+        "model": "gpt-5-mini",
+        "input_tokens": 3762
+      }
+    },
+    {
+      "t_ms": 1792798977539,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-9",
+        "output_tokens": 46,
+        "cost_micros": 226
+      }
+    },
+    {
+      "t_ms": 1792798977539,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d"
+      }
+    },
+    {
+      "t_ms": 1792798980585,
+      "src": "demo",
+      "event": "idle_gap_started",
+      "path": null,
+      "detail": null
+    },
+    {
+      "t_ms": 1792799011000,
+      "src": "demo",
+      "event": "idle_gap_ended",
+      "path": null,
+      "detail": null
+    },
+    {
+      "t_ms": 1792799042966,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d"
+      }
+    },
+    {
+      "t_ms": 1792799043000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-a",
+        "model": "gpt-5-mini",
+        "input_tokens": 3728
+      }
+    },
+    {
+      "t_ms": 1792799044857,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-a",
+        "output_tokens": 124,
+        "cost_micros": 604
+      }
+    },
+    {
+      "t_ms": 1792799044918,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "tool_search"
+      }
+    },
+    {
+      "t_ms": 1792799044918,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "tool_search"
+      }
+    },
+    {
+      "t_ms": 1792799045000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-b",
+        "model": "gpt-5-mini",
+        "input_tokens": 4094
+      }
+    },
+    {
+      "t_ms": 1792799046000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-c",
+        "model": "gpt-5-mini",
+        "input_tokens": 4159
+      }
+    },
+    {
+      "t_ms": 1792799046140,
+      "src": "client",
+      "event": "tool_to_server",
+      "path": [
+        "agent",
+        "browser"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_find"
+      }
+    },
+    {
+      "t_ms": 1792799046220,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_find"
+      }
+    },
+    {
+      "t_ms": 1792799046236,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-b",
+        "output_tokens": 33,
+        "cost_micros": 1090
+      }
+    },
+    {
+      "t_ms": 1792799047000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-d",
+        "model": "gpt-5-mini",
+        "input_tokens": 4328
+      }
+    },
+    {
+      "t_ms": 1792799047066,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-c",
+        "output_tokens": 39,
+        "cost_micros": 225
+      }
+    },
+    {
+      "t_ms": 1792799047332,
+      "src": "client",
+      "event": "tool_to_server",
+      "path": [
+        "agent",
+        "browser"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_navigate"
+      }
+    },
+    {
+      "t_ms": 1792799047392,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_navigate"
+      }
+    },
+    {
+      "t_ms": 1792799048121,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-d",
+        "output_tokens": 40,
+        "cost_micros": 240
+      }
+    },
+    {
+      "t_ms": 1792799048558,
+      "src": "client",
+      "event": "tool_to_server",
+      "path": [
+        "agent",
+        "browser"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_type"
+      }
+    },
+    {
+      "t_ms": 1792799048640,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_type"
+      }
+    },
+    {
+      "t_ms": 1792799049000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-e",
+        "model": "gpt-5-mini",
+        "input_tokens": 4547
+      }
+    },
+    {
+      "t_ms": 1792799049655,
+      "src": "client",
+      "event": "tool_to_server",
+      "path": [
+        "agent",
+        "browser"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_get_text"
+      }
+    },
+    {
+      "t_ms": 1792799049721,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_get_text"
+      }
+    },
+    {
+      "t_ms": 1792799049991,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-e",
+        "output_tokens": 40,
+        "cost_micros": 266
+      }
+    },
+    {
+      "t_ms": 1792799050000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-f",
+        "model": "gpt-5-mini",
+        "input_tokens": 4606
+      }
+    },
+    {
+      "t_ms": 1792799050736,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d"
+      }
+    },
+    {
+      "t_ms": 1792799050994,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-f",
+        "output_tokens": 30,
+        "cost_micros": 204
+      }
+    },
+    {
+      "t_ms": 1792799051029,
+      "src": "demo",
+      "event": "vm_pause_requested",
+      "path": null,
+      "detail": null
+    },
+    {
+      "t_ms": 1792799081752,
+      "src": "demo",
+      "event": "vm_resumed",
+      "path": null,
+      "detail": {
+        "paused_s": 30
+      }
+    },
+    {
+      "t_ms": 1792799081863,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d"
+      }
+    },
+    {
+      "t_ms": 1792799082000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-10",
+        "model": "gpt-5-mini",
+        "input_tokens": 4596
+      }
+    },
+    {
+      "t_ms": 1792799084130,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "tool_search"
+      }
+    },
+    {
+      "t_ms": 1792799084165,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "tool_search"
+      }
+    },
+    {
+      "t_ms": 1792799084209,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-10",
+        "output_tokens": 176,
+        "cost_micros": 695
+      }
+    },
+    {
+      "t_ms": 1792799085000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-11",
+        "model": "gpt-5-mini",
+        "input_tokens": 5488
+      }
+    },
+    {
+      "t_ms": 1792799085000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-12",
+        "model": "gpt-5-mini",
+        "input_tokens": 5660
+      }
+    },
+    {
+      "t_ms": 1792799085161,
+      "src": "client",
+      "event": "tool_to_server",
+      "path": [
+        "agent",
+        "browser"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_snapshot"
+      }
+    },
+    {
+      "t_ms": 1792799085207,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_snapshot"
+      }
+    },
+    {
+      "t_ms": 1792799085986,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-11",
+        "output_tokens": 28,
+        "cost_micros": 1428
+      }
+    },
+    {
+      "t_ms": 1792799086000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-13",
+        "model": "gpt-5-mini",
+        "input_tokens": 5719
+      }
+    },
+    {
+      "t_ms": 1792799086245,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-12",
+        "output_tokens": 40,
+        "cost_micros": 285
+      }
+    },
+    {
+      "t_ms": 1792799086498,
+      "src": "client",
+      "event": "tool_to_server",
+      "path": [
+        "agent",
+        "browser"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_get_text"
+      }
+    },
+    {
+      "t_ms": 1792799086618,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_get_text"
+      }
+    },
+    {
+      "t_ms": 1792799087004,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-13",
+        "output_tokens": 38,
+        "cost_micros": 239
+      }
+    },
+    {
+      "t_ms": 1792799087668,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d"
+      }
+    },
+    {
+      "t_ms": 1792799087986,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d"
+      }
+    },
+    {
+      "t_ms": 1792799088000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-14",
+        "model": "gpt-5-mini",
+        "input_tokens": 5670
+      }
+    },
+    {
+      "t_ms": 1792799089789,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-14",
+        "output_tokens": 148,
+        "cost_micros": 677
+      }
+    },
+    {
+      "t_ms": 1792799089866,
+      "src": "client",
+      "event": "tool_to_server",
+      "path": [
+        "agent",
+        "browser"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_snapshot"
+      }
+    },
+    {
+      "t_ms": 1792799089924,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_snapshot"
+      }
+    },
+    {
+      "t_ms": 1792799090000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-15",
+        "model": "gpt-5-mini",
+        "input_tokens": 5962
+      }
+    },
+    {
+      "t_ms": 1792799090918,
+      "src": "client",
+      "event": "tool_to_server",
+      "path": [
+        "agent",
+        "browser"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_type"
+      }
+    },
+    {
+      "t_ms": 1792799090966,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-15",
+        "output_tokens": 44,
+        "cost_micros": 283
+      }
+    },
+    {
+      "t_ms": 1792799091000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-16",
+        "model": "gpt-5-mini",
+        "input_tokens": 6185
+      }
+    },
+    {
+      "t_ms": 1792799091012,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_type"
+      }
+    },
+    {
+      "t_ms": 1792799091987,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-16",
+        "output_tokens": 40,
+        "cost_micros": 301
+      }
+    },
+    {
+      "t_ms": 1792799092000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-17",
+        "model": "gpt-5-mini",
+        "input_tokens": 6244
+      }
+    },
+    {
+      "t_ms": 1792799092050,
+      "src": "client",
+      "event": "tool_to_server",
+      "path": [
+        "agent",
+        "browser"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_get_text"
+      }
+    },
+    {
+      "t_ms": 1792799092090,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_get_text"
+      }
+    },
+    {
+      "t_ms": 1792799093033,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-17",
+        "output_tokens": 26,
+        "cost_micros": 231
+      }
+    },
+    {
+      "t_ms": 1792799093172,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d"
+      }
+    },
+    {
+      "t_ms": 1792799093355,
+      "src": "demo",
+      "event": "idle_reap_hold_started",
+      "path": null,
+      "detail": null
+    },
+    {
+      "t_ms": 1792799243480,
+      "src": "demo",
+      "event": "idle_reap_hold_ended",
+      "path": null,
+      "detail": null
+    },
+    {
+      "t_ms": 1792799243588,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d"
+      }
+    },
+    {
+      "t_ms": 1792799244000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-18",
+        "model": "gpt-5-mini",
+        "input_tokens": 6189
+      }
+    },
+    {
+      "t_ms": 1792799246000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-19",
+        "model": "gpt-5-mini",
+        "input_tokens": 6299
+      }
+    },
+    {
+      "t_ms": 1792799246086,
+      "src": "client",
+      "event": "tool_to_server",
+      "path": [
+        "agent",
+        "browser"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_get_text"
+      }
+    },
+    {
+      "t_ms": 1792799246189,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1023234200d",
+        "name": "mcp__browser__browser_get_text"
+      }
+    },
+    {
+      "t_ms": 1792799246401,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-18",
+        "output_tokens": 91,
+        "cost_micros": 462
+      }
+    },
+    {
+      "t_ms": 1792799247023,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "a97caa037c7403f2-19",
+        "output_tokens": 20,
+        "cost_micros": 232
+      }
+    },
+    {
+      "t_ms": 1792799247268,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1023234200d"
+      }
+    },
+    {
+      "t_ms": 1792799247495,
+      "src": "demo",
+      "event": "run_finished",
+      "path": null,
+      "detail": null
+    }
+  ],
+  "conversation": [
+    {
+      "t_ms": 1792798940859,
+      "session": "demo.u1023234200d",
+      "role": "user",
+      "text": "Open http://localhost:8000/ in the browser (find the browser tools with tool_search). Tell me the page title and the text of the line that starts with 'stamp', quoting them from the browser's snapshot."
+    },
+    {
+      "t_ms": 1792798944455,
+      "session": "demo.u1023234200d",
+      "role": "tool",
+      "name": "tool_search",
+      "input": "{\"limit\":20,\"query\":\"browser\"}",
+      "output": "Loaded 20 tools — call them directly from now on:\n- mcp__browser__browser_close(_model_supports_vision?) — Close browser; next tool starts fresh.\n- mcp__browser__browser_get_text(_model_supports_vision?, max_chars?, selector?) — Extract text. Use browser_wait_for to validate.\n- mcp__browser__browser_network_requests(_model_supports_vision?, filename?, filter?, static?) — List/filter bounded requests; use browser_network_request for one.\n- mcp__browser__browser_click(_model_supports_vision?, doubleClick?, element?, target) — Click/double-click ref; snapshot.\n- mcp__browser__browser_console_mess",
+      "end_ms": 1792798944471
+    },
+    {
+      "t_ms": 1792798946705,
+      "session": "demo.u1023234200d",
+      "role": "tool",
+      "name": "mcp__browser__browser_navigate",
+      "input": "{\"_model_supports_vision\":false,\"url\":\"http://localhost:8000/\"}",
+      "output": "### Page\nURL: http://localhost:8000/\nTitle: Field Notes\nStatus: 200\nConsole: 0 errors, 0 warnings\n\n- generic\n  - heading [level=1]\n    - text: Field Notes\n  - generic \"A page served from inside the sandbox, for the browser to read.\"\n  - generic \"stamp stamp-1023234200-25963\"\n  - list\n    - listitem\n      - text: first note\n    - listitem\n      - text: second note\n    - listitem\n      - text: third note\n  - label\n    - text: Your note\n  - textbox \"note\" [ref=e1]\n  - generic",
+      "end_ms": 1792798964908
+    },
+    {
+      "t_ms": 1792798966955,
+      "session": "demo.u1023234200d",
+      "role": "assistant",
+      "text": "From the browser snapshot:\n\n- Title: \"Field Notes\"\n- Line starting with 'stamp': \"stamp stamp-1023234200-25963\""
+    },
+    {
+      "t_ms": 1792798973421,
+      "session": "demo.u1023234200d",
+      "role": "user",
+      "text": "Open http://localhost:8000/ in the browser. Tell me the page title, the heading, and the text of the line that starts with 'stamp', quoting them from the browser's snapshot."
+    },
+    {
+      "t_ms": 1792798975890,
+      "session": "demo.u1023234200d",
+      "role": "tool",
+      "name": "mcp__browser__browser_navigate",
+      "input": "{\"_model_supports_vision\":false,\"url\":\"http://localhost:8000/\"}",
+      "output": "- generic\n  - heading [level=1]\n    - text: Field Notes\n  - generic \"A page served from inside the sandbox, for the browser to read.\"\n  - generic \"stamp stamp-1023234200-25963\"\n  - list\n    - listitem\n      - text: first note\n    - listitem\n      - text: second note\n    - listitem\n      - text: third note\n  - label\n    - text: Your note\n  - textbox \"note\" [ref=e2]\n  - generic",
+      "end_ms": 1792798975955
+    },
+    {
+      "t_ms": 1792798977058,
+      "session": "demo.u1023234200d",
+      "role": "assistant",
+      "text": "From the browser snapshot:\n\n- Title: \"Field Notes\"\n- Heading (level 1): \"Field Notes\"\n- Line starting with 'stamp': \"stamp stamp-1023234200-25963\""
+    },
+    {
+      "t_ms": 1792799042966,
+      "session": "demo.u1023234200d",
+      "role": "user",
+      "text": "On the page that is open, type exactly M323186232 into the 'Your note' textbox: take a browser_snapshot to get its ref, then use browser_type with that ref and the text. Then take another browser_snapshot, use browser_get_text with the selector #echo, and tell me what it says."
+    },
+    {
+      "t_ms": 1792799044918,
+      "session": "demo.u1023234200d",
+      "role": "tool",
+      "name": "tool_search",
+      "input": "{\"limit\":50,\"query\":\"browser_type\"}",
+      "output": "Loaded 2 tools — call them directly from now on:\n- mcp__browser__browser_type(_model_supports_vision?, clear?, element?, slowly?, submit?, target, text) — Type ref; optional submit.\n- mcp__browser__browser_take_screenshot(_model_supports_vision?, fullPage?, type?) — Capture image; file lasts until shutdown.\n",
+      "end_ms": 1792799044918
+    },
+    {
+      "t_ms": 1792799046140,
+      "session": "demo.u1023234200d",
+      "role": "tool",
+      "name": "mcp__browser__browser_find",
+      "input": "{\"_model_supports_vision\":false,\"text\":\"Your note\"}",
+      "output": "Match 1\nPath: generic > label \"Your note\"\n> label \"Your note\"",
+      "end_ms": 1792799046220
+    },
+    {
+      "t_ms": 1792799047332,
+      "session": "demo.u1023234200d",
+      "role": "tool",
+      "name": "mcp__browser__browser_navigate",
+      "input": "{\"_model_supports_vision\":false,\"url\":\"http://localhost:8000/\"}",
+      "output": "- generic\n  - heading [level=1]\n    - text: Field Notes\n  - generic \"A page served from inside the sandbox, for the browser to read.\"\n  - generic \"stamp stamp-1023234200-25963\"\n  - list\n    - listitem\n      - text: first note\n    - listitem\n      - text: second note\n    - listitem\n      - text: third note\n  - label\n    - text: Your note\n  - textbox \"note\" [ref=e4]\n  - generic",
+      "end_ms": 1792799047392
+    },
+    {
+      "t_ms": 1792799048558,
+      "session": "demo.u1023234200d",
+      "role": "tool",
+      "name": "mcp__browser__browser_type",
+      "input": "{\"_model_supports_vision\":false,\"target\":\"e4\",\"text\":\"M323186232\"}",
+      "output": "### Page\nURL: http://localhost:8000/\nTitle: note:M323186232\nStatus: 200\nConsole: 0 errors, 0 warnings\n\n- generic\n  - heading [level=1]\n    - text: Field Notes\n  - generic \"A page served from inside the sandbox, for the browser to read.\"\n  - generic \"stamp stamp-1023234200-25963\"\n  - list\n    - listitem\n      - text: first note\n    - listitem\n      - text: second note\n    - listitem\n      - text: third note\n  - label\n    - text: Your note\n  - textbox \"note\" [value=\"M323186232\"] [ref=e5]\n  - generic \"echo:M323186232\"",
+      "end_ms": 1792799048640
+    },
+    {
+      "t_ms": 1792799049655,
+      "session": "demo.u1023234200d",
+      "role": "tool",
+      "name": "mcp__browser__browser_get_text",
+      "input": "{\"_model_supports_vision\":false,\"max_chars\":20000,\"selector\":\"#echo\"}",
+      "output": "echo:M323186232",
+      "end_ms": 1792799049721
+    },
+    {
+      "t_ms": 1792799050349,
+      "session": "demo.u1023234200d",
+      "role": "assistant",
+      "text": "I typed into the textbox and read #echo.\n\n- #echo text (from the page): \"echo:M323186232\""
+    },
+    {
+      "t_ms": 1792799081863,
+      "session": "demo.u1023234200d",
+      "role": "user",
+      "text": "Do not call browser_navigate or browser_reload. Take a browser_snapshot of the page that is open (the whole page, no target) and use browser_get_text with the selector #echo. Tell me what #echo says and what the 'Your note' textbox contains."
+    },
+    {
+      "t_ms": 1792799084130,
+      "session": "demo.u1023234200d",
+      "role": "tool",
+      "name": "tool_search",
+      "input": "{\"limit\":50,\"query\":\"snapshot\"}",
+      "output": "Loaded 12 tools — call them directly from now on:\n- mcp__browser__browser_snapshot(_model_supports_vision?, boxes?, depth?, target?) — Snapshot page. Narrow with target/depth. Refs are session-only and never reused.\n- mcp__browser__browser_click(_model_supports_vision?, doubleClick?, element?, target) — Click/double-click ref; snapshot.\n- mcp__browser__browser_find(_model_supports_vision?, regex?, text?) — Find text/regex; snapshot. Provide exactly one of text or regex.\n- mcp__browser__browser_hover(_model_supports_vision?, element?, target) — Native hover ref; snapshot.\n- mcp__browser__browse",
+      "end_ms": 1792799084165
+    },
+    {
+      "t_ms": 1792799085161,
+      "session": "demo.u1023234200d",
+      "role": "tool",
+      "name": "mcp__browser__browser_snapshot",
+      "input": "{\"_model_supports_vision\":false}",
+      "output": "- generic\n  - heading [level=1]\n    - text: Field Notes\n  - generic \"A page served from inside the sandbox, for the browser to read.\"\n  - generic \"stamp stamp-1023234200-25963\"\n  - list\n    - listitem\n      - text: first note\n    - listitem\n      - text: second note\n    - listitem\n      - text: third note\n  - label\n    - text: Your note\n  - textbox \"note\" [value=\"M323186232\"] [ref=e6]\n  - generic \"echo:M323186232\"",
+      "end_ms": 1792799085207
+    },
+    {
+      "t_ms": 1792799086498,
+      "session": "demo.u1023234200d",
+      "role": "tool",
+      "name": "mcp__browser__browser_get_text",
+      "input": "{\"_model_supports_vision\":false,\"max_chars\":20000,\"selector\":\"#echo\"}",
+      "output": "echo:M323186232",
+      "end_ms": 1792799086618
+    },
+    {
+      "t_ms": 1792799087223,
+      "session": "demo.u1023234200d",
+      "role": "assistant",
+      "text": "From the snapshot:\n\n- #echo text: \"echo:M323186232\"\n- 'Your note' textbox value (from the snapshot): \"M323186232\""
+    },
+    {
+      "t_ms": 1792799087986,
+      "session": "demo.u1023234200d",
+      "role": "user",
+      "text": "On the page that is open, replace the contents of the 'Your note' textbox with exactly R68552306: take a browser_snapshot to get its ref, then use browser_type with that ref and the text. Then use browser_get_text with the selector #echo and tell me what it says."
+    },
+    {
+      "t_ms": 1792799089866,
+      "session": "demo.u1023234200d",
+      "role": "tool",
+      "name": "mcp__browser__browser_snapshot",
+      "input": "{\"_model_supports_vision\":false}",
+      "output": "- generic\n  - heading [level=1]\n    - text: Field Notes\n  - generic \"A page served from inside the sandbox, for the browser to read.\"\n  - generic \"stamp stamp-1023234200-25963\"\n  - list\n    - listitem\n      - text: first note\n    - listitem\n      - text: second note\n    - listitem\n      - text: third note\n  - label\n    - text: Your note\n  - textbox \"note\" [value=\"M323186232\"] [ref=e7]\n  - generic \"echo:M323186232\"",
+      "end_ms": 1792799089924
+    },
+    {
+      "t_ms": 1792799090918,
+      "session": "demo.u1023234200d",
+      "role": "tool",
+      "name": "mcp__browser__browser_type",
+      "input": "{\"_model_supports_vision\":false,\"clear\":true,\"target\":\"e7\",\"text\":\"R68552306\"}",
+      "output": "### Page\nURL: http://localhost:8000/\nTitle: note:R68552306\nStatus: 200\nConsole: 0 errors, 0 warnings\n\n- generic\n  - heading [level=1]\n    - text: Field Notes\n  - generic \"A page served from inside the sandbox, for the browser to read.\"\n  - generic \"stamp stamp-1023234200-25963\"\n  - list\n    - listitem\n      - text: first note\n    - listitem\n      - text: second note\n    - listitem\n      - text: third note\n  - label\n    - text: Your note\n  - textbox \"note\" [value=\"R68552306\"] [ref=e8]\n  - generic \"echo:R68552306\"",
+      "end_ms": 1792799091012
+    },
+    {
+      "t_ms": 1792799092050,
+      "session": "demo.u1023234200d",
+      "role": "tool",
+      "name": "mcp__browser__browser_get_text",
+      "input": "{\"_model_supports_vision\":false,\"max_chars\":20000,\"selector\":\"#echo\"}",
+      "output": "echo:R68552306",
+      "end_ms": 1792799092090
+    },
+    {
+      "t_ms": 1792799092773,
+      "session": "demo.u1023234200d",
+      "role": "assistant",
+      "text": "I replaced the textbox contents and read #echo.\n\n- #echo text: \"echo:R68552306\""
+    },
+    {
+      "t_ms": 1792799243588,
+      "session": "demo.u1023234200d",
+      "role": "user",
+      "text": "Do not call browser_navigate or browser_reload. Use browser_get_text with the selector #echo on the page that is open, and tell me what it says."
+    },
+    {
+      "t_ms": 1792799246086,
+      "session": "demo.u1023234200d",
+      "role": "tool",
+      "name": "mcp__browser__browser_get_text",
+      "input": "{\"_model_supports_vision\":false,\"max_chars\":20000,\"selector\":\"#echo\"}",
+      "output": "echo:R68552306",
+      "end_ms": 1792799246189
+    },
+    {
+      "t_ms": 1792799246867,
+      "session": "demo.u1023234200d",
+      "role": "assistant",
+      "text": "From the page (using selector #echo): \"echo:R68552306\""
+    }
+  ],
+  "billing": {
+    "rows": [
+      {
+        "request_id": "a97caa037c7403f2-4",
+        "t_ms": 1792798941000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1377,
+        "output_tokens": 364,
+        "cache_read_tokens": 1280,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(320)",
+        "cost_micros": 784,
+        "price_micros": 784,
+        "latency_ms": 3535
+      },
+      {
+        "request_id": "a97caa037c7403f2-5",
+        "t_ms": 1792798944000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 3502,
+        "output_tokens": 125,
+        "cache_read_tokens": 1536,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(64)",
+        "cost_micros": 780,
+        "price_micros": 780,
+        "latency_ms": 2205
+      },
+      {
+        "request_id": "a97caa037c7403f2-6",
+        "t_ms": 1792798965000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 3789,
+        "output_tokens": 211,
+        "cache_read_tokens": 3584,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(128)",
+        "cost_micros": 563,
+        "price_micros": 563,
+        "latency_ms": 2238
+      },
+      {
+        "request_id": "a97caa037c7403f2-7",
+        "t_ms": 1792798968000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 182,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 46,
+        "price_micros": 46,
+        "latency_ms": 955
+      },
+      {
+        "request_id": "a97caa037c7403f2-8",
+        "t_ms": 1792798973000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 3443,
+        "output_tokens": 189,
+        "cache_read_tokens": 1536,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(128)",
+        "cost_micros": 893,
+        "price_micros": 893,
+        "latency_ms": 2381
+      },
+      {
+        "request_id": "a97caa037c7403f2-9",
+        "t_ms": 1792798976000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 3762,
+        "output_tokens": 46,
+        "cache_read_tokens": 3584,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 226,
+        "price_micros": 226,
+        "latency_ms": 1539
+      },
+      {
+        "request_id": "a97caa037c7403f2-a",
+        "t_ms": 1792799043000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 3728,
+        "output_tokens": 124,
+        "cache_read_tokens": 2560,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(64)",
+        "cost_micros": 604,
+        "price_micros": 604,
+        "latency_ms": 1857
+      },
+      {
+        "request_id": "a97caa037c7403f2-b",
+        "t_ms": 1792799045000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 4094,
+        "output_tokens": 33,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 1090,
+        "price_micros": 1090,
+        "latency_ms": 1236
+      },
+      {
+        "request_id": "a97caa037c7403f2-c",
+        "t_ms": 1792799046000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 4159,
+        "output_tokens": 39,
+        "cache_read_tokens": 3968,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 225,
+        "price_micros": 225,
+        "latency_ms": 1066
+      },
+      {
+        "request_id": "a97caa037c7403f2-d",
+        "t_ms": 1792799047000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 4328,
+        "output_tokens": 40,
+        "cache_read_tokens": 4096,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 240,
+        "price_micros": 240,
+        "latency_ms": 1121
+      },
+      {
+        "request_id": "a97caa037c7403f2-e",
+        "t_ms": 1792799049000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 4547,
+        "output_tokens": 40,
+        "cache_read_tokens": 4224,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 266,
+        "price_micros": 266,
+        "latency_ms": 991
+      },
+      {
+        "request_id": "a97caa037c7403f2-f",
+        "t_ms": 1792799050000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 4606,
+        "output_tokens": 30,
+        "cache_read_tokens": 4480,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 204,
+        "price_micros": 204,
+        "latency_ms": 994
+      },
+      {
+        "request_id": "a97caa037c7403f2-10",
+        "t_ms": 1792799082000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 4596,
+        "output_tokens": 176,
+        "cache_read_tokens": 3584,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(128)",
+        "cost_micros": 695,
+        "price_micros": 695,
+        "latency_ms": 2209
+      },
+      {
+        "request_id": "a97caa037c7403f2-11",
+        "t_ms": 1792799085000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 5488,
+        "output_tokens": 28,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 1428,
+        "price_micros": 1428,
+        "latency_ms": 986
+      },
+      {
+        "request_id": "a97caa037c7403f2-12",
+        "t_ms": 1792799085000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 5660,
+        "output_tokens": 40,
+        "cache_read_tokens": 5376,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 285,
+        "price_micros": 285,
+        "latency_ms": 1245
+      },
+      {
+        "request_id": "a97caa037c7403f2-13",
+        "t_ms": 1792799086000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 5719,
+        "output_tokens": 38,
+        "cache_read_tokens": 5632,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 239,
+        "price_micros": 239,
+        "latency_ms": 1004
+      },
+      {
+        "request_id": "a97caa037c7403f2-14",
+        "t_ms": 1792799088000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 5670,
+        "output_tokens": 148,
+        "cache_read_tokens": 4608,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(64)",
+        "cost_micros": 677,
+        "price_micros": 677,
+        "latency_ms": 1789
+      },
+      {
+        "request_id": "a97caa037c7403f2-15",
+        "t_ms": 1792799090000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 5962,
+        "output_tokens": 44,
+        "cache_read_tokens": 5760,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 283,
+        "price_micros": 283,
+        "latency_ms": 966
+      },
+      {
+        "request_id": "a97caa037c7403f2-16",
+        "t_ms": 1792799091000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 6185,
+        "output_tokens": 40,
+        "cache_read_tokens": 5888,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 301,
+        "price_micros": 301,
+        "latency_ms": 987
+      },
+      {
+        "request_id": "a97caa037c7403f2-17",
+        "t_ms": 1792799092000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 6244,
+        "output_tokens": 26,
+        "cache_read_tokens": 6144,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 231,
+        "price_micros": 231,
+        "latency_ms": 1033
+      },
+      {
+        "request_id": "a97caa037c7403f2-18",
+        "t_ms": 1792799244000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 6189,
+        "output_tokens": 91,
+        "cache_read_tokens": 5632,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 462,
+        "price_micros": 462,
+        "latency_ms": 2401
+      },
+      {
+        "request_id": "a97caa037c7403f2-19",
+        "t_ms": 1792799246000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 6299,
+        "output_tokens": 20,
+        "cache_read_tokens": 6144,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 232,
+        "price_micros": 232,
+        "latency_ms": 1023
+      }
+    ],
+    "rows_found": 22,
+    "total_cost_micros": 10754,
+    "total_price_micros": 10754,
+    "total_cost_usd": 0.010754,
+    "input_tokens": 99529,
+    "output_tokens": 1892,
+    "cache_read_tokens": 79616
+  },
+  "sandbox": {
+    "provider": "e2b",
+    "label": "E2B microVM",
+    "per_session": true,
+    "region": null,
+    "vms": [
+      {
+        "session": "demo.u1023234200d",
+        "sandbox_id": "ip4eh07tqskf2lp4rzvjr",
+        "created_ms": 1792798946662
+      }
+    ]
+  },
+  "disk": null,
+  "teardown": {
+    "tagging_index_stale": 15,
+    "name": "demo",
+    "region": "us-west-2",
+    "verified_at": "2026-10-23T23:52:53Z",
+    "verdict": "clean",
+    "before": {
+      "cloudmap_namespaces": 1,
+      "cloudmap_services": 4,
+      "e2b_sandboxes": 1,
+      "ec2_internet_gateways": 1,
+      "ec2_network_interfaces": 5,
+      "ec2_route_tables": 1,
+      "ec2_security_groups": 2,
+      "ec2_subnets": 1,
+      "ec2_vpcs": 1,
+      "ecr_repositories": 5,
+      "ecs_clusters": 1,
+      "ecs_services": 4,
+      "ecs_task_definitions": 5,
+      "ecs_tasks": 4,
+      "efs_access_points": 1,
+      "efs_file_systems": 1,
+      "efs_mount_targets": 1,
+      "iam_roles": 5,
+      "log_groups": 1,
+      "route53_hosted_zones": 1,
+      "s3_buckets": 1,
+      "ssm_parameters": 12
+    },
+    "counts": {
+      "cloudmap_namespaces": 0,
+      "cloudmap_services": 0,
+      "e2b_sandboxes": 0,
+      "ec2_internet_gateways": 0,
+      "ec2_network_interfaces": 0,
+      "ec2_route_tables": 0,
+      "ec2_security_groups": 0,
+      "ec2_subnets": 0,
+      "ec2_vpcs": 0,
+      "ecr_repositories": 0,
+      "ecs_clusters": 0,
+      "ecs_services": 0,
+      "ecs_task_definitions": 0,
+      "ecs_tasks": 0,
+      "efs_access_points": 0,
+      "efs_file_systems": 0,
+      "efs_mount_targets": 0,
+      "iam_roles": 0,
+      "log_groups": 0,
+      "route53_hosted_zones": 0,
+      "s3_buckets": 0,
+      "ssm_parameters": 0,
+      "tagging_api": 0
+    }
+  }
+}
