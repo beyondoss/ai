@@ -311,10 +311,20 @@ async fn a_killed_bash_job_dies_on_the_target() {
     let n = job_number(&out).unwrap_or_else(|| {
         panic!("a silent command on a streaming target must yield as a job: {out}")
     });
-    let pids: Vec<String> = out
+    // The pids arrive when the transport has started the command, which on a loaded runner can be
+    // after the 2 s idle window: the first result is then a bare yield. The output is not lost, it
+    // comes back on the job's next wait.
+    let mut seen = out;
+    let give_up = Instant::now() + Duration::from_secs(30);
+    while !seen.contains("pids ") && Instant::now() < give_up {
+        let more = call(&jobs, json!({ "job": n })).await.unwrap_or_else(|e| e);
+        seen.push('\n');
+        seen.push_str(&more);
+    }
+    let pids: Vec<String> = seen
         .lines()
         .find_map(|l| l.strip_prefix("pids "))
-        .unwrap_or_else(|| panic!("no pids in: {out}"))
+        .unwrap_or_else(|| panic!("no pids in: {seen}"))
         .split_whitespace()
         .map(str::to_string)
         .collect();
