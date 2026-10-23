@@ -20,6 +20,7 @@ fn limits(models: Option<&[&str]>, tools: Option<&[&str]>, max_steps: Option<u32
         models: models.map(owned),
         tools: tools.map(owned),
         max_steps,
+        max_mcp_json_servers: None,
     }
 }
 

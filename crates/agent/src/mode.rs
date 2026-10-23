@@ -551,6 +551,7 @@ impl Mode {
         let (connectors, warnings) = crate::service::workspace_mcp(
             service.definition_fs(exec.backend()).as_ref(),
             std::path::Path::new(service.workspace_root()),
+            service.limits().max_mcp_json_servers,
         )
         .await;
         for warning in &warnings {

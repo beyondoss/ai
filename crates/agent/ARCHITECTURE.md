@@ -5681,9 +5681,11 @@ file is trusted, because it is the tenant's text and this is the replica: a `hea
 ignored with a warning (a name's headers come only from `secrets.mcp_headers`, so an entry the grant
 has no headers for connects without any), and `${VAR}` or `!cmd` is never expanded. A `command`
 entry is skipped with a warning (it would be a process on the replica; running it in the sandbox is
-not built). The file contributes at most `mcp_json::MAX_HOSTED_CONNECTORS` (16) connectors, in
-file order: each is an outbound handshake from the shared replica dialed together at session start,
-and the rest are dropped with one warning; the grant's own connectors are not counted. When the
+not built). The file contributes at most `limits.max_mcp_json_servers` connectors (the grant's
+[ceiling](#grant-ceilings--limits)), in file order: each is an outbound handshake from the shared
+replica dialed together at session start, and the rest are dropped with one warning that names the
+limit that applied. The agent's own hard ceiling, `mcp_json::MAX_HOSTED_CONNECTORS` (64), holds when the
+grant names no limit or a larger one; the grant's own connectors are not counted. When the
 grant and the file name the same connector, the grant's wins, headers
 included. The connectors are saved in the [snapshot](#sandbox-snapshot), so a reopened session
 dials them without waking the sandbox to read the file again; a changed file is picked up by the
@@ -6128,6 +6130,9 @@ nothing the tenant writes can exceed it.
   the tools that filter does not govern (`memory`) are not governed here either.
 - **Steps.** `max_steps` is the lower of the session's own cap and the ceiling; with no cap of its own
   the session gets the ceiling.
+- **`.mcp.json` servers.** `max_mcp_json_servers` is the most `url` servers a session adds from the
+  workspace or bundle `.mcp.json` (see "The workspace's `.mcp.json`"); the lower of it and the agent's
+  ceiling of 64 applies, so an absent claim is 64, never unlimited.
 - **Absent means as before.** A grant without `limits`, or with only some fields, ceilings only those.
   The claim is applied in `setup_prompt` (`Mode::apply_limits`) after the `AGENTS.md` frontmatter, so
   nothing earlier can exceed it.

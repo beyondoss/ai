@@ -79,6 +79,9 @@ enum Cmd {
         /// The grant's `limits.max_steps` ceiling.
         #[arg(long)]
         limits_max_steps: Option<u32>,
+        /// The grant's `limits.max_mcp_json_servers` ceiling: servers a session may add from `.mcp.json`.
+        #[arg(long)]
+        limits_max_mcp_json_servers: Option<u32>,
         /// The grant's `bundle` claim, `url=sha256hex`: the agent folder as a plain tar the replica
         /// fetches and verifies. With it, `--exec-url` may be empty (a session with no sandbox).
         #[arg(long)]
@@ -171,6 +174,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             limits_models,
             limits_tools,
             limits_max_steps,
+            limits_max_mcp_json_servers,
             bundle,
         } => {
             let connectors = connectors(&mcp, &mcp_sandbox, &mcp_managed, &mcp_header)?;
@@ -188,13 +192,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     Ok::<_, String>((header_name.to_string(), value))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let limits =
-                (limits_models.is_some() || limits_tools.is_some() || limits_max_steps.is_some())
-                    .then_some(keys::Limits {
-                        models: limits_models,
-                        tools: limits_tools,
-                        max_steps: limits_max_steps,
-                    });
+            let limits = (limits_models.is_some()
+                || limits_tools.is_some()
+                || limits_max_steps.is_some()
+                || limits_max_mcp_json_servers.is_some())
+            .then_some(keys::Limits {
+                models: limits_models,
+                tools: limits_tools,
+                max_steps: limits_max_steps,
+                max_mcp_json_servers: limits_max_mcp_json_servers,
+            });
             let bundle = bundle
                 .map(|b| {
                     let (url, sha256) = b.rsplit_once('=').ok_or("--bundle takes url=sha256hex")?;

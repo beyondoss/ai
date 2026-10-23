@@ -196,6 +196,7 @@ fn connectors_limits_and_a_managed_token_are_accepted_by_the_agents_verifier() {
             models: Some(vec!["gpt-5-mini".into()]),
             tools: Some(vec!["read".into()]),
             max_steps: Some(9),
+            max_mcp_json_servers: Some(4),
         }),
         ..args(false)
     };
@@ -220,6 +221,7 @@ fn connectors_limits_and_a_managed_token_are_accepted_by_the_agents_verifier() {
         Some(&["gpt-5-mini".to_string()][..])
     );
     assert_eq!(grant.limits.max_steps, Some(9));
+    assert_eq!(grant.limits.max_mcp_json_servers, Some(4));
     let vault = &grant.secrets.mcp_headers["vault"];
     assert_eq!(vault.len(), 1);
     assert!(vault[0].value.expose().starts_with("Bearer bmc_v1."));

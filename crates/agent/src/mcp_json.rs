@@ -35,12 +35,12 @@ pub const FILE: &str = ".mcp.json";
 /// Larger than any real config; a bigger file is ignored rather than read whole.
 pub const MAX_BYTES: u64 = 256 * 1024;
 
-/// Most connectors a hosted session takes from the file. Each is an outbound handshake from the
-/// shared replica, dialed together at session start, and every tool it lists lands in the prompt;
-/// a real project config names a handful, so 16 leaves room without letting a tenant's file fan a
-/// session out to thousands of dials. Connectors from the session grant are not counted: those are
-/// the control plane's call.
-pub const MAX_HOSTED_CONNECTORS: usize = 16;
+/// The agent's hard ceiling on connectors a hosted session takes from the file, whatever the grant
+/// says and when it says nothing. Each is an outbound handshake from the shared replica, dialed
+/// together at session start, and every tool it lists lands in the prompt. The real number is the
+/// control plane's (`limits.max_mcp_json_servers` in the grant); this only keeps a missing or huge
+/// one from meaning thousands of dials. Connectors from the session grant are not counted.
+pub const MAX_HOSTED_CONNECTORS: usize = 64;
 
 enum Entry {
     Stdio {
@@ -137,8 +137,14 @@ pub fn local_servers(text: &str) -> (Vec<McpServerConfig>, Vec<String>) {
 /// The file's usable servers as grant-shaped connectors, plus a warning for each entry skipped or
 /// stripped. See the module doc for what a hosted session takes from the file. Names are held to
 /// the grant's own rule, so a name the grant would refuse never reaches the connect path.
-pub fn hosted_connectors(text: &str) -> (Vec<McpConnector>, Vec<String>) {
+pub fn hosted_connectors(text: &str, grant_limit: Option<u32>) -> (Vec<McpConnector>, Vec<String>) {
     let (entries, mut warnings) = parse(text);
+    let (cap, limit) = match grant_limit {
+        Some(n) if (n as usize) < MAX_HOSTED_CONNECTORS => {
+            (n as usize, "the grant's max_mcp_json_servers")
+        }
+        _ => (MAX_HOSTED_CONNECTORS, "the agent's ceiling"),
+    };
     let mut connectors = Vec::new();
     let mut over_cap = 0usize;
     for (name, entry) in entries {
@@ -150,7 +156,7 @@ pub fn hosted_connectors(text: &str) -> (Vec<McpConnector>, Vec<String>) {
             Entry::Stdio { .. } => warnings.push(format!(
                 "{FILE}: server `{name}` skipped: a `command` server is not run in a hosted session"
             )),
-            Entry::Http { .. } if connectors.len() >= MAX_HOSTED_CONNECTORS => over_cap += 1,
+            Entry::Http { .. } if connectors.len() >= cap => over_cap += 1,
             Entry::Http { url, headers } => {
                 if !headers.is_empty() {
                     warnings.push(format!(
@@ -169,8 +175,8 @@ pub fn hosted_connectors(text: &str) -> (Vec<McpConnector>, Vec<String>) {
     }
     if over_cap > 0 {
         warnings.push(format!(
-            "{FILE}: {over_cap} server(s) skipped: a hosted session takes at most \
-             {MAX_HOSTED_CONNECTORS} from the file"
+            "{FILE}: {over_cap} server(s) skipped: {limit} lets a hosted session take \
+             at most {cap} from the file"
         ));
     }
     (connectors, warnings)
@@ -240,7 +246,7 @@ mod tests {
 
     #[test]
     fn hosted_connectors_keep_only_the_url_and_say_what_they_dropped() {
-        let (connectors, warnings) = hosted_connectors(FILE_TEXT);
+        let (connectors, warnings) = hosted_connectors(FILE_TEXT, None);
         let mut names: Vec<_> = connectors.iter().map(|c| c.name.as_str()).collect();
         names.sort();
         assert_eq!(names, ["docs", "legacy", "typed"]);
@@ -274,22 +280,53 @@ mod tests {
     fn hosted_connectors_refuse_names_the_grant_would_refuse() {
         let (connectors, warnings) = hosted_connectors(
             r#"{"mcpServers": {"a__b": {"url": "https://a/mcp"}, "has space": {"url": "https://a/mcp"}, "fine": {"url": "https://a/mcp"}}}"#,
+            None,
         );
         assert_eq!(connectors.len(), 1);
         assert_eq!(connectors[0].name, "fine");
         assert_eq!(warnings.len(), 2, "{warnings:?}");
     }
 
-    #[test]
-    fn hosted_connectors_stop_at_the_cap_and_say_so() {
-        let n = MAX_HOSTED_CONNECTORS + 5;
+    fn file_of(n: usize) -> String {
         let servers: Vec<String> = (0..n)
             .map(|i| format!(r#""s{i}": {{"url": "https://a/{i}"}}"#))
             .collect();
-        let (connectors, warnings) =
-            hosted_connectors(&format!(r#"{{"mcpServers": {{{}}}}}"#, servers.join(",")));
+        format!(r#"{{"mcpServers": {{{}}}}}"#, servers.join(","))
+    }
+
+    #[test]
+    fn the_grants_limit_below_the_ceiling_caps_the_file_and_the_warning_names_it() {
+        let (connectors, warnings) = hosted_connectors(&file_of(10), Some(3));
+        assert_eq!(connectors.len(), 3);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("7 server(s) skipped"), "{warnings:?}");
+        assert!(warnings[0].contains("max_mcp_json_servers"), "{warnings:?}");
+        assert!(warnings[0].contains("at most 3"), "{warnings:?}");
+    }
+
+    #[test]
+    fn no_limit_means_the_ceiling_never_unlimited() {
+        let (connectors, warnings) = hosted_connectors(&file_of(MAX_HOSTED_CONNECTORS + 5), None);
         assert_eq!(connectors.len(), MAX_HOSTED_CONNECTORS);
+        assert_eq!(MAX_HOSTED_CONNECTORS, 64);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("5 server(s) skipped"), "{warnings:?}");
+        assert!(warnings[0].contains("ceiling"), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_limit_above_the_ceiling_still_stops_at_the_ceiling() {
+        let (connectors, warnings) =
+            hosted_connectors(&file_of(MAX_HOSTED_CONNECTORS + 5), Some(1000));
+        assert_eq!(connectors.len(), MAX_HOSTED_CONNECTORS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("ceiling"), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_file_within_the_limit_warns_of_nothing() {
+        let (connectors, warnings) = hosted_connectors(&file_of(3), Some(3));
+        assert_eq!(connectors.len(), 3);
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 }
