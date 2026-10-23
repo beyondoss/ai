@@ -92,6 +92,7 @@ pub struct Limits {
     pub models: Option<Vec<String>>,
     pub tools: Option<Vec<String>>,
     pub max_steps: Option<u32>,
+    pub max_mcp_json_servers: Option<u32>,
 }
 
 /// The grant's `bundle` claim: the agent folder, as an immutable tar named by its hash.
@@ -175,6 +176,7 @@ pub fn mint_grant(keys: &GrantKeys, a: &MintArgs) -> Res<String> {
                 models: l.models.clone(),
                 tools: l.tools.clone(),
                 max_steps: l.max_steps,
+                max_mcp_json_servers: l.max_mcp_json_servers,
             }),
         bundle: a
             .bundle
@@ -333,6 +335,7 @@ pub fn inspect_grant(keys: &GrantKeys, token: &str, needle: &str) -> Res<serde_j
             "models": grant.limits.models,
             "tools": grant.limits.tools,
             "max_steps": grant.limits.max_steps,
+            "max_mcp_json_servers": grant.limits.max_mcp_json_servers,
         },
     }))
 }

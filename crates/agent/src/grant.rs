@@ -170,6 +170,12 @@ pub struct Limits {
     /// The most model turns one prompt may take; the lower of this and the session's own cap applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_steps: Option<u32>,
+    /// The most servers a session may add from the workspace or bundle `.mcp.json` (see
+    /// [`crate::mcp_json`]); connectors the grant itself carries are not counted. The agent holds a
+    /// hard ceiling of [`crate::mcp_json::MAX_HOSTED_CONNECTORS`] whatever this says, and applies it
+    /// when this is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_mcp_json_servers: Option<u32>,
 }
 
 impl Limits {
@@ -1232,6 +1238,7 @@ mod tests {
             models: Some(vec!["claude-sonnet-*".into()]),
             tools: Some(vec!["read".into()]),
             max_steps: Some(7),
+            max_mcp_json_servers: Some(3),
         });
         let built = build(&inputs);
         let grant = verifier(&built).verify(&built.token, built.now).unwrap();
@@ -1241,6 +1248,12 @@ mod tests {
         );
         assert_eq!(grant.limits.tools, Some(vec!["read".to_string()]));
         assert_eq!(grant.limits.max_steps, Some(7));
+        assert_eq!(grant.limits.max_mcp_json_servers, Some(3));
+        assert!(
+            built.payload_json.contains("\"max_mcp_json_servers\":3"),
+            "{}",
+            built.payload_json
+        );
         assert!(
             built.payload_json.contains("\"limits\":{"),
             "{}",
@@ -1329,6 +1342,7 @@ mod tests {
             ]),
             tools: Some(vec!["read".into(), "bash".into()]),
             max_steps: Some(5),
+            max_mcp_json_servers: None,
         };
         for ok in ["claude-test", "gpt-5-mini", "gpt--mini", "x-fast"] {
             assert!(l.check_model(ok).is_ok(), "{ok}");

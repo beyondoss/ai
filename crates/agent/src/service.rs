@@ -654,7 +654,9 @@ impl ServiceSession {
             prompt_templates,
             prompt_collisions,
             agents,
-            mcp_connectors: workspace_mcp(backend, root).await.0,
+            mcp_connectors: workspace_mcp(backend, root, self.limits().max_mcp_json_servers)
+                .await
+                .0,
             context_files: match context_files {
                 true => crate::resources::load_context_files_via(backend, root, home).await,
                 false => Vec::new(),
@@ -828,10 +830,11 @@ fn claude_roots(root: &Path, home: Option<&Path>, leaf: &str) -> Vec<(PathBuf, &
 pub async fn workspace_mcp(
     backend: &dyn crate::tools::fs::FsBackend,
     root: &Path,
+    grant_limit: Option<u32>,
 ) -> (Vec<McpConnector>, Vec<String>) {
     let path = root.join(crate::mcp_json::FILE);
     match crate::tools::fs::read_text_capped(backend, &path, crate::mcp_json::MAX_BYTES).await {
-        Ok(text) => crate::mcp_json::hosted_connectors(&text),
+        Ok(text) => crate::mcp_json::hosted_connectors(&text, grant_limit),
         Err(_) => (Vec::new(), Vec::new()),
     }
 }

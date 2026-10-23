@@ -54,6 +54,7 @@ pub struct Limits {
     pub models: Option<Vec<String>>,
     pub tools: Option<Vec<String>>,
     pub max_steps: Option<u32>,
+    pub max_mcp_json_servers: Option<u32>,
 }
 
 /// The sealed secrets, in wire order. `dek` is 32 raw bytes.
@@ -195,6 +196,8 @@ fn payload_json(c: &Claims, sealed: &str) -> String {
             list("models", &l.models),
             list("tools", &l.tools),
             l.max_steps.map(|n| format!("\"max_steps\":{n}")),
+            l.max_mcp_json_servers
+                .map(|n| format!("\"max_mcp_json_servers\":{n}")),
         ]
         .into_iter()
         .flatten()
