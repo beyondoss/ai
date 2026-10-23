@@ -99,8 +99,13 @@ folder (about 32 round trips at every open without one).
   session opened, and times open to VM create, and VM create to the first tool result. The browser
   needs the VM's address, so the browser check opens a second session on the same VM with a grant that
   names it.
-- **browser**: the browser connector is the sandbox, so its VM is made before the session opens and
-  seeded from the bundle; the agent itself never calls an exec endpoint.
+- **browser**: the browser connector is the sandbox, and its address is the front too
+  (`/mcp/<session>`). The agent offers the browser's tools at open from a list saved in the bundle
+  (`.mcp-tools.json`, made at bundle build by `mcp-tools.sh` running `rustwright-mcp` once), so nothing
+  dials the front and no VM exists. The model's first browser call reaches the front, which makes the
+  VM, seeds it, installs the browser stack (the VM fetches the `rustwright-mcp` binary itself) and
+  forwards; the agent then compares the server's real list with the saved one.
+  `vm-created-on-first-tool` shows it, as for coding.
 
 Every use case's report has a "Session open" section: sandbox requests while each session opened, and
 the time from connecting to the first answer.

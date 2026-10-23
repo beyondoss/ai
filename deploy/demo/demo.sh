@@ -571,7 +571,7 @@ LOGS=$(cw "" "$((START_MS - 5000))")
 # is its end, and any between are the proof made again when a new agent reopens the session.
 # The exec front (a coding agent's sandbox that is made on its first request): when it was first asked and
 # when the VM existed.
-jq -c '.[]|select(.m|startswith("{"))|{t, d:(.m|fromjson? // empty)}|select(.d.src=="front" and (.d.event|test("first_request|vm_create_start|vm_ready|vm_seeded|vm_failed")))|
+jq -c '.[]|select(.m|startswith("{"))|{t, d:(.m|fromjson? // empty)}|select(.d.src=="front" and (.d.event|test("first_request|vm_create_start|vm_ready|vm_seeded|browser_ready|vm_failed")))|
   {t_ms:.d.ts_ms, src:"front", event:.d.event, path:null, detail:.d.detail}' <<<"$LOGS" >> "$TIMELINE"
 jq -c '[.[]|select(.m|startswith("{"))|{t, d:(.m|fromjson? // empty)}|select(.d.src=="sandbox")|
   {t_ms:.d.ts_ms, src:"sandbox", event:.d.event, vm:.d.vm, path:(if .d.event=="exec_start" then ["agent","sandbox"] elif .d.event=="exec_end" or .d.event=="job_ended_callback" then ["sandbox","agent"] else null end), detail:.d.detail}]

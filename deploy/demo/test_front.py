@@ -32,6 +32,9 @@ vm_for() {{
 }}
 vm_field() {{ jq -r ".$2" "$VMDIR/$1.json"; }}
 e2b_kill() {{ echo "$1" >> "{TMP}/kills"; }}
+vm_run() {{ echo seeded; }}
+vm_browser_up() {{ echo "$3" >> "{TMP}/browser_up"; }}
+vm_bridge_start() {{ echo "$3" >> "{TMP}/bridge_start"; }}
 ''')
 
 os.environ.update(FRONT_VMDIR=VMDIR, FRONT_E2B_SH=STUB_E2B, FRONT_CA_FILE=os.path.join(TMP, "ca.pem"))
@@ -66,7 +69,7 @@ def post(srv, session):
 class FrontTest(unittest.TestCase):
     def setUp(self):
         front.sessions.clear()
-        for n in ("creates", "kills", "deleted"):
+        for n in ("creates", "kills", "deleted", "browser_up", "bridge_start"):
             try:
                 os.remove(os.path.join(TMP, n))
             except FileNotFoundError:
@@ -83,6 +86,30 @@ class FrontTest(unittest.TestCase):
         self.assertEqual(lines("kills"), ["vm1"])
         self.assertEqual(post(srv, "s1"), 502)
         self.assertEqual(len(lines("creates")), 2, "the second request must not reuse the dead entry")
+        srv.shutdown()
+
+    def test_an_mcp_request_creates_the_vm_and_installs_the_browser_stack_and_an_exec_request_does_not(self):
+        srv = serve()
+        for path in ("/exec/e1?bundle=https://b/t.tar", "/mcp/m1?bundle=https://b/t.tar&browser=https://b/rw&site=site"):
+            c = http.client.HTTPConnection("127.0.0.1", srv.server_port, timeout=20)
+            c.request("POST", path, body=b"{}")
+            c.getresponse().read()
+            c.close()
+        self.assertEqual(len(lines("creates")), 2)
+        self.assertEqual(lines("browser_up"), ["https://b/rw"], "only the MCP request installs the stack")
+        self.assertTrue(lines("bridge_start")[0].endswith("/workspace/site"), lines("bridge_start"))
+        srv.shutdown()
+
+    def test_an_mcp_request_with_a_non_https_browser_or_a_climbing_site_is_refused(self):
+        srv = serve()
+        for q in ("browser=http://b/rw", "browser=https://b/rw&site=../x"):
+            c = http.client.HTTPConnection("127.0.0.1", srv.server_port, timeout=20)
+            c.request("POST", f"/mcp/m2?{q}", body=b"{}")
+            r = c.getresponse()
+            r.read()
+            c.close()
+            self.assertEqual(r.status, 400)
+        self.assertEqual(lines("creates"), [])
         srv.shutdown()
 
     def test_an_entry_past_the_vm_timeout_is_pruned(self):

@@ -7,8 +7,8 @@
 #                                        managed connector that holds no key, and a grant's ceilings
 #     ./deploy/demo/demo.sh coding       a sandbox per session: a skill, a subagent, a background app,
 #                                        a browser, all from the folder
-#     ./deploy/demo/demo.sh browser      a browser in a sandbox that sleeps: no held connection, state
-#                                        that survives a pause
+#     ./deploy/demo/demo.sh browser      a browser in a sandbox that does not exist until the model uses
+#                                        it, then sleeps: no held connection, state that survives a pause
 #
 # Each needs `SANDBOX=both ./deploy/demo/up.sh`. This file only defines: the check lists and titles, each
 # use case's preparation, its grants and its checks. demo.sh sources it and supplies the runner
@@ -19,7 +19,7 @@ UC_AGENTS=$HERE/agents
 
 CHECKS_assistant=(persona-applied remote-mcp-real managed-mcp-no-key memory-across-sessions limits-enforced skill-from-bundle no-sandbox-at-all)
 CHECKS_coding=(vm-created-on-first-tool skill-used fix-verified subagent-from-folder app-as-background-job browser-sees-localhost)
-CHECKS_browser=(browser-reads-page no-held-connection idle-cost state-survives-pause state-survives-idle-reap)
+CHECKS_browser=(vm-created-on-first-tool browser-reads-page no-held-connection idle-cost state-survives-pause state-survives-idle-reap)
 CHECK_TITLE+=(
   [persona-applied]="AGENTS.md sets the model and the tools"
   [remote-mcp-real]="A public remote MCP server (DeepWiki), from .mcp.json"
@@ -49,7 +49,7 @@ declare -A UC_TITLE=(
 declare -A UC_SUMMARY=(
   [assistant]="A folder with an AGENTS.md, a .mcp.json and a skill, deployed as a bundle. The agent has no sandbox at all: its grant names no exec endpoint. It has memory, a read-only view of its own folder (the skill), a public MCP server and one managed connector (a stand-in endpoint on AWS that holds the real key); the grant caps its models."
   [coding]="A folder with a failing Python app, a skill with a script, a reviewer subagent and an AGENTS.md, deployed as a bundle. The agent's own E2B microVM does not exist until the first sandbox tool call makes it (and seeds it from the bundle); then it fixes the bug, reviews it, runs the app as a background job and looks at the page with a browser in the same VM."
-  [browser]="A folder with an AGENTS.md, a .mcp.json and a page, deployed as a bundle. The browser (rustwright-mcp behind a supergateway bridge) runs inside an E2B microVM that is paused and resumed; the grant names it as a connector that holds no standing stream."
+  [browser]="A folder with an AGENTS.md, a .mcp.json and a page, deployed as a bundle together with the browser server's tool list (saved by running the server once at bundle build). The browser (rustwright-mcp behind a supergateway bridge) runs inside an E2B microVM that does not exist until the model first calls a browser tool, and is then paused and resumed; the grant names it as a connector that holds no standing stream."
 )
 
 # ---- helpers shared by the use cases -----------------------------------------------------------------
@@ -106,20 +106,9 @@ _grant_assistant() { # session [tamper]: no sandbox at all: the folder is the bu
     --limits-models "gpt-4.1-mini,gpt-5-mini" ${2:+--tamper}
 }
 
-_grant_vm() { # session [tamper]: the session's own E2B VM, private (its ports need the traffic token)
-  local s=$1 traffic
-  traffic=$(vm_field "$s" traffic_token)
-  DEMO_EXEC_BEARER=$(vm_field "$s" bearer) DEMO_EXEC_HEADER_TRAFFIC=$traffic DEMO_MCP_HEADER_BROWSER=$traffic \
-    "$DEMO" mint-grant --tenant "$UC_TENANT" --session "$s" --shard demo --workspace "$VM_HOME/workspace" \
-    --exec-url "$(vm_field "$s" url)" --exec-bearer --exec-header traffic=e2b-traffic-access-token \
-    --bundle "$BUNDLE_URL=$BUNDLE_SHA" \
-    --mcp "browser=$(vm_bridge_url "$s")" --mcp-sandbox browser --mcp-header browser=e2b-traffic-access-token \
-    --limits-models gpt-5-mini ${2:+--tamper}
-}
-
 # The coding agent's exec endpoint is the front, keyed on the first session's name: a VM that does not
 # exist yet is made when the first request arrives, and seeded from the bundle (front.py).
-_front_url() { echo "http://sandbox.$DNS:$FRONT_PORT/exec/$SESS_C?bundle=$(jq -rn --arg u "$BUNDLE_URL" '$u|@uri')"; }
+_front_url() { echo "http://sandbox.$DNS:$FRONT_PORT/exec/${1:-$SESS_C}?bundle=$(jq -rn --arg u "$BUNDLE_URL" '$u|@uri')"; }
 _grant_coding() { # session [tamper]
   "$DEMO" mint-grant --tenant "$UC_TENANT" --session "$1" --shard demo --workspace "$VM_HOME/workspace" \
     --exec-url "$(_front_url)" --bundle "$BUNDLE_URL=$BUNDLE_SHA" --limits-models gpt-5-mini ${2:+--tamper}
@@ -133,6 +122,17 @@ _grant_coding_browser() { # session [tamper]
     --exec-url "$(_front_url)" --bundle "$BUNDLE_URL=$BUNDLE_SHA" \
     --mcp "browser=$(vm_bridge_url "$SESS_C")" --mcp-sandbox browser --mcp-header browser=e2b-traffic-access-token \
     --limits-models gpt-5-mini ${2:+--tamper}
+}
+
+# The browser agent: the exec endpoint and the browser's MCP address are both the front, keyed on its
+# session. Neither names a VM, so neither costs one until the model calls a browser tool: the front makes
+# the VM on that first request, seeds it from the bundle, installs the browser stack (the VM fetches the
+# rustwright-mcp binary itself) and forwards.
+_front_mcp_url() { echo "http://sandbox.$DNS:$FRONT_PORT/mcp/$SESS_B?bundle=$(jq -rn --arg u "$BUNDLE_URL" '$u|@uri')&browser=$(jq -rn --arg u "$RW_URL" '$u|@uri')&site=site"; }
+_grant_browser() { # session [tamper]
+  "$DEMO" mint-grant --tenant "$UC_TENANT" --session "$1" --shard demo --workspace "$VM_HOME/workspace" \
+    --exec-url "$(_front_url "$SESS_B")" --bundle "$BUNDLE_URL=$BUNDLE_SHA" \
+    --mcp "browser=$(_front_mcp_url)" --mcp-sandbox browser --limits-models gpt-5-mini ${2:+--tamper}
 }
 
 # ---- preparation -------------------------------------------------------------------------------------------
@@ -234,7 +234,7 @@ uc_session_open_json() {
   sleep 6   # the stubs' lines reach CloudWatch a few seconds late
   reqs=$(cw sandbox/ "$((START_MS - 120000))" '"exec_request"' | jq -c '[.[]|(.m|fromjson? // empty)|select(.event=="exec_request")|.ts_ms]')
   fronts='[]'
-  [ "$MODE" != coding ] || fronts=$(cw front/ "$((START_MS - 120000))" '"exec_request"' | jq -c '[.[]|(.m|fromjson? // empty)|select(.event=="exec_request")|.ts_ms]')
+  [ "$MODE" != coding ] && [ "$MODE" != browser ] || fronts=$(cw front/ "$((START_MS - 120000))" '"exec_request"' | jq -c '[.[]|(.m|fromjson? // empty)|select(.event=="exec_request" or .event=="mcp_request")|.ts_ms]')
   jq -sc --argjson r "$reqs" --argjson f "$fronts" --arg mode "$MODE" --argjson vm "${VM_AT_OPEN:-null}" '
     map(. as $s | $s + {exec_requests: ([$r[] | select(. >= ($s.started_ms - 500) and . <= ($s.ready_ms + 1500))] | length),
         front_forwarded: ([$f[] | select(. >= ($s.started_ms - 500) and . <= ($s.ready_ms + 1500))] | length)})
@@ -242,25 +242,6 @@ uc_session_open_json() {
        per_session: ((map(.exec_requests) | add // 0) / (length | if . == 0 then 1 else . end)),
        open_ms_mean: ((map(.open_ms) | add // 0) / (length | if . == 0 then 1 else . end) | floor),
        vms_at_open: $vm}' "$UC_OPENS"
-}
-
-# A browser VM: made before the session opens (the browser connector needs the VM up, so creating it at
-# open is right here), seeded from the bundle, with the browser stack installed in it.
-uc_prepare_vm() { # session
-  local s=$1 id tok rw
-  rw=$(rustwright_bin) || { echo "demo: could not build rustwright-mcp" >&2; exit 1; }
-  VM_PRIVATE=1 vm_for "$s" || { echo "demo: no E2B sandbox for $s" >&2; exit 1; }
-  id=$(vm_field "$s" id)
-  tok=$(vm_field "$s" envd_token)
-  echo "  E2B sandbox $id (private: its ports need the traffic token)"
-  vm_put "$id" "$tok" "$BUNDLE_TAR" "$VM_HOME/bundle.tar" \
-    && vm_run "$id" "$tok" "mkdir -p '$VM_HOME/workspace' && tar -xf $VM_HOME/bundle.tar -C '$VM_HOME/workspace' && rm -f $VM_HOME/bundle.tar" >/dev/null \
-    || { echo "demo: could not seed the folder from the bundle" >&2; exit 1; }
-  local t0
-  t0=$(now_ms)
-  vm_browser_up "$id" "$tok" "$rw" || { echo "demo: the browser stack did not come up" >&2; exit 1; }
-  echo "  browser stack installed in $(( ($(now_ms) - t0) / 1000 )) s (Chrome $CHROME_VERSION headless shell, rustwright-mcp, supergateway $SUPERGATEWAY_VERSION)"
-  GRANT_FN=_grant_vm
 }
 
 uc_prepare_coding() {
@@ -288,20 +269,31 @@ uc_prepare_coding() {
 }
 
 uc_prepare_browser() {
-  [ "$USE_E2B" = 1 ] || uc_need "E2B"
+  [ "$USE_E2B" = 1 ] && [ "$USECASES" = 1 ] || uc_need "E2B and the exec front"
   SESS_B=demo.u${SID}d
+  FRONT_PORT=8084
   uc_stage
   PAGE_STAMP=stamp-$SID-$RANDOM
   sed -i "s/STAMP_PLACEHOLDER/$PAGE_STAMP/" "$STAGE/site/index.html"
+  local rw bucket sha
+  rw=$(rustwright_bin) || { echo "demo: could not build rustwright-mcp" >&2; exit 1; }
+  # The browser server's tool list, from the server itself, goes into the bundle: the agent offers these
+  # tools at open without starting the server (or the VM it will run in).
+  "$HERE/mcp-tools.sh" browser "$rw" > "$STAGE/.mcp-tools.json" 2>/dev/null || { echo "demo: could not list the browser server's tools" >&2; exit 1; }
+  echo "  saved tool list  $(jq '.browser|length' "$STAGE/.mcp-tools.json") browser tools, from running the server once"
   uc_bundle || { echo "demo: could not publish the bundle" >&2; exit 1; }
-  uc_prepare_vm "$SESS_B"
-  local id tok
-  id=$(vm_field "$SESS_B" id)
-  tok=$(vm_field "$SESS_B" envd_token)
-  vm_bridge_start "$id" "$tok" "$VM_HOME/workspace/site" || { echo "demo: the browser bridge did not start" >&2; exit 1; }
-  BRIDGE_UP_MS=$(now_ms)
+  # The binary the VM will fetch for itself, by a presigned link (nothing passes through the front).
+  sha=$(sha256sum "$rw" | cut -d' ' -f1)
+  bucket=$(bundle_bucket)
+  command aws --region "$REGION" s3 cp "$rw" "s3://$bucket/rustwright-mcp-$sha" --only-show-errors || { echo "demo: could not publish the browser server" >&2; exit 1; }
+  RW_URL=$(command aws --region "$REGION" s3 presign "s3://$bucket/rustwright-mcp-$sha" --expires-in 21600) || exit 1
+  GRANT_FN=_grant_browser
+  # Open the session. There is no sandbox VM for it, and opening must not make one.
   VM_AT_OPEN=$(vm_count_for "$SESS_B") || VM_AT_OPEN=null
   uc_open "$SESS_B"
+  VM_AT_OPEN_AFTER=$(vm_count_for "$SESS_B") || VM_AT_OPEN_AFTER=null
+  echo "  E2B sandboxes for this session before the open: $VM_AT_OPEN, after it: $VM_AT_OPEN_AFTER"
+  VM_AT_OPEN=${VM_AT_OPEN_AFTER}
 }
 
 # ============================================================================================================
@@ -561,6 +553,7 @@ vm_in() { # session script -> runs it in the session's VM
 }
 
 check_vm_created_on_first_tool() {
+  [ "$MODE" != browser ] || { _vm_created_on_first_browser_tool; return; }
   local ready=$UC_READY_MS out tool t_tool t_end t_sent fl first_req create_start vm_up seeded rows model_done vms_after tool_out ok
   out=$(chat "$SESS_C" --timeout-secs 600 --prompt "Use the bash tool to run: ls app; uname -a   Then tell me in one sentence what you see.")
   note_calls "$SESS_C" "$out"
@@ -602,6 +595,52 @@ check_vm_created_on_first_tool() {
       "$(jq -nc --argjson a "$((create_start - ready))" '{label:"session open to VM create",value:$a,unit:"ms"}')"
   else
     result 0 "vms_at_open=${VM_AT_OPEN:-?} ready=$ready first_req=$first_req create=$create_start tool=$t_tool model_done=$model_done vms_after=$vms_after tool_end=$t_end out=${tool_out:0:120}"
+  fi
+}
+
+# The browser's version: the model is offered the browser tools at open from the list saved in the bundle,
+# and the VM (with the browser stack in it) is made by the front when the first of them is called.
+_vm_created_on_first_browser_tool() {
+  local ready=$UC_READY_MS out tool t_tool t_end t_sent fl first_req create_start vm_up seeded browser_up model_done vms_after nav ok
+  out=$(chat "$SESS_B" --timeout-secs 600 --prompt "Open http://localhost:8000/ in the browser (find the browser tools with tool_search). Tell me the page title and the text of the line that starts with 'stamp', quoting them from the browser's snapshot.")
+  note_calls "$SESS_B" "$out"
+  tool=$(jq -c '[.tools[]|select(.name|test("browser_navigate"))][0] // null' <<<"$out")
+  t_tool=$(jq -r '.t_ms // 0' <<<"$tool")
+  t_end=$(jq -r '.end_ms // 0' <<<"$tool")
+  t_sent=$(jq -r .sent_at_ms <<<"$out")
+  nav=$(jq -r '.output // ""' <<<"$tool")
+  for _ in $(seq 1 20); do
+    fl=$(cw front/ "$((ready - 60000))" | jq -c --arg s "$SESS_B" '[.[]|(.m|fromjson? // empty)|select(.src=="front" and .detail.session==$s)]')
+    [ "$(jq '[.[]|select(.event=="browser_ready")]|length' <<<"$fl")" -ge 1 ] && break
+    sleep 3
+  done
+  _fl() { jq -r --arg e "$1" '[.[]|select(.event==$e)][0].ts_ms // 0' <<<"$fl"; }
+  first_req=$(_fl first_request)
+  create_start=$(_fl vm_create_start)
+  vm_up=$(_fl vm_ready)
+  seeded=$(_fl vm_seeded)
+  browser_up=$(_fl browser_ready)
+  vms_after=$(vm_count_for "$SESS_B" || echo -1)
+  # Now that it exists, the demo can reach it too (the later checks pause it and read its processes).
+  if vm_adopt "$SESS_B"; then
+    jq --argjson c "$create_start" '.created_ms = $c' "$VMDIR/$SESS_B.json" > "$VMDIR/$SESS_B.json.tmp" && mv "$VMDIR/$SESS_B.json.tmp" "$VMDIR/$SESS_B.json"
+  fi
+  model_done=$(jq '[.[]|((.start_unix_secs*1000) + .latency_ms)]|min // 0' <<<"$(uc_rows_since "$t_sent" 1)")
+  echo "  session ready at $ready; VMs for it at open: ${VM_AT_OPEN:-?}"
+  echo "  the model's browser_navigate call started $t_tool; the front was first asked at $first_req (+$((first_req - ready)) ms after open)"
+  echo "  VM create began $create_start, VM serving $vm_up (+$((vm_up - create_start)) ms), seeded $seeded, browser stack and bridge up $browser_up (+$((browser_up - seeded)) ms)"
+  echo "  the first browser result arrived at $t_end: $((t_end - t_tool)) ms after the call started; E2B VMs for it now: $vms_after"
+  ok=0
+  if [ "${VM_AT_OPEN:-1}" = 0 ] && [ "$create_start" -gt "$ready" ] && [ "$first_req" -ge "$((t_tool - 1500))" ] && [ "$create_start" -ge "$((model_done - 1500))" ] \
+    && [ "$vms_after" = 1 ] && [ "$t_end" -gt "$create_start" ] && [[ $nav == *"$PAGE_STAMP"* ]]; then ok=1; fi
+  if [ "$ok" = 1 ]; then
+    result 1 "no VM existed when the session opened, yet the model had the browser tools (from the list saved in the bundle); only when it called browser_navigate did the front make the VM ($((create_start - ready)) ms after the session was ready), seed it, install the browser stack and forward the call; the first browser result came $((t_end - t_tool)) ms after the call started" \
+      "$(jq -nc --argjson ready "$ready" --argjson fr "$first_req" --argjson cs "$create_start" --argjson up "$vm_up" --argjson sd "$seeded" --argjson bu "$browser_up" --argjson te "$t_end" --argjson tt "$t_tool" --argjson md "$model_done" \
+        '{vms_at_open:0, session_ready_ms:$ready, first_model_call_answered_ms:$md, tool_call_started_ms:$tt, front_first_request_ms:$fr, vm_create_started_ms:$cs, vm_serving_ms:$up, vm_seeded_ms:$sd, browser_ready_ms:$bu, first_tool_result_ms:$te,
+          open_to_vm_create_ms:($cs-$ready), vm_provision_ms:($up-$cs), seed_from_bundle_ms:($sd-$up), browser_stack_ms:($bu-$sd), first_tool_call_to_result_ms:($te-$tt)}')" \
+      "$(jq -nc --argjson a "$((t_end - t_tool))" '{label:"first browser call to its result (VM made inside it)",value:$a,unit:"ms"}')"
+  else
+    result 0 "vms_at_open=${VM_AT_OPEN:-?} ready=$ready first_req=$first_req create=$create_start tool=$t_tool model_done=$model_done vms_after=$vms_after tool_end=$t_end nav=${nav:0:160}"
   fi
 }
 
