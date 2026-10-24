@@ -4821,8 +4821,16 @@ the old kid is still accepted, while minting stays under the current secret. A g
 key id, but the AEAD refuses a wrong key cleanly: when opening under the current secret fails with
 `SealOpenFailed`, the replica opens a copy of the blob under the previous secret (one more X25519 and
 AEAD, only on that failure), and reports `SealOpenFailed` if both fail. Rotate in this order: give
-every replica current=B, previous=A; then move the minter to seal under B; then drop the previous
-secret once the longest grant life (5 min) plus the notify token lifetime (about 723 s) has passed.
+every replica current=new, previous=old; then switch the minter; then drop the previous secret. A
+notify token has no time in it (it is a function of the key and of tenant, session, scope and job id),
+so a job kept before the switch holds its old-kid token for as long as it runs; 723 s is only how long
+a sandbox retries one callback. Routine rotation: drop the previous secret after 24 h, the session
+ceiling, by which time nearly every job kept before the switch has ended. Urgent rotation (the old key
+is exposed): drop it as soon as one grant life (5 min) has passed since the minter switched. Dropping
+early costs a job kept before the switch that ends afterwards a `503` (`UnknownKid`) on its callback,
+which the sandbox retries for up to 723 s and then abandons. Its push notice is lost and its result is
+not wrong: the callback is only a hint, and the session learns of the end the next time it reads its
+jobs or reopens (FLEET.md, "Job-end callbacks").
 
 ### Golden vectors
 

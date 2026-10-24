@@ -21,8 +21,11 @@
 //!   key ([`NotifyKey::with_previous`]) and accepts tokens naming that kid, so a kept job's
 //!   notification survives the switch; the kid picks the key, so the two are never tried in turn.
 //!   A token naming any other kid is [`Verdict::UnknownKid`] (answered `503`, so a sandbox keeps
-//!   retrying through a seal-secret rollout). The operator drops the previous secret once the
-//!   longest token lifetime has passed.
+//!   retrying through a seal-secret rollout). A token has no time in it, so a job kept before the
+//!   switch holds its old-kid token for as long as it runs. The operator drops the previous secret
+//!   after 24 h (routine) or one grant life (5 min) after the minter switched (urgent); a job that
+//!   ends after that gets `503`, retries for 723 s and gives up, and the session learns of the end
+//!   when it next reads its jobs or reopens.
 //! - **Its own scope only.** [`NotifyKey::mint`] takes the tenant, the session and the job, and
 //!   computes the scope itself ([`JobScope::for_session`]), so a replica cannot mint for another
 //!   session's jobs.
