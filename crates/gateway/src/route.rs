@@ -261,7 +261,16 @@ fn is_mount(mount: &str) -> bool {
     MOUNTS.contains(&mount)
         || mount
             .strip_prefix("/openai/deployments/")
-            .is_some_and(|d| !d.is_empty() && !d.contains('/'))
+            .is_some_and(is_deployment_name)
+}
+
+/// An Azure deployment name as the managed allowlist admits it: `[A-Za-z0-9._-]+`, and not `.` or
+/// `..`. A percent-escape is refused outright, so `..%2Fv1%2Fthreads%2Ft` cannot ride the segment to
+/// an upstream that decodes it and removes dot-segments.
+fn is_deployment_name(d: &str) -> bool {
+    !matches!(d, "" | "." | "..")
+        && d.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// [`forward_endpoint`], anchored: the row only when everything before its suffix is exactly one

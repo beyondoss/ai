@@ -688,7 +688,9 @@ served before this check). On `/{provider}/…` the method must be `POST` and th
 string excluded, must be exactly a mount prefix followed by a generation endpoint: `/chat/completions`,
 `/messages`, `/responses`, `/embeddings`, `/messages/count_tokens`, `/responses/input_tokens` or
 `/responses/compact`. The mounts are `/v1`, `/api/v1`, `/openai/v1`, `/inference/v1`,
-`/anthropic/v1`, `/backend-api/codex` and Azure's `/openai/deployments/{name}` (one segment). A path
+`/anthropic/v1`, `/backend-api/codex` and Azure's `/openai/deployments/{name}` (one segment, `[A-Za-z0-9._-]+`, not `.` or `..`: a
+percent-escape such as `..%2Fv1%2Fthreads%2Ft` is refused, since an upstream that decodes it and drops
+dot-segments would reach a non-generation endpoint on the pool key). A path
 that merely ends in an endpoint suffix (`/v1/threads/t/messages`, `/v1/x/chat/completions`) is
 refused: it would be an unmetered write on the pool key. Wire selection and BYO paths still match
 by suffix (`route::forward_endpoint`); only the allowlist is anchored
