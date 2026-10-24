@@ -400,8 +400,8 @@ pub struct GrantVerifier {
     fleet_secret: StaticSecret,
     /// `fleet_secret`'s public half — half of the HKDF salt, so derived once here.
     fleet_public: PublicKey,
-    /// The seal secret this fleet rotated away from, during a rotation. Only the notify key
-    /// consults it: a grant's seal names no key, and a grant is re-minted for each connection.
+    /// The seal secret this fleet rotated away from, during a rotation: a grant's seal and a
+    /// notify token's kid are each tried against it after the current secret.
     previous_seal: Option<StaticSecret>,
 }
 
@@ -416,7 +416,8 @@ impl GrantVerifier {
         }
     }
 
-    /// Also accept notify tokens minted under `previous`, the seal secret being rotated out.
+    /// Also accept grants sealed to, and notify tokens minted under, `previous`: the seal secret
+    /// being rotated out.
     #[must_use]
     pub fn with_previous_seal(mut self, previous: StaticSecret) -> Self {
         self.previous_seal = Some(previous);
@@ -524,27 +525,45 @@ impl GrantVerifier {
         if blob.len() < EPH_LEN + NONCE_LEN + TAG_LEN {
             return Err(GrantError::SealMalformed);
         }
-        let (head, body) = blob.split_at_mut(EPH_LEN + NONCE_LEN);
-        let (eph, nonce) = head.split_at(EPH_LEN);
-        let eph =
-            PublicKey::from(<[u8; 32]>::try_from(eph).map_err(|_| GrantError::SealMalformed)?);
-        let key = derive_seal_key(
-            &self.fleet_secret.diffie_hellman(&eph),
-            &eph,
-            &self.fleet_public,
-        )
-        .ok_or(GrantError::SealMalformed)?;
-        let (ciphertext, tag) = body.split_at_mut(body.len() - TAG_LEN);
-        XChaCha20Poly1305::new(Key::from_slice(&key[..]))
-            .decrypt_in_place_detached(
-                XNonce::from_slice(nonce),
-                aad,
-                ciphertext,
-                Tag::from_slice(tag),
-            )
-            .map_err(|_| GrantError::SealOpenFailed)?;
-        serde_json::from_slice(ciphertext).map_err(|_| GrantError::BadClaims)
+        // The seal names no key, but the AEAD refuses a wrong one cleanly: during a rotation a
+        // grant sealed to the previous secret opens on a second try, from a copy of the blob.
+        let Some(previous) = &self.previous_seal else {
+            return open_sealed(&self.fleet_secret, &self.fleet_public, aad, &mut blob);
+        };
+        let mut copy = Zeroizing::new(blob.to_vec());
+        match open_sealed(&self.fleet_secret, &self.fleet_public, aad, &mut blob) {
+            Err(GrantError::SealOpenFailed) => {
+                let public = PublicKey::from(previous);
+                open_sealed(previous, &public, aad, &mut copy)
+            }
+            other => other,
+        }
     }
+}
+
+/// Open a sealed blob (`eph_pk ‖ nonce ‖ ciphertext ‖ tag`, at least that long) in place under
+/// `secret` and parse the plaintext. `public` is `secret`'s public half.
+fn open_sealed(
+    secret: &StaticSecret,
+    public: &PublicKey,
+    aad: &[u8],
+    blob: &mut [u8],
+) -> Result<GrantSecrets, GrantError> {
+    let (head, body) = blob.split_at_mut(EPH_LEN + NONCE_LEN);
+    let (eph, nonce) = head.split_at(EPH_LEN);
+    let eph = PublicKey::from(<[u8; 32]>::try_from(eph).map_err(|_| GrantError::SealMalformed)?);
+    let key = derive_seal_key(&secret.diffie_hellman(&eph), &eph, public)
+        .ok_or(GrantError::SealMalformed)?;
+    let (ciphertext, tag) = body.split_at_mut(body.len() - TAG_LEN);
+    XChaCha20Poly1305::new(Key::from_slice(&key[..]))
+        .decrypt_in_place_detached(
+            XNonce::from_slice(nonce),
+            aad,
+            ciphertext,
+            Tag::from_slice(tag),
+        )
+        .map_err(|_| GrantError::SealOpenFailed)?;
+    serde_json::from_slice(ciphertext).map_err(|_| GrantError::BadClaims)
 }
 
 /// HKDF-SHA256(ikm = shared, salt = eph_pk ‖ fleet_pk, info = `bsg_v1 seal`) → the AEAD key. `None`
@@ -1599,6 +1618,36 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(verifier.keys.len(), 1);
+    }
+
+    #[test]
+    fn grant_sealed_to_the_previous_secret_opens_only_with_it_configured() {
+        let fx = fixture();
+        let base = verifier(&fx);
+        let old = secret_from(&fx.seal_key_file).unwrap();
+        let rotated = || GrantVerifier::new(base.keys.clone(), StaticSecret::from([0x44; 32]));
+        assert_eq!(
+            rotated().verify(&fx.token, fx.now).unwrap_err(),
+            GrantError::SealOpenFailed
+        );
+        let both = rotated().with_previous_seal(old);
+        let grant = both.verify(&fx.token, fx.now).unwrap();
+        assert_eq!(
+            serde_json::to_value(&grant.secrets).unwrap(),
+            serde_json::to_value(&fx.secrets).unwrap()
+        );
+        // A grant sealed to neither still fails as SealOpenFailed.
+        let other = fx
+            .negative
+            .iter()
+            .find(|c| c.name == "wrong_seal_key")
+            .unwrap();
+        let neither = GrantVerifier::new(base.keys.clone(), StaticSecret::from([0x55; 32]))
+            .with_previous_seal(StaticSecret::from([0x66; 32]));
+        assert_eq!(
+            neither.verify(&other.token, other.now).unwrap_err(),
+            GrantError::SealOpenFailed
+        );
     }
 
     #[test]

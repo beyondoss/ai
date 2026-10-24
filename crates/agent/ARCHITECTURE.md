@@ -4808,15 +4808,16 @@ The parsed verifier lands in `ServeConfig::grant_verifier` (an `Arc`, shared by 
 `serve --service` is what consults it: see "Service mode" below.
 
 Signing keys rotate without a gap: trust the new kid beside the old, move the minter to the new kid,
-and drop the old one once every grant it signed has expired. The fleet seal key is one secret at a
-time for grants, so rotating it is a coordinated switch: a grant sealed to the old key fails
-`SealOpenFailed` on a replica that already holds the new one, until it is re-minted (a grant's seal
-carries no key id, and a grant is minted per connection). Notify tokens do carry a kid, so a replica
-can be given the old secret as `--seal-key-previous` (`AI_AGENT_SEAL_KEY_PREVIOUS`, or base64 in
-`AI_AGENT_SEAL_KEY_PREVIOUS_B64`; not both, and it needs `--seal-key`). It accepts notify tokens under
-the old kid, still mints only under the current secret, and holds at most these two. Remove the
-previous secret once the longest token lifetime (about 723 s) has passed since the last replica
-switched to the new one.
+and drop the old one once every grant it signed has expired. The fleet seal key rotates with a previous
+secret held beside the current one: `--seal-key-previous` (`AI_AGENT_SEAL_KEY_PREVIOUS`, or base64 in
+`AI_AGENT_SEAL_KEY_PREVIOUS_B64`; not both, and it needs `--seal-key`). A replica never holds more
+than these two, and seals nothing itself. A notify token carries a kid, so the kid picks the key and
+the old kid is still accepted, while minting stays under the current secret. A grant's seal carries no
+key id, but the AEAD refuses a wrong key cleanly: when opening under the current secret fails with
+`SealOpenFailed`, the replica opens a copy of the blob under the previous secret (one more X25519 and
+AEAD, only on that failure), and reports `SealOpenFailed` if both fail. Rotate in this order: give
+every replica current=B, previous=A; then move the minter to seal under B; then drop the previous
+secret once the longest grant life (5 min) plus the notify token lifetime (about 723 s) has passed.
 
 ### Golden vectors
 
