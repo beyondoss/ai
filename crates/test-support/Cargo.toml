@@ -28,7 +28,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 serde_json.workspace = true
 sha2 = "0.10"
 # The exec-endpoint double serves real HTTP and runs real processes.
-tokio = { version = "1", features = ["full"] }
+tokio.workspace = true
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [dev-dependencies]
