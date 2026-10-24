@@ -602,8 +602,9 @@ enum Command {
         #[usage(long, env = "AI_AGENT_SEAL_KEY")]
         seal_key: Option<std::path::PathBuf>,
         /// During a seal-key rotation: file with the previous X25519 secret (base64), under which
-        /// notify tokens are still accepted (never minted). Drop it once the longest token
-        /// lifetime has passed. May instead be base64 in `AI_AGENT_SEAL_KEY_PREVIOUS_B64`; not both.
+        /// notify tokens are still accepted (never minted). Tokens carry no time, so drop it after 24 h
+        /// (routine) or 5 min after the minter switched (urgent); see the README. May instead be
+        /// base64 in `AI_AGENT_SEAL_KEY_PREVIOUS_B64`; not both.
         #[usage(long, env = "AI_AGENT_SEAL_KEY_PREVIOUS")]
         seal_key_previous: Option<std::path::PathBuf>,
         /// Run as a multi-tenant service: every connection must carry a signed session grant.

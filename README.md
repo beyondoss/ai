@@ -395,9 +395,14 @@ docker run --rm -p 8080:8080 \
   both forms is a startup error.
 - **Rotating the seal key:** give replicas the old secret as `--seal-key-previous`
   (`AI_AGENT_SEAL_KEY_PREVIOUS`, or base64 in `AI_AGENT_SEAL_KEY_PREVIOUS_B64`) beside the new
-  `--seal-key`. Grants sealed to the old key and notify tokens minted under it keep working. Order: replicas
-  first, then the minter switches to the new key, then remove the previous key once the grant life
-  (5 min) plus the token lifetime (about 723 s) has passed.
+  `--seal-key`. Grants sealed to the old key and notify tokens minted under it keep working. Order: every
+  replica gets current=new, previous=old; then switch the minter; then drop the previous secret. A notify
+  token has no time in it, so a job kept before the switch holds its old-key token until the job ends.
+  Routine rotation: drop it after 24 h, the session ceiling, when nearly every such job has ended.
+  Urgent rotation (the old key is exposed): drop it one grant life (5 min) after the minter switched.
+  Dropping early costs only the push notice: a job kept before the switch that ends afterwards gets
+  `503` on its callback, retries for up to 723 s and gives up, and the session learns of the end the
+  next time it reads its jobs or reopens.
 - **Required:** the grant verifier (`--grant-key`, repeatable, plus `--seal-key` or
   `AI_AGENT_SEAL_KEY_B64`), at least one
   `--shard <name>=</abs/path>`, and a listener (`--listen`, `--listen-uds`, or systemd activation).
