@@ -49,6 +49,18 @@ pub(crate) mod route;
 pub(crate) mod secret;
 pub(crate) mod signed_id;
 pub(crate) mod state;
+/// The atomics and mutex the lock-free modules use. Under `--cfg beyond_loom` they are loom's, so the
+/// `loom_*` models in those modules explore every interleaving; otherwise they are std's, unchanged.
+pub(crate) mod sync {
+    #[cfg(beyond_loom)]
+    pub(crate) use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    #[cfg(beyond_loom)]
+    pub(crate) use loom::sync::{Mutex, MutexGuard};
+    #[cfg(not(beyond_loom))]
+    pub(crate) use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    #[cfg(not(beyond_loom))]
+    pub(crate) use std::sync::{Mutex, MutexGuard};
+}
 pub(crate) mod store_watch;
 pub(crate) mod terminal;
 pub(crate) mod translate;

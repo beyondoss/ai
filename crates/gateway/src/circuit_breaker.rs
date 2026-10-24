@@ -69,8 +69,8 @@
 //! cb.release(permit);
 //! ```
 
+use crate::sync::{AtomicU64, Ordering};
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// How failures are counted before opening the circuit.
@@ -749,7 +749,7 @@ pub enum CircuitState {
     },
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(beyond_loom)))]
 impl Permit {
     /// A second permit equal to this one: what only a bug could produce, for the tests that show
     /// the breaker's word still holds against a permit resolved twice.
@@ -761,7 +761,7 @@ impl Permit {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(beyond_loom)))]
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -1705,7 +1705,7 @@ mod tests {
 }
 
 /// Behaviors a mutation-testing pass found no test constraining.
-#[cfg(test)]
+#[cfg(all(test, not(beyond_loom)))]
 mod mutation_gaps {
     use super::tests::{fail, succeed};
     use super::*;
@@ -1843,5 +1843,201 @@ mod mutation_gaps {
     #[test]
     fn an_open_circuit_says_so() {
         assert_eq!(CircuitOpen.to_string(), "circuit breaker is open");
+    }
+}
+
+/// Permutation models of the lock-free word (`cargo test --lib loom` under `--cfg beyond_loom`; `mise run
+/// test:loom`). Each explores every interleaving of two or three threads over the real
+/// `CircuitBreaker`, with loom's atomic behind `crate::sync`. The clock is a fixed function, so no
+/// reset timeout elapses inside a model: what they check is the CAS protocol, not time.
+#[cfg(all(test, beyond_loom))]
+mod loom_models {
+    use super::*;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    fn now() -> u64 {
+        100
+    }
+
+    fn breaker(config: CircuitBreakerConfig) -> Arc<CircuitBreaker> {
+        Arc::new(CircuitBreaker::with_clock(config, now))
+    }
+
+    fn fail_once(cb: &CircuitBreaker) {
+        if let Ok(p) = cb.allow() {
+            cb.record_failure_for(p);
+        }
+    }
+
+    fn half_open(permits: u32) -> Arc<CircuitBreaker> {
+        let cb = breaker(CircuitBreakerConfig::consecutive(1).half_open_permits(permits));
+        cb.force_state(CircuitState::HalfOpen {
+            permits_remaining: permits,
+        });
+        cb
+    }
+
+    /// Concurrent failures are never lost: below the threshold the count is exact.
+    #[test]
+    fn consecutive_failures_below_the_threshold_are_all_counted() {
+        loom::model(|| {
+            let cb = breaker(CircuitBreakerConfig::consecutive(3));
+            let hs: Vec<_> = (0..2)
+                .map(|_| {
+                    let cb = cb.clone();
+                    thread::spawn(move || fail_once(&cb))
+                })
+                .collect();
+            for h in hs {
+                h.join().unwrap();
+            }
+            assert_eq!(cb.state(), CircuitState::Closed { failure_count: 2 });
+        });
+    }
+
+    /// Failures that cross the threshold trip the breaker however they interleave, and a late
+    /// failure on the open breaker changes nothing.
+    #[test]
+    fn consecutive_failures_crossing_the_threshold_trip_once() {
+        loom::model(|| {
+            let cb = breaker(CircuitBreakerConfig::consecutive(2));
+            let hs: Vec<_> = (0..3)
+                .map(|_| {
+                    let cb = cb.clone();
+                    thread::spawn(move || fail_once(&cb))
+                })
+                .collect();
+            for h in hs {
+                h.join().unwrap();
+            }
+            assert_eq!(cb.state(), CircuitState::Open);
+            assert!(cb.allow().is_err(), "an open breaker admits nothing");
+        });
+    }
+
+    /// The windowed rule counts every failure in one window: none is dropped by a racing CAS.
+    #[test]
+    fn windowed_failures_in_one_window_trip_the_breaker() {
+        loom::model(|| {
+            let cb = breaker(CircuitBreakerConfig::windowed(3, Duration::from_secs(10)));
+            let hs: Vec<_> = (0..3)
+                .map(|_| {
+                    let cb = cb.clone();
+                    thread::spawn(move || fail_once(&cb))
+                })
+                .collect();
+            for h in hs {
+                h.join().unwrap();
+            }
+            assert_eq!(cb.state(), CircuitState::Open);
+        });
+    }
+
+    /// A success racing a failure in the windowed rule leaves a coherent closed word: the failure
+    /// is counted unless the success reset the window first, and never anything else.
+    #[test]
+    fn windowed_success_racing_a_failure_leaves_a_valid_count() {
+        loom::model(|| {
+            let cb = breaker(CircuitBreakerConfig::windowed(3, Duration::from_secs(10)));
+            fail_once(&cb);
+            let a = {
+                let cb = cb.clone();
+                thread::spawn(move || {
+                    if let Ok(p) = cb.allow() {
+                        let _ = cb.record_success_for(p);
+                    }
+                })
+            };
+            let b = {
+                let cb = cb.clone();
+                thread::spawn(move || fail_once(&cb))
+            };
+            a.join().unwrap();
+            b.join().unwrap();
+            match cb.state() {
+                CircuitState::Closed { failure_count } => assert!(failure_count <= 2),
+                other => panic!("two failures cannot trip a threshold of 3: {other:?}"),
+            }
+        });
+    }
+
+    /// Half-open admits exactly the configured number of probes, however many race for them.
+    #[test]
+    fn half_open_admits_at_most_the_configured_probes() {
+        loom::model(|| {
+            let cb = half_open(2);
+            let hs: Vec<_> = (0..3)
+                .map(|_| {
+                    let cb = cb.clone();
+                    // Keep the permit: a probe in flight.
+                    thread::spawn(move || cb.allow().ok())
+                })
+                .collect();
+            let admitted = hs.into_iter().filter_map(|h| h.join().unwrap()).count();
+            assert_eq!(admitted, 2, "two permits, three askers");
+            assert_eq!(
+                cb.state(),
+                CircuitState::HalfOpen {
+                    permits_remaining: 0
+                }
+            );
+        });
+    }
+
+    /// A probe's success and another probe's failure racing in half-open leave the breaker closed
+    /// or open, never half-open with the outcome lost.
+    #[test]
+    fn half_open_success_racing_failure_resolves_the_breaker() {
+        loom::model(|| {
+            let cb = half_open(2);
+            let a = {
+                let cb = cb.clone();
+                thread::spawn(move || {
+                    if let Ok(p) = cb.allow() {
+                        let _ = cb.record_success_for(p);
+                    }
+                })
+            };
+            let b = {
+                let cb = cb.clone();
+                thread::spawn(move || fail_once(&cb))
+            };
+            a.join().unwrap();
+            b.join().unwrap();
+            assert!(
+                matches!(cb.state(), CircuitState::Closed { .. } | CircuitState::Open),
+                "an answered probe decides the breaker: {:?}",
+                cb.state()
+            );
+        });
+    }
+
+    /// Every probe permit handed out and given back returns to the pool: none leaks, none is
+    /// minted.
+    #[test]
+    fn released_probe_permits_all_come_back() {
+        loom::model(|| {
+            let cb = half_open(2);
+            let hs: Vec<_> = (0..3)
+                .map(|_| {
+                    let cb = cb.clone();
+                    thread::spawn(move || {
+                        if let Ok(p) = cb.allow() {
+                            cb.release(p);
+                        }
+                    })
+                })
+                .collect();
+            for h in hs {
+                h.join().unwrap();
+            }
+            assert_eq!(
+                cb.state(),
+                CircuitState::HalfOpen {
+                    permits_remaining: 2
+                }
+            );
+        });
     }
 }

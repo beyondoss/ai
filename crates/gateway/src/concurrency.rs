@@ -16,9 +16,8 @@
 //! nothing in flight has no entry — and sharded so tenants on different shards never contend.
 
 use crate::key::Identity;
+use crate::sync::{AtomicUsize, Mutex, MutexGuard, Ordering};
 use rustc_hash::FxHashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
 
 /// The process-wide budget for request bodies the gateway holds in memory (`max_buffered_body_bytes`).
 ///
@@ -180,7 +179,7 @@ impl Drop for TenantSlot<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(beyond_loom)))]
 mod tests {
     use super::*;
 
@@ -246,5 +245,155 @@ mod tests {
             .map(|s| s.lock().map(|m| m.len()).unwrap_or(0))
             .sum();
         assert_eq!(entries, 0, "sparse: nothing in flight means nothing stored");
+    }
+}
+
+/// Permutation models of the tenant slot and the body budget (`cargo test --lib loom` under
+/// `--cfg beyond_loom`; `mise run test:loom`). Each explores every interleaving of two or three threads.
+#[cfg(all(test, beyond_loom))]
+mod loom_models {
+    use super::*;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    /// However the acquires and releases interleave, a tenant never holds more than its ceiling,
+    /// and when everyone is done nothing is held and nothing is stored.
+    #[test]
+    fn a_tenant_never_holds_more_than_its_ceiling() {
+        loom::model(|| {
+            let slots = Arc::new(TenantSlots::new(2).expect("on"));
+            let held = Arc::new(AtomicUsize::new(0));
+            let hs: Vec<_> = (0..3)
+                .map(|_| {
+                    let (slots, held) = (slots.clone(), held.clone());
+                    thread::spawn(move || {
+                        if slots.try_acquire(7) {
+                            let now = held.fetch_add(1, Ordering::SeqCst) + 1;
+                            assert!(now <= 2, "{now} slots held under a ceiling of 2");
+                            assert!(slots.in_flight(7) <= 2);
+                            held.fetch_sub(1, Ordering::SeqCst);
+                            slots.release(7);
+                        }
+                    })
+                })
+                .collect();
+            for h in hs {
+                h.join().unwrap();
+            }
+            assert_eq!(slots.in_flight(7), 0, "every release freed its slot");
+            assert!(
+                slots.try_acquire(7) && slots.try_acquire(7),
+                "no slot was lost"
+            );
+        });
+    }
+
+    /// A release racing an acquire at the ceiling either frees the slot in time or does not, but
+    /// the slot is never lost: once the holder is done, the tenant can take it again.
+    #[test]
+    fn a_release_racing_an_acquire_loses_no_slot() {
+        loom::model(|| {
+            let slots = Arc::new(TenantSlots::new(1).expect("on"));
+            assert!(slots.try_acquire(1));
+            let releaser = {
+                let slots = slots.clone();
+                thread::spawn(move || slots.release(1))
+            };
+            let taker = {
+                let slots = slots.clone();
+                thread::spawn(move || {
+                    if slots.try_acquire(1) {
+                        slots.release(1);
+                    }
+                })
+            };
+            releaser.join().unwrap();
+            taker.join().unwrap();
+            assert_eq!(slots.in_flight(1), 0);
+            assert!(slots.try_acquire(1), "the freed slot can be taken");
+        });
+    }
+
+    /// The reserved total never passes the limit, and what is held at the end is exactly what the
+    /// granted reservations asked for.
+    #[test]
+    fn the_body_budget_never_over_reserves() {
+        loom::model(|| {
+            let budget = Arc::new(BodyBudget::new(100).expect("on"));
+            let hs: Vec<_> = [60usize, 50, 40]
+                .into_iter()
+                .map(|n| {
+                    let budget = budget.clone();
+                    thread::spawn(move || {
+                        let ok = budget.try_reserve(n);
+                        assert!(budget.used() <= 100);
+                        ok.then_some(n)
+                    })
+                })
+                .collect();
+            let granted: usize = hs.into_iter().filter_map(|h| h.join().unwrap()).sum();
+            assert!(granted <= 100, "granted {granted} of 100");
+            assert_eq!(budget.used(), granted, "a refusal reserved nothing");
+        });
+    }
+
+    /// `reserve_body`'s shape: try a rounded-up target, fall back to the exact one, release exactly
+    /// what was reserved. With two requests racing, the budget is never crossed and ends empty.
+    #[test]
+    fn a_reservation_released_returns_exactly_what_it_took() {
+        loom::model(|| {
+            let budget = Arc::new(BodyBudget::new(100).expect("on"));
+            let hs: Vec<_> = [(80usize, 55usize), (70, 45)]
+                .into_iter()
+                .map(|(rounded, exact)| {
+                    let budget = budget.clone();
+                    thread::spawn(move || {
+                        let mut held = 0;
+                        for target in [rounded, exact] {
+                            if budget.try_reserve(target) {
+                                held = target;
+                                break;
+                            }
+                        }
+                        assert!(budget.used() <= 100);
+                        if held > 0 {
+                            budget.release(held);
+                        }
+                    })
+                })
+                .collect();
+            for h in hs {
+                h.join().unwrap();
+            }
+            assert_eq!(
+                budget.used(),
+                0,
+                "release returned exactly what was reserved"
+            );
+        });
+    }
+
+    /// A hold frees its bytes on drop.
+    #[test]
+    fn a_dropped_hold_frees_its_bytes() {
+        loom::model(|| {
+            let budget = Arc::new(BodyBudget::new(100).expect("on"));
+            let hs: Vec<_> = (0..2)
+                .map(|_| {
+                    let budget = budget.clone();
+                    thread::spawn(move || {
+                        if let Some(hold) = budget.hold(70) {
+                            assert!(budget.used() <= 100);
+                            drop(hold);
+                        }
+                    })
+                })
+                .collect();
+            for h in hs {
+                h.join().unwrap();
+            }
+            assert_eq!(budget.used(), 0);
+            assert!(budget.hold(100).is_some(), "the whole budget is free again");
+        });
     }
 }

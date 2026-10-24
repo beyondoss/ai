@@ -18,6 +18,8 @@ rust-version = "1.92"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 unused_must_use = "deny"
+# `beyond_loom` is set by `mise run test:loom` (RUSTFLAGS="--cfg beyond_loom"), never by cargo itself.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(beyond_loom)'] }
 
 # Panic surface: a stray `.unwrap()`/`.expect()`/`panic!`/`todo!` in a request or agent-loop path is
 # a worker crash, not an error response. Deny them so a new one is a hard CI failure (clippy runs with
