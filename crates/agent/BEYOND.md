@@ -152,10 +152,11 @@ and the ring routing in [FLEET.md](FLEET.md). Beyond's edge does neither.
     minter: every replica starts with `--seal-key-previous` set to the old key and unseals grants with
     either (#498), and only then does the minter switch to the new key. Notify tokens are verified by
     kid and minted under the current key only. In a routine rotation, drop `--seal-key-previous` after
-    24 h, the session ceiling. If the old key is exposed, drop it once one grant life (5 minutes) has passed since the
-    minter switched. The cost of dropping early: a job kept before the switch that ends after the drop
-    gets 503 UnknownKid on its callback, retries for up to 723 s and gives up, and its end shows on the
-    session's next read or open. The callback is a hint, so this loses a push notice, never a result.
+    24 h, the session ceiling. If the old key is exposed, drop it once one grant life (5 minutes) has
+    passed since the minter switched. The cost of dropping early: a job kept before the switch that
+    ends after the drop gets 503 UnknownKid on its callback, retries for up to 723 s and gives up, and
+    its end shows on the session's next read or open. The callback is a hint, so this loses a push
+    notice, never a result.
     _Why:_ a re-mint must never strand stored sessions, and a routine rotation must never cost a kept
     job its end notice.
 12. **Session ids and the gateway.** Beyond mints session ids as `<home_shard>.<opaque>`, choosing each
