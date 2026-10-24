@@ -75,7 +75,7 @@ async fn a_front_that_refuses_extensions_is_probed_once_not_per_call() {
     }
     for probe in [
         r#"-c printf %s "$HOME""#,
-        "command -v bash",
+        "-c command -v bash",
         "rg --version",
         "cat",
         "true",
