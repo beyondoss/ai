@@ -4,7 +4,7 @@
 Usage: python3 -I .github/scripts/advisory-bump.py BODY_FILE [--dry-run]
 
 Runs `cargo audit --json`. For each vulnerable package that has a patched version, runs
-`cargo update -p NAME@VERSION` (Cargo takes the newest semver-compatible release, so a patch that
+`cargo update -p NAME@VERSION ...` once for all of them (Cargo takes the newest semver-compatible release, so a patch that
 needs a new major or a loosened requirement stays unfixed), then audits again. Writes a markdown
 description of the outcome to BODY_FILE: what was bumped, and for each advisory still open its id,
 title and the dependency chain (`cargo tree -i`). With --dry-run Cargo.lock is restored afterwards.
@@ -37,7 +37,7 @@ def key(v):
 
 
 def tree(name, version):
-    p = run("cargo", "tree", "-i", f"{name}@{version}", "-e", "normal,build")
+    p = run("cargo", "tree", "-i", f"{name}@{version}", "--workspace", "--target", "all")
     return (p.stdout or p.stderr).strip()
 
 
@@ -52,9 +52,17 @@ def main():
             return 0
         targets = sorted({(v["package"]["name"], v["package"]["version"])
                           for v in before if v["versions"]["patched"]})
-        for name, version in targets:
-            print(f"+ cargo update -p {name}@{version}", flush=True)
-            print(run("cargo", "update", "-p", f"{name}@{version}").stderr.strip(), flush=True)
+        # One invocation: some patched releases only resolve together (rustls needs a newer
+        # rustls-webpki). If Cargo rejects the set, drop the spec it names and retry.
+        specs = [f"{n}@{v}" for n, v in targets]
+        while specs:
+            print("+ cargo update " + " ".join(f"-p {x}" for x in specs), flush=True)
+            p = run("cargo", "update", *[a for x in specs for a in ("-p", x)])
+            print(p.stderr.strip(), flush=True)
+            if p.returncode == 0:
+                break
+            bad = [x for x in specs if x.split("@")[0] in p.stderr]
+            specs = [x for x in specs if x not in bad] if bad else []
         after = audit()
         changed = open("Cargo.lock").read() != original
         old = {(k[1], k[2]) for k in map(key, before)}
