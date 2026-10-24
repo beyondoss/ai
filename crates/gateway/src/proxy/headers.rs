@@ -115,24 +115,98 @@ pub(super) fn retain_managed_client_headers(
     Ok(())
 }
 
+/// The upstream response headers a managed answer relays to the tenant. Everything else is dropped
+/// in `response_filter`: a managed answer comes from Beyond's shared account, so the provider's
+/// organization and project ids (`openai-organization`, `openai-project`,
+/// `anthropic-organization-id`), its live quota gauges for the pool key (`x-ratelimit-*`,
+/// `anthropic-ratelimit-*`, which move with every other tenant's load), edge and infrastructure
+/// tags (`server`, `via`, `cf-ray`, `x-ms-region`, `x-envoy-*`) and cookies (`set-cookie`) are the
+/// account's, not the caller's.
+///
+/// An allowlist, like [`MANAGED_FORWARD_HEADERS`] on the request side, so a header a provider adds
+/// next year is dropped until someone decides a client needs it. What a client needs is small:
+/// framing and caching (`content-type`, `content-length`, `transfer-encoding`, `content-encoding`,
+/// `cache-control`, `vary`, `date`, `connection`, `keep-alive`, `x-accel-buffering`), the backoff
+/// hints SDKs read (`retry-after`, `retry-after-ms`, `x-should-retry`), and the ids a user quotes
+/// to support (`x-request-id`, `request-id`, `anthropic-request-id`, `x-amzn-requestid`,
+/// `apim-request-id`, `x-generation-id`), plus the version and timing headers SDKs surface.
+/// Names are lower-case, as `http::HeaderName` stores them.
+pub(super) const MANAGED_RESPONSE_HEADERS: [&str; 22] = [
+    "content-type",
+    "content-length",
+    "content-encoding",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "cache-control",
+    "vary",
+    "date",
+    "x-accel-buffering",
+    "retry-after",
+    "retry-after-ms",
+    "x-should-retry",
+    "x-request-id",
+    "request-id",
+    "anthropic-request-id",
+    "x-amzn-requestid",
+    "apim-request-id",
+    "x-generation-id",
+    "openai-processing-ms",
+    "openai-version",
+    "anthropic-version",
+];
+
+/// Whether a managed answer may relay the upstream response header `name` (lower-case).
+pub(super) fn managed_response_header_allowed(name: &str) -> bool {
+    MANAGED_RESPONSE_HEADERS.contains(&name)
+}
+
+/// Drop every upstream response header a managed answer may not relay
+/// ([`MANAGED_RESPONSE_HEADERS`]). Allocates nothing.
+pub(super) fn retain_managed_response_headers(resp: &mut pingora::http::ResponseHeader) {
+    remove_headers_where(resp, |name| !managed_response_header_allowed(name));
+}
+
 /// Drop every `x-beyond-*` header from a request about to go upstream. Allocates nothing.
 pub(super) fn strip_beyond_headers(req: &mut pingora::http::RequestHeader) {
     remove_headers_where(req, |name| name.starts_with("x-beyond-"));
 }
 
+/// A pingora header block whose entries [`remove_headers_where`] can sweep. Removal goes through
+/// pingora's `remove_header` so its case-preserving name map stays in step with the `HeaderMap`.
+pub(super) trait EditableHeaders {
+    fn map(&self) -> &http::HeaderMap;
+    fn remove(&mut self, name: &str);
+}
+
+impl EditableHeaders for pingora::http::RequestHeader {
+    fn map(&self) -> &http::HeaderMap {
+        &self.headers
+    }
+    fn remove(&mut self, name: &str) {
+        self.remove_header(name);
+    }
+}
+
+impl EditableHeaders for pingora::http::ResponseHeader {
+    fn map(&self) -> &http::HeaderMap {
+        &self.headers
+    }
+    fn remove(&mut self, name: &str) {
+        self.remove_header(name);
+    }
+}
+
 /// Remove every header whose (lower-case) name `drop` matches, allocating nothing: names are
 /// copied in batches onto the stack, since the map cannot be borrowed while it is edited. A name
 /// past the stack slot's length (no real header) is cloned instead.
-pub(super) fn remove_headers_where(
-    req: &mut pingora::http::RequestHeader,
-    drop: impl Fn(&str) -> bool,
-) {
+pub(super) fn remove_headers_where<H: EditableHeaders>(req: &mut H, drop: impl Fn(&str) -> bool) {
     const BATCH: usize = 16;
     loop {
         let mut names = ArrayVec::<ArrayString<64>, BATCH>::new();
         let mut long = None;
         let mut more = false;
-        for k in req.headers.keys().map(http::HeaderName::as_str) {
+        for k in req.map().keys().map(http::HeaderName::as_str) {
             if !drop(k) {
                 continue;
             }
@@ -150,10 +224,10 @@ pub(super) fn remove_headers_where(
             }
         }
         for name in &names {
-            req.remove_header(name.as_str());
+            req.remove(name.as_str());
         }
         if let Some(name) = long {
-            req.remove_header(&name);
+            req.remove(name.as_str());
         }
         if !more {
             return;

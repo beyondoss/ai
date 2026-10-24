@@ -628,9 +628,11 @@ async fn warm_and_proto(client: &reqwest::Client, url: &str, vkey: &str) -> Stri
         })
         .await;
     }
+    // A managed answer drops every header outside the allowlist, `x-mock-proto` among them, so the
+    // protocol is read from a BYO answer, which relays upstream headers untouched.
     let resp = client
         .post(format!("{url}/v1/chat/completions"))
-        .header("authorization", format!("Bearer {vkey}"))
+        .header("authorization", format!("Bearer {BYO_KEY}"))
         .header("content-type", "application/json")
         .body(MANAGED_BODY)
         .send()

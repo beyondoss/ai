@@ -349,3 +349,92 @@ async fn pool_keys_over_cleartext_warn_at_boot() {
     gw.wait_for_log_line(&["upstream_tls is DISABLED while pool keys are configured"])
         .await;
 }
+
+/// The response headers that name Beyond's provider account or gauge the pool key's live quota.
+const ACCOUNT_HEADERS: [(&str, &str); 14] = [
+    ("openai-organization", "org-beyond-pool"),
+    ("openai-project", "proj_beyond_pool"),
+    ("anthropic-organization-id", "00000000-beyond-pool"),
+    ("x-ratelimit-remaining-requests", "4999"),
+    ("x-ratelimit-remaining-tokens", "1999000"),
+    ("x-ratelimit-limit-requests", "5000"),
+    ("anthropic-ratelimit-requests-remaining", "49"),
+    ("anthropic-ratelimit-tokens-reset", "2026-10-24T00:00:00Z"),
+    ("ratelimit-remaining", "10"),
+    ("server", "cloudflare"),
+    ("cf-ray", "8a1b2c3d4e5f-IAD"),
+    ("set-cookie", "__cf_bm=abc; HttpOnly"),
+    ("x-ms-region", "East US"),
+    ("via", "1.1 google"),
+];
+
+/// What a client needs from a response: backoff hints, the ids a user quotes to support, and the
+/// version and timing headers SDKs surface.
+const CLIENT_HEADERS: [(&str, &str); 9] = [
+    ("retry-after", "7"),
+    ("retry-after-ms", "7000"),
+    ("x-should-retry", "true"),
+    ("x-request-id", "req_upstream_1"),
+    ("request-id", "req_upstream_2"),
+    ("anthropic-request-id", "req_upstream_3"),
+    ("openai-processing-ms", "42"),
+    ("openai-version", "2020-10-01"),
+    ("cache-control", "no-cache"),
+];
+
+/// A managed answer comes from Beyond's shared provider account, so the account's organization and
+/// project ids and the pool key's live rate-limit gauges are not relayed; backoff hints and request
+/// ids are. A BYO answer is the caller's own account talking and is relayed untouched.
+/// claim: SEC-8
+/// defect: D290
+#[tokio::test]
+async fn managed_responses_drop_the_provider_account_headers_and_byo_keeps_them() {
+    let (pubkey, sk) = test_keypair(1);
+    let body = br#"{"id":"chatcmpl-mock","object":"chat.completion","model":"gpt-4o-mini","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+    let reply = {
+        let mut r = String::from(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n",
+        );
+        // Upper case on the wire: the match is case-insensitive.
+        for (k, v) in ACCOUNT_HEADERS.iter().chain(CLIENT_HEADERS.iter()) {
+            r.push_str(&format!("{}: {v}\r\n", k.to_uppercase()));
+        }
+        r.push_str(&format!("content-length: {}\r\n\r\n", body.len()));
+        let mut r = r.into_bytes();
+        r.extend_from_slice(body);
+        r
+    };
+    let upstream = ScriptedUpstream::start(move |_, _| vec![Step::Write(reply.clone())]).await;
+    let gw = Gateway::builder(unused_nats_port(), &upstream.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    for (managed, auth) in [
+        (true, format!("Bearer {}", managed_key(&sk))),
+        (false, "Bearer sk-byo".to_owned()),
+    ] {
+        let resp = test_client()
+            .post(format!("{}/openai/v1/chat/completions", gw.url()))
+            .header("authorization", &auth)
+            .header("content-type", "application/json")
+            .body(CHAT)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let h = resp.headers();
+        for (k, v) in ACCOUNT_HEADERS {
+            assert_eq!(
+                h.get(k).and_then(|v| v.to_str().ok()),
+                (!managed).then_some(v),
+                "managed={managed} {k}"
+            );
+        }
+        for (k, v) in CLIENT_HEADERS {
+            assert_eq!(h.get(k).unwrap(), v, "managed={managed} {k}");
+        }
+        assert_eq!(h.get("content-type").unwrap(), "application/json");
+        assert!(h.get("x-beyond-request-id").is_some());
+        assert_eq!(resp.bytes().await.unwrap().as_ref(), body);
+    }
+}

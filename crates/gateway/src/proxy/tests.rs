@@ -401,6 +401,61 @@ fn new_ctx_pays_no_arc_clone() {
 
 /// The header sweep removes every match, past its stack batch and past its name slot, and keeps
 /// everything else.
+/// The managed response allowlist keeps what a client needs and drops the provider account's
+/// identity and live quota, whatever the provider or the case on the wire.
+#[test]
+fn managed_response_headers_drop_account_identity_and_quota() {
+    for kept in [
+        "content-type",
+        "content-length",
+        "transfer-encoding",
+        "cache-control",
+        "retry-after",
+        "retry-after-ms",
+        "x-should-retry",
+        "x-request-id",
+        "request-id",
+        "anthropic-request-id",
+        "x-amzn-requestid",
+        "openai-processing-ms",
+        "openai-version",
+    ] {
+        assert!(managed_response_header_allowed(kept), "{kept}");
+    }
+    for dropped in [
+        "openai-organization",
+        "openai-project",
+        "anthropic-organization-id",
+        "x-ratelimit-remaining-requests",
+        "x-ratelimit-reset-tokens",
+        "anthropic-ratelimit-tokens-remaining",
+        "ratelimit-remaining",
+        "x-groq-region",
+        "x-ms-region",
+        "azure-openai-deployment",
+        "x-envoy-upstream-service-time",
+        "server",
+        "via",
+        "cf-ray",
+        "set-cookie",
+        "x-something-new",
+    ] {
+        assert!(!managed_response_header_allowed(dropped), "{dropped}");
+    }
+    // Names reach the predicate lower-cased (`http::HeaderName`), so a wire spelling in capitals
+    // is swept all the same.
+    let mut resp = pingora::http::ResponseHeader::build(200, None).unwrap();
+    resp.insert_header("OpenAI-Organization", "org-x").unwrap();
+    resp.insert_header("X-RateLimit-Remaining-Tokens", "1")
+        .unwrap();
+    resp.insert_header("Retry-After", "3").unwrap();
+    resp.insert_header("Content-Type", "text/plain").unwrap();
+    retain_managed_response_headers(&mut resp);
+    let mut left: Vec<&str> = resp.headers.keys().map(http::HeaderName::as_str).collect();
+    left.sort_unstable();
+    assert_eq!(left, ["content-type", "retry-after"]);
+}
+
 #[test]
 fn remove_headers_where_removes_every_match_in_stack_batches() {
     let mut req = pingora::http::RequestHeader::build(http::Method::POST, b"/v1/x", None).unwrap();

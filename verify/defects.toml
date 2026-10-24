@@ -3003,3 +3003,17 @@ state = "fixed"
 test = "managed_endpoint_holds_a_managed_key_to_metered_calls"
 fix = "8f78fe98"
 note = "Fixed with route::anchored_forward_endpoint, used only by the managed allowlist: everything before the endpoint suffix must be exactly one of /v1, /api/v1, /openai/v1, /inference/v1, /anthropic/v1, /backend-api/codex, or Azure's /openai/deployments/{one segment}. forward_endpoint (wire selection, sub-resources, BYO) is unchanged."
+
+[[defect]]
+id = "D290"
+severity = "med"
+area = "Security"
+title = "Every managed answer relayed the shared provider account's organization ids and live quota"
+impact = "A managed tenant read openai-organization, openai-project, anthropic-organization-id and the x-ratelimit-* / anthropic-ratelimit-* headers on its own responses: Beyond's account identity, and the remaining requests and tokens of the pool key, a live gauge of every other tenant's load."
+confidence = "high"
+evidence = "Code: response_filter removed only x-beyond-* and headers echoing the pool key. Reproduced by managed_responses_drop_the_provider_account_headers_and_byo_keeps_them, which sent those headers from the upstream."
+claims = ["SEC-8"]
+state = "fixed"
+test = "managed_responses_drop_the_provider_account_headers_and_byo_keeps_them"
+fix = "FIXCOMMIT"
+note = "Fixed with an allowlist on the managed response (proxy::headers::MANAGED_RESPONSE_HEADERS): framing, caching, SSE delivery, retry hints and request ids only. BYO keeps every header. Unit test managed_response_headers_drop_account_identity_and_quota covers the predicate."

@@ -1058,6 +1058,12 @@ impl ProxyHttp for AiProxy {
             upstream_response.remove_header(name);
         }
 
+        // A managed answer comes from Beyond's shared provider account: only the allowlisted
+        // headers reach the tenant, never the account's org ids or live quota (BYO keeps all).
+        if rc.managed() {
+            headers::retain_managed_response_headers(upstream_response);
+        }
+
         // The pool key never reaches the client. A provider, or anything between us and
         // it, that echoes the credential it was sent would otherwise hand Beyond's key to a
         // tenant: any header carrying it is dropped, and an error body (>= 400, where an echo

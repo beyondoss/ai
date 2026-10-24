@@ -2594,6 +2594,9 @@ so no response header could carry it. A per-request cost lookup belongs to the c
 keyed by `x-beyond-request-id`. The provider header value is
 precomputed per provider at boot (`Provider::name_header`), so it is a refcount bump per response.
 
+On a managed answer these sit among the few upstream headers that survive; see "Which response
+headers ride back" under Trust Boundaries.
+
 ### Capture is a tap, not a buffer
 
 Capture copies each chunk as it passes and **never withholds a byte** — the same passive-tap
@@ -3662,6 +3665,31 @@ crosses the proxy for anyone. BYO requests forward the client's headers, credent
 less every `x-beyond-*` header (the gateway's own control headers, swept by prefix on every route,
 managed or BYO) and the hop-by-hop ones.
 
+**Which response headers ride back.** A managed answer comes out of Beyond's shared provider
+account, so the provider's headers about that account are not the tenant's to read: the
+organization and project ids (`openai-organization`, `openai-project`,
+`anthropic-organization-id`), and the live quota of the pool key (`x-ratelimit-*`,
+`anthropic-ratelimit-*`, `ratelimit-*`), which moves with every other tenant's load and so is a
+gauge of it. Edge and infrastructure tags (`server`, `via`, `cf-ray`, `x-ms-region`,
+`x-envoy-*`, `azure-openai-*`, regional headers such as Groq's) and cookies (`set-cookie`) go
+with them. `response_filter` keeps an allowlist (`MANAGED_RESPONSE_HEADERS` in `proxy/headers.rs`,
+the same shape as the request side) and removes every other header, in place and without
+allocating:
+
+| Kept                                                                                                                                                        | Why                                               |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `content-type`, `content-length`, `content-encoding`, `transfer-encoding`, `connection`, `keep-alive`, `cache-control`, `vary`, `date`, `x-accel-buffering` | framing, caching and SSE delivery                 |
+| `retry-after`, `retry-after-ms`, `x-should-retry`                                                                                                           | the backoff hints SDKs read; they name no account |
+| `x-request-id`, `request-id`, `anthropic-request-id`, `x-amzn-requestid`, `apim-request-id`, `x-generation-id`                                              | ids a user quotes to support                      |
+| `openai-processing-ms`, `openai-version`, `anthropic-version`                                                                                               | timing and version, surfaced by the SDKs          |
+
+An allowlist rather than a denylist because a header a provider adds next year is dropped until
+someone decides a client needs it, where a denylist would relay it until someone noticed. The SDK
+harnesses under `verify/clients` read only `retry-after`, `retry-after-ms`, `x-should-retry` and
+the gateway's own `x-beyond-*`. Adding a header is a one-line change to the constant. A BYO answer
+is the caller's own account talking and keeps every header. The request ids and the vendor id
+the billing row records are read from the head before the sweep, so the row is unchanged.
+
 **Where a credential may travel:**
 
 - A managed key reaches no provider in any location. Every static-key header and `Authorization`
@@ -3704,9 +3732,15 @@ is kept once for all of them:
 2. **Responses stored state.** OpenAI stores responses by default, and resolves any stored
    response, conversation or item id for whoever holds the key. Tenant-bound by signed ids: every
    such id the gateway returns is signed for the tenant, and an id that does not verify for the
-   caller is a 400 before any upstream (see [Tenant-bound Responses ids](#tenant-bound-responses-ids-signed_idrs)). Other organization resources (files,
-   vector stores, stored prompts, batches) are out of reach: a managed key reaches only POST
-   generation endpoints, so no tenant can create or list them.
+   caller is a 400 before any upstream (see [Tenant-bound Responses ids](#tenant-bound-responses-ids-signed_idrs)).
+3. **Other organization resources** (files, vector stores, stored prompts, batches). A managed key
+   reaches only POST generation endpoints, so no tenant can create or list them. A generation
+   body can still _reference_ one by id (`file_search.vector_store_ids`, `input_file.file_id`,
+   `prompt.id`), and the provider resolves it for the pool key. That is safe only because
+   Beyond's pool organization holds no such resources: there is nothing for a tenant to name.
+   **The pool organization must stay free of stored resources** (files, vector stores, stored
+   prompts, batches, fine-tunes); creating one there, even for Beyond's own use, makes it readable
+   by every managed tenant who guesses or is told its id. Use a separate organization and key.
 
 **What the catalog allowlists (managed `/v1` and `/auto` only):**
 
