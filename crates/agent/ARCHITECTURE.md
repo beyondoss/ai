@@ -193,8 +193,10 @@ The harness layers several capabilities over the bare tools + loop:
   pooling** (`--upstream-http2 <off|auto|h2c>`, **auto by default**): instead of each session building
   its own `reqwest::Client` (so N sessions ≈ N connections to the gateway on the plaintext HTTP/1.1 hop),
   `serve_ws` builds **one** client and injects it into every session via
-  `GatewayClient::with_http_client` (guarded so a model-switch/idle rebuild never discards the shared
-  pool). Credentials are _not_ on that client — they are applied per-request by each session's
+  `GatewayClient::new_shared` / `with_credential_source_shared` (which build no client of their own —
+  constructing a `reqwest::Client` loads and parses the system root certificates, which was over half
+  of the CPU of opening a `--service` session — and which guard against a model-switch/idle rebuild
+  discarding the shared pool). Credentials are _not_ on that client — they are applied per-request by each session's
   `GatewayClient`. `h2c` gives it `.http2_prior_knowledge()`, so all sessions multiplex over ~one
   cleartext-HTTP/2 connection — paired with the gateway's downstream `h2c` support (backward-compatible:
   Pingora peeks the H2 preface and falls back to h1). `off` keeps the per-session-client behavior; `auto`
@@ -2346,7 +2348,10 @@ it does not (see the exec protocol below). A `read_bytes` is one `dd | base64` c
 that base64s to exactly the 128 KiB head a runner's capture keeps whole. A larger window cannot be
 one command, because the capture keeps a stream's head and tail and drops the middle, and base64 of a
 glued head and tail still decodes, into bytes the file never held. A capture still reported as
-truncated is a read error, never a short read.
+truncated is a read error, never a short read. The attach probe also runs that exact pipeline on three bytes
+(`Capabilities::no_read_window`); a target whose `dd` or `base64` rejects `iflag=skip_bytes,count_bytes` or
+`-w0` fails reads with a clear error, because `base64` succeeds on the empty output of a failed `dd` and the
+file would otherwise read back as empty.
 
 ### Running the tools against a remote exec endpoint
 
