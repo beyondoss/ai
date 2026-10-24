@@ -2346,7 +2346,10 @@ it does not (see the exec protocol below). A `read_bytes` is one `dd | base64` c
 that base64s to exactly the 128 KiB head a runner's capture keeps whole. A larger window cannot be
 one command, because the capture keeps a stream's head and tail and drops the middle, and base64 of a
 glued head and tail still decodes, into bytes the file never held. A capture still reported as
-truncated is a read error, never a short read.
+truncated is a read error, never a short read. The attach probe also runs that exact pipeline on three bytes
+(`Capabilities::no_read_window`); a target whose `dd` or `base64` rejects `iflag=skip_bytes,count_bytes` or
+`-w0` fails reads with a clear error, because `base64` succeeds on the empty output of a failed `dd` and the
+file would otherwise read back as empty.
 
 ### Running the tools against a remote exec endpoint
 
