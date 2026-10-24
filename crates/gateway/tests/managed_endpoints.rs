@@ -148,7 +148,7 @@ async fn a_managed_key_reaches_only_generation_endpoints_on_a_provider_route() {
 }
 
 /// claim: SEC-1
-/// defect: D290
+/// defect: D295
 #[tokio::test]
 async fn an_azure_deployment_segment_admits_only_plain_names() {
     let nats_port = unused_nats_port();

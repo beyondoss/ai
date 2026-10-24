@@ -1380,7 +1380,7 @@ mod tests {
     }
 
     /// claim: SEC-22
-    /// defect: D291
+    /// defect: D296
     #[test]
     fn nats_url_plaintext_is_loopback_only() {
         for ok in [
@@ -1421,7 +1421,7 @@ mod tests {
     }
 
     /// claim: SEC-12
-    /// defect: D292
+    /// defect: D297
     #[test]
     fn the_public_dev_signing_key_is_refused_as_a_trust_anchor() {
         use base64::Engine;
@@ -1443,7 +1443,7 @@ mod tests {
     }
 
     /// claim: SEC-22
-    /// defect: D294
+    /// defect: D299
     #[test]
     fn redact_userinfo_hides_credentials_wherever_a_url_is_printed() {
         for (input, want) in [

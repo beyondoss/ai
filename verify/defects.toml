@@ -3005,7 +3005,7 @@ fix = "8f78fe98"
 note = "Fixed with route::anchored_forward_endpoint, used only by the managed allowlist: everything before the endpoint suffix must be exactly one of /v1, /api/v1, /openai/v1, /inference/v1, /anthropic/v1, /backend-api/codex, or Azure's /openai/deployments/{one segment}. forward_endpoint (wire selection, sub-resources, BYO) is unchanged."
 
 [[defect]]
-id = "D290"
+id = "D295"
 severity = "med"
 area = "Security"
 title = "A percent-encoded Azure deployment segment reached the pool key on a non-generation path"
@@ -3019,7 +3019,7 @@ fix = "25d87429"
 note = "Fixed in route.rs: a deployment name matches [A-Za-z0-9._-]+ and is not . or .."
 
 [[defect]]
-id = "D291"
+id = "D296"
 severity = "high"
 area = "Security"
 title = "A plaintext nats_url to a remote host was accepted"
@@ -3033,7 +3033,7 @@ fix = "6dd357bb"
 note = "Fixed in AiConfig::check: a nats:// URL, or one with no scheme, must name a loopback host (localhost, 127.0.0.0/8, ::1); tls:// is accepted anywhere. The error names the host, not the URL."
 
 [[defect]]
-id = "D292"
+id = "D297"
 severity = "high"
 area = "Security"
 title = "The public dev signing key was accepted as a production trust anchor"
@@ -3047,7 +3047,7 @@ fix = "1d563b60"
 note = "Fixed: a release build (cfg(not(debug_assertions))) refuses to boot with the dev public key in signing_keys or AI_SIGNING_KEY_*, and LiveKeys::put ignores it from KV (live_keys test a_release_ring_ignores_the_public_dev_key). Debug builds keep it: every cargo test, and the verify live harness (target/debug/beyond-ai), run debug. key::the_dev_public_key_is_what_the_dev_seed_derives pins the constant to the seed."
 
 [[defect]]
-id = "D293"
+id = "D298"
 severity = "med"
 area = "Security"
 title = "A pre-epoch wall clock made every bai_v3 key valid"
@@ -3061,7 +3061,7 @@ fix = "bceffcf5"
 note = "Fixed: unix_now returns Option and verify_with refuses a v3 key as expired when the clock is None. v1 and v2 never read the clock."
 
 [[defect]]
-id = "D294"
+id = "D299"
 severity = "low"
 area = "Security"
 title = "doctor printed a nats_url with its credentials"

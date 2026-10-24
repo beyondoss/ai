@@ -816,7 +816,7 @@ mod tests {
     /// A clock read that fails (before the epoch) refuses a v3 key instead of reading as 0, which
     /// would pass every `exp`; v1 and v2 never read the clock.
     /// claim: A5
-    /// defect: D293
+    /// defect: D298
     #[test]
     fn an_unreadable_clock_refuses_a_v3_key() {
         let (sk, vk) = test_keypair(1);

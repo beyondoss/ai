@@ -2297,7 +2297,7 @@ fn a_rerun_walks_the_parents_row() {
 /// but POST is a 405.
 /// claim: SEC-1
 /// defect: D289
-/// defect: D290
+/// defect: D295
 #[test]
 fn managed_endpoint_holds_a_managed_key_to_metered_calls() {
     let state = phase_state();
