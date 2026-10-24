@@ -4,12 +4,13 @@
 //! so the keypair is reproducible across runs and across machines. Anyone can
 //! reproduce it, so anyone can mint valid tokens for it. Never use it anywhere real.
 //!
-//! It prints three lines you can paste straight into a dev config:
+//! It prints four lines you can paste straight into a dev config:
 //!   - `SIGNING_PUBKEY_B64=` — the Ed25519 public key, standard-base64 of the 32 raw
 //!     bytes, in the exact form `verifying_key_from_value` accepts for the gateway's
 //!     `[signing_keys]` table.
 //!   - `KID=` — the key id the token is minted under.
 //!   - `DEV_BAI_V1=` — a ready-to-use `bai_v1...` token for tenant 1 / vpc 1.
+//!   - `DEV_BAI_V3=` — a `bai_v3...` token for the same tenant that expires an hour from now.
 //!
 //! Run it via: `cargo run --example mint_dev_key` (or `mise run ai:mint-dev-key`).
 
@@ -19,7 +20,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use beyond_ai::__test::key::{Keyring, VirtualKey, mint};
+use beyond_ai::__test::key::{Keyring, VirtualKey, mint, mint_v3};
 use ed25519_dalek::SigningKey;
 
 fn main() {
@@ -60,4 +61,14 @@ fn main() {
     println!("SIGNING_PUBKEY_B64={pubkey_b64}");
     println!("KID={KID}");
     println!("DEV_BAI_V1={token}");
+
+    // A short-lived key: `exp` is unix seconds, an hour out. Verified at the real clock.
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_secs()
+        + 3600;
+    let v3 = mint_v3(&vk, 1, exp, KID, &signing_key);
+    ring.verify(&v3).expect("dev v3 token must verify");
+    println!("DEV_BAI_V3={v3}");
 }

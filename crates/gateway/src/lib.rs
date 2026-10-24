@@ -35,6 +35,7 @@ pub(crate) mod drain;
 pub(crate) mod error;
 pub(crate) mod key;
 pub(crate) mod lex;
+pub(crate) mod live_keys;
 pub(crate) mod metrics;
 pub(crate) mod peek;
 pub(crate) mod pin;
@@ -62,7 +63,7 @@ pub use config::{AiConfig, ValidConfig};
 pub use metrics::Metrics;
 pub use proxy::AiProxy;
 pub use state::GatewayState;
-pub use store_watch::{Allowance, Capture, Deny, WatcherService};
+pub use store_watch::{Allowance, Capture, Deny, SigningKeys, WatcherService};
 pub use usage::{USAGE_TARGET, usage_log_filter};
 pub use usage_file::{UsageFiles, UsageRow};
 
@@ -74,9 +75,9 @@ pub mod __test {
         pub use crate::control::Walk;
     }
     pub mod key {
-        pub use crate::key::{Keyring, VirtualKey};
+        pub use crate::key::{KeyError, Keyring, VirtualKey};
         #[cfg(feature = "mint")]
-        pub use crate::key::{mint, mint_v2};
+        pub use crate::key::{mint, mint_v2, mint_v3};
     }
     pub mod lex {
         pub use crate::lex::{unescape, unescapes_to};
@@ -146,7 +147,7 @@ pub mod __bench {
     pub mod key {
         pub use crate::key::{Keyring, VirtualKey};
         #[cfg(feature = "mint")]
-        pub use crate::key::{mint, mint_v2};
+        pub use crate::key::{mint, mint_v2, mint_v3};
     }
     pub mod metrics {
         pub use crate::metrics::{Metrics, ProviderMetrics, Rejection};

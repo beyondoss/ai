@@ -480,7 +480,7 @@ impl AiProxy {
             return Err(Refusal::BodyTooLarge);
         }
 
-        // Identity + key handling. One branch: `bai_v1`/`bai_v2` is fail-closed (prefix match →
+        // Identity + key handling. One branch: `bai_v1`/`bai_v2`/`bai_v3` is fail-closed (prefix match →
         // verify; any verify failure is 401, never BYO). Anything else → BYO: the user's own
         // provider token, passed through unchanged (no Beyond identity, so no deny-set, no
         // allowance, and no per-tenant attribution). A public listener without this split would
@@ -489,16 +489,22 @@ impl AiProxy {
         if !managed_key {
             return Ok(None);
         }
-        let Ok(identity) = self.state.keyring.verify(raw_key) else {
-            return Err(Refusal::InvalidKey);
+        // One deny-set load serves both the distrusted-kid check inside verify and the tenant/key
+        // check below. Expiry is judged here, at admission: a stream already admitted is not cut
+        // when its key passes `exp`, the same rule as a deny.
+        let deny = self.state.deny.load();
+        let identity = match self.state.keyring.verify_with(
+            raw_key,
+            &self.state.live_keys.load(),
+            &deny,
+            crate::key::unix_now,
+        ) {
+            Ok(identity) => identity,
+            Err(crate::key::KeyError::Expired) => return Err(Refusal::KeyExpired),
+            Err(_) => return Err(Refusal::InvalidKey),
         };
-        // Deny-set: O(1), default-allow. Tenant deny OR (v2) key deny. Tenant wins if both.
-        if let Some(reason) = self
-            .state
-            .deny
-            .load()
-            .reason_for(identity.tenant_id, identity.key_id)
-        {
+        // Deny-set: O(1), default-allow. Tenant deny OR (v2/v3) key deny. Tenant wins if both.
+        if let Some(reason) = deny.reason_for(identity.tenant_id, identity.key_id) {
             // Counted per reason (`Refusal::metric`): an `Unknown` is a control plane writing a
             // reason this build does not know (a deploy ahead of the gateway's), and folded into
             // `deny_fraud` it would spike the fraud signal and mask real fraud.

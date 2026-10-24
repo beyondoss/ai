@@ -7,10 +7,12 @@
 //! a NATS blip keeps the last-known allowance the same way deny does. Auth and pool/signing keys
 //! come from config, so they're unaffected by NATS being down.
 //!
-//! Three sets are watched, all sparse, differing in prefix, payload, and fail direction: the
+//! Four sets are watched, all sparse, differing in prefix, payload, and fail direction: the
 //! **deny-set** (`blackhole.`, enforcement — `blackhole.{tenant}` and `blackhole.key.{id}` share
 //! this one watcher), the **allowance-set** (`allowance.`, quota bit — `allowance.{tenant}` and
-//! `allowance.key.{id}`), and the **capture-set** (`aicapture.`, payload logging).
+//! `allowance.key.{id}`), the **capture-set** (`aicapture.`, payload logging), and the **signing
+//! keys** (`signing_key.{kid}`, the live half of the keyring; see `live_keys`). `blackhole.kid.{kid}`
+//! rides the deny-set's watcher: it distrusts a signing key id.
 //! The seed → watch → batch-apply → reconnect loop below is written **once**, over the [`WatchedSet`]
 //! trait, and instantiated per set. That loop carries several non-obvious correctness properties —
 //! `is_resumable`'s revision-0 trap, the scan→subscribe race, batched `rcu`, backoff crediting — and
@@ -48,6 +50,7 @@
 use crate::allowance::{self, AllowanceSet};
 use crate::capture::{self, CaptureSet};
 use crate::deny::{self, DenySet};
+use crate::live_keys::{self, LiveKeys};
 use crate::state::GatewayState;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -351,6 +354,58 @@ impl WatchedSet for Allowance {
     }
 }
 
+/// The live signing keys: public keys under `signing_key.{kid}`, trusted alongside the config ring.
+///
+/// Not enforcement on its own (a missing key refuses, never admits), so a cursorless snapshot may
+/// seed it. Its own snapshot file, like allowance, so one set's file is never read as another's.
+pub struct SigningKeys;
+
+impl WatchedSet for SigningKeys {
+    type Set = LiveKeys;
+
+    const PREFIX: &'static str = live_keys::PREFIX;
+    const NOUN: &'static str = "signing-keys";
+    const SEED_FROM_CURSORLESS_SNAPSHOT: bool = true;
+
+    fn from_entries<'a>(
+        _state: &GatewayState,
+        entries: impl Iterator<Item = &'a KvEntry>,
+    ) -> LiveKeys {
+        livekeys_from_entries(entries)
+    }
+
+    fn apply_batch(_state: &GatewayState, cur: &LiveKeys, updates: &[KvUpdate]) -> LiveKeys {
+        apply_signing_keys_batch(cur, updates)
+    }
+
+    fn len(set: &LiveKeys) -> usize {
+        set.len()
+    }
+
+    fn slot(state: &GatewayState) -> &Watched<LiveKeys> {
+        &state.live_keys
+    }
+
+    fn record_size(state: &GatewayState, len: usize) {
+        state.metrics.signing_keys_live.set(len as i64);
+    }
+
+    fn record_connected(state: &GatewayState, connected: bool) {
+        state
+            .metrics
+            .signing_keys_nats_connected
+            .set(i64::from(connected));
+    }
+
+    fn snapshot_path(state: &GatewayState) -> Option<String> {
+        state
+            .config
+            .snapshot_path()
+            .as_ref()
+            .map(|p| format!("{p}.signing_keys"))
+    }
+}
+
 /// Reconnect backoff for the watch loop: 1s doubling to a 30s cap. A fixed 2s retry hammered the log
 /// at a constant rate through a long outage (minutes to hours), burying other signals during the very
 /// incident an oncall is reading these logs for. The gateway serves correctly on the stale set
@@ -637,6 +692,39 @@ fn allowanceset_from_entries<'a>(entries: impl Iterator<Item = &'a KvEntry>) -> 
     for e in entries {
         if let Some(target) = allowance::parse_key(&e.key) {
             set.insert_target(target);
+        }
+    }
+    set
+}
+
+/// Apply a batch of watched deltas to the live signing keys. A `Put` trusts the key (a bad value or a
+/// full set is logged and ignored, see `LiveKeys::put`); a `Delete`/`Purge` retires it, the only
+/// thing that frees an entry.
+fn apply_signing_keys_batch(cur: &LiveKeys, updates: &[KvUpdate]) -> LiveKeys {
+    let mut set = cur.clone();
+    for update in updates {
+        match update {
+            KvUpdate::Put(e) => {
+                if let Some(kid) = live_keys::parse_key(&e.key) {
+                    set.put(kid, &e.value);
+                }
+            }
+            KvUpdate::Delete { key, .. } | KvUpdate::Purge { key, .. } => {
+                if let Some(kid) = live_keys::parse_key(key) {
+                    set.remove(kid);
+                }
+            }
+        }
+    }
+    set
+}
+
+/// Build the live keys from KV entries, dropping any whose key isn't `signing_key.{kid}`.
+fn livekeys_from_entries<'a>(entries: impl Iterator<Item = &'a KvEntry>) -> LiveKeys {
+    let mut set = LiveKeys::new();
+    for e in entries {
+        if let Some(kid) = live_keys::parse_key(&e.key) {
+            set.put(kid, &e.value);
         }
     }
     set
@@ -977,6 +1065,169 @@ mod tests {
             deny::parse_key(&format!("{}key.7", Deny::PREFIX)),
             Some(deny::DenyTarget::Key(7))
         );
+    }
+
+    #[test]
+    fn signing_keys_watch_the_signing_key_prefix() {
+        assert_eq!(SigningKeys::PREFIX, "signing_key.");
+        assert_eq!(
+            live_keys::parse_key(&format!("{}7", SigningKeys::PREFIX)),
+            Some(7)
+        );
+        // The distrust entry rides the deny watcher's prefix, not this one.
+        assert_eq!(
+            deny::parse_key(&format!("{}kid.7", Deny::PREFIX)),
+            Some(deny::DenyTarget::Kid(7))
+        );
+    }
+
+    fn pubkey_b64(seed: u8) -> Vec<u8> {
+        use base64::Engine;
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        base64::engine::general_purpose::STANDARD
+            .encode(sk.verifying_key().to_bytes())
+            .into_bytes()
+    }
+
+    fn del(key: &str) -> KvUpdate {
+        KvUpdate::Delete {
+            key: key.to_string(),
+            version: VersionToken::from_u64(2),
+        }
+    }
+
+    /// A KV add makes a token verify; the delete takes it away again unless config also holds the kid.
+    /// claim: A7
+    #[test]
+    fn kv_signing_keys_add_and_delete_change_what_verifies() {
+        use crate::key::{Keyring, VirtualKey, mint_v2};
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+        let id = VirtualKey {
+            tenant_id: 1,
+            vpc_id: 2,
+            key_id: None,
+        };
+        let token = mint_v2(&id, 3, 9, &sk);
+        let cfg_only: Keyring = [(9, sk.verifying_key())].into_iter().collect();
+        let empty = Keyring::new();
+        let deny = DenySet::new();
+        let verifies =
+            |ring: &Keyring, live: &LiveKeys| ring.verify_with(&token, live, &deny, || 0).is_ok();
+
+        let mut live = LiveKeys::new();
+        assert!(!verifies(&empty, &live), "unknown before the KV entry");
+
+        live = apply_signing_keys_batch(
+            &live,
+            &[KvUpdate::Put(entry("signing_key.9", &pubkey_b64(11)))],
+        );
+        assert!(verifies(&empty, &live), "trusted once the KV entry lands");
+
+        // Rotation: a second kid arrives while the first is still trusted.
+        live = apply_signing_keys_batch(
+            &live,
+            &[KvUpdate::Put(entry("signing_key.10", &pubkey_b64(12)))],
+        );
+        assert!(verifies(&empty, &live));
+        assert_eq!(live.len(), 2);
+
+        live = apply_signing_keys_batch(&live, &[del("signing_key.9")]);
+        assert!(!verifies(&empty, &live), "retired by the KV delete");
+        assert!(verifies(&cfg_only, &live), "config still trusts it");
+        assert_eq!(live.len(), 1);
+    }
+
+    /// A bad value or a foreign key changes nothing; the seed path skips them too.
+    #[test]
+    fn invalid_signing_key_entries_are_ignored() {
+        let live = apply_signing_keys_batch(
+            &LiveKeys::new(),
+            &[
+                KvUpdate::Put(entry("signing_key.1", b"not a key")),
+                KvUpdate::Put(entry("signing_key.01", &pubkey_b64(1))),
+                KvUpdate::Put(entry("signing_key.x", &pubkey_b64(1))),
+                KvUpdate::Put(entry("blackhole.1", &pubkey_b64(1))),
+                KvUpdate::Put(entry("signing_key.2", &pubkey_b64(1))),
+            ],
+        );
+        assert_eq!(live.len(), 1);
+        assert!(live.get(2).is_some());
+
+        let entries = [
+            entry("signing_key.3", &pubkey_b64(3)),
+            entry("signing_key.4", b"junk"),
+            entry("allowance.5", b""),
+        ];
+        let seeded = livekeys_from_entries(entries.iter());
+        assert_eq!(seeded.len(), 1);
+        assert!(seeded.get(3).is_some());
+    }
+
+    /// The live ring stops at `MAX_SIGNING_KEYS` however it was fed, and a delete frees a slot.
+    #[test]
+    fn the_live_keyring_is_capped_and_a_delete_frees_a_slot() {
+        let max = live_keys::MAX_SIGNING_KEYS;
+        let puts: Vec<KvUpdate> = (0..max as u32 + 5)
+            .map(|k| KvUpdate::Put(entry(&format!("signing_key.{k}"), &pubkey_b64(1))))
+            .collect();
+        let live = apply_signing_keys_batch(&LiveKeys::new(), &puts);
+        assert_eq!(live.len(), max);
+        assert!(live.get(max as u32).is_none());
+
+        let entries: Vec<KvEntry> = (0..max as u32 + 5)
+            .map(|k| entry(&format!("signing_key.{k}"), &pubkey_b64(1)))
+            .collect();
+        assert_eq!(livekeys_from_entries(entries.iter()).len(), max);
+
+        let live = apply_signing_keys_batch(
+            &live,
+            &[
+                del("signing_key.0"),
+                KvUpdate::Put(entry(&format!("signing_key.{max}"), &pubkey_b64(1))),
+            ],
+        );
+        assert_eq!(live.len(), max);
+        assert!(live.get(max as u32).is_some());
+    }
+
+    /// `blackhole.kid.{kid}` distrusts the kid whichever source holds its key, and the delete restores it.
+    /// claim: A6
+    #[test]
+    fn a_kid_deny_entry_refuses_config_and_live_keys_and_a_delete_restores_them() {
+        use crate::key::{KeyError, Keyring, VirtualKey, mint_v2};
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+        let id = VirtualKey {
+            tenant_id: 1,
+            vpc_id: 2,
+            key_id: None,
+        };
+        let cfg_token = mint_v2(&id, 3, 9, &sk);
+        let live_token = mint_v2(&id, 3, 10, &sk);
+        let cfg: Keyring = [(9, sk.verifying_key())].into_iter().collect();
+        let live = apply_signing_keys_batch(
+            &LiveKeys::new(),
+            &[KvUpdate::Put(entry("signing_key.10", &pubkey_b64(11)))],
+        );
+
+        let mut deny = apply_batch(
+            &DenySet::new(),
+            &[
+                KvUpdate::Put(entry("blackhole.kid.9", b"fraud")),
+                KvUpdate::Put(entry("blackhole.kid.10", b"fraud")),
+            ],
+        );
+        assert_eq!(
+            cfg.verify_with(&cfg_token, &live, &deny, || 0),
+            Err(KeyError::Distrusted(9))
+        );
+        assert_eq!(
+            cfg.verify_with(&live_token, &live, &deny, || 0),
+            Err(KeyError::Distrusted(10))
+        );
+
+        deny = apply_batch(&deny, &[del("blackhole.kid.9"), del("blackhole.kid.10")]);
+        assert!(cfg.verify_with(&cfg_token, &live, &deny, || 0).is_ok());
+        assert!(cfg.verify_with(&live_token, &live, &deny, || 0).is_ok());
     }
 
     #[test]

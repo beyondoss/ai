@@ -61,6 +61,8 @@ pub enum Refusal {
     MissingKey,
     /// A managed key that does not verify.
     InvalidKey,
+    /// A `bai_v3` key whose signature verified but whose `exp` has passed (past the leeway).
+    KeyExpired,
     /// Over a rate guardrail ([`crate::ratelimit`]).
     RateLimited(Throttled),
     /// A body past `MAX_REQUEST_BODY`: declared, read while choosing a row, or streamed.
@@ -157,6 +159,7 @@ impl Refusal {
             ),
             Self::MissingKey => fixed!("authentication_error", "missing API key"),
             Self::InvalidKey => fixed!("authentication_error", "invalid API key"),
+            Self::KeyExpired => fixed!("authentication_error", "key expired"),
             Self::RateLimited(_) => fixed!("rate_limit_error", "rate limit exceeded"),
             Self::BodyTooLarge => fixed!("invalid_request_error", "request body too large"),
             Self::Denied(_) => fixed!("access_denied", "tenant is over limit or suspended"),
@@ -229,7 +232,7 @@ impl Refusal {
 
     pub fn status(&self) -> u16 {
         match self {
-            Self::MissingKey | Self::InvalidKey => 401,
+            Self::MissingKey | Self::InvalidKey | Self::KeyExpired => 401,
             Self::QuotaExhausted => 402,
             Self::Denied(reason) => reason.http_status(),
             Self::UnknownProvider | Self::CatalogMiss { .. } => 404,
@@ -271,7 +274,7 @@ impl Refusal {
     /// be the type its compile-time body spells (the variant test checks each).
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::MissingKey | Self::InvalidKey => "authentication_error",
+            Self::MissingKey | Self::InvalidKey | Self::KeyExpired => "authentication_error",
             Self::RateLimited(_) | Self::TenantBusy => "rate_limit_error",
             Self::Denied(_) => "access_denied",
             Self::QuotaExhausted => "insufficient_quota",
@@ -336,6 +339,7 @@ impl Refusal {
             Self::AmbiguousCredential => Rejection::AmbiguousCredential,
             Self::MissingKey => Rejection::MissingKey,
             Self::InvalidKey => Rejection::Auth,
+            Self::KeyExpired => Rejection::KeyExpired,
             Self::RateLimited(throttled) => (*throttled).into(),
             Self::BodyTooLarge => Rejection::BodyTooLarge,
             // Distinct per reason: an `Unknown` is a control plane ahead of this build, not fraud.
@@ -476,6 +480,7 @@ pub(crate) fn every() -> Vec<Refusal> {
         Refusal::AmbiguousCredential,
         Refusal::MissingKey,
         Refusal::InvalidKey,
+        Refusal::KeyExpired,
         Refusal::RateLimited(Throttled::PerCredential),
         Refusal::RateLimited(Throttled::ByoGlobal),
         Refusal::BodyTooLarge,
@@ -550,6 +555,7 @@ pub(crate) fn every() -> Vec<Refusal> {
             | Refusal::AmbiguousCredential
             | Refusal::MissingKey
             | Refusal::InvalidKey
+            | Refusal::KeyExpired
             | Refusal::RateLimited(_)
             | Refusal::BodyTooLarge
             | Refusal::Denied(_)
@@ -589,7 +595,7 @@ mod tests {
     use std::collections::HashSet;
 
     /// How many variants `Refusal` has: the exhaustive `match` in [`every`] is the list.
-    const VARIANTS: usize = 32;
+    const VARIANTS: usize = 33;
 
     #[test]
     fn every_variant_is_listed() {
@@ -625,6 +631,12 @@ mod tests {
                 401,
                 "auth",
                 r#"{"error":{"message":"invalid API key","type":"authentication_error"}}"#,
+                None,
+            ),
+            Refusal::KeyExpired => (
+                401,
+                "key_expired",
+                r#"{"error":{"message":"key expired","type":"authentication_error"}}"#,
                 None,
             ),
             Refusal::RateLimited(Throttled::PerCredential) => (

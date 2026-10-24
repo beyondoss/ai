@@ -12,7 +12,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use beyond_ai::doctor;
 use beyond_ai::{
     AdminApp, AiConfig, AiProxy, Allowance, Capture, CaptureDrain, CaptureSink, Deny, GatewayState,
-    Metrics, USAGE_TARGET, UsageFiles, UsageRow, ValidConfig, WatcherService, usage_log_filter,
+    Metrics, SigningKeys, USAGE_TARGET, UsageFiles, UsageRow, ValidConfig, WatcherService,
+    usage_log_filter,
 };
 use clap::{Parser, Subcommand};
 use pingora_core::apps::HttpServerOptions;
@@ -495,6 +496,10 @@ fn main() {
     server.add_service(background_service(
         "ai-watch-capture",
         WatcherService::<Capture>::new(state.clone()),
+    ));
+    server.add_service(background_service(
+        "ai-watch-signing-keys",
+        WatcherService::<SigningKeys>::new(state.clone()),
     ));
 
     // Metrics listener now also serves /livez + /readyz for the ECS/k8s probes. Pingora's built-in

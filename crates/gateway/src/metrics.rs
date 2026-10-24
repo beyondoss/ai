@@ -112,12 +112,15 @@ pub enum Rejection {
     /// A `/{name}/…` route whose provider has no pool key configured: nothing to send on a managed
     /// key. 503 before any upstream.
     NoPoolKey,
+    /// A `bai_v3` key past its `exp` (plus leeway). 401, distinct from `Auth` so an integration
+    /// that never refreshes its short-lived credential is visible as that, not as a forged key.
+    KeyExpired,
 }
 
 impl Rejection {
     /// Every variant, in `as_index` order. The array in `Metrics` is built from this, so adding a
     /// variant without adding it here fails the exhaustive `match` in `as_index`.
-    pub(crate) const ALL: [Rejection; 30] = [
+    pub(crate) const ALL: [Rejection; 31] = [
         Rejection::Auth,
         Rejection::DenySpend,
         Rejection::DenyFraud,
@@ -148,6 +151,7 @@ impl Rejection {
         Rejection::MissingKey,
         Rejection::AmbiguousCredential,
         Rejection::NoPoolKey,
+        Rejection::KeyExpired,
     ];
 
     /// The `reason=` label value. `RateLimit` keeps the original `"rate_limit"` string so existing
@@ -184,6 +188,7 @@ impl Rejection {
             Rejection::MissingKey => "missing_key",
             Rejection::AmbiguousCredential => "ambiguous_credential",
             Rejection::NoPoolKey => "no_pool_key",
+            Rejection::KeyExpired => "key_expired",
         }
     }
 
@@ -219,6 +224,7 @@ impl Rejection {
             Rejection::MissingKey => 27,
             Rejection::AmbiguousCredential => 28,
             Rejection::NoPoolKey => 29,
+            Rejection::KeyExpired => 30,
         }
     }
 }
@@ -440,6 +446,11 @@ pub struct Metrics {
     pub allowance_ready: IntGauge,
     /// NATS connectivity for the **allowance-set** watcher, separate from deny/capture.
     pub allowance_nats_connected: IntGauge,
+    /// Live signing keys held (`signing_key.{kid}` entries; at most `MAX_SIGNING_KEYS`). A value
+    /// stuck at the cap means retired kids are not being deleted.
+    pub signing_keys_live: IntGauge,
+    /// NATS connectivity for the **signing-key** watcher, separate from the other sets.
+    pub signing_keys_nats_connected: IntGauge,
     /// Exact-match cache hits that replayed a stored 2xx and never reached a provider.
     pub cache_hits_total: IntCounter,
     /// Constant `1` with `kind="process"`: the exact-match cache is this pod's table, not a fleet
@@ -579,6 +590,14 @@ impl Metrics {
             "ai_allowance_nats_connected",
             "Allowance-set watcher NATS connectivity (1=connected, 0=disconnected)",
         ))?;
+        let signing_keys_live = IntGauge::with_opts(Opts::new(
+            "ai_signing_keys_live",
+            "Signing public keys held from the control plane (KV signing_key.{kid})",
+        ))?;
+        let signing_keys_nats_connected = IntGauge::with_opts(Opts::new(
+            "ai_signing_keys_nats_connected",
+            "Signing-key watcher NATS connectivity (1=connected, 0=disconnected)",
+        ))?;
         let captures_total = IntCounter::with_opts(Opts::new(
             "ai_captures_total",
             "Requests whose payloads were captured",
@@ -668,6 +687,8 @@ impl Metrics {
         r.register(Box::new(allowance_set_size.clone()))?;
         r.register(Box::new(allowance_ready.clone()))?;
         r.register(Box::new(allowance_nats_connected.clone()))?;
+        r.register(Box::new(signing_keys_live.clone()))?;
+        r.register(Box::new(signing_keys_nats_connected.clone()))?;
         r.register(Box::new(captures_total.clone()))?;
         r.register(Box::new(capture_bytes_total.clone()))?;
         r.register(Box::new(capture_dropped_total.clone()))?;
@@ -713,6 +734,8 @@ impl Metrics {
             allowance_set_size,
             allowance_ready,
             allowance_nats_connected,
+            signing_keys_live,
+            signing_keys_nats_connected,
             captures_total,
             capture_bytes_total,
             capture_dropped_total,

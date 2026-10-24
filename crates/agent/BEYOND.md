@@ -8,6 +8,7 @@ operations) and [ARCHITECTURE.md](ARCHITECTURE.md) (the mechanism).
 - [Must fix before hosted agents go live](#must-fix-before-hosted-agents-go-live)
 - [Principles](#principles)
 - [Decisions](#decisions)
+- [Gateway credentials: expiry and signing keys](#gateway-credentials-expiry-and-signing-keys)
 - [What Beyond builds, per part](#what-beyond-builds-per-part)
 - [Conformance](#conformance)
 
@@ -156,6 +157,42 @@ and the ring routing in [FLEET.md](FLEET.md). Beyond's edge does neither.
     _Why:_ placement stays the fleet's and minting stays Beyond's; the gateway's key, limits and usage
     are one Beyond-owned loop.
 
+## Gateway credentials: expiry and signing keys
+
+The gateway verifies a managed key (`bai_v1`, `bai_v2`, `bai_v3`) with no lookup, from a signature
+under a public key it trusts. Layouts, the leeway and the contract vectors are in
+`crates/gateway/ARCHITECTURE.md` (Identity) and `verify/key_vectors.json`. This is what Beyond's
+control plane must provide for the short-lived credentials and live key rotation they allow. It
+states the contract, not how Beyond meets it.
+
+1. **Mint `bai_v3` for short-lived credentials.** A `bai_v3` key is a `bai_v2` key plus a mandatory
+   `exp` (unix seconds). The gateway refuses it once `now > exp + 30s` with a 401, `key expired`.
+   Expiry is judged when a request is admitted; a stream already admitted is not cut. Anything that
+   should not expire stays `bai_v2`. The minter must reproduce `verify/key_vectors.json` byte for byte.
+2. **Exchange a workload identity for a `bai_v3`.** An RFC 8693 style token exchange. A workload
+   presents the OIDC token its platform issued (AWS, GCP, GitHub Actions, or our hosted agents).
+   Beyond checks the token's signature against the issuer's keys and its `iss`, `aud` and `sub`
+   against the tenant's trust rules, and returns a `bai_v3` for that tenant with `exp` about an hour
+   out. A token that matches no rule gets nothing; a rule can be removed, and no key minted after that
+   is issued under it. The workload asks again before `exp`; the gateway never refreshes anything.
+3. **Publish and retire signing keys through KV.** To rotate: write `signing_key.{kid}` to the KV
+   bucket the gateway watches (value: the public key, base64 or raw, as `signing_keys` takes it)
+   and mint under that `kid` once replicas have it. The gateway holds at most 64 such keys, so delete
+   `signing_key.{kid}` for a retired kid. To cut a kid off at once, from any source, write
+   `blackhole.kid.{kid}`; it beats both config and KV and is checked before any signature math.
+   Deleting that entry restores the kid. Writes to these two prefixes decide who can mint for any
+   tenant, so the principal allowed to write them is the one that may hold a signing key.
+4. **Stop minting `bai_v1`.** It names tenant and VPC only, so no single credential can be cut off
+   without cutting off the tenant. New keys are `bai_v2` (long-lived) or `bai_v3` (short-lived).
+
+Long-lived `bai_v2` keys remain the SDK path: an SDK sends a static string and never refreshes, so
+only a workload that can run the exchange gets a `bai_v3`.
+
+**Acceptance check:** a `bai_v3` presented after `exp` plus 30s is a 401 `key expired`; a kid
+written to `blackhole.kid.{kid}` refuses every token under it, whichever source holds its key; a
+token under a kid written to `signing_key.{kid}` is admitted with no restart and refused once the entry
+is deleted.
+
 ## What Beyond builds, per part
 
 | Part                   | Must do                                                                                                                                                                                                                                                                                                            | Acceptance check                                                                                                                                                                                        |
@@ -164,6 +201,7 @@ and the ring routing in [FLEET.md](FLEET.md). Beyond's edge does neither.
 | Control plane: bundles | Build a plain `ustar` bundle at deploy (`src/bundle.rs`) and refuse unsafe entries there: absolute or `..` paths, symlinks, hardlinks, devices, pax or GNU headers, and anything over the size cap. Store it content-addressed. Save `.mcp-tools.json` at its root for in-sandbox MCP servers (`src/mcp_json.rs`). | A bundle with an unsafe entry fails the deploy, not the session open. A stored bundle hashes to its name. A session over a bundle with `.mcp-tools.json` opens with no exec request and no MCP request. |
 | Exec front / edge      | Make the VM on the first request. One create per session. Kill a VM whose create failed. Cap VMs per tenant and answer `503` when full. Time out idle clients. No entry outlives its VM. Follow the exec protocol (`src/exec_endpoint.rs`, exec v1.4) and the edge contract in [FLEET.md](FLEET.md).               | N concurrent first requests for one session create one VM. A failed create leaves no VM. The tenant's N+1th VM gets `503`. A VM that is gone leaves no route entry.                                     |
 | Connector broker       | Authorization code with PKCE. Refresh tokens encrypted per tenant. Mint `bmc_v1` (`src/managed_mcp_token.rs`) bound to one user's connection, with a short expiry. Support revocation and scope.                                                                                                                   | The broker reproduces `tests/fixtures/managed_mcp/v1.json` byte for byte. A token for one connection cannot reach another's. A revoked connection is refused at once. An expired token is refused.      |
+| Control plane: keys    | Mint `bai_v3` with `exp`; exchange workload OIDC tokens for it; publish `signing_key.{kid}` and `blackhole.kid.{kid}`; stop minting `bai_v1`. See the section above.                                                                                                                                               | An expired `bai_v3` is refused. A rotated-in kid is admitted without a restart. A distrusted kid is refused.                                                                                            |
 | Bundle store           | Serve bundles by hash over TLS. Retain per decision 6.                                                                                                                                                                                                                                                             | A pinned hash is still served after 10 newer deploys. A deleted tenant's bundles are gone.                                                                                                              |
 
 ## Conformance
