@@ -22,6 +22,10 @@ key sealed into the VM. What it buys is waking sandboxes.
 That still matters for hosted agents. They multiply the number of sandboxes behind agent-token routes,
 so forged-key wakes become a cost and availability attack on every tenant. Narrow this first.
 
+Token epochs (decision 2) raise the stakes. They travel on the same key channel, so a service that
+can write it can raise an epoch and revoke a live session's token. The verifiers' raise-only rule
+stops it reviving a revoked one, but only the narrowed credential stops the forced revocation.
+
 The requirement: a dedicated API NGS user allowed to publish `$KV.edge-agent-keys.>`, and a deny on
 that subject for the shared user. A KV put is a publish to that subject, and NATS can scope it only
 per user. A separate bucket makes it one subject rather than a prefix inside the routing bucket.
@@ -70,7 +74,9 @@ and the ring routing in [FLEET.md](FLEET.md). Beyond's edge does neither.
    tokens inside it expire at the session's end or after 24 h, whichever comes first. Revocation is a
    per-sandbox token epoch: each `bagt_v1` carries one, and the edge and `sandbox-exec` refuse any token
    below the sandbox's current epoch, which they learn through the key channel they already watch.
-   Ending a session bumps the epoch.
+   Ending a session bumps the epoch. The edge and `sandbox-exec` only ever raise a sandbox's epoch
+   and never accept a lower one, so nothing that can write the key channel can bring a revoked token
+   back.
    _Why:_ a leaked grant is useless within minutes; a leaked token is useless once the session is gone.
    An epoch is one number per sandbox, takes effect at once, and needs no denylist. 5 minutes covers
    clock skew and the open; the grant has no leeway.
@@ -154,7 +160,7 @@ and the ring routing in [FLEET.md](FLEET.md). Beyond's edge does neither.
 
 | Part                   | Must do                                                                                                                                                                                                                                                                                                            | Acceptance check                                                                                                                                                                                        |
 | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Control plane: grants  | Mint `bsg_v1` grants (`src/grant.rs`) that are valid for 5 minutes and re-minted on resume. Carry the tenant policy, `limits` and exec headers. Revoke the session's tokens when it ends.                                                                                                                          | A grant older than its expiry opens nothing. A session's token is refused after the session ends.                                                                                                       |
+| Control plane: grants  | Mint `bsg_v1` grants (`src/grant.rs`) that are valid for 5 minutes and re-minted on resume. Carry `limits` and exec headers. Revoke the session's tokens when it ends.                                                                                                                                             | A grant older than its expiry opens nothing. A session's token is refused after the session ends.                                                                                                       |
 | Control plane: bundles | Build a plain `ustar` bundle at deploy (`src/bundle.rs`) and refuse unsafe entries there: absolute or `..` paths, symlinks, hardlinks, devices, pax or GNU headers, and anything over the size cap. Store it content-addressed. Save `.mcp-tools.json` at its root for in-sandbox MCP servers (`src/mcp_json.rs`). | A bundle with an unsafe entry fails the deploy, not the session open. A stored bundle hashes to its name. A session over a bundle with `.mcp-tools.json` opens with no exec request and no MCP request. |
 | Exec front / edge      | Make the VM on the first request. One create per session. Kill a VM whose create failed. Cap VMs per tenant and answer `503` when full. Time out idle clients. No entry outlives its VM. Follow the exec protocol (`src/exec_endpoint.rs`, exec v1.4) and the edge contract in [FLEET.md](FLEET.md).               | N concurrent first requests for one session create one VM. A failed create leaves no VM. The tenant's N+1th VM gets `503`. A VM that is gone leaves no route entry.                                     |
 | Connector broker       | Authorization code with PKCE. Refresh tokens encrypted per tenant. Mint `bmc_v1` (`src/managed_mcp_token.rs`) bound to one user's connection, with a short expiry. Support revocation and scope.                                                                                                                   | The broker reproduces `tests/fixtures/managed_mcp/v1.json` byte for byte. A token for one connection cannot reach another's. A revoked connection is refused at once. An expired token is refused.      |
