@@ -41,6 +41,10 @@ if [ "$USE_E2B" = 1 ]; then
   e2b_need_key || exit 2
   # The key works. (VMs are made per session by demo.sh, so there is nothing to create here.)
   e2b_count >/dev/null || { echo "up: E2B's API did not accept E2B_API_KEY" >&2; exit 2; }
+  # The browser agent's VMs boot from a template with the browser stack in it (found by name if an earlier
+  # run built it; see e2b_browser_template). It belongs to the account, so `down.sh` keeps it.
+  BROWSER_TEMPLATE=
+  [ "$USECASES" = 0 ] || BROWSER_TEMPLATE=$(e2b_browser_template) || exit 2
 fi
 ACCOUNT=$(account)
 ECR="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com"
@@ -422,13 +426,10 @@ TD_AGENT=$(jq -n --arg family "$P-agent" --arg exec "$(EXEC agent)" --arg taskro
     {name:"agent", image:$img, essential:true, stopTimeout:2, entryPoint:["/bin/sh","-c"], command:[$script],
      portMappings:[{containerPort:8080},{containerPort:8443}],
      mountPoints:[{sourceVolume:"efs",containerPath:"/mnt/efs",readOnly:false}],
-     environment:([{name:"HOME",value:"/tmp"},{name:"GATEWAY_URL",value:$gw},{name:"MODEL",value:$model},
-       {name:"NOTIFY_ORIGIN",value:$origin},{name:"GRANT_KEY_FLAG",value:$grant},{name:"TLS_CERT",value:$cert}]
-       + (if $taskrole == "" then [] else [{name:"AI_AGENT_MCP_ALLOW_PRIVATE",value:"1"}] end)),
+     environment:[{name:"HOME",value:"/tmp"},{name:"GATEWAY_URL",value:$gw},{name:"MODEL",value:$model},
+       {name:"NOTIFY_ORIGIN",value:$origin},{name:"GRANT_KEY_FLAG",value:$grant},{name:"TLS_CERT",value:$cert}],
      secrets:[{name:"AI_AGENT_SEAL_KEY_B64",valueFrom:$seal},{name:"TLS_KEY",valueFrom:$tlskey}],
      logConfiguration:$logs}]} + (if $taskrole == "" then {} else {taskRoleArn:$taskrole} end)
-  # AI_AGENT_MCP_ALLOW_PRIVATE (use cases only): the browser agent MCP address is the exec front, a
-  # private address in this VPC (a VM that does not exist yet has no public one). Demo only.
   # The use cases scan the agent process'"'"'s memory through ECS Exec, which Linux allows a non-parent
   # only with CAP_SYS_PTRACE (Yama scope 1 on Fargate): granted for that, in this mode only.
   | if $taskrole == "" then . else .containerDefinitions[0].linuxParameters = {capabilities:{add:["SYS_PTRACE"]}} end' | register "$P-agent")
@@ -438,7 +439,7 @@ SANDBOX_SCRIPT='printf "%s" "$CA_PEM" > /tmp/ca.pem
 exec /usr/local/bin/beyond-ai-demo exec-stub --listen 0.0.0.0:8081 --root /workspace --home /home/sandbox'
 TD_SANDBOX=$(jq -n --arg family "$P-sandbox" --arg exec "$(EXEC sandbox)" --argjson logs "$(LOGS sandbox)" \
   --arg img "$ECR/$P-sandbox:latest" --argjson vol "$EFSVOL" --arg script "$SANDBOX_SCRIPT" --arg ca "$CA_PEM" \
-  --arg usecases "$USECASES" --argjson flogs "$(LOGS front)" --arg fimg "$ECR/$P-front:latest" --arg ek "$(param_arn e2b-key)" --arg name "$NAME" '{
+  --arg usecases "$USECASES" --argjson flogs "$(LOGS front)" --arg fimg "$ECR/$P-front:latest" --arg ek "$(param_arn e2b-key)" --arg name "$NAME" --arg btpl "${BROWSER_TEMPLATE:-}" '{
   family:$family, networkMode:"awsvpc", requiresCompatibilities:["FARGATE"], cpu:"256", memory:(if $usecases == "1" then "1024" else "512" end),
   executionRoleArn:$exec, volumes:$vol,
   containerDefinitions:[
@@ -451,7 +452,7 @@ TD_SANDBOX=$(jq -n --arg family "$P-sandbox" --arg exec "$(EXEC sandbox)" --argj
   # makes that session'"'"'s E2B microVM when the first request arrives (front.py).
   | if $usecases == "1" then .containerDefinitions += [
     {name:"front", image:$fimg, essential:true, portMappings:[{containerPort:8084}],
-     environment:[{name:"CA_PEM",value:$ca},{name:"NAME",value:$name}],
+     environment:[{name:"CA_PEM",value:$ca},{name:"NAME",value:$name},{name:"E2B_BROWSER_TEMPLATE",value:$btpl}],
      secrets:[{name:"E2B_API_KEY",valueFrom:$ek}], logConfiguration:$flogs}] else . end' | register "$P-sandbox")
 fi
 

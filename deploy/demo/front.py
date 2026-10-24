@@ -69,12 +69,19 @@ BRIDGE_PORT=${BRIDGE_PORT:-8931}
 vm_for "$1" || exit 1
 id=$(vm_field "$1" id); tok=$(vm_field "$1" envd_token)
 echo READY
+[ -z "$3" ] || vm_browser_warm "$id" "$tok"
+# The browser stack and the bridge come up while the bundle is being fetched: they do not need it.
+if [ -n "$3" ]; then
+  { vm_browser_up "$id" "$tok" "$3" && vm_bridge_start "$id" "$tok"; } & bpid=$!
+fi
 if [ -n "$2" ]; then
   vm_run "$id" "$tok" "mkdir -p $VM_HOME/workspace && curl -fsS -m 60 -o $VM_HOME/bundle.tar '$2' && tar -xf $VM_HOME/bundle.tar -C $VM_HOME/workspace && rm -f $VM_HOME/bundle.tar && echo seeded" | grep -q seeded || exit 3
 fi
 echo SEEDED
 if [ -n "$3" ]; then
-  vm_browser_up "$id" "$tok" "$3" && vm_bridge_start "$id" "$tok" "${4:+$VM_HOME/workspace/$4}" || exit 4
+  wait "$bpid" || exit 4
+  # The page it serves is in the bundle, so it starts once the bundle is there.
+  [ -z "$4" ] || vm_site_start "$id" "$tok" "$VM_HOME/workspace/$4"
   echo BROWSER
 fi
 '''
@@ -84,6 +91,8 @@ def make_vm(session, bundle, browser="", site=""):
     env = dict(os.environ, VMDIR=VMDIR, STUB=STUB, CA_FILE=CA_FILE, E2B_SH=E2B_SH,
                VM_PRIVATE="1", TAG_KEY="beyond-ai-demo", SANDBOX_PORT="8081")
     env.setdefault("NAME", os.environ.get("DEMO_NAME", "demo"))
+    if browser and os.environ.get("E2B_BROWSER_TEMPLATE"):
+        env["E2B_TEMPLATE"] = os.environ["E2B_BROWSER_TEMPLATE"]  # the browser stack is already in it
     log("vm_create_start", session=session)
     p = subprocess.Popen(["bash", "-c", SCRIPT, "front", session, bundle or "", browser, site], env=env,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

@@ -126,7 +126,7 @@ _grant_coding_browser() { # session [tamper]
 
 # The browser agent: the exec endpoint and the browser's MCP address are both the front, keyed on its
 # session. Neither names a VM, so neither costs one until the model calls a browser tool: the front makes
-# the VM on that first request, seeds it from the bundle, installs the browser stack (the VM fetches the
+# the VM on that first request, seeds it from the bundle, brings up the browser bridge (the stack is in the VM's template; the VM fetches the
 # rustwright-mcp binary itself) and forwards.
 _front_mcp_url() { echo "http://sandbox.$DNS:$FRONT_PORT/mcp/$SESS_B?bundle=$(jq -rn --arg u "$BUNDLE_URL" '$u|@uri')&browser=$(jq -rn --arg u "$RW_URL" '$u|@uri')&site=site"; }
 _grant_browser() { # session [tamper]
@@ -604,11 +604,12 @@ _vm_created_on_first_browser_tool() {
   local ready=$UC_READY_MS out tool t_tool t_end t_sent fl first_req create_start vm_up seeded browser_up model_done vms_after nav ok
   out=$(chat "$SESS_B" --timeout-secs 600 --prompt "Open http://localhost:8000/ in the browser (find the browser tools with tool_search). Tell me the page title and the text of the line that starts with 'stamp', quoting them from the browser's snapshot.")
   note_calls "$SESS_B" "$out"
-  tool=$(jq -c '[.tools[]|select(.name|test("browser_navigate"))][0] // null' <<<"$out")
+  # The first browser tool the model calls, whichever it is (it may close or read before navigating).
+  tool=$(jq -c '[.tools[]|select(.name|startswith("mcp__browser__"))][0] // null' <<<"$out")
   t_tool=$(jq -r '.t_ms // 0' <<<"$tool")
   t_end=$(jq -r '.end_ms // 0' <<<"$tool")
   t_sent=$(jq -r .sent_at_ms <<<"$out")
-  nav=$(jq -r '.output // ""' <<<"$tool")
+  nav=$(jq -r '[.tools[]|select(.name|test("browser_navigate"))][0].output // ""' <<<"$out")
   for _ in $(seq 1 20); do
     fl=$(cw front/ "$((ready - 60000))" | jq -c --arg s "$SESS_B" '[.[]|(.m|fromjson? // empty)|select(.src=="front" and .detail.session==$s)]')
     [ "$(jq '[.[]|select(.event=="browser_ready")]|length' <<<"$fl")" -ge 1 ] && break
@@ -627,14 +628,14 @@ _vm_created_on_first_browser_tool() {
   fi
   model_done=$(jq '[.[]|((.start_unix_secs*1000) + .latency_ms)]|min // 0' <<<"$(uc_rows_since "$t_sent" 1)")
   echo "  session ready at $ready; VMs for it at open: ${VM_AT_OPEN:-?}"
-  echo "  the model's browser_navigate call started $t_tool; the front was first asked at $first_req (+$((first_req - ready)) ms after open)"
+  echo "  the model's first browser call started $t_tool; the front was first asked at $first_req (+$((first_req - ready)) ms after open)"
   echo "  VM create began $create_start, VM serving $vm_up (+$((vm_up - create_start)) ms), seeded $seeded, browser stack and bridge up $browser_up (+$((browser_up - seeded)) ms)"
   echo "  the first browser result arrived at $t_end: $((t_end - t_tool)) ms after the call started; E2B VMs for it now: $vms_after"
   ok=0
   if [ "${VM_AT_OPEN:-1}" = 0 ] && [ "$create_start" -gt "$ready" ] && [ "$first_req" -ge "$((t_tool - 1500))" ] && [ "$create_start" -ge "$((model_done - 1500))" ] \
     && [ "$vms_after" = 1 ] && [ "$t_end" -gt "$create_start" ] && [[ $nav == *"$PAGE_STAMP"* ]]; then ok=1; fi
   if [ "$ok" = 1 ]; then
-    result 1 "no VM existed when the session opened, yet the model had the browser tools (from the list saved in the bundle); only when it called browser_navigate did the front make the VM ($((create_start - ready)) ms after the session was ready), seed it, install the browser stack and forward the call; the first browser result came $((t_end - t_tool)) ms after the call started" \
+    result 1 "no VM existed when the session opened, yet the model had the browser tools (from the list saved in the bundle); only when it first called a browser tool did the front make the VM ($((create_start - ready)) ms after the session was ready), seed it, start the browser bridge and forward the call; the first browser result came $((t_end - t_tool)) ms after the call started" \
       "$(jq -nc --argjson ready "$ready" --argjson fr "$first_req" --argjson cs "$create_start" --argjson up "$vm_up" --argjson sd "$seeded" --argjson bu "$browser_up" --argjson te "$t_end" --argjson tt "$t_tool" --argjson md "$model_done" \
         '{vms_at_open:0, session_ready_ms:$ready, first_model_call_answered_ms:$md, tool_call_started_ms:$tt, front_first_request_ms:$fr, vm_create_started_ms:$cs, vm_serving_ms:$up, vm_seeded_ms:$sd, browser_ready_ms:$bu, first_tool_result_ms:$te,
           open_to_vm_create_ms:($cs-$ready), vm_provision_ms:($up-$cs), seed_from_bundle_ms:($sd-$up), browser_stack_ms:($bu-$sd), first_tool_call_to_result_ms:($te-$tt)}')" \
