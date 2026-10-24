@@ -98,14 +98,20 @@ struct Fingerprint {
     tail: String,
 }
 
+/// The most tenant-and-connector tool lists the broker keeps for refusals. A list that does not fit
+/// is simply not cached: the refusal then says why instead of listing the tools.
+const CATALOG_MAX: usize = 1024;
+
 #[derive(Default)]
 struct State {
     pending: HashMap<String, Pending>,
     conns: HashMap<String, Arc<AsyncMutex<Conn>>>,
     /// `tenant \0 session \0 connector` -> connection id.
     bindings: BTreeMap<String, String>,
-    /// What each connector's `tools/list` last said: the catalog is not the user's data, and it lets
-    /// a session whose connection is gone still see what the tools are.
+    /// What each connector's `tools/list` last said to a tenant (`tenant \0 connector`): it lets a
+    /// session whose connection is gone still see what the tools are, and only that tenant's
+    /// sessions are shown it. Bounded by [`CATALOG_MAX`]: one entry per tenant and connector the
+    /// broker has served, replaced in place, and no new entry once the cap is reached.
     catalog: HashMap<String, Value>,
     fingerprints: Vec<Fingerprint>,
 }
@@ -764,7 +770,7 @@ impl Broker {
                 "managed_refused",
                 json!({"connector": connector, "tenant": claims.tenant, "session": claims.session_id, "reason": "no connection bound to this session"}),
             );
-            return self.refusal(connector, &rpc, "No user has connected their account to this session, so there is nothing to act as. The user has to sign in first.");
+            return self.refusal(&claims.tenant, connector, &rpc, "No user has connected their account to this session, so there is nothing to act as. The user has to sign in first.");
         };
         // A request names no connection: the binding is the only way to one. One that tries is refused.
         if let Some(asked) = req
@@ -786,7 +792,12 @@ impl Broker {
         }
         let conn = self.lock().conns.get(&bound).cloned();
         let Some(conn) = conn else {
-            return self.refusal(connector, &rpc, "The connection no longer exists.");
+            return self.refusal(
+                &claims.tenant,
+                connector,
+                &rpc,
+                "The connection no longer exists.",
+            );
         };
 
         let mut force = false;
@@ -798,7 +809,7 @@ impl Broker {
                         "managed_refused",
                         json!({"connector": connector, "tenant": claims.tenant, "session": claims.session_id, "connection": bound, "reason": why}),
                     );
-                    return self.refusal(connector, &rpc, &format!("The connection to this account is no longer active: {why}. The user has to sign in again to reconnect it; nothing else is wrong and the session is fine."));
+                    return self.refusal(&claims.tenant, connector, &rpc, &format!("The connection to this account is no longer active: {why}. The user has to sign in again to reconnect it; nothing else is wrong and the session is fine."));
                 }
                 Err(Refusal::Unavailable(why)) => {
                     line(
@@ -836,9 +847,11 @@ impl Broker {
                         && status == 200
                         && let Ok(v) = serde_json::from_slice::<Value>(&body)
                     {
-                        self.lock()
-                            .catalog
-                            .insert(connector.to_string(), v["result"].clone());
+                        let mut st = self.lock();
+                        let key = bind_key(&claims.tenant, "", connector);
+                        if st.catalog.len() < CATALOG_MAX || st.catalog.contains_key(&key) {
+                            st.catalog.insert(key, v["result"].clone());
+                        }
                     }
                     let keep: Vec<_> = headers
                         .into_iter()
@@ -862,7 +875,7 @@ impl Broker {
     /// A refusal the model can read. A tool call gets a tool error (so the model sees why, and the
     /// session carries on); the handshake and the tool list are answered from what the broker already
     /// knows, so a connection that is gone does not make the connector vanish from the session.
-    fn refusal(&self, connector: &str, rpc: &Value, text: &str) -> Resp {
+    fn refusal(&self, tenant: &str, connector: &str, rpc: &Value, text: &str) -> Resp {
         let method = rpc["method"].as_str().unwrap_or("");
         let Some(id) = rpc.get("id").cloned() else {
             return (202, json_headers(), Vec::new());
@@ -875,7 +888,12 @@ impl Broker {
                 "serverInfo": {"name": "managed-broker", "version": "0.1.0"},
             }),
             "ping" => json!({}),
-            "tools/list" => match self.lock().catalog.get(connector).cloned() {
+            "tools/list" => match self
+                .lock()
+                .catalog
+                .get(&bind_key(tenant, "", connector))
+                .cloned()
+            {
                 Some(c) => c,
                 None => {
                     return reply(
