@@ -5130,6 +5130,8 @@ is still rooted at the same tenant. An id the caller supplies is never rewritten
 > [FLEET.md](FLEET.md).** This section is the mechanism: what a replica does and why. That one is the
 > contract and the operations — the routing obligations the agent cannot enforce, replica sizing and
 > blast radius, what to alert on, how it scales, and what it costs against the alternatives.
+>
+> What Beyond must provide on its side of hosted agents is [BEYOND.md](BEYOND.md).
 
 `serve --listen … --service` turns the daemon from "a headless agent for whoever is on the other end
 of this socket" into a **fail-closed multi-tenant service**. Every connection presents a

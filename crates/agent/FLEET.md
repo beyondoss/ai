@@ -10,6 +10,8 @@ for the two people who need more than [ARCHITECTURE.md](ARCHITECTURE.md)'s mecha
 - [How it scales](#how-it-scales)
 - [What it costs, and against what](#what-it-costs-and-against-what)
 
+What Beyond itself must provide for hosted agents is [BEYOND.md](BEYOND.md).
+
 Everything with a number in it was measured. Where a number is derived rather than observed, it says
 so — a capacity figure nobody can trace is worse than no figure, because it gets planned against.
 
