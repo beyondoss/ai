@@ -3015,5 +3015,5 @@ evidence = "Code: response_filter removed only x-beyond-* and headers echoing th
 claims = ["SEC-8"]
 state = "fixed"
 test = "managed_responses_drop_the_provider_account_headers_and_byo_keeps_them"
-fix = "FIXCOMMIT"
+fix = "95e72d6"
 note = "Fixed with an allowlist on the managed response (proxy::headers::MANAGED_RESPONSE_HEADERS): framing, caching, SSE delivery, retry hints and request ids only. BYO keeps every header. Unit test managed_response_headers_drop_account_identity_and_quota covers the predicate."
