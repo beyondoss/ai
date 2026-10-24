@@ -10,7 +10,7 @@
 #
 #     SCAN-RESULT pid=… kb=<memory read> unreadable=<ranges refused> jwt_shaped=<distinct JWT-shaped strings>
 #     SCAN-NEEDLE <kind> <tail> <lines holding it>       one per needle
-#     SCAN-JWT <last 24 characters>                       one per distinct JWT-shaped string
+#     SCAN-JWT <last 24 characters> <first 24 of the payload>   one per distinct JWT-shaped string
 #
 # Every writable mapping is read in full, including the allocator's large reservation: a read of a page
 # that was never touched costs a syscall and nothing else. Mappings with no resident page are skipped
@@ -43,5 +43,5 @@ echo "SCAN-RESULT pid=$pid kb=$kb unreadable=$bad jwt_shaped=$(grep '^eyJ' "$hit
 while read -r kind tail; do
   echo "SCAN-NEEDLE $kind $tail $(grep -c -F "$tail" "$hits")"
 done < "$needles"
-grep '^eyJ' "$hits" | sort -u | sed 's/.*\(.\{24\}\)$/SCAN-JWT \1/'
+grep '^eyJ' "$hits" | sort -u | awk -F. '{ printf "SCAN-JWT %s %s\n", substr($3, length($3) - 23), substr($2, 1, 24) }'
 rm -f "$hits" "$err" /tmp/scan.ranges

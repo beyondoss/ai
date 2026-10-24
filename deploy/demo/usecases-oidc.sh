@@ -195,8 +195,10 @@ scan_agent_oidc() { # needles-file -> the scan's stdout
     cat "$HERE/oidc/scan-memory.sh"
     cat <<'EOF'
 echo "SCAN-ENV needle_hits=$(tr '\0' '\n' < /proc/$pid/environ | grep -c -F -f /tmp/needles.tails) jwt_like=$(tr '\0' '\n' < /proc/$pid/environ | grep -c 'eyJ[A-Za-z0-9_-]\{8,\}\.')"
-echo "SCAN-EFS files=$(find /mnt/efs -type f 2>/dev/null | wc -l) kb=$(du -sk /mnt/efs 2>/dev/null | cut -f1) needle_files=$(grep -rl -F -f /tmp/needles.tails /mnt/efs 2>/dev/null | wc -l)"
+echo "SCAN-EFS files=$(find /mnt/efs -type f 2>/dev/null | wc -l) kb=$(du -sk /mnt/efs 2>/dev/null | cut -f1) needle_files=$(find /mnt/efs -type f -exec grep -l -F -f /tmp/needles.tails {} + 2>/dev/null | wc -l)"
 rm -f /tmp/needles /tmp/needles.tails
+# an ECS Exec session can drop its last output when it closes at once
+sleep 5
 EOF
   })
   # The script is longer than a command line comfortably is: it goes to the bundles bucket and the agent
@@ -207,7 +209,8 @@ EOF
   printf '%s\n' "$script" > "$WORK/scan.sh"
   command aws --region "$REGION" s3 cp "$WORK/scan.sh" "s3://$bucket/$key" --only-show-errors || { echo "SCAN-ERROR could not stage the scan"; return; }
   url=$(command aws --region "$REGION" s3 presign "s3://$bucket/$key" --expires-in 600)
-  out=$(command aws --region "$REGION" ecs execute-command --cluster "$CLUSTER" --task "$task" --container agent --interactive \
+  # (the session plugin ends the session, and drops its last output, when its stdin closes: hold stdin open)
+  out=$(sleep 50 | command aws --region "$REGION" ecs execute-command --cluster "$CLUSTER" --task "$task" --container agent --interactive \
     --command "/bin/sh -c 'wget -q -O /tmp/scan.sh \"$url\" && sh /tmp/scan.sh; rm -f /tmp/scan.sh'" 2>&1 | tr -d '\r') || true
   command aws --region "$REGION" s3 rm "s3://$bucket/$key" --only-show-errors > /dev/null 2>&1 || true
   grep -aoE 'SCAN-[A-Z]+ .*' <<<"$out" || echo "SCAN-ERROR $(head -c 300 <<<"$out" | tr '\n' ' ')"
@@ -218,9 +221,16 @@ check_agent_never_sees_token() {
   # The control: a fresh token-shaped string, handed to the agent in a prompt, so it is in the agent's
   # memory (and the session's transcript) for certain. The scan has to find it.
   ctl_sig=$(openssl rand -base64 36 | tr '+/' '-_' | tr -d '=\n' | head -c 43)
-  ctl_jwt="eyJhbGciOiJSUzI1NiJ9.eyJjdHJsIjoicGxhbnRlZCJ9.$ctl_sig"
+  CTL_PAYLOAD=eyJjdHJsIjoicGxhbnRlZCJ9   # {"ctrl":"planted"}
+  ctl_jwt="eyJhbGciOiJSUzI1NiJ9.$CTL_PAYLOAD.$ctl_sig"
   out=$(chat "$SESS_OA" --prompt "Do not use any tool. This is a format question only: is $ctl_jwt a valid JWT? Answer in one short sentence.")
   note_calls "$SESS_OA" "$out"
+  # and a fresh call for each user, so each has an access token in flight right now (the scan below runs
+  # within that token's 60 seconds, or the broker refreshes: either way the latest token is on the list)
+  for s in "$SESS_OA" "$SESS_OB"; do
+    out=$(chat "$s" --prompt "List my notes with your notes tool.")
+    note_calls "$s" "$out"
+  done
   # every token the broker has handled for the two connections: the last 24 characters of each (enough to
   # recognise a token, never enough to use it)
   : > "$needles"
@@ -277,13 +287,14 @@ check_agent_never_sees_token() {
   bad=$(sed -n 's/.* unreadable=\([0-9]*\).*/\1/p' <<<"$res")
   ctl_hits=$(grep '^SCAN-NEEDLE control' <<<"$scan" | awk '{print $4}' | head -1)
   real_hits=$(grep -E '^SCAN-NEEDLE (access|refresh) ' <<<"$scan" | awk '{s += $4} END {print s + 0}')
-  other_jwts=$(grep '^SCAN-JWT' <<<"$scan" | grep -vF "${ctl_sig: -24}" | wc -l)
+  # the strings this run (and earlier runs against the same agent process) planted all carry the same payload
+  other_jwts=$(grep '^SCAN-JWT' <<<"$scan" | grep -vc " $CTL_PAYLOAD\$" || true)
   local env_hits env_jwt efs_files efs_hits
   env_hits=$(sed -n 's/^SCAN-ENV needle_hits=\([0-9]*\).*/\1/p' <<<"$scan")
   env_jwt=$(sed -n 's/.*jwt_like=\([0-9]*\).*/\1/p' <<<"$scan")
   efs_files=$(sed -n 's/^SCAN-EFS files=\([0-9]*\).*/\1/p' <<<"$scan")
   efs_hits=$(sed -n 's/.*needle_files=\([0-9]*\).*/\1/p' <<<"$scan")
-  echo "  agent memory: $((${kb:-0} / 1024)) MB read, $bad ranges refused; the planted control was found ${ctl_hits:-0} time(s); real token tails found ${real_hits:-?}; other JWT-shaped strings ${other_jwts}"
+  echo "  agent memory: $((${kb:-0} / 1024)) MB read, $bad ranges refused; the planted control was found ${ctl_hits:-0} time(s); real token tails found ${real_hits:-?}; JWT-shaped strings that are not a planted control: ${other_jwts}"
   echo "  agent environment: ${env_hits:-?} token tails, ${env_jwt:-?} JWT-like values; EFS: ${efs_files:-?} files, ${efs_hits:-?} holding a token tail"
   local needle_count
   needle_count=$(grep -vc '^control' "$needles" || true)
@@ -357,10 +368,15 @@ check_users_isolated() {
   echo "  bob's session saw:   ${tb:0:110}"
   [[ $ta == *"(alice)"* && $ta != *"bob"* && $ta != *"$rb"* && $tb == *"(bob)"* && $tb != *"alice"* && $tb != *"$ra"* && -n $ra && -n $rb && $ra != "$rb" ]] || ok=0
   # the broker's own view: every call of a session reached that session's user's connection
-  calls=$(oidc_log "$((t0 - 5000))" '^managed_call$' 2 | jq -c '[.[]|.detail|{session, connection, sub, method}]')
+  # (the log lines reach CloudWatch a few seconds late: wait until both sessions' tool calls are in)
+  for _ in $(seq 1 25); do
+    calls=$(oidc_log "$((t0 - 5000))" '^managed_call$' 2 | jq -c '[.[]|.detail|{session, connection, sub, method}]')
+    [ "$(jq -r --arg a "$SESS_OA" --arg b "$SESS_OB" '([.[]|select(.method=="tools/call" and .session==$a)]|length) > 0 and ([.[]|select(.method=="tools/call" and .session==$b)]|length) > 0' <<<"$calls")" = true ] && break
+    sleep 4
+  done
   jq -e --arg a "$SESS_OA" --arg b "$SESS_OB" --arg ca "${OIDC_CONN[alice]}" --arg cb "${OIDC_CONN[bob]}" \
     '([.[]|select(.session==$a)] | length > 0 and all(.[]; .connection == $ca)) and ([.[]|select(.session==$b)] | length > 0 and all(.[]; .connection == $cb))' <<<"$calls" > /dev/null || ok=0
-  echo "  broker: every call of alice's session used ${OIDC_CONN[alice]}, bob's ${OIDC_CONN[bob]}: $(jq -r --arg a "$SESS_OA" --arg b "$SESS_OB" '[.[]|select(.session==$a)]|length' <<<"$calls")/$(jq -r --arg b "$SESS_OB" '[.[]|select(.session==$b)]|length' <<<"$calls") calls"
+  echo "  broker: every call of alice's session used ${OIDC_CONN[alice]}, bob's ${OIDC_CONN[bob]}: $(jq -r --arg a "$SESS_OA" '[.[]|select(.session==$a)]|length' <<<"$calls") / $(jq -r --arg b "$SESS_OB" '[.[]|select(.session==$b)]|length' <<<"$calls") calls (handshake included)"
 
   # What alice's session could try with the one credential it has: its own token. Each attempt is made raw,
   # against the broker, as a compromised agent would.
@@ -410,7 +426,11 @@ check_scope_enforced() {
   text=$(jq -r .text <<<"$out")
   tool=$(jq -r '[.tools[]|select(.name=="mcp__notes__add_note")][0].output // "" | tostring' <<<"$out")
   echo "  add_note answered: ${tool:0:200}"
-  ev=$(oidc_log "$((t0 - 5000))" '^resource_refused$' 1 | jq -c '[.[]|select(.detail.why=="scope")|.detail]')
+  for _ in $(seq 1 15); do
+    ev=$(oidc_log "$((t0 - 5000))" '^resource_refused$' 1 | jq -c '[.[]|select(.detail.why=="scope")|.detail]')
+    [ "$(jq length <<<"$ev")" -ge 1 ] && break
+    sleep 4
+  done
   echo "  the notes service refused it itself: $ev"
   after=$(chat "$SESS_OA" --prompt "List my notes with your notes tool.")
   note_calls "$SESS_OA" "$after"
