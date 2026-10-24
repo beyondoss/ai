@@ -14,6 +14,7 @@ import statistics
 import sys
 
 KB = 1024.0
+CACHE_DIR_OVERHEAD_KB = 16  # the cache's own directory and its lock file, which du counts and the cache does not
 
 
 def load_samples(path):
@@ -194,8 +195,8 @@ def main():
           f"({driver['config']['bundles_in_burst']} never-seen bundles, {driver['config']['burst_sessions']} sessions at once)",
           {"label": "peak fetches", "value": fetch_peak, "unit": "of 4"})
     check("cache-bounded", "the bundle cache stays within its budget once sessions release their bundles",
-          max(idle_cache or [0]) <= budget_kb,
-          f"budget {budget_kb / KB:.0f} MB; on disk at the end of each idle: "
+          max(idle_cache or [0]) <= budget_kb + CACHE_DIR_OVERHEAD_KB,
+          f"budget {budget_kb / KB:.0f} MB (the cache counts the blocks of its bundles; du also counts its own directory and lock file); on disk at the end of each idle: "
           + ", ".join(f"{c / KB:.1f} MB" for c in idle_cache) + f"; peak with sessions open {cache_peak_kb / KB:.1f} MB "
           "(bundles a session holds are never evicted, so the budget can be exceeded by exactly those)",
           {"label": "peak on disk", "value": round(cache_peak_kb / KB, 1), "unit": f"MB of {budget_kb / KB:.0f}"})

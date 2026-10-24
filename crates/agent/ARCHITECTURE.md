@@ -6192,8 +6192,10 @@ fetch it, `bundle.sha256` what it must hash to). `bundle.rs` does the rest:
   prefix, which the error says), a corrupt header checksum, a truncated archive or more than
   64 MiB of content refuses the **whole** bundle; modes, owners and times are ignored.
 - **Bounded.** The cache keeps at most `--bundle-cache-mb` (`AI_AGENT_BUNDLE_CACHE_MB`, default 1024)
-  MiB of unpacked bundles. `Cache` records each directory's size as it unpacks and never walks the
-  disk. `ensure` returns a `Pin` that the session's `BundleFs` holds for its life,
+  MiB of unpacked bundles. `Cache` records each directory's size as it unpacks, measured once as the
+  disk it occupies (allocated blocks of every file and directory, as `du` counts them, not the bytes
+  of content: a bundle of a few small files holds tens of KiB of blocks), and never walks the disk
+  afterwards. `ensure` returns a `Pin` that the session's `BundleFs` holds for its life,
   since it keeps reading skills from the directory; dropping it stamps the entry's last release. After
   every install, while over budget, the unpinned entry released longest ago is evicted: renamed to
   `.trash-*` under the cache lock (a request that then finds no entry fetches afresh, and nothing is

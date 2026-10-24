@@ -70,7 +70,10 @@ pub fn cache() -> &'static Arc<Cache> {
 ///
 /// A session holds a [`Pin`] on its bundle for its whole life (it keeps reading skills from the
 /// directory), and a pinned directory is never evicted. So the cache may exceed the budget, but only by
-/// the bytes of pinned bundles, and comes back within it as they are released. Sizes are recorded as bundles unpack; the disk is never walked.
+/// the bytes of pinned bundles, and comes back within it as they are released. A bundle's size is the
+/// disk it occupies (allocated blocks, directories included), measured once as it unpacks: a bundle of a
+/// few small files holds tens of kilobytes of blocks, and counting only content would let thousands of
+/// them through a small budget.
 ///
 /// Each cache owns a fresh subdirectory of the shared base, holding a lock file that stays locked for
 /// the cache's life. Creating a cache removes the subdirectories of caches whose lock it can take: their
@@ -324,7 +327,7 @@ impl Cache {
     }
 }
 
-/// Unpack `bytes` beside `dest` and rename it into place, returning the bytes of content.
+/// Unpack `bytes` beside `dest` and rename it into place, returning the bytes it occupies on disk.
 fn install(root: &Path, dest: &Path, bytes: &[u8]) -> Result<u64, String> {
     let io = |what: &str, e: std::io::Error| format!("bundle: {what}: {e}");
     std::fs::create_dir_all(root).map_err(|e| io("creating the cache", e))?;
@@ -336,13 +339,11 @@ fn install(root: &Path, dest: &Path, bytes: &[u8]) -> Result<u64, String> {
     ));
     let _ = std::fs::remove_dir_all(&tmp); // a crashed process's leftover under a reused pid
     std::fs::create_dir(&tmp).map_err(|e| io("creating a work directory", e))?;
-    let size = match unpack(bytes, &tmp) {
-        Ok(size) => size,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&tmp);
-            return Err(e);
-        }
-    };
+    if let Err(e) = unpack(bytes, &tmp) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(e);
+    }
+    let size = disk_bytes(&tmp);
     match std::fs::rename(&tmp, dest) {
         Ok(()) => Ok(size),
         Err(e) => {
@@ -350,6 +351,26 @@ fn install(root: &Path, dest: &Path, bytes: &[u8]) -> Result<u64, String> {
             Err(io("installing it", e))
         }
     }
+}
+
+/// The disk `dir` occupies: allocated blocks of every file and directory in it, as `du` counts them.
+fn disk_bytes(dir: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut total = 0;
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(d) = pending.pop() {
+        if let Ok(meta) = std::fs::symlink_metadata(&d) {
+            total += meta.blocks() * 512;
+        }
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            match e.file_type() {
+                Ok(t) if t.is_dir() => pending.push(e.path()),
+                Ok(_) => total += e.metadata().map_or(0, |m| m.blocks() * 512),
+                Err(_) => {}
+            }
+        }
+    }
+    total
 }
 
 /// Unpack a plain tar into the existing, empty directory `dest`.
@@ -722,6 +743,12 @@ mod tests {
         cache.ensure(&bundle, Some(&egress)).await.unwrap();
     }
 
+    /// The disk one of the `served` bundles occupies once unpacked.
+    fn served_disk() -> u64 {
+        let out = unpacked(&tar(&[file("AGENTS.md", "bundle-000")])).unwrap();
+        disk_bytes(out.path())
+    }
+
     /// A ten-byte bundle (distinct per `n`) served from its own loopback server.
     fn served(n: u8) -> (BundleServer, Bundle) {
         let bytes = tar(&[file("AGENTS.md", &format!("bundle-{n:03}"))]);
@@ -733,12 +760,47 @@ mod tests {
         (server, bundle)
     }
 
+    /// What `du` reports for `dir`: allocated blocks of every file and directory in it.
+    fn du_bytes(dir: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt as _;
+        let mut total = std::fs::symlink_metadata(dir).unwrap().blocks() * 512;
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let meta = e.metadata().unwrap();
+            total += if meta.is_dir() {
+                du_bytes(&e.path())
+            } else {
+                meta.blocks() * 512
+            };
+        }
+        total
+    }
+
+    #[tokio::test]
+    async fn many_tiny_bundles_are_held_to_the_budget_by_the_disk_they_occupy() {
+        let root = tempfile::tempdir().unwrap();
+        let egress = egress();
+        // A ten-byte bundle occupies whole blocks for its file and directory: room for a few on disk.
+        let budget = 3 * served_disk();
+        let cache = Cache::new(root.path(), budget);
+        let mut servers = Vec::new();
+        for n in 0..40 {
+            let (server, bundle) = served(n);
+            drop(cache.ensure(&bundle, Some(&egress)).await.unwrap());
+            servers.push(server);
+        }
+        let disk = du_bytes(cache.dir());
+        assert!(
+            disk <= budget + served_disk(),
+            "{disk} bytes on disk against a budget of {budget}"
+        );
+    }
+
     #[tokio::test]
     async fn over_budget_evicts_the_oldest_unpinned_bundle_and_never_a_pinned_one() {
         let root = tempfile::tempdir().unwrap();
         let egress = egress();
         // Room for two of the ten-byte bundles.
-        let cache = Cache::new(root.path(), 25);
+        let cache = Cache::new(root.path(), served_disk() * 5 / 2);
         let ((_a, a), (_b, b), (_c, c)) = (served(1), served(2), served(3));
         let held_oldest = cache.ensure(&a, Some(&egress)).await.unwrap();
         drop(cache.ensure(&b, Some(&egress)).await.unwrap());
@@ -763,7 +825,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let egress = egress();
         // Room for one ten-byte bundle; two sessions hold one each, so both stay while they are held.
-        let cache = Cache::new(root.path(), 15);
+        let cache = Cache::new(root.path(), served_disk() * 3 / 2);
         let ((_a, a), (_b, b)) = (served(1), served(2));
         let held_a = cache.ensure(&a, Some(&egress)).await.unwrap();
         let held_b = cache.ensure(&b, Some(&egress)).await.unwrap();
@@ -789,7 +851,7 @@ mod tests {
     async fn a_bundle_requested_after_its_eviction_is_fetched_again() {
         let root = tempfile::tempdir().unwrap();
         let egress = egress();
-        let cache = Cache::new(root.path(), 15);
+        let cache = Cache::new(root.path(), served_disk() * 3 / 2);
         let ((sa, a), (_b, b)) = (served(1), served(2));
         drop(cache.ensure(&a, Some(&egress)).await.unwrap());
         drop(cache.ensure(&b, Some(&egress)).await.unwrap());
