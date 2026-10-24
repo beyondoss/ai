@@ -55,7 +55,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && linker_env="CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')_LINKER" \
     && cc_env="CC_$(echo "$target" | tr '-' '_')" \
     && export "$linker_env=musl-gcc" "$cc_env=musl-gcc" \
-    && cargo chef cook --release --target "$target" -p beyond-ai-fleet-sim --recipe-path recipe.json
+    && cargo chef cook --release --locked --target "$target" -p beyond-ai-fleet-sim --recipe-path recipe.json
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -63,7 +63,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && linker_env="CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')_LINKER" \
     && cc_env="CC_$(echo "$target" | tr '-' '_')" \
     && export "$linker_env=musl-gcc" "$cc_env=musl-gcc" \
-    && cargo build --release --target "$target" -p beyond-ai-fleet-sim --bin fleet-sim \
+    && cargo build --release --locked --target "$target" -p beyond-ai-fleet-sim --bin fleet-sim \
     && cp "target/$target/release/fleet-sim" /usr/local/bin/fleet-sim
 
 # The metrics sidecar, in its own image. Nothing but socat, because it is pulled by every replica

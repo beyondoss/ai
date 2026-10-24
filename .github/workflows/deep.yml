@@ -52,7 +52,7 @@ jobs:
             --file crates/gateway/src/peek.rs
             --file crates/gateway/src/circuit_breaker.rs --file crates/gateway/src/route.rs)
           cargo mutants -p beyond-ai --test-tool nextest --shard ${{ matrix.shard }}/32 "${FILES[@]}" \
-            --jobs 2 --timeout-multiplier 3 --minimum-test-timeout 180 --output s1 -- --lib </dev/null || true
+            --jobs 2 --timeout-multiplier 3 --minimum-test-timeout 180 --cargo-arg=--locked --output s1 -- --lib </dev/null || true
           cat s1/mutants.out/missed.txt s1/mutants.out/timeout.txt 2>/dev/null | sort -u > survivors.txt || true
           echo "stage 1 survivors: $(wc -l < survivors.txt)"
           if [ -s survivors.txt ]; then
@@ -62,7 +62,7 @@ jobs:
             python3 .github/scripts/survivor-diff.py . survivors.txt > survivors.diff
             RE=$(python3 -c "import re,sys; print('|'.join('^'+re.escape(l.strip())+'\$' for l in open(sys.argv[1]) if l.strip()))" survivors.txt)
             cargo mutants -p beyond-ai --test-tool nextest "${FILES[@]}" --in-diff survivors.diff --re "$RE" \
-              --jobs 2 --timeout-multiplier 3 --minimum-test-timeout 600 --output s2 </dev/null || rc=$?
+              --jobs 2 --timeout-multiplier 3 --minimum-test-timeout 600 --cargo-arg=--locked --output s2 </dev/null || rc=$?
             mkdir -p mutants.out && cp s2/mutants.out/*.txt mutants.out/ 2>/dev/null || true
             [ "${rc:-0}" = 3 ] && exit 0
             exit "${rc:-0}"
@@ -96,7 +96,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      - run: cargo nextest run -p beyond-ai --profile deep -E 'test(/prop/)' </dev/null
+      - run: cargo nextest run --locked -p beyond-ai --profile deep -E 'test(/prop/)' </dev/null
         env:
           PROPTEST_CASES: "100000"
           PROPS_SECS: "5400"
@@ -127,7 +127,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p beyond-ai-providers --lib no_catalog_row_outlives_its_retirement </dev/null
+      - run: cargo test --locked -p beyond-ai-providers --lib no_catalog_row_outlives_its_retirement </dev/null
         env:
           CATALOG_RETIREMENT_STRICT: "1"
   # Coverage-guided fuzzing (cargo-fuzz) of the gateway's byte-level parsers, 10 minutes per target.

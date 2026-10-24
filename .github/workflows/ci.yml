@@ -67,7 +67,7 @@ jobs:
       - run: mise check:rs
       # Code Mode is a cargo feature so default/release binaries do not link QuickJS (agent VM
       # density: idle RSS is resident `.text`). The feature-gated paths still have to clippy clean.
-      - run: cargo clippy -p beyond-ai-agent --all-targets --features code-mode -- -D warnings
+      - run: cargo clippy -p beyond-ai-agent --all-targets --features code-mode --locked -- -D warnings
   # Unit + integration tests via nextest: it runs the whole suite in parallel across the runner's
   # cores, and — crucially — its per-test `slow-timeout` (see .config/nextest.toml) TERMINATES and
   # *names* a test that hangs, so a deadlock fails the job in a couple of minutes with the culprit
@@ -201,7 +201,7 @@ jobs:
               sleep 5
             done'
       - name: compile tests
-        run: cargo nextest run --workspace --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}' --no-run
+        run: cargo nextest run --workspace --locked --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}' --no-run
         timeout-minutes: 20
       # The run is a transient system unit (`systemd-run --wait`), not a child of the step. The
       # wedge leaves the test step `in_progress` past the nextest global-timeout, the step timeout and
@@ -231,7 +231,7 @@ jobs:
             -p MemoryMax=8G -p MemorySwapMax=0 -p TasksMax=4096 -p RuntimeMaxSec=11min \
             -p StandardInput=null -p StandardOutput=append:"$LOG" -p StandardError=append:"$LOG" \
             "${env_args[@]}" \
-            "$(command -v cargo)" nextest run --workspace --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}'
+            "$(command -v cargo)" nextest run --workspace --locked --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}'
           status=$?
           echo "--- last 200 lines of the log file ---"
           tail -200 "$LOG"
@@ -296,7 +296,7 @@ jobs:
         with:
           tool: nextest
       - name: compile tests
-        run: cargo nextest run --profile ci -p beyond-ai -E "$STRESS_FILTER" --no-run
+        run: cargo nextest run --locked --profile ci -p beyond-ai -E "$STRESS_FILTER" --no-run
         timeout-minutes: 20
       # Same pipe rules as `test`: nextest writes to a file, and the hogs get /dev/null for all
       # three streams, so no grandchild holds GitHub's stdout pipe open past the step.
@@ -316,7 +316,7 @@ jobs:
             echo "=== run $i/$STRESS_RUNS ===" >> "$LOG"
             start=$SECONDS
             rm -f target/nextest/ci/junit.xml
-            cargo nextest run --color never --profile ci -p beyond-ai -E "$STRESS_FILTER" >> "$LOG" 2>&1 </dev/null
+            cargo nextest run --locked --color never --profile ci -p beyond-ai -E "$STRESS_FILTER" >> "$LOG" 2>&1 </dev/null
             rc=$?
             # Each run overwrites the JUnit report; keep one per run for the flaky report below.
             cp target/nextest/ci/junit.xml "$RUNNER_TEMP/junit-$i.xml" 2>/dev/null
