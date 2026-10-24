@@ -292,8 +292,8 @@ if (UC && UC.name === "assistant") {
   EDGES.splice(EDGES.findIndex(e => e[0] === "agent" && e[1] === "sandbox"), 1);
   EDGES.push(["agent", "standin"], ["agent", "deepwiki"]);
 } else if (UC && UC.name === "oidc") {
-  NODES.broker = { x: 200, y: 66, w: 118, h: 54, label: "broker", sub: "refresh token, sealed" };
-  NODES.notes = { x: 370, y: 36, w: 104, h: 40, label: "notes service", sub: "validates the JWT" };
+  NODES.broker = { x: 190, y: 70, w: 118, h: 54, label: "broker", sub: "refresh token, sealed" };
+  NODES.notes = { x: 340, y: 30, w: 104, h: 40, label: "notes service", sub: "validates the JWT" };
   NODES.idp = { x: 62, y: 88, w: 100, h: 46, label: "identity provider", sub: "Keycloak" };
   NODES.sandbox.label = "no sandbox"; NODES.sandbox.sub = "none in the grant";
   EDGES.splice(EDGES.findIndex(e => e[0] === "agent" && e[1] === "sandbox"), 1);
