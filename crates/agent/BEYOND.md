@@ -14,11 +14,15 @@ operations) and [ARCHITECTURE.md](ARCHITECTURE.md) (the mechanism).
 ## Must fix before hosted agents go live
 
 **Narrow who may write `edge-agent-keys`.** Today every Beyond service (API, orchestrator, edge,
-instd) shares one NATS credential, so any of them can write the `edge-agent-keys` bucket, which means
-any of them can publish agent-token verification keys. Hosted agents make exec tokens the gate to
-customers' sandboxes, so a forged key is no longer a bounded problem and this must be narrowed first.
+instd) shares one NGS credential, so any of them can write the `edge-agent-keys` bucket, which means
+any of them can publish agent-token verification keys. Beyond's own assessment is that the stakes are
+bounded: a forged edge key only gets a request past the edge, because `sandbox-exec` still checks the
+key sealed into the VM. What it buys is waking sandboxes.
 
-The requirement: a dedicated API NATS user allowed to publish `$KV.edge-agent-keys.>`, and a deny on
+That still matters for hosted agents. They multiply the number of sandboxes behind agent-token routes,
+so forged-key wakes become a cost and availability attack on every tenant. Narrow this first.
+
+The requirement: a dedicated API NGS user allowed to publish `$KV.edge-agent-keys.>`, and a deny on
 that subject for the shared user. A KV put is a publish to that subject, and NATS can scope it only
 per user. A separate bucket makes it one subject rather than a prefix inside the routing bucket.
 
