@@ -1,4 +1,4 @@
-//! Stateless virtual API key: `bai_v1` / `bai_v2`.
+//! Stateless virtual API key: `bai_v1` / `bai_v2` / `bai_v3`.
 //!
 //! The gateway authenticates every request from a `{payload}` it can verify **without a
 //! lookup**: tenant/app identity lives *inside* the token, signed with Ed25519. We hold only
@@ -16,10 +16,20 @@
 //! supplies (not derived from tenant+vpc); mint is still deterministic for a given key_id.
 //! Revocation is out-of-band via the deny-set (`blackhole.{tenant}` and `blackhole.key.{id}`).
 //! Quota exhaust is the same shape on the allowance-set (`allowance.{tenant}` / `allowance.key.{id}`).
+//!
+//! `bai_v3` is `bai_v2` plus a mandatory `exp` (unix seconds): a short-lived credential the control
+//! plane mints in exchange for a workload identity. Long-lived keys stay v2. `exp` is checked at
+//! admission only — a stream already admitted is not cut when it passes, the same rule as a deny.
+//!
+//! The trusted public keys are the config ring (this module's [`Keyring`]) plus the live ring the
+//! control plane publishes at runtime (`live_keys`); a `kid` named in the deny-set
+//! (`blackhole.kid.{kid}`) is distrusted whichever source holds it, before any signature math.
 
+use crate::deny::DenySet;
+use crate::live_keys::LiveKeys;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 #[cfg(any(test, feature = "mint"))]
 use ed25519_dalek::{Signer, SigningKey};
 use std::collections::HashMap;
@@ -29,15 +39,20 @@ use std::collections::HashMap;
 /// `request_filter` fail-closes on a managed prefix: a match that then fails verify is 401, never BYO.
 pub const PREFIX_V1: &str = "bai_v1";
 pub const PREFIX_V2: &str = "bai_v2";
+pub const PREFIX_V3: &str = "bai_v3";
 
-/// Whether a presented credential claims to be a managed virtual key (`bai_v1…` or `bai_v2…`).
+/// Clock skew a `bai_v3` key is forgiven past its `exp`: a key is expired when `now > exp + LEEWAY_SECS`.
+/// Covers drift between the control plane that minted `exp` and the gateway replica reading it.
+pub const LEEWAY_SECS: u64 = 30;
+
+/// Whether a presented credential claims to be a managed virtual key (`bai_v1…`, `bai_v2…` or `bai_v3…`).
 ///
 /// Used by the identity branch and the rate-guard managed flag — they must agree. A prefix match
 /// is fail-closed at verify (401), so classifying it as managed here also exempts a forged flood
 /// from the BYO aggregate without ever forwarding it upstream.
 #[inline]
 pub fn is_managed_prefix(token: &str) -> bool {
-    token.starts_with(PREFIX_V1) || token.starts_with(PREFIX_V2)
+    token.starts_with(PREFIX_V1) || token.starts_with(PREFIX_V2) || token.starts_with(PREFIX_V3)
 }
 
 /// Signing-key identifier. Lets the control plane rotate signing keys: new tokens are minted
@@ -47,7 +62,7 @@ pub type Kid = u32;
 /// The identity carried by a virtual key.
 ///
 /// `tenant_id`/`vpc_id`/`key_id` are `u64` to match the platform's id width (cf. ClickHouse
-/// `tenant_id UInt64` / `vpc_id UInt64`). `key_id` is `Some` on `bai_v2` only — v1 has no
+/// `tenant_id UInt64` / `vpc_id UInt64`). `key_id` is `Some` on `bai_v2` and `bai_v3` — v1 has no
 /// per-credential identity, so a key-level deny cannot apply to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtualKey {
@@ -76,6 +91,25 @@ impl VirtualKey {
         out[8..16].copy_from_slice(&self.vpc_id.to_le_bytes());
         out[16..].copy_from_slice(&key_id.to_le_bytes());
         out
+    }
+
+    /// v3: fixed 32-byte little-endian payload `tenant_id ++ vpc_id ++ key_id ++ exp`, `exp` in
+    /// unix seconds. Mandatory — a v3 key with no expiry is just a v2 key.
+    #[cfg(any(test, feature = "mint"))]
+    fn encode_payload_v3(&self, key_id: u64, exp: u64) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[..24].copy_from_slice(&self.encode_payload_v2(key_id));
+        out[24..].copy_from_slice(&exp.to_le_bytes());
+        out
+    }
+
+    /// The identity and `exp` of a v3 payload: the v2 fields, then `exp`.
+    fn decode_payload_v3(bytes: &[u8]) -> Option<(Self, u64)> {
+        if bytes.len() != 32 {
+            return None;
+        }
+        let vk = Self::decode_payload_v2(&bytes[..24])?;
+        Some((vk, u64::from_le_bytes(bytes[24..].try_into().ok()?)))
     }
 
     fn decode_payload_v1(bytes: &[u8]) -> Option<Self> {
@@ -142,10 +176,18 @@ pub enum KeyError {
     UnknownKid(Kid),
     #[error("signature verification failed")]
     BadSignature,
+    /// The `kid` is in the deny-set (`blackhole.kid.{kid}`): distrusted, whichever source holds it.
+    #[error("signing key id {0} is distrusted")]
+    Distrusted(Kid),
+    /// A `bai_v3` key whose signature verified but whose `exp` has passed (past [`LEEWAY_SECS`]).
+    /// Only ever returned for an authentic token, so it tells a forger nothing.
+    #[error("key expired")]
+    Expired,
 }
 
-/// The set of trusted Ed25519 public keys, indexed by `kid`. Built once at boot from config
-/// (`signing_keys`); multiple kids may be trusted at once for zero-downtime rotation via redeploy.
+/// The Ed25519 public keys trusted from config, indexed by `kid`. Built once at boot from
+/// `signing_keys`; multiple kids may be trusted at once for zero-downtime rotation via redeploy.
+/// Keys the control plane adds at runtime live in [`LiveKeys`] and are consulted after these.
 #[derive(Debug, Default, Clone)]
 pub struct Keyring {
     keys: HashMap<Kid, VerifyingKey>,
@@ -184,9 +226,34 @@ impl Keyring {
         self.keys.is_empty()
     }
 
-    /// Verify a virtual key string and extract its identity. Stateless: the only input besides
-    /// the token is the public keyring. Accepts `bai_v1` and `bai_v2`.
+    /// Verify a virtual key against this ring alone, on the system clock. Accepts `bai_v1`,
+    /// `bai_v2` and `bai_v3`. The gateway itself calls [`Self::verify_with`], which also consults
+    /// the live ring and the deny-set; this is the config-only form for callers holding just a ring.
     pub fn verify(&self, token: &str) -> Result<Identity, KeyError> {
+        self.verify_at(token, unix_now())
+    }
+
+    /// [`Self::verify`] with the clock stated: unix seconds `now`. How the contract vectors and
+    /// any caller that owns its time check a `bai_v3` key.
+    pub fn verify_at(&self, token: &str, now: u64) -> Result<Identity, KeyError> {
+        self.verify_with(token, &LiveKeys::default(), &DenySet::default(), || now)
+    }
+
+    /// Verify a virtual key string and extract its identity. Stateless: the inputs besides the
+    /// token are the public keys (this ring, then `live`), the set of distrusted kids in `deny`,
+    /// and — for `bai_v3` only — `now`, unix seconds. `now` is a parameter, not a read of the
+    /// clock, so a test sets the time without a seam in the release binary; it is called at most
+    /// once, and only for a v3 token that already verified.
+    ///
+    /// Order is cheapest refusal first: shape, distrusted kid, unknown kid, signature, and only
+    /// then `exp` — an expiry verdict is never given for a token the signature has not vouched for.
+    pub fn verify_with(
+        &self,
+        token: &str,
+        live: &LiveKeys,
+        deny: &DenySet,
+        now: impl FnOnce() -> u64,
+    ) -> Result<Identity, KeyError> {
         // Split into exactly 4 parts: prefix, kid, payload, sig. `splitn(4, '.')` rejects any
         // token with fewer separators; a payload/sig never contains '.' (base64url has none).
         let mut parts = token.splitn(4, '.');
@@ -198,6 +265,7 @@ impl Keyring {
         let version = match prefix {
             PREFIX_V1 => 1u8,
             PREFIX_V2 => 2,
+            PREFIX_V3 => 3,
             p if p.starts_with("bai_v") => return Err(KeyError::BadVersion),
             _ => return Err(KeyError::Malformed),
         };
@@ -211,10 +279,10 @@ impl Keyring {
         let kid: Kid = kid_str.parse().map_err(|_| KeyError::Malformed)?;
 
         // Decode the fixed-size fields straight onto the stack — no per-request heap allocation on
-        // the verify hot path. v1 payload is 16 bytes (22-char b64), v2 is 24 bytes (32-char b64);
-        // the signature is 64. `decode_slice` sizes its bounds check against a (ceil) estimate, so
-        // the buffers are a few bytes larger than the exact decoded length.
-        let mut payload_buf = [0u8; 36];
+        // the verify hot path. v1 payload is 16 bytes (22-char b64), v2 is 24 (32-char), v3 is 32
+        // (43-char); the signature is 64. `decode_slice` sizes its bounds check against a (ceil)
+        // estimate, so the buffers are a few bytes larger than the exact decoded length.
+        let mut payload_buf = [0u8; 40];
         let plen = URL_SAFE_NO_PAD
             .decode_slice(payload_b64, &mut payload_buf)
             .map_err(|_| KeyError::Malformed)?;
@@ -229,16 +297,26 @@ impl Keyring {
             .map_err(|_| KeyError::Malformed)?;
         let signature = Signature::from_bytes(&sig_arr);
 
+        // Distrust beats both key sources and costs no signature math: a revoked kid is refused
+        // before we even look for its key.
+        if deny.kid_denied(kid) {
+            return Err(KeyError::Distrusted(kid));
+        }
         // Resolve the public key *before* the cryptographic check so an unknown kid is a distinct,
-        // cheap rejection (no signature math on keys we don't trust).
-        let vk = self.get(kid).ok_or(KeyError::UnknownKid(kid))?;
+        // cheap rejection (no signature math on keys we don't trust). Config first, then the live
+        // ring the control plane feeds.
+        let vk = self
+            .get(kid)
+            .or_else(|| live.get(kid))
+            .ok_or(KeyError::UnknownKid(kid))?;
 
         // The signed message binds version + kid + payload, so none can be swapped independently
-        // (including a v1↔v2 downgrade). Stack buffer, no allocation per verify.
+        // (including a v1↔v2↔v3 relabel). Stack buffer, no allocation per verify. `verify_strict`,
+        // not `verify`: it also refuses a small-order public key or `R`, which the lax check admits.
         let mut signed_buf = [0u8; SIGNED_BYTES_CAP];
         let signed = write_signed_bytes(&mut signed_buf, prefix, kid, payload_b64)
             .ok_or(KeyError::Malformed)?;
-        vk.verify(signed, &signature)
+        vk.verify_strict(signed, &signature)
             .map_err(|_| KeyError::BadSignature)?;
 
         match version {
@@ -248,26 +326,43 @@ impl Keyring {
             2 => VirtualKey::decode_payload_v2(payload)
                 .map(Identity)
                 .ok_or(KeyError::Malformed),
+            3 => {
+                let (vk, exp) =
+                    VirtualKey::decode_payload_v3(payload).ok_or(KeyError::Malformed)?;
+                // `exp + LEEWAY_SECS` saturates: an `exp` of `u64::MAX` is "never", not a wrap to 29.
+                if now() > exp.saturating_add(LEEWAY_SECS) {
+                    return Err(KeyError::Expired);
+                }
+                Ok(Identity(vk))
+            }
             _ => Err(KeyError::BadVersion),
         }
     }
 }
 
+/// Unix seconds now. A clock before the epoch reads as 0, which only ever makes a key look *less*
+/// expired, and a host whose clock is that broken fails far louder elsewhere.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// Whether `s` is the one decimal spelling `mint` writes for a kid: ASCII digits, no sign, and no
 /// leading zero (except `0` itself).
-fn is_canonical_kid(s: &str) -> bool {
+pub(crate) fn is_canonical_kid(s: &str) -> bool {
     let b = s.as_bytes();
     !b.is_empty() && b.iter().all(u8::is_ascii_digit) && (b.len() == 1 || b[0] != b'0')
 }
 
 /// Upper bound on `{prefix}.{kid}.{payload}`: prefix (6) + `.` + a `u32` kid (≤ 10 digits) + `.`
-/// + a 24-byte base64url payload (32 chars, v2) = 50 bytes. 64 leaves headroom. v1 is 40.
+/// + a 32-byte base64url payload (43 chars, v3) = 61 bytes. 64 leaves headroom. v2 is 50, v1 40.
 const SIGNED_BYTES_CAP: usize = 64;
 
 /// Write the signature-covered bytes `{prefix}.{kid}.{payload}` into `buf`, returning the written
 /// slice — or `None` if they don't fit in `SIGNED_BYTES_CAP`. Binding version + kid + payload here
 /// is what stops an attacker from re-pointing a valid signature at a different kid, a tampered
-/// payload, or the other version. For a well-formed key the length is bounded (≤ 50 bytes), so
+/// payload, or the other version. For a well-formed key the length is bounded (≤ 61 bytes), so
 /// `None` means the input was malformed — `write!` returns `WriteZero` rather than panicking or
 /// truncating, keeping the verify hot path allocation- *and* panic-free.
 fn write_signed_bytes<'a>(
@@ -338,6 +433,33 @@ pub fn mint_v2(vk: &VirtualKey, key_id: u64, kid: Kid, signing_key: &SigningKey)
     let sig: Signature = signing_key.sign(signed);
     let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
     format!("{PREFIX_V2}.{kid}.{payload_b64}.{sig_b64}")
+}
+
+/// Mint a `bai_v3` virtual key: `bai_v2` plus `exp`, unix seconds, after which (and
+/// [`LEEWAY_SECS`]) the gateway refuses it. `exp` is mandatory — a key that should not expire is a
+/// `bai_v2` key.
+///
+/// Byte layout (the Go control plane must match it byte for byte):
+/// `bai_v3.{kid}.{payload_b64}.{sig_b64}` where `payload` is 32 bytes little-endian
+/// `tenant_id u64 || vpc_id u64 || key_id u64 || exp u64`, `payload_b64`/`sig_b64` are base64url
+/// (no pad), and the signed bytes are `bai_v3.{kid}.{payload_b64}`. Same Ed25519 keyring as v1/v2.
+/// Gated as [`mint`] is.
+#[cfg(any(test, feature = "mint"))]
+#[allow(clippy::expect_used)] // payload is a fixed 43-char base64 of 32 bytes; always fits the cap
+pub fn mint_v3(
+    vk: &VirtualKey,
+    key_id: u64,
+    exp: u64,
+    kid: Kid,
+    signing_key: &SigningKey,
+) -> String {
+    let payload_b64 = URL_SAFE_NO_PAD.encode(vk.encode_payload_v3(key_id, exp));
+    let mut signed_buf = [0u8; SIGNED_BYTES_CAP];
+    let signed = write_signed_bytes(&mut signed_buf, PREFIX_V3, kid, &payload_b64)
+        .expect("minted v3 signed bytes fit in SIGNED_BYTES_CAP");
+    let sig: Signature = signing_key.sign(signed);
+    let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+    format!("{PREFIX_V3}.{kid}.{payload_b64}.{sig_b64}")
 }
 
 #[cfg(test)]
@@ -529,7 +651,7 @@ mod tests {
         let ring = ring_with(1, vk);
         assert_eq!(ring.verify("garbage"), Err(KeyError::Malformed));
         assert_eq!(ring.verify("bai_v1.1.only-three"), Err(KeyError::Malformed));
-        assert_eq!(ring.verify("bai_v3.1.aaaa.bbbb"), Err(KeyError::BadVersion));
+        assert_eq!(ring.verify("bai_v4.1.aaaa.bbbb"), Err(KeyError::BadVersion));
         // A v2-shaped token with junk payload/sig is this version, just malformed — not BadVersion.
         assert_eq!(ring.verify("bai_v2.1.aaaa.bbbb"), Err(KeyError::Malformed));
         assert_eq!(
@@ -568,12 +690,226 @@ mod tests {
         );
     }
 
+    const EXP: u64 = 2_000_000_000;
+
+    fn who() -> VirtualKey {
+        VirtualKey {
+            tenant_id: 42,
+            vpc_id: 99,
+            key_id: None,
+        }
+    }
+
+    /// Verify at a fixed `now` against only the config ring.
+    fn verify_at(ring: &Keyring, token: &str, now: u64) -> Result<Identity, KeyError> {
+        ring.verify_with(token, &LiveKeys::default(), &DenySet::default(), || now)
+    }
+
+    /// claim: A5
     #[test]
-    fn managed_prefix_is_v1_or_v2() {
+    fn v3_roundtrips_identity_and_key_id() {
+        let (sk, vk) = test_keypair(1);
+        let ring = ring_with(7, vk);
+        let token = mint_v3(&who(), 1_000_042, EXP, 7, &sk);
+        assert!(token.starts_with("bai_v3."));
+        let got = verify_at(&ring, &token, EXP - 10).unwrap();
+        assert_eq!(
+            (got.tenant_id, got.vpc_id, got.key_id),
+            (42, 99, Some(1_000_042))
+        );
+        // Deterministic like v2: same inputs, same token; a different exp is a different token.
+        assert_eq!(token, mint_v3(&who(), 1_000_042, EXP, 7, &sk));
+        assert_ne!(token, mint_v3(&who(), 1_000_042, EXP + 1, 7, &sk));
+    }
+
+    /// claim: A5
+    #[test]
+    fn v3_is_expired_only_past_exp_plus_leeway() {
+        let (sk, vk) = test_keypair(1);
+        let ring = ring_with(7, vk);
+        let token = mint_v3(&who(), 5, EXP, 7, &sk);
+        for now in [
+            0,
+            EXP - 1,
+            EXP,
+            EXP + 1,
+            EXP + LEEWAY_SECS - 1,
+            EXP + LEEWAY_SECS,
+        ] {
+            assert!(verify_at(&ring, &token, now).is_ok(), "now={now}");
+        }
+        for now in [EXP + LEEWAY_SECS + 1, EXP + 3600, u64::MAX] {
+            assert_eq!(
+                verify_at(&ring, &token, now),
+                Err(KeyError::Expired),
+                "now={now}"
+            );
+        }
+    }
+
+    #[test]
+    fn v3_exp_at_the_top_of_the_range_does_not_wrap() {
+        let (sk, vk) = test_keypair(1);
+        let ring = ring_with(7, vk);
+        let token = mint_v3(&who(), 5, u64::MAX, 7, &sk);
+        assert!(verify_at(&ring, &token, u64::MAX).is_ok());
+    }
+
+    #[test]
+    fn expiry_is_judged_after_the_signature() {
+        // An expired token that was tampered with is a bad signature, not "expired": the verdict
+        // on `exp` is only given to a token the signature vouches for.
+        let (sk, vk) = test_keypair(1);
+        let ring = ring_with(7, vk);
+        let token = mint_v3(&who(), 5, 1, 7, &sk);
+        let mut parts: Vec<&str> = token.split('.').collect();
+        let mut payload = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+        payload[24] ^= 1;
+        let forged = URL_SAFE_NO_PAD.encode(&payload);
+        parts[2] = &forged;
+        assert_eq!(
+            verify_at(&ring, &parts.join("."), EXP),
+            Err(KeyError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn exp_is_read_only_for_v3() {
+        // `now` is a clock read: v1/v2 must not take it.
+        let (sk, vk) = test_keypair(1);
+        let ring = ring_with(7, vk);
+        let v2 = mint_v2(&who(), 5, 7, &sk);
+        let got = ring.verify_with(&v2, &LiveKeys::default(), &DenySet::default(), || {
+            unreachable!("v2 has no expiry")
+        });
+        assert!(got.is_ok());
+    }
+
+    /// claim: A5
+    #[test]
+    fn a_v2_token_relabelled_as_v3_is_rejected() {
+        let (sk, vk) = test_keypair(1);
+        let ring = ring_with(7, vk);
+        let v2 = mint_v2(&who(), 5, 7, &sk);
+        let relabelled = v2.replacen("bai_v2", "bai_v3", 1);
+        assert_eq!(
+            verify_at(&ring, &relabelled, 0),
+            Err(KeyError::BadSignature)
+        );
+        // And a v3 relabelled down to v2 drops its exp, which the signature forbids too.
+        let v3 = mint_v3(&who(), 5, EXP, 7, &sk);
+        let down = v3.replacen("bai_v3", "bai_v2", 1);
+        assert_eq!(verify_at(&ring, &down, 0), Err(KeyError::BadSignature));
+    }
+
+    #[test]
+    fn a_correctly_signed_v3_with_the_wrong_payload_length_is_malformed() {
+        let (sk, vk) = test_keypair(1);
+        let ring = ring_with(7, vk);
+        for len in [16usize, 24, 31, 33] {
+            let payload = URL_SAFE_NO_PAD.encode(vec![1u8; len]);
+            let mut buf = [0u8; SIGNED_BYTES_CAP];
+            let signed = write_signed_bytes(&mut buf, PREFIX_V3, 7, &payload).unwrap();
+            let sig = URL_SAFE_NO_PAD.encode(sk.sign(signed).to_bytes());
+            let token = format!("{PREFIX_V3}.7.{payload}.{sig}");
+            assert_eq!(
+                verify_at(&ring, &token, 0),
+                Err(KeyError::Malformed),
+                "len={len}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_small_order_public_key_does_not_verify_strictly() {
+        // The identity point as the public key with the identity as R and S = 0 verifies under the
+        // lax check for any message; `verify_strict` refuses it.
+        let mut ident = [0u8; 32];
+        ident[0] = 1;
+        let weak = VerifyingKey::from_bytes(&ident).unwrap();
+        let ring = ring_with(1, weak);
+        let payload = URL_SAFE_NO_PAD.encode(who().encode_payload_v2(5));
+        let mut sig = [0u8; 64];
+        sig[0] = 1;
+        let token = format!("{PREFIX_V2}.1.{payload}.{}", URL_SAFE_NO_PAD.encode(sig));
+        assert_eq!(ring.verify(&token), Err(KeyError::BadSignature));
+    }
+
+    /// claim: A6
+    #[test]
+    fn a_distrusted_kid_is_refused_from_either_source_before_any_signature_math() {
+        let (sk, vk) = test_keypair(1);
+        let ring = ring_with(7, vk);
+        let mut deny = DenySet::new();
+        deny.insert_target(
+            crate::deny::DenyTarget::Kid(7),
+            crate::deny::DenyReason::Fraud,
+        );
+        let token = mint_v2(&who(), 5, 7, &sk);
+        let none = LiveKeys::default();
+        assert_eq!(
+            ring.verify_with(&token, &none, &deny, || 0),
+            Err(KeyError::Distrusted(7))
+        );
+        // Same for a live-only kid.
+        let mut live = LiveKeys::new();
+        live.put(
+            8,
+            base64::engine::general_purpose::STANDARD
+                .encode(vk.to_bytes())
+                .as_bytes(),
+        );
+        let t8 = mint_v2(&who(), 5, 8, &sk);
+        assert!(
+            Keyring::new()
+                .verify_with(&t8, &live, &DenySet::default(), || 0)
+                .is_ok()
+        );
+        deny.insert_target(
+            crate::deny::DenyTarget::Kid(8),
+            crate::deny::DenyReason::Fraud,
+        );
+        assert_eq!(
+            Keyring::new().verify_with(&t8, &live, &deny, || 0),
+            Err(KeyError::Distrusted(8))
+        );
+        // The garbage token with a distrusted kid is still refused for its kid, with no sig to check.
+        assert_eq!(
+            ring.verify_with("bai_v2.7.AAAA.AAAA", &none, &deny, || 0),
+            Err(KeyError::Malformed)
+        );
+    }
+
+    #[test]
+    fn config_key_wins_when_both_sources_name_a_kid() {
+        let (sk_cfg, vk_cfg) = test_keypair(1);
+        let (sk_live, vk_live) = test_keypair(2);
+        let ring = ring_with(7, vk_cfg);
+        let mut live = LiveKeys::new();
+        live.put(
+            7,
+            base64::engine::general_purpose::STANDARD
+                .encode(vk_live.to_bytes())
+                .as_bytes(),
+        );
+        let d = DenySet::default();
+        assert!(
+            ring.verify_with(&mint_v2(&who(), 5, 7, &sk_cfg), &live, &d, || 0)
+                .is_ok()
+        );
+        assert_eq!(
+            ring.verify_with(&mint_v2(&who(), 5, 7, &sk_live), &live, &d, || 0),
+            Err(KeyError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn managed_prefix_is_v1_v2_or_v3() {
         assert!(is_managed_prefix("bai_v1.1.payload.sig"));
         assert!(is_managed_prefix("bai_v2.1.payload.sig"));
+        assert!(is_managed_prefix("bai_v3.1.aaaa.bbbb"));
         // Unknown versions stay off the managed branch (verify would BadVersion if we entered).
-        assert!(!is_managed_prefix("bai_v3.1.aaaa.bbbb"));
+        assert!(!is_managed_prefix("bai_v4.1.aaaa.bbbb"));
         assert!(!is_managed_prefix("bai_"));
         assert!(!is_managed_prefix("sk-openai"));
     }

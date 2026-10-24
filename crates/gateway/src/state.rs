@@ -15,6 +15,7 @@ use crate::config::{UpstreamTls, ValidConfig};
 use crate::deny::DenySet;
 use crate::error::{ConfigError, GatewayError, Result};
 use crate::key::Keyring;
+use crate::live_keys::LiveKeys;
 use crate::metrics::{Metrics, ProviderMetrics};
 use crate::ratelimit::RateLimit;
 use crate::route::{self, AuthScheme, Dialect, Provider};
@@ -372,8 +373,12 @@ pub struct GatewayState {
     pub config: ValidConfig,
     pub metrics: Arc<Metrics>,
 
-    /// Trusted Ed25519 public keys by kid — from config (rotate via redeploy). Static for life.
+    /// Trusted Ed25519 public keys by kid — from config. Static for life; the control plane adds
+    /// more at runtime through [`Self::live_keys`].
     pub keyring: Keyring,
+    /// Signing public keys published to KV (`signing_key.{kid}`), trusted alongside `keyring`.
+    /// Watched from NATS; empty until the first read, which only costs tokens under a live-only kid.
+    pub live_keys: Watched<LiveKeys>,
     /// Signs and verifies tenant-bound Responses ids (`signed_id.rs`). `None` without
     /// `id_signing_keys`: a managed Responses relay to a store is then a 503.
     pub id_signer: Option<crate::signed_id::Signer>,
@@ -574,6 +579,7 @@ impl GatewayState {
         Ok(Arc::new(Self {
             metrics,
             keyring,
+            live_keys: Watched::new(LiveKeys::new()),
             id_signer,
             providers,
             by_id,

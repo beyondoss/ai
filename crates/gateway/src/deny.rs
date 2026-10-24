@@ -10,6 +10,15 @@
 //! `blackhole.key.{id}` cuts off one `bai_v2` credential. A request is denied if **either**
 //! matches. v1 tokens have no `key_id`, so only the tenant map can deny them.
 //!
+//! A third membership, `blackhole.kid.{kid}`, distrusts a **signing key id**: every token under that
+//! kid is refused at verify (401), whichever source — config or the live ring — supplies its key.
+//! It is not a tenant or credential cut-off and `reason_for` never sees it; `Keyring::verify_with`
+//! asks [`DenySet::kid_denied`] before any signature math. Unlike the two maps above, the kid it is
+//! asked about comes straight from an *unverified* token, so that set uses std's SipHash (and is
+//! skipped when empty) rather than `DenyHasher`; it is also never capped, because refusing to
+//! record a distrust would fail unsafe. Its size is the number of kids the control plane has
+//! distrusted — a handful — and a KV delete of the entry frees it.
+//!
 //! Sizing, honestly: the stored element is the **pair** `(u64, DenyReason)` = 16 bytes (the 1-byte
 //! enum is padded out to the id's 8-byte alignment), and hashbrown rounds up to a power-of-two
 //! bucket count held at a 87.5% max load factor. So 1M denied tenants is `2^21` buckets × (16 B +
@@ -24,7 +33,8 @@
 //! next budget reset, so they expire into a `Del` event that removes them; fraud holds have no TTL
 //! (sticky). This struct only reflects current membership.
 
-use std::collections::HashMap;
+use crate::key::Kid;
+use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasherDefault;
 
 /// The deny map's hasher. **Deliberately not** std's `RandomState` (SipHash-1-3).
@@ -74,12 +84,16 @@ impl DenyReason {
 pub enum DenyTarget {
     Tenant(u64),
     Key(u64),
+    /// A signing key id, not a tenant or credential: see the module doc.
+    Kid(Kid),
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct DenySet {
     denied: HashMap<u64, DenyReason, DenyHasher>,
     keys: HashMap<u64, DenyReason, DenyHasher>,
+    /// Distrusted signing key ids. Membership only; the entry's value is not read.
+    kids: HashSet<Kid>,
 }
 
 impl DenySet {
@@ -93,7 +107,14 @@ impl DenySet {
         Self {
             denied: HashMap::with_capacity_and_hasher(n, DenyHasher::default()),
             keys: HashMap::with_hasher(DenyHasher::default()),
+            kids: HashSet::new(),
         }
+    }
+
+    /// Whether signing key id `kid` is distrusted. Hot path (every managed request): an empty set
+    /// answers without hashing.
+    pub fn kid_denied(&self, kid: Kid) -> bool {
+        !self.kids.is_empty() && self.kids.contains(&kid)
     }
 
     /// Default-allow: absence from the set = allowed. This is the safe-for-availability default —
@@ -129,6 +150,9 @@ impl DenySet {
         match target {
             DenyTarget::Tenant(t) => self.insert(t, reason),
             DenyTarget::Key(k) => self.insert_key(k, reason),
+            DenyTarget::Kid(k) => {
+                self.kids.insert(k);
+            }
         }
     }
 
@@ -144,15 +168,18 @@ impl DenySet {
         match target {
             DenyTarget::Tenant(t) => self.remove(t),
             DenyTarget::Key(k) => self.remove_key(k),
+            DenyTarget::Kid(k) => {
+                self.kids.remove(&k);
+            }
         }
     }
 
     pub fn len(&self) -> usize {
-        self.denied.len() + self.keys.len()
+        self.denied.len() + self.keys.len() + self.kids.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.denied.is_empty() && self.keys.is_empty()
+        self.denied.is_empty() && self.keys.is_empty() && self.kids.is_empty()
     }
 }
 
@@ -164,6 +191,7 @@ impl FromIterator<(u64, DenyReason)> for DenySet {
         Self {
             denied: iter.into_iter().collect(),
             keys: HashMap::with_hasher(DenyHasher::default()),
+            kids: HashSet::new(),
         }
     }
 }
@@ -172,6 +200,7 @@ impl FromIterator<(u64, DenyReason)> for DenySet {
 ///
 /// - `blackhole.{tenant_id}` → [`DenyTarget::Tenant`]
 /// - `blackhole.key.{id}` → [`DenyTarget::Key`]
+/// - `blackhole.kid.{kid}` → [`DenyTarget::Kid`]
 ///
 /// Both live under the `blackhole.` watch prefix, so one watcher sees both. `None` for anything
 /// else (so an unrelated watched key never corrupts the set). The `key.` form is checked first —
@@ -180,6 +209,9 @@ pub fn parse_key(key: &str) -> Option<DenyTarget> {
     let rest = key.strip_prefix("blackhole.")?;
     if let Some(id) = rest.strip_prefix("key.") {
         return Some(DenyTarget::Key(id.parse().ok()?));
+    }
+    if let Some(kid) = rest.strip_prefix("kid.") {
+        return Some(DenyTarget::Kid(kid.parse().ok()?));
     }
     Some(DenyTarget::Tenant(rest.parse().ok()?))
 }
@@ -280,6 +312,9 @@ mod tests {
         assert_eq!(parse_key("blackhole.notanumber"), None);
         assert_eq!(parse_key("blackhole.key.notanumber"), None);
         assert_eq!(parse_key("blackhole.key"), None);
+        assert_eq!(parse_key("blackhole.kid.3"), Some(DenyTarget::Kid(3)));
+        assert_eq!(parse_key("blackhole.kid.x"), None);
+        assert_eq!(parse_key("blackhole.kid"), None);
         assert_eq!(parse_key("signkey.1"), None);
     }
 
@@ -299,6 +334,21 @@ mod tests {
         assert_eq!(set.reason_for(2, Some(100)), Some(DenyReason::Fraud)); // key still denied
         set.remove_key(100);
         assert_eq!(set.reason_for(2, Some(100)), None);
+    }
+
+    #[test]
+    fn kid_distrust_is_its_own_membership() {
+        let mut set = DenySet::new();
+        assert!(!set.kid_denied(3));
+        set.insert_target(DenyTarget::Kid(3), DenyReason::Fraud);
+        assert!(set.kid_denied(3));
+        assert!(!set.kid_denied(4));
+        // A kid is neither a tenant nor a credential id of the same number.
+        assert_eq!(set.reason_for(3, Some(3)), None);
+        assert_eq!(set.len(), 1);
+        set.remove_target(DenyTarget::Kid(3));
+        assert!(!set.kid_denied(3));
+        assert!(set.is_empty());
     }
 
     #[test]

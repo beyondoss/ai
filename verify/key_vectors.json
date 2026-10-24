@@ -1,0 +1,183 @@
+{
+  "about": "Contract vectors for the stateless virtual key (bai_v1/v2/v3). Fixed Ed25519 seed (32 bytes of 0x07), public. `mint` rows are exact token strings the minter must produce; `verify` rows are the outcome a verifier trusting only kid 1 -> public_key_b64 must give a token at the given unix `now`. Layouts: crates/gateway/src/key.rs. Checked by crates/gateway/tests/key_vectors.rs.",
+  "seed_byte": 7,
+  "public_key_b64": "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=",
+  "kid": 1,
+  "leeway_secs": 30,
+  "mint": [
+    {
+      "name": "v1",
+      "version": 1,
+      "tenant_id": 42,
+      "vpc_id": 99,
+      "key_id": null,
+      "exp": null,
+      "token": "bai_v1.1.KgAAAAAAAABjAAAAAAAAAA.ieJOnaTFILXitexVvbi5ygQPFRa8u1f8EhyZd9OYotedCDTaw-IxuplSFs337vhpvawWmL5PKGtWgcj7BLdVCw"
+    },
+    {
+      "name": "v2",
+      "version": 2,
+      "tenant_id": 42,
+      "vpc_id": 99,
+      "key_id": 1000042,
+      "exp": null,
+      "token": "bai_v2.1.KgAAAAAAAABjAAAAAAAAAGpCDwAAAAAA.NGCVXTZw0MxlCPro0Lm03Z6kYZibWDBAc9tCSl2K9d0755Kmfy1jdyqBWk1eOBsa_RUHAuAl7TdhqJ4Ek2-ICw"
+    },
+    {
+      "name": "v3",
+      "version": 3,
+      "tenant_id": 42,
+      "vpc_id": 99,
+      "key_id": 1000042,
+      "exp": 2000000000,
+      "token": "bai_v3.1.KgAAAAAAAABjAAAAAAAAAGpCDwAAAAAAAJQ1dwAAAAA.MQilRxVeXxn16hjAH9MI5tEf7ppzJVHgXpbNoybbdtt_hLc9sGjzfwI8NDNUYDLr6u9iOjMSVBPJOI6tfcU6Ag"
+    },
+    {
+      "name": "v3_max",
+      "version": 3,
+      "tenant_id": 42,
+      "vpc_id": 99,
+      "key_id": 1000042,
+      "exp": 18446744073709551615,
+      "token": "bai_v3.1.KgAAAAAAAABjAAAAAAAAAGpCDwAAAAAA__________8.8fY-rluuyxd98h00imH_EntplF1ubmfU4rzihich1iMb1ultVUbLTbdd02TKtlz5t21DUn-AydI9ohO3ZifNDQ"
+    }
+  ],
+  "verify": [
+    {
+      "name": "v1 ignores the clock",
+      "token": "bai_v1.1.KgAAAAAAAABjAAAAAAAAAA.ieJOnaTFILXitexVvbi5ygQPFRa8u1f8EhyZd9OYotedCDTaw-IxuplSFs337vhpvawWmL5PKGtWgcj7BLdVCw",
+      "now": 0,
+      "outcome": "ok",
+      "identity": {
+        "tenant_id": 42,
+        "vpc_id": 99,
+        "key_id": null
+      }
+    },
+    {
+      "name": "v1 ignores the clock far in the future",
+      "token": "bai_v1.1.KgAAAAAAAABjAAAAAAAAAA.ieJOnaTFILXitexVvbi5ygQPFRa8u1f8EhyZd9OYotedCDTaw-IxuplSFs337vhpvawWmL5PKGtWgcj7BLdVCw",
+      "now": 4000000000,
+      "outcome": "ok",
+      "identity": {
+        "tenant_id": 42,
+        "vpc_id": 99,
+        "key_id": null
+      }
+    },
+    {
+      "name": "v2 ignores the clock",
+      "token": "bai_v2.1.KgAAAAAAAABjAAAAAAAAAGpCDwAAAAAA.NGCVXTZw0MxlCPro0Lm03Z6kYZibWDBAc9tCSl2K9d0755Kmfy1jdyqBWk1eOBsa_RUHAuAl7TdhqJ4Ek2-ICw",
+      "now": 4000000000,
+      "outcome": "ok",
+      "identity": {
+        "tenant_id": 42,
+        "vpc_id": 99,
+        "key_id": 1000042
+      }
+    },
+    {
+      "name": "v3 well before exp",
+      "token": "bai_v3.1.KgAAAAAAAABjAAAAAAAAAGpCDwAAAAAAAJQ1dwAAAAA.MQilRxVeXxn16hjAH9MI5tEf7ppzJVHgXpbNoybbdtt_hLc9sGjzfwI8NDNUYDLr6u9iOjMSVBPJOI6tfcU6Ag",
+      "now": 1999996400,
+      "outcome": "ok",
+      "identity": {
+        "tenant_id": 42,
+        "vpc_id": 99,
+        "key_id": 1000042
+      }
+    },
+    {
+      "name": "v3 at exp",
+      "token": "bai_v3.1.KgAAAAAAAABjAAAAAAAAAGpCDwAAAAAAAJQ1dwAAAAA.MQilRxVeXxn16hjAH9MI5tEf7ppzJVHgXpbNoybbdtt_hLc9sGjzfwI8NDNUYDLr6u9iOjMSVBPJOI6tfcU6Ag",
+      "now": 2000000000,
+      "outcome": "ok",
+      "identity": {
+        "tenant_id": 42,
+        "vpc_id": 99,
+        "key_id": 1000042
+      }
+    },
+    {
+      "name": "v3 one second past exp (inside leeway)",
+      "token": "bai_v3.1.KgAAAAAAAABjAAAAAAAAAGpCDwAAAAAAAJQ1dwAAAAA.MQilRxVeXxn16hjAH9MI5tEf7ppzJVHgXpbNoybbdtt_hLc9sGjzfwI8NDNUYDLr6u9iOjMSVBPJOI6tfcU6Ag",
+      "now": 2000000001,
+      "outcome": "ok",
+      "identity": {
+        "tenant_id": 42,
+        "vpc_id": 99,
+        "key_id": 1000042
+      }
+    },
+    {
+      "name": "v3 last second of leeway",
+      "token": "bai_v3.1.KgAAAAAAAABjAAAAAAAAAGpCDwAAAAAAAJQ1dwAAAAA.MQilRxVeXxn16hjAH9MI5tEf7ppzJVHgXpbNoybbdtt_hLc9sGjzfwI8NDNUYDLr6u9iOjMSVBPJOI6tfcU6Ag",
+      "now": 2000000030,
+      "outcome": "ok",
+      "identity": {
+        "tenant_id": 42,
+        "vpc_id": 99,
+        "key_id": 1000042
+      }
+    },
+    {
+      "name": "v3 first second past leeway",
+      "token": "bai_v3.1.KgAAAAAAAABjAAAAAAAAAGpCDwAAAAAAAJQ1dwAAAAA.MQilRxVeXxn16hjAH9MI5tEf7ppzJVHgXpbNoybbdtt_hLc9sGjzfwI8NDNUYDLr6u9iOjMSVBPJOI6tfcU6Ag",
+      "now": 2000000031,
+      "outcome": "expired"
+    },
+    {
+      "name": "v3 an hour past exp",
+      "token": "bai_v3.1.KgAAAAAAAABjAAAAAAAAAGpCDwAAAAAAAJQ1dwAAAAA.MQilRxVeXxn16hjAH9MI5tEf7ppzJVHgXpbNoybbdtt_hLc9sGjzfwI8NDNUYDLr6u9iOjMSVBPJOI6tfcU6Ag",
+      "now": 2000003600,
+      "outcome": "expired"
+    },
+    {
+      "name": "v3 with exp u64::MAX never expires",
+      "token": "bai_v3.1.KgAAAAAAAABjAAAAAAAAAGpCDwAAAAAA__________8.8fY-rluuyxd98h00imH_EntplF1ubmfU4rzihich1iMb1ultVUbLTbdd02TKtlz5t21DUn-AydI9ohO3ZifNDQ",
+      "now": 18446744073709551615,
+      "outcome": "ok",
+      "identity": {
+        "tenant_id": 42,
+        "vpc_id": 99,
+        "key_id": 1000042
+      }
+    },
+    {
+      "name": "v2 relabelled as v3",
+      "token": "bai_v3.1.KgAAAAAAAABjAAAAAAAAAGpCDwAAAAAA.NGCVXTZw0MxlCPro0Lm03Z6kYZibWDBAc9tCSl2K9d0755Kmfy1jdyqBWk1eOBsa_RUHAuAl7TdhqJ4Ek2-ICw",
+      "now": 0,
+      "outcome": "bad_signature"
+    },
+    {
+      "name": "v3 relabelled as v2",
+      "token": "bai_v2.1.KgAAAAAAAABjAAAAAAAAAGpCDwAAAAAAAJQ1dwAAAAA.MQilRxVeXxn16hjAH9MI5tEf7ppzJVHgXpbNoybbdtt_hLc9sGjzfwI8NDNUYDLr6u9iOjMSVBPJOI6tfcU6Ag",
+      "now": 0,
+      "outcome": "bad_signature"
+    },
+    {
+      "name": "v3 relabelled as v1",
+      "token": "bai_v1.1.KgAAAAAAAABjAAAAAAAAAGpCDwAAAAAAAJQ1dwAAAAA.MQilRxVeXxn16hjAH9MI5tEf7ppzJVHgXpbNoybbdtt_hLc9sGjzfwI8NDNUYDLr6u9iOjMSVBPJOI6tfcU6Ag",
+      "now": 0,
+      "outcome": "bad_signature"
+    },
+    {
+      "name": "v3 under a kid nobody trusts",
+      "token": "bai_v3.2.KgAAAAAAAABjAAAAAAAAAGpCDwAAAAAAAJQ1dwAAAAA.MQilRxVeXxn16hjAH9MI5tEf7ppzJVHgXpbNoybbdtt_hLc9sGjzfwI8NDNUYDLr6u9iOjMSVBPJOI6tfcU6Ag",
+      "now": 0,
+      "outcome": "unknown_kid"
+    },
+    {
+      "name": "v3 with an unknown version prefix",
+      "token": "bai_v4.1.KgAAAAAAAABjAAAAAAAAAGpCDwAAAAAAAJQ1dwAAAAA.MQilRxVeXxn16hjAH9MI5tEf7ppzJVHgXpbNoybbdtt_hLc9sGjzfwI8NDNUYDLr6u9iOjMSVBPJOI6tfcU6Ag",
+      "now": 0,
+      "outcome": "bad_version"
+    },
+    {
+      "name": "v3 with a truncated signature",
+      "token": "bai_v3.1.KgAAAAAAAABjAAAAAAAAAGpCDwAAAAAAAJQ1dwAAAAA.MQilRxVeXxn16hjAH9MI5tEf7ppzJVHgXpbNoybbdtt_hLc9sGjzfwI8NDNUYDLr6u9iOjMSVBPJOI6tfc",
+      "now": 0,
+      "outcome": "malformed"
+    }
+  ]
+}

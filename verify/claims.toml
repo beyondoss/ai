@@ -629,6 +629,66 @@ touches = [
 ]
 defects = []
 
+[[claim]]
+id = "A5"
+priority = "P0"
+group = "Auth and limits"
+text = "A bai_v3 key is served until its exp (plus 30s leeway), then refused with a 401 that says the key expired"
+oracle = "served before exp; 401 key expired after; contract vectors agree"
+layer = "hermetic"
+layer_note = "Refused or admitted at the key check, before any upstream call."
+clients = ["raw"]
+failover_clients = []
+touches = [
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/live_keys.rs",
+  "crates/gateway/src/proxy/",
+  "crates/gateway/src/deny.rs",
+  "crates/gateway/src/store_watch.rs",
+  "verify/key_vectors.json",
+]
+defects = []
+
+[[claim]]
+id = "A6"
+priority = "P0"
+group = "Auth and limits"
+text = "A signing key id in the deny-set (blackhole.kid.N) is distrusted whichever source holds its key"
+oracle = "every token under the kid 401s; deleting the entry restores it"
+layer = "hermetic"
+layer_note = "Refused or admitted at the key check, before any upstream call."
+clients = ["raw"]
+failover_clients = []
+touches = [
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/live_keys.rs",
+  "crates/gateway/src/proxy/",
+  "crates/gateway/src/deny.rs",
+  "crates/gateway/src/store_watch.rs",
+  "verify/key_vectors.json",
+]
+defects = []
+
+[[claim]]
+id = "A7"
+priority = "P0"
+group = "Auth and limits"
+text = "A signing public key written to KV (signing_key.N) is trusted without a restart and retired by its delete"
+oracle = "token under a KV-only kid: 401, then 200 after the put, then 401 after the delete"
+layer = "hermetic"
+layer_note = "Refused or admitted at the key check, before any upstream call."
+clients = ["raw"]
+failover_clients = []
+touches = [
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/live_keys.rs",
+  "crates/gateway/src/proxy/",
+  "crates/gateway/src/deny.rs",
+  "crates/gateway/src/store_watch.rs",
+  "verify/key_vectors.json",
+]
+defects = []
+
 # --- Embeddings and streaming ------------------------------------------------------------------
 [[claim]]
 id = "M1"
