@@ -146,12 +146,15 @@ and the ring routing in [FLEET.md](FLEET.md). Beyond's edge does neither.
 11. **Keys Beyond holds.** Beyond's minter derives the same per-tenant `dek` on every re-mint, stores it
     durably, rotates it by plan and destroys it when the tenant is deleted, which crypto-erases the
     tenant's sessions. Beyond holds the seal key's public half and the managed-MCP secret. The seal key
-    also derives the `bjn_v1` notify key, so a replica holding one seal key strands every outstanding
-    notify token when it rotates. The agent accepts two seal keys during a rotation (#495), the way it
-    already trusts two signing kids. Grants carry no seal kid, so a rotation goes replicas first, then
-    Beyond's minter: every replica starts with `--seal-key-previous` set to the old key and unseals
-    with either, and only then does the minter switch to the new key. Notify tokens are verified by
-    kid and minted under the current key only.
+    also derives the `bjn_v1` notify key, so one seal key per replica would strand every outstanding
+    notify token at a rotation; that is why the agent accepts two (#495, #498), the way it already
+    trusts two signing kids. Grants carry no seal kid, so a rotation goes replicas first, then Beyond's
+    minter: every replica starts with `--seal-key-previous` set to the old key and unseals grants with
+    either (#498), and only then does the minter switch to the new key. Notify tokens are verified by
+    kid and minted under the current key only. Drop `--seal-key-previous` once 5 minutes (one grant
+    life) have passed since the minter switched and no kept job still holds a notify token under the
+    old kid. A notify token never expires, so the 723 s retry budget bounds only a callback already in
+    flight, not the token. A job kept before the switch keeps its old token until it is kept again.
     _Why:_ a re-mint must never strand stored sessions, and rotating a key must never strand kept jobs.
 12. **Session ids and the gateway.** Beyond mints session ids as `<home_shard>.<opaque>`, choosing each
     tenant's home shard from the shards the fleet publishes. Beyond's control plane also mints each
