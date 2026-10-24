@@ -71,6 +71,10 @@ run = "dprint check"
 description = "Fail if a src file of a crate is missing from that crate's ARCHITECTURE.md module table."
 run = "python3 -I .github/scripts/check-module-tables.py"
 
+[tasks."audit"]
+description = "Check Cargo.lock for known RustSec advisories (.cargo/audit.toml); needs cargo-audit 0.22.1 (`cargo binstall cargo-audit@0.22.1`)."
+run = "cargo audit"
+
 [tasks."format"]
 run = "dprint fmt && cargo fmt"
 

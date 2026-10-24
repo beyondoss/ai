@@ -352,21 +352,65 @@ jobs:
       # The authority on "no test seam ships": the release binaries themselves, scanned for the
       # seam prefix (a grep over what was just built; seconds).
       - run: mise check:release-seams
+  # Dependency advisories are checked only on a PR that touches dependencies. An advisory is
+  # published on its own schedule, so an unrelated PR must never turn red because one landed since
+  # main last changed; advisories.yml bumps main's lockfile daily instead. `deps` is true when the
+  # PR changes Cargo.lock, a Cargo.toml, or .cargo/audit.toml. A merge-queue run skips it (the PR
+  # ran it); a dispatched run (a bot PR) compares with main.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      deps: ${{ steps.diff.outputs.deps }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          deps=false
+          if [ "$EVENT" = pull_request ] || [ "$EVENT" = workflow_dispatch ]; then
+            base=${BASE_SHA:-$(git rev-parse origin/main)}
+            if git diff --name-only "$base"...HEAD | grep -qE '(^|/)Cargo\.toml$|^Cargo\.lock$|^\.cargo/audit\.toml$'; then
+              deps=true
+            fi
+          fi
+          echo "deps=$deps" >>"$GITHUB_OUTPUT"
+  # Advisories only: no license or duplicate-version checks. Ignores live in .cargo/audit.toml.
+  advisories:
+    name: advisories
+    needs: changes
+    if: needs.changes.outputs.deps == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.22.1
+      - run: cargo audit
   # Mutation testing is not a PR check: a missed mutant is a test gap, not a bug, and the per-PR
   # run added about an hour to every gateway change. The full mutation sweep is weekly (deep.yml).
   # Single required status check. Branch protection can require just `Check`; it stays green only if
-  # every parallel job above did. Cheap (no build), and keeps the required-check name stable.
+  # every parallel job above did. `advisories` is the one job allowed to be skipped: it must pass
+  # only when it ran (the PR touched dependencies). Cheap (no build), and keeps the required-check name stable.
   Check:
     name: Check
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, gateway-stress, build]
+    needs: [fmt, clippy, test, gateway-stress, build, changes, advisories]
     if: always()
     steps:
       - name: Gate on all checks
         run: |
-          echo "fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} test=${{ needs.test.result }} gateway-stress=${{ needs.gateway-stress.result }} build=${{ needs.build.result }}"
+          echo "fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} test=${{ needs.test.result }} gateway-stress=${{ needs.gateway-stress.result }} build=${{ needs.build.result }} changes=${{ needs.changes.result }} advisories=${{ needs.advisories.result }}"
           [ "${{ needs.fmt.result }}" = "success" ] \
             && [ "${{ needs.clippy.result }}" = "success" ] \
             && [ "${{ needs.test.result }}" = "success" ] \
             && [ "${{ needs.gateway-stress.result }}" = "success" ] \
-            && [ "${{ needs.build.result }}" = "success" ]
+            && [ "${{ needs.build.result }}" = "success" ] \
+            && [ "${{ needs.changes.result }}" = "success" ] \
+            && { [ "${{ needs.advisories.result }}" = "success" ] || [ "${{ needs.advisories.result }}" = "skipped" ]; }

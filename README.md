@@ -504,6 +504,25 @@ CI runs on Linux only — the only platform this project ships or supports (see 
 once; a test that passes only on the retry is reported as a flaky-test warning and counted in the job
 summary, so a green run never silently means a flaky one.
 
+### Dependency advisories
+
+`mise run audit` runs `cargo audit` (RustSec advisories only; no license or duplicate-version
+checks) against `Cargo.lock`, honoring `.cargo/audit.toml`. It runs in two places:
+
+- **On a PR, only if the PR changes `Cargo.lock`, a `Cargo.toml` or `.cargo/audit.toml`.** The
+  `advisories` job in `ci.yml` is skipped otherwise, and `Check` treats skipped as passing. An
+  advisory published after main last changed therefore never turns an unrelated PR red; it surfaces
+  on the next PR that touches dependencies, or in the daily run below.
+- **Daily on main** (`advisories.yml`). If the audit fails, each vulnerable package with a patched
+  release gets `cargo update -p NAME@VERSION`, and the result goes to a single `deps/advisories` bot
+  PR with auto-merge on (created, or updated in place, never duplicated). Advisories a lockfile bump
+  cannot fix are named in that PR's body, or in one reused `advisories` issue when the lockfile cannot
+  change at all, with the `cargo tree -i` dependency chain.
+
+To ignore an advisory, add its id to `[advisories] ignore` in `.cargo/audit.toml` with a comment that
+assesses actual exposure (which dependency pulls it in, whether the vulnerable path is reachable, and
+the fix path). The edit touches `.cargo/audit.toml`, so the PR that makes it runs the audit.
+
 ## Architecture
 
 [crates/gateway/ARCHITECTURE.md](crates/gateway/ARCHITECTURE.md) — request flow, module map, key invariants.
