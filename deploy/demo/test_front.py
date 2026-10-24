@@ -34,7 +34,9 @@ vm_field() {{ jq -r ".$2" "$VMDIR/$1.json"; }}
 e2b_kill() {{ echo "$1" >> "{TMP}/kills"; }}
 vm_run() {{ echo seeded; }}
 vm_browser_up() {{ echo "$3" >> "{TMP}/browser_up"; }}
-vm_bridge_start() {{ echo "$3" >> "{TMP}/bridge_start"; }}
+vm_bridge_start() {{ echo started >> "{TMP}/bridge_start"; }}
+vm_browser_warm() {{ :; }}
+vm_site_start() {{ echo "$3" >> "{TMP}/site_start"; }}
 ''')
 
 os.environ.update(FRONT_VMDIR=VMDIR, FRONT_E2B_SH=STUB_E2B, FRONT_CA_FILE=os.path.join(TMP, "ca.pem"))
@@ -69,7 +71,7 @@ def post(srv, session):
 class FrontTest(unittest.TestCase):
     def setUp(self):
         front.sessions.clear()
-        for n in ("creates", "kills", "deleted", "browser_up", "bridge_start"):
+        for n in ("creates", "kills", "deleted", "browser_up", "bridge_start", "site_start"):
             try:
                 os.remove(os.path.join(TMP, n))
             except FileNotFoundError:
@@ -97,7 +99,7 @@ class FrontTest(unittest.TestCase):
             c.close()
         self.assertEqual(len(lines("creates")), 2)
         self.assertEqual(lines("browser_up"), ["https://b/rw"], "only the MCP request installs the stack")
-        self.assertTrue(lines("bridge_start")[0].endswith("/workspace/site"), lines("bridge_start"))
+        self.assertTrue(lines("site_start")[0].endswith("/workspace/site"), lines("site_start"))
         srv.shutdown()
 
     def test_an_mcp_request_with_a_non_https_browser_or_a_climbing_site_is_refused(self):

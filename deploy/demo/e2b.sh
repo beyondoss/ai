@@ -52,7 +52,7 @@ stub_bin() { # builds it once per run; prints the path
 
 # Run a command in a VM through envd's process API (Connect, server-streaming). Prints stdout.
 vm_run() { # id envd-token script [env-json]
-  local id=$1 tok=$2 script=$3 envs=${4:-'{}'} req len
+  local id=$1 tok=$2 script=$3 envs=${4:-'{}'} req len rf="$VMDIR/req.$BASHPID.bin"
   req=$(jq -nc --arg s "$script" --argjson e "$envs" '{process:{cmd:"/bin/bash",args:["-c",$s],envs:$e}}')
   len=${#req}
   {
@@ -60,11 +60,11 @@ vm_run() { # id envd-token script [env-json]
     # shellcheck disable=SC2059
     printf "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' $((len >> 24 & 255)) $((len >> 16 & 255)) $((len >> 8 & 255)) $((len & 255)))"
     printf '%s' "$req"
-  } > "$VMDIR/req.$$.bin"
+  } > "$rf"
   curl -sS -m "${E2B_CURL_MAX:-60}" -X POST "https://49983-$id.e2b.app/process.Process/Start" -H "X-Access-Token: $tok" \
-    -H 'Content-Type: application/connect+json' -H 'Connect-Protocol-Version: 1' --data-binary "@$VMDIR/req.$$.bin" \
+    -H 'Content-Type: application/connect+json' -H 'Connect-Protocol-Version: 1' --data-binary "@$rf" \
     | tr -d '\000-\010\013-\037' | grep -o '"stdout":"[^"]*"' | sed 's/"stdout":"//;s/"$//' | while read -r b; do printf '%s' "$b" | base64 -d 2>/dev/null; done
-  rm -f "$VMDIR/req.$$.bin"
+  rm -f "$rf"
 }
 vm_put() { # id token local-file remote-path
   curl -sS -m 120 -X POST "https://49983-$1.e2b.app/files?path=$4&username=user" -H "X-Access-Token: $2" \
@@ -184,8 +184,23 @@ vm_browser_up() { # id token rustwright-binary-or-url (a URL is fetched by the V
   else
     vm_put "$1" "$2" "$3" "$VM_HOME/rustwright-mcp" || return 1
   fi
+  # A VM made from the browser template (e2b_browser_template) has the stack already; a plain one installs it.
   vm_run "$1" "$2" "chmod +x $VM_HOME/rustwright-mcp
 sudo sysctl -w vm.overcommit_memory=1 >/dev/null
+if ! { test -x $VM_HOME/chrome-headless-shell-linux64/chrome-headless-shell && test -x $VM_HOME/sg/node_modules/.bin/supergateway; }; then
+$(browser_install_script)
+fi
+echo browser-stack-ready" | grep -q browser-stack-ready
+}
+# Chromium's first launch in a fresh VM reads its files cold and takes ~10 s; a throwaway run, started the
+# moment the VM is up and left to run beside the seeding and the bridge, makes the model's first navigate ~1 s.
+vm_browser_warm() { # id token
+  vm_run "$1" "$2" "test -x $VM_HOME/chrome-headless-shell-linux64/chrome-headless-shell || exit 0
+(setsid nohup timeout 40 $VM_HOME/chrome-headless-shell-linux64/chrome-headless-shell --no-sandbox --disable-gpu --dump-dom about:blank >/dev/null 2>&1 </dev/null &)" >/dev/null
+}
+# The install, as one script: run in a plain VM at its first browser request, or once at template build.
+browser_install_script() {
+  cat <<EOS
 export DEBIAN_FRONTEND=noninteractive
 (sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends unzip libnss3 libatk1.0-0 libatk-bridge2.0-0 \\
   libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 \\
@@ -194,12 +209,51 @@ export DEBIAN_FRONTEND=noninteractive
 (mkdir -p $VM_HOME/sg && cd $VM_HOME/sg && npm init -y >/dev/null && npm i supergateway@$SUPERGATEWAY_VERSION >/tmp/npm.log 2>&1) &
 wait
 cd $VM_HOME && unzip -q -o c.zip && rm -f c.zip
-test -x $VM_HOME/chrome-headless-shell-linux64/chrome-headless-shell && test -x $VM_HOME/sg/node_modules/.bin/supergateway && echo browser-stack-ready" | grep -q browser-stack-ready
+chown -R user:user $VM_HOME 2>/dev/null || true
+test -x $VM_HOME/chrome-headless-shell-linux64/chrome-headless-shell && test -x $VM_HOME/sg/node_modules/.bin/supergateway
+EOS
 }
-# Start the bridge (and, if given, a static file server for a directory on localhost:8000).
-vm_bridge_start() { # id token [site-dir]
-  vm_run "$1" "$2" "${3:+cd $3 && (setsid nohup python3 -m http.server 8000 --bind 127.0.0.1 >/tmp/site.log 2>&1 </dev/null &)}
-cd $VM_HOME
+
+# The browser stack baked into an E2B template, so a session's VM boots with it instead of installing it
+# in the first request. Built once and reused: the name carries a hash of what the build installs, so a
+# changed version builds a new one and an unchanged one is found by name. A template belongs to the
+# account, not to a run: `down.sh` keeps it. Prints the template name. Needs E2B_API_KEY.
+e2b_browser_template() {
+  local name row tid bid resp body status i
+  name="beyond-ai-demo-browser-$(browser_install_script | sha256sum | cut -c1-10)"
+  row=$(e2b_curl "$E2B_API/templates" | jq -r --arg n "$name" '[.[]|select((.aliases // [])|index($n))][0] // empty | "\(.templateID) \(.buildStatus)"') || return 1
+  case "$row" in
+    *" ready") echo "$name"; return 0 ;;
+  esac
+  # A template whose build never finished is removed and made again.
+  [ -z "$row" ] || e2b_curl -o /dev/null -X DELETE "$E2B_API/templates/${row%% *}" >&2
+  resp=$(e2b_curl -X POST "$E2B_API/v3/templates" -H 'Content-Type: application/json' -d "$(jq -nc --arg n "$name" '{name:$n, cpuCount:2, memoryMB:2048}')")
+  tid=$(jq -r '.templateID // empty' <<<"$resp")
+  bid=$(jq -r '.buildID // empty' <<<"$resp")
+  [ -n "$tid" ] && [ -n "$bid" ] || { echo "E2B: the template was not created: $(head -c 300 <<<"$resp")" >&2; return 1; }
+  echo "  + building E2B template $name ($tid)" >&2
+  body=$(jq -nc --arg s "$(browser_install_script)" '{fromImage:"e2bdev/base", steps:[{type:"RUN", args:[$s, "root"]}]}')
+  e2b_curl -X POST "$E2B_API/v2/templates/$tid/builds/$bid" -H 'Content-Type: application/json' -d "$body" >&2 || return 1
+  for i in $(seq 1 180); do
+    status=$(e2b_curl "$E2B_API/templates/$tid/builds/$bid/status")
+    case $(jq -r .status <<<"$status") in
+      ready) echo "$name"; return 0 ;;
+      error) echo "E2B: the template build failed: $(jq -c .reason <<<"$status" | head -c 400)" >&2; return 1 ;;
+    esac
+    sleep 5
+  done
+  echo "E2B: the template build timed out" >&2
+  return 1
+}
+# A static file server for a directory, on localhost:8000.
+vm_site_start() { # id token dir
+  vm_run "$1" "$2" "cd $3 && (setsid nohup python3 -m http.server 8000 --bind 127.0.0.1 >/tmp/site.log 2>&1 </dev/null &)
+for i in \$(seq 1 50); do curl -sf -m 1 -o /dev/null localhost:8000/ && break; sleep 0.1; done
+curl -sf -m 1 -o /dev/null localhost:8000/ && echo up" | grep -q up
+}
+# Start the bridge.
+vm_bridge_start() { # id token
+  vm_run "$1" "$2" "cd $VM_HOME
 export RUSTWRIGHT_CHROMIUM=$VM_HOME/chrome-headless-shell-linux64/chrome-headless-shell
 (setsid nohup $VM_HOME/sg/node_modules/.bin/supergateway --stdio $VM_HOME/rustwright-mcp --outputTransport streamableHttp \\
   --stateful --port $BRIDGE_PORT --streamableHttpPath /mcp --healthEndpoint /healthz >/tmp/bridge.log 2>&1 </dev/null &)
