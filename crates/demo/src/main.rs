@@ -5,7 +5,7 @@
 //! - `mint-grant`: mint one `bsg_v1` session grant from those keys.
 //! - `chat`: one conversation step over the agent's WebSocket.
 
-use beyond_ai_demo::{chat, keys, stub};
+use beyond_ai_demo::{chat, keys, load, load_host, stub};
 
 use std::path::PathBuf;
 
@@ -150,6 +150,44 @@ enum Cmd {
         /// Corrupt the tag: the right kid, a wrong MAC.
         #[arg(long)]
         forge: bool,
+    },
+    /// The load proof's stand-in: a scripted model and a bundle host (token in DEMO_LOAD_TOKEN).
+    LoadHost {
+        #[arg(long, default_value = "0.0.0.0:8086")]
+        listen: String,
+        #[arg(long, default_value = "0.0.0.0:8083")]
+        model_listen: String,
+        /// Hold every bundle fetch this long, so concurrent fetches overlap and their peak shows.
+        #[arg(long, default_value_t = 250)]
+        fetch_hold_ms: u64,
+        #[arg(long, default_value_t = 1000)]
+        mcp_hold_ms: u64,
+    },
+    /// The load proof's driver: waves of sessions against one replica. Writes the client's record.
+    Load {
+        #[arg(long)]
+        host: String,
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// The bundle host as the replica reaches it, `ip:port`.
+        #[arg(long)]
+        loadhost: String,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 500)]
+        sessions: usize,
+        #[arg(long, default_value_t = 200)]
+        burst: usize,
+        #[arg(long, default_value_t = 50)]
+        tenants: usize,
+        #[arg(long, default_value_t = 60)]
+        ramp_secs: u64,
+        #[arg(long, default_value_t = 90)]
+        hold_secs: u64,
+        #[arg(long, default_value_t = 180)]
+        idle_secs: u64,
+        #[arg(long, default_value_t = 2)]
+        waves: usize,
     },
     /// One conversation step; the grant is in DEMO_GRANT. Prints a JSON summary.
     Chat {
@@ -345,6 +383,61 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let (token, scope) = keys::notify_token(&tenant, &session, &job, forge)?;
             println!("{}", serde_json::json!({"token": token, "scope": scope}));
+            Ok(())
+        }
+        Cmd::LoadHost {
+            listen,
+            model_listen,
+            fetch_hold_ms,
+            mcp_hold_ms,
+        } => {
+            let token =
+                std::env::var("DEMO_LOAD_TOKEN").map_err(|_| "DEMO_LOAD_TOKEN is not set")?;
+            tokio::task::spawn_blocking(move || {
+                load_host::run(load_host::Args {
+                    listen,
+                    model_listen,
+                    token,
+                    fetch_hold_ms,
+                    mcp_hold_ms,
+                })
+                .map_err(|e| e.to_string())
+            })
+            .await??;
+            Ok(())
+        }
+        Cmd::Load {
+            host,
+            port,
+            loadhost,
+            out,
+            sessions,
+            burst,
+            tenants,
+            ramp_secs,
+            hold_secs,
+            idle_secs,
+            waves,
+        } => {
+            let token =
+                std::env::var("DEMO_LOAD_TOKEN").map_err(|_| "DEMO_LOAD_TOKEN is not set")?;
+            let phases = load::run(load::Args {
+                host,
+                port,
+                loadhost,
+                token,
+                out,
+                sessions,
+                burst,
+                tenants,
+                ramp_secs,
+                hold_secs,
+                idle_secs,
+                waves,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            println!("{phases}");
             Ok(())
         }
         Cmd::Chat {

@@ -10,8 +10,11 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # `</` becomes `<\/` (still valid JSON) so nothing in the record can close the script element.
 data=$(jq -c . "$dir/run.json" | sed 's#</#<\\/#g')
 out="$dir/report.html"
+# The load proof's record has its own page.
+template="$here/report.template.html"
+[ "$(jq -r '.kind // ""' "$dir/run.json")" != load ] || template="$here/report-load.template.html"
 while IFS= read -r line; do
   if [ "$line" = '/*RUN_JSON*/' ]; then printf '%s\n' "$data"; else printf '%s\n' "$line"; fi
-done < "$here/report.template.html" > "$out.tmp"
+done < "$template" > "$out.tmp"
 mv "$out.tmp" "$out"
 echo "$out"
