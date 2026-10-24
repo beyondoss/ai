@@ -668,6 +668,52 @@ async fn after_revocation_the_next_call_says_why_and_the_session_carries_on() {
     );
 }
 
+/// A connector's tool list is cached so a session whose connection is gone still sees its tools.
+/// The cache is per tenant: one tenant's list must never answer another tenant's session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cached_tool_list_is_never_served_to_another_tenant() {
+    let h = harness(60).await;
+    let alice = h.consent("acme", "sub-alice", "alice", None).await;
+    h.bind("acme", "s.alice", &alice).await;
+    // Connecting lists the tools, which caches acme's list.
+    let a = h.session("acme", "s.alice").await;
+    assert!(call(&a, "my_notes", json!({})).await.is_ok());
+
+    let list = |tenant: &str| {
+        let headers = vec![
+            (
+                "authorization".to_string(),
+                format!("Bearer {}", h.bmc(tenant, "s.x")),
+            ),
+            ("content-type".to_string(), "application/json".to_string()),
+            (
+                "accept".to_string(),
+                "application/json, text/event-stream".to_string(),
+            ),
+        ];
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string();
+        let addr = h.oidc.managed_addr.clone();
+        async move {
+            let (_, _, b) = request(
+                "POST",
+                &addr,
+                "/managed/notes/mcp",
+                &headers,
+                body.as_bytes(),
+            )
+            .await
+            .unwrap();
+            serde_json::from_slice::<Value>(&b).unwrap()
+        }
+    };
+    // Another tenant's session, bound to nothing: it gets the refusal, not acme's tools.
+    let other = list("globex").await;
+    assert!(
+        other.get("result").is_none() && other["error"]["code"] == -32001,
+        "{other}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_provider_that_stops_honouring_the_token_ends_the_connection_cleanly() {
     let h = harness(2).await;
