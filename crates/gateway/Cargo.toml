@@ -118,3 +118,9 @@ harness = false
 [[bench]]
 name = "e2e"
 harness = false
+
+# Permutation models of the lock-free breaker, the tenant slot and the body budget (`loom_*` tests in
+# `circuit_breaker.rs` and `concurrency.rs`). A normal dependency, not a dev one, because `crate::sync` names it
+# in the library itself; it exists only under `--cfg beyond_loom` (`mise run test:loom`).
+[target.'cfg(beyond_loom)'.dependencies]
+loom = "=0.7.2"

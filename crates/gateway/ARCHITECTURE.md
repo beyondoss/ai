@@ -4039,6 +4039,17 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   Anthropic SDKs accumulate it (tool calls by `index`, blocks by `content[index]`, the Responses
   item lifecycle, and openai-python's `accumulate_delta` for the message a Chat client echoes on
   its next turn).
+- **Loom models (`mise run test:loom`, weekly in `deep.yml`):** `circuit_breaker.rs` and
+  `concurrency.rs` take their atomics and mutex from `crate::sync`, which is loom's under
+  `--cfg beyond_loom` and std's otherwise. The `loom_models` modules explore every interleaving
+  (preemptions bounded at 3) of 2-3 threads: concurrent failures are never lost and trip the breaker;
+  half-open admits exactly its configured probes; a probe's success racing a failure leaves the
+  breaker closed or open; released probe permits all come back; a tenant never holds more than its
+  ceiling and a release loses no slot; the body budget never over-reserves and a release returns
+  exactly what was reserved. The cfg is `beyond_loom`, not `loom`, because a global `--cfg loom`
+  also switches on `event-listener`'s loom path and breaks the build. The existing unit tests are
+  gated `not(beyond_loom)` (their static-atomic clocks are not loom-compatible). Not a PR check: the
+  models run in seconds, but the cfg forces a cold rebuild of the dependency tree (about 3 minutes).
 - **Property tests (`tests/props_*.rs`):** generated, adversarial inputs instead of examples —
   arbitrary unicode and escapes, nested tool arguments with boundary numbers, every content kind,
   SSE framed with CRLF, comments, multi-line data and cut at any byte, errors and truncation at

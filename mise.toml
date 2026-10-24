@@ -79,6 +79,10 @@ description = "Unit tests for the pure-logic modules (key/route/peek/usage/deny/
 run = "cargo test --lib"
 
 # Integration tests (gateway driven against a mock upstream + NATS) — to be added; see ARCHITECTURE.md.
+[tasks."test:loom"]
+description = "Loom permutation models of the gateway's lock-free code (circuit breaker, tenant slot, body budget). Own cfg name: a global `--cfg loom` breaks event-listener in the dependency tree."
+run = 'RUSTFLAGS="--cfg beyond_loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p beyond-ai --release --lib loom'
+
 [tasks."test:integration:rs"]
 description = "End-to-end gateway tests against a mock provider + docker-compose NATS (TODO)."
 run = "cargo test --test '*'"

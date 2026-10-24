@@ -100,6 +100,20 @@ jobs:
         env:
           PROPTEST_CASES: "100000"
           PROPS_SECS: "5400"
+  # Loom permutation models of the gateway's hand-rolled lock-free code (circuit breaker, tenant
+  # slot, body budget): every interleaving of 2-3 threads, preemptions bounded at 3. The models run
+  # in about 11s, but the release build with the cfg is a cold compile of the whole tree (RUSTFLAGS
+  # differ from the other jobs, so it shares no cache with them): too slow for the PR gate.
+  loom:
+    name: loom models
+    if: ${{ !inputs.only_mutants }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: mise run test:loom </dev/null
   # The calendar check PRs skip: a catalog row with a `retires` date in verify/catalog_truth.toml
   # only warns in a PR run (from 14 days before the date), so a date never fails an unrelated
   # change. CATALOG_RETIREMENT_STRICT=1 turns that warning into a failure here, up to two weeks
