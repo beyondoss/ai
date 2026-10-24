@@ -5244,7 +5244,7 @@ skill/template paths, memory backend, session directory, model or gateway URL), 
   a tenant's `bash` on the machine every other tenant shares. The target is built from `exec_url`
   plus the grant's `SecretHeader`s, then **probed**: `sh -c 'printf %s "$HOME"'`. Its output becomes
   the backend's home (`ShellFs::with_home`), so `~` expands inside the sandbox; a second
-  `command -v bash` records which shell the remote `bash` tool should ask for. Exec headers are never
+  `sh -c 'command -v bash'` (the exec protocol runs no shell of its own) records which shell the remote `bash` tool should ask for. Exec headers are never
   persisted — `set_exec_endpoint`, the only writer of that record, is refused.
 
   The probe runs **when the sandbox is first needed, not when the session opens**: a sandbox sleeps

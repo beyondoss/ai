@@ -65,6 +65,10 @@ pub const GRANT_HEADER: &str = "x-beyond-grant";
 /// [`ShellFs::with_home`](crate::tools::fs::shell::ShellFs::with_home) needs to expand a `~`.
 const HOME_PROBE: &str = r#"printf %s "$HOME""#;
 
+/// Whether the sandbox has a `bash`. `command` is a shell builtin with no binary behind it on most
+/// images, and the exec protocol runs its program without a shell, so a shell has to be asked.
+const BASH_PROBE: &str = "command -v bash";
+
 /// How long the startup probe gets. Generous for one round trip to a sandbox that has to be awake
 /// anyway, short enough that a dead endpoint fails the session rather than hanging the client.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -446,7 +450,7 @@ impl ServiceSession {
     /// any tool can reach it, and a failure is returned to the caller.
     ///
     /// The probe is `sh -c 'printf %s "$HOME"'`. Its output becomes the backend's home (so `~`
-    /// expands inside the sandbox, not on the replica), and a second `command -v bash` records which
+    /// expands inside the sandbox, not on the replica), and a second `sh -c 'command -v bash'` records which
     /// shell the remote `bash` tool should ask for. Both are cached on this `ServiceSession`. The
     /// target watches a flag its runner raises on a request the endpoint did not answer or refused,
     /// which is what makes a lazily attached cell ([`Self::lazy_exec`]) probe again.
@@ -486,8 +490,8 @@ impl ServiceSession {
         // by construction (the probe above just ran one).
         let shell = runner
             .run(
-                "command",
-                &["-v".to_string(), "bash".to_string()],
+                "sh",
+                &["-c".to_string(), BASH_PROBE.to_string()],
                 None,
                 PROBE_TIMEOUT,
             )
@@ -1340,6 +1344,25 @@ mod tests {
             sandbox: RwLock::new(None),
             bundle_dir: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The endpoint runs a request's program directly, as the protocol says: `command` is not a
+    /// program there, so only a probe that goes through `sh -c` can find the bash that is installed.
+    #[tokio::test]
+    async fn the_probe_finds_bash_through_a_shell() {
+        let has_bash = std::process::Command::new("sh")
+            .args(["-c", "command -v bash"])
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(has_bash, "the test host has no bash");
+        let dir = tempfile::tempdir().unwrap();
+        let mock = beyond_ai_test_support::exec_mock::ExecMock::start(dir.path(), true).await;
+        let mut s = session(&[("a", "/mnt/efs/a")], "a.x");
+        Arc::get_mut(&mut s.grant).unwrap().exec_url = mock.url.clone();
+        s.connect_exec(1 << 20).await.unwrap();
+        assert_eq!(s.sandbox().unwrap().shell, "bash");
     }
 
     #[test]
