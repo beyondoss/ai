@@ -70,7 +70,7 @@ pub fn cache() -> &'static Arc<Cache> {
 ///
 /// A session holds a [`Pin`] on its bundle for its whole life (it keeps reading skills from the
 /// directory), and a pinned directory is never evicted. So the cache may exceed the budget, but only by
-/// the bytes of pinned bundles. Sizes are recorded as bundles unpack; the disk is never walked.
+/// the bytes of pinned bundles, and comes back within it as they are released. Sizes are recorded as bundles unpack; the disk is never walked.
 ///
 /// Each cache owns a fresh subdirectory of the shared base, holding a lock file that stays locked for
 /// the cache's life. Creating a cache removes the subdirectories of caches whose lock it can take: their
@@ -118,6 +118,18 @@ impl Drop for Pin {
         if let Some(entry) = state.entries.get_mut(&self.sha256) {
             entry.refs = entry.refs.saturating_sub(1);
             entry.last_release = std::time::SystemTime::now();
+        }
+        // Releasing is when a cache that grew past its budget on pinned bundles can shrink: with no
+        // more installs coming, nothing else would trim it. The directories are renamed away under the
+        // lock; deleting them is left to a thread of their own so a drop never waits on the disk.
+        let doomed = self.cache.evict(&mut state);
+        drop(state);
+        if !doomed.is_empty() {
+            std::thread::spawn(move || {
+                for trash in doomed {
+                    let _ = std::fs::remove_dir_all(trash);
+                }
+            });
         }
     }
 }
@@ -744,6 +756,33 @@ mod tests {
             .filter(|n| n != LOCK)
             .collect();
         assert_eq!(names.len(), 2, "no .trash or .unpack leftovers: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn bundles_released_while_over_budget_are_trimmed_without_waiting_for_the_next_install() {
+        let root = tempfile::tempdir().unwrap();
+        let egress = egress();
+        // Room for one ten-byte bundle; two sessions hold one each, so both stay while they are held.
+        let cache = Cache::new(root.path(), 15);
+        let ((_a, a), (_b, b)) = (served(1), served(2));
+        let held_a = cache.ensure(&a, Some(&egress)).await.unwrap();
+        let held_b = cache.ensure(&b, Some(&egress)).await.unwrap();
+        assert!(held_a.dir().is_dir() && held_b.dir().is_dir());
+        // Both sessions end and nothing else arrives: the cache must still come back within budget.
+        drop(held_a);
+        drop(held_b);
+        let kept = [&a, &b]
+            .iter()
+            .filter(|bundle| cache.dir().join(&bundle.sha256).is_dir())
+            .count();
+        assert_eq!(
+            kept, 1,
+            "over budget with nothing held: the older is evicted"
+        );
+        assert!(
+            !cache.dir().join(&a.sha256).exists(),
+            "the least recently released goes first"
+        );
     }
 
     #[tokio::test]
