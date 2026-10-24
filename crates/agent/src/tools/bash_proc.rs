@@ -673,6 +673,16 @@ mod imp {
         sent == Err(rustix::io::Errno::PERM)
     }
 
+    /// `AsyncFd::new` is deprecated because it accepts any `AsRawFd`, which can't guarantee the
+    /// fd stays open. Its replacement, `register`, is `unsafe` (and this crate forbids unsafe
+    /// code). The soundness gap doesn't apply here: `OwnedFd` keeps its fd open until drop.
+    #[allow(deprecated)]
+    fn new_async_fd(
+        fd: rustix::fd::OwnedFd,
+    ) -> std::io::Result<tokio::io::unix::AsyncFd<rustix::fd::OwnedFd>> {
+        tokio::io::unix::AsyncFd::new(fd)
+    }
+
     pub(super) async fn wait_gone(group: &ProcGroup) {
         loop {
             let procs = {
@@ -693,7 +703,7 @@ mod imp {
                 };
                 if let Ok(fd) = rustix::process::pidfd_open(p, PidfdFlags::NONBLOCK)
                     && crate::tools::exec::start_time(pid) == Some(start)
-                    && let Ok(fd) = tokio::io::unix::AsyncFd::new(fd)
+                    && let Ok(fd) = new_async_fd(fd)
                 {
                     fds.push(fd);
                 }
