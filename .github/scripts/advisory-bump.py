@@ -4,8 +4,12 @@
 Usage: python3 -I .github/scripts/advisory-bump.py BODY_FILE [--dry-run]
 
 Runs `cargo audit --json`. For each vulnerable package that has a patched version, runs
-`cargo update -p NAME@VERSION ...` once for all of them (Cargo takes the newest semver-compatible release, so a patch that
-needs a new major or a loosened requirement stays unfixed), then audits again. Writes a markdown
+`cargo update -p NAME@VERSION --precise MIN` where MIN is the lowest patched release semver-compatible
+with VERSION, so a compromised newer release cannot ride in with the fix (a plain `cargo update -p`
+takes the newest one). `--precise` takes exactly one package, so the bumps run one at a time, in
+rounds: one that Cargo rejects (rustls needs a newer rustls-webpki, say) is retried after the others
+have moved. What still fails falls back to a plain `cargo update -p NAME@VERSION`, and the PR body
+says so. A patch that needs a new major or a loosened requirement stays unfixed. Then audits again. Writes a markdown
 description of the outcome to BODY_FILE: what was bumped, and for each advisory still open its id,
 title and the dependency chain (`cargo tree -i`). With --dry-run Cargo.lock is restored afterwards.
 
@@ -15,6 +19,7 @@ advisories remain (a human has to act); anything else is an unexpected failure.
 """
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -30,6 +35,39 @@ def audit():
         return json.loads(p.stdout)["vulnerabilities"]["list"]
     except (ValueError, KeyError):
         sys.exit(f"cargo audit produced no usable JSON (exit {p.returncode}):\n{p.stderr}")
+
+
+def parse(v):
+    m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", v)
+    return tuple(map(int, m.groups())) if m else None
+
+
+def compatible(cur, new):
+    """Cargo's caret rule: the same leftmost non-zero component."""
+    if new <= cur:
+        return False
+    if cur[0]:
+        return new[0] == cur[0]
+    if cur[1]:
+        return new[:2] == cur[:2]
+    return new == cur
+
+
+def min_patched(version, patched):
+    """The lowest lower bound among the advisory's patched ranges that `version` can move to."""
+    cur = parse(version)
+    if cur is None:
+        return None
+    found = []
+    for rng in patched:
+        for comp in rng.split(","):
+            m = re.fullmatch(r"\s*(>=|\^|~|=)?\s*(\d+\.\d+\.\d+)\s*", comp)
+            # `<` / `>` / a pre-release bound is no usable lower bound; only the first comparator of
+            # a range is its lower bound.
+            if m and parse(m.group(2)) and compatible(cur, parse(m.group(2))):
+                found.append(parse(m.group(2)))
+            break
+    return ".".join(map(str, min(found))) if found else None
 
 
 def key(v):
@@ -50,19 +88,38 @@ def main():
         if not before:
             open(body_path, "w").write("`cargo audit` is clean.\n")
             return 0
-        targets = sorted({(v["package"]["name"], v["package"]["version"])
-                          for v in before if v["versions"]["patched"]})
-        # One invocation: some patched releases only resolve together (rustls needs a newer
-        # rustls-webpki). If Cargo rejects the set, drop the spec it names and retry.
-        specs = [f"{n}@{v}" for n, v in targets]
-        while specs:
-            print("+ cargo update " + " ".join(f"-p {x}" for x in specs), flush=True)
-            p = run("cargo", "update", *[a for x in specs for a in ("-p", x)])
-            print(p.stderr.strip(), flush=True)
-            if p.returncode == 0:
+        # One target per package version: it must reach the highest of its advisories' minimums.
+        wanted = {}
+        for v in before:
+            if v["versions"]["patched"]:
+                wanted.setdefault((v["package"]["name"], v["package"]["version"]), []).append(
+                    min_patched(v["package"]["version"], v["versions"]["patched"]))
+        pending = []
+        fallback_notes = []
+        for (n, v), mins in sorted(wanted.items()):
+            if None in mins:
+                fallback_notes.append((n, v, "no patched range with a lower bound compatible with the locked version"))
+            else:
+                pending.append((n, v, max(mins, key=parse)))
+        # Rounds: a precise bump can need another package to have moved first, so retry the
+        # rejected ones until a whole round makes no progress.
+        failed = pending
+        while failed:
+            rejected = []
+            for n, v, m in failed:
+                print(f"+ cargo update -p {n}@{v} --precise {m}", flush=True)
+                p = run("cargo", "update", "-p", f"{n}@{v}", "--precise", m)
+                print(p.stderr.strip(), flush=True)
+                if p.returncode != 0:
+                    rejected.append((n, v, m))
+            if len(rejected) == len(failed):
                 break
-            bad = [x for x in specs if x.split("@")[0] in p.stderr]
-            specs = [x for x in specs if x not in bad] if bad else []
+            failed = rejected
+        fallback_notes += [(n, v, f"`--precise {m}` did not resolve") for n, v, m in failed]
+        for n, v, why in fallback_notes:
+            print(f"+ cargo update -p {n}@{v}   (fallback: {why})", flush=True)
+            p = run("cargo", "update", "-p", f"{n}@{v}")
+            print(p.stderr.strip(), flush=True)
         after = audit()
         changed = open("Cargo.lock").read() != original
         old = {(k[1], k[2]) for k in map(key, before)}
@@ -72,8 +129,11 @@ def main():
         out = []
         if changed:
             out.append("Bumps vulnerable packages in `Cargo.lock` to patched releases "
-                       "(`cargo update -p NAME@VERSION`, semver-compatible only).\n")
+                       "(`cargo update -p NAME@VERSION --precise MIN_PATCHED`: the lowest patched release, "
+                       "semver-compatible only).\n")
             out += [f"- fixed {i}: {n} {v}" for i, n, v in sorted(fixed)]
+            out += [f"- fell back to the newest compatible release for {n} {v} ({why}); review that bump by hand"
+                    for n, v, why in fallback_notes]
         if after:
             out.append("\nNot fixable by a lockfile bump (needs a dependency requirement change, "
                        "a major bump, or an ignore with an exposure assessment in "
