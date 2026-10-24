@@ -2626,12 +2626,14 @@ pub async fn connect_granted(
     connectors: &[crate::grant::McpConnector],
     secrets: &BTreeMap<String, Vec<crate::grant::SecretHeader>>,
     egress: &McpEgress,
+    exec_url: &str,
     host: Arc<McpHost>,
     idle_reap_after: Duration,
     saved: &BTreeMap<String, Vec<crate::tools::mcp_manifest::CachedTool>>,
 ) -> (McpTools, McpCatalog, Vec<String>) {
-    let (jobs, refused, mut warnings) =
-        granted_jobs(connectors, secrets, egress, host, false, None, saved);
+    let (jobs, refused, mut warnings) = granted_jobs(
+        connectors, secrets, egress, exec_url, host, false, None, saved,
+    );
     warnings.extend(
         refused
             .into_iter()
@@ -2649,6 +2651,7 @@ pub(crate) async fn connect_granted_each(
     connectors: &[crate::grant::McpConnector],
     secrets: &BTreeMap<String, Vec<crate::grant::SecretHeader>>,
     egress: &McpEgress,
+    exec_url: &str,
     host: Arc<McpHost>,
     idle_reap_after: Duration,
     only: Option<&[String]>,
@@ -2657,6 +2660,7 @@ pub(crate) async fn connect_granted_each(
         connectors,
         secrets,
         egress,
+        exec_url,
         host,
         true,
         only,
@@ -2671,11 +2675,12 @@ pub(crate) async fn connect_granted_each(
 }
 
 /// A grant's connectors as dial jobs: `(jobs, refused by egress, header warnings)`.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn granted_jobs(
     connectors: &[crate::grant::McpConnector],
     secrets: &BTreeMap<String, Vec<crate::grant::SecretHeader>>,
     egress: &McpEgress,
+    exec_url: &str,
     host: Arc<McpHost>,
     apps: bool,
     only: Option<&[String]>,
@@ -2688,10 +2693,22 @@ fn granted_jobs(
     let mut jobs = Vec::with_capacity(connectors.len());
     let mut refused = Vec::new();
     let mut warnings = Vec::new();
+    let exec = reqwest::Url::parse(exec_url).ok();
+    // Built on the first sandbox connector that sits on the exec origin, then shared by the rest.
+    let mut exec_egress: Option<McpEgress> = None;
     for connector in connectors {
         if only.is_some_and(|o| !o.contains(&connector.name)) {
             continue;
         }
+        let egress = match (connector.sandbox, &exec) {
+            (true, Some(exec)) if same_origin(exec, &connector.url) => {
+                if exec_egress.is_none() {
+                    exec_egress = exec.host_str().and_then(|h| egress.allowing_host(h).ok());
+                }
+                exec_egress.as_ref().unwrap_or(egress)
+            }
+            _ => egress,
+        };
         if let Err(e) = egress.check(&connector.url) {
             refused.push((connector.name.clone(), e));
             continue;
@@ -3297,6 +3314,15 @@ impl McpEgress {
         })
     }
 
+    /// This egress with `host` also permitted at any address: the host of the grant's `exec_url`,
+    /// which the control plane chose and the exec path already dials. A fresh pair of clients,
+    /// because the resolver's policy is fixed when a client is built; the shared pair is untouched.
+    fn allowing_host(&self, host: &str) -> Result<Self, String> {
+        let mut policy = (*self.policy).clone();
+        policy.allow_hosts.push(host.to_ascii_lowercase());
+        Self::new(policy)
+    }
+
     /// GET `url` through this egress and return its body, refusing one over `max` bytes. For the
     /// agent bundle a grant names; its integrity is the caller's hash check, not the transport's.
     pub(crate) async fn fetch(&self, url: &str, max: usize) -> Result<Vec<u8>, String> {
@@ -3349,6 +3375,15 @@ impl McpEgress {
             },
         )
     }
+}
+
+/// Whether `url` has the scheme, host and port of `origin`.
+fn same_origin(origin: &reqwest::Url, url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|u| {
+        u.scheme() == origin.scheme()
+            && u.host_str() == origin.host_str()
+            && u.port_or_known_default() == origin.port_or_known_default()
+    })
 }
 
 /// One MCP resource, exposed as a zero-arg tool that `resources/read`s a fixed URI.
