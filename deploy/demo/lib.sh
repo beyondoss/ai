@@ -28,16 +28,24 @@ SANDBOX_PORT=8081
 # as the assistant's workspace host, E2B for the coding and browser agents, the stand-in managed-MCP
 # endpoint, and ECS exec on the agent). The same exec-stub either way.
 SANDBOX=${SANDBOX:-fargate}
+# `oidc` is a stack of its own for `demo.sh oidc`: no sandbox at all, an identity provider (Keycloak) and
+# the broker that signs users in and acts as them, and ECS Exec on the agent for its memory scan.
 case "$SANDBOX" in
-  fargate | e2b | both) ;;
-  *) echo "SANDBOX must be fargate, e2b or both" >&2; exit 2 ;;
+  fargate | e2b | both | oidc) ;;
+  *) echo "SANDBOX must be fargate, e2b, both or oidc" >&2; exit 2 ;;
 esac
-USE_FARGATE=0 USE_E2B=0 USECASES=0
-[ "$SANDBOX" = e2b ] || USE_FARGATE=1
-[ "$SANDBOX" = fargate ] || USE_E2B=1
+USE_FARGATE=0 USE_E2B=0 USECASES=0 OIDC=0
+[ "$SANDBOX" = e2b ] || [ "$SANDBOX" = oidc ] || USE_FARGATE=1
+[ "$SANDBOX" = fargate ] || [ "$SANDBOX" = oidc ] || USE_E2B=1
 [ "$SANDBOX" != both ] || USECASES=1
+[ "$SANDBOX" != oidc ] || OIDC=1
+# what the use cases that scan the agent process's memory through ECS Exec need
+EXECSCAN=0
+[ "$USECASES" = 0 ] && [ "$OIDC" = 0 ] || EXECSCAN=1
 STANDIN_PORT=8082                # the stand-in managed-MCP endpoint (public: it checks bmc_v1 tokens)
 PROVIDER_PORT=8083               # its "third party", loopback only
+OIDC_CONTROL_PORT=8085           # the broker's control plane (consent, binding, revocation), open to the caller only
+OIDC_IDP_PORT=8180               # the identity provider (Keycloak), open to the caller only: the scripted user signs in here
 TAGSPEC="{Key=$TAG_KEY,Value=$NAME}"
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

@@ -25,7 +25,13 @@ default = ["gateway-key", "agent-lib"]
 gateway-key = ["dep:beyond-ai", "dep:ed25519-dalek"]
 # `notify-token` mints a callback token with the agent's own `NotifyKey`, so a forged one is forged
 # the way a real attacker would have to: the right kid, a wrong tag.
-agent-lib = ["dep:beyond-ai-agent"]
+agent-lib = [
+  "dep:beyond-ai-agent",
+  "dep:chacha20poly1305",
+  "dep:hkdf",
+  "dep:ring",
+  "dep:sha2",
+]
 
 [dependencies]
 base64.workspace = true
@@ -33,11 +39,18 @@ beyond-ai = { path = "../gateway", features = ["mint"], optional = true }
 beyond-ai-agent = { path = "../agent", optional = true }
 # The exec endpoint is the repo's reference one, the same code the conformance suite grades.
 beyond-ai-test-support = { path = "../test-support" }
+# The broker seals refresh tokens (XChaCha20-Poly1305) under a per-tenant key derived (HKDF) from one master.
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"], optional = true }
 clap.workspace = true
 ed25519-dalek = { version = "2.2", features = ["rand_core"], optional = true }
 futures.workspace = true
 getrandom = { version = "0.3", features = ["std"] }
+hkdf = { version = "0.12", optional = true }
+# The protected resource checks access tokens' RS256 / ES256 signatures against the provider's JWKS.
+ring = { version = "0.17", optional = true }
+serde.workspace = true
 serde_json.workspace = true
+sha2 = { version = "0.10", optional = true }
 tokio.workspace = true
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }
 

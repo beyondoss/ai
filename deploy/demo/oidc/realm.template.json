@@ -1,0 +1,126 @@
+{
+  "realm": "demo",
+  "enabled": true,
+  "sslRequired": "none",
+  "accessTokenLifespan": 60,
+  "ssoSessionIdleTimeout": 3600,
+  "registrationAllowed": false,
+  "clientScopes": [
+    {
+      "name": "notes:read",
+      "protocol": "openid-connect",
+      "description": "Read your own notes",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Read your notes"
+      },
+      "protocolMappers": [
+        {
+          "name": "aud-notes-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "notes-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        },
+        {
+          "name": "sub",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-sub-mapper",
+          "config": { "access.token.claim": "true", "id.token.claim": "true" }
+        },
+        {
+          "name": "username",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "username",
+            "claim.name": "preferred_username",
+            "jsonType.label": "String",
+            "access.token.claim": "true",
+            "id.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "name": "notes:write",
+      "protocol": "openid-connect",
+      "description": "Add to your notes",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Add to your notes"
+      },
+      "protocolMappers": [
+        {
+          "name": "aud-notes-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "notes-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "notes-broker",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "__CLIENT_SECRET__",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "consentRequired": true,
+      "redirectUris": ["__REDIRECT_URI__"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "access.token.lifespan": "60",
+        "display.on.consent.screen": "true"
+      },
+      "defaultClientScopes": ["notes:read"],
+      "optionalClientScopes": ["offline_access", "notes:write"]
+    }
+  ],
+  "users": [
+    {
+      "id": "11111111-aaaa-4aaa-8aaa-111111111111",
+      "username": "alice",
+      "enabled": true,
+      "email": "alice@example.test",
+      "emailVerified": true,
+      "firstName": "Alice",
+      "lastName": "Demo",
+      "realmRoles": ["offline_access"],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "__ALICE_PASSWORD__",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "22222222-bbbb-4bbb-8bbb-222222222222",
+      "username": "bob",
+      "enabled": true,
+      "email": "bob@example.test",
+      "emailVerified": true,
+      "firstName": "Bob",
+      "lastName": "Demo",
+      "realmRoles": ["offline_access"],
+      "credentials": [
+        { "type": "password", "value": "__BOB_PASSWORD__", "temporary": false }
+      ]
+    }
+  ]
+}

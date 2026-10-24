@@ -99,6 +99,23 @@ if [ "$USECASES" = 1 ]; then
   printf '%s' "$E2B_API_KEY" | put_param e2b-key SecureString
 fi
 
+# For `demo.sh oidc`: the bmc_v1 key (as above), the key tenants' keys derive from (refresh tokens are sealed
+# under them), the control plane's credential, the broker's client secret at the identity provider, two
+# users' passwords, and the provider's realm (built from oidc/realm.template.json with those secrets).
+# Created once, kept by reruns; only the stack's own task roles can read them.
+if [ "$OIDC" = 1 ]; then
+  param_exists managed-secret || openssl rand -base64 32 | tr -d '\n' | put_param managed-secret SecureString
+  param_exists broker-master || openssl rand -base64 32 | tr -d '\n' | put_param broker-master SecureString
+  param_exists broker-admin || printf '%s' "$(openssl rand -hex 24)" | put_param broker-admin SecureString
+  param_exists oidc-client-secret || printf '%s' "$(openssl rand -hex 24)" | put_param oidc-client-secret SecureString
+  param_exists oidc-users || jq -nc --arg a "$(openssl rand -hex 12)" --arg b "$(openssl rand -hex 12)" '{alice:$a,bob:$b}' | put_param oidc-users SecureString
+  OIDC_USERS=$(ssm_get oidc-users)
+  sed -e "s|__CLIENT_SECRET__|$(ssm_get oidc-client-secret)|" \
+    -e "s|__REDIRECT_URI__|http://oidc.$DNS:$OIDC_CONTROL_PORT/oauth/callback|" \
+    -e "s|__ALICE_PASSWORD__|$(jq -r .alice <<<"$OIDC_USERS")|" -e "s|__BOB_PASSWORD__|$(jq -r .bob <<<"$OIDC_USERS")|" \
+    "$HERE/oidc/realm.template.json" | jq -c . | put_param oidc-realm SecureString
+fi
+
 # Generated once. The marker goes in last, so an interrupted run regenerates the lot instead of
 # keeping half of a key set.
 if ! param_exists generated; then
@@ -159,7 +176,7 @@ IMAGES_CHANGED=
 ensure_image "$P-gateway" Dockerfile
 ensure_image "$P-agent" Dockerfile.agent
 [ "$USE_FARGATE" = 0 ] || ensure_image "$P-sandbox" deploy/demo/Dockerfile.sandbox
-[ "$USECASES" = 0 ] || ensure_image "$P-standin" deploy/demo/Dockerfile.standin
+{ [ "$USECASES" = 1 ] || [ "$OIDC" = 1 ]; } && ensure_image "$P-standin" deploy/demo/Dockerfile.standin
 [ "$USECASES" = 0 ] || ensure_image "$P-front" deploy/demo/Dockerfile.sandbox front
 
 # ---------------------------------------------------------------------------------------------
@@ -236,13 +253,19 @@ sg_rule "$SG_TASKS" --protocol tcp --port "$AGENT_PORT" --cidr "$CALLER"
 [ "$USE_E2B" = 0 ] || sg_rule "$SG_TASKS" --protocol tcp --port "$AGENT_TLS_PORT" --cidr 0.0.0.0/0
 # The stand-in managed-MCP endpoint is a public service, like Beyond's would be: it answers only a
 # request carrying a valid bmc_v1 token. (Public, so the agent's MCP egress policy needs no exception.)
-[ "$USECASES" = 0 ] || sg_rule "$SG_TASKS" --protocol tcp --port "$STANDIN_PORT" --cidr 0.0.0.0/0
+{ [ "$USECASES" = 1 ] || [ "$OIDC" = 1 ]; } && sg_rule "$SG_TASKS" --protocol tcp --port "$STANDIN_PORT" --cidr 0.0.0.0/0
+# The broker's control plane and the identity provider's login page: the caller's address alone (the
+# scripted user signs in from here; in a real deployment the browser would, and the callback is public).
+if [ "$OIDC" = 1 ]; then
+  sg_rule "$SG_TASKS" --protocol tcp --port "$OIDC_CONTROL_PORT" --cidr "$CALLER"
+  sg_rule "$SG_TASKS" --protocol tcp --port "$OIDC_IDP_PORT" --cidr "$CALLER"
+fi
 
 # ---------------------------------------------------------------------------------------------
 # The use cases' agent folders are deployed as bundles: one tar per folder, named by its hash, in a
 # private bucket that demo.sh uploads to and hands the replica presigned links to. down.sh empties and
 # deletes it.
-if [ "$USECASES" = 1 ]; then
+if [ "$USECASES" = 1 ] || [ "$OIDC" = 1 ]; then
   say "bundles bucket"
   BUCKET=$(bundle_bucket)
   if ! command aws --region "$REGION" s3api head-bucket --bucket "$BUCKET" >/dev/null 2>&1; then
@@ -310,9 +333,11 @@ role agent-exec "fleet-secret tls-key"
 [ "$USE_FARGATE" = 0 ] || role sandbox-exec "$([ "$USECASES" = 0 ] || echo e2b-key)"
 # The stand-in's role is the only one that can read the "third party's" key.
 [ "$USECASES" = 0 ] || role standin-exec "managed-secret provider-secret"
-# ECS Exec on the agent (`demo.sh assistant` scans the agent process's memory through it): the task
-# role may open the SSM message channel and nothing else.
-if [ "$USECASES" = 1 ]; then
+# The identity provider's realm (its users' passwords) and the broker's keys: this stack's task alone.
+[ "$OIDC" = 0 ] || role oidc-exec "managed-secret broker-master broker-admin oidc-client-secret oidc-realm"
+# ECS Exec on the agent (`demo.sh assistant` and `demo.sh oidc` scan the agent process's memory through
+# it): the task role may open the SSM message channel and nothing else.
+if [ "$EXECSCAN" = 1 ]; then
   if ! aws iam get-role --role-name "$P-agent-task" >/dev/null 2>&1; then
     aws iam create-role --role-name "$P-agent-task" --assume-role-policy-document "$TRUST" --tags "Key=$TAG_KEY,Value=$NAME" >/dev/null
     made "role $P-agent-task"
@@ -416,7 +441,7 @@ NOTIFY_ORIGIN="https://$(printf %s "$IP" | tr . -).sslip.io:8443"; echo "notify 
 '"$AGENT_SCRIPT"
 fi
 AGENT_TASK_ROLE=
-[ "$USECASES" = 0 ] || AGENT_TASK_ROLE="arn:aws:iam::$ACCOUNT:role/$P-agent-task"
+[ "$EXECSCAN" = 0 ] || AGENT_TASK_ROLE="arn:aws:iam::$ACCOUNT:role/$P-agent-task"
 TD_AGENT=$(jq -n --arg family "$P-agent" --arg exec "$(EXEC agent)" --arg taskrole "$AGENT_TASK_ROLE" --argjson logs "$(LOGS agent)" \
   --arg img "$ECR/$P-agent:latest" --argjson vol "$EFSVOL" --arg script "$AGENT_SCRIPT" \
   --arg gw "http://gateway.$DNS:$GATEWAY_PORT" --arg model "$MODEL" --arg origin "https://agent.$DNS:$AGENT_TLS_PORT" \
@@ -468,6 +493,27 @@ TD_STANDIN=$(jq -n --arg family "$P-standin" --arg exec "$(EXEC standin)" --argj
      logConfiguration:$logs}]}' | register "$P-standin")
 fi
 
+# The identity provider and the broker share one task: the broker reaches Keycloak on loopback, and the
+# provider's name for itself (oidc.<dns>) is what tokens say and the scripted user's browser is sent to.
+# Keycloak is `start-dev` (its embedded database): a stack for a demo, torn down by down.sh.
+if [ "$OIDC" = 1 ]; then
+TD_OIDC=$(jq -n --arg family "$P-oidc" --arg exec "$(EXEC oidc)" --argjson logs_kc "$(LOGS keycloak)" --argjson logs_b "$(LOGS broker)" \
+  --arg img "$ECR/$P-standin:latest" --arg host "oidc.$DNS" --arg realm "$(param_arn oidc-realm)" --arg ms "$(param_arn managed-secret)" \
+  --arg bm "$(param_arn broker-master)" --arg ba "$(param_arn broker-admin)" --arg cs "$(param_arn oidc-client-secret)" '{
+  family:$family, networkMode:"awsvpc", requiresCompatibilities:["FARGATE"], cpu:"1024", memory:"2048",
+  executionRoleArn:$exec,
+  containerDefinitions:[
+    {name:"keycloak", image:"quay.io/keycloak/keycloak:26.4", essential:true, entryPoint:["/bin/bash","-c"],
+     command:["mkdir -p /opt/keycloak/data/import && printf \"%s\" \"$REALM_JSON\" > /opt/keycloak/data/import/realm.json && exec /opt/keycloak/bin/kc.sh start-dev --import-realm --http-port=8180 --hostname=http://\($host):8180 --hostname-strict=false"],
+     portMappings:[{containerPort:8180}], secrets:[{name:"REALM_JSON",valueFrom:$realm}], logConfiguration:$logs_kc},
+    {name:"broker", image:$img, essential:true, entryPoint:["/usr/local/bin/beyond-ai-demo"],
+     command:["oidc-endpoint","--issuer","http://\($host):8180/realms/demo","--redirect-uri","http://\($host):8085/oauth/callback"],
+     portMappings:[{containerPort:8082},{containerPort:8085}],
+     secrets:[{name:"DEMO_MANAGED_SECRET",valueFrom:$ms},{name:"DEMO_BROKER_MASTER",valueFrom:$bm},
+       {name:"DEMO_BROKER_ADMIN",valueFrom:$ba},{name:"DEMO_OIDC_CLIENT_SECRET",valueFrom:$cs}],
+     logConfiguration:$logs_b}]}' | register "$P-oidc")
+fi
+
 # ---------------------------------------------------------------------------------------------
 say "services"
 service() { # name, task definition arn, port
@@ -492,7 +538,7 @@ service() { # name, task definition arn, port
 # are tagged at create.
 service gateway "$TD_GATEWAY"
 EXEC_FLAG=
-[ "$USECASES" = 0 ] || EXEC_FLAG=1
+[ "$EXECSCAN" = 0 ] || EXEC_FLAG=1
 service agent "$TD_AGENT"
 EXEC_FLAG=
 SERVICES=("$P-gateway" "$P-agent")
@@ -503,6 +549,10 @@ fi
 if [ "$USECASES" = 1 ]; then
   service standin "$TD_STANDIN"
   SERVICES+=("$P-standin")
+fi
+if [ "$OIDC" = 1 ]; then
+  service oidc "$TD_OIDC"
+  SERVICES+=("$P-oidc")
 fi
 
 echo "waiting for the ${#SERVICES[@]} services to be stable..."
@@ -518,9 +568,11 @@ case "$SANDBOX" in
   e2b) echo "  sandbox E2B: one microVM per session, made by demo.sh (metadata $TAG_KEY=$NAME); down.sh kills them" ;;
   both) echo "  sandbox the use cases: a Fargate workspace host, E2B microVMs (metadata $TAG_KEY=$NAME; down.sh kills them),"
     echo "          and the stand-in managed-MCP endpoint at $(svc_ip standin):$STANDIN_PORT" ;;
+  oidc) echo "  sandbox none. The identity provider (Keycloak) and the broker are one task at $(svc_ip oidc):$OIDC_IDP_PORT / :$STANDIN_PORT / :$OIDC_CONTROL_PORT" ;;
   *) echo "  sandbox Fargate: one shared exec-stub service" ;;
 esac
 echo "  next    ./deploy/demo/demo.sh        a scripted conversation, with a run record and report"
 echo "          ./deploy/demo/demo.sh kill   kill the agent mid-job; the session survives"
 [ "$USECASES" = 0 ] || echo "          ./deploy/demo/demo.sh assistant | coding | browser    the three use cases"
+[ "$OIDC" = 0 ] || echo "          ./deploy/demo/demo.sh oidc   an agent acting as a signed-in user, through a managed connector"
 echo "          ./deploy/demo/down.sh        delete everything, then prove it is gone"

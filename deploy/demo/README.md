@@ -80,6 +80,18 @@ named checks, a `run.json` and a `report.html` of its own in `results/<timestamp
 | `demo.sh coding`    | a failing Python app, a skill with a script, a `reviewer` subagent, `AGENTS.md`               | `vm-created-on-first-tool`, `skill-used`, `fix-verified`, `subagent-from-folder`, `app-as-background-job`, `browser-sees-localhost`               |
 | `demo.sh browser`   | `AGENTS.md`, a `.mcp.json` and a page                                                         | `browser-reads-page`, `no-held-connection`, `idle-cost`, `state-survives-pause`, `state-survives-idle-reap`                                       |
 
+### A fourth: an agent that acts as a signed-in user
+
+`SANDBOX=oidc ./deploy/demo/up.sh` is a stack of its own (no sandbox, no E2B): the gateway and the agent as
+above, and one more task holding **Keycloak** (the identity provider, two users, `alice` and `bob`) and the
+**broker** with the notes service it fronts. `demo.sh oidc` signs both users in through the provider's real
+login and consent pages (scripted: `oidc/login.sh`), binds each to a session, and drives the agent through
+`user-signs-in-once`, `agent-acts-as-user`, `agent-never-sees-token` (including a scan of the agent
+process's memory, with a control string planted so the scan is shown to see what is there), `token-refresh`
+(the access token lives 60 s), `users-isolated`, `scope-enforced` and `revocation`. The agent folder is
+`agents/oidc/`; the broker's behaviour is written down in [BROKER.md](BROKER.md). Use a name of its own
+(`DEMO_NAME=oidc`) so it never shares resources with another stack.
+
 ### Bundles, and what opening a session costs
 
 `demo.sh` tars the folder (`tar --format=ustar`, with this run's stamps in it), names the tar by its
@@ -207,6 +219,11 @@ gateway, no load balancer), plus the model: a full `demo.sh all` spends about on
   (`crates/test-support`), which passes the exec conformance suite, notify included
   (`crates/demo/tests/stub_conformance.rs`). It mounts the EFS read-only, which is how `sealed-at-rest`
   reads the bytes.
+- **oidc** task (`SANDBOX=oidc`): a Keycloak container (`start-dev`, the realm imported from
+  `oidc/realm.template.json` through an SSM parameter) and the broker container (`beyond-ai-demo
+  oidc-endpoint`, `crates/demo/src/oidc/`) side by side. The broker's managed port is public like the
+  stand-in's; its control port and Keycloak's login page are open to the caller's address alone. Its role
+  reads the broker's keys, its client secret and the realm, and nothing else.
 - **names**: Cloud Map private DNS (`gateway`, `agent`, `sandbox` in `<name>.local`). A replaced agent
   gets a new address; its name follows after the private zone catches up (some tens of seconds), and the
   sandbox's callback schedule retries until it does. (With E2B the callback names the agent's address

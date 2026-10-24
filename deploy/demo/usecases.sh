@@ -148,6 +148,7 @@ uc_prepare() { # called by demo.sh once, before the checks
     assistant) uc_prepare_assistant ;;
     coding) uc_prepare_coding ;;
     browser) uc_prepare_browser ;;
+    oidc) uc_prepare_oidc ;;
   esac
 }
 
@@ -921,3 +922,7 @@ echo "vm $(free -m | awk "/^Mem:/{print \$2, \$3}")"')
     result 0 "could not find all three processes: $rep"
   fi
 }
+
+# The oidc use case (an agent acting as a signed-in user) lives in its own file.
+# shellcheck source=usecases-oidc.sh
+. "$HERE/usecases-oidc.sh"

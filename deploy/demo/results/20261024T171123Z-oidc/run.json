@@ -1,0 +1,3940 @@
+{
+  "schema": 1,
+  "use_case": {
+    "name": "oidc",
+    "title": "oidc: an agent that acts as a signed-in user and never holds their tokens",
+    "summary": "A folder with an AGENTS.md, deployed as a bundle; the agent has no sandbox. Its one connector is managed: it holds a bmc_v1 token and nothing else. Behind that connector a broker (the stand-in for Beyond's managed endpoint) signs each user in once with authorization code + PKCE against a real identity provider (Keycloak), keeps their refresh token sealed under a per-tenant key, refreshes the 60-second access tokens itself, and calls a notes service that trusts only a validated JWT. The checks drive two users through it, then look for any token in the agent.",
+    "folder": "deploy/demo/agents/oidc",
+    "tree": [
+      {
+        "path": "AGENTS.md",
+        "bytes": 837,
+        "text": "---\nmodel: gpt-4.1-mini\ntools: mcp__notes__my_notes, mcp__notes__add_note\nmax-steps: 6\n---\n\nYou are Sage, a notes assistant for one signed-in person. You have no shell and no sandbox: only a notes\nservice, reached through a connector that acts as whoever is signed in. You do not know who that is, and\nyou never see a password or a token.\n\n- Answer in at most four sentences, plain text, no markdown.\n- To read the person's notes call `my_notes`. Quote what it returns exactly, including any reference code.\n- To add a note call `add_note`.\n- When a tool returns an error, quote its message in your own answer, word for word, and say whether\n  anything else is wrong. Never guess at what a tool would have said, and never retry a refused call.\n- Use only the tools you were asked to use, and do nothing when the person asks for no tool.\n"
+      }
+    ],
+    "bundle": {
+      "sha256": "d684fed17606678d7bce645a5e6825c65dc24acb3dfc23a52bede75ec4034636",
+      "bytes": 10240,
+      "store": "a private S3 bucket (beyond-ai-demo-oidc-bundles-123456789012), fetched with a presigned link"
+    }
+  },
+  "session_open": {
+    "sessions": [
+      {
+        "session": "demo.u1024171123a",
+        "started_ms": 1792861907919,
+        "ready_ms": 1792861908147,
+        "connected_ms": 121,
+        "state_ms": 78,
+        "open_ms": 199,
+        "exec_requests": 0,
+        "front_forwarded": 0
+      },
+      {
+        "session": "demo.u1024171123b",
+        "started_ms": 1792861908163,
+        "ready_ms": 1792861908414,
+        "connected_ms": 112,
+        "state_ms": 122,
+        "open_ms": 234,
+        "exec_requests": 0,
+        "front_forwarded": 0
+      }
+    ],
+    "exec_requests_at_open": 0,
+    "sessions_opened": 2,
+    "per_session": 0,
+    "open_ms_mean": 216,
+    "vms_at_open": null
+  },
+  "run": {
+    "id": "20261024T171123Z",
+    "mode": "oidc",
+    "started_ms": 1792861883208,
+    "ended_ms": 1792862088105,
+    "commit": "c633496ffaa073809e8b07159f40d773c942b671",
+    "uncommitted_files": 4,
+    "region": "us-west-2",
+    "name": "oidc"
+  },
+  "model": {
+    "requested": "gpt-4.1-mini",
+    "replica_default": "gpt-5-mini",
+    "provider": "openai",
+    "routed": [
+      "gpt-4.1-mini"
+    ],
+    "price_model": [
+      "gpt-4.1-mini"
+    ],
+    "via": "crates/gateway (managed bai_v1 key)"
+  },
+  "checks": [
+    {
+      "name": "user-signs-in-once",
+      "title": "A user signs in once, and the broker holds the refresh token sealed",
+      "pass": true,
+      "started_ms": 1792861905950,
+      "ended_ms": 1792861914294,
+      "duration_ms": 8344,
+      "detail": "alice and bob each signed in once through the provider's login and consent pages (authorization code + PKCE S256); the broker holds each refresh token sealed (XChaCha20-Poly1305 under a per-tenant key: it opens under the tenant's key, not another's, and the plaintext is not in the file); each granted notes:read and offline_access, not notes:write; each session is bound to exactly its user's connection",
+      "headline": {
+        "label": "refresh tokens stored",
+        "value": "2 sealed",
+        "unit": ""
+      },
+      "measurements": {
+        "users": [
+          {
+            "user": "alice",
+            "connection": "conn_HUJ8FIc_VYHO",
+            "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+            "granted_scope": "openid offline_access notes:read",
+            "pkce_method": "S256",
+            "at_rest": {
+              "cipher": "XChaCha20-Poly1305, key = HKDF-SHA256(master, tenant), aad = connection id",
+              "file_bytes": 1154,
+              "opens_as_another_connection": false,
+              "opens_under_another_tenants_key": false,
+              "opens_under_the_tenants_key": true,
+              "plaintext_token_in_file": false,
+              "sealed_bytes": 892,
+              "sealed_head": "4322P_EPuAvRzb8I",
+              "token_tail_in_file": false
+            },
+            "refresh_token_stored": true
+          },
+          {
+            "user": "bob",
+            "connection": "conn_1n73cKx4l4BC",
+            "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+            "granted_scope": "openid offline_access notes:read",
+            "pkce_method": "S256",
+            "at_rest": {
+              "cipher": "XChaCha20-Poly1305, key = HKDF-SHA256(master, tenant), aad = connection id",
+              "file_bytes": 1152,
+              "opens_as_another_connection": false,
+              "opens_under_another_tenants_key": false,
+              "opens_under_the_tenants_key": true,
+              "plaintext_token_in_file": false,
+              "sealed_bytes": 892,
+              "sealed_head": "4XN9SYGTCSLceoB2",
+              "token_tail_in_file": false
+            },
+            "refresh_token_stored": true
+          }
+        ],
+        "broker_log": [
+          {
+            "user": "alice",
+            "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+            "connection": "conn_HUJ8FIc_VYHO",
+            "scope": "openid offline_access notes:read",
+            "refresh_token_stored": "sealed",
+            "refresh_sealed_bytes": 892
+          },
+          {
+            "user": "bob",
+            "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+            "connection": "conn_1n73cKx4l4BC",
+            "scope": "openid offline_access notes:read",
+            "refresh_token_stored": "sealed",
+            "refresh_sealed_bytes": 892
+          }
+        ]
+      }
+    },
+    {
+      "name": "agent-acts-as-user",
+      "title": "The agent acts as the user: the service sees the user's sub in a validated token",
+      "pass": true,
+      "started_ms": 1792861914298,
+      "ended_ms": 1792861922394,
+      "duration_ms": 8096,
+      "detail": "the model called the notes tool; the service validated a JWT (signature via JWKS, issuer, audience notes-api, expiry, scope notes:read) whose sub is alice's (11111111-aaaa-4aaa-8aaa-111111111111) and returned alice's notes; the reply quotes her reference PR-109a0bc7",
+      "headline": {
+        "label": "sub the service saw",
+        "value": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "unit": ""
+      },
+      "measurements": {
+        "service_saw": [
+          {
+            "user": "alice",
+            "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+            "iss": "http://oidc.oidc.local:8180/realms/demo",
+            "aud": "notes-api",
+            "azp": "notes-broker",
+            "scope": [
+              "openid",
+              "offline_access",
+              "notes:read"
+            ],
+            "ttl_s": 60,
+            "ref": "PR-109a0bc7"
+          }
+        ],
+        "reference": "PR-109a0bc7",
+        "alice_sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "reply_quotes_reference": true
+      }
+    },
+    {
+      "name": "agent-never-sees-token",
+      "title": "The agent never holds an access or refresh token",
+      "pass": true,
+      "started_ms": 1792861922398,
+      "ended_ms": 1792861985334,
+      "duration_ms": 62936,
+      "detail": "4 real token tails (every access and refresh token the broker handled for the two users) were looked for in the grant, the agent's env, its logs (5 lines), both transcripts, the sealed session files and 1044 MB of its memory: none found. The planted control was found in memory (11) and in the transcript (1), so the scans do see what is there",
+      "headline": {
+        "label": "token copies in the agent",
+        "value": 0,
+        "unit": "found"
+      },
+      "measurements": {
+        "real_token_tails_searched": 4,
+        "kinds": "access:2 control:1 refresh:2",
+        "agent_memory": {
+          "mb_read": 1044,
+          "planted_control_found": 11,
+          "real_token_hits": 0,
+          "other_jwt_shaped": 0
+        },
+        "env": {
+          "token_hits": 0,
+          "jwt_like": 0
+        },
+        "grant": "only a bmc_v1 bearer; no JWT text",
+        "agent_log": {
+          "lines": 5,
+          "token_hits": 0
+        },
+        "transcripts": {
+          "bytes": 5250,
+          "planted_control_found": 1,
+          "token_hits": 0
+        },
+        "efs": {
+          "files": 19,
+          "token_hits": 0,
+          "note": "sealed, so ciphertext either way"
+        }
+      }
+    },
+    {
+      "name": "token-refresh",
+      "title": "The access token lapses and the broker refreshes it, invisibly to the agent",
+      "pass": true,
+      "started_ms": 1792861985338,
+      "ended_ms": 1792862062553,
+      "duration_ms": 77215,
+      "detail": "bob's first call used access token ofrtrt:74b7ad41-645e-e493-70fe-cb0b58baa1e6 (60s lifetime); after it lapsed the second call still worked: the broker refreshed (1792862112>1792862046), the notes service saw a new token ofrtrt:eabb4fd4-ae3a-40c9-f011-99d074c41de3, and the agent saw only the same answer (PR-41a93904) through the same bmc_v1 token",
+      "headline": {
+        "label": "access token lifetime",
+        "value": 60,
+        "unit": "s"
+      },
+      "measurements": {
+        "first_token_jti": "ofrtrt:74b7ad41-645e-e493-70fe-cb0b58baa1e6",
+        "second_token_jti": "ofrtrt:eabb4fd4-ae3a-40c9-f011-99d074c41de3",
+        "first_exp": 1792862046,
+        "second_exp": 1792862112,
+        "access_ttl_s": 60,
+        "broker_refresh": [
+          {
+            "detail": {
+              "access_ttl_s": 60,
+              "connection": "conn_1n73cKx4l4BC",
+              "forced": false,
+              "refresh_rotated": true,
+              "refreshes": 2,
+              "sub": "22222222-bbbb-4bbb-8bbb-222222222222"
+            },
+            "event": "token_refreshed",
+            "src": "broker",
+            "ts_ms": 1792862052869
+          }
+        ],
+        "same_answer_ref": "PR-41a93904",
+        "agent_visible_difference": "none"
+      }
+    },
+    {
+      "name": "users-isolated",
+      "title": "Two users in two sessions each see only their own data",
+      "pass": true,
+      "started_ms": 1792862062557,
+      "ended_ms": 1792862076143,
+      "duration_ms": 13586,
+      "detail": "alice's session saw only alice's notes (PR-109a0bc7) and bob's only bob's (PR-41a93904); every broker call of a session used that user's connection; alice's own token could not reach bob's connection by any route (named in a header or the URL, a token for an unconnected session, another connector, re-binding), and the service itself refused a request for another user's notes",
+      "headline": {
+        "label": "cross-user attempts refused",
+        "value": 6,
+        "unit": ""
+      },
+      "measurements": {
+        "alice_reference": "PR-109a0bc7",
+        "bob_reference": "PR-41a93904",
+        "broker_calls": [
+          {
+            "session": "demo.u1024171123a",
+            "connection": "conn_HUJ8FIc_VYHO",
+            "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+            "method": "server/discover"
+          },
+          {
+            "session": "demo.u1024171123a",
+            "connection": "conn_HUJ8FIc_VYHO",
+            "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+            "method": "initialize"
+          },
+          {
+            "session": "demo.u1024171123a",
+            "connection": "conn_HUJ8FIc_VYHO",
+            "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+            "method": "notifications/initialized"
+          },
+          {
+            "session": "demo.u1024171123a",
+            "connection": "conn_HUJ8FIc_VYHO",
+            "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+            "method": "tools/list"
+          },
+          {
+            "session": "demo.u1024171123a",
+            "connection": "conn_HUJ8FIc_VYHO",
+            "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+            "method": "resources/list"
+          },
+          {
+            "session": "demo.u1024171123a",
+            "connection": "conn_HUJ8FIc_VYHO",
+            "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+            "method": "prompts/list"
+          },
+          {
+            "session": "demo.u1024171123a",
+            "connection": "conn_HUJ8FIc_VYHO",
+            "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+            "method": "tools/call"
+          },
+          {
+            "session": "demo.u1024171123b",
+            "connection": "conn_1n73cKx4l4BC",
+            "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+            "method": "tools/call"
+          }
+        ],
+        "attempts_with_alices_token": [
+          {
+            "attempt": "names bob's connection in a header",
+            "http": 403,
+            "answer": "{\"error\":\"this session's token is not bound to that connection\"}",
+            "refused": true
+          },
+          {
+            "attempt": "names bob's connection in the URL",
+            "http": 403,
+            "answer": "{\"error\":\"this session's token is not bound to that connection\"}",
+            "refused": true
+          },
+          {
+            "attempt": "a valid token for a session nobody connected",
+            "http": 200,
+            "answer": "{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"text\":\"No user has connected their account to this session, so there is nothing to act as. The user has to sign i",
+            "refused": true
+          },
+          {
+            "attempt": "the token, aimed at another connector",
+            "http": 401,
+            "answer": "{\"error\":\"unauthorized\"}",
+            "refused": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "scope-enforced",
+      "title": "A tool needing a scope the connection lacks is refused upstream",
+      "pass": true,
+      "started_ms": 1792862076148,
+      "ended_ms": 1792862082175,
+      "duration_ms": 6027,
+      "detail": "add_note needs notes:write; alice's connection was granted only notes:read. The notes service (not the broker, not the agent) refused it for the missing scope, the tool returned \"insufficient_scope… notes:write… not granted\", the model told the user, and no note was written (reading back shows none)",
+      "headline": {
+        "label": "add_note",
+        "value": "refused upstream",
+        "unit": ""
+      },
+      "measurements": {
+        "tool_error": "tool execution failed: insufficient_scope: add_note needs the notes:write scope, which this connection was not granted (it has: openid offline_access notes:read). The user would have to reconnect and approve it.",
+        "service_refusal": [
+          {
+            "needs": "notes:write",
+            "scope": [
+              "openid",
+              "offline_access",
+              "notes:read"
+            ],
+            "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+            "tool": "add_note",
+            "why": "scope"
+          }
+        ],
+        "model_reply": "The attempt to add the note \"buy milk\" failed because the connection lacks the necessary notes:write scope. The user would have to reconnect and approve it.",
+        "note_written": false
+      }
+    },
+    {
+      "name": "revocation",
+      "title": "After the user revokes, the next call says so and the session survives",
+      "pass": true,
+      "started_ms": 1792862082180,
+      "ended_ms": 1792862088085,
+      "duration_ms": 5905,
+      "detail": "the user revoked: the broker asked the provider to revoke the refresh token (RFC 7009) and proved it dead (using it gets invalid_grant), then erased the stored copy; alice's next call returned a plain message that the connection was revoked and the model relayed it; her session kept running (it answered afterwards), and bob's connection was untouched",
+      "headline": {
+        "label": "next call after revoke",
+        "value": "clear message",
+        "unit": ""
+      },
+      "measurements": {
+        "revocation": {
+          "refresh_after_revoke": "invalid_grant",
+          "revoked": true,
+          "upstream_revoked": true
+        },
+        "tool_message": "tool execution failed: The connection to this account is no longer active: the user revoked this connection. The user has to sign in again to reconnect it; nothing else is wrong and the session is fine.",
+        "model_reply": "The connection to this account is no longer active because the user revoked it. The user has to sign in again to reconnect; nothing else is wrong and the session is fine.",
+        "stored_after": {
+          "status": "revoked",
+          "refresh_token_stored": false
+        },
+        "session_survived": true,
+        "other_user_unaffected": true
+      }
+    },
+    {
+      "name": "teardown-zero",
+      "title": "Teardown leaves nothing behind",
+      "pass": true,
+      "status": "pass",
+      "detail": "every resource type counted 0 at 2026-10-24T17:20:26Z",
+      "measurements": {
+        "resource_types": 22,
+        "remaining": 0
+      },
+      "started_ms": null,
+      "ended_ms": null,
+      "headline": {
+        "label": "left behind",
+        "value": "0",
+        "unit": "resources"
+      }
+    }
+  ],
+  "timeline": [
+    {
+      "t_ms": 1792861883208,
+      "src": "demo",
+      "event": "run_started",
+      "path": null,
+      "detail": null
+    },
+    {
+      "t_ms": 1792861899062,
+      "src": "broker",
+      "event": "managed_refused",
+      "path": null,
+      "detail": {
+        "connector": "notes",
+        "reason": "no bearer token"
+      }
+    },
+    {
+      "t_ms": 1792861906026,
+      "src": "broker",
+      "event": "consent_started",
+      "path": null,
+      "detail": {
+        "connector": "notes",
+        "pkce": "S256",
+        "scope": "openid offline_access notes:read",
+        "tenant": "uc-oidc-1024171123"
+      }
+    },
+    {
+      "t_ms": 1792861906767,
+      "src": "broker",
+      "event": "connection_created",
+      "path": [
+        "you",
+        "idp"
+      ],
+      "detail": {
+        "access_ttl_s": 60,
+        "connection": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "refresh_sealed_bytes": 892,
+        "refresh_token_stored": "sealed",
+        "scope": "openid offline_access notes:read",
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tenant": "uc-oidc-1024171123",
+        "user": "alice"
+      }
+    },
+    {
+      "t_ms": 1792861906983,
+      "src": "broker",
+      "event": "consent_started",
+      "path": null,
+      "detail": {
+        "connector": "notes",
+        "pkce": "S256",
+        "scope": "openid offline_access notes:read",
+        "tenant": "uc-oidc-1024171123"
+      }
+    },
+    {
+      "t_ms": 1792861907566,
+      "src": "broker",
+      "event": "connection_created",
+      "path": [
+        "you",
+        "idp"
+      ],
+      "detail": {
+        "access_ttl_s": 60,
+        "connection": "conn_1n73cKx4l4BC",
+        "connector": "notes",
+        "refresh_sealed_bytes": 892,
+        "refresh_token_stored": "sealed",
+        "scope": "openid offline_access notes:read",
+        "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+        "tenant": "uc-oidc-1024171123",
+        "user": "bob"
+      }
+    },
+    {
+      "t_ms": 1792861907795,
+      "src": "broker",
+      "event": "session_bound",
+      "path": null,
+      "detail": {
+        "connection": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "session": "demo.u1024171123a",
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tenant": "uc-oidc-1024171123",
+        "user": "alice"
+      }
+    },
+    {
+      "t_ms": 1792861907894,
+      "src": "broker",
+      "event": "session_bound",
+      "path": null,
+      "detail": {
+        "connection": "conn_1n73cKx4l4BC",
+        "connector": "notes",
+        "session": "demo.u1024171123b",
+        "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+        "tenant": "uc-oidc-1024171123",
+        "user": "bob"
+      }
+    },
+    {
+      "t_ms": 1792861908084,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "method": "server/discover",
+        "session": "demo.u1024171123a",
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792861908086,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "method": "initialize",
+        "session": "demo.u1024171123a",
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792861908088,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "method": "notifications/initialized",
+        "session": "demo.u1024171123a",
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 202
+      }
+    },
+    {
+      "t_ms": 1792861908089,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "method": "tools/list",
+        "session": "demo.u1024171123a",
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792861908091,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "method": "resources/list",
+        "session": "demo.u1024171123a",
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792861908092,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "method": "prompts/list",
+        "session": "demo.u1024171123a",
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792861908301,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_1n73cKx4l4BC",
+        "connector": "notes",
+        "method": "server/discover",
+        "session": "demo.u1024171123b",
+        "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792861908303,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_1n73cKx4l4BC",
+        "connector": "notes",
+        "method": "initialize",
+        "session": "demo.u1024171123b",
+        "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792861908304,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_1n73cKx4l4BC",
+        "connector": "notes",
+        "method": "notifications/initialized",
+        "session": "demo.u1024171123b",
+        "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 202
+      }
+    },
+    {
+      "t_ms": 1792861908306,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_1n73cKx4l4BC",
+        "connector": "notes",
+        "method": "tools/list",
+        "session": "demo.u1024171123b",
+        "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792861908307,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_1n73cKx4l4BC",
+        "connector": "notes",
+        "method": "resources/list",
+        "session": "demo.u1024171123b",
+        "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792861908309,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_1n73cKx4l4BC",
+        "connector": "notes",
+        "method": "prompts/list",
+        "session": "demo.u1024171123b",
+        "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792861908414,
+      "src": "demo",
+      "event": "sessions_opened",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": null
+    },
+    {
+      "t_ms": 1792861914000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-38",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1186
+      }
+    },
+    {
+      "t_ms": 1792861914400,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1024171123a"
+      }
+    },
+    {
+      "t_ms": 1792861915000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-39",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1260
+      }
+    },
+    {
+      "t_ms": 1792861915074,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-38",
+        "output_tokens": 16,
+        "cost_micros": 500
+      }
+    },
+    {
+      "t_ms": 1792861915515,
+      "src": "resource",
+      "event": "resource_call",
+      "path": [
+        "broker",
+        "notes"
+      ],
+      "detail": {
+        "notes": 2,
+        "ref": "PR-109a0bc7",
+        "seen": {
+          "aud": "notes-api",
+          "azp": "notes-broker",
+          "exp": 1792861966,
+          "iat": 1792861906,
+          "iss": "http://oidc.oidc.local:8180/realms/demo",
+          "jti": "ofrtac:9b31d162-14de-cdcb-3816-17a780382799",
+          "scope": [
+            "openid",
+            "offline_access",
+            "notes:read"
+          ],
+          "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+          "tool": "my_notes",
+          "user": "alice"
+        }
+      }
+    },
+    {
+      "t_ms": 1792861915515,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "method": "tools/call",
+        "session": "demo.u1024171123a",
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792861915546,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123a",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792861915546,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123a",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792861916160,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-39",
+        "output_tokens": 32,
+        "cost_micros": 210
+      }
+    },
+    {
+      "t_ms": 1792861916725,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1024171123a"
+      }
+    },
+    {
+      "t_ms": 1792861917000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-3a",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 152
+      }
+    },
+    {
+      "t_ms": 1792861917522,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-3a",
+        "output_tokens": 5,
+        "cost_micros": 69
+      }
+    },
+    {
+      "t_ms": 1792861922507,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1024171123a"
+      }
+    },
+    {
+      "t_ms": 1792861923000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-3b",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1380
+      }
+    },
+    {
+      "t_ms": 1792861923000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-3c",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1411
+      }
+    },
+    {
+      "t_ms": 1792861923429,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1024171123a"
+      }
+    },
+    {
+      "t_ms": 1792861923532,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1024171123a"
+      }
+    },
+    {
+      "t_ms": 1792861923854,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-3b",
+        "output_tokens": 17,
+        "cost_micros": 234
+      }
+    },
+    {
+      "t_ms": 1792861924000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-3d",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1485
+      }
+    },
+    {
+      "t_ms": 1792861924111,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-3c",
+        "output_tokens": 16,
+        "cost_micros": 206
+      }
+    },
+    {
+      "t_ms": 1792861924679,
+      "src": "resource",
+      "event": "resource_call",
+      "path": [
+        "broker",
+        "notes"
+      ],
+      "detail": {
+        "notes": 2,
+        "ref": "PR-109a0bc7",
+        "seen": {
+          "aud": "notes-api",
+          "azp": "notes-broker",
+          "exp": 1792861966,
+          "iat": 1792861906,
+          "iss": "http://oidc.oidc.local:8180/realms/demo",
+          "jti": "ofrtac:9b31d162-14de-cdcb-3816-17a780382799",
+          "scope": [
+            "openid",
+            "offline_access",
+            "notes:read"
+          ],
+          "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+          "tool": "my_notes",
+          "user": "alice"
+        }
+      }
+    },
+    {
+      "t_ms": 1792861924680,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "method": "tools/call",
+        "session": "demo.u1024171123a",
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792861924709,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123a",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792861924710,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123a",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792861925003,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-3d",
+        "output_tokens": 31,
+        "cost_micros": 644
+      }
+    },
+    {
+      "t_ms": 1792861925717,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1024171123a"
+      }
+    },
+    {
+      "t_ms": 1792861925832,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1024171123b"
+      }
+    },
+    {
+      "t_ms": 1792861926000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-3e",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1179
+      }
+    },
+    {
+      "t_ms": 1792861926609,
+      "src": "resource",
+      "event": "resource_call",
+      "path": [
+        "broker",
+        "notes"
+      ],
+      "detail": {
+        "notes": 2,
+        "ref": "PR-41a93904",
+        "seen": {
+          "aud": "notes-api",
+          "azp": "notes-broker",
+          "exp": 1792861967,
+          "iat": 1792861907,
+          "iss": "http://oidc.oidc.local:8180/realms/demo",
+          "jti": "ofrtac:e8c2e0a3-4c5d-fb6b-2e44-85e94477d29f",
+          "scope": [
+            "openid",
+            "offline_access",
+            "notes:read"
+          ],
+          "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+          "tool": "my_notes",
+          "user": "bob"
+        }
+      }
+    },
+    {
+      "t_ms": 1792861926609,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_1n73cKx4l4BC",
+        "connector": "notes",
+        "method": "tools/call",
+        "session": "demo.u1024171123b",
+        "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792861926635,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123b",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792861926635,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123b",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792861926740,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-3e",
+        "output_tokens": 16,
+        "cost_micros": 497
+      }
+    },
+    {
+      "t_ms": 1792861927000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-3f",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1252
+      }
+    },
+    {
+      "t_ms": 1792861927000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-40",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 147
+      }
+    },
+    {
+      "t_ms": 1792861927521,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1024171123b"
+      }
+    },
+    {
+      "t_ms": 1792861927527,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-40",
+        "output_tokens": 5,
+        "cost_micros": 67
+      }
+    },
+    {
+      "t_ms": 1792861927843,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-3f",
+        "output_tokens": 34,
+        "cost_micros": 248
+      }
+    },
+    {
+      "t_ms": 1792861985433,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1024171123b"
+      }
+    },
+    {
+      "t_ms": 1792861986000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-41",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1300
+      }
+    },
+    {
+      "t_ms": 1792861986271,
+      "src": "broker",
+      "event": "token_refreshed",
+      "path": [
+        "broker",
+        "idp"
+      ],
+      "detail": {
+        "access_ttl_s": 60,
+        "connection": "conn_1n73cKx4l4BC",
+        "forced": false,
+        "refresh_rotated": true,
+        "refreshes": 1,
+        "sub": "22222222-bbbb-4bbb-8bbb-222222222222"
+      }
+    },
+    {
+      "t_ms": 1792861986272,
+      "src": "resource",
+      "event": "resource_call",
+      "path": [
+        "broker",
+        "notes"
+      ],
+      "detail": {
+        "notes": 2,
+        "ref": "PR-41a93904",
+        "seen": {
+          "aud": "notes-api",
+          "azp": "notes-broker",
+          "exp": 1792862046,
+          "iat": 1792861986,
+          "iss": "http://oidc.oidc.local:8180/realms/demo",
+          "jti": "ofrtrt:74b7ad41-645e-e493-70fe-cb0b58baa1e6",
+          "scope": [
+            "openid",
+            "offline_access",
+            "notes:read"
+          ],
+          "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+          "tool": "my_notes",
+          "user": "bob"
+        }
+      }
+    },
+    {
+      "t_ms": 1792861986272,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_1n73cKx4l4BC",
+        "connector": "notes",
+        "method": "tools/call",
+        "session": "demo.u1024171123b",
+        "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792861986274,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123b",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792861986312,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123b",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792861986771,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-41",
+        "output_tokens": 16,
+        "cost_micros": 200
+      }
+    },
+    {
+      "t_ms": 1792861987000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-42",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1373
+      }
+    },
+    {
+      "t_ms": 1792861987320,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1024171123b"
+      }
+    },
+    {
+      "t_ms": 1792861987990,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-42",
+        "output_tokens": 34,
+        "cost_micros": 604
+      }
+    },
+    {
+      "t_ms": 1792862052860,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1024171123b"
+      }
+    },
+    {
+      "t_ms": 1792862052869,
+      "src": "broker",
+      "event": "token_refreshed",
+      "path": [
+        "broker",
+        "idp"
+      ],
+      "detail": {
+        "access_ttl_s": 60,
+        "connection": "conn_1n73cKx4l4BC",
+        "forced": false,
+        "refresh_rotated": true,
+        "refreshes": 2,
+        "sub": "22222222-bbbb-4bbb-8bbb-222222222222"
+      }
+    },
+    {
+      "t_ms": 1792862052871,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_1n73cKx4l4BC",
+        "connector": "notes",
+        "method": "server/discover",
+        "session": "demo.u1024171123b",
+        "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792862052874,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_1n73cKx4l4BC",
+        "connector": "notes",
+        "method": "initialize",
+        "session": "demo.u1024171123b",
+        "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792862052876,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_1n73cKx4l4BC",
+        "connector": "notes",
+        "method": "notifications/initialized",
+        "session": "demo.u1024171123b",
+        "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 202
+      }
+    },
+    {
+      "t_ms": 1792862052877,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_1n73cKx4l4BC",
+        "connector": "notes",
+        "method": "tools/list",
+        "session": "demo.u1024171123b",
+        "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792862052879,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_1n73cKx4l4BC",
+        "connector": "notes",
+        "method": "resources/list",
+        "session": "demo.u1024171123b",
+        "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792862052882,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_1n73cKx4l4BC",
+        "connector": "notes",
+        "method": "prompts/list",
+        "session": "demo.u1024171123b",
+        "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792862053000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-43",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1422
+      }
+    },
+    {
+      "t_ms": 1792862053908,
+      "src": "resource",
+      "event": "resource_call",
+      "path": [
+        "broker",
+        "notes"
+      ],
+      "detail": {
+        "notes": 2,
+        "ref": "PR-41a93904",
+        "seen": {
+          "aud": "notes-api",
+          "azp": "notes-broker",
+          "exp": 1792862112,
+          "iat": 1792862052,
+          "iss": "http://oidc.oidc.local:8180/realms/demo",
+          "jti": "ofrtrt:eabb4fd4-ae3a-40c9-f011-99d074c41de3",
+          "scope": [
+            "openid",
+            "offline_access",
+            "notes:read"
+          ],
+          "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+          "tool": "my_notes",
+          "user": "bob"
+        }
+      }
+    },
+    {
+      "t_ms": 1792862053908,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_1n73cKx4l4BC",
+        "connector": "notes",
+        "method": "tools/call",
+        "session": "demo.u1024171123b",
+        "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792862053958,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123b",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792862053958,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123b",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792862053985,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-43",
+        "output_tokens": 16,
+        "cost_micros": 210
+      }
+    },
+    {
+      "t_ms": 1792862054000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-44",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1495
+      }
+    },
+    {
+      "t_ms": 1792862054950,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1024171123b"
+      }
+    },
+    {
+      "t_ms": 1792862054984,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-44",
+        "output_tokens": 28,
+        "cost_micros": 259
+      }
+    },
+    {
+      "t_ms": 1792862062673,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1024171123a"
+      }
+    },
+    {
+      "t_ms": 1792862062685,
+      "src": "broker",
+      "event": "token_refreshed",
+      "path": [
+        "broker",
+        "idp"
+      ],
+      "detail": {
+        "access_ttl_s": 60,
+        "connection": "conn_HUJ8FIc_VYHO",
+        "forced": false,
+        "refresh_rotated": true,
+        "refreshes": 1,
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111"
+      }
+    },
+    {
+      "t_ms": 1792862062686,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "method": "server/discover",
+        "session": "demo.u1024171123a",
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792862062688,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "method": "initialize",
+        "session": "demo.u1024171123a",
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792862062689,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "method": "notifications/initialized",
+        "session": "demo.u1024171123a",
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 202
+      }
+    },
+    {
+      "t_ms": 1792862062691,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "method": "tools/list",
+        "session": "demo.u1024171123a",
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792862062693,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "method": "resources/list",
+        "session": "demo.u1024171123a",
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792862062695,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "method": "prompts/list",
+        "session": "demo.u1024171123a",
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792862063000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-45",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1530
+      }
+    },
+    {
+      "t_ms": 1792862063000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-46",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1604
+      }
+    },
+    {
+      "t_ms": 1792862063641,
+      "src": "resource",
+      "event": "resource_call",
+      "path": [
+        "broker",
+        "notes"
+      ],
+      "detail": {
+        "notes": 2,
+        "ref": "PR-109a0bc7",
+        "seen": {
+          "aud": "notes-api",
+          "azp": "notes-broker",
+          "exp": 1792862122,
+          "iat": 1792862062,
+          "iss": "http://oidc.oidc.local:8180/realms/demo",
+          "jti": "ofrtrt:8344d5b2-92fc-965f-2852-1413b2add45e",
+          "scope": [
+            "openid",
+            "offline_access",
+            "notes:read"
+          ],
+          "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+          "tool": "my_notes",
+          "user": "alice"
+        }
+      }
+    },
+    {
+      "t_ms": 1792862063641,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "method": "tools/call",
+        "session": "demo.u1024171123a",
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792862063682,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123a",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792862063682,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123a",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792862063905,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-45",
+        "output_tokens": 16,
+        "cost_micros": 215
+      }
+    },
+    {
+      "t_ms": 1792862064045,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-46",
+        "output_tokens": 31,
+        "cost_micros": 269
+      }
+    },
+    {
+      "t_ms": 1792862064743,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1024171123a"
+      }
+    },
+    {
+      "t_ms": 1792862064840,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1024171123b"
+      }
+    },
+    {
+      "t_ms": 1792862065000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-47",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1537
+      }
+    },
+    {
+      "t_ms": 1792862065621,
+      "src": "resource",
+      "event": "resource_call",
+      "path": [
+        "broker",
+        "notes"
+      ],
+      "detail": {
+        "notes": 2,
+        "ref": "PR-41a93904",
+        "seen": {
+          "aud": "notes-api",
+          "azp": "notes-broker",
+          "exp": 1792862112,
+          "iat": 1792862052,
+          "iss": "http://oidc.oidc.local:8180/realms/demo",
+          "jti": "ofrtrt:eabb4fd4-ae3a-40c9-f011-99d074c41de3",
+          "scope": [
+            "openid",
+            "offline_access",
+            "notes:read"
+          ],
+          "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+          "tool": "my_notes",
+          "user": "bob"
+        }
+      }
+    },
+    {
+      "t_ms": 1792862065621,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_1n73cKx4l4BC",
+        "connector": "notes",
+        "method": "tools/call",
+        "session": "demo.u1024171123b",
+        "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792862065647,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123b",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792862065647,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123b",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792862065738,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-47",
+        "output_tokens": 16,
+        "cost_micros": 218
+      }
+    },
+    {
+      "t_ms": 1792862066000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-48",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1610
+      }
+    },
+    {
+      "t_ms": 1792862066629,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1024171123b"
+      }
+    },
+    {
+      "t_ms": 1792862066945,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-48",
+        "output_tokens": 37,
+        "cost_micros": 281
+      }
+    },
+    {
+      "t_ms": 1792862073625,
+      "src": "broker",
+      "event": "managed_refused",
+      "path": null,
+      "detail": {
+        "asked_for": "conn_1n73cKx4l4BC",
+        "bound": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "reason": "request named a connection this session is not bound to",
+        "session": "demo.u1024171123a",
+        "tenant": "uc-oidc-1024171123"
+      }
+    },
+    {
+      "t_ms": 1792862073730,
+      "src": "broker",
+      "event": "managed_refused",
+      "path": null,
+      "detail": {
+        "asked_for": "conn_1n73cKx4l4BC",
+        "bound": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "reason": "request named a connection this session is not bound to",
+        "session": "demo.u1024171123a",
+        "tenant": "uc-oidc-1024171123"
+      }
+    },
+    {
+      "t_ms": 1792862073836,
+      "src": "broker",
+      "event": "managed_refused",
+      "path": null,
+      "detail": {
+        "connector": "notes",
+        "reason": "no connection bound to this session",
+        "session": "demo.u1024171123z",
+        "tenant": "uc-oidc-1024171123"
+      }
+    },
+    {
+      "t_ms": 1792862073941,
+      "src": "broker",
+      "event": "managed_refused",
+      "path": null,
+      "detail": {
+        "connector": "other",
+        "reason": "token names another connector"
+      }
+    },
+    {
+      "t_ms": 1792862074171,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1024171123a"
+      }
+    },
+    {
+      "t_ms": 1792862075000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-49",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1659
+      }
+    },
+    {
+      "t_ms": 1792862075122,
+      "src": "resource",
+      "event": "resource_refused",
+      "path": null,
+      "detail": {
+        "asked_for": "bob",
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "why": "another user's notes"
+      }
+    },
+    {
+      "t_ms": 1792862075122,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "method": "tools/call",
+        "session": "demo.u1024171123a",
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792862075171,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123a",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792862075171,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123a",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792862075913,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-49",
+        "output_tokens": 20,
+        "cost_micros": 312
+      }
+    },
+    {
+      "t_ms": 1792862076000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-4a",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1713
+      }
+    },
+    {
+      "t_ms": 1792862076112,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1024171123a"
+      }
+    },
+    {
+      "t_ms": 1792862076241,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1024171123a"
+      }
+    },
+    {
+      "t_ms": 1792862076933,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-4a",
+        "output_tokens": 33,
+        "cost_micros": 277
+      }
+    },
+    {
+      "t_ms": 1792862077000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-4b",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1771
+      }
+    },
+    {
+      "t_ms": 1792862077000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-4c",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1846
+      }
+    },
+    {
+      "t_ms": 1792862077253,
+      "src": "resource",
+      "event": "resource_refused",
+      "path": null,
+      "detail": {
+        "needs": "notes:write",
+        "scope": [
+          "openid",
+          "offline_access",
+          "notes:read"
+        ],
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tool": "add_note",
+        "why": "scope"
+      }
+    },
+    {
+      "t_ms": 1792862077254,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "method": "tools/call",
+        "session": "demo.u1024171123a",
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792862077275,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123a",
+        "name": "mcp__notes__add_note"
+      }
+    },
+    {
+      "t_ms": 1792862077275,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123a",
+        "name": "mcp__notes__add_note"
+      }
+    },
+    {
+      "t_ms": 1792862077975,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-4b",
+        "output_tokens": 21,
+        "cost_micros": 281
+      }
+    },
+    {
+      "t_ms": 1792862078090,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-4c",
+        "output_tokens": 34,
+        "cost_micros": 294
+      }
+    },
+    {
+      "t_ms": 1792862078409,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1024171123a"
+      }
+    },
+    {
+      "t_ms": 1792862080112,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1024171123a"
+      }
+    },
+    {
+      "t_ms": 1792862081000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-4d",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1894
+      }
+    },
+    {
+      "t_ms": 1792862081000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-4e",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1968
+      }
+    },
+    {
+      "t_ms": 1792862081088,
+      "src": "resource",
+      "event": "resource_call",
+      "path": [
+        "broker",
+        "notes"
+      ],
+      "detail": {
+        "notes": 2,
+        "ref": "PR-109a0bc7",
+        "seen": {
+          "aud": "notes-api",
+          "azp": "notes-broker",
+          "exp": 1792862122,
+          "iat": 1792862062,
+          "iss": "http://oidc.oidc.local:8180/realms/demo",
+          "jti": "ofrtrt:8344d5b2-92fc-965f-2852-1413b2add45e",
+          "scope": [
+            "openid",
+            "offline_access",
+            "notes:read"
+          ],
+          "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+          "tool": "my_notes",
+          "user": "alice"
+        }
+      }
+    },
+    {
+      "t_ms": 1792862081088,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "method": "tools/call",
+        "session": "demo.u1024171123a",
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792862081137,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123a",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792862081137,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123a",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792862081934,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-4d",
+        "output_tokens": 16,
+        "cost_micros": 783
+      }
+    },
+    {
+      "t_ms": 1792862082000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-4f",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 2013
+      }
+    },
+    {
+      "t_ms": 1792862082017,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-4e",
+        "output_tokens": 31,
+        "cost_micros": 299
+      }
+    },
+    {
+      "t_ms": 1792862082147,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1024171123a"
+      }
+    },
+    {
+      "t_ms": 1792862082282,
+      "src": "broker",
+      "event": "connection_revoked",
+      "path": null,
+      "detail": {
+        "connection": "conn_HUJ8FIc_VYHO",
+        "result": {
+          "refresh_after_revoke": "invalid_grant",
+          "revoked": true,
+          "upstream_revoked": true
+        },
+        "sub": "11111111-aaaa-4aaa-8aaa-111111111111",
+        "tenant": "uc-oidc-1024171123"
+      }
+    },
+    {
+      "t_ms": 1792862082404,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1024171123a"
+      }
+    },
+    {
+      "t_ms": 1792862083000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-50",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 2080
+      }
+    },
+    {
+      "t_ms": 1792862083114,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-4f",
+        "output_tokens": 16,
+        "cost_micros": 332
+      }
+    },
+    {
+      "t_ms": 1792862083557,
+      "src": "broker",
+      "event": "managed_refused",
+      "path": null,
+      "detail": {
+        "connection": "conn_HUJ8FIc_VYHO",
+        "connector": "notes",
+        "reason": "the user revoked this connection",
+        "session": "demo.u1024171123a",
+        "tenant": "uc-oidc-1024171123"
+      }
+    },
+    {
+      "t_ms": 1792862083608,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123a",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792862083608,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123a",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792862084295,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-50",
+        "output_tokens": 37,
+        "cost_micros": 315
+      }
+    },
+    {
+      "t_ms": 1792862084903,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1024171123a"
+      }
+    },
+    {
+      "t_ms": 1792862085000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-51",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 2137
+      }
+    },
+    {
+      "t_ms": 1792862085214,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1024171123a"
+      }
+    },
+    {
+      "t_ms": 1792862085684,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-51",
+        "output_tokens": 3,
+        "cost_micros": 284
+      }
+    },
+    {
+      "t_ms": 1792862085983,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1024171123a"
+      }
+    },
+    {
+      "t_ms": 1792862086000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-52",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1661
+      }
+    },
+    {
+      "t_ms": 1792862086090,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1024171123b"
+      }
+    },
+    {
+      "t_ms": 1792862086811,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-52",
+        "output_tokens": 16,
+        "cost_micros": 229
+      }
+    },
+    {
+      "t_ms": 1792862086940,
+      "src": "resource",
+      "event": "resource_call",
+      "path": [
+        "broker",
+        "notes"
+      ],
+      "detail": {
+        "notes": 2,
+        "ref": "PR-41a93904",
+        "seen": {
+          "aud": "notes-api",
+          "azp": "notes-broker",
+          "exp": 1792862112,
+          "iat": 1792862052,
+          "iss": "http://oidc.oidc.local:8180/realms/demo",
+          "jti": "ofrtrt:eabb4fd4-ae3a-40c9-f011-99d074c41de3",
+          "scope": [
+            "openid",
+            "offline_access",
+            "notes:read"
+          ],
+          "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+          "tool": "my_notes",
+          "user": "bob"
+        }
+      }
+    },
+    {
+      "t_ms": 1792862086941,
+      "src": "broker",
+      "event": "managed_call",
+      "path": [
+        "agent",
+        "broker"
+      ],
+      "detail": {
+        "connection": "conn_1n73cKx4l4BC",
+        "connector": "notes",
+        "method": "tools/call",
+        "session": "demo.u1024171123b",
+        "sub": "22222222-bbbb-4bbb-8bbb-222222222222",
+        "tenant": "uc-oidc-1024171123",
+        "upstream_status": 200
+      }
+    },
+    {
+      "t_ms": 1792862086989,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123b",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792862086989,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024171123b",
+        "name": "mcp__notes__my_notes"
+      }
+    },
+    {
+      "t_ms": 1792862087000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-53",
+        "model": "gpt-4.1-mini",
+        "input_tokens": 1734
+      }
+    },
+    {
+      "t_ms": 1792862087922,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "b7a88aa517f7e029-53",
+        "output_tokens": 29,
+        "cost_micros": 279
+      }
+    },
+    {
+      "t_ms": 1792862087940,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1024171123b"
+      }
+    },
+    {
+      "t_ms": 1792862088105,
+      "src": "demo",
+      "event": "run_finished",
+      "path": null,
+      "detail": null
+    }
+  ],
+  "conversation": [
+    {
+      "t_ms": 1792861914400,
+      "session": "demo.u1024171123a",
+      "role": "user",
+      "text": "List my notes with your notes tool and quote the passport renewal reference exactly."
+    },
+    {
+      "t_ms": 1792861915546,
+      "session": "demo.u1024171123a",
+      "role": "tool",
+      "name": "mcp__notes__my_notes",
+      "input": "{}",
+      "output": "notes for 11111111-aaaa-4aaa-8aaa-111111111111 (alice):\n- alice: passport renewal, reference PR-109a0bc7\n- alice: dentist on Friday at 09:00",
+      "end_ms": 1792861915546
+    },
+    {
+      "t_ms": 1792861916368,
+      "session": "demo.u1024171123a",
+      "role": "assistant",
+      "text": "Your notes include \"passport renewal, reference PR-109a0bc7\" exactly. Would you like me to do anything else with this note?"
+    },
+    {
+      "t_ms": 1792861922507,
+      "session": "demo.u1024171123a",
+      "role": "user",
+      "text": "Do not use any tool. This is a format question only: is eyJhbGciOiJSUzI1NiJ9.eyJjdHJsIjoicGxhbnRlZCJ9.vyHJ2SIyhGrEtCc0YEQDi4iwjR3zi9WDy3dnPwcSZH- a valid JWT? Answer in one short sentence."
+    },
+    {
+      "t_ms": 1792861923158,
+      "session": "demo.u1024171123a",
+      "role": "assistant",
+      "text": "Yes, it has the correct three-part dot-separated format for a JWT."
+    },
+    {
+      "t_ms": 1792861923532,
+      "session": "demo.u1024171123a",
+      "role": "user",
+      "text": "List my notes with your notes tool."
+    },
+    {
+      "t_ms": 1792861924709,
+      "session": "demo.u1024171123a",
+      "role": "tool",
+      "name": "mcp__notes__my_notes",
+      "input": "{}",
+      "output": "notes for 11111111-aaaa-4aaa-8aaa-111111111111 (alice):\n- alice: passport renewal, reference PR-109a0bc7\n- alice: dentist on Friday at 09:00",
+      "end_ms": 1792861924710
+    },
+    {
+      "t_ms": 1792861925387,
+      "session": "demo.u1024171123a",
+      "role": "assistant",
+      "text": "Your notes are: \"passport renewal, reference PR-109a0bc7\" and \"dentist on Friday at 09:00\"."
+    },
+    {
+      "t_ms": 1792861925832,
+      "session": "demo.u1024171123b",
+      "role": "user",
+      "text": "List my notes with your notes tool."
+    },
+    {
+      "t_ms": 1792861926635,
+      "session": "demo.u1024171123b",
+      "role": "tool",
+      "name": "mcp__notes__my_notes",
+      "input": "{}",
+      "output": "notes for 22222222-bbbb-4bbb-8bbb-222222222222 (bob):\n- bob: passport renewal, reference PR-41a93904\n- bob: dentist on Friday at 09:00",
+      "end_ms": 1792861926635
+    },
+    {
+      "t_ms": 1792861927218,
+      "session": "demo.u1024171123b",
+      "role": "assistant",
+      "text": "You have two notes: 1) passport renewal with reference PR-41a93904, 2) dentist appointment on Friday at 09:00."
+    },
+    {
+      "t_ms": 1792861985433,
+      "session": "demo.u1024171123b",
+      "role": "user",
+      "text": "List my notes with your notes tool."
+    },
+    {
+      "t_ms": 1792861986274,
+      "session": "demo.u1024171123b",
+      "role": "tool",
+      "name": "mcp__notes__my_notes",
+      "input": "{}",
+      "output": "notes for 22222222-bbbb-4bbb-8bbb-222222222222 (bob):\n- bob: passport renewal, reference PR-41a93904\n- bob: dentist on Friday at 09:00",
+      "end_ms": 1792861986312
+    },
+    {
+      "t_ms": 1792861986980,
+      "session": "demo.u1024171123b",
+      "role": "assistant",
+      "text": "You have two notes: one about passport renewal with reference PR-41a93904, and another about a dentist appointment on Friday at 09:00."
+    },
+    {
+      "t_ms": 1792862052860,
+      "session": "demo.u1024171123b",
+      "role": "user",
+      "text": "List my notes with your notes tool again."
+    },
+    {
+      "t_ms": 1792862053958,
+      "session": "demo.u1024171123b",
+      "role": "tool",
+      "name": "mcp__notes__my_notes",
+      "input": "{}",
+      "output": "notes for 22222222-bbbb-4bbb-8bbb-222222222222 (bob):\n- bob: passport renewal, reference PR-41a93904\n- bob: dentist on Friday at 09:00",
+      "end_ms": 1792862053958
+    },
+    {
+      "t_ms": 1792862054576,
+      "session": "demo.u1024171123b",
+      "role": "assistant",
+      "text": "Your notes are: passport renewal with reference PR-41a93904 and a dentist appointment on Friday at 09:00."
+    },
+    {
+      "t_ms": 1792862062673,
+      "session": "demo.u1024171123a",
+      "role": "user",
+      "text": "List my notes with your notes tool."
+    },
+    {
+      "t_ms": 1792862063682,
+      "session": "demo.u1024171123a",
+      "role": "tool",
+      "name": "mcp__notes__my_notes",
+      "input": "{}",
+      "output": "notes for 11111111-aaaa-4aaa-8aaa-111111111111 (alice):\n- alice: passport renewal, reference PR-109a0bc7\n- alice: dentist on Friday at 09:00",
+      "end_ms": 1792862063682
+    },
+    {
+      "t_ms": 1792862064399,
+      "session": "demo.u1024171123a",
+      "role": "assistant",
+      "text": "Your notes are: \"passport renewal, reference PR-109a0bc7\" and \"dentist on Friday at 09:00\"."
+    },
+    {
+      "t_ms": 1792862064840,
+      "session": "demo.u1024171123b",
+      "role": "user",
+      "text": "List my notes with your notes tool."
+    },
+    {
+      "t_ms": 1792862065647,
+      "session": "demo.u1024171123b",
+      "role": "tool",
+      "name": "mcp__notes__my_notes",
+      "input": "{}",
+      "output": "notes for 22222222-bbbb-4bbb-8bbb-222222222222 (bob):\n- bob: passport renewal, reference PR-41a93904\n- bob: dentist on Friday at 09:00",
+      "end_ms": 1792862065647
+    },
+    {
+      "t_ms": 1792862066303,
+      "session": "demo.u1024171123b",
+      "role": "assistant",
+      "text": "You have two notes: one is about passport renewal with reference PR-41a93904, and the other is about a dentist appointment on Friday at 09:00."
+    },
+    {
+      "t_ms": 1792862074171,
+      "session": "demo.u1024171123a",
+      "role": "user",
+      "text": "Call my_notes with the owner argument set to bob, and tell me what it says."
+    },
+    {
+      "t_ms": 1792862075171,
+      "session": "demo.u1024171123a",
+      "role": "tool",
+      "name": "mcp__notes__my_notes",
+      "input": "{\"owner\":\"bob\"}",
+      "output": "tool execution failed: forbidden: you are signed in as alice; you can only read your own notes, not bob's",
+      "end_ms": 1792862075171
+    },
+    {
+      "t_ms": 1792862075757,
+      "session": "demo.u1024171123a",
+      "role": "assistant",
+      "text": "You are signed in as alice and can only read your own notes, not bob's. The attempt to get notes with owner set to bob was forbidden."
+    },
+    {
+      "t_ms": 1792862076241,
+      "session": "demo.u1024171123a",
+      "role": "user",
+      "text": "Use your add_note tool to add the note: buy milk. Then say exactly what happened."
+    },
+    {
+      "t_ms": 1792862077275,
+      "session": "demo.u1024171123a",
+      "role": "tool",
+      "name": "mcp__notes__add_note",
+      "input": "{\"text\":\"buy milk\"}",
+      "output": "tool execution failed: insufficient_scope: add_note needs the notes:write scope, which this connection was not granted (it has: openid offline_access notes:read). The user would have to reconnect and approve it.",
+      "end_ms": 1792862077275
+    },
+    {
+      "t_ms": 1792862078018,
+      "session": "demo.u1024171123a",
+      "role": "assistant",
+      "text": "The attempt to add the note \"buy milk\" failed because the connection lacks the necessary notes:write scope. The user would have to reconnect and approve it."
+    },
+    {
+      "t_ms": 1792862080112,
+      "session": "demo.u1024171123a",
+      "role": "user",
+      "text": "List my notes with your notes tool."
+    },
+    {
+      "t_ms": 1792862081137,
+      "session": "demo.u1024171123a",
+      "role": "tool",
+      "name": "mcp__notes__my_notes",
+      "input": "{}",
+      "output": "notes for 11111111-aaaa-4aaa-8aaa-111111111111 (alice):\n- alice: passport renewal, reference PR-109a0bc7\n- alice: dentist on Friday at 09:00",
+      "end_ms": 1792862081137
+    },
+    {
+      "t_ms": 1792862081788,
+      "session": "demo.u1024171123a",
+      "role": "assistant",
+      "text": "Your notes are: \"passport renewal, reference PR-109a0bc7\" and \"dentist on Friday at 09:00\"."
+    },
+    {
+      "t_ms": 1792862082404,
+      "session": "demo.u1024171123a",
+      "role": "user",
+      "text": "List my notes with your notes tool."
+    },
+    {
+      "t_ms": 1792862083608,
+      "session": "demo.u1024171123a",
+      "role": "tool",
+      "name": "mcp__notes__my_notes",
+      "input": "{}",
+      "output": "tool execution failed: The connection to this account is no longer active: the user revoked this connection. The user has to sign in again to reconnect it; nothing else is wrong and the session is fine.",
+      "end_ms": 1792862083608
+    },
+    {
+      "t_ms": 1792862084445,
+      "session": "demo.u1024171123a",
+      "role": "assistant",
+      "text": "The connection to this account is no longer active because the user revoked it. The user has to sign in again to reconnect; nothing else is wrong and the session is fine."
+    },
+    {
+      "t_ms": 1792862085214,
+      "session": "demo.u1024171123a",
+      "role": "user",
+      "text": "Do not use any tool. Reply with the single word: alive."
+    },
+    {
+      "t_ms": 1792862085873,
+      "session": "demo.u1024171123a",
+      "role": "assistant",
+      "text": "alive"
+    },
+    {
+      "t_ms": 1792862086090,
+      "session": "demo.u1024171123b",
+      "role": "user",
+      "text": "List my notes with your notes tool."
+    },
+    {
+      "t_ms": 1792862086989,
+      "session": "demo.u1024171123b",
+      "role": "tool",
+      "name": "mcp__notes__my_notes",
+      "input": "{}",
+      "output": "notes for 22222222-bbbb-4bbb-8bbb-222222222222 (bob):\n- bob: passport renewal, reference PR-41a93904\n- bob: dentist on Friday at 09:00",
+      "end_ms": 1792862086989
+    },
+    {
+      "t_ms": 1792862087642,
+      "session": "demo.u1024171123b",
+      "role": "assistant",
+      "text": "Your current notes are: passport renewal with reference PR-41a93904, and dentist appointment on Friday at 09:00."
+    }
+  ],
+  "billing": {
+    "rows": [
+      {
+        "request_id": "b7a88aa517f7e029-38",
+        "t_ms": 1792861914000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1186,
+        "output_tokens": 16,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 500,
+        "price_micros": 500,
+        "latency_ms": 1074
+      },
+      {
+        "request_id": "b7a88aa517f7e029-39",
+        "t_ms": 1792861915000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1260,
+        "output_tokens": 32,
+        "cache_read_tokens": 1152,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 210,
+        "price_micros": 210,
+        "latency_ms": 1160
+      },
+      {
+        "request_id": "b7a88aa517f7e029-3a",
+        "t_ms": 1792861917000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 152,
+        "output_tokens": 5,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 69,
+        "price_micros": 69,
+        "latency_ms": 522
+      },
+      {
+        "request_id": "b7a88aa517f7e029-3b",
+        "t_ms": 1792861923000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1380,
+        "output_tokens": 17,
+        "cache_read_tokens": 1152,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 234,
+        "price_micros": 234,
+        "latency_ms": 854
+      },
+      {
+        "request_id": "b7a88aa517f7e029-3c",
+        "t_ms": 1792861923000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1411,
+        "output_tokens": 16,
+        "cache_read_tokens": 1280,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 206,
+        "price_micros": 206,
+        "latency_ms": 1111
+      },
+      {
+        "request_id": "b7a88aa517f7e029-3d",
+        "t_ms": 1792861924000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1485,
+        "output_tokens": 31,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 644,
+        "price_micros": 644,
+        "latency_ms": 1003
+      },
+      {
+        "request_id": "b7a88aa517f7e029-3e",
+        "t_ms": 1792861926000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1179,
+        "output_tokens": 16,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 497,
+        "price_micros": 497,
+        "latency_ms": 740
+      },
+      {
+        "request_id": "b7a88aa517f7e029-3f",
+        "t_ms": 1792861927000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1252,
+        "output_tokens": 34,
+        "cache_read_tokens": 1024,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 248,
+        "price_micros": 248,
+        "latency_ms": 843
+      },
+      {
+        "request_id": "b7a88aa517f7e029-40",
+        "t_ms": 1792861927000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 147,
+        "output_tokens": 5,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 67,
+        "price_micros": 67,
+        "latency_ms": 527
+      },
+      {
+        "request_id": "b7a88aa517f7e029-41",
+        "t_ms": 1792861986000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1300,
+        "output_tokens": 16,
+        "cache_read_tokens": 1152,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 200,
+        "price_micros": 200,
+        "latency_ms": 771
+      },
+      {
+        "request_id": "b7a88aa517f7e029-42",
+        "t_ms": 1792861987000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1373,
+        "output_tokens": 34,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 604,
+        "price_micros": 604,
+        "latency_ms": 990
+      },
+      {
+        "request_id": "b7a88aa517f7e029-43",
+        "t_ms": 1792862053000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1422,
+        "output_tokens": 16,
+        "cache_read_tokens": 1280,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 210,
+        "price_micros": 210,
+        "latency_ms": 985
+      },
+      {
+        "request_id": "b7a88aa517f7e029-44",
+        "t_ms": 1792862054000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1495,
+        "output_tokens": 28,
+        "cache_read_tokens": 1280,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 259,
+        "price_micros": 259,
+        "latency_ms": 984
+      },
+      {
+        "request_id": "b7a88aa517f7e029-45",
+        "t_ms": 1792862063000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1530,
+        "output_tokens": 16,
+        "cache_read_tokens": 1408,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 215,
+        "price_micros": 215,
+        "latency_ms": 905
+      },
+      {
+        "request_id": "b7a88aa517f7e029-46",
+        "t_ms": 1792862063000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1604,
+        "output_tokens": 31,
+        "cache_read_tokens": 1408,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 269,
+        "price_micros": 269,
+        "latency_ms": 1045
+      },
+      {
+        "request_id": "b7a88aa517f7e029-47",
+        "t_ms": 1792862065000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1537,
+        "output_tokens": 16,
+        "cache_read_tokens": 1408,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 218,
+        "price_micros": 218,
+        "latency_ms": 738
+      },
+      {
+        "request_id": "b7a88aa517f7e029-48",
+        "t_ms": 1792862066000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1610,
+        "output_tokens": 37,
+        "cache_read_tokens": 1408,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 281,
+        "price_micros": 281,
+        "latency_ms": 945
+      },
+      {
+        "request_id": "b7a88aa517f7e029-49",
+        "t_ms": 1792862075000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1659,
+        "output_tokens": 20,
+        "cache_read_tokens": 1280,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 312,
+        "price_micros": 312,
+        "latency_ms": 913
+      },
+      {
+        "request_id": "b7a88aa517f7e029-4a",
+        "t_ms": 1792862076000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1713,
+        "output_tokens": 33,
+        "cache_read_tokens": 1536,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 277,
+        "price_micros": 277,
+        "latency_ms": 933
+      },
+      {
+        "request_id": "b7a88aa517f7e029-4b",
+        "t_ms": 1792862077000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1771,
+        "output_tokens": 21,
+        "cache_read_tokens": 1536,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 281,
+        "price_micros": 281,
+        "latency_ms": 975
+      },
+      {
+        "request_id": "b7a88aa517f7e029-4c",
+        "t_ms": 1792862077000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1846,
+        "output_tokens": 34,
+        "cache_read_tokens": 1664,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 294,
+        "price_micros": 294,
+        "latency_ms": 1090
+      },
+      {
+        "request_id": "b7a88aa517f7e029-4d",
+        "t_ms": 1792862081000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1894,
+        "output_tokens": 16,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 783,
+        "price_micros": 783,
+        "latency_ms": 934
+      },
+      {
+        "request_id": "b7a88aa517f7e029-4e",
+        "t_ms": 1792862081000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1968,
+        "output_tokens": 31,
+        "cache_read_tokens": 1792,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 299,
+        "price_micros": 299,
+        "latency_ms": 1017
+      },
+      {
+        "request_id": "b7a88aa517f7e029-4f",
+        "t_ms": 1792862082000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 2013,
+        "output_tokens": 16,
+        "cache_read_tokens": 1664,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 332,
+        "price_micros": 332,
+        "latency_ms": 1114
+      },
+      {
+        "request_id": "b7a88aa517f7e029-50",
+        "t_ms": 1792862083000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 2080,
+        "output_tokens": 37,
+        "cache_read_tokens": 1920,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 315,
+        "price_micros": 315,
+        "latency_ms": 1295
+      },
+      {
+        "request_id": "b7a88aa517f7e029-51",
+        "t_ms": 1792862085000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 2137,
+        "output_tokens": 3,
+        "cache_read_tokens": 1920,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 284,
+        "price_micros": 284,
+        "latency_ms": 684
+      },
+      {
+        "request_id": "b7a88aa517f7e029-52",
+        "t_ms": 1792862086000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1661,
+        "output_tokens": 16,
+        "cache_read_tokens": 1536,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 229,
+        "price_micros": 229,
+        "latency_ms": 811
+      },
+      {
+        "request_id": "b7a88aa517f7e029-53",
+        "t_ms": 1792862087000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-4.1-mini-2025-04-14",
+        "requested_model": "gpt-4.1-mini",
+        "routed_model": "gpt-4.1-mini",
+        "price_model": "gpt-4.1-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1734,
+        "output_tokens": 29,
+        "cache_read_tokens": 1536,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 279,
+        "price_micros": 279,
+        "latency_ms": 922
+      }
+    ],
+    "rows_found": 28,
+    "total_cost_micros": 8616,
+    "total_price_micros": 8616,
+    "total_cost_usd": 0.008616,
+    "input_tokens": 41799,
+    "output_tokens": 622,
+    "cache_read_tokens": 30336
+  },
+  "sandbox": {
+    "provider": "none",
+    "label": "none",
+    "per_session": false,
+    "vms": []
+  },
+  "disk": null,
+  "teardown": {
+    "tagging_index_stale": 10,
+    "name": "oidc",
+    "region": "us-west-2",
+    "verified_at": "2026-10-24T17:20:26Z",
+    "verdict": "clean",
+    "before": {
+      "cloudmap_namespaces": 1,
+      "cloudmap_services": 3,
+      "ec2_internet_gateways": 1,
+      "ec2_network_interfaces": 4,
+      "ec2_route_tables": 1,
+      "ec2_security_groups": 2,
+      "ec2_subnets": 1,
+      "ec2_vpcs": 1,
+      "ecr_repositories": 3,
+      "ecs_clusters": 1,
+      "ecs_services": 3,
+      "ecs_task_definitions": 3,
+      "ecs_tasks": 3,
+      "efs_access_points": 1,
+      "efs_file_systems": 1,
+      "efs_mount_targets": 1,
+      "iam_roles": 4,
+      "log_groups": 1,
+      "route53_hosted_zones": 1,
+      "s3_buckets": 1,
+      "ssm_parameters": 15
+    },
+    "counts": {
+      "cloudmap_namespaces": 0,
+      "cloudmap_services": 0,
+      "ec2_internet_gateways": 0,
+      "ec2_network_interfaces": 0,
+      "ec2_route_tables": 0,
+      "ec2_security_groups": 0,
+      "ec2_subnets": 0,
+      "ec2_vpcs": 0,
+      "ecr_repositories": 0,
+      "ecs_clusters": 0,
+      "ecs_services": 0,
+      "ecs_task_definitions": 0,
+      "ecs_tasks": 0,
+      "efs_access_points": 0,
+      "efs_file_systems": 0,
+      "efs_mount_targets": 0,
+      "iam_roles": 0,
+      "log_groups": 0,
+      "route53_hosted_zones": 0,
+      "s3_buckets": 0,
+      "ssm_parameters": 0,
+      "tagging_api": 0
+    }
+  }
+}
