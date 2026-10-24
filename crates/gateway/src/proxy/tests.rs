@@ -2293,7 +2293,10 @@ fn a_rerun_walks_the_parents_row() {
 }
 
 /// `managed_endpoint`: an upgrade is refused anywhere, a provider route only on its generation
-/// endpoints (404 otherwise), and anything but POST is a 405.
+/// endpoints (404 otherwise; a path that only ends in an endpoint suffix is not one), and anything
+/// but POST is a 405.
+/// claim: SEC-1
+/// defect: D289
 #[test]
 fn managed_endpoint_holds_a_managed_key_to_metered_calls() {
     let state = phase_state();
@@ -2338,6 +2341,47 @@ fn managed_endpoint_holds_a_managed_key_to_metered_calls() {
                 ..
             })
         ));
+    }
+    // Anchored: a path that merely ends in an endpoint suffix is not that endpoint.
+    for path in [
+        "/v1/threads/t/messages",
+        "/v1/x/chat/completions",
+        "/v1/responses/abc/cancel",
+        "/v1/responses/messages",
+        "/v1/x/messages/count_tokens",
+        "/openai/deployments/a/b/chat/completions",
+        "/openai/deployments//chat/completions",
+        "/chat/completions",
+        "//v1/messages",
+    ] {
+        assert!(
+            matches!(
+                managed_endpoint(&req(http::Method::POST, "/p"), &on(path)),
+                Err(Refusal::ManagedEndpoint {
+                    wrong_method: false,
+                    ..
+                })
+            ),
+            "{path}"
+        );
+    }
+    for path in [
+        "/v1/messages",
+        "/v1/messages/count_tokens",
+        "/v1/responses/input_tokens",
+        "/v1/responses/compact?x=1",
+        "/v1/chat/completions/",
+        "/api/v1/chat/completions",
+        "/openai/v1/embeddings",
+        "/inference/v1/chat/completions",
+        "/anthropic/v1/messages",
+        "/backend-api/codex/responses",
+        "/openai/deployments/d/chat/completions?api-version=1",
+    ] {
+        assert!(
+            managed_endpoint(&req(http::Method::POST, "/p"), &on(path)).is_ok(),
+            "{path}"
+        );
     }
 }
 

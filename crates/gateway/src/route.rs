@@ -243,6 +243,41 @@ pub fn forward_endpoint(path_and_query: &str) -> Option<&'static EndpointPath> {
     )
 }
 
+/// The mount prefixes a provider hangs its API under, as a client spells them after the
+/// `/{provider}` segment: every gateway provider's [`providers::ProviderSpec::base_path`] (with
+/// `/v1` for Anthropic, whose base is bare) plus Codex's. Azure's `/openai/deployments/{name}` is
+/// the one mount with a variable segment ([`is_mount`]).
+const MOUNTS: [&str; 6] = [
+    "/v1",
+    "/api/v1",
+    "/openai/v1",
+    "/inference/v1",
+    "/anthropic/v1",
+    "/backend-api/codex",
+];
+
+/// Whether `mount` (a path with its endpoint suffix removed) is a known mount prefix.
+fn is_mount(mount: &str) -> bool {
+    MOUNTS.contains(&mount)
+        || mount
+            .strip_prefix("/openai/deployments/")
+            .is_some_and(|d| !d.is_empty() && !d.contains('/'))
+}
+
+/// [`forward_endpoint`], anchored: the row only when everything before its suffix is exactly one
+/// mount prefix. The managed allowlist reads this, where a bare suffix match would admit
+/// `/v1/threads/t/messages` (an unmetered write on the pool key) as a `/messages` call.
+pub fn anchored_forward_endpoint(path_and_query: &str) -> Option<&'static EndpointPath> {
+    let path = normalize_endpoint_path(
+        path_and_query
+            .split_once('?')
+            .map_or(path_and_query, |(p, _)| p),
+    );
+    ENDPOINT_PATHS
+        .iter()
+        .find(|e| path.strip_suffix(e.suffix).is_some_and(is_mount))
+}
+
 /// The [`ENDPOINT_PATHS`] row a catalog-walk path names, exactly: under `/auto` the `/v1` is
 /// optional, and every trailing slash is ignored. Deliberately looser than a forwarded path, which
 /// keeps the provider's own spelling (one trailing slash is the same resource, `//` one the

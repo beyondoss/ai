@@ -1009,12 +1009,13 @@ fn requests_background(body: &[u8]) -> bool {
 
 /// The `/{provider}/…` endpoints a managed key may reach: the metered generation calls and their
 /// token-count / compact sub-resources ([`route::ENDPOINT_PATHS`], the table every routing
-/// decision reads too), matched by suffix so every provider's mount prefix (`/api/v1`,
-/// `/openai/v1`, `/inference/v1`, `/anthropic/v1`, `/backend-api/codex`) works. Everything else on
-/// a provider (files, batches, stored responses, fine-tuning, models) is refused for managed keys.
-/// A query string is ignored.
+/// decision reads too), anchored: exactly a provider's mount prefix (`/v1`, `/api/v1`,
+/// `/openai/v1`, `/inference/v1`, `/anthropic/v1`, `/backend-api/codex`, Azure's
+/// `/openai/deployments/{name}`) then the endpoint suffix. A path that merely ends in one
+/// (`/v1/threads/t/messages`) is refused. Everything else on a provider (files, batches, stored
+/// responses, fine-tuning, models) is refused for managed keys. A query string is ignored.
 fn is_managed_provider_endpoint(path_and_query: &str) -> bool {
-    route::forward_endpoint(path_and_query).is_some()
+    route::anchored_forward_endpoint(path_and_query).is_some()
 }
 
 /// The wire a `/{provider}/…` forwarded path (query allowed) is answered on: its

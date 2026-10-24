@@ -2989,3 +2989,17 @@ state = "fixed"
 test = "service_tier_asap_is_the_standard_class"
 fix = "e5316cc"
 note = "Fixed in the contract, as D271 was for auto: a reported service_tier asap is the standard class (providers::pricing::Tier::parse and verify/pricing_reference.py alike; crates/providers/ARCHITECTURE.md's class table). Anthropic and Bedrock still refuse anything but standard. Golden vector openrouter_service_tier_asap_reported, from the reference pricer."
+
+[[defect]]
+id = "D289"
+severity = "med"
+area = "Security"
+title = "A managed key reached any provider path that merely ended in an endpoint suffix"
+impact = "The managed allowlist matched by suffix, so POST /openai/v1/threads/t/messages (OpenAI Assistants) or /v1/x/chat/completions passed as a metered generation call: an unmetered write into Beyond's shared org on the pool key."
+confidence = "high"
+evidence = "Code: proxy.rs is_managed_provider_endpoint read route::forward_endpoint, whose endpoint_of_path is path.ends_with(suffix) under any prefix. Reproduced by managed_endpoint_holds_a_managed_key_to_metered_calls, which admitted /v1/threads/t/messages."
+claims = ["SEC-1"]
+state = "fixed"
+test = "managed_endpoint_holds_a_managed_key_to_metered_calls"
+fix = "8f78fe98"
+note = "Fixed with route::anchored_forward_endpoint, used only by the managed allowlist: everything before the endpoint suffix must be exactly one of /v1, /api/v1, /openai/v1, /inference/v1, /anthropic/v1, /backend-api/codex, or Azure's /openai/deployments/{one segment}. forward_endpoint (wire selection, sub-resources, BYO) is unchanged."

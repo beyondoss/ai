@@ -685,10 +685,14 @@ path is, else what `wire` says.
 **Managed endpoint allowlist.** A managed key spends Beyond's shared pool key, so it reaches only
 metered generation calls. On `/v1` and `/auto` the method must be `POST` (a managed `GET`/`HEAD /v1/models` is
 served before this check). On `/{provider}/…` the method must be `POST` and the forwarded path, query
-string excluded, must end in a generation endpoint: `/chat/completions`, `/messages`, `/responses`,
-`/embeddings`, `/messages/count_tokens`, `/responses/input_tokens` or `/responses/compact`. The
-suffix match covers every mount prefix (`/api/v1`, `/openai/v1`, `/inference/v1`, `/anthropic/v1`,
-`/backend-api/codex`). That list is `route::ENDPOINT_PATHS`, the one table the forwarded wire,
+string excluded, must be exactly a mount prefix followed by a generation endpoint: `/chat/completions`,
+`/messages`, `/responses`, `/embeddings`, `/messages/count_tokens`, `/responses/input_tokens` or
+`/responses/compact`. The mounts are `/v1`, `/api/v1`, `/openai/v1`, `/inference/v1`,
+`/anthropic/v1`, `/backend-api/codex` and Azure's `/openai/deployments/{name}` (one segment). A path
+that merely ends in an endpoint suffix (`/v1/threads/t/messages`, `/v1/x/chat/completions`) is
+refused: it would be an unmetered write on the pool key. Wire selection and BYO paths still match
+by suffix (`route::forward_endpoint`); only the allowlist is anchored
+(`route::anchored_forward_endpoint`). The endpoint list is `route::ENDPOINT_PATHS`, the one table the forwarded wire,
 the sub-resources (`SubResource::of_forward_path`, `of_path`), the Chat stream-usage buffer and the
 catalog's endpoint names (`implied_endpoint`) read too, so the allowlist cannot drift from routing
 (D209; it was five copies). A forwarded path drops its query and one trailing slash (`//` is a path
