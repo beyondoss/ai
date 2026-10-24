@@ -47,10 +47,16 @@ pub async fn run_checks(config: &AiConfig) -> Vec<CheckResult> {
     )
     .await
     {
-        Ok(_) => out.push(pass("nats", format!("connected to {}", config.nats_url))),
+        Ok(_) => out.push(pass(
+            "nats",
+            format!(
+                "connected to {}",
+                crate::config::redact_userinfo(&config.nats_url)
+            ),
+        )),
         Err(e) => out.push(fail(
             "nats",
-            e.to_string(),
+            crate::config::redact_userinfo(&e.to_string()).into_owned(),
             "check AI_NATS_URL and credentials",
         )),
     }

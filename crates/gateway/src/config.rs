@@ -1134,6 +1134,35 @@ impl AiConfig {
     }
 }
 
+/// `text` with the userinfo of every `scheme://user:pass@host` URL in it replaced by `***`, so a
+/// `nats_url` carrying credentials can be printed or logged. Applies to a bare URL, a comma-separated
+/// list, and free text that embeds one (an error message). Text with no URL userinfo is returned as is.
+pub fn redact_userinfo(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('@') || !text.contains("://") {
+        return text.into();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("://") {
+        let (head, tail) = rest.split_at(i + 3);
+        out.push_str(head);
+        // The authority ends at the first `/`, `?`, `#`, `,` or whitespace; userinfo is what
+        // precedes the last `@` inside it (a password may itself hold an `@`).
+        let end = tail
+            .find(|c: char| matches!(c, '/' | '?' | '#' | ',') || c.is_whitespace())
+            .unwrap_or(tail.len());
+        match tail[..end].rfind('@') {
+            Some(at) => {
+                out.push_str("***");
+                rest = &tail[at..];
+            }
+            None => rest = tail,
+        }
+    }
+    out.push_str(rest);
+    out.into()
+}
+
 /// Refuse a `nats_url` that is plaintext to a host off this machine. The NATS channel delivers
 /// signing keys (`signing_key.{kid}`) and deny entries, and async-nats upgrades to TLS only when the
 /// server asks, so a `nats://` URL to a remote host is an unauthenticated trust anchor on the wire.
@@ -1407,6 +1436,28 @@ mod tests {
         assert!(with(b64(8)).check_no_dev_signing_key().is_ok());
         // `check` applies the rule in release builds only; debug builds (all tests) keep the key.
         assert_eq!(with(b64(7)).check().is_err(), !cfg!(debug_assertions));
+    }
+
+    #[test]
+    fn redact_userinfo_hides_credentials_wherever_a_url_is_printed() {
+        for (input, want) in [
+            ("nats://localhost:4222", "nats://localhost:4222"),
+            ("nats://user:pw@host:4222", "nats://***@host:4222"),
+            ("tls://tok@host", "tls://***@host"),
+            ("nats://u:p@w@host:4222/x", "nats://***@host:4222/x"),
+            (
+                "nats://a:b@one:4222,nats://c:d@two:4222",
+                "nats://***@one:4222,nats://***@two:4222",
+            ),
+            (
+                "connect to nats://u:secret@host:4222 failed: refused",
+                "connect to nats://***@host:4222 failed: refused",
+            ),
+            ("mail me@example.com", "mail me@example.com"),
+            ("nats://host/path@x", "nats://host/path@x"),
+        ] {
+            assert_eq!(redact_userinfo(input), want, "{input}");
+        }
     }
 
     #[test]
