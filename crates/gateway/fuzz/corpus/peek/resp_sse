@@ -1,0 +1,8 @@
+)data: {"type":"response.created","response":{"id":"resp_ab","output":[]}}
+
+data: {"type":"response.output_item.added","item":{"id":"msg_ab","type":"message"}}
+
+data: {"type":"response.output_text.delta","item_id":"msg_ab","delta":"hi"}
+
+data: {"type":"response.completed","response":{"id":"resp_ab","output":[{"id":"msg_ab"}],"usage":{"input_tokens":3,"output_tokens":2}}}
+

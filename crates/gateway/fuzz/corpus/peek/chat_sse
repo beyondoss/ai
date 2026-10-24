@@ -1,0 +1,6 @@
+)data: {"id":"c","model":"gpt-5","choices":[{"delta":{"role":"assistant","content":"he"}}]}
+
+data: {"choices":[{"delta":{"content":"llo"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}
+
+data: [DONE]
+

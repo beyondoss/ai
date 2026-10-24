@@ -1,7 +1,7 @@
 name: Deep checks
 # The slow hermetic hunts that don't fit a PR: the full mutation run over the money and correctness
-# paths, the property tests at a case count high enough to find rare shapes, and the strict catalog
-# retirement-date check. None needs provider keys. Weekly, or on demand from the Actions tab.
+# paths, the property tests at a case count high enough to find rare shapes, coverage-guided fuzzing
+# of the byte parsers, and the strict catalog retirement-date check. None needs provider keys. Weekly, or on demand from the Actions tab.
 on:
   schedule:
     - cron: "0 7 * * 0"
@@ -130,3 +130,36 @@ jobs:
       - run: cargo test -p beyond-ai-providers --lib no_catalog_row_outlives_its_retirement </dev/null
         env:
           CATALOG_RETIREMENT_STRICT: "1"
+  # Coverage-guided fuzzing (cargo-fuzz) of the gateway's byte-level parsers, 10 minutes per target.
+  # A crash fails the job and its input is uploaded; the nightly is pinned to a date so a toolchain
+  # change never arrives as a surprise failure (keep in step with `mise run fuzz`).
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    if: ${{ !inputs.only_mutants }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [lex, peek, usage, translate, key, signed_id]
+    env:
+      FUZZ_NIGHTLY: nightly-2026-04-01
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install "$FUZZ_NIGHTLY" --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/gateway/fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: fuzz
+        working-directory: crates/gateway/fuzz
+        run: cargo "+$FUZZ_NIGHTLY" fuzz run ${{ matrix.target }} -- -max_total_time=600 -timeout=10 -rss_limit_mb=2048
+      - name: upload crash inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: crates/gateway/fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
