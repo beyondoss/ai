@@ -1379,6 +1379,8 @@ mod tests {
         assert_eq!(c.config_bucket, "ai-gateway");
     }
 
+    /// claim: SEC-22
+    /// defect: D291
     #[test]
     fn nats_url_plaintext_is_loopback_only() {
         for ok in [
@@ -1418,6 +1420,8 @@ mod tests {
         assert!(cfg("nats://nats.example.com:4222").validate().is_err());
     }
 
+    /// claim: SEC-12
+    /// defect: D292
     #[test]
     fn the_public_dev_signing_key_is_refused_as_a_trust_anchor() {
         use base64::Engine;
@@ -1438,6 +1442,8 @@ mod tests {
         assert_eq!(with(b64(7)).check().is_err(), !cfg!(debug_assertions));
     }
 
+    /// claim: SEC-22
+    /// defect: D294
     #[test]
     fn redact_userinfo_hides_credentials_wherever_a_url_is_printed() {
         for (input, want) in [

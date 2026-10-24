@@ -647,7 +647,7 @@ touches = [
   "crates/gateway/src/store_watch.rs",
   "verify/key_vectors.json",
 ]
-defects = []
+defects = ["D293"]
 
 [[claim]]
 id = "A6"
@@ -907,7 +907,7 @@ touches = [
   "crates/gateway/src/control.rs",
   "crates/gateway/src/secret.rs",
 ]
-defects = ["D01"]
+defects = ["D01", "D290"]
 
 [[claim]]
 id = "SEC-2"
@@ -1097,7 +1097,7 @@ touches = [
   "crates/gateway/src/control.rs",
   "crates/gateway/src/secret.rs",
 ]
-defects = ["D28"]
+defects = ["D28", "D292"]
 
 [[claim]]
 id = "SEC-13"
@@ -1272,7 +1272,7 @@ touches = [
   "crates/gateway/src/control.rs",
   "crates/gateway/src/secret.rs",
 ]
-defects = ["D53"]
+defects = ["D53", "D291", "D294"]
 
 [[claim]]
 id = "SEC-23"
