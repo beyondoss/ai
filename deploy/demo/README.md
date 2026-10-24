@@ -244,10 +244,11 @@ Measured on one run (`results/20261024T171544Z-load`, commit in the record):
 | memory with no sessions               | **a quiet replica is not quiet**: with zero sessions and no work, anonymous memory drifted up 20 MB in one idle and 58 MB in the other, in step with transparent huge pages (30 and 118 MB of it), and fell to 186 MB only when the replica next did work                 |
 | headroom                              | wave 1 peaked at 894 MB of the task's 1,024 MB (wave 2 at 464 MB): about 2,000 held sessions is the ceiling at this size                                                                                                                                                  |
 
-Two things the run found are in the record as failed checks, not fixed here: the memory drift with no sessions
-(the kernel's huge-page collapse filling pages the allocator has freed but not returned; the agent enables
-huge pages on purpose, so this is a trade to decide, not a leak, and it does not grow across waves), and
-the cache, which is only trimmed when a bundle is installed.
+Two things the run found are in the record as failed checks. The cache was trimmed only when a bundle was
+installed, so it stayed over its budget with no sessions open; that is fixed in #488 (the record is from before
+it). The other is the memory drift with no sessions: the kernel's huge-page collapse filling pages the allocator
+has freed but not returned. The agent enables huge pages on purpose, so this is a trade to decide, not a leak,
+and it does not grow across waves.
 
 ## What it costs
 
