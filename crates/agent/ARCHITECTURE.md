@@ -2615,7 +2615,9 @@ each one).
 
 The token is built: [`notify_token`](src/notify_token.rs) is the only code that makes or checks a
 `bjn_v1` token. `NotifyKey::from_seal_secret` derives `K` (HKDF-SHA256 of the seal secret's bytes
-as given, before X25519 clamps them) and its kid once; `mint` takes the tenant, session and job and
+as given, before X25519 clamps them) and its kid once, and `with_previous` adds the same pair from
+the previous seal secret, which verifies (picked by the token's kid, never tried in turn) but never
+mints; `mint` takes the tenant, session and job and
 computes the session's own scope itself, so a replica cannot mint for another session; `verify`
 builds the MAC input from the request's tenant, session, scope and job id, takes only the kid and
 tag from the token, and compares the tag with `verify_slice`. `tests/notify_token.rs` holds it to
@@ -4807,8 +4809,14 @@ The parsed verifier lands in `ServeConfig::grant_verifier` (an `Arc`, shared by 
 
 Signing keys rotate without a gap: trust the new kid beside the old, move the minter to the new kid,
 and drop the old one once every grant it signed has expired. The fleet seal key is one secret at a
-time, so rotating it is a coordinated switch: a grant sealed to the old key fails `SealOpenFailed` on
-a replica that already holds the new one, until it is re-minted.
+time for grants, so rotating it is a coordinated switch: a grant sealed to the old key fails
+`SealOpenFailed` on a replica that already holds the new one, until it is re-minted (a grant's seal
+carries no key id, and a grant is minted per connection). Notify tokens do carry a kid, so a replica
+can be given the old secret as `--seal-key-previous` (`AI_AGENT_SEAL_KEY_PREVIOUS`, or base64 in
+`AI_AGENT_SEAL_KEY_PREVIOUS_B64`; not both, and it needs `--seal-key`). It accepts notify tokens under
+the old kid, still mints only under the current secret, and holds at most these two. Remove the
+previous secret once the longest token lifetime (about 723 s) has passed since the last replica
+switched to the new one.
 
 ### Golden vectors
 

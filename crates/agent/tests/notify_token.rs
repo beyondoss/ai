@@ -281,3 +281,45 @@ fn mints_only_its_own_scope() {
         Verdict::Valid
     );
 }
+
+fn stat(b: u8) -> x25519_dalek::StaticSecret {
+    x25519_dalek::StaticSecret::from([b; 32])
+}
+
+/// A seal-secret rotation: the replica holding the new secret refuses the old kid, unless it also
+/// holds the old secret as the previous one; and it never mints under the previous one.
+#[test]
+fn previous_seal_secret_verifies_but_never_mints() {
+    let job = JobId::parse("0123456789abcdef").unwrap();
+    let scope = JobScope::for_session(Some("t"), "s");
+    let old = NotifyKey::from_seal_secret(&stat(1));
+    let token = old.mint("t", "s", &job);
+
+    let rotated = NotifyKey::from_seal_secret(&stat(2));
+    assert_eq!(
+        rotated.verify(&token, "t", "s", scope.name(), job.as_str()),
+        Verdict::UnknownKid
+    );
+
+    let rotating = NotifyKey::from_seal_secret(&stat(2)).with_previous(&stat(1));
+    assert_eq!(
+        rotating.verify(&token, "t", "s", scope.name(), job.as_str()),
+        Verdict::Valid
+    );
+    // A tampered tag under the previous kid is a bad mac, not an unknown kid.
+    let mut bad = token.clone();
+    bad.pop();
+    bad.push(if token.ends_with('A') { 'B' } else { 'A' });
+    assert_ne!(
+        rotating.verify(&bad, "t", "s", scope.name(), job.as_str()),
+        Verdict::Valid
+    );
+    // Minting is under the current secret only.
+    let minted = rotating.mint("t", "s", &job);
+    assert_eq!(minted, rotated.mint("t", "s", &job));
+    assert_eq!(rotating.kid(), rotated.kid());
+    assert_eq!(
+        old.verify(&minted, "t", "s", scope.name(), job.as_str()),
+        Verdict::UnknownKid
+    );
+}
