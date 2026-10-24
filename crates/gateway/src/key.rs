@@ -230,18 +230,21 @@ impl Keyring {
     /// `bai_v2` and `bai_v3`. The gateway itself calls [`Self::verify_with`], which also consults
     /// the live ring and the deny-set; this is the config-only form for callers holding just a ring.
     pub fn verify(&self, token: &str) -> Result<Identity, KeyError> {
-        self.verify_at(token, unix_now())
+        self.verify_with(token, &LiveKeys::default(), &DenySet::default(), unix_now)
     }
 
     /// [`Self::verify`] with the clock stated: unix seconds `now`. How the contract vectors and
     /// any caller that owns its time check a `bai_v3` key.
     pub fn verify_at(&self, token: &str, now: u64) -> Result<Identity, KeyError> {
-        self.verify_with(token, &LiveKeys::default(), &DenySet::default(), || now)
+        self.verify_with(token, &LiveKeys::default(), &DenySet::default(), || {
+            Some(now)
+        })
     }
 
     /// Verify a virtual key string and extract its identity. Stateless: the inputs besides the
     /// token are the public keys (this ring, then `live`), the set of distrusted kids in `deny`,
-    /// and — for `bai_v3` only — `now`, unix seconds. `now` is a parameter, not a read of the
+    /// and — for `bai_v3` only — `now`, unix seconds, or `None` when the clock cannot be read (a v3 key
+    /// is then refused as expired: a clock that says nothing must not make every `exp` pass). `now` is a parameter, not a read of the
     /// clock, so a test sets the time without a seam in the release binary; it is called at most
     /// once, and only for a v3 token that already verified.
     ///
@@ -252,7 +255,7 @@ impl Keyring {
         token: &str,
         live: &LiveKeys,
         deny: &DenySet,
-        now: impl FnOnce() -> u64,
+        now: impl FnOnce() -> Option<u64>,
     ) -> Result<Identity, KeyError> {
         // Split into exactly 4 parts: prefix, kid, payload, sig. `splitn(4, '.')` rejects any
         // token with fewer separators; a payload/sig never contains '.' (base64url has none).
@@ -330,7 +333,7 @@ impl Keyring {
                 let (vk, exp) =
                     VirtualKey::decode_payload_v3(payload).ok_or(KeyError::Malformed)?;
                 // `exp + LEEWAY_SECS` saturates: an `exp` of `u64::MAX` is "never", not a wrap to 29.
-                if now() > exp.saturating_add(LEEWAY_SECS) {
+                if now().is_none_or(|now| now > exp.saturating_add(LEEWAY_SECS)) {
                     return Err(KeyError::Expired);
                 }
                 Ok(Identity(vk))
@@ -340,12 +343,13 @@ impl Keyring {
     }
 }
 
-/// Unix seconds now. A clock before the epoch reads as 0, which only ever makes a key look *less*
-/// expired, and a host whose clock is that broken fails far louder elsewhere.
-pub fn unix_now() -> u64 {
+/// Unix seconds now, or `None` when the clock reads before the epoch. Not 0: a 0 would pass every
+/// `bai_v3` `exp`, so [`Keyring::verify_with`] refuses a v3 key on `None`.
+pub fn unix_now() -> Option<u64> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 /// Whether `s` is the one decimal spelling `mint` writes for a kid: ASCII digits, no sign, and no
@@ -724,7 +728,9 @@ mod tests {
 
     /// Verify at a fixed `now` against only the config ring.
     fn verify_at(ring: &Keyring, token: &str, now: u64) -> Result<Identity, KeyError> {
-        ring.verify_with(token, &LiveKeys::default(), &DenySet::default(), || now)
+        ring.verify_with(token, &LiveKeys::default(), &DenySet::default(), || {
+            Some(now)
+        })
     }
 
     /// claim: A5
@@ -807,6 +813,34 @@ mod tests {
         assert!(got.is_ok());
     }
 
+    /// A clock read that fails (before the epoch) refuses a v3 key instead of reading as 0, which
+    /// would pass every `exp`; v1 and v2 never read the clock.
+    /// claim: A5
+    /// defect: D293
+    #[test]
+    fn an_unreadable_clock_refuses_a_v3_key() {
+        let (sk, vk) = test_keypair(1);
+        let ring = ring_with(7, vk);
+        let v3 = mint_v3(&who(), 5, EXP, 7, &sk);
+        let none = LiveKeys::default();
+        let deny = DenySet::default();
+        assert_eq!(
+            ring.verify_with(&v3, &none, &deny, || None),
+            Err(KeyError::Expired)
+        );
+        assert!(
+            ring.verify_with(&v3, &none, &deny, || Some(EXP - 10))
+                .is_ok()
+        );
+        let never = mint_v3(&who(), 5, u64::MAX, 7, &sk);
+        assert_eq!(
+            ring.verify_with(&never, &none, &deny, || None),
+            Err(KeyError::Expired)
+        );
+        let v2 = mint_v2(&who(), 5, 7, &sk);
+        assert!(ring.verify_with(&v2, &none, &deny, || None).is_ok());
+    }
+
     /// claim: A5
     #[test]
     fn a_v2_token_relabelled_as_v3_is_rejected() {
@@ -870,7 +904,7 @@ mod tests {
         let token = mint_v2(&who(), 5, 7, &sk);
         let none = LiveKeys::default();
         assert_eq!(
-            ring.verify_with(&token, &none, &deny, || 0),
+            ring.verify_with(&token, &none, &deny, || Some(0)),
             Err(KeyError::Distrusted(7))
         );
         // Same for a live-only kid.
@@ -884,7 +918,7 @@ mod tests {
         let t8 = mint_v2(&who(), 5, 8, &sk);
         assert!(
             Keyring::new()
-                .verify_with(&t8, &live, &DenySet::default(), || 0)
+                .verify_with(&t8, &live, &DenySet::default(), || Some(0))
                 .is_ok()
         );
         deny.insert_target(
@@ -892,12 +926,12 @@ mod tests {
             crate::deny::DenyReason::Fraud,
         );
         assert_eq!(
-            Keyring::new().verify_with(&t8, &live, &deny, || 0),
+            Keyring::new().verify_with(&t8, &live, &deny, || Some(0)),
             Err(KeyError::Distrusted(8))
         );
         // The garbage token with a distrusted kid is still refused for its kid, with no sig to check.
         assert_eq!(
-            ring.verify_with("bai_v2.7.AAAA.AAAA", &none, &deny, || 0),
+            ring.verify_with("bai_v2.7.AAAA.AAAA", &none, &deny, || Some(0)),
             Err(KeyError::Malformed)
         );
     }
@@ -916,11 +950,11 @@ mod tests {
         );
         let d = DenySet::default();
         assert!(
-            ring.verify_with(&mint_v2(&who(), 5, 7, &sk_cfg), &live, &d, || 0)
+            ring.verify_with(&mint_v2(&who(), 5, 7, &sk_cfg), &live, &d, || Some(0))
                 .is_ok()
         );
         assert_eq!(
-            ring.verify_with(&mint_v2(&who(), 5, 7, &sk_live), &live, &d, || 0),
+            ring.verify_with(&mint_v2(&who(), 5, 7, &sk_live), &live, &d, || Some(0)),
             Err(KeyError::BadSignature)
         );
     }

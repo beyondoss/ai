@@ -1736,7 +1736,7 @@ Expiry is judged **at admission only**. A stream already admitted is not cut whe
 `exp`, the same rule as a deny: bounding an admitted request is `request_max_secs`' job. The v3 identity
 carries `key_id` as v2 does, so `blackhole.key.{id}` and `allowance.key.{id}` apply unchanged.
 The clock is an argument of `Keyring::verify_with` (the proxy passes the system clock), so tests
-set the time without a seam in the binary. `verify/key_vectors.json` holds deterministic v3
+set the time without a seam in the binary. The argument returns `Option<u64>`: a clock that fails (before the epoch) is `None`, and a v3 key is then refused as expired, not read as 0, which would pass every `exp`. `verify/key_vectors.json` holds deterministic v3
 vectors, expired and leeway-edge cases included, that the control plane's minter must reproduce.
 
 Signatures are checked with `verify_strict` for every version, which also refuses a small-order
@@ -3554,6 +3554,9 @@ to serve.
   release build (`cfg(not(debug_assertions))`) refuses to boot with that public key in
   `signing_keys` or `AI_SIGNING_KEY_*`, and ignores it (with a warning) in a KV `signing_key.{kid}`
   entry. Debug builds, which every test and `cargo run` use, keep it.
+- A v3 key is refused as expired when the clock cannot be read. `unix_now` returns `None` for a
+  pre-epoch wall clock (it used to read 0, which passes every `exp`), and `verify_with` treats
+  `None` as past any `exp`, `u64::MAX` included. v1 and v2 never read the clock.
 - The NATS channel is encrypted or local: `nats_url` that is plaintext (`nats://`, or no scheme) to
   a non-loopback host is a boot failure, because that channel delivers signing keys and deny
   entries and async-nats upgrades to TLS only when the server requires it. `tls://` is accepted

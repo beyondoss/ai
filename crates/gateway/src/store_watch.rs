@@ -1111,8 +1111,9 @@ mod tests {
         let cfg_only: Keyring = [(9, sk.verifying_key())].into_iter().collect();
         let empty = Keyring::new();
         let deny = DenySet::new();
-        let verifies =
-            |ring: &Keyring, live: &LiveKeys| ring.verify_with(&token, live, &deny, || 0).is_ok();
+        let verifies = |ring: &Keyring, live: &LiveKeys| {
+            ring.verify_with(&token, live, &deny, || Some(0)).is_ok()
+        };
 
         let mut live = LiveKeys::new();
         assert!(!verifies(&empty, &live), "unknown before the KV entry");
@@ -1217,17 +1218,23 @@ mod tests {
             ],
         );
         assert_eq!(
-            cfg.verify_with(&cfg_token, &live, &deny, || 0),
+            cfg.verify_with(&cfg_token, &live, &deny, || Some(0)),
             Err(KeyError::Distrusted(9))
         );
         assert_eq!(
-            cfg.verify_with(&live_token, &live, &deny, || 0),
+            cfg.verify_with(&live_token, &live, &deny, || Some(0)),
             Err(KeyError::Distrusted(10))
         );
 
         deny = apply_batch(&deny, &[del("blackhole.kid.9"), del("blackhole.kid.10")]);
-        assert!(cfg.verify_with(&cfg_token, &live, &deny, || 0).is_ok());
-        assert!(cfg.verify_with(&live_token, &live, &deny, || 0).is_ok());
+        assert!(
+            cfg.verify_with(&cfg_token, &live, &deny, || Some(0))
+                .is_ok()
+        );
+        assert!(
+            cfg.verify_with(&live_token, &live, &deny, || Some(0))
+                .is_ok()
+        );
     }
 
     #[test]
