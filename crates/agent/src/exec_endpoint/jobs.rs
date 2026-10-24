@@ -10,7 +10,9 @@
 //! [`SandboxJobs`] is that contract. [`ShellJobs`] implements it over plain exec commands — `sh`,
 //! `setsid`, `mkfifo`, `tee`, `dd`, `wc`, `base64`, `date` — so it works over every exec protocol
 //! version and every vendor with no change on their side, busybox included. (An endpoint can offer
-//! the same operations natively; the baseline is what every endpoint gets.)
+//! the same operations natively; the baseline is what every endpoint gets.) Its probe runs the one
+//! pipeline `read` depends on (`dd iflag=skip_bytes,count_bytes | base64 -w0`), so an image whose
+//! `dd` or `base64` merely exists, without those flags, has no jobs rather than jobs that cannot read.
 //!
 //! ## Layout
 //!
@@ -1184,6 +1186,8 @@ probe)
   for c in setsid mkfifo tee dd wc base64 date; do
     command -v "$c" >/dev/null 2>&1 || m="$m $c"
   done
+  # Present is not enough: `read` leans on GNU/busybox `dd iflag=skip_bytes,count_bytes` and `base64 -w0`.
+  [ "$(printf abc | dd iflag=skip_bytes,count_bytes skip=1 count=1 status=none 2>/dev/null | base64 -w0 2>/dev/null)" = Yg== ] || m="$m dd-or-base64-flags"
   if [ -z "$m" ]; then echo ok; else echo "missing$m"; fi
   command -v curl >/dev/null 2>&1 && echo curl
   IFS= read -r _s 2>/dev/null && [ "$_s" = stdin-probe ] && echo stdin
@@ -1559,6 +1563,59 @@ mod tests {
             "processes 12, 34 in the sandbox"
         );
         assert_eq!(describe_survivors(""), "a process in the sandbox");
+    }
+
+    /// This host's `sh`, with `prelude` run before every script: a way to make one tool of the
+    /// "sandbox" behave like a stripped-down image's.
+    struct Prelude(&'static str);
+
+    #[async_trait]
+    impl CommandRunner for Prelude {
+        async fn run(
+            &self,
+            program: &str,
+            args: &[String],
+            cwd: Option<&str>,
+            timeout: Duration,
+        ) -> std::io::Result<crate::tools::exec::ExecResult> {
+            crate::tools::exec::RealRunner
+                .run(program, args, cwd, timeout)
+                .await
+        }
+
+        async fn run_with_stdin(
+            &self,
+            program: &str,
+            args: &[String],
+            cwd: Option<&str>,
+            timeout: Duration,
+            stdin: &[u8],
+        ) -> std::io::Result<crate::tools::exec::ExecResult> {
+            let mut args = args.to_vec();
+            args[1] = format!("{}\n{}", self.0, args[1]);
+            crate::tools::exec::RealRunner
+                .run_with_stdin(program, &args, cwd, timeout, stdin)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_whose_tools_lack_the_flags_reads_need_has_no_jobs() {
+        let whole = ShellJobs::new(Arc::new(Prelude(":"))).baseline().await;
+        assert!(whole.jobs, "this host's tools must pass the probe");
+        // `dd` and `base64` exist, but a busybox-style `dd` has no `iflag=skip_bytes`.
+        let dd = ShellJobs::new(Arc::new(Prelude(
+            "dd() { echo 'dd: unrecognized operand' >&2; return 1; }",
+        )))
+        .baseline()
+        .await;
+        assert!(!dd.jobs, "dd without iflag=skip_bytes passed the probe");
+        let b64 = ShellJobs::new(Arc::new(Prelude(
+            "base64() { echo 'base64: invalid option -- w' >&2; return 1; }",
+        )))
+        .baseline()
+        .await;
+        assert!(!b64.jobs, "base64 without -w passed the probe");
     }
 
     /// A held start whose stdout chunk is read before the stderr chunk carrying the start marker:
