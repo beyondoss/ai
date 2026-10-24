@@ -201,6 +201,54 @@ In `demo.sh`: write `check_<name_with_underscores>()` (it talks to the agent wit
 title in `CHECK_TITLE`, and add its name to the lists at the top. The runner times and records it and
 the report draws it.
 
+## Load: one replica, many tenants
+
+`load.sh` proves that one service-mode replica stays bounded when many tenants share it, on the real
+stack and the demo's task size (Fargate, 0.5 vCPU, 1 GB). It spends nothing on a model: `SANDBOX=load`
+brings up only the agent task and a second task running `beyond-ai-demo load-host`, a scripted model that
+answers instantly (a prompt gets one `read` of the bundle's skill, the tool result gets a one-line answer)
+and the bundle host. There is no gateway, no sandbox and no provider key.
+
+```sh
+./deploy/demo/load.sh up      # about 4 minutes; DEMO_NAME=load, so it shares nothing with another stack
+./deploy/demo/load.sh run     # about 20 minutes: results/<timestamp>-load/{run.json,report.html}
+./deploy/demo/load.sh down    # down.sh, with its counts merged into the same record
+```
+
+The load: 150 bundles (50 tenants, three versions each, 10 with 5 MB of skills) and 100 more for the
+burst. Two waves, each ramping to 500 sessions open at once (60% long-lived; 40% churning through a second
+set of bundles, so the cache has something to evict), a few turns each, every turn reading a skill; hold,
+close everything, idle 3 minutes. Then the cold-start burst (200 sessions at once on 100 bundles nobody has
+opened), then one tenant whose `.mcp.json` lists 200 servers, with the grant limit unset and at 5.
+`LOAD_SESSIONS`, `LOAD_IDLE_SECS` and the like change the sizes; `LOAD_CACHE_MB` (default 16) is the cache
+budget, set low so eviction happens.
+
+The replica is read from inside its task. A `sampler` container shares the task's process namespace and
+network and logs, every two seconds, what the kernel says about the agent process (resident and anonymous
+memory, threads, fds, CPU), its bundle cache on disk, the established sockets and the agent's own metrics.
+The bundle host holds each fetch for 250 ms, so overlapping fetches show as a peak it can count (S3 shows
+none), and counts dials to the connector URLs. The driver records what a client sees. `load-analyze.py`
+joins them and grades the bounds; a metric that grows from one wave to the next is a failed check.
+
+Measured on one run (`results/20261024T171544Z-load`, commit in the record):
+
+| bound                                 | result                                                                                                                                                                                                                                                                    |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| memory per session                    | about 270 KB of anonymous memory per session the replica holds (slope over the waves); a closed session is held for the idle reaper's 60 s, so the replica held 1,950 for 500 open at a client, about 1 MB per client-open session                                        |
+| open latency, 500 open at once        | p50 1.19 s and p99 5.6 s in wave 1; 1.13 s and 4.3 s in wave 2 (40 ms of it network); the replica's CPU is the limit, 31% median of a vCPU with peaks of 62 to 77% against the task's 50%                                                                                 |
+| cold-start burst                      | 200 sessions on 100 unseen bundles: open p50 5.2 s, p99 8.8 s, every session opened                                                                                                                                                                                       |
+| concurrent bundle fetches             | peak 4 (the cap), reached in the burst and in both waves                                                                                                                                                                                                                  |
+| connector cap, `.mcp.json` of 200     | limit unset: 64 servers dialed per session (the agent's ceiling), 320 connections open at once for 5 sessions; limit 5: 5 per session, 25 for 5 sessions                                                                                                                  |
+| no growth across waves                | peak anonymous memory 894 MB then 464 MB; the floor in the idle after each wave 322 MB then 324 MB; threads and fds back to 4 and 12 after both; open latency and CPU the same in both waves                                                                              |
+| bundle cache against its 16 MB budget | peak 54 MB with sessions open (bundles a session holds are never evicted); 1,283 directories evicted; **not trimmed when sessions close**: it stayed at 54 MB through both idles and was trimmed only by the next install (19 MB after the burst, still above the budget) |
+| memory with no sessions               | **a quiet replica is not quiet**: with zero sessions and no work, anonymous memory drifted up 20 MB in one idle and 58 MB in the other, in step with transparent huge pages (30 and 118 MB of it), and fell to 186 MB only when the replica next did work                 |
+| headroom                              | wave 1 peaked at 894 MB of the task's 1,024 MB (wave 2 at 464 MB): about 2,000 held sessions is the ceiling at this size                                                                                                                                                  |
+
+Two things the run found are in the record as failed checks, not fixed here: the memory drift with no sessions
+(the kernel's huge-page collapse filling pages the allocator has freed but not returned; the agent enables
+huge pages on purpose, so this is a trade to decide, not a leak, and it does not grow across waves), and
+the cache, which is only trimmed when a bundle is installed.
+
 ## What it costs
 
 About **$0.08 an hour** while up (three Fargate tasks of 0.25 to 0.5 vCPU, EFS, nothing else: no NAT

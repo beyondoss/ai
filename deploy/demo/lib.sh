@@ -31,14 +31,17 @@ SANDBOX=${SANDBOX:-fargate}
 # `oidc` is a stack of its own for `demo.sh oidc`: no sandbox at all, an identity provider (Keycloak) and
 # the broker that signs users in and acts as them, and ECS Exec on the agent for its memory scan.
 case "$SANDBOX" in
-  fargate | e2b | both | oidc) ;;
-  *) echo "SANDBOX must be fargate, e2b, both or oidc" >&2; exit 2 ;;
+  fargate | e2b | both | oidc | load) ;;
+  *) echo "SANDBOX must be fargate, e2b, both, oidc or load" >&2; exit 2 ;;
 esac
-USE_FARGATE=0 USE_E2B=0 USECASES=0 OIDC=0
-[ "$SANDBOX" = e2b ] || [ "$SANDBOX" = oidc ] || USE_FARGATE=1
-[ "$SANDBOX" = fargate ] || [ "$SANDBOX" = oidc ] || USE_E2B=1
+USE_FARGATE=0 USE_E2B=0 USECASES=0 OIDC=0 LOAD=0
+[ "$SANDBOX" = e2b ] || [ "$SANDBOX" = oidc ] || [ "$SANDBOX" = load ] || USE_FARGATE=1
+[ "$SANDBOX" = fargate ] || [ "$SANDBOX" = oidc ] || [ "$SANDBOX" = load ] || USE_E2B=1
 [ "$SANDBOX" != both ] || USECASES=1
 [ "$SANDBOX" != oidc ] || OIDC=1
+# `load`: the load proof (load.sh). One agent replica, a scripted model and a bundle host, and nothing
+# else: no gateway, no sandbox, no provider key.
+[ "$SANDBOX" != load ] || LOAD=1
 # what the use cases that scan the agent process's memory through ECS Exec need
 EXECSCAN=0
 [ "$USECASES" = 0 ] && [ "$OIDC" = 0 ] || EXECSCAN=1
@@ -46,6 +49,9 @@ STANDIN_PORT=8082                # the stand-in managed-MCP endpoint (public: it
 PROVIDER_PORT=8083               # its "third party", loopback only
 OIDC_CONTROL_PORT=8085           # the broker's control plane (consent, binding, revocation), open to the caller only
 OIDC_IDP_PORT=8180               # the identity provider (Keycloak), open to the caller only: the scripted user signs in here
+LOADHOST_PORT=8086               # the load proof's bundle host (public: bundles are named by hash)
+LOADMODEL_PORT=8083              # its scripted model (inside the VPC; the task is a different one)
+METRICS_PORT=9100                # the agent's own metrics, loopback, read by the load proof's sampler
 TAGSPEC="{Key=$TAG_KEY,Value=$NAME}"
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

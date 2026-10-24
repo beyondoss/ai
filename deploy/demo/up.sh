@@ -74,7 +74,9 @@ put_param() { # name, type; value on stdin
 param_exists() { command aws --region "$REGION" ssm get-parameter --name "$SSM/$1" >/dev/null 2>&1; }
 
 KEY=${!KEYVAR:-}
-if [ -n "$KEY" ]; then
+if [ "$LOAD" = 1 ]; then
+  : # the load proof talks to a scripted model: no provider key, no gateway
+elif [ -n "$KEY" ]; then
   printf '%s' "$KEY" | put_param "$PROVIDER-key" SecureString
 elif ! param_exists openai-key && ! param_exists openrouter-key; then
   echo "up: set OPENAI_API_KEY (or OPENROUTER_API_KEY); it is stored in SSM and read by the gateway only" >&2
@@ -87,6 +89,12 @@ if param_exists openrouter-key && ! param_exists openai-key; then
   MODEL=${DEMO_MODEL:-openai/gpt-5-mini}
 else
   PROVIDER=openai
+fi
+
+# The load proof's bundle host takes uploads and reports stats only with this token.
+if [ "$LOAD" = 1 ]; then
+  MODEL=claude-test
+  param_exists load-token || openssl rand -hex 24 | tr -d "\n" | put_param load-token SecureString
 fi
 
 # For the use cases: the secret the stand-in managed-MCP endpoint shares with the grant minter, and the
@@ -173,10 +181,10 @@ ensure_image() { # repo, dockerfile, [build target]
   IMAGES_CHANGED=1
 }
 IMAGES_CHANGED=
-ensure_image "$P-gateway" Dockerfile
+[ "$LOAD" = 1 ] || ensure_image "$P-gateway" Dockerfile
 ensure_image "$P-agent" Dockerfile.agent
 [ "$USE_FARGATE" = 0 ] || ensure_image "$P-sandbox" deploy/demo/Dockerfile.sandbox
-{ [ "$USECASES" = 1 ] || [ "$OIDC" = 1 ]; } && ensure_image "$P-standin" deploy/demo/Dockerfile.standin
+{ [ "$USECASES" = 1 ] || [ "$OIDC" = 1 ] || [ "$LOAD" = 1 ]; } && ensure_image "$P-standin" deploy/demo/Dockerfile.standin
 [ "$USECASES" = 0 ] || ensure_image "$P-front" deploy/demo/Dockerfile.sandbox front
 
 # ---------------------------------------------------------------------------------------------
@@ -260,6 +268,9 @@ if [ "$OIDC" = 1 ]; then
   sg_rule "$SG_TASKS" --protocol tcp --port "$OIDC_CONTROL_PORT" --cidr "$CALLER"
   sg_rule "$SG_TASKS" --protocol tcp --port "$OIDC_IDP_PORT" --cidr "$CALLER"
 fi
+# The load proof's bundle host: the replica fetches bundles from it at its public address, as it would
+# from S3. Uploads and stats need the token; a bundle is only served by the hash it is named by.
+[ "$LOAD" = 0 ] || sg_rule "$SG_TASKS" --protocol tcp --port "$LOADHOST_PORT" --cidr 0.0.0.0/0
 
 # ---------------------------------------------------------------------------------------------
 # The use cases' agent folders are deployed as bundles: one tar per folder, named by its hash, in a
@@ -328,11 +339,12 @@ role() { # suffix, space-separated parameter names it may read (empty: none)
 }
 # The gateway's role reads the provider key and its id-signing key and nothing else; the agent's
 # reads its own seal and TLS keys; the sandbox's reads nothing. No role can read the whole prefix.
-role gateway-exec "$PROVIDER-key id-signing-key"
+[ "$LOAD" = 1 ] || role gateway-exec "$PROVIDER-key id-signing-key"
 role agent-exec "fleet-secret tls-key"
 [ "$USE_FARGATE" = 0 ] || role sandbox-exec "$([ "$USECASES" = 0 ] || echo e2b-key)"
 # The stand-in's role is the only one that can read the "third party's" key.
 [ "$USECASES" = 0 ] || role standin-exec "managed-secret provider-secret"
+[ "$LOAD" = 0 ] || role loadhost-exec "load-token"
 # The identity provider's realm (its users' passwords) and the broker's keys: this stack's task alone.
 [ "$OIDC" = 0 ] || role oidc-exec "managed-secret broker-master broker-admin oidc-client-secret oidc-realm"
 # ECS Exec on the agent (`demo.sh assistant` and `demo.sh oidc` scan the agent process's memory through
@@ -409,6 +421,7 @@ register() { # family, json (stdin); echoes the ARN in use
     --tags "key=spec,value=$hash" "key=$TAG_KEY,value=$NAME" --query 'taskDefinition.taskDefinitionArn'
 }
 
+if [ "$LOAD" = 0 ]; then
 TD_GATEWAY=$(jq -n --arg family "$P-gateway" --arg exec "$(EXEC gateway)" --argjson logs_gw "$(LOGS gateway)" \
   --argjson logs_nats "$(LOGS nats)" --arg img "$ECR/$P-gateway:latest" --arg pub "$GATEWAY_PUB" \
   --arg pk "$(param_arn "$PROVIDER-key")" --arg ik "$(param_arn id-signing-key)" \
@@ -423,6 +436,7 @@ TD_GATEWAY=$(jq -n --arg family "$P-gateway" --arg exec "$(EXEC gateway)" --argj
      environment:[{name:"AI_NATS_URL",value:"nats://127.0.0.1:4222"},{name:"AI_SIGNING_KEY_1",value:$pub}],
      secrets:[{name:$poolvar,valueFrom:$pk},{name:"AI_ID_SIGNING_KEY_1",valueFrom:$ik}],
      logConfiguration:$logs_gw}]}' | register "$P-gateway")
+fi
 
 # The agent is NOT pid 1: pid 1 is a shell that never forwards SIGTERM. A stopped task is therefore
 # SIGKILLed two seconds later, agent included, with no chance to seal its segment or release its
@@ -442,6 +456,10 @@ NOTIFY_ORIGIN="https://$(printf %s "$IP" | tr . -).sslip.io:8443"; echo "notify 
 fi
 AGENT_TASK_ROLE=
 [ "$EXECSCAN" = 0 ] || AGENT_TASK_ROLE="arn:aws:iam::$ACCOUNT:role/$P-agent-task"
+if [ "$LOAD" = 1 ]; then
+  # shellcheck source=load-tasks.sh
+  . "$HERE/load-tasks.sh"
+else
 TD_AGENT=$(jq -n --arg family "$P-agent" --arg exec "$(EXEC agent)" --arg taskrole "$AGENT_TASK_ROLE" --argjson logs "$(LOGS agent)" \
   --arg img "$ECR/$P-agent:latest" --argjson vol "$EFSVOL" --arg script "$AGENT_SCRIPT" \
   --arg gw "http://gateway.$DNS:$GATEWAY_PORT" --arg model "$MODEL" --arg origin "https://agent.$DNS:$AGENT_TLS_PORT" \
@@ -459,6 +477,7 @@ TD_AGENT=$(jq -n --arg family "$P-agent" --arg exec "$(EXEC agent)" --arg taskro
   # The use cases scan the agent process'"'"'s memory through ECS Exec, which Linux allows a non-parent
   # only with CAP_SYS_PTRACE (Yama scope 1 on Fargate): granted for that, in this mode only.
   | if $taskrole == "" then . else .containerDefinitions[0].linuxParameters = {capabilities:{add:["SYS_PTRACE"]}} end' | register "$P-agent")
+fi
 
 if [ "$USE_FARGATE" = 1 ]; then
 SANDBOX_SCRIPT='printf "%s" "$CA_PEM" > /tmp/ca.pem
@@ -536,12 +555,13 @@ service() { # name, task definition arn, port
 }
 # An ECS service tag cannot be added after create when the service already has none; fine here, ours
 # are tagged at create.
-service gateway "$TD_GATEWAY"
+[ "$LOAD" = 1 ] || service gateway "$TD_GATEWAY"
 EXEC_FLAG=
 [ "$EXECSCAN" = 0 ] || EXEC_FLAG=1
 service agent "$TD_AGENT"
 EXEC_FLAG=
 SERVICES=("$P-gateway" "$P-agent")
+[ "$LOAD" = 0 ] || SERVICES=("$P-agent")
 if [ "$USE_FARGATE" = 1 ]; then
   service sandbox "$TD_SANDBOX"
   SERVICES+=("$P-sandbox")
@@ -555,6 +575,11 @@ if [ "$OIDC" = 1 ]; then
   SERVICES+=("$P-oidc")
 fi
 
+if [ "$LOAD" = 1 ]; then
+  service loadhost "$TD_LOADHOST"
+  SERVICES+=("$P-loadhost")
+fi
+
 echo "waiting for the ${#SERVICES[@]} services to be stable..."
 aws ecs wait services-stable --cluster "$CLUSTER" --services "${SERVICES[@]}"
 
@@ -563,11 +588,17 @@ echo
 created=$(wc -l < "$WORK/made" 2>/dev/null || echo 0)
 echo "up: created $created resource(s) in $REGION (tag $TAG_KEY=$NAME)."
 echo "  agent   ws://$IP:$AGENT_PORT   (open to $CALLER only)"
-echo "  model   $MODEL via the gateway, provider $PROVIDER"
+if [ "$LOAD" = 1 ]; then
+  echo "  model   scripted stand-in at loadhost.$DNS:$LOADMODEL_PORT (no gateway, no provider)"
+  echo "  loadhost $(svc_ip loadhost):$LOADHOST_PORT"
+else
+  echo "  model   $MODEL via the gateway, provider $PROVIDER"
+fi
 case "$SANDBOX" in
   e2b) echo "  sandbox E2B: one microVM per session, made by demo.sh (metadata $TAG_KEY=$NAME); down.sh kills them" ;;
   both) echo "  sandbox the use cases: a Fargate workspace host, E2B microVMs (metadata $TAG_KEY=$NAME; down.sh kills them),"
     echo "          and the stand-in managed-MCP endpoint at $(svc_ip standin):$STANDIN_PORT" ;;
+  load) echo "  sandbox none (the load proof: assistant-style bundles, no exec endpoint)" ;;
   oidc) echo "  sandbox none. The identity provider (Keycloak) and the broker are one task at $(svc_ip oidc):$OIDC_IDP_PORT / :$STANDIN_PORT / :$OIDC_CONTROL_PORT" ;;
   *) echo "  sandbox Fargate: one shared exec-stub service" ;;
 esac

@@ -348,6 +348,31 @@ pub fn spawn_model_server_fn(
     (format!("http://{addr}"), requests)
 }
 
+/// As [`spawn_model_server_fn`], bound where the caller says and keeping no record of the requests:
+/// for a stand-in model that serves a long run, where a recorder would grow without bound.
+pub fn spawn_model_server_fn_on(
+    bind: &str,
+    answer: impl Fn(&str) -> String + Send + Sync + 'static,
+) {
+    let listener = TcpListener::bind(bind).unwrap();
+    let answer = Arc::new(answer);
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut stream) = conn else { break };
+            let answer = answer.clone();
+            thread::spawn(move || {
+                let req = read_http_request(&mut stream);
+                if is_session_title_request(&req) {
+                    reply(&mut stream, &turn_text(SCRIPTED_SESSION_TITLE));
+                    return;
+                }
+                let resp = answer(&req);
+                reply(&mut stream, &resp);
+            });
+        }
+    });
+}
+
 fn spawn_model_server_routed_inner(
     routes: Vec<(String, String)>,
     fallback: String,

@@ -5,6 +5,8 @@
 pub mod chat;
 pub mod http;
 pub mod keys;
+pub mod load;
+pub mod load_host;
 #[cfg(feature = "agent-lib")]
 pub mod managed;
 #[cfg(feature = "agent-lib")]

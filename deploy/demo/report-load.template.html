@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>One replica, many tenants: load report</title>
+<style>
+[hidden]{display:none!important}
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #14181f; --muted: #5d6675; --line: #dde1e8;
+  --accent: #2f6df6; --ok: #138a4b; --bad: #d12b3a; --warn: #b7791f;
+  --s1: #2f6df6; --s2: #c26a00; --s3: #138a4b; --s4: #b0299f; --band: rgba(93,102,117,.09); --code: #f0f2f6;
+}
+:root[data-theme="dark"] {
+  --bg: #0e1218; --panel: #161c25; --ink: #e8ecf3; --muted: #93a0b4; --line: #27303d;
+  --accent: #6b9bff; --ok: #3ecf80; --bad: #ff6b7a; --warn: #f0b24a;
+  --s1: #6b9bff; --s2: #f0a24a; --s3: #3ecf80; --s4: #e070d0; --band: rgba(147,160,180,.10); --code: #1b222d;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e1218; --panel: #161c25; --ink: #e8ecf3; --muted: #93a0b4; --line: #27303d;
+    --accent: #6b9bff; --ok: #3ecf80; --bad: #ff6b7a; --warn: #f0b24a;
+    --s1: #6b9bff; --s2: #f0a24a; --s3: #3ecf80; --s4: #e070d0; --band: rgba(147,160,180,.10); --code: #1b222d;
+  }
+}
+* { box-sizing: border-box; }
+html { color-scheme: light dark; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+.wrap { max-width: 1180px; margin: 0 auto; padding: 16px; }
+header { display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: baseline; justify-content: space-between; margin-bottom: 14px; }
+h1 { font-size: 22px; margin: 0; letter-spacing: -0.01em; }
+.sub { color: var(--muted); font-size: 13px; }
+.sub b { color: var(--ink); font-weight: 600; }
+button { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 14px; min-width: 0; }
+.card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+.card p.note { color: var(--muted); font-size: 13px; margin: 0 0 8px; }
+.board { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 10px; }
+.chk { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+.chk .v { font-size: 24px; font-weight: 800; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.chk.pass .v { color: var(--ok); } .chk.fail .v { color: var(--bad); } .chk.pending .v { color: var(--muted); }
+.chk .t { font-size: 13px; margin: 2px 0 6px; } .chk .k { font-size: 12px; color: var(--muted); }
+.chk .n { font-family: ui-monospace, monospace; font-size: 11px; color: var(--muted); }
+.tiles { display: flex; gap: 22px; flex-wrap: wrap; }
+.tiles div b { display: block; font-size: 24px; font-variant-numeric: tabular-nums; }
+.tiles div span { font-size: 12px; color: var(--muted); }
+table { border-collapse: collapse; width: 100%; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+th, td { text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--muted); font-weight: 600; }
+.tablewrap { overflow-x: auto; }
+svg { width: 100%; height: auto; display: block; }
+.ax text { fill: var(--muted); font-size: 11px; }
+.ax line, .ax path { stroke: var(--line); fill: none; }
+.band text { fill: var(--muted); font-size: 10.5px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--muted); margin-top: 6px; }
+.legend i { display: inline-block; width: 14px; height: 3px; margin-right: 5px; vertical-align: middle; border-radius: 2px; }
+.tear { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 4px 18px; font-variant-numeric: tabular-nums; font-size: 13px; }
+.tear span { display: flex; justify-content: space-between; border-bottom: 1px dotted var(--line); }
+.tear .z { color: var(--ok); font-weight: 700; } .tear .nz { color: var(--bad); font-weight: 700; }
+.flag { color: var(--bad); font-weight: 700; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div><h1>One replica, many tenants</h1><div class="sub" id="sub"></div></div>
+  <button id="theme" type="button">Theme</button>
+</header>
+<div class="card"><h2>What was graded</h2><div class="board" id="board"></div></div>
+<div class="card"><h2>The numbers</h2><div class="tiles" id="tiles"></div></div>
+<div class="card"><h2>Memory over time</h2>
+  <p class="note">Anonymous memory is the replica's own heap and stacks; resident memory also counts the binary's mapped pages. Bands are the run's phases. The grey area is sessions the replica holds (right axis).</p>
+  <div id="c-mem"></div></div>
+<div class="card"><h2>CPU over time</h2>
+  <p class="note">The replica's CPU as a share of one vCPU, against the task's half vCPU allotment (dashed). Memory and open latency are read against this.</p>
+  <div id="c-cpu"></div></div>
+<div class="card"><h2>File descriptors and threads over time</h2><div id="c-fd"></div></div>
+<div class="card"><h2>Bundle cache on disk</h2>
+  <p class="note">Against its budget. A bundle a session still holds is never evicted, so the line may rise above the budget while sessions are open; it must come back once they close and the next bundles arrive.</p>
+  <div id="c-cache"></div></div>
+<div class="card"><h2>Sockets</h2>
+  <p class="note">Established connections from the replica to the bundle host (bundle fetches, and the dials of a <code>.mcp.json</code> with many servers), and the sessions' own WebSockets.</p>
+  <div id="c-net"></div></div>
+<div class="card"><h2>Wave by wave</h2><div class="tablewrap" id="waves"></div></div>
+<div class="card"><h2>The .mcp.json with 200 servers</h2><div class="tablewrap" id="mcp"></div></div>
+<div class="card"><h2>Phases</h2><div class="tablewrap" id="phases"></div></div>
+<div class="card"><h2>Teardown</h2><div id="tear"></div></div>
+</div>
+<script id="run" type="application/json">
+/*RUN_JSON*/
+</script>
+<script>
+const R = JSON.parse(document.getElementById('run').textContent);
+const A = R.analysis, KB = 1024;
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const f1 = x => (Math.round(x * 10) / 10).toLocaleString();
+const root = document.documentElement;
+const saved = (() => { try { return localStorage.getItem('theme'); } catch (e) { return null; } })();
+if (saved) root.dataset.theme = saved;
+$('theme').onclick = () => { const t = root.dataset.theme === 'dark' ? 'light' : 'dark'; root.dataset.theme = t; try { localStorage.setItem('theme', t); } catch (e) {} };
+
+$('sub').innerHTML = `commit <b>${esc(R.commit)}</b> &middot; ${esc(R.region)} &middot; Fargate task <b>${R.task.vcpu} vCPU, ${R.task.memory_mb} MB</b> &middot; cache budget <b>${R.cache_budget_mb} MB</b> &middot; scripted model, no sandbox &middot; ${esc(R.started_at)}`;
+
+$('board').innerHTML = R.checks.map(c => `<div class="chk ${c.status}"><div class="v">${c.headline ? esc(c.headline.value) + ' <span class="k">' + esc(c.headline.unit) + '</span>' : (c.status === 'pass' ? 'PASS' : c.status === 'fail' ? 'FAIL' : '...')}</div>
+  <div class="t">${esc(c.title)}</div><div class="k">${esc(c.detail)}</div><div class="n">${esc(c.name)} &middot; ${c.status}</div></div>`).join('');
+
+const w = A.waves;
+$('tiles').innerHTML = [
+  [f1(A.per_session_kb), 'KB anonymous memory per open session'],
+  [w.map(x => Math.round(x.open_p50_ms)).join(' / '), 'open p50 ms, per wave'],
+  [w.map(x => Math.round(x.open_p99_ms)).join(' / '), 'open p99 ms, per wave'],
+  [Math.max(...w.map(x => x.sessions_live_peak)), 'sessions held at the peak'],
+  [A.fetch_peak + ' of 4', 'peak concurrent bundle fetches'],
+  [f1(A.cache.peak_kb / KB) + ' of ' + f1(A.cache.budget_kb / KB), 'MB bundle cache, peak vs budget'],
+  [f1(R.rtt_ms), 'ms network round trip (driver to replica)'],
+].map(([b, s]) => `<div><b>${esc(b)}</b><span>${esc(s)}</span></div>`).join('');
+
+// ---- charts ------------------------------------------------------------------------------------
+const S = R.samples, T0 = R.phases[0].start_ms - 30000, T1 = R.phases[R.phases.length - 1].end_ms + 10000;
+const W = 1100, H = 250, L = 52, RGT = 52, TOP = 22, BOT = 26;
+const X = t => L + (t - T0) / (T1 - T0) * (W - L - RGT);
+const nice = m => { const p = Math.pow(10, Math.floor(Math.log10(m || 1))); const n = m / p; return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * p; };
+function bands() {
+  let out = '';
+  R.phases.forEach((p, i) => {
+    if (/^idle/.test(p.name) && !/^idle[0-9]$/.test(p.name)) return;
+    const x0 = X(p.start_ms), x1 = X(p.end_ms);
+    if (i % 2 === 0) out += `<rect x="${x0}" y="${TOP}" width="${x1 - x0}" height="${H - TOP - BOT}" fill="var(--band)"/>`;
+    out += `<g class="band"><text x="${(x0 + x1) / 2}" y="${TOP - 8}" text-anchor="middle">${esc(p.name)}</text></g>`;
+  });
+  return out;
+}
+function xaxis() {
+  let out = '<g class="ax">';
+  const mins = Math.ceil((T1 - T0) / 60000);
+  const step = mins > 40 ? 10 : 5;
+  for (let m = 0; m <= mins; m += step) {
+    const t = T0 + m * 60000; out += `<line x1="${X(t)}" x2="${X(t)}" y1="${H - BOT}" y2="${H - BOT + 4}"/><text x="${X(t)}" y="${H - 8}" text-anchor="middle">${m} min</text>`;
+  }
+  return out + '</g>';
+}
+// series: [{key|fn, color, label, dash, area}], left axis in `unit`; optional right-axis series list
+function chart(el, left, unit, right, runit, extraLines) {
+  const val = (s, ser) => ser.fn ? ser.fn(s) : s[ser.key];
+  const lmax = nice(Math.max(1, ...left.flatMap(ser => S.map(s => val(s, ser) || 0)), ...(extraLines || []).map(e => e.y)) * 1.08);
+  const rmax = right.length ? nice(Math.max(1, ...right.flatMap(ser => S.map(s => val(s, ser) || 0))) * 1.08) : 1;
+  const YL = v => H - BOT - v / lmax * (H - TOP - BOT), YR = v => H - BOT - v / rmax * (H - TOP - BOT);
+  let svg = `<svg viewBox="0 0 ${W} ${H}" role="img">` + bands();
+  for (let i = 0; i <= 4; i++) {
+    const v = lmax * i / 4, y = YL(v);
+    svg += `<g class="ax"><line x1="${L}" x2="${W - RGT}" y1="${y}" y2="${y}"/><text x="${L - 6}" y="${y + 4}" text-anchor="end">${f1(v)}</text></g>`;
+    if (right.length) svg += `<g class="ax"><text x="${W - RGT + 6}" y="${y + 4}">${f1(rmax * i / 4)}</text></g>`;
+  }
+  svg += `<g class="ax"><text x="${L - 6}" y="12" text-anchor="end">${esc(unit)}</text>${right.length ? `<text x="${W - RGT + 6}" y="12">${esc(runit)}</text>` : ''}</g>` + xaxis();
+  const path = (ser, Y) => S.map((s, i) => `${i ? 'L' : 'M'}${X(s.t).toFixed(1)},${Y(val(s, ser) || 0).toFixed(1)}`).join('');
+  right.forEach(ser => { svg += `<path d="${path(ser, YR)}L${X(S[S.length - 1].t)},${YR(0)}L${X(S[0].t)},${YR(0)}Z" fill="var(--muted)" opacity=".16" stroke="none"/>`; });
+  (extraLines || []).forEach(e => { svg += `<line x1="${L}" x2="${W - RGT}" y1="${YL(e.y)}" y2="${YL(e.y)}" stroke="${e.color}" stroke-width="1.5" stroke-dasharray="6 4"/>`; });
+  left.forEach(ser => { svg += `<path d="${path(ser, YL)}" fill="none" stroke="${ser.color}" stroke-width="2" ${ser.dash ? 'stroke-dasharray="5 3"' : ''}/>`; });
+  svg += '</svg>';
+  const leg = left.map(s => `<span><i style="background:${s.color}"></i>${esc(s.label)}</span>`)
+    .concat(right.map(s => `<span><i style="background:var(--muted);opacity:.4"></i>${esc(s.label)}</span>`))
+    .concat((extraLines || []).map(e => `<span><i style="background:${e.color}"></i>${esc(e.label)}</span>`)).join('');
+  el.innerHTML = svg + `<div class="legend">${leg}</div>`;
+}
+const live = { key: 'agent_sessions_live', label: 'sessions held (right axis)' };
+chart($('c-mem'), [
+  { fn: s => s.RssAnon / KB, color: 'var(--s1)', label: 'anonymous memory, MB' },
+  { fn: s => s.VmRSS / KB, color: 'var(--s2)', label: 'resident memory, MB', dash: true },
+], 'MB', [live], 'sessions');
+chart($('c-cpu'), [
+  { key: 'cpu_pct', color: 'var(--s4)', label: 'replica CPU, % of one vCPU' },
+], '%', [live], 'sessions', [{ y: 50, color: 'var(--bad)', label: 'task allotment (0.5 vCPU)' }]);
+chart($('c-fd'), [
+  { key: 'fds', color: 'var(--s1)', label: 'open file descriptors' },
+  { key: 'Threads', color: 'var(--s3)', label: 'threads' },
+], 'count', [live], 'sessions');
+chart($('c-cache'), [
+  { fn: s => s.cache_kb / KB, color: 'var(--s1)', label: 'bundle cache on disk, MB' },
+], 'MB', [{ key: 'cache_dirs', label: 'bundles cached (right axis)' }], 'bundles', [{ y: A.cache.budget_kb / KB, color: 'var(--bad)', label: 'budget' }]);
+chart($('c-net'), [
+  { key: 'to_loadhost', color: 'var(--s2)', label: 'established to the bundle host' },
+], 'connections', [{ key: 'ws_established', label: 'session WebSockets (right axis)' }], 'sockets');
+
+// ---- tables ------------------------------------------------------------------------------------
+const row = (cells, th) => '<tr>' + cells.map(c => `<${th ? 'th' : 'td'}>${c}</${th ? 'th' : 'td'}>`).join('') + '</tr>';
+const growth = (a, b, unit, tolPct, tolAbs) => { const d = b - a; const bad = d > Math.max(a * tolPct, tolAbs); return `<span class="${bad ? 'flag' : ''}">${d >= 0 ? '+' : ''}${f1(d)} ${unit}</span>`; };
+let t = '<table>' + row(['', ...w.map(x => 'wave ' + x.wave), 'change'], true);
+const line = (label, get, unit, tp, ta) => t += row([label, ...w.map(x => f1(get(x)) + ' ' + unit), w.length > 1 ? growth(get(w[0]), get(w[w.length - 1]), unit, tp, ta) : '']);
+line('sessions held at the peak', x => x.sessions_live_peak, '', 0.05, 25);
+line('open p50', x => x.open_p50_ms, 'ms', 0.5, 200);
+line('open p99', x => x.open_p99_ms, 'ms', 0.5, 500);
+line('open p50, net of network RTT', x => x.open_p50_ms_net_of_rtt, 'ms', 0.5, 200);
+line('open p99, net of network RTT', x => x.open_p99_ms_net_of_rtt, 'ms', 0.5, 500);
+line('anonymous memory at the peak', x => x.rss_anon_peak_mb, 'MB', 0.05, 4);
+line('anonymous memory floor in the idle (no sessions)', x => x.after_idle.RssAnon / KB, 'MB', 0.05, 4);
+line('...of it in transparent huge pages', x => x.after_idle.AnonHugePages / KB, 'MB', 0.5, 20);
+line('drift upward while idle, no sessions', x => x.after_idle.drift / KB, 'MB', 0.5, 4);
+line('CPU, median over the wave', x => x.cpu_mean_pct, '% of a vCPU', 0.25, 10);
+line('CPU, peak', x => x.cpu_peak_pct, '% of a vCPU', 0.25, 10);
+line('per-session cost (slope over the wave)', x => x.per_session_kb_slope, 'KB', 0.25, 20);
+line('per-session cost (peak over the baseline)', x => x.per_session_kb_from_baseline, 'KB', 0.25, 20);
+line('threads at the peak', x => x.threads_peak, '', 0.1, 2);
+line('threads after the idle', x => x.after_idle.Threads, '', 0.1, 2);
+line('fds at the peak', x => x.fds_peak, '', 0.1, 10);
+line('fds after the idle', x => x.after_idle.fds, '', 0.1, 10);
+line('bundle cache after the idle', x => x.after_idle.cache_kb / KB, 'MB', 0.1, 4);
+line('opens that failed', x => x.open_failures, '', 0, 0);
+$('waves').innerHTML = t + '</table>';
+
+const m = A.mcp, mk = Object.keys(m);
+$('mcp').innerHTML = mk.length ? '<table>' + row(['grant limit', 'sessions', 'servers dialed (of 200)', 'connections at the host', 'open at once (host)', 'established, replica side (peak)', 'open p50 ms'], true) +
+  mk.map(k => row([k === 'mcp-unset' ? 'unset (agent ceiling)' : '5', m[k].sessions, m[k].distinct_servers, m[k].dials_at_the_host, m[k].peak_open_at_the_host, m[k].peak_established_from_the_replica, Math.round(m[k].open_p50_ms)])).join('') + '</table>' : '';
+
+$('phases').innerHTML = '<table>' + row(['phase', 'seconds', 'opens', 'failed', 'turns', 'open p50', 'open p99', 'turn p50', 'fetches at the host', 'peak fetches', 'refetches'], true) +
+  R.phases.map(p => { const h = R.host[p.name] || {}; return row([esc(p.name), Math.round((p.end_ms - p.start_ms) / 1000), p.opens, p.open_failures, p.turns, Math.round(p.open_p50_ms), Math.round(p.open_p99_ms), Math.round(p.turn_p50_ms), h.fetches ?? '', h.fetch_peak ?? '', h.refetches ?? '']); }).join('') + '</table>';
+
+if (R.teardown) {
+  const c = R.teardown.counts;
+  $('tear').innerHTML = `<div class="tear">${Object.keys(c).map(k => `<span>${esc(k)}<b class="${c[k] ? 'nz' : 'z'}">${c[k]}</b></span>`).join('')}</div>`;
+} else $('tear').innerHTML = '<p class="note">Not torn down yet (<code>load.sh down</code>).</p>';
+</script>
+</body>
+</html>
