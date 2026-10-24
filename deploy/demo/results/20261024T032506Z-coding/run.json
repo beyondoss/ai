@@ -1,0 +1,3656 @@
+{
+  "schema": 1,
+  "use_case": {
+    "name": "coding",
+    "title": "coding: an agent that fixes, runs and reviews code in its own sandbox",
+    "summary": "A folder with a failing Python app, a skill with a script, a reviewer subagent and an AGENTS.md, deployed as a bundle. The agent's own E2B microVM does not exist until the first sandbox tool call makes it (and seeds it from the bundle); then it fixes the bug, reviews it, runs the app as a background job and looks at the page with a browser in the same VM.",
+    "folder": "deploy/demo/agents/coding",
+    "tree": [
+      {
+        "path": ".agents/agents/reviewer.md",
+        "bytes": 592,
+        "text": "---\nname: reviewer\ndescription: Reviews a small change to the app for correctness. Read-only; call it after you edit code, naming the file you changed.\ntools: read, grep, find, ls\n---\n\nYou are a careful, terse code reviewer for a small Python app. You can read files but not change them.\n\nRead the file you are asked about and `app/test_server.py`. Check that the change does what the tests\nexpect and does not break anything obvious. Reply in at most four lines, then end with exactly one\nlast line, either\n\n`REVIEWER-SIGNOFF: approved`\n\nor `REVIEWER-SIGNOFF: changes-needed: <the reason>`.\n"
+      },
+      {
+        "path": "AGENTS.md",
+        "bytes": 923,
+        "text": "---\nmodel: gpt-5-mini\ntools: read, edit, write, bash, bash_job, grep, find, ls, subagent, tool_search\nmax-steps: 40\n---\n\nYou maintain a tiny Python web app in `app/` (standard library only: `app/server.py` and its tests in\n`app/test_server.py`). The workspace is your working directory.\n\n- To run the tests, use the `run-tests` skill: read its `SKILL.md` and run the script it names. Do not\n  invent another way to run them.\n- Fix bugs in `app/server.py`, never by editing the tests.\n- After a change, have the `reviewer` agent review it before you say you are done, and report its\n  `REVIEWER-SIGNOFF` line verbatim.\n- Run the app with `bash` and `run_in_background=true` (it serves on port 8000). To look at a page it\n  serves, use the browser tools, which you reach through `tool_search`; they run in the same machine,\n  so `http://localhost:8000/` is the app.\n- Keep your answers short: what you did, and what you saw.\n"
+      },
+      {
+        "path": ".agents/skills/run-tests/run-tests.sh",
+        "bytes": 474,
+        "text": "#!/usr/bin/env bash\n# Run the app's unittest suite and end with a one-line verdict (see SKILL.md).\ncd \"$(dirname \"$0\")/../../../app\" || exit 2\nout=$(python3 -m unittest -v 2>&1)\nstatus=$?\nprintf '%s\\n' \"$out\"\nran=$(printf '%s\\n' \"$out\" | sed -n 's/^Ran \\([0-9]*\\) test.*/\\1/p')\nfailed=$(printf '%s\\n' \"$out\" | grep -c '\\.\\.\\. FAIL$')\nerrors=$(printf '%s\\n' \"$out\" | grep -c '\\.\\.\\. ERROR$')\necho \"RUN-TESTS-SKILL: ${ran:-0} run, $failed failed, $errors errors\"\nexit $status\n"
+      },
+      {
+        "path": ".agents/skills/run-tests/SKILL.md",
+        "bytes": 464,
+        "text": "---\nname: run-tests\ndescription: Run this project's test suite and get a one-line verdict. Use whenever you need to know whether the app's tests pass.\n---\n\n# Running the tests\n\nRun the script from the workspace root:\n\n```sh\nbash .agents/skills/run-tests/run-tests.sh\n```\n\nIt runs every test in `app/`, prints the unittest output, and ends with one line:\n\n`RUN-TESTS-SKILL: <N> run, <F> failed, <E> errors`\n\nReport that line. Exit status 0 means every test passed.\n"
+      },
+      {
+        "path": "app/server.py",
+        "bytes": 1069,
+        "text": "\"\"\"A tiny web app: one page that greets someone. Standard library only; serves on port 8000.\"\"\"\n\nimport os\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nHERE = os.path.dirname(os.path.abspath(__file__))\n\n\ndef greeting(name):\n    return f\"Hello, {name.title}!\"\n\n\ndef build():\n    try:\n        with open(os.path.join(HERE, \"BUILD\")) as f:\n            return f.read().strip()\n    except OSError:\n        return \"dev\"\n\n\ndef page(name=\"world\"):\n    return (\n        \"<!doctype html><html><head><title>Greeter</title></head><body>\"\n        f\"<h1>{greeting(name)}</h1><p>build {build()}</p></body></html>\"\n    )\n\n\nclass Handler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        body = page().encode()\n        self.send_response(200)\n        self.send_header(\"Content-Type\", \"text/html; charset=utf-8\")\n        self.send_header(\"Content-Length\", str(len(body)))\n        self.end_headers()\n        self.wfile.write(body)\n\n    def log_message(self, *args):\n        pass\n\n\nif __name__ == \"__main__\":\n    HTTPServer((\"127.0.0.1\", 8000), Handler).serve_forever()\n"
+      },
+      {
+        "path": "app/test_server.py",
+        "bytes": 437,
+        "text": "import unittest\n\nimport server\n\n\nclass GreeterTest(unittest.TestCase):\n    def test_greeting_capitalises_the_name(self):\n        self.assertEqual(server.greeting(\"ada\"), \"Hello, Ada!\")\n\n    def test_the_page_greets_the_world(self):\n        self.assertIn(\"<h1>Hello, World!</h1>\", server.page())\n\n    def test_the_page_names_its_build(self):\n        self.assertIn(\"build \", server.page())\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+      },
+      {
+        "path": ".mcp.json",
+        "bytes": 203,
+        "text": "{\n  \"mcpServers\": {\n    \"browser\": {\n      \"command\": \"rustwright-mcp\",\n      \"env\": {\n        \"RUSTWRIGHT_CHROMIUM\": \"/home/user/chrome-headless-shell-linux64/chrome-headless-shell\"\n      }\n    }\n  }\n}\n"
+      }
+    ],
+    "bundle": {
+      "sha256": "40a5b51059f8ee7fa386a8b408c9db94aca4074b3b2d0db1fdb1705d395fc46b",
+      "bytes": 20480,
+      "store": "a private S3 bucket (beyond-ai-demo-demo-bundles-123456789012), fetched with a presigned link"
+    }
+  },
+  "session_open": {
+    "sessions": [
+      {
+        "session": "demo.u1024032507c",
+        "started_ms": 1792812378144,
+        "ready_ms": 1792812378440,
+        "connected_ms": 119,
+        "state_ms": 160,
+        "open_ms": 279,
+        "exec_requests": 0,
+        "front_forwarded": 0
+      },
+      {
+        "session": "demo.u1024032507e",
+        "started_ms": 1792812485378,
+        "ready_ms": 1792812486151,
+        "connected_ms": 114,
+        "state_ms": 638,
+        "open_ms": 752,
+        "exec_requests": 0,
+        "front_forwarded": 0
+      }
+    ],
+    "exec_requests_at_open": 0,
+    "sessions_opened": 2,
+    "per_session": 0,
+    "open_ms_mean": 515,
+    "vms_at_open": 0
+  },
+  "run": {
+    "id": "20261024T032506Z",
+    "mode": "coding",
+    "started_ms": 1792812307001,
+    "ended_ms": 1792812508507,
+    "commit": "77d983b73f9d6513126cdf6994bf50e23d11ede6",
+    "uncommitted_files": 6,
+    "region": "us-west-2",
+    "name": "demo"
+  },
+  "model": {
+    "requested": "gpt-5-mini",
+    "replica_default": "gpt-5-mini",
+    "provider": "openai",
+    "routed": [
+      "gpt-5-mini"
+    ],
+    "price_model": [
+      "gpt-5-mini"
+    ],
+    "via": "crates/gateway (managed bai_v1 key)"
+  },
+  "checks": [
+    {
+      "name": "vm-created-on-first-tool",
+      "title": "The sandbox VM is created by the first sandbox tool call",
+      "pass": true,
+      "started_ms": 1792812378629,
+      "ended_ms": 1792812391243,
+      "duration_ms": 12614,
+      "detail": "no VM existed when the session opened; the first model call came back, the model called bash, and only then did the front create the VM (3022 ms after the session was ready), seeded from the bundle; the first tool result came 4134 ms after the create began",
+      "headline": {
+        "label": "session open to VM create",
+        "value": 3022,
+        "unit": "ms"
+      },
+      "measurements": {
+        "vms_at_open": 0,
+        "session_ready_ms": 1792812378440,
+        "first_model_call_answered_ms": 1792812381685,
+        "tool_call_started_ms": 1792812381468,
+        "front_first_request_ms": 1792812381462,
+        "vm_create_started_ms": 1792812381462,
+        "vm_serving_ms": 1792812383667,
+        "vm_seeded_ms": 1792812384099,
+        "first_tool_result_ms": 1792812385596,
+        "open_to_vm_create_ms": 3022,
+        "vm_provision_ms": 2205,
+        "seed_from_bundle_ms": 432,
+        "vm_create_to_first_tool_result_ms": 4134
+      }
+    },
+    {
+      "name": "skill-used",
+      "title": "The model reads the folder's skill and runs its script",
+      "pass": true,
+      "started_ms": 1792812391246,
+      "ended_ms": 1792812418222,
+      "duration_ms": 26976,
+      "detail": "the model read .agents/skills/run-tests/SKILL.md, then ran its script in the sandbox 2 time(s); the script's own marker line came back: RUN-TESTS-SKILL: 3 run, 0 failed, 0 errors",
+      "headline": {
+        "label": "script runs in the sandbox",
+        "value": 2,
+        "unit": ""
+      },
+      "measurements": {
+        "skill_reads": 1,
+        "script_runs": 2,
+        "first_verdict": "RUN-TESTS-SKILL: 3 run, 2 failed, 0 errors",
+        "last_verdict": "RUN-TESTS-SKILL: 3 run, 0 failed, 0 errors",
+        "turn_ms": 26829
+      }
+    },
+    {
+      "name": "fix-verified",
+      "title": "The failing test passes, checked in the sandbox",
+      "pass": true,
+      "started_ms": 1792812418225,
+      "ended_ms": 1792812418868,
+      "duration_ms": 643,
+      "detail": "the suite failed before the agent started (FAILED (failures=2)) and passes now, run by the demo in the VM; the test file is byte for byte the original",
+      "headline": {
+        "label": "tests",
+        "value": "fail to pass",
+        "unit": "checked by the demo"
+      },
+      "measurements": {
+        "before": "Ran 3 tests in 0.000s\n\nFAILED (failures=2)\nexit=1",
+        "after": "Ran 3 tests in 0.000s\n\nOK\nexit=0",
+        "fixed_line": "10:    return f\"Hello, {name.title()}!\"\n23:        \"<!doctype html><html><head><title>Greeter</title></head><body>\"",
+        "tests_unmodified": true
+      }
+    },
+    {
+      "name": "subagent-from-folder",
+      "title": "The reviewer subagent from .agents/agents is called",
+      "pass": true,
+      "started_ms": 1792812418871,
+      "ended_ms": 1792812435571,
+      "duration_ms": 16700,
+      "detail": "the model called the reviewer subagent that only .agents/agents/reviewer.md defines, and its sign-off line (a marker in that file's body) came back: REVIEWER-SIGNOFF: approved",
+      "headline": {
+        "label": "reviewer subagent",
+        "value": 12139,
+        "unit": "ms"
+      },
+      "measurements": {
+        "subagent_input": "{\"agent\":\"reviewer\",\"task\":\"Review the change made to app/server.py (the greeting function changed to use name.title()). Indicate whether the change is correct and include a line starting with REVIEWER-SIGNOFF followed by your signoff.\"}",
+        "signoff": "REVIEWER-SIGNOFF: approved",
+        "subagent_ms": 12139
+      }
+    },
+    {
+      "name": "app-as-background-job",
+      "title": "The app runs as a background job; a short job's end is pushed",
+      "pass": true,
+      "started_ms": 1792812435575,
+      "ended_ms": 1792812468607,
+      "duration_ms": 33032,
+      "detail": "the app was started with run_in_background and answered 200 inside the VM; a 15 s job started next ended and the agent was told (exit 0, its real output) while the app kept running",
+      "headline": {
+        "label": "short job started to its end reported",
+        "value": 18,
+        "unit": "s"
+      },
+      "measurements": {
+        "app_answers": "200\n<h1>Hello, World!</h1>",
+        "app_after_the_short_job": "200",
+        "job_end_notice": "[job 2 exited with code 0 after 15.3 seconds: `sleep 15; echo finished-job-2287122172`]\nfinished-job-2287122172\nbash_job {\"job\": 2} returns the full output.",
+        "job_end_reported_after_ms": 18567,
+        "first_turn_ms": 24779
+      }
+    },
+    {
+      "name": "browser-sees-localhost",
+      "title": "The browser reads the page the sandbox serves",
+      "pass": true,
+      "started_ms": 1792812468611,
+      "ended_ms": 1792812508503,
+      "duration_ms": 39892,
+      "detail": "the browser inside the VM opened localhost:8000, the page the agent's own app serves, and the snapshot showed the fixed heading and this run's build line (build-1024032507)",
+      "headline": {
+        "label": "navigate + snapshot",
+        "value": 130,
+        "unit": "ms"
+      },
+      "measurements": {
+        "navigate_ms": 130,
+        "snapshot": "### Page\nURL: http://localhost:8000/\nTitle: Greeter\nStatus: 200\nConsole: 0 errors, 0 warnings\n\n- generic\n  - heading [level=1]\n    - text: Hello, World!\n  - generic \"build build-1024032507\""
+      }
+    },
+    {
+      "name": "teardown-zero",
+      "title": "Teardown leaves nothing behind",
+      "pass": true,
+      "status": "pass",
+      "detail": "every resource type counted 0 at 2026-10-24T03:32:37Z",
+      "measurements": {
+        "resource_types": 23,
+        "remaining": 0
+      },
+      "started_ms": null,
+      "ended_ms": null,
+      "headline": {
+        "label": "left behind",
+        "value": "0",
+        "unit": "resources"
+      }
+    }
+  ],
+  "timeline": [
+    {
+      "t_ms": 1792812307001,
+      "src": "demo",
+      "event": "run_started",
+      "path": null,
+      "detail": null
+    },
+    {
+      "t_ms": 1792812378722,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1024032507c"
+      }
+    },
+    {
+      "t_ms": 1792812379000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-30",
+        "model": "gpt-5-mini",
+        "input_tokens": 3390
+      }
+    },
+    {
+      "t_ms": 1792812381462,
+      "src": "front",
+      "event": "first_request",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c"
+      }
+    },
+    {
+      "t_ms": 1792812381462,
+      "src": "front",
+      "event": "vm_create_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c"
+      }
+    },
+    {
+      "t_ms": 1792812381468,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "bash"
+      }
+    },
+    {
+      "t_ms": 1792812381685,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-30",
+        "output_tokens": 100,
+        "cost_micros": 1048
+      }
+    },
+    {
+      "t_ms": 1792812382526,
+      "src": "sandbox",
+      "event": "listening",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "bearer_required": true,
+        "listen": "0.0.0.0:8081",
+        "url": "http://0.0.0.0:8081/exec"
+      }
+    },
+    {
+      "t_ms": 1792812383667,
+      "src": "front",
+      "event": "vm_ready",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c"
+      }
+    },
+    {
+      "t_ms": 1792812384099,
+      "src": "front",
+      "event": "vm_seeded",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "bundle": true
+      }
+    },
+    {
+      "t_ms": 1792812384247,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"printf %s \\\"$HOME\\\"\"]"
+      }
+    },
+    {
+      "t_ms": 1792812384247,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "command [\"-v\",\"bash\"]"
+      }
+    },
+    {
+      "t_ms": 1792812384348,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "rg [\"--version\"]"
+      }
+    },
+    {
+      "t_ms": 1792812384550,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "grep [\"-rnZ\",\"-e\",\"__cap_probe__\",\"--\",\"/dev/null\"]"
+      }
+    },
+    {
+      "t_ms": 1792812384652,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "find [\"/dev/null\",\"-maxdepth\",\"0\",\"-printf\",\"%y\"]"
+      }
+    },
+    {
+      "t_ms": 1792812384754,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "cat []"
+      }
+    },
+    {
+      "t_ms": 1792812384956,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"printf exec-v1.2\"]"
+      }
+    },
+    {
+      "t_ms": 1792812385000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-31",
+        "model": "gpt-5-mini",
+        "input_tokens": 3547
+      }
+    },
+    {
+      "t_ms": 1792812385058,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "true []"
+      }
+    },
+    {
+      "t_ms": 1792812385159,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"printf a; sleep 0.3 2>/dev/null || sleep 1; printf b\"]"
+      }
+    },
+    {
+      "t_ms": 1792812385159,
+      "src": "sandbox",
+      "event": "exec_start",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": [
+        "agent",
+        "sandbox"
+      ],
+      "detail": {
+        "command": "sh -c printf a; sleep 0.3 2>/dev/null || sleep 1; printf b"
+      }
+    },
+    {
+      "t_ms": 1792812385463,
+      "src": "sandbox",
+      "event": "exec_end",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": [
+        "sandbox",
+        "agent"
+      ],
+      "detail": {
+        "ended": 1
+      }
+    },
+    {
+      "t_ms": 1792812385564,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"ls app; uname -a\"]"
+      }
+    },
+    {
+      "t_ms": 1792812385564,
+      "src": "sandbox",
+      "event": "exec_start",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": [
+        "agent",
+        "sandbox"
+      ],
+      "detail": {
+        "command": "sh -c ls app; uname -a"
+      }
+    },
+    {
+      "t_ms": 1792812385564,
+      "src": "sandbox",
+      "event": "exec_end",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": [
+        "sandbox",
+        "agent"
+      ],
+      "detail": {
+        "ended": 2
+      }
+    },
+    {
+      "t_ms": 1792812385595,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "bash"
+      }
+    },
+    {
+      "t_ms": 1792812388000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-32",
+        "model": "gpt-5-mini",
+        "input_tokens": 170
+      }
+    },
+    {
+      "t_ms": 1792812388152,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-31",
+        "output_tokens": 137,
+        "cost_micros": 383
+      }
+    },
+    {
+      "t_ms": 1792812388762,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1024032507c"
+      }
+    },
+    {
+      "t_ms": 1792812389221,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-32",
+        "output_tokens": 0,
+        "cost_micros": 43
+      }
+    },
+    {
+      "t_ms": 1792812390027,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "true []"
+      }
+    },
+    {
+      "t_ms": 1792812391000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-33",
+        "model": "gpt-5-mini",
+        "input_tokens": 3571
+      }
+    },
+    {
+      "t_ms": 1792812391341,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1024032507c"
+      }
+    },
+    {
+      "t_ms": 1792812393476,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-33",
+        "output_tokens": 107,
+        "cost_micros": 531
+      }
+    },
+    {
+      "t_ms": 1792812393908,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "read"
+      }
+    },
+    {
+      "t_ms": 1792812393981,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
+      }
+    },
+    {
+      "t_ms": 1792812394000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-34",
+        "model": "gpt-5-mini",
+        "input_tokens": 3873
+      }
+    },
+    {
+      "t_ms": 1792812394082,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
+      }
+    },
+    {
+      "t_ms": 1792812394184,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
+      }
+    },
+    {
+      "t_ms": 1792812394232,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "read"
+      }
+    },
+    {
+      "t_ms": 1792812395000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-35",
+        "model": "gpt-5-mini",
+        "input_tokens": 4346
+      }
+    },
+    {
+      "t_ms": 1792812395332,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-34",
+        "output_tokens": 33,
+        "cost_micros": 228
+      }
+    },
+    {
+      "t_ms": 1792812395588,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "bash"
+      }
+    },
+    {
+      "t_ms": 1792812395704,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"bash .agents/skills/run-tests/run-tests.sh\"]"
+      }
+    },
+    {
+      "t_ms": 1792812395704,
+      "src": "sandbox",
+      "event": "exec_start",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": [
+        "agent",
+        "sandbox"
+      ],
+      "detail": {
+        "command": "sh -c bash .agents/skills/run-tests/run-tests.sh"
+      }
+    },
+    {
+      "t_ms": 1792812395906,
+      "src": "sandbox",
+      "event": "exec_end",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": [
+        "sandbox",
+        "agent"
+      ],
+      "detail": {
+        "ended": 3
+      }
+    },
+    {
+      "t_ms": 1792812395930,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "bash"
+      }
+    },
+    {
+      "t_ms": 1792812397054,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-35",
+        "output_tokens": 37,
+        "cost_micros": 297
+      }
+    },
+    {
+      "t_ms": 1792812398000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-36",
+        "model": "gpt-5-mini",
+        "input_tokens": 4799
+      }
+    },
+    {
+      "t_ms": 1792812398004,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "read"
+      }
+    },
+    {
+      "t_ms": 1792812398035,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
+      }
+    },
+    {
+      "t_ms": 1792812398136,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
+      }
+    },
+    {
+      "t_ms": 1792812398237,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
+      }
+    },
+    {
+      "t_ms": 1792812398283,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "read"
+      }
+    },
+    {
+      "t_ms": 1792812400598,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-36",
+        "output_tokens": 226,
+        "cost_micros": 673
+      }
+    },
+    {
+      "t_ms": 1792812400904,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "edit"
+      }
+    },
+    {
+      "t_ms": 1792812400977,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
+      }
+    },
+    {
+      "t_ms": 1792812401000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-37",
+        "model": "gpt-5-mini",
+        "input_tokens": 5045
+      }
+    },
+    {
+      "t_ms": 1792812401078,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
+      }
+    },
+    {
+      "t_ms": 1792812401180,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
+      }
+    },
+    {
+      "t_ms": 1792812401281,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"t=\\\"$1\\\"\\ncase \\\"$t\\\" in -*) t=\\\"./$t\\\" ;; esac\\nif [ -L \\\"$t\\\" ]; then\\n  r=$(readlink -f \\\"$t\\\" 2>/dev/null) || r=\\n  if [ -z \\\"$r\\\" ]; then\\n    r="
+      }
+    },
+    {
+      "t_ms": 1792812401302,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "edit"
+      }
+    },
+    {
+      "t_ms": 1792812402118,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-37",
+        "output_tokens": 19,
+        "cost_micros": 234
+      }
+    },
+    {
+      "t_ms": 1792812402450,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "read"
+      }
+    },
+    {
+      "t_ms": 1792812402499,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
+      }
+    },
+    {
+      "t_ms": 1792812402600,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
+      }
+    },
+    {
+      "t_ms": 1792812402702,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
+      }
+    },
+    {
+      "t_ms": 1792812402732,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "read"
+      }
+    },
+    {
+      "t_ms": 1792812403000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-38",
+        "model": "gpt-5-mini",
+        "input_tokens": 5480
+      }
+    },
+    {
+      "t_ms": 1792812404724,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "bash"
+      }
+    },
+    {
+      "t_ms": 1792812404832,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"bash .agents/skills/run-tests/run-tests.sh\"]"
+      }
+    },
+    {
+      "t_ms": 1792812404832,
+      "src": "sandbox",
+      "event": "exec_start",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": [
+        "agent",
+        "sandbox"
+      ],
+      "detail": {
+        "command": "sh -c bash .agents/skills/run-tests/run-tests.sh"
+      }
+    },
+    {
+      "t_ms": 1792812404894,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "bash"
+      }
+    },
+    {
+      "t_ms": 1792812404933,
+      "src": "sandbox",
+      "event": "exec_end",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": [
+        "sandbox",
+        "agent"
+      ],
+      "detail": {
+        "ended": 4
+      }
+    },
+    {
+      "t_ms": 1792812404973,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-38",
+        "output_tokens": 65,
+        "cost_micros": 377
+      }
+    },
+    {
+      "t_ms": 1792812405000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-39",
+        "model": "gpt-5-mini",
+        "input_tokens": 5667
+      }
+    },
+    {
+      "t_ms": 1792812407000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-3a",
+        "model": "gpt-5-mini",
+        "input_tokens": 1777
+      }
+    },
+    {
+      "t_ms": 1792812407460,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "subagent"
+      }
+    },
+    {
+      "t_ms": 1792812407554,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-39",
+        "output_tokens": 178,
+        "cost_micros": 563
+      }
+    },
+    {
+      "t_ms": 1792812409000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-3b",
+        "model": "gpt-5-mini",
+        "input_tokens": 2278
+      }
+    },
+    {
+      "t_ms": 1792812409111,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-3a",
+        "output_tokens": 85,
+        "cost_micros": 614
+      }
+    },
+    {
+      "t_ms": 1792812409601,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
+      }
+    },
+    {
+      "t_ms": 1792812409702,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
+      }
+    },
+    {
+      "t_ms": 1792812409804,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
+      }
+    },
+    {
+      "t_ms": 1792812410047,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-3b",
+        "output_tokens": 34,
+        "cost_micros": 234
+      }
+    },
+    {
+      "t_ms": 1792812411022,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
+      }
+    },
+    {
+      "t_ms": 1792812411022,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
+      }
+    },
+    {
+      "t_ms": 1792812411123,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
+      }
+    },
+    {
+      "t_ms": 1792812412000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-3c",
+        "model": "gpt-5-mini",
+        "input_tokens": 2483
+      }
+    },
+    {
+      "t_ms": 1792812417000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-3d",
+        "model": "gpt-5-mini",
+        "input_tokens": 5935
+      }
+    },
+    {
+      "t_ms": 1792812417070,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "subagent"
+      }
+    },
+    {
+      "t_ms": 1792812417863,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-3c",
+        "output_tokens": 536,
+        "cost_micros": 1203
+      }
+    },
+    {
+      "t_ms": 1792812418082,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-3d",
+        "output_tokens": 57,
+        "cost_micros": 302
+      }
+    },
+    {
+      "t_ms": 1792812418170,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1024032507c"
+      }
+    },
+    {
+      "t_ms": 1792812418227,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "true []"
+      }
+    },
+    {
+      "t_ms": 1792812418329,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "true []"
+      }
+    },
+    {
+      "t_ms": 1792812418970,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1024032507c"
+      }
+    },
+    {
+      "t_ms": 1792812419000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-3e",
+        "model": "gpt-5-mini",
+        "input_tokens": 5600
+      }
+    },
+    {
+      "t_ms": 1792812422000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-3f",
+        "model": "gpt-5-mini",
+        "input_tokens": 1781
+      }
+    },
+    {
+      "t_ms": 1792812422557,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-3e",
+        "output_tokens": 251,
+        "cost_micros": 1326
+      }
+    },
+    {
+      "t_ms": 1792812422593,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "subagent"
+      }
+    },
+    {
+      "t_ms": 1792812425145,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-3f",
+        "output_tokens": 74,
+        "cost_micros": 593
+      }
+    },
+    {
+      "t_ms": 1792812425839,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
+      }
+    },
+    {
+      "t_ms": 1792812425940,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
+      }
+    },
+    {
+      "t_ms": 1792812426000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-40",
+        "model": "gpt-5-mini",
+        "input_tokens": 2271
+      }
+    },
+    {
+      "t_ms": 1792812426041,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
+      }
+    },
+    {
+      "t_ms": 1792812426927,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-40",
+        "output_tokens": 31,
+        "cost_micros": 227
+      }
+    },
+    {
+      "t_ms": 1792812427000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-41",
+        "model": "gpt-5-mini",
+        "input_tokens": 2473
+      }
+    },
+    {
+      "t_ms": 1792812427055,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
+      }
+    },
+    {
+      "t_ms": 1792812427157,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
+      }
+    },
+    {
+      "t_ms": 1792812427258,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
+      }
+    },
+    {
+      "t_ms": 1792812434422,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-41",
+        "output_tokens": 595,
+        "cost_micros": 1319
+      }
+    },
+    {
+      "t_ms": 1792812434732,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "subagent"
+      }
+    },
+    {
+      "t_ms": 1792812435000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-42",
+        "model": "gpt-5-mini",
+        "input_tokens": 5917
+      }
+    },
+    {
+      "t_ms": 1792812435537,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1024032507c"
+      }
+    },
+    {
+      "t_ms": 1792812435671,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1024032507c"
+      }
+    },
+    {
+      "t_ms": 1792812435811,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-42",
+        "output_tokens": 12,
+        "cost_micros": 207
+      }
+    },
+    {
+      "t_ms": 1792812436000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-43",
+        "model": "gpt-5-mini",
+        "input_tokens": 5782
+      }
+    },
+    {
+      "t_ms": 1792812438530,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "bash"
+      }
+    },
+    {
+      "t_ms": 1792812438626,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"cd app && python3 server.py\"]"
+      }
+    },
+    {
+      "t_ms": 1792812438626,
+      "src": "sandbox",
+      "event": "exec_start",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": [
+        "agent",
+        "sandbox"
+      ],
+      "detail": {
+        "command": "sh -c cd app && python3 server.py"
+      }
+    },
+    {
+      "t_ms": 1792812438776,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-43",
+        "output_tokens": 97,
+        "cost_micros": 603
+      }
+    },
+    {
+      "t_ms": 1792812440000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-44",
+        "model": "gpt-5-mini",
+        "input_tokens": 6001
+      }
+    },
+    {
+      "t_ms": 1792812440086,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "bash"
+      }
+    },
+    {
+      "t_ms": 1792812440148,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "true []"
+      }
+    },
+    {
+      "t_ms": 1792812440353,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "true []"
+      }
+    },
+    {
+      "t_ms": 1792812440353,
+      "src": "sandbox",
+      "event": "job_ended_callback",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": [
+        "sandbox",
+        "agent"
+      ],
+      "detail": {
+        "attempt": 1,
+        "error": null,
+        "job": "f1b33a1910c3dcc1",
+        "status": 200,
+        "took_ms": 222,
+        "kind": "keep_proof"
+      }
+    },
+    {
+      "t_ms": 1792812441155,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-44",
+        "output_tokens": 5,
+        "cost_micros": 214
+      }
+    },
+    {
+      "t_ms": 1792812441284,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1024032507c"
+      }
+    },
+    {
+      "t_ms": 1792812443000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-45",
+        "model": "gpt-5-mini",
+        "input_tokens": 6024
+      }
+    },
+    {
+      "t_ms": 1792812443597,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1024032507c"
+      }
+    },
+    {
+      "t_ms": 1792812446035,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-45",
+        "output_tokens": 211,
+        "cost_micros": 661
+      }
+    },
+    {
+      "t_ms": 1792812446720,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "bash"
+      }
+    },
+    {
+      "t_ms": 1792812446753,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"sleep 15; echo finished-job-2287122172\"]"
+      }
+    },
+    {
+      "t_ms": 1792812446753,
+      "src": "sandbox",
+      "event": "exec_start",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": [
+        "agent",
+        "sandbox"
+      ],
+      "detail": {
+        "command": "sh -c sleep 15; echo finished-job-2287122172"
+      }
+    },
+    {
+      "t_ms": 1792812448000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-46",
+        "model": "gpt-5-mini",
+        "input_tokens": 6357
+      }
+    },
+    {
+      "t_ms": 1792812448259,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "name": "bash"
+      }
+    },
+    {
+      "t_ms": 1792812448275,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "true []"
+      }
+    },
+    {
+      "t_ms": 1792812448377,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "true []"
+      }
+    },
+    {
+      "t_ms": 1792812448377,
+      "src": "sandbox",
+      "event": "job_ended_callback",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": [
+        "sandbox",
+        "agent"
+      ],
+      "detail": {
+        "attempt": 1,
+        "error": null,
+        "job": "4ce39f5dde9bdfbe",
+        "status": 200,
+        "took_ms": 48,
+        "kind": "keep_proof"
+      }
+    },
+    {
+      "t_ms": 1792812448622,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-46",
+        "output_tokens": 5,
+        "cost_micros": 217
+      }
+    },
+    {
+      "t_ms": 1792812448930,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1024032507c"
+      }
+    },
+    {
+      "t_ms": 1792812453656,
+      "src": "sandbox",
+      "event": "exec_end",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": [
+        "sandbox",
+        "agent"
+      ],
+      "detail": {
+        "ended": 5
+      }
+    },
+    {
+      "t_ms": 1792812461779,
+      "src": "sandbox",
+      "event": "exec_end",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": [
+        "sandbox",
+        "agent"
+      ],
+      "detail": {
+        "ended": 6
+      }
+    },
+    {
+      "t_ms": 1792812461881,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "true []"
+      }
+    },
+    {
+      "t_ms": 1792812461881,
+      "src": "sandbox",
+      "event": "job_ended_callback",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": [
+        "sandbox",
+        "agent"
+      ],
+      "detail": {
+        "attempt": 1,
+        "error": null,
+        "job": "4ce39f5dde9bdfbe",
+        "status": 200,
+        "took_ms": 109,
+        "kind": "job_end"
+      }
+    },
+    {
+      "t_ms": 1792812461982,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "true []"
+      }
+    },
+    {
+      "t_ms": 1792812462000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-47",
+        "model": "gpt-5-mini",
+        "input_tokens": 6244
+      }
+    },
+    {
+      "t_ms": 1792812462164,
+      "src": "client",
+      "event": "background_finished",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507c",
+        "wake": true
+      }
+    },
+    {
+      "t_ms": 1792812468160,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-47",
+        "output_tokens": 461,
+        "cost_micros": 1216
+      }
+    },
+    {
+      "t_ms": 1792812468376,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1024032507c"
+      }
+    },
+    {
+      "t_ms": 1792812468482,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "true []"
+      }
+    },
+    {
+      "t_ms": 1792812486266,
+      "src": "client",
+      "event": "prompt",
+      "path": [
+        "you",
+        "agent"
+      ],
+      "detail": {
+        "session": "demo.u1024032507e"
+      }
+    },
+    {
+      "t_ms": 1792812487000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-48",
+        "model": "gpt-5-mini",
+        "input_tokens": 3668
+      }
+    },
+    {
+      "t_ms": 1792812489000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-49",
+        "model": "gpt-5-mini",
+        "input_tokens": 4234
+      }
+    },
+    {
+      "t_ms": 1792812489256,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507e",
+        "name": "tool_search"
+      }
+    },
+    {
+      "t_ms": 1792812489256,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507e",
+        "name": "tool_search"
+      }
+    },
+    {
+      "t_ms": 1792812489916,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-48",
+        "output_tokens": 75,
+        "cost_micros": 1067
+      }
+    },
+    {
+      "t_ms": 1792812491224,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-49",
+        "output_tokens": 76,
+        "cost_micros": 1211
+      }
+    },
+    {
+      "t_ms": 1792812491490,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507e",
+        "name": "ls"
+      }
+    },
+    {
+      "t_ms": 1792812491539,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"printf %s \\\"$HOME\\\"\"]"
+      }
+    },
+    {
+      "t_ms": 1792812491642,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "command [\"-v\",\"bash\"]"
+      }
+    },
+    {
+      "t_ms": 1792812491744,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "rg [\"--version\"]"
+      }
+    },
+    {
+      "t_ms": 1792812491846,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "grep [\"-rnZ\",\"-e\",\"__cap_probe__\",\"--\",\"/dev/null\"]"
+      }
+    },
+    {
+      "t_ms": 1792812491947,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "find [\"/dev/null\",\"-maxdepth\",\"0\",\"-printf\",\"%y\"]"
+      }
+    },
+    {
+      "t_ms": 1792812492000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-4a",
+        "model": "gpt-5-mini",
+        "input_tokens": 4331
+      }
+    },
+    {
+      "t_ms": 1792812492150,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "cat []"
+      }
+    },
+    {
+      "t_ms": 1792812492252,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
+      }
+    },
+    {
+      "t_ms": 1792812492355,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "find [\"/home/user/workspace/app\",\"-mindepth\",\"1\",\"-maxdepth\",\"1\",\"-printf\",\"%Y\\\\t%s\\\\t%f\\\\0\"]"
+      }
+    },
+    {
+      "t_ms": 1792812492362,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507e",
+        "name": "ls"
+      }
+    },
+    {
+      "t_ms": 1792812493075,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-4a",
+        "output_tokens": 33,
+        "cost_micros": 198
+      }
+    },
+    {
+      "t_ms": 1792812493468,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507e",
+        "name": "read"
+      }
+    },
+    {
+      "t_ms": 1792812493575,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"[ -e \\\"$1\\\" ] || exit 1\\nif [ -d \\\"$1\\\" ]; then t=d\\nelif [ -f \\\"$1\\\" ]; then t=f\\nelse t=o\\nfi\\nif [ -w \\\"$1\\\" ]; then w=w; else w=-; fi\\nprintf '%s\\"
+      }
+    },
+    {
+      "t_ms": 1792812493575,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
+      }
+    },
+    {
+      "t_ms": 1792812493773,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507e",
+        "name": "read"
+      }
+    },
+    {
+      "t_ms": 1792812493778,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"if [ ! -e \\\"$1\\\" ]; then\\n  echo \\\"No such file or directory (os error 2)\\\" >&2\\n  exit 1\\nfi\\nif [ -d \\\"$1\\\" ]; then\\n  echo \\\"Is a directory (os err"
+      }
+    },
+    {
+      "t_ms": 1792812494000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-4b",
+        "model": "gpt-5-mini",
+        "input_tokens": 4780
+      }
+    },
+    {
+      "t_ms": 1792812496337,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507e",
+        "name": "bash"
+      }
+    },
+    {
+      "t_ms": 1792812496421,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"printf exec-v1.2\"]"
+      }
+    },
+    {
+      "t_ms": 1792812496524,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "true []"
+      }
+    },
+    {
+      "t_ms": 1792812496543,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-4b",
+        "output_tokens": 73,
+        "cost_micros": 391
+      }
+    },
+    {
+      "t_ms": 1792812496625,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"printf a; sleep 0.3 2>/dev/null || sleep 1; printf b\"]"
+      }
+    },
+    {
+      "t_ms": 1792812496625,
+      "src": "sandbox",
+      "event": "exec_start",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": [
+        "agent",
+        "sandbox"
+      ],
+      "detail": {
+        "command": "sh -c printf a; sleep 0.3 2>/dev/null || sleep 1; printf b"
+      }
+    },
+    {
+      "t_ms": 1792812496930,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "sh [\"-c\",\"python3 app/server.py\"]"
+      }
+    },
+    {
+      "t_ms": 1792812496930,
+      "src": "sandbox",
+      "event": "exec_start",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": [
+        "agent",
+        "sandbox"
+      ],
+      "detail": {
+        "command": "sh -c python3 app/server.py"
+      }
+    },
+    {
+      "t_ms": 1792812496930,
+      "src": "sandbox",
+      "event": "exec_end",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": [
+        "sandbox",
+        "agent"
+      ],
+      "detail": {
+        "ended": 7
+      }
+    },
+    {
+      "t_ms": 1792812497000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-4c",
+        "model": "gpt-5-mini",
+        "input_tokens": 5033
+      }
+    },
+    {
+      "t_ms": 1792812497089,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507e",
+        "name": "bash"
+      }
+    },
+    {
+      "t_ms": 1792812497132,
+      "src": "sandbox",
+      "event": "exec_end",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": [
+        "sandbox",
+        "agent"
+      ],
+      "detail": {
+        "ended": 8
+      }
+    },
+    {
+      "t_ms": 1792812500000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-4d",
+        "model": "gpt-5-mini",
+        "input_tokens": 5384
+      }
+    },
+    {
+      "t_ms": 1792812500416,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-4c",
+        "output_tokens": 166,
+        "cost_micros": 525
+      }
+    },
+    {
+      "t_ms": 1792812500520,
+      "src": "client",
+      "event": "tool_start",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507e",
+        "name": "tool_search"
+      }
+    },
+    {
+      "t_ms": 1792812500521,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507e",
+        "name": "tool_search"
+      }
+    },
+    {
+      "t_ms": 1792812501453,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-4d",
+        "output_tokens": 60,
+        "cost_micros": 1466
+      }
+    },
+    {
+      "t_ms": 1792812501967,
+      "src": "client",
+      "event": "tool_to_server",
+      "path": [
+        "agent",
+        "browser"
+      ],
+      "detail": {
+        "session": "demo.u1024032507e",
+        "name": "mcp__browser__browser_navigate"
+      }
+    },
+    {
+      "t_ms": 1792812502000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-4e",
+        "model": "gpt-5-mini",
+        "input_tokens": 5521
+      }
+    },
+    {
+      "t_ms": 1792812502097,
+      "src": "client",
+      "event": "tool_end",
+      "path": null,
+      "detail": {
+        "session": "demo.u1024032507e",
+        "name": "mcp__browser__browser_navigate"
+      }
+    },
+    {
+      "t_ms": 1792812508355,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-4e",
+        "output_tokens": 444,
+        "cost_micros": 1059
+      }
+    },
+    {
+      "t_ms": 1792812508480,
+      "src": "client",
+      "event": "turn_complete",
+      "path": [
+        "agent",
+        "efs"
+      ],
+      "detail": {
+        "session": "demo.u1024032507e"
+      }
+    },
+    {
+      "t_ms": 1792812508507,
+      "src": "demo",
+      "event": "run_finished",
+      "path": null,
+      "detail": null
+    },
+    {
+      "t_ms": 1792812509000,
+      "src": "gateway",
+      "event": "model_request",
+      "path": [
+        "agent",
+        "gateway",
+        "model"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-4f",
+        "model": "gpt-5-mini",
+        "input_tokens": 184
+      }
+    },
+    {
+      "t_ms": 1792812509436,
+      "src": "sandbox",
+      "event": "exec_request",
+      "vm": "iuxbfgulk84m3hzvv5ie2",
+      "path": null,
+      "detail": {
+        "command": "true []"
+      }
+    },
+    {
+      "t_ms": 1792812509889,
+      "src": "gateway",
+      "event": "model_response",
+      "path": [
+        "model",
+        "gateway",
+        "agent"
+      ],
+      "detail": {
+        "request_id": "dad43ab8a0a3b00-4f",
+        "output_tokens": 0,
+        "cost_micros": 46
+      }
+    }
+  ],
+  "conversation": [
+    {
+      "t_ms": 1792812378722,
+      "session": "demo.u1024032507c",
+      "role": "user",
+      "text": "Use the bash tool to run: ls app; uname -a   Then tell me in one sentence what you see."
+    },
+    {
+      "t_ms": 1792812381468,
+      "session": "demo.u1024032507c",
+      "role": "tool",
+      "name": "bash",
+      "input": "{\"command\":\"ls app; uname -a\"}",
+      "output": "BUILD\nserver.py\ntest_server.py\nLinux e2b.local 6.1.158+ #1 SMP PREEMPT_DYNAMIC Wed Sep 30 12:40:02 UTC 2026 x86_64 GNU/Linux\n",
+      "end_ms": 1792812385595
+    },
+    {
+      "t_ms": 1792812388366,
+      "session": "demo.u1024032507c",
+      "role": "assistant",
+      "text": "The app directory contains BUILD, server.py, and test_server.py, and the system is Linux e2b.local running kernel 6.1.158+ on x86_64 GNU/Linux."
+    },
+    {
+      "t_ms": 1792812391341,
+      "session": "demo.u1024032507c",
+      "role": "user",
+      "text": "The app's tests are failing. Use the run-tests skill to run them, then fix the bug in app/server.py (never edit the tests), then run them again with the skill. Tell me the final RUN-TESTS-SKILL line."
+    },
+    {
+      "t_ms": 1792812393908,
+      "session": "demo.u1024032507c",
+      "role": "tool",
+      "name": "read",
+      "input": "{\"path\":\"skill:run-tests/SKILL.md\"}",
+      "output": "     1\t---\n     2\tname: run-tests\n     3\tdescription: Run this project's test suite and get a one-line verdict. Use whenever you need to know whether the app's tests pass.\n     4\t---\n     5\t\n     6\t# Running the tests\n     7\t\n     8\tRun the script from the workspace root:\n     9\t\n    10\t```sh\n    11\tbash .agents/skills/run-tests/run-tests.sh\n    12\t```\n    13\t\n    14\tIt runs every test in `app/`, prints the unittest output, and ends with one line:\n    15\t\n    16\t`RUN-TESTS-SKILL: <N> run, <F> failed, <E> errors`\n    17\t\n    18\tReport that line. Exit status 0 means every test passed.\n",
+      "end_ms": 1792812394232
+    },
+    {
+      "t_ms": 1792812395588,
+      "session": "demo.u1024032507c",
+      "role": "tool",
+      "name": "bash",
+      "input": "{\"command\":\"bash .agents/skills/run-tests/run-tests.sh\",\"timeout_ms\":120000}",
+      "output": "tool execution failed: test_greeting_capitalises_the_name (test_server.GreeterTest.test_greeting_capitalises_the_name) ... FAIL\ntest_the_page_greets_the_world (test_server.GreeterTest.test_the_page_greets_the_world) ... FAIL\ntest_the_page_names_its_build (test_server.GreeterTest.test_the_page_names_its_build) ... ok\n\n======================================================================\nFAIL: test_greeting_capitalises_the_name (test_server.GreeterTest.test_greeting_capitalises_the_name)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  ",
+      "end_ms": 1792812395930
+    },
+    {
+      "t_ms": 1792812398004,
+      "session": "demo.u1024032507c",
+      "role": "tool",
+      "name": "read",
+      "input": "{\"path\":\"app/server.py\"}",
+      "output": "     1\t\"\"\"A tiny web app: one page that greets someone. Standard library only; serves on port 8000.\"\"\"\n     2\t\n     3\timport os\n     4\tfrom http.server import BaseHTTPRequestHandler, HTTPServer\n     5\t\n     6\tHERE = os.path.dirname(os.path.abspath(__file__))\n     7\t\n     8\t\n     9\tdef greeting(name):\n    10\t    return f\"Hello, {name.title}!\"\n    11\t\n    12\t\n    13\tdef build():\n    14\t    try:\n    15\t        with open(os.path.join(HERE, \"BUILD\")) as f:\n    16\t            return f.read().strip()\n    17\t    except OSError:\n    18\t        return \"dev\"\n    19\t\n    20\t\n    21\tdef page(name=\"world\"):",
+      "end_ms": 1792812398283
+    },
+    {
+      "t_ms": 1792812400904,
+      "session": "demo.u1024032507c",
+      "role": "tool",
+      "name": "edit",
+      "input": "{\"edits\":[{\"new_string\":\"    return f\\\"Hello, {name.title()}!\\\"\",\"old_string\":\"    return f\\\"Hello, {name.title}!\\\"\"}],\"path\":\"app/server.py\"}",
+      "output": "edited /home/user/workspace/app/server.py (1 replacement)",
+      "end_ms": 1792812401302
+    },
+    {
+      "t_ms": 1792812402450,
+      "session": "demo.u1024032507c",
+      "role": "tool",
+      "name": "read",
+      "input": "{\"path\":\"app/server.py\"}",
+      "output": "     1\t\"\"\"A tiny web app: one page that greets someone. Standard library only; serves on port 8000.\"\"\"\n     2\t\n     3\timport os\n     4\tfrom http.server import BaseHTTPRequestHandler, HTTPServer\n     5\t\n     6\tHERE = os.path.dirname(os.path.abspath(__file__))\n     7\t\n     8\t\n     9\tdef greeting(name):\n    10\t    return f\"Hello, {name.title()}!\"\n    11\t\n    12\t\n    13\tdef build():\n    14\t    try:\n    15\t        with open(os.path.join(HERE, \"BUILD\")) as f:\n    16\t            return f.read().strip()\n    17\t    except OSError:\n    18\t        return \"dev\"\n    19\t\n    20\t\n    21\tdef page(name=\"world\"",
+      "end_ms": 1792812402732
+    },
+    {
+      "t_ms": 1792812404724,
+      "session": "demo.u1024032507c",
+      "role": "tool",
+      "name": "bash",
+      "input": "{\"command\":\"bash .agents/skills/run-tests/run-tests.sh\",\"timeout_ms\":120000}",
+      "output": "test_greeting_capitalises_the_name (test_server.GreeterTest.test_greeting_capitalises_the_name) ... ok\ntest_the_page_greets_the_world (test_server.GreeterTest.test_the_page_greets_the_world) ... ok\ntest_the_page_names_its_build (test_server.GreeterTest.test_the_page_names_its_build) ... ok\n\n----------------------------------------------------------------------\nRan 3 tests in 0.000s\n\nOK\nRUN-TESTS-SKILL: 3 run, 0 failed, 0 errors\n",
+      "end_ms": 1792812404894
+    },
+    {
+      "t_ms": 1792812407460,
+      "session": "demo.u1024032507c",
+      "role": "tool",
+      "name": "subagent",
+      "input": "{\"agent\":\"reviewer\",\"task\":\"Please review the change I made to app/server.py (the greeting function). Say whether the change is correct and include a line starting with REVIEWER-SIGNOFF followed by your signoff.\"}",
+      "output": "Read app/server.py and app/test_server.py.\n\nThe greeting now returns f\"Hello, {name.title()}!\" which satisfies test_greeting_capitalises_the_name and the page tests; I see no obvious breakage to other code paths.\n\nMinor note: name.title() title-cases multi-word names and doesn't strip surrounding whitespace, but that's not tested here.\n\nREVIEWER-SIGNOFF: approved",
+      "end_ms": 1792812417070
+    },
+    {
+      "t_ms": 1792812417620,
+      "session": "demo.u1024032507c",
+      "role": "assistant",
+      "text": "I ran the tests, fixed app/server.py (called name.title()), re-ran the tests, and got:\n\nRUN-TESTS-SKILL: 3 run, 0 failed, 0 errors\n\nReviewer said: REVIEWER-SIGNOFF: approved"
+    },
+    {
+      "t_ms": 1792812418970,
+      "session": "demo.u1024032507c",
+      "role": "user",
+      "text": "Ask the reviewer agent to review your change to app/server.py, and report its REVIEWER-SIGNOFF line verbatim."
+    },
+    {
+      "t_ms": 1792812422593,
+      "session": "demo.u1024032507c",
+      "role": "tool",
+      "name": "subagent",
+      "input": "{\"agent\":\"reviewer\",\"task\":\"Review the change made to app/server.py (the greeting function changed to use name.title()). Indicate whether the change is correct and include a line starting with REVIEWER-SIGNOFF followed by your signoff.\"}",
+      "output": "name.title() produces \"Ada\" from \"ada\", so the greeting and page tests (expecting \"Hello, Ada!\" and \"Hello, World!\") are satisfied.  \nNo other code paths appear affected (build() and the HTTP handler unchanged).\n\nREVIEWER-SIGNOFF: approved",
+      "end_ms": 1792812434732
+    },
+    {
+      "t_ms": 1792812435283,
+      "session": "demo.u1024032507c",
+      "role": "assistant",
+      "text": "REVIEWER-SIGNOFF: approved"
+    },
+    {
+      "t_ms": 1792812435671,
+      "session": "demo.u1024032507c",
+      "role": "user",
+      "text": "Start the app in the background: use bash with run_in_background=true to run exactly: cd app && python3 server.py   Then reply with just the word started."
+    },
+    {
+      "t_ms": 1792812438530,
+      "session": "demo.u1024032507c",
+      "role": "tool",
+      "name": "bash",
+      "input": "{\"command\":\"cd app && python3 server.py\",\"run_in_background\":true}",
+      "output": "(no output yet)\n\nRunning in the background as job 1 (it keeps running in the sandbox until it exits, you stop it, or the session ends). You will be told when it exits, so do not poll it or sleep. To see what it has printed since, bash_job {\"job\": 1, \"timeout_ms\": 0}; to wait for it to finish (a build or a test run, not a server), bash_job {\"job\": 1}; to stop it, bash_job {\"job\": 1, \"kill\": true}.",
+      "end_ms": 1792812440086
+    },
+    {
+      "t_ms": 1792812441126,
+      "session": "demo.u1024032507c",
+      "role": "assistant",
+      "text": "started"
+    },
+    {
+      "t_ms": 1792812443597,
+      "session": "demo.u1024032507c",
+      "role": "user",
+      "text": "Use the bash tool with run_in_background=true to run exactly: sleep 15; echo finished-job-2287122172 . Then reply with just the word started and end your turn. Never call bash_job: do not poll, wait on or kill the job; you will be told when it ends, and then you must reply with the job's exact output line and its exit code."
+    },
+    {
+      "t_ms": 1792812446720,
+      "session": "demo.u1024032507c",
+      "role": "tool",
+      "name": "bash",
+      "input": "{\"command\":\"sleep 15; echo finished-job-2287122172\",\"run_in_background\":true}",
+      "output": "(no output yet)\n\nRunning in the background as job 2 (it keeps running in the sandbox until it exits, you stop it, or the session ends). You will be told when it exits, so do not poll it or sleep. To see what it has printed since, bash_job {\"job\": 2, \"timeout_ms\": 0}; to wait for it to finish (a build or a test run, not a server), bash_job {\"job\": 2}; to stop it, bash_job {\"job\": 2, \"kill\": true}.",
+      "end_ms": 1792812448259
+    },
+    {
+      "t_ms": 1792812448799,
+      "session": "demo.u1024032507c",
+      "role": "assistant",
+      "text": "started"
+    },
+    {
+      "t_ms": 1792812462164,
+      "session": "demo.u1024032507c",
+      "role": "notice",
+      "text": "[job 2 exited with code 0 after 15.3 seconds: `sleep 15; echo finished-job-2287122172`]\nfinished-job-2287122172\nbash_job {\"job\": 2} returns the full output."
+    },
+    {
+      "t_ms": 1792812468196,
+      "session": "demo.u1024032507c",
+      "role": "assistant",
+      "text": "finished-job-2287122172 (exit code 0)"
+    },
+    {
+      "t_ms": 1792812486266,
+      "session": "demo.u1024032507e",
+      "role": "user",
+      "text": "Use the browser tools (find them with tool_search) to open http://localhost:8000/ and tell me the heading and the build line of the page, quoting them from what the browser shows."
+    },
+    {
+      "t_ms": 1792812489256,
+      "session": "demo.u1024032507e",
+      "role": "tool",
+      "name": "tool_search",
+      "input": "{\"query\":\"browser\"}",
+      "output": "Loaded 5 tools — call them directly from now on:\n- mcp__browser__browser_close(_model_supports_vision?) — Close browser; next tool starts fresh.\n- mcp__browser__browser_get_text(_model_supports_vision?, max_chars?, selector?) — Extract text. Use browser_wait_for to validate.\n- mcp__browser__browser_network_requests(_model_supports_vision?, filename?, filter?, static?) — List/filter bounded requests; use browser_network_request for one.\n- mcp__browser__browser_click(_model_supports_vision?, doubleClick?, element?, target) — Click/double-click ref; snapshot.\n- mcp__browser__browser_console_messa",
+      "end_ms": 1792812489256
+    },
+    {
+      "t_ms": 1792812491490,
+      "session": "demo.u1024032507e",
+      "role": "tool",
+      "name": "ls",
+      "input": "{\"all\":false,\"path\":\"app\"}",
+      "output": "__pycache__/\nBUILD\nserver.py\ntest_server.py",
+      "end_ms": 1792812492362
+    },
+    {
+      "t_ms": 1792812493468,
+      "session": "demo.u1024032507e",
+      "role": "tool",
+      "name": "read",
+      "input": "{\"limit\":400,\"path\":\"app/server.py\"}",
+      "output": "     1\t\"\"\"A tiny web app: one page that greets someone. Standard library only; serves on port 8000.\"\"\"\n     2\t\n     3\timport os\n     4\tfrom http.server import BaseHTTPRequestHandler, HTTPServer\n     5\t\n     6\tHERE = os.path.dirname(os.path.abspath(__file__))\n     7\t\n     8\t\n     9\tdef greeting(name):\n    10\t    return f\"Hello, {name.title()}!\"\n    11\t\n    12\t\n    13\tdef build():\n    14\t    try:\n    15\t        with open(os.path.join(HERE, \"BUILD\")) as f:\n    16\t            return f.read().strip()\n    17\t    except OSError:\n    18\t        return \"dev\"\n    19\t\n    20\t\n    21\tdef page(name=\"world\"",
+      "end_ms": 1792812493773
+    },
+    {
+      "t_ms": 1792812496337,
+      "session": "demo.u1024032507e",
+      "role": "tool",
+      "name": "bash",
+      "input": "{\"command\":\"python3 app/server.py\",\"run_in_background\":true}",
+      "output": "tool execution failed: Traceback (most recent call last):\n  File \"/home/user/workspace/app/server.py\", line 42, in <module>\n    HTTPServer((\"127.0.0.1\", 8000), Handler).serve_forever()\n    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.11/socketserver.py\", line 456, in __init__\n    self.server_bind()\n  File \"/usr/local/lib/python3.11/http/server.py\", line 136, in server_bind\n    socketserver.TCPServer.server_bind(self)\n  File \"/usr/local/lib/python3.11/socketserver.py\", line 472, in server_bind\n    self.socket.bind(self.server_address)\nOSError: [Errno 98] Address alrea",
+      "end_ms": 1792812497089
+    },
+    {
+      "t_ms": 1792812500520,
+      "session": "demo.u1024032507e",
+      "role": "tool",
+      "name": "tool_search",
+      "input": "{\"query\":\"browser_navigate\"}",
+      "output": "Loaded 3 tools — call them directly from now on:\n- mcp__browser__browser_navigate(_model_supports_vision?, url) — Navigate; snapshot.\n- mcp__browser__browser_navigate_back(_model_supports_vision?) — Back; snapshot.\n- mcp__browser__browser_navigate_forward(_model_supports_vision?) — Forward; snapshot.\n",
+      "end_ms": 1792812500521
+    },
+    {
+      "t_ms": 1792812501967,
+      "session": "demo.u1024032507e",
+      "role": "tool",
+      "name": "mcp__browser__browser_navigate",
+      "input": "{\"_model_supports_vision\":true,\"url\":\"http://localhost:8000/\"}",
+      "output": "### Page\nURL: http://localhost:8000/\nTitle: Greeter\nStatus: 200\nConsole: 0 errors, 0 warnings\n\n- generic\n  - heading [level=1]\n    - text: Hello, World!\n  - generic \"build build-1024032507\"",
+      "end_ms": 1792812502097
+    },
+    {
+      "t_ms": 1792812508076,
+      "session": "demo.u1024032507e",
+      "role": "assistant",
+      "text": "I opened http://localhost:8000/ with the browser tool. Quoting what the browser showed:\n\n- \"Hello, World!\"\n- \"build build-1024032507\""
+    }
+  ],
+  "billing": {
+    "rows": [
+      {
+        "request_id": "dad43ab8a0a3b00-30",
+        "t_ms": 1792812379000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 3390,
+        "output_tokens": 100,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(64)",
+        "cost_micros": 1048,
+        "price_micros": 1048,
+        "latency_ms": 2685
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-31",
+        "t_ms": 1792812385000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 3547,
+        "output_tokens": 137,
+        "cache_read_tokens": 3456,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(64)",
+        "cost_micros": 383,
+        "price_micros": 383,
+        "latency_ms": 3152
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-32",
+        "t_ms": 1792812388000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 170,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 43,
+        "price_micros": 43,
+        "latency_ms": 1221
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-33",
+        "t_ms": 1792812391000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 3571,
+        "output_tokens": 107,
+        "cache_read_tokens": 2560,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(64)",
+        "cost_micros": 531,
+        "price_micros": 531,
+        "latency_ms": 2476
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-34",
+        "t_ms": 1792812394000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 3873,
+        "output_tokens": 33,
+        "cache_read_tokens": 3584,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 228,
+        "price_micros": 228,
+        "latency_ms": 1332
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-35",
+        "t_ms": 1792812395000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 4346,
+        "output_tokens": 37,
+        "cache_read_tokens": 3840,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 297,
+        "price_micros": 297,
+        "latency_ms": 2054
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-36",
+        "t_ms": 1792812398000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 4799,
+        "output_tokens": 226,
+        "cache_read_tokens": 4352,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(128)",
+        "cost_micros": 673,
+        "price_micros": 673,
+        "latency_ms": 2598
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-37",
+        "t_ms": 1792812401000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 5045,
+        "output_tokens": 19,
+        "cache_read_tokens": 4736,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 234,
+        "price_micros": 234,
+        "latency_ms": 1118
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-38",
+        "t_ms": 1792812403000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 5480,
+        "output_tokens": 65,
+        "cache_read_tokens": 4992,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 377,
+        "price_micros": 377,
+        "latency_ms": 1973
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-39",
+        "t_ms": 1792812405000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 5667,
+        "output_tokens": 178,
+        "cache_read_tokens": 5376,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(64)",
+        "cost_micros": 563,
+        "price_micros": 563,
+        "latency_ms": 2554
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-3a",
+        "t_ms": 1792812407000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1777,
+        "output_tokens": 85,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 614,
+        "price_micros": 614,
+        "latency_ms": 2111
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-3b",
+        "t_ms": 1792812409000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 2278,
+        "output_tokens": 34,
+        "cache_read_tokens": 1792,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 234,
+        "price_micros": 234,
+        "latency_ms": 1047
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-3c",
+        "t_ms": 1792812412000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 2483,
+        "output_tokens": 536,
+        "cache_read_tokens": 2176,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(448)",
+        "cost_micros": 1203,
+        "price_micros": 1203,
+        "latency_ms": 5863
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-3d",
+        "t_ms": 1792812417000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 5935,
+        "output_tokens": 57,
+        "cache_read_tokens": 5760,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 302,
+        "price_micros": 302,
+        "latency_ms": 1082
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-3e",
+        "t_ms": 1792812419000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 5600,
+        "output_tokens": 251,
+        "cache_read_tokens": 2560,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(128)",
+        "cost_micros": 1326,
+        "price_micros": 1326,
+        "latency_ms": 3557
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-3f",
+        "t_ms": 1792812422000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 1781,
+        "output_tokens": 74,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 593,
+        "price_micros": 593,
+        "latency_ms": 3145
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-40",
+        "t_ms": 1792812426000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 2271,
+        "output_tokens": 31,
+        "cache_read_tokens": 1792,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 227,
+        "price_micros": 227,
+        "latency_ms": 927
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-41",
+        "t_ms": 1792812427000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 2473,
+        "output_tokens": 595,
+        "cache_read_tokens": 2176,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(512)",
+        "cost_micros": 1319,
+        "price_micros": 1319,
+        "latency_ms": 7422
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-42",
+        "t_ms": 1792812435000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 5917,
+        "output_tokens": 12,
+        "cache_read_tokens": 5760,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 207,
+        "price_micros": 207,
+        "latency_ms": 811
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-43",
+        "t_ms": 1792812436000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 5782,
+        "output_tokens": 97,
+        "cache_read_tokens": 4608,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(64)",
+        "cost_micros": 603,
+        "price_micros": 603,
+        "latency_ms": 2776
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-44",
+        "t_ms": 1792812440000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 6001,
+        "output_tokens": 5,
+        "cache_read_tokens": 5760,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 214,
+        "price_micros": 214,
+        "latency_ms": 1155
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-45",
+        "t_ms": 1792812443000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 6024,
+        "output_tokens": 211,
+        "cache_read_tokens": 5632,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(128)",
+        "cost_micros": 661,
+        "price_micros": 661,
+        "latency_ms": 3035
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-46",
+        "t_ms": 1792812448000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 6357,
+        "output_tokens": 5,
+        "cache_read_tokens": 6144,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 217,
+        "price_micros": 217,
+        "latency_ms": 622
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-47",
+        "t_ms": 1792812462000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 6244,
+        "output_tokens": 461,
+        "cache_read_tokens": 5632,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(384)",
+        "cost_micros": 1216,
+        "price_micros": 1216,
+        "latency_ms": 6160
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-48",
+        "t_ms": 1792812487000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 3668,
+        "output_tokens": 75,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 1067,
+        "price_micros": 1067,
+        "latency_ms": 2916
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-49",
+        "t_ms": 1792812489000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 4234,
+        "output_tokens": 76,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 1211,
+        "price_micros": 1211,
+        "latency_ms": 2224
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-4a",
+        "t_ms": 1792812492000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 4331,
+        "output_tokens": 33,
+        "cache_read_tokens": 4224,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 198,
+        "price_micros": 198,
+        "latency_ms": 1075
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-4b",
+        "t_ms": 1792812494000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 4780,
+        "output_tokens": 73,
+        "cache_read_tokens": 4224,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 391,
+        "price_micros": 391,
+        "latency_ms": 2543
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-4c",
+        "t_ms": 1792812497000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 5033,
+        "output_tokens": 166,
+        "cache_read_tokens": 4736,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(128)",
+        "cost_micros": 525,
+        "price_micros": 525,
+        "latency_ms": 3416
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-4d",
+        "t_ms": 1792812500000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 5384,
+        "output_tokens": 60,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 1466,
+        "price_micros": 1466,
+        "latency_ms": 1453
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-4e",
+        "t_ms": 1792812502000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 5521,
+        "output_tokens": 444,
+        "cache_read_tokens": 5376,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(384)",
+        "cost_micros": 1059,
+        "price_micros": 1059,
+        "latency_ms": 6355
+      },
+      {
+        "request_id": "dad43ab8a0a3b00-4f",
+        "t_ms": 1792812509000,
+        "tenant_id": 1,
+        "provider": "openai",
+        "model": "gpt-5-mini-2025-08-07",
+        "requested_model": "gpt-5-mini",
+        "routed_model": "gpt-5-mini",
+        "price_model": "gpt-5-mini",
+        "outcome": "ok",
+        "price_status": "priced",
+        "input_tokens": 184,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": "Some(0)",
+        "cost_micros": 46,
+        "price_micros": 46,
+        "latency_ms": 889
+      }
+    ],
+    "rows_found": 32,
+    "total_cost_micros": 19276,
+    "total_price_micros": 19276,
+    "total_cost_usd": 0.019276,
+    "input_tokens": 133946,
+    "output_tokens": 4283,
+    "cache_read_tokens": 101248
+  },
+  "sandbox": {
+    "provider": "e2b",
+    "label": "E2B microVM",
+    "per_session": true,
+    "region": null,
+    "vms": [
+      {
+        "session": "demo.u1024032507c",
+        "sandbox_id": "iuxbfgulk84m3hzvv5ie2",
+        "created_ms": 1792812381462
+      }
+    ]
+  },
+  "disk": null,
+  "teardown": {
+    "tagging_index_stale": 15,
+    "name": "demo",
+    "region": "us-west-2",
+    "verified_at": "2026-10-24T03:32:37Z",
+    "verdict": "clean",
+    "before": {
+      "cloudmap_namespaces": 1,
+      "cloudmap_services": 4,
+      "e2b_sandboxes": 3,
+      "ec2_internet_gateways": 1,
+      "ec2_network_interfaces": 5,
+      "ec2_route_tables": 1,
+      "ec2_security_groups": 2,
+      "ec2_subnets": 1,
+      "ec2_vpcs": 1,
+      "ecr_repositories": 5,
+      "ecs_clusters": 1,
+      "ecs_services": 4,
+      "ecs_task_definitions": 5,
+      "ecs_tasks": 4,
+      "efs_access_points": 1,
+      "efs_file_systems": 1,
+      "efs_mount_targets": 1,
+      "iam_roles": 5,
+      "log_groups": 1,
+      "route53_hosted_zones": 1,
+      "s3_buckets": 1,
+      "ssm_parameters": 12
+    },
+    "counts": {
+      "cloudmap_namespaces": 0,
+      "cloudmap_services": 0,
+      "e2b_sandboxes": 0,
+      "ec2_internet_gateways": 0,
+      "ec2_network_interfaces": 0,
+      "ec2_route_tables": 0,
+      "ec2_security_groups": 0,
+      "ec2_subnets": 0,
+      "ec2_vpcs": 0,
+      "ecr_repositories": 0,
+      "ecs_clusters": 0,
+      "ecs_services": 0,
+      "ecs_task_definitions": 0,
+      "ecs_tasks": 0,
+      "efs_access_points": 0,
+      "efs_file_systems": 0,
+      "efs_mount_targets": 0,
+      "iam_roles": 0,
+      "log_groups": 0,
+      "route53_hosted_zones": 0,
+      "s3_buckets": 0,
+      "ssm_parameters": 0,
+      "tagging_api": 0
+    }
+  }
+}

@@ -33,9 +33,7 @@ vm_for() {{
 vm_field() {{ jq -r ".$2" "$VMDIR/$1.json"; }}
 e2b_kill() {{ echo "$1" >> "{TMP}/kills"; }}
 vm_run() {{ echo seeded; }}
-vm_browser_up() {{ echo "$3" >> "{TMP}/browser_up"; }}
-vm_bridge_start() {{ echo started >> "{TMP}/bridge_start"; }}
-vm_browser_warm() {{ :; }}
+vm_browser_start() {{ echo "$3" >> "{TMP}/browser_up"; echo started >> "{TMP}/bridge_start"; }}
 vm_site_start() {{ echo "$3" >> "{TMP}/site_start"; }}
 ''')
 

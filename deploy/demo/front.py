@@ -11,7 +11,7 @@ streaming the answer back as it arrives. A session that never calls a sandbox to
 A sandbox MCP server is fronted the same way: `http://<front>:8084/mcp/<session>?bundle=<tar url>&browser=<url
 of the rustwright-mcp binary>&site=<dir>` is the connector's stable address. The first request for a
 session creates its VM like an exec request does and, because it is an MCP request, also installs the
-browser stack and starts the bridge (`vm_browser_up`, `vm_bridge_start`) before forwarding to it. The
+browser stack and starts the bridge (`vm_browser_start`) before forwarding to it. The
 agent advertises the server's tools from a list saved in its bundle, so nothing dials this address (and
 no VM exists) until the model first calls one of them.
 
@@ -69,10 +69,9 @@ BRIDGE_PORT=${BRIDGE_PORT:-8931}
 vm_for "$1" || exit 1
 id=$(vm_field "$1" id); tok=$(vm_field "$1" envd_token)
 echo READY
-[ -z "$3" ] || vm_browser_warm "$id" "$tok"
 # The browser stack and the bridge come up while the bundle is being fetched: they do not need it.
 if [ -n "$3" ]; then
-  { vm_browser_up "$id" "$tok" "$3" && vm_bridge_start "$id" "$tok"; } & bpid=$!
+  vm_browser_start "$id" "$tok" "$3" & bpid=$!
 fi
 if [ -n "$2" ]; then
   vm_run "$id" "$tok" "mkdir -p $VM_HOME/workspace && curl -fsS -m 60 -o $VM_HOME/bundle.tar '$2' && tar -xf $VM_HOME/bundle.tar -C $VM_HOME/workspace && rm -f $VM_HOME/bundle.tar && echo seeded" | grep -q seeded || exit 3
