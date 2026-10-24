@@ -229,17 +229,7 @@ pub(super) async fn peek_body_model(
                 "request body still arriving at request_max_secs",
             )));
         }
-        let read = session.read_request_body();
-        let read = match read_timeout {
-            Some(t) => tokio::time::timeout(t, read).await.unwrap_or_else(|_| {
-                pingora_core::Error::e_explain(
-                    pingora_core::ErrorType::ReadTimedout,
-                    "reading body, client_read_timeout_secs",
-                )
-            }),
-            None => read.await,
-        };
-        match read.map_err(down)? {
+        match read_chunk(session, read_timeout).await.map_err(down)? {
             // An empty chunk feeds nothing, adds nothing, and re-reserves the same total (a no-op).
             Some(chunk) => {
                 scanner.feed(&chunk);
@@ -262,6 +252,69 @@ pub(super) async fn peek_body_model(
         over_cap: over_cap && !done,
         over_budget,
     })
+}
+
+/// One body read, bounded by `read_timeout` when the session has none of its own.
+async fn read_chunk(
+    session: &mut Session,
+    read_timeout: Option<Duration>,
+) -> pingora_core::Result<Option<Bytes>> {
+    let read = session.read_request_body();
+    match read_timeout {
+        Some(t) => tokio::time::timeout(t, read).await.unwrap_or_else(|_| {
+            pingora_core::Error::e_explain(
+                pingora_core::ErrorType::ReadTimedout,
+                "reading body, client_read_timeout_secs",
+            )
+        }),
+        None => read.await,
+    }
+}
+
+/// Hold a request that has sent headers and no body until its body starts, so a client that never
+/// sends one costs a stream and nothing upstream: `upstream_peer` connects before the first body
+/// byte, and pingora's HTTP/2 server has no body read timeout. Reads the whole body when
+/// `whole` (a declared length that fits pingora's replay buffer), else its first chunk, which the
+/// buffer replays to the upstream ahead of the rest. A stall ends the request the way an up-front
+/// read's does (a tagged read timeout, answered 408), and a body still arriving at `deadline` ends
+/// it too. The bytes stay in pingora's buffer; nothing is returned. A later stall between chunks of a large body is
+/// bounded by the upstream's `read_timeout_secs`.
+pub(super) async fn await_body_start(
+    session: &mut Session,
+    read_timeout: Duration,
+    deadline: u64,
+    whole: bool,
+) -> pingora_core::Result<()> {
+    let down = |mut e: Box<pingora_core::Error>| {
+        e.as_down();
+        e
+    };
+    if session.as_mut().is_body_done() {
+        return Ok(());
+    }
+    if expects_continue(session) {
+        session.write_continue_response().await.map_err(down)?;
+        session
+            .req_header_mut()
+            .remove_header(&http::header::EXPECT);
+    }
+    session.as_mut().enable_retry_buffering();
+    loop {
+        if crate::deadline::expired(deadline) {
+            return Err(down(pingora_core::Error::explain(
+                pingora_core::ErrorType::ReadTimedout,
+                "request body still arriving at request_max_secs",
+            )));
+        }
+        match read_chunk(session, Some(read_timeout))
+            .await
+            .map_err(down)?
+        {
+            Some(chunk) if !whole && !chunk.is_empty() => return Ok(()),
+            Some(_) => {}
+            None => return Ok(()),
+        }
+    }
 }
 
 /// Whether the client asked for `100 Continue` before it sends the body. curl does for any body

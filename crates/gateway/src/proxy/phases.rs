@@ -616,6 +616,27 @@ impl AiProxy {
                 body = peek.complete;
             }
         }
+        // A request whose body the gateway has not touched streams to the upstream, which pingora
+        // connects before the first body byte. Hold it until the body starts (see
+        // `await_body_start`): over HTTP/2 nothing else bounds a client that sends none, and over
+        // HTTP/1.1 pingora's own timeout fires only after the upstream is connected.
+        let untouched =
+            body.is_none() && !peeked && !matches!(&plan, Plan::Catalog(w) if w.relay.is_some());
+        if untouched
+            && arrival.full_body.is_none()
+            && let secs = self.state.config.client_read_timeout_secs()
+            && secs > 0
+        {
+            let t = Duration::from_secs(secs);
+            await_body_start(
+                session,
+                t,
+                arrival.deadline,
+                arrival.declared_len.is_some_and(|n| !past_replay_buffer(n)),
+            )
+            .await
+            .map_err(Stop::Failed)?;
+        }
         Ok(Read { plan, body })
     }
 
