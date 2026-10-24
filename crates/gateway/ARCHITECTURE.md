@@ -4063,6 +4063,22 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   counterexample that was a real defect is a named regression in `tests/props_regressions.rs`
   (and `tests/billing_streams.rs` for the metering bypass); the generators skip that exact shape,
   naming the defect, until it is fixed.
+- **Fuzzing (`crates/gateway/fuzz/`, cargo-fuzz / libFuzzer):** the property tests generate
+  structured inputs; the fuzz targets feed raw bytes, steered by coverage, to the parsers that read
+  request and response bytes. Release builds check overflow and a panic aborts a worker, so a panic
+  reachable from bytes is a denial of service. Targets (each asserts no panic, plus an invariant
+  already proven by a property where one is cheap): `lex` (`unescape` agrees with serde_json),
+  `peek` (every span and injection point is inside the body; scanners fed in fuzzer-chosen
+  chunks), `usage` (the billing parsers, body and SSE stream, whole and split), `translate`
+  (`response_json_status`, `SseBridge` chunked at fuzzer-chosen boundaries, and `request`, over
+  every dialect pairing), `key` (`Keyring::verify_at` on arbitrary token strings against the
+  contract-vector ring) and `signed_id` (`Signer::verify`, `unsign_request`, and `Relay::feed`
+  chunked). They reach the code through the `__test` seam the integration tests already use, so
+  nothing is added to the release binary. Seeds are committed under `fuzz/corpus/<target>/`. Run one
+  with `mise run fuzz -- <target> [secs]` (a pinned nightly is installed on first use); a crash is
+  written to `fuzz/artifacts/<target>/`, replay it with `cargo +nightly-2026-04-01 fuzz run <target>
+  <file>` in `crates/gateway/fuzz`, minimize it with `cargo fuzz tmin`, and add it as a regression
+  test. The weekly deep job runs every target for 10 minutes and uploads the artifacts of a crash.
 - **Tenant-bound Responses ids end to end (`tests/signed_ids.rs`):** tenant A's response, item and
   conversation ids, used by tenant B in each position (signed, or stripped to OpenAI's id), are a
   400 naming the field with zero upstream hits, and a full item carrying A's id reaches OpenAI

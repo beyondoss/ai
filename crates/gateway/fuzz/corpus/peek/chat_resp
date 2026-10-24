@@ -1,0 +1,1 @@
+){"id": "c1", "model": "gpt-5", "choices": [{"message": {"role": "assistant", "content": "ok", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{\"a\":1}"}}]}, "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}}
