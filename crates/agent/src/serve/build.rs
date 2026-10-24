@@ -42,16 +42,30 @@ pub(super) fn build_gateway_client(
     model: &str,
 ) -> Result<GatewayClient, String> {
     let mode = cfg.mode();
+    // The daemon-wide pool, when there is one (see below). Handed to the constructor rather than
+    // injected afterward: a `GatewayClient` builds its own `reqwest::Client` otherwise, which loads
+    // and parses the system root certificates, and under `--service` that ran for every session
+    // opened only to be discarded.
+    let shared = cfg.shared_http.as_ref();
     let client = match mode.gateway_key() {
-        Some(key) => GatewayClient::new(cfg.gateway.clone(), key).map_err(|e| e.to_string())?,
+        Some(key) => match shared {
+            Some(h) => GatewayClient::new_shared(cfg.gateway.clone(), key, h.clone()),
+            None => GatewayClient::new(cfg.gateway.clone(), key).map_err(|e| e.to_string())?,
+        },
         None => match resolve_gateway_credential(cfg.key.clone(), model, &cfg.provider_env)? {
-            GatewayCredential::Static(key) => {
-                GatewayClient::new(cfg.gateway.clone(), key).map_err(|e| e.to_string())?
-            }
-            GatewayCredential::Oauth(source) => {
-                GatewayClient::with_credential_source(cfg.gateway.clone(), source)
-                    .map_err(|e| e.to_string())?
-            }
+            GatewayCredential::Static(key) => match shared {
+                Some(h) => GatewayClient::new_shared(cfg.gateway.clone(), key, h.clone()),
+                None => GatewayClient::new(cfg.gateway.clone(), key).map_err(|e| e.to_string())?,
+            },
+            GatewayCredential::Oauth(source) => match shared {
+                Some(h) => GatewayClient::with_credential_source_shared(
+                    cfg.gateway.clone(),
+                    source,
+                    h.clone(),
+                ),
+                None => GatewayClient::with_credential_source(cfg.gateway.clone(), source)
+                    .map_err(|e| e.to_string())?,
+            },
         },
     }
     .with_retry(
@@ -80,16 +94,12 @@ pub(super) fn build_gateway_client(
     } else {
         client
     };
-    // W3 (shared upstream pool): inject the daemon-wide `reqwest::Client` so every session multiplexes
-    // over one connection pool instead of each opening its own. **Must** precede `with_idle_timeout`
-    // below: `with_http_client` sets the `http_shared` guard, which makes that later call a no-op rather
-    // than rebuilding (and thereby tearing down) the shared pool on a model switch or idle override. The
-    // shared client's own read timeout is fixed when the supervisor builds it (see
-    // `serve_ws::build_shared_h2_client`). `None` (stdio/`run`, or `--upstream-http2 off`) is unchanged.
-    let client = match &cfg.shared_http {
-        Some(h) => client.with_http_client(h.clone()),
-        None => client,
-    };
+    // W3 (shared upstream pool): `cfg.shared_http` is the daemon-wide `reqwest::Client`, so every session
+    // multiplexes over one connection pool instead of each opening its own. Its `http_shared` guard makes
+    // the `with_idle_timeout` below a no-op rather than a rebuild (which would tear the shared pool down
+    // on a model switch or idle override); the shared client's own read timeout is fixed when the
+    // supervisor builds it (see `serve_ws::build_shared_h2_client`). `None` (stdio/`run`, or
+    // `--upstream-http2 off`) builds a client of its own, as before.
     // Task #38 (pi-parity fix): `run`'s identical `--idle-timeout-ms` wiring (`commands/run.rs::run_task`'s own
     // `with_idle_timeout` call site) previously had no `serve` counterpart — this is called on every
     // model switch (`set_model`/`cycle_model` rebuild the whole client), same as `with_retry` above, so

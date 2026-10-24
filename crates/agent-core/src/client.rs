@@ -279,10 +279,18 @@ impl CredentialSource for StaticCredential {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread has built a `reqwest::Client` here.
+    static HTTP_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Build the underlying HTTP client with a given idle-read timeout, connect timeout fixed at
 /// [`CONNECT_TIMEOUT`]. Factored out so [`GatewayClient::new`] and
 /// [`GatewayClient::with_idle_timeout`] share one construction path.
 fn build_http(read_timeout: Duration) -> Result<reqwest::Client> {
+    #[cfg(test)]
+    HTTP_BUILDS.with(|n| n.set(n.get() + 1));
     crate::tls::ensure_provider();
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
@@ -336,6 +344,31 @@ impl GatewayClient {
         Self::with_credential_source(base_url, Arc::new(StaticCredential(ApiKey::new(api_key))))
     }
 
+    /// [`new`](Self::new) over an externally-owned `http` client (a daemon's shared pool). No client
+    /// of its own is built: constructing a `reqwest::Client` loads and parses the system root
+    /// certificates, which is far too much work to do per session only to discard the result.
+    pub fn new_shared(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        http: reqwest::Client,
+    ) -> Self {
+        Self::with_credential_source_shared(
+            base_url,
+            Arc::new(StaticCredential(ApiKey::new(api_key))),
+            http,
+        )
+    }
+
+    /// [`with_credential_source`](Self::with_credential_source) over an externally-owned `http`
+    /// client; see [`new_shared`](Self::new_shared).
+    pub fn with_credential_source_shared(
+        base_url: impl Into<String>,
+        source: Arc<dyn CredentialSource>,
+        http: reqwest::Client,
+    ) -> Self {
+        Self::assemble(base_url.into(), source, http, true)
+    }
+
     /// Build a client whose credential is resolved fresh via `source` immediately before every
     /// request — e.g. an OAuth-aware source that transparently refreshes an expiring token. See
     /// [`CredentialSource`].
@@ -343,11 +376,24 @@ impl GatewayClient {
         base_url: impl Into<String>,
         source: Arc<dyn CredentialSource>,
     ) -> Result<Self> {
-        let http = build_http(READ_TIMEOUT)?;
-        Ok(Self {
+        Ok(Self::assemble(
+            base_url.into(),
+            source,
+            build_http(READ_TIMEOUT)?,
+            false,
+        ))
+    }
+
+    fn assemble(
+        base_url: String,
+        source: Arc<dyn CredentialSource>,
+        http: reqwest::Client,
+        http_shared: bool,
+    ) -> Self {
+        Self {
             http,
-            http_shared: false,
-            base_url: base_url.into().trim_end_matches('/').to_string(),
+            http_shared,
+            base_url: base_url.trim_end_matches('/').to_string(),
             credential_source: source,
             max_retries: MAX_RETRIES,
             base_backoff: BASE_BACKOFF,
@@ -355,7 +401,7 @@ impl GatewayClient {
             extra_headers: Arc::new(HashMap::new()),
             hooks: None,
             codex_websocket: Some(Arc::new(crate::codex_websocket::CodexWebSocketCache::new())),
-        })
+        }
     }
 
     /// Builder-style: override the pre-first-byte retry budget and exponential-backoff base (still
@@ -1784,6 +1830,26 @@ mod tests {
         let debug = format!("{key:?}");
         assert_eq!(debug, "ApiKey(***)");
         assert!(!debug.contains("supersecret"), "got: {debug}");
+    }
+
+    /// Building a reqwest client loads and parses the system root certificates; a client handed a
+    /// shared one must not build another only to throw it away.
+    #[test]
+    fn a_client_over_a_shared_http_client_builds_none_of_its_own() {
+        let shared = build_http(READ_TIMEOUT).unwrap();
+        let before = HTTP_BUILDS.with(|n| n.get());
+        let client = GatewayClient::new_shared("http://gw.test/", "k", shared.clone());
+        let by_source = GatewayClient::with_credential_source_shared(
+            "http://gw.test",
+            Arc::new(StaticCredential(ApiKey::new("k"))),
+            shared,
+        );
+        assert_eq!(HTTP_BUILDS.with(|n| n.get()), before);
+        assert!(client.http_shared && by_source.http_shared);
+        assert_eq!(client.base_url, "http://gw.test");
+        // The ordinary constructor still builds exactly one.
+        GatewayClient::new("http://gw.test", "k").unwrap();
+        assert_eq!(HTTP_BUILDS.with(|n| n.get()), before + 1);
     }
 
     #[test]
