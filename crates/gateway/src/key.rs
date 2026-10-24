@@ -397,6 +397,20 @@ pub fn verifying_key_from_value(bytes: &[u8]) -> Option<VerifyingKey> {
     VerifyingKey::from_bytes(&arr).ok()
 }
 
+/// The public half of the dev signing seed (`[7u8; 32]`, `examples/mint_dev_key.rs`, also in
+/// `verify/key_vectors.json`). The seed is public, so anyone can mint any tenant under this key; a
+/// release build refuses it as a trust anchor, from config or from the KV `signing_key.*` channel.
+/// A test derives it from the seed, so it cannot drift.
+const DEV_PUBLIC_KEY: [u8; 32] = [
+    234, 74, 108, 99, 226, 156, 82, 10, 190, 245, 80, 123, 19, 46, 197, 249, 149, 71, 118, 174,
+    190, 190, 123, 146, 66, 30, 234, 105, 20, 70, 210, 44,
+];
+
+/// Whether `vk` is the public dev signing key ([`DEV_PUBLIC_KEY`]).
+pub(crate) fn is_public_dev_key(vk: &VerifyingKey) -> bool {
+    vk.to_bytes() == DEV_PUBLIC_KEY
+}
+
 /// Mint a `bai_v1` virtual key (tenant+vpc only). Lives here for tests + determinism checks
 /// and as the reference implementation; production minting is the Go control plane
 /// (`crypto/ed25519`), which must produce byte-identical output for the same inputs.
@@ -477,6 +491,14 @@ mod tests {
         let mut r = Keyring::new();
         r.insert(kid, vk);
         r
+    }
+
+    #[test]
+    fn the_dev_public_key_is_what_the_dev_seed_derives() {
+        let (_, vk) = test_keypair(7);
+        assert!(is_public_dev_key(&vk));
+        assert_eq!(DEV_PUBLIC_KEY, vk.to_bytes());
+        assert!(!is_public_dev_key(&test_keypair(8).1));
     }
 
     /// claim: A1

@@ -54,6 +54,11 @@ impl LiveKeys {
     /// Trust `value` as kid `kid`'s public key. Logged and ignored if `value` is not a key or the
     /// set is full and `kid` is new.
     pub fn put(&mut self, kid: Kid, value: &[u8]) {
+        self.put_with(kid, value, !cfg!(debug_assertions));
+    }
+
+    /// [`Self::put`], with whether the public dev key is refused (release builds) passed in.
+    fn put_with(&mut self, kid: Kid, value: &[u8], refuse_dev: bool) {
         let Some(vk) = verifying_key_from_value(value) else {
             warn!(
                 kid,
@@ -61,6 +66,13 @@ impl LiveKeys {
             );
             return;
         };
+        if refuse_dev && crate::key::is_public_dev_key(&vk) {
+            warn!(
+                kid,
+                "ignoring signing_key entry: it is the public dev key, which anyone can mint under"
+            );
+            return;
+        }
         if self.keys.len() >= MAX_SIGNING_KEYS && !self.keys.contains_key(&kid) {
             warn!(
                 kid,
@@ -99,6 +111,18 @@ mod tests {
         base64::engine::general_purpose::STANDARD
             .encode(sk.verifying_key().to_bytes())
             .into_bytes()
+    }
+
+    #[test]
+    fn a_release_ring_ignores_the_public_dev_key() {
+        let dev = pubkey(7);
+        let mut live = LiveKeys::new();
+        live.put_with(1, &dev, true);
+        assert!(live.get(1).is_none());
+        live.put_with(1, &dev, false);
+        assert!(live.get(1).is_some());
+        live.put_with(2, &pubkey(8), true);
+        assert!(live.get(2).is_some());
     }
 
     #[test]

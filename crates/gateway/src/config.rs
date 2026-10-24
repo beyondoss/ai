@@ -966,6 +966,10 @@ impl AiConfig {
         }
         self.validate_tls()?;
         check_nats_url(&self.nats_url)?;
+        // Debug builds (every test, `cargo run`) keep the dev key; a release build never trusts it.
+        if !cfg!(debug_assertions) {
+            self.check_no_dev_signing_key()?;
+        }
         // A malformed id signing key is a boot failure, not a 503 on every managed Responses turn.
         self.build_id_signer()?;
         Ok(())
@@ -1099,6 +1103,20 @@ impl AiConfig {
         }
         let hyphenated = name.replace('_', "-");
         if known(&hyphenated) { hyphenated } else { name }
+    }
+
+    /// Refuse the public dev signing key ([`crate::key::is_public_dev_key`]) in any configured
+    /// `signing_keys` entry, whether it came from the file or `AI_SIGNING_KEY_<KID>`. Called from
+    /// [`Self::check`] in release builds only.
+    fn check_no_dev_signing_key(&self) -> Result<()> {
+        for (kid, value) in &self.signing_keys {
+            if crate::key::verifying_key_from_value(value.as_bytes())
+                .is_some_and(|vk| crate::key::is_public_dev_key(&vk))
+            {
+                return Err(ConfigError::DevSigningKey { kid: kid.clone() }.into());
+            }
+        }
+        Ok(())
     }
 
     /// Build the trusted keyring from the configured signing public keys.
@@ -1369,6 +1387,26 @@ mod tests {
         };
         assert!(cfg("nats://localhost:4222").validate().is_ok());
         assert!(cfg("nats://nats.example.com:4222").validate().is_err());
+    }
+
+    #[test]
+    fn the_public_dev_signing_key_is_refused_as_a_trust_anchor() {
+        use base64::Engine;
+        let b64 = |seed: u8| {
+            let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+            base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes())
+        };
+        let with = |v: String| AiConfig {
+            signing_keys: HashMap::from([("1".to_string(), v)]),
+            ..Default::default()
+        };
+        // Seed 7 is the mint_dev_key example's; the constant must be what it derives.
+        assert_eq!(b64(7), "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=");
+        let e = with(b64(7)).check_no_dev_signing_key().unwrap_err();
+        assert!(e.to_string().contains("dev key"), "{e}");
+        assert!(with(b64(8)).check_no_dev_signing_key().is_ok());
+        // `check` applies the rule in release builds only; debug builds (all tests) keep the key.
+        assert_eq!(with(b64(7)).check().is_err(), !cfg!(debug_assertions));
     }
 
     #[test]

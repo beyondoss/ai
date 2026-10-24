@@ -151,6 +151,12 @@ pub enum ConfigError {
     #[error("invalid signing public key for kid {kid}")]
     SigningPublicKey { kid: Kid },
 
+    #[error(
+        "signing key for kid {kid} is the public dev key (seed [7u8; 32], examples/mint_dev_key.rs) \
+         — refusing to boot a release build: anyone can mint any tenant under it. Configure a real key."
+    )]
+    DevSigningKey { kid: String },
+
     #[error(transparent)]
     IdSigner(#[from] SignerError),
 
