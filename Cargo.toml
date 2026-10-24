@@ -78,7 +78,9 @@ jsonschema = { version = "0.47", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["full"] }
+# Held below 1.54: pingora-core 0.9 passes capacity 0 to `BufReader::with_capacity`, which tokio
+# 1.54 asserts against (every gateway accept panics). Lift once a pingora release fixes it.
+tokio = { version = ">=1.53.3, <1.54", features = ["full"] }
 # `CancellationToken` for cooperative run/turn/tool abort. A standalone sync primitive — no runtime is
 # entered to construct or await it — so the core stays executor-agnostic.
 tokio-util = "0.7"
