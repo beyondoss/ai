@@ -280,6 +280,28 @@ pub fn notify_token(tenant: &str, session: &str, job: &str, forge: bool) -> Res<
     Ok((token, scope))
 }
 
+/// A `bmc_v1` token for one session's connector, valid for `ttl_secs` (secret from `DEMO_MANAGED_SECRET`).
+#[cfg(feature = "agent-lib")]
+pub fn mint_managed_token(
+    tenant: &str,
+    session: &str,
+    connector: &str,
+    ttl_secs: u64,
+) -> Res<String> {
+    use beyond_ai_agent::managed_mcp_token::{Claims, ManagedKey};
+
+    let key = ManagedKey::from_secret_bytes(&b32("DEMO_MANAGED_SECRET")?);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    Ok(key.mint(&Claims {
+        tenant: tenant.into(),
+        session_id: session.into(),
+        connector: connector.into(),
+        exp: now + ttl_secs,
+    }))
+}
+
 /// What a grant holds, without its secrets: the demo unseals a grant it minted (with the same keys
 /// the agent unseals with) and looks for `needle` in everything sealed inside, in the claims and in
 /// the token's own text. Header and key values are never printed; only their names and whether the

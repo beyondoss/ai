@@ -14,6 +14,10 @@
 #                                   run for real, with its own checks and its own record
 #                                   (needs `SANDBOX=both ./deploy/demo/up.sh`; see usecases.sh)
 #
+#     ./deploy/demo/demo.sh oidc    an agent acting as a signed-in user through a managed connector, never
+#                                   holding their tokens (needs `SANDBOX=oidc ./deploy/demo/up.sh`; see
+#                                   usecases-oidc.sh and BROKER.md)
+#
 # Every run writes results/<UTC timestamp>/run.json (the record) and report.html (one self-contained
 # page rendered from it, replaying the run). Neither ever holds a key or a grant.
 #
@@ -58,8 +62,8 @@ fi
 MODE=${1:-core}
 case "$MODE" in
   core | kill | all) ;;
-  assistant | coding | browser) USECASE=1 ;;
-  *) echo "usage: demo.sh [core|kill|all|assistant|coding|browser]" >&2; exit 2 ;;
+  assistant | coding | browser | oidc) USECASE=1 ;;
+  *) echo "usage: demo.sh [core|kill|all|assistant|coding|browser|oidc]" >&2; exit 2 ;;
 esac
 USECASE=${USECASE:-}
 declare -n CHECKS="CHECKS_$MODE"
@@ -587,6 +591,14 @@ jq -c '[.[]|select(.m|startswith("{"))|{t, d:(.m|fromjson? // empty)}|select(.d.
 # The stand-in managed endpoint's lines: one per request it verified, refused or forwarded.
 jq -c '.[]|select(.m|startswith("{"))|{t, d:(.m|fromjson? // empty)}|select(.d.src=="standin" and (.d.event|test("managed_call|managed_refused")))|
   {t_ms:.d.ts_ms, src:"standin", event:.d.event, path:(if .d.event=="managed_call" then ["agent","standin"] else null end), detail:.d.detail}' <<<"$LOGS" >> "$TIMELINE"
+# The broker and the notes service it fronts (oidc): sign-ins, calls, refreshes, revocations.
+jq -c '.[]|select(.m|startswith("{"))|{t, d:(.m|fromjson? // empty)}|select(.d.src=="broker" or .d.src=="resource")|
+  {t_ms:.d.ts_ms, src:.d.src, event:.d.event, path:(
+     if .d.event=="managed_call" then ["agent","broker"]
+     elif .d.event=="resource_call" then ["broker","notes"]
+     elif .d.event=="token_refreshed" then ["broker","idp"]
+     elif .d.event=="connection_created" then ["you","idp"]
+     else null end), detail:.d.detail}' <<<"$LOGS" >> "$TIMELINE"
 jq -c '.[]|{t, d:(.m|fromjson? // empty)}|select(.d.target=="ai.usage")|.d.fields|
   ({t_ms:((.start_unix_secs*1000)), src:"gateway", event:"model_request", path:["agent","gateway","model"], detail:{request_id, model:.requested_model, input_tokens}},
    {t_ms:((.start_unix_secs*1000)+.latency_ms), src:"gateway", event:"model_response", path:["model","gateway","agent"], detail:{request_id, output_tokens, cost_micros}})' <<<"$LOGS" >> "$TIMELINE"
@@ -629,6 +641,7 @@ if compgen -G "$VMDIR/*.json" >/dev/null; then
     vms: map({session, sandbox_id:.id, created_ms})}' "$VMDIR"/*.json)
 else
   SANDBOX_JSON='{"provider":"fargate","label":"Fargate task","per_session":false,"vms":[]}'
+  [ "$MODE" != oidc ] || SANDBOX_JSON='{"provider":"none","label":"none","per_session":false,"vms":[]}'
 fi
 OPEN_JSON=null
 [ -z "$USECASE" ] || OPEN_JSON=$(uc_session_open_json)

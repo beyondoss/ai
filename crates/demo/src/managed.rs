@@ -18,17 +18,14 @@
 //! of JSON-RPC POSTs answered, not a web framework.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use beyond_ai_agent::managed_mcp_token::{ManagedKey, Reject};
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
-type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
-const MAX_HEAD: usize = 64 * 1024;
-const MAX_BODY: usize = 4 * 1024 * 1024;
+use crate::http::{
+    Req, Res, constant_time_eq, error_body, json_headers, now_ms, post, read_request, respond,
+};
 
 pub struct Args {
     /// Where the managed endpoint listens (public).
@@ -136,126 +133,11 @@ async fn accept(l: TcpListener, shared: Arc<Shared>, side: Side) {
     }
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
-}
-
 fn line(event: &str, detail: Value) {
     println!(
         "{}",
         json!({"ts_ms": now_ms(), "src": "standin", "event": event, "detail": detail})
     );
-}
-
-struct Req {
-    method: String,
-    path: String,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
-
-impl Req {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
-    }
-}
-
-/// Split `buf` at the end of the head; `None` until the blank line has arrived.
-fn head_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
-}
-
-fn parse_headers(head: &str) -> Vec<(String, String)> {
-    head.lines()
-        .skip(1)
-        .filter_map(|l| l.split_once(':'))
-        .map(|(n, v)| (n.trim().to_ascii_lowercase(), v.trim().to_string()))
-        .collect()
-}
-
-async fn read_request(s: &mut TcpStream) -> Res<Option<Req>> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
-    let end = loop {
-        if let Some(e) = head_end(&buf) {
-            break e;
-        }
-        if buf.len() > MAX_HEAD {
-            return Err("request head too large".into());
-        }
-        let n = s.read(&mut chunk).await?;
-        if n == 0 {
-            return Ok(None);
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    };
-    let head = String::from_utf8_lossy(&buf[..end]).into_owned();
-    let mut first = head.lines().next().unwrap_or("").split_whitespace();
-    let (method, path) = (
-        first.next().unwrap_or("").to_string(),
-        first.next().unwrap_or("").to_string(),
-    );
-    let headers = parse_headers(&head);
-    let len: usize = headers
-        .iter()
-        .find(|(n, _)| n == "content-length")
-        .and_then(|(_, v)| v.parse().ok())
-        .unwrap_or(0);
-    if len > MAX_BODY {
-        return Err("request body too large".into());
-    }
-    let mut body = buf[end..].to_vec();
-    while body.len() < len {
-        let n = s.read(&mut chunk).await?;
-        if n == 0 {
-            return Err("request body cut short".into());
-        }
-        body.extend_from_slice(&chunk[..n]);
-    }
-    body.truncate(len);
-    Ok(Some(Req {
-        method,
-        path,
-        headers,
-        body,
-    }))
-}
-
-async fn respond(
-    s: &mut TcpStream,
-    status: u16,
-    headers: &[(String, String)],
-    body: &[u8],
-) -> Res<()> {
-    let reason = match status {
-        200 => "OK",
-        202 => "Accepted",
-        401 => "Unauthorized",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        _ => "Error",
-    };
-    let mut out = format!(
-        "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\nconnection: close\r\n",
-        body.len()
-    );
-    for (n, v) in headers {
-        out.push_str(&format!("{n}: {v}\r\n"));
-    }
-    out.push_str("\r\n");
-    s.write_all(out.as_bytes()).await?;
-    s.write_all(body).await?;
-    s.shutdown().await?;
-    Ok(())
-}
-
-fn json_headers() -> Vec<(String, String)> {
-    vec![("content-type".into(), "application/json".into())]
 }
 
 async fn serve(mut s: TcpStream, shared: Arc<Shared>, side: Side) -> Res<()> {
@@ -267,10 +149,6 @@ async fn serve(mut s: TcpStream, shared: Arc<Shared>, side: Side) -> Res<()> {
         Side::Provider => provider(&shared, &req),
     };
     respond(&mut s, status, &headers, &body).await
-}
-
-fn error_body(msg: &str) -> Vec<u8> {
-    json!({"error": msg}).to_string().into_bytes()
 }
 
 /// The managed endpoint: verify, then forward with the real secret.
@@ -412,40 +290,6 @@ fn provider(sh: &Shared, req: &Req) -> (u16, Vec<(String, String)>, Vec<u8>) {
         Err(e) => json!({"jsonrpc": "2.0", "id": id, "error": e}),
     };
     (200, json_headers(), body.to_string().into_bytes())
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-/// One POST over a fresh connection; the status, lowercased headers and body of the answer.
-pub async fn post(
-    addr: &str,
-    path: &str,
-    headers: &[(String, String)],
-    body: &[u8],
-) -> Res<(u16, Vec<(String, String)>, Vec<u8>)> {
-    let mut s = TcpStream::connect(addr).await?;
-    let mut head = format!(
-        "POST {path} HTTP/1.1\r\nhost: {addr}\r\ncontent-length: {}\r\nconnection: close\r\n",
-        body.len()
-    );
-    for (n, v) in headers {
-        head.push_str(&format!("{n}: {v}\r\n"));
-    }
-    head.push_str("\r\n");
-    s.write_all(head.as_bytes()).await?;
-    s.write_all(body).await?;
-    let mut raw = Vec::new();
-    s.read_to_end(&mut raw).await?;
-    let end = head_end(&raw).ok_or("no response head")?;
-    let head = String::from_utf8_lossy(&raw[..end]).into_owned();
-    let status: u16 = head
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .ok_or("no status")?;
-    Ok((status, parse_headers(&head), raw[end..].to_vec()))
 }
 
 #[cfg(test)]

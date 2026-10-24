@@ -100,6 +100,43 @@ enum Cmd {
         #[arg(long, default_value = "127.0.0.1:8083")]
         provider_listen: String,
     },
+    /// Run the broker that acts as a signed-in user, and the notes service it fronts (secrets from
+    /// DEMO_MANAGED_SECRET, DEMO_BROKER_MASTER, DEMO_BROKER_ADMIN and DEMO_OIDC_CLIENT_SECRET).
+    #[cfg(feature = "agent-lib")]
+    OidcEndpoint {
+        #[arg(long, default_value = "0.0.0.0:8082")]
+        managed_listen: String,
+        #[arg(long, default_value = "0.0.0.0:8085")]
+        control_listen: String,
+        #[arg(long, default_value = "127.0.0.1:8086")]
+        resource_listen: String,
+        /// `host:port` the identity provider is reached at.
+        #[arg(long, default_value = "127.0.0.1:8180")]
+        idp_internal: String,
+        /// The provider's issuer URL, as its tokens name it.
+        #[arg(long)]
+        issuer: String,
+        #[arg(long, default_value = "notes-broker")]
+        client_id: String,
+        /// The callback URL registered at the provider.
+        #[arg(long)]
+        redirect_uri: String,
+        #[arg(long, default_value = "/data")]
+        data_dir: PathBuf,
+    },
+    /// Print one `bmc_v1` token (secret from DEMO_MANAGED_SECRET): what a session's grant holds, for
+    /// a check that plays a session presenting it.
+    #[cfg(feature = "agent-lib")]
+    ManagedToken {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        connector: String,
+        #[arg(long, default_value_t = 600)]
+        ttl_secs: u64,
+    },
     /// Print a job-end callback token and its scope as JSON (secret from DEMO_FLEET_SECRET).
     #[cfg(feature = "agent-lib")]
     NotifyToken {
@@ -256,6 +293,44 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             beyond_ai_demo::managed::run(beyond_ai_demo::managed::Args {
                 listen,
                 provider_listen,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        #[cfg(feature = "agent-lib")]
+        Cmd::ManagedToken {
+            tenant,
+            session,
+            connector,
+            ttl_secs,
+        } => {
+            println!(
+                "{}",
+                keys::mint_managed_token(&tenant, &session, &connector, ttl_secs)?
+            );
+            Ok(())
+        }
+        #[cfg(feature = "agent-lib")]
+        Cmd::OidcEndpoint {
+            managed_listen,
+            control_listen,
+            resource_listen,
+            idp_internal,
+            issuer,
+            client_id,
+            redirect_uri,
+            data_dir,
+        } => {
+            beyond_ai_demo::oidc::run(beyond_ai_demo::oidc::Args {
+                managed_listen,
+                control_listen,
+                resource_listen,
+                idp_internal,
+                issuer,
+                client_id,
+                redirect_uri,
+                data_dir,
             })
             .await
             .map_err(|e| e.to_string())?;

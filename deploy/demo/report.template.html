@@ -269,7 +269,7 @@ if (OP && OP.sessions && OP.sessions.length) {
 /* ---- header ---- */
 const passed = run.checks.filter(c => c.pass === true).length;
 const failed = run.checks.filter(c => c.pass === false).length;
-$("meta").innerHTML = `<b>${esc(run.model.requested)}</b> via ${esc(run.model.via)} · provider ${esc(run.model.provider)} · sandbox ${run.sandbox && run.sandbox.provider === "e2b" ? "E2B microVM × " + run.sandbox.vms.length + (run.sandbox.region ? " (" + esc(run.sandbox.region) + ")" : "") : "Fargate"} · ${esc(run.run.region)} · commit <b>${esc(run.run.commit.slice(0, 9))}</b> · run ${esc(run.run.id)} · ${fmtT(END)} long`;
+$("meta").innerHTML = `<b>${esc(run.model.requested)}</b> via ${esc(run.model.via)} · provider ${esc(run.model.provider)} · sandbox ${run.sandbox && run.sandbox.provider === "e2b" ? "E2B microVM × " + run.sandbox.vms.length + (run.sandbox.region ? " (" + esc(run.sandbox.region) + ")" : "") : run.sandbox && run.sandbox.provider === "none" ? "none" : "Fargate"} · ${esc(run.run.region)} · commit <b>${esc(run.run.commit.slice(0, 9))}</b> · run ${esc(run.run.id)} · ${fmtT(END)} long`;
 $("verdict").innerHTML = failed ? `<b style="color:var(--bad)">${failed} failed</b>` : `<b style="color:var(--ok)">${passed} checks passed</b>`;
 
 /* ---- the map ---- */
@@ -291,6 +291,13 @@ if (UC && UC.name === "assistant") {
   NODES.sandbox.label = "no sandbox"; NODES.sandbox.sub = "none in the grant";
   EDGES.splice(EDGES.findIndex(e => e[0] === "agent" && e[1] === "sandbox"), 1);
   EDGES.push(["agent", "standin"], ["agent", "deepwiki"]);
+} else if (UC && UC.name === "oidc") {
+  NODES.broker = { x: 200, y: 66, w: 118, h: 54, label: "broker", sub: "refresh token, sealed" };
+  NODES.notes = { x: 370, y: 36, w: 104, h: 40, label: "notes service", sub: "validates the JWT" };
+  NODES.idp = { x: 62, y: 88, w: 100, h: 46, label: "identity provider", sub: "Keycloak" };
+  NODES.sandbox.label = "no sandbox"; NODES.sandbox.sub = "none in the grant";
+  EDGES.splice(EDGES.findIndex(e => e[0] === "agent" && e[1] === "sandbox"), 1);
+  EDGES.push(["agent", "broker"], ["broker", "notes"], ["broker", "idp"], ["you", "idp"]);
 } else if (UC) {
   NODES.browser = { x: 600, y: 190, w: 80, h: 50, label: "browser", sub: "in the VM" };
   EDGES.push(["sandbox", "browser"]);
@@ -319,7 +326,7 @@ for (const id in NODES) {
   nodeEls[id] = g;
 }
 const COLORS = { prompt: "--c-you", first_token: "--c-you", model_request: "--c-model", model_response: "--c-model", exec_start: "--c-tool", exec_end: "--c-tool",
-  managed_call: "--c-tool", tool_to_server: "--c-tool", job_ended_callback: "--c-job", turn_complete: "--c-efs", session_read_from_efs: "--c-efs", grant_refused: "--c-bad", forged_job_ended: "--c-bad", session_reattached: "--c-you" };
+  managed_call: "--c-tool", resource_call: "--c-tool", token_refreshed: "--c-job", connection_created: "--c-you", tool_to_server: "--c-tool", job_ended_callback: "--c-job", turn_complete: "--c-efs", session_read_from_efs: "--c-efs", grant_refused: "--c-bad", forged_job_ended: "--c-bad", session_reattached: "--c-you" };
 const sorted = run.timeline.slice().sort((a, b) => a.t_ms - b.t_ms);
 // The first token: the model's reply travelling back to you, one per prompt (the client summary has it as `first_token` via the conversation).
 for (const m of run.conversation) if (m.role === "assistant") sorted.push({ t_ms: m.t_ms, src: "client", event: "first_token", path: ["agent", "you"], detail: { session: m.session } });
