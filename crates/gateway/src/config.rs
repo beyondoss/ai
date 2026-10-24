@@ -965,6 +965,7 @@ impl AiConfig {
             .into());
         }
         self.validate_tls()?;
+        check_nats_url(&self.nats_url)?;
         // A malformed id signing key is a boot failure, not a 503 on every managed Responses turn.
         self.build_id_signer()?;
         Ok(())
@@ -1113,6 +1114,38 @@ impl AiConfig {
         }
         Ok(ring)
     }
+}
+
+/// Refuse a `nats_url` that is plaintext to a host off this machine. The NATS channel delivers
+/// signing keys (`signing_key.{kid}`) and deny entries, and async-nats upgrades to TLS only when the
+/// server asks, so a `nats://` URL to a remote host is an unauthenticated trust anchor on the wire.
+/// `tls://` and `wss://` are fine anywhere; any other scheme (or none) needs a loopback host
+/// (`localhost`, `127.0.0.0/8`, `::1`). A comma-separated list is checked entry by entry. The error
+/// names the host only, never the URL, which may carry credentials.
+fn check_nats_url(url: &str) -> Result<()> {
+    for entry in url.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let (scheme, rest) = entry.split_once("://").unwrap_or(("", entry));
+        if scheme.eq_ignore_ascii_case("tls") || scheme.eq_ignore_ascii_case("wss") {
+            continue;
+        }
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+        let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+        let host = match hostport.strip_prefix('[') {
+            Some(v6) => v6.split(']').next().unwrap_or(v6),
+            None => hostport.split(':').next().unwrap_or(hostport),
+        };
+        let loopback = host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        if !loopback {
+            return Err(ConfigError::NatsPlaintext {
+                host: host.to_owned(),
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// `names` with every key lowercased, for the table `table` (named in the error). See
@@ -1297,6 +1330,45 @@ mod tests {
         // Read timeout must comfortably exceed a long stream.
         assert!(c.read_timeout_secs >= 300);
         assert_eq!(c.config_bucket, "ai-gateway");
+    }
+
+    #[test]
+    fn nats_url_plaintext_is_loopback_only() {
+        for ok in [
+            "nats://localhost:4222",
+            "nats://127.0.0.1:4222",
+            "nats://127.5.6.7",
+            "nats://[::1]:4222",
+            "localhost:4222",
+            "nats://user:pass@localhost:4222",
+            "tls://connect.ngs.global",
+            "tls://user:pass@nats.example.com:4222",
+            "nats://localhost:4222,nats://127.0.0.1:4223",
+        ] {
+            assert!(check_nats_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "nats://nats.example.com:4222",
+            "nats://10.0.0.5:4222",
+            "nats.example.com:4222",
+            "nats://localhost.evil.example:4222",
+            "nats://user:pass@nats.example.com:4222",
+            "nats://localhost:4222,nats://nats.example.com:4222",
+            "ws://nats.example.com",
+        ] {
+            let e = check_nats_url(bad).unwrap_err().to_string();
+            assert!(e.contains("plaintext"), "{bad}: {e}");
+            assert!(
+                !e.contains("pass"),
+                "the error must not echo credentials: {e}"
+            );
+        }
+        let cfg = |u: &str| AiConfig {
+            nats_url: u.to_owned(),
+            ..Default::default()
+        };
+        assert!(cfg("nats://localhost:4222").validate().is_ok());
+        assert!(cfg("nats://nats.example.com:4222").validate().is_err());
     }
 
     #[test]

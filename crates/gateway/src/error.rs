@@ -162,6 +162,13 @@ pub enum ConfigError {
     IdSigningKeysMissing,
 
     #[error(
+        "nats_url names a plaintext connection to {host:?}, which is not loopback — refusing to \
+         boot: the NATS channel carries signing keys and deny entries, and async-nats upgrades to \
+         TLS only if the server demands it. Use a tls:// URL (or nats://localhost for a local server)."
+    )]
+    NatsPlaintext { host: String },
+
+    #[error(
         "require_signing_keys is set but no signing_keys are configured — refusing to boot into a \
          mode where every bai_v1 token 401s. Check the signing_keys config / SSM param."
     )]
