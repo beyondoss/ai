@@ -146,8 +146,11 @@ and the ring routing in [FLEET.md](FLEET.md). Beyond's edge does neither.
     durably, rotates it by plan and destroys it when the tenant is deleted, which crypto-erases the
     tenant's sessions. Beyond holds the seal key's public half and the managed-MCP secret. The seal key
     also derives the `bjn_v1` notify key, so a replica holding one seal key strands every outstanding
-    notify token when it rotates. The agent should accept two seal keys during a rotation, the way it
-    already trusts two signing kids.
+    notify token when it rotates. The agent accepts two seal keys during a rotation (#495), the way it
+    already trusts two signing kids. Grants carry no seal kid, so a rotation goes replicas first, then
+    Beyond's minter: every replica starts with `--seal-key-previous` set to the old key and unseals
+    with either, and only then does the minter switch to the new key. Notify tokens are verified by
+    kid and minted under the current key only.
     _Why:_ a re-mint must never strand stored sessions, and rotating a key must never strand kept jobs.
 12. **Session ids and the gateway.** Beyond mints session ids as `<home_shard>.<opaque>`, choosing each
     tenant's home shard from the shards the fleet publishes. Beyond's control plane also mints each
