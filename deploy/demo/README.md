@@ -99,8 +99,13 @@ folder (about 32 round trips at every open without one).
   session opened, and times open to VM create, and VM create to the first tool result. The browser
   needs the VM's address, so the browser check opens a second session on the same VM with a grant that
   names it.
-- **browser**: the browser connector is the sandbox, so its VM is made before the session opens and
-  seeded from the bundle; the agent itself never calls an exec endpoint.
+- **browser**: the browser connector is the sandbox, and its address is the front too
+  (`/mcp/<session>`). The agent offers the browser's tools at open from a list saved in the bundle
+  (`.mcp-tools.json`, made at bundle build by `mcp-tools.sh` running `rustwright-mcp` once), so nothing
+  dials the front and no VM exists. The model's first browser call reaches the front, which makes the
+  VM, seeds it, installs the browser stack (the VM fetches the `rustwright-mcp` binary itself) and
+  forwards; the agent then compares the server's real list with the saved one.
+  `vm-created-on-first-tool` shows it, as for coding.
 
 Every use case's report has a "Session open" section: sandbox requests while each session opened, and
 the time from connecting to the first answer.
@@ -108,11 +113,11 @@ the time from connecting to the first answer.
 Before and after, per session, from the committed records (before: `20261020T230210Z-assistant`,
 `20261020T231038Z-coding`, `20261020T231305Z-browser`; after: the records beside them from this change):
 
-| use case  | sandbox requests at open, before | after         | open latency, before (derived) | after (measured)                                                                                                                    |
-| --------- | -------------------------------- | ------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
-| assistant | 32                               | 0             | about 0.9 s                    | 302 ms (mean of 3)                                                                                                                  |
-| coding    | 38                               | 0             | about 3.0 s                    | 306 ms, with no VM yet; the VM is made 2.7 s later, by the first tool call, and its first result comes 5.4 s after the create began |
-| browser   | 34 (and no others all run)       | 0 (0 all run) | about 3.0 s                    | 1264 ms, which now includes connecting to the browser in the VM                                                                     |
+| use case  | sandbox requests at open, before | after         | open latency, before (derived) | after (measured)                                                                                                                       |
+| --------- | -------------------------------- | ------------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
+| assistant | 32                               | 0             | about 0.9 s                    | 302 ms (mean of 3)                                                                                                                     |
+| coding    | 38                               | 0             | about 3.0 s                    | 306 ms, with no VM yet; the VM is made 2.7 s later, by the first tool call, and its first result comes 5.4 s after the create began    |
+| browser   | 34 (and no others all run)       | 0 (0 all run) | about 3.0 s                    | 292 ms, with no VM yet; the first browser call makes the VM, installs the browser stack and returns its result 18.2 s after it started |
 
 The "before" counts are the exec requests in the old records before the first model call (assistant:
 129 across its setup session and three sessions, less the setup's own command, divided by four). The

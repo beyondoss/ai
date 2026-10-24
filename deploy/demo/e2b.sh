@@ -178,8 +178,12 @@ BRIDGE_PORT=8931
 # session (`--stateful`). Hosted sessions skip `command` entries in .mcp.json, so this bridge is how a
 # stdio server becomes a URL a grant can name. `vm.overcommit_memory=1`: a small VM refuses the
 # renderer's large mappings otherwise and the renderer dies.
-vm_browser_up() { # id token rustwright-binary
-  vm_put "$1" "$2" "$3" "$VM_HOME/rustwright-mcp" || return 1
+vm_browser_up() { # id token rustwright-binary-or-url (a URL is fetched by the VM itself)
+  if [[ $3 == http* ]]; then
+    vm_run "$1" "$2" "curl -fsS -m 120 -o $VM_HOME/rustwright-mcp '$3' && echo fetched" | grep -q fetched || return 1
+  else
+    vm_put "$1" "$2" "$3" "$VM_HOME/rustwright-mcp" || return 1
+  fi
   vm_run "$1" "$2" "chmod +x $VM_HOME/rustwright-mcp
 sudo sysctl -w vm.overcommit_memory=1 >/dev/null
 export DEBIAN_FRONTEND=noninteractive

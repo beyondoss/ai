@@ -8,8 +8,15 @@ answers nothing itself. On the FIRST request for a session it creates that sessi
 seeds the agent folder into it from the bundle, and from then on forwards every request to the VM,
 streaming the answer back as it arrives. A session that never calls a sandbox tool never costs a VM.
 
+A sandbox MCP server is fronted the same way: `http://<front>:8084/mcp/<session>?bundle=<tar url>&browser=<url
+of the rustwright-mcp binary>&site=<dir>` is the connector's stable address. The first request for a
+session creates its VM like an exec request does and, because it is an MCP request, also installs the
+browser stack and starts the bridge (`vm_browser_up`, `vm_bridge_start`) before forwarding to it. The
+agent advertises the server's tools from a list saved in its bundle, so nothing dials this address (and
+no VM exists) until the model first calls one of them.
+
 One JSON line per event goes to stdout (CloudWatch): `first_request`, `vm_create_start`, `vm_ready`,
-`vm_seeded`, and `exec_request` for every request forwarded. The E2B key comes from the environment
+`vm_seeded`, `browser_ready`, and `exec_request` / `mcp_request` for every request forwarded. The E2B key comes from the environment
 and is only ever handed to the helper functions in e2b.sh.
 """
 import http.client
@@ -39,6 +46,7 @@ CLIENT_TIMEOUT = float(os.environ.get("FRONT_CLIENT_TIMEOUT", "120"))
 # 64 leaves room for retries and refuses a flood instead of spawning a thread and a VM for each.
 MAX_INFLIGHT = int(os.environ.get("FRONT_MAX_INFLIGHT", "64"))
 inflight = threading.BoundedSemaphore(MAX_INFLIGHT)
+BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "8931"))
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "host", "content-length"}
 
 sessions = {}  # session -> {"lock": Lock, "vm": dict | None, "born": float}
@@ -57,6 +65,7 @@ def log(event, **detail):
 # (a presigned URL), so the bytes never pass through here.
 SCRIPT = r'''
 . "$E2B_SH"
+BRIDGE_PORT=${BRIDGE_PORT:-8931}
 vm_for "$1" || exit 1
 id=$(vm_field "$1" id); tok=$(vm_field "$1" envd_token)
 echo READY
@@ -64,21 +73,27 @@ if [ -n "$2" ]; then
   vm_run "$id" "$tok" "mkdir -p $VM_HOME/workspace && curl -fsS -m 60 -o $VM_HOME/bundle.tar '$2' && tar -xf $VM_HOME/bundle.tar -C $VM_HOME/workspace && rm -f $VM_HOME/bundle.tar && echo seeded" | grep -q seeded || exit 3
 fi
 echo SEEDED
+if [ -n "$3" ]; then
+  vm_browser_up "$id" "$tok" "$3" && vm_bridge_start "$id" "$tok" "${4:+$VM_HOME/workspace/$4}" || exit 4
+  echo BROWSER
+fi
 '''
 
 
-def make_vm(session, bundle):
+def make_vm(session, bundle, browser="", site=""):
     env = dict(os.environ, VMDIR=VMDIR, STUB=STUB, CA_FILE=CA_FILE, E2B_SH=E2B_SH,
                VM_PRIVATE="1", TAG_KEY="beyond-ai-demo", SANDBOX_PORT="8081")
     env.setdefault("NAME", os.environ.get("DEMO_NAME", "demo"))
     log("vm_create_start", session=session)
-    p = subprocess.Popen(["bash", "-c", SCRIPT, "front", session, bundle or ""], env=env,
+    p = subprocess.Popen(["bash", "-c", SCRIPT, "front", session, bundle or "", browser, site], env=env,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     for line in p.stdout:
         if line.strip() == "READY":
             log("vm_ready", session=session)
         elif line.strip() == "SEEDED":
             log("vm_seeded", session=session, bundle=bool(bundle))
+        elif line.strip() == "BROWSER":
+            log("browser_ready", session=session)
     err = p.stderr.read()
     if p.wait() != 0:
         raise RuntimeError(f"creating the sandbox failed ({p.returncode}): {err[-300:]}")
@@ -103,7 +118,7 @@ def drop(session, s, kill=True):
     log("vm_dropped", session=session)
 
 
-def vm_for(session, bundle):
+def vm_for(session, bundle, browser="", site=""):
     with sessions_lock:
         old = [(k, v) for k, v in sessions.items() if v["vm"] and time.time() - v["born"] > VM_TTL]
     for k, v in old:  # past its timeout: E2B has already killed it
@@ -113,7 +128,7 @@ def vm_for(session, bundle):
     with s["lock"]:
         if s["vm"] is None:
             log("first_request", session=session)
-            s["vm"] = make_vm(session, bundle)
+            s["vm"] = make_vm(session, bundle, browser, site)
             s["born"] = time.time()
         return s["vm"], s
 
@@ -136,6 +151,9 @@ class Front(BaseHTTPRequestHandler):
     def do_GET(self):
         self.reply(200, {"ok": True}) if self.path == "/healthz" else self.reply(404, {"error": "not found"})
 
+    def do_DELETE(self):  # ends an MCP session; same path as a POST
+        self.do_POST()
+
     def do_POST(self):
         if not inflight.acquire(blocking=False):
             self.close_connection = True  # the body is unread
@@ -147,23 +165,33 @@ class Front(BaseHTTPRequestHandler):
 
     def forward(self):
         u = urlsplit(self.path)
-        m = re.fullmatch(r"/exec/([A-Za-z0-9._-]+)", u.path)
+        m = re.fullmatch(r"/(exec|mcp)/([A-Za-z0-9._-]+)", u.path)
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         if not m:
-            return self.reply(404, {"error": "POST /exec/<session>"})
-        session = m.group(1)
-        bundle = (parse_qs(u.query).get("bundle") or [""])[0]
+            return self.reply(404, {"error": "POST /exec/<session> or /mcp/<session>"})
+        kind, session = m.groups()
+        q = parse_qs(u.query)
+        bundle = (q.get("bundle") or [""])[0]
+        browser, site = "", ""
+        if kind == "mcp":
+            browser = (q.get("browser") or [""])[0]
+            site = (q.get("site") or [""])[0]
+            if (browser and not browser.startswith("https://")) or not re.fullmatch(r"[A-Za-z0-9._/-]*", site) or ".." in site:
+                return self.reply(400, {"error": "browser must be an https URL; site a relative directory"})
         try:
-            vm, entry = vm_for(session, bundle)
+            vm, entry = vm_for(session, bundle, browser, site)
         except Exception as e:  # the next request tries again
             with sessions_lock:
                 sessions.pop(session, None)
             log("vm_failed", session=session, error=str(e))
             return self.reply(502, {"error": str(e)})
-        log("exec_request", session=session)
-        up = urlsplit(vm["url"])
+        log("mcp_request" if kind == "mcp" else "exec_request", session=session)
+        # An MCP request goes to the bridge's port on the same VM, which takes no bearer; an exec
+        # request goes to the exec stub, which does.
+        up = urlsplit(f"https://{BRIDGE_PORT}-{vm['id']}.e2b.app/mcp" if kind == "mcp" else vm["url"])
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP | {"authorization"}}
-        headers["Authorization"] = "Bearer " + vm["bearer"]
+        if kind == "exec":
+            headers["Authorization"] = "Bearer " + vm["bearer"]
         if vm.get("traffic_token"):
             headers["e2b-traffic-access-token"] = vm["traffic_token"]
         conn = http.client.HTTPSConnection(up.hostname, timeout=3700)
@@ -174,7 +202,7 @@ class Front(BaseHTTPRequestHandler):
             drop(session, entry)
             return self.reply(502, {"error": str(e)})
         try:
-            conn.request("POST", up.path, body=body, headers=headers)
+            conn.request(self.command, up.path, body=body, headers=headers)
             resp = conn.getresponse()
             self.send_response(resp.status)
             for k, v in resp.getheaders():
