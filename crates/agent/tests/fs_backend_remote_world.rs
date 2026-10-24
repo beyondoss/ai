@@ -113,6 +113,7 @@ fn full_caps() -> Capabilities {
         grep_null: true,
         find_printf: true,
         stdin: true,
+        no_read_window: false,
     }
 }
 

@@ -149,6 +149,7 @@ fn shell_posix_backend() -> Arc<dyn FsBackend> {
             // so every `write`/`edit` parity case covers it too. The ripgrep rung is `connect`ed and
             // probes stdin as present, so between them both write paths are diffed against `LocalFs`.
             stdin: false,
+            no_read_window: false,
         },
     ))
 }

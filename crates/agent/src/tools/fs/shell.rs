@@ -38,6 +38,8 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// What the stdin probe feeds `cat`, and must read back.
 const STDIN_PROBE: &str = "stdin-probe";
+/// The read pipeline on a known input; see [`Capabilities::no_read_window`].
+const READ_WINDOW_PROBE: &str = "printf abc | dd iflag=skip_bytes,count_bytes skip=1 count=1 status=none 2>/dev/null | base64 -w0 2>/dev/null";
 /// Raw bytes per argv chunk when stdin is unavailable: 48 KiB, which base64s to exactly 64 KiB — half
 /// of Linux's 128 KiB cap on a single argv string (`MAX_ARG_STRLEN`), leaving the whole argv far under
 /// the kernel's total `ARG_MAX` as well.
@@ -72,6 +74,14 @@ pub struct Capabilities {
     /// runs `cat` on empty input; `docker exec` without `-i` does the same. Writing through either as
     /// though stdin arrived would replace the file with an *empty* one.
     pub stdin: bool,
+    /// The target's `dd` or `base64` lacks the flags a read leans on (`dd iflag=skip_bytes,count_bytes`,
+    /// `base64 -w0`): older busybox, for one. Negative so an unprobed [`Capabilities::default`] reads
+    /// as capable.
+    ///
+    /// **Reads then fail, loudly.** In a pipeline whose last command is `base64`, a `dd` that rejects
+    /// its flags still leaves `base64` succeeding on empty input, so an existing file would read back
+    /// as an *empty* one, and a model that believes a file is empty overwrites it.
+    pub no_read_window: bool,
 }
 
 /// Which program a search will actually use — the fallback ladder, named so it can be logged.
@@ -131,11 +141,23 @@ impl Capabilities {
             .run_with_stdin("cat", &[], None, PROBE_TIMEOUT, STDIN_PROBE.as_bytes())
             .await
             .is_ok_and(|r| r.code == Some(0) && r.stdout == STDIN_PROBE);
+        // The exact pipeline `READ_WINDOW_SCRIPT` ends in, on three bytes: `Yg==` is "b" and nothing
+        // else. Judged on stdout, because the pipeline's exit status is `base64`'s alone.
+        let no_read_window = !runner
+            .run(
+                "sh",
+                &["-c".to_string(), READ_WINDOW_PROBE.to_string()],
+                None,
+                PROBE_TIMEOUT,
+            )
+            .await
+            .is_ok_and(|r| r.code == Some(0) && r.stdout.trim() == "Yg==");
         Self {
             rg,
             grep_null,
             find_printf,
             stdin,
+            no_read_window,
         }
     }
 
@@ -345,6 +367,12 @@ impl FsBackend for ShellFs {
     /// a stream and drops the middle, and base64 of a glued head and tail still decodes, into a file
     /// that never existed. A short chunk is end-of-file and ends the loop.
     async fn read_bytes(&self, path: &Path, offset: u64, max: usize) -> Result<Vec<u8>, FsError> {
+        if self.caps.no_read_window {
+            return Err(FsError::Backend(format!(
+                "read {}: this target's dd or base64 does not support iflag=skip_bytes,count_bytes / -w0, so files cannot be read",
+                path.display()
+            )));
+        }
         let target = path.to_string_lossy().into_owned();
         let mut out = Vec::new();
         loop {
@@ -1537,6 +1565,80 @@ pub fn query(pattern: &str, root: PathBuf, limit: usize) -> SearchQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// This host's `sh`, with a prelude run before every script. A `PATH` shim, not a shell function,
+    /// because the read script `exec`s `dd`, which skips functions.
+    struct Prelude(String);
+
+    #[async_trait]
+    impl CommandRunner for Prelude {
+        async fn run(
+            &self,
+            program: &str,
+            args: &[String],
+            cwd: Option<&str>,
+            timeout: Duration,
+        ) -> std::io::Result<ExecResult> {
+            let mut args = args.to_vec();
+            if let ("sh", Some(script)) = (program, args.get_mut(1)) {
+                *script = format!("{}\n{script}", self.0);
+            }
+            crate::tools::exec::RealRunner
+                .run(program, &args, cwd, timeout)
+                .await
+        }
+
+        async fn run_with_stdin(
+            &self,
+            program: &str,
+            args: &[String],
+            cwd: Option<&str>,
+            timeout: Duration,
+            stdin: &[u8],
+        ) -> std::io::Result<ExecResult> {
+            crate::tools::exec::RealRunner
+                .run_with_stdin(program, args, cwd, timeout, stdin)
+                .await
+        }
+    }
+
+    /// A directory whose `dd`/`base64` reject the flags, as a busybox without them does, and the
+    /// prelude that puts it first on `PATH`.
+    fn shim(dir: &Path, tool: &str) -> Prelude {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("shim");
+        std::fs::create_dir_all(&bin).unwrap();
+        let f = bin.join(tool);
+        std::fs::write(
+            &f,
+            format!("#!/bin/sh\necho '{tool}: unrecognized option' >&2\nexit 1\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Prelude(format!("PATH={}:$PATH", bin.display()))
+    }
+
+    #[tokio::test]
+    async fn a_target_whose_dd_lacks_the_flags_never_reads_an_existing_file_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("precious.txt");
+        std::fs::write(&path, "keep me\n").unwrap();
+        let fs = ShellFs::connect(Arc::new(shim(dir.path(), "dd"))).await;
+        assert!(fs.capabilities().no_read_window);
+        let err = fs.read_bytes(&path, 0, 1024).await.unwrap_err();
+        assert!(err.to_string().contains("cannot be read"), "{err}");
+        // A target with the flags reads it, and the probe agrees.
+        let fs = ShellFs::connect(Arc::new(Prelude(":".into()))).await;
+        assert!(!fs.capabilities().no_read_window);
+        assert_eq!(fs.read_bytes(&path, 0, 1024).await.unwrap(), b"keep me\n");
+    }
+
+    #[tokio::test]
+    async fn a_target_whose_base64_lacks_dash_w_is_probed_as_unable_to_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let caps = Capabilities::probe(&shim(dir.path(), "base64")).await;
+        assert!(caps.no_read_window);
+    }
 
     #[test]
     fn parses_a_match_record() {
