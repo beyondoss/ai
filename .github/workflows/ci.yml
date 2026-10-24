@@ -355,8 +355,12 @@ jobs:
   # Dependency advisories are checked only on a PR that touches dependencies. An advisory is
   # published on its own schedule, so an unrelated PR must never turn red because one landed since
   # main last changed; advisories.yml bumps main's lockfile daily instead. `deps` is true when the
-  # PR changes Cargo.lock, a Cargo.toml, or .cargo/audit.toml. A merge-queue run skips it (the PR
-  # ran it); a dispatched run (a bot PR) compares with main.
+  # change touches what decides the dependency set or what is built from it: Cargo.lock, a
+  # Cargo.toml, .cargo/audit.toml, .cargo/config(.toml), rust-toolchain(.toml) or a Dockerfile. A
+  # merge-queue run compares the queued tree with the queue's base commit rather than always
+  # running: it still catches deps that change only in combination (two queued PRs, a merge that
+  # alters the lock) without turning the queue red, for a PR that touches no dependency, over an
+  # advisory published since main last changed. A dispatched run (a bot PR) compares with main.
   changes:
     name: changes
     runs-on: ubuntu-latest
@@ -370,12 +374,12 @@ jobs:
       - id: diff
         env:
           EVENT: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
           deps=false
-          if [ "$EVENT" = pull_request ] || [ "$EVENT" = workflow_dispatch ]; then
+          if [ "$EVENT" = pull_request ] || [ "$EVENT" = workflow_dispatch ] || [ "$EVENT" = merge_group ]; then
             base=${BASE_SHA:-$(git rev-parse origin/main)}
-            if git diff --name-only "$base"...HEAD | grep -qE '(^|/)Cargo\.toml$|^Cargo\.lock$|^\.cargo/audit\.toml$'; then
+            if git diff --name-only "$base"...HEAD | grep -qE '(^|/)Cargo\.toml$|^Cargo\.lock$|^\.cargo/(audit\.toml|config(\.toml)?)$|(^|/)rust-toolchain(\.toml)?$|(^|/)Dockerfile[^/]*$'; then
               deps=true
             fi
           fi
