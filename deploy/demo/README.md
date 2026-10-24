@@ -103,12 +103,20 @@ folder (about 32 round trips at every open without one).
   (`/mcp/<session>`). The agent offers the browser's tools at open from a list saved in the bundle
   (`.mcp-tools.json`, made at bundle build by `mcp-tools.sh` running `rustwright-mcp` once), so nothing
   dials the front and no VM exists. The model's first browser call reaches the front, which makes the
-  VM from an E2B template that already holds the browser stack (Chromium, supergateway), seeds it (the VM
-  fetches the `rustwright-mcp` binary itself) and forwards; the agent then compares the server's real list with the saved one.
+  VM from an E2B template that is a snapshot of a running browser stack: Chromium (on a debugging port),
+  supergateway with its node modules and the `rustwright-mcp` binary are all in it, the bridge is
+  already listening, and one throwaway session has warmed their pages. The front seeds the VM from the
+  bundle and forwards; the agent then compares the server's real list with the saved one. Nothing is
+  fetched or installed at VM start. `rustwright-mcp` attaches to the running Chromium
+  (`RUSTWRIGHT_MCP_CDP_ENDPOINT`) instead of launching one, so the first navigate does not pay a
+  browser start; one Chromium serves the VM's sessions. Without that, a first call spent 8 s starting
+  Chromium and 4 s starting node, both reading a cold disk.
   `vm-created-on-first-tool` shows it, as for coding. `up.sh` builds that template once
-  (`e2b_browser_template`: named by a hash of what it installs, found and reused if it exists, so a
-  second `up.sh` builds nothing). It belongs to the E2B account, not to the run, so `down.sh` keeps it
-  and the sandbox count it proves is still zero; delete it from E2B's dashboard if you want it gone.
+  (`e2b_browser_template`: named by a hash of what it installs, the `rustwright-mcp` binary and the
+  start command, found and reused if it exists, so a second `up.sh` builds nothing). It belongs to the
+  E2B account, not to the run, so `down.sh` keeps it and the sandbox count it proves is still zero;
+  delete it from E2B's dashboard if you want it gone. A plain VM (the coding agent's) still installs
+  the stack when it first asks for a browser, and then starts Chromium and the bridge the same way.
   The agent reaches the front, a private address, with no switch turned: a `sandbox: true` connector
   may dial the origin of the grant's `exec_url`, and nothing else private.
 
@@ -118,11 +126,19 @@ the time from connecting to the first answer.
 Before and after, per session, from the committed records (before: `20261020T230210Z-assistant`,
 `20261020T231038Z-coding`, `20261020T231305Z-browser`; after: the records beside them from this change):
 
-| use case  | sandbox requests at open, before | after         | open latency, before (derived) | after (measured)                                                                                                                                                                                                                              |
-| --------- | -------------------------------- | ------------- | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| assistant | 32                               | 0             | about 0.9 s                    | 302 ms (mean of 3)                                                                                                                                                                                                                            |
-| coding    | 38                               | 0             | about 3.0 s                    | 306 ms, with no VM yet; the VM is made 2.7 s later, by the first tool call, and its first result comes 5.4 s after the create began                                                                                                           |
-| browser   | 34 (and no others all run)       | 0 (0 all run) | about 3.0 s                    | 311 ms, with no VM yet; the first browser call makes the VM (from a template that already holds the browser stack) and returns its result 10.5 s after it started, down from 18.2 s: VM 3.0 s, bundle 0.9 s, browser bridge 5.7 s, call 0.9 s |
+| use case  | sandbox requests at open, before | after         | open latency, before (derived) | after (measured)                                                                                                                                                                                                                                                                                                                      |
+| --------- | -------------------------------- | ------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| assistant | 32                               | 0             | about 0.9 s                    | 302 ms (mean of 3)                                                                                                                                                                                                                                                                                                                    |
+| coding    | 38                               | 0             | about 3.0 s                    | 306 ms, with no VM yet; the VM is made 2.7 s later, by the first tool call, and its first result comes 5.4 s after the create began                                                                                                                                                                                                   |
+| browser   | 34 (and no others all run)       | 0 (0 all run) | about 3.0 s                    | 311 ms, with no VM yet; the first browser call makes the VM (from a template that snapshots the running browser stack) and returns its result 7.6 s after it started, down from 10.5 s with a template that held only the stack, and 18.2 s with none: VM 3.8 s, bundle 0.6 s, browser stack and bridge 2.0 s (was 5.7 s), call 1.2 s |
+
+Where the browser bridge's start went, timed in a fresh VM (not the front's overlapped path): from a
+template that only had the files baked, node and supergateway took 4.1 s to listen, `rustwright-mcp`
+50 ms to answer `initialize`, and the first navigate 8.1 s (it launches Chromium); every one of those
+is reading a cold disk, and the same steps with the files already read take 1.0 s, 40 ms and 1.7 s.
+From the snapshot template the bridge is listening and the first `initialize` plus navigate takes
+190-330 ms; what is left of the start is the VM resume (about 1.2 s more than a plain VM, as pages come
+in on demand), one round trip to check the stack, and starting the page server for the bundle.
 
 The "before" counts are the exec requests in the old records before the first model call (assistant:
 129 across its setup session and three sessions, less the setup's own command, divided by four). The

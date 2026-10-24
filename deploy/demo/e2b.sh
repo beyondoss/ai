@@ -172,31 +172,31 @@ rustwright_bin() { # builds it once; prints the path
 CHROME_VERSION=${CHROME_VERSION:-155.0.8059.12}
 SUPERGATEWAY_VERSION=${SUPERGATEWAY_VERSION:-4.2.0}
 BRIDGE_PORT=8931
+CDP_PORT=9222
 
 # The browser stack inside a VM: a lean Chromium (Chrome for Testing's headless shell), rustwright-mcp
 # (a stdio MCP server) and supergateway, which serves it as streamable HTTP, one stdio child per MCP
 # session (`--stateful`). Hosted sessions skip `command` entries in .mcp.json, so this bridge is how a
 # stdio server becomes a URL a grant can name. `vm.overcommit_memory=1`: a small VM refuses the
 # renderer's large mappings otherwise and the renderer dies.
-vm_browser_up() { # id token rustwright-binary-or-url (a URL is fetched by the VM itself)
-  if [[ $3 == http* ]]; then
-    vm_run "$1" "$2" "curl -fsS -m 120 -o $VM_HOME/rustwright-mcp '$3' && echo fetched" | grep -q fetched || return 1
-  else
-    vm_put "$1" "$2" "$3" "$VM_HOME/rustwright-mcp" || return 1
-  fi
-  # A VM made from the browser template (e2b_browser_template) has the stack already; a plain one installs it.
-  vm_run "$1" "$2" "chmod +x $VM_HOME/rustwright-mcp
+browser_up_script() { # rustwright-binary-url-or-empty
+  cat <<EOS
+$([ -z "$1" ] || echo "test -x $VM_HOME/rustwright-mcp || curl -fsS -m 120 -o $VM_HOME/rustwright-mcp '$1' || exit 1")
+chmod +x $VM_HOME/rustwright-mcp
 sudo sysctl -w vm.overcommit_memory=1 >/dev/null
 if ! { test -x $VM_HOME/chrome-headless-shell-linux64/chrome-headless-shell && test -x $VM_HOME/sg/node_modules/.bin/supergateway; }; then
 $(browser_install_script)
 fi
-echo browser-stack-ready" | grep -q browser-stack-ready
+EOS
 }
-# Chromium's first launch in a fresh VM reads its files cold and takes ~10 s; a throwaway run, started the
-# moment the VM is up and left to run beside the seeding and the bridge, makes the model's first navigate ~1 s.
-vm_browser_warm() { # id token
-  vm_run "$1" "$2" "test -x $VM_HOME/chrome-headless-shell-linux64/chrome-headless-shell || exit 0
-(setsid nohup timeout 40 $VM_HOME/chrome-headless-shell-linux64/chrome-headless-shell --no-sandbox --disable-gpu --dump-dom about:blank >/dev/null 2>&1 </dev/null &)" >/dev/null
+# The binary: put from a local file, or fetched by the VM itself from a URL.
+browser_binary_put() { # id token rustwright-binary-or-url
+  [[ $3 == http* ]] || vm_put "$1" "$2" "$3" "$VM_HOME/rustwright-mcp"
+}
+vm_browser_up() { # id token rustwright-binary-or-url
+  browser_binary_put "$@" || return 1
+  vm_run "$1" "$2" "$(browser_up_script "$([[ $3 == http* ]] && echo "$3")")
+echo browser-stack-ready" | grep -q browser-stack-ready
 }
 # The install, as one script: run in a plain VM at its first browser request, or once at template build.
 browser_install_script() {
@@ -215,12 +215,19 @@ EOS
 }
 
 # The browser stack baked into an E2B template, so a session's VM boots with it instead of installing it
-# in the first request. Built once and reused: the name carries a hash of what the build installs, so a
-# changed version builds a new one and an unchanged one is found by name. A template belongs to the
-# account, not to a run: `down.sh` keeps it. Prints the template name. Needs E2B_API_KEY.
+# in the first request: Chromium, supergateway with its node modules, and the rustwright-mcp binary, so
+# a first browser call only launches processes. Built once and reused: the name carries a hash of what the
+# build installs (the install script and the binary's sha256), so a changed version builds a new one and an
+# unchanged one is found by name. The binary reaches the build by a presigned link from the bundles bucket
+# (which must exist). A template belongs to the account, not to a run: `down.sh` keeps it. Prints the
+# template name. Needs E2B_API_KEY.
 e2b_browser_template() {
-  local name row tid bid resp body status i
-  name="beyond-ai-demo-browser-$(browser_install_script | sha256sum | cut -c1-10)"
+  local name row tid bid resp body status i rw rwsha rwurl start ready
+  rw=$(rustwright_bin) || return 1
+  rwsha=$(sha256sum "$rw" | cut -d' ' -f1)
+  start=$(browser_bridge_script; browser_warm_script)
+  ready="test -e /tmp/browser-warm && curl -sf -m 2 localhost:$BRIDGE_PORT/healthz"
+  name="beyond-ai-demo-browser-$({ browser_install_script; echo "$rwsha"; echo "$start"; echo "$ready"; } | sha256sum | cut -c1-10)"
   row=$(e2b_curl "$E2B_API/templates" | jq -r --arg n "$name" '[.[]|select((.aliases // [])|index($n))][0] // empty | "\(.templateID) \(.buildStatus)"') || return 1
   case "$row" in
     *" ready") echo "$name"; return 0 ;;
@@ -232,7 +239,11 @@ e2b_browser_template() {
   bid=$(jq -r '.buildID // empty' <<<"$resp")
   [ -n "$tid" ] && [ -n "$bid" ] || { echo "E2B: the template was not created: $(head -c 300 <<<"$resp")" >&2; return 1; }
   echo "  + building E2B template $name ($tid)" >&2
-  body=$(jq -nc --arg s "$(browser_install_script)" '{fromImage:"e2bdev/base", steps:[{type:"RUN", args:[$s, "root"]}]}')
+  command aws --region "$REGION" s3 cp "$rw" "s3://$(bundle_bucket)/rustwright-mcp-$rwsha" --only-show-errors || return 1
+  rwurl=$(command aws --region "$REGION" s3 presign "s3://$(bundle_bucket)/rustwright-mcp-$rwsha" --expires-in 3600) || return 1
+  body=$(jq -nc --arg s "$(browser_install_script)" --arg b "curl -fsS -m 120 -o $VM_HOME/rustwright-mcp '$rwurl' && echo '$rwsha  $VM_HOME/rustwright-mcp' | sha256sum -c - >/dev/null && chmod 755 $VM_HOME/rustwright-mcp && chown user:user $VM_HOME/rustwright-mcp" \
+    --arg start "$start" --arg ready "$ready" \
+    '{fromImage:"e2bdev/base", steps:[{type:"RUN", args:[$s, "root"]}, {type:"RUN", args:[$b, "root"]}], startCmd:$start, readyCmd:$ready}')
   e2b_curl -X POST "$E2B_API/v2/templates/$tid/builds/$bid" -H 'Content-Type: application/json' -d "$body" >&2 || return 1
   for i in $(seq 1 180); do
     status=$(e2b_curl "$E2B_API/templates/$tid/builds/$bid/status")
@@ -251,13 +262,47 @@ vm_site_start() { # id token dir
 for i in \$(seq 1 50); do curl -sf -m 1 -o /dev/null localhost:8000/ && break; sleep 0.1; done
 curl -sf -m 1 -o /dev/null localhost:8000/ && echo up" | grep -q up
 }
+# The browser and the bridge's launch, idempotent: each part does nothing if it already answers (a VM made
+# from the browser template resumes with both running). Chromium starts first and keeps running on a
+# debugging port; rustwright-mcp attaches to it (RUSTWRIGHT_MCP_CDP_ENDPOINT) instead of launching one, so
+# the model's first navigate does not pay a browser start. Used by vm_bridge_start and, in the template, as
+# the start command. One Chromium serves the VM's sessions, which is how the demo uses it.
+browser_bridge_script() {
+  cat <<EOS
+cd $VM_HOME
+sudo sysctl -w vm.overcommit_memory=1 >/dev/null
+curl -sf -m 2 localhost:$CDP_PORT/json/version >/dev/null || (setsid nohup $VM_HOME/chrome-headless-shell-linux64/chrome-headless-shell --no-sandbox \\
+  --disable-gpu --remote-debugging-port=$CDP_PORT --user-data-dir=/tmp/chrome-profile about:blank >/tmp/chrome.log 2>&1 </dev/null &)
+export RUSTWRIGHT_MCP_CDP_ENDPOINT=http://127.0.0.1:$CDP_PORT
+curl -sf -m 2 localhost:$BRIDGE_PORT/healthz >/dev/null || (setsid nohup $VM_HOME/sg/node_modules/.bin/supergateway --stdio $VM_HOME/rustwright-mcp --outputTransport streamableHttp \\
+  --stateful --port $BRIDGE_PORT --streamableHttpPath /mcp --healthEndpoint /healthz >/tmp/bridge.log 2>&1 </dev/null &)
+for i in \$(seq 1 300); do curl -sf -m 2 localhost:$CDP_PORT/json/version >/dev/null && curl -sf -m 2 localhost:$BRIDGE_PORT/healthz >/dev/null && break; sleep 0.1; done
+EOS
+}
+# One throwaway browser session through the bridge (initialize, navigate, close), then a marker: the
+# rustwright-mcp, Chromium and node pages it touches are in memory when the template is snapshotted.
+browser_warm_script() {
+  cat <<EOS
+H='-H Content-Type:application/json -H Accept:application/json,text/event-stream'
+init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"warm","version":"0"}}}'
+sid=\$(curl -sS -D - -o /dev/null \$H localhost:$BRIDGE_PORT/mcp -d "\$init" | tr -d '\\r' | grep -i '^mcp-session-id' | cut -d' ' -f2)
+curl -sS -o /dev/null \$H -H "Mcp-Session-Id: \$sid" localhost:$BRIDGE_PORT/mcp -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+curl -sS -o /dev/null -m 60 \$H -H "Mcp-Session-Id: \$sid" localhost:$BRIDGE_PORT/mcp -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_navigate","arguments":{"url":"data:text/html,<h1>warm</h1>"}}}'
+curl -sS -o /dev/null -X DELETE -H "Mcp-Session-Id: \$sid" localhost:$BRIDGE_PORT/mcp
+touch /tmp/browser-warm
+EOS
+}
 # Start the bridge.
 vm_bridge_start() { # id token
-  vm_run "$1" "$2" "cd $VM_HOME
-export RUSTWRIGHT_CHROMIUM=$VM_HOME/chrome-headless-shell-linux64/chrome-headless-shell
-(setsid nohup $VM_HOME/sg/node_modules/.bin/supergateway --stdio $VM_HOME/rustwright-mcp --outputTransport streamableHttp \\
-  --stateful --port $BRIDGE_PORT --streamableHttpPath /mcp --healthEndpoint /healthz >/tmp/bridge.log 2>&1 </dev/null &)
-for i in \$(seq 1 30); do curl -sf -m 2 localhost:$BRIDGE_PORT/healthz >/dev/null && break; sleep 1; done
+  vm_run "$1" "$2" "$(browser_bridge_script)
+curl -sf -m 2 localhost:$BRIDGE_PORT/healthz" | grep -q ok
+}
+# Both in one round trip: the front's path. In a VM made from the browser template the binary, the stack,
+# Chromium and the bridge are all there already and this only checks them.
+vm_browser_start() { # id token rustwright-binary-or-url
+  browser_binary_put "$@" || return 1
+  vm_run "$1" "$2" "$(browser_up_script "$([[ $3 == http* ]] && echo "$3")")
+$(browser_bridge_script)
 curl -sf -m 2 localhost:$BRIDGE_PORT/healthz" | grep -q ok
 }
 vm_bridge_url() { echo "https://$BRIDGE_PORT-$(vm_field "$1" id).e2b.app/mcp"; }

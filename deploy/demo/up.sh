@@ -41,10 +41,7 @@ if [ "$USE_E2B" = 1 ]; then
   e2b_need_key || exit 2
   # The key works. (VMs are made per session by demo.sh, so there is nothing to create here.)
   e2b_count >/dev/null || { echo "up: E2B's API did not accept E2B_API_KEY" >&2; exit 2; }
-  # The browser agent's VMs boot from a template with the browser stack in it (found by name if an earlier
-  # run built it; see e2b_browser_template). It belongs to the account, so `down.sh` keeps it.
   BROWSER_TEMPLATE=
-  [ "$USECASES" = 0 ] || BROWSER_TEMPLATE=$(e2b_browser_template) || exit 2
 fi
 ACCOUNT=$(account)
 ECR="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com"
@@ -255,6 +252,10 @@ if [ "$USECASES" = 1 ]; then
   aws s3api put-public-access-block --bucket "$BUCKET" \
     --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
   aws s3api put-bucket-tagging --bucket "$BUCKET" --tagging "TagSet=[{Key=$TAG_KEY,Value=$NAME}]"
+  # The browser agent's VMs boot from a template with the browser stack and the rustwright-mcp binary in it
+  # (found by name if an earlier run built it; see e2b_browser_template). It belongs to the account, so
+  # `down.sh` keeps it.
+  [ "$USE_E2B" != 1 ] || BROWSER_TEMPLATE=$(e2b_browser_template) || exit 2
 fi
 
 # ---------------------------------------------------------------------------------------------
