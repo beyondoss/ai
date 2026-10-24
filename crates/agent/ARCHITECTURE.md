@@ -5672,6 +5672,14 @@ exempt from the MCP idle reap: closing its session would end the server's state 
 page) inside a VM that costs nothing while asleep, so the session lives until the agent session ends.
 `tests/mcp_sandbox_connector.rs` counts `GET`s and open connections at a session-id-issuing fixture.
 
+A sandbox front is usually on a private address, so a `sandbox: true` connector whose URL has the same
+scheme, host and port as the grant's `exec_url` is dialed through a client pair built with that one
+host allowed (`McpEgress::allowing_host`, from `granted_jobs`): the control plane chose that origin,
+and the exec path already dials it. Nothing wider opens. A sandbox connector on any other private
+address, and a default connector even on the exec origin, are refused as before, and the
+`.mcp.json` entries (`sandbox: false` always) never get it. `tests/mcp_sandbox_connector.rs` covers
+all three cases.
+
 **The workspace's `.mcp.json`.** A tenant's folder can carry its connectors too: after the sandbox is
 attached, `<workspace>/.mcp.json` is read through the exec backend like `AGENTS.md`
 (`service::workspace_mcp`) and each `url` entry joins the grant's connectors

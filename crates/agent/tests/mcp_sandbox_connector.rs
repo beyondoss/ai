@@ -48,6 +48,7 @@ async fn call_with_idle_gap(
         &[connector],
         &BTreeMap::new(),
         &egress,
+        "",
         mcp::host(),
         reap_after,
         &BTreeMap::new(),
@@ -133,5 +134,66 @@ async fn a_default_connector_is_still_reaped_when_idle() {
     assert!(
         fixture.initializes() >= 2,
         "and the next call dials a new one"
+    );
+}
+
+/// Connect `url` as a connector against the default (private-refusing) egress, with the grant's
+/// exec endpoint at `exec_url`; returns whether the tool was advertised and the warnings.
+async fn dial_guarded(url: &str, sandbox: bool, exec_url: &str) -> (bool, Vec<String>) {
+    let egress = McpEgress::new(EgressPolicy::default()).unwrap();
+    let connector = McpConnector {
+        name: "c".into(),
+        url: url.into(),
+        sandbox,
+        managed: false,
+    };
+    let (tools, _catalog, warnings) = mcp::connect_granted(
+        &[connector],
+        &BTreeMap::new(),
+        &egress,
+        exec_url,
+        mcp::host(),
+        Duration::ZERO,
+        &BTreeMap::new(),
+    )
+    .await;
+    let found = tools.snapshot().iter().any(|t| t.name() == "mcp__c__echo");
+    (found, warnings)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sandbox_connector_on_the_exec_origin_connects_at_a_private_address() {
+    let fixture = spawn_session_mcp_fixture().await;
+    let exec = fixture.url.replace("/mcp", "/exec");
+    let (found, warnings) = dial_guarded(&fixture.url, true, &exec).await;
+    assert!(found && warnings.is_empty(), "{warnings:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sandbox_connector_on_another_private_address_is_refused() {
+    let fixture = spawn_session_mcp_fixture().await;
+    let other = spawn_session_mcp_fixture().await;
+    // Same host, different port: a different origin.
+    let exec = other.url.replace("/mcp", "/exec");
+    let (found, warnings) = dial_guarded(&fixture.url, true, &exec).await;
+    assert!(!found);
+    assert!(
+        warnings.iter().any(|w| w.contains("refusing to dial")),
+        "{warnings:?}"
+    );
+    // And with no exec endpoint at all.
+    let (found, _) = dial_guarded(&fixture.url, true, "").await;
+    assert!(!found);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_default_connector_on_the_exec_origin_is_still_refused() {
+    let fixture = spawn_session_mcp_fixture().await;
+    let exec = fixture.url.replace("/mcp", "/exec");
+    let (found, warnings) = dial_guarded(&fixture.url, false, &exec).await;
+    assert!(!found);
+    assert!(
+        warnings.iter().any(|w| w.contains("refusing to dial")),
+        "{warnings:?}"
     );
 }

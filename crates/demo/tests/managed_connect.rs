@@ -81,6 +81,7 @@ async fn a_managed_connector_calls_through_the_endpoint_holding_no_third_party_k
         &grant.mcp,
         &grant.secrets.mcp_headers,
         &egress,
+        &grant.exec_url,
         mcp::host(),
         Duration::ZERO,
         &std::collections::BTreeMap::new(),
