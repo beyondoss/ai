@@ -3003,3 +3003,17 @@ state = "fixed"
 test = "managed_endpoint_holds_a_managed_key_to_metered_calls"
 fix = "8f78fe98"
 note = "Fixed with route::anchored_forward_endpoint, used only by the managed allowlist: everything before the endpoint suffix must be exactly one of /v1, /api/v1, /openai/v1, /inference/v1, /anthropic/v1, /backend-api/codex, or Azure's /openai/deployments/{one segment}. forward_endpoint (wire selection, sub-resources, BYO) is unchanged."
+
+[[defect]]
+id = "D300"
+severity = "med"
+area = "Reliability"
+title = "A client that sent headers and no body held a stream and an upstream connection for up to 600 seconds over HTTP/2"
+impact = "A keyless client (BYO needs no key) could open h2c streams, send headers and withhold the body. Pingora connects the upstream before it reads a body byte and its HTTP/2 server has no body read timeout, so each stream held a downstream stream plus an upstream connection until the upstream's read_timeout_secs (600s) fired; the request deadline is only checked when a chunk arrives. Over HTTP/1.1 pingora's own timeout ended it at 60s, but only after the upstream was connected."
+confidence = "high"
+evidence = "Measured on main with client_read_timeout_secs = 2 and read_timeout_secs = 6 against a silent upstream (the test below, before the fix): HTTP/1.1 answered 408 after 2.0s with the upstream connection already made; h2c answered nothing at 2s and 504 after 6.0s, the upstream's own timeout, with an upstream connection held throughout."
+claims = ["REL-1", "SEC-16"]
+state = "fixed"
+test = "a_client_that_withholds_its_body_is_cut_at_client_read_timeout"
+fix = "296ce136"
+note = "Fixed: request_filter holds a request whose body the gateway has not read until the body starts (proxy/full_body.rs await_body_start): the first chunk, or the whole body when its declared length fits the replay buffer, each read bounded by client_read_timeout_secs, with the tagged read timeout and 408 an up-front read already gives (D265). Pingora replays what was read. No upstream is dialed for a stall. Not changed: a stall between later chunks of a large body over h2c is still bounded by read_timeout_secs (tested: a_large_upload_that_stalls_after_its_first_chunk_ends_at_the_upstream_bound)."
