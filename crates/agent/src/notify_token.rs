@@ -16,9 +16,13 @@
 //! purpose   "job_ended"
 //! ```
 //!
-//! - **One key.** A replica mints and verifies under the key derived from its own seal secret and
-//!   no other; a token naming any other kid is [`Verdict::UnknownKid`] (answered `503`, so a
-//!   sandbox keeps retrying through a seal-secret rollout).
+//! - **Mints under one key, verifies under at most two.** A replica mints under the key derived
+//!   from its current seal secret only. During a rotation it may also hold the previous secret's
+//!   key ([`NotifyKey::with_previous`]) and accepts tokens naming that kid, so a kept job's
+//!   notification survives the switch; the kid picks the key, so the two are never tried in turn.
+//!   A token naming any other kid is [`Verdict::UnknownKid`] (answered `503`, so a sandbox keeps
+//!   retrying through a seal-secret rollout). The operator drops the previous secret once the
+//!   longest token lifetime has passed.
 //! - **Its own scope only.** [`NotifyKey::mint`] takes the tenant, the session and the job, and
 //!   computes the scope itself ([`JobScope::for_session`]), so a replica cannot mint for another
 //!   session's jobs.
@@ -82,8 +86,15 @@ impl Verdict {
     }
 }
 
-/// The notify key `K` and its kid, derived once from the fleet seal secret.
+/// The notify key `K` and its kid, derived once from the fleet seal secret, plus (during a
+/// rotation) the same pair from the previous seal secret, which verifies but never mints.
 pub struct NotifyKey {
+    current: Derived,
+    previous: Option<Derived>,
+}
+
+/// One seal secret's `K` and kid.
+struct Derived {
     key: Zeroizing<[u8; 32]>,
     kid: String,
 }
@@ -104,9 +115,27 @@ impl NotifyKey {
     }
 
     /// Derive from the seal secret's raw bytes.
+    pub fn from_secret_bytes(secret: &[u8; 32]) -> Self {
+        Self {
+            current: Derived::from_secret_bytes(secret),
+            previous: None,
+        }
+    }
+
+    /// Also accept tokens minted under the previous seal secret's key. Never used to mint. A
+    /// previous secret equal to the current one adds nothing.
+    #[must_use]
+    pub fn with_previous(mut self, previous: &StaticSecret) -> Self {
+        let previous = Derived::from_secret_bytes(&Zeroizing::new(previous.to_bytes()));
+        self.previous = (previous.kid != self.current.kid).then_some(previous);
+        self
+    }
+}
+
+impl Derived {
     // SAFETY (expect): HKDF-SHA256 fails only for an output longer than 255 × 32 bytes.
     #[allow(clippy::expect_used)]
-    pub fn from_secret_bytes(secret: &[u8; 32]) -> Self {
+    fn from_secret_bytes(secret: &[u8; 32]) -> Self {
         let mut key = Zeroizing::new([0u8; 32]);
         Hkdf::<Sha256>::new(None, secret)
             .expand(HKDF_INFO, key.as_mut())
@@ -117,20 +146,24 @@ impl NotifyKey {
         let kid = hex::encode(&h.finalize()[..KID_LEN / 2]);
         Self { key, kid }
     }
+}
 
-    /// This key's kid: eight lowercase hex digits.
+impl NotifyKey {
+    /// The kid tokens are minted under: eight lowercase hex digits.
     pub fn kid(&self) -> &str {
-        &self.kid
+        &self.current.kid
     }
 
     /// The token for job `id` of `session_id` in `tenant`, bound to that session's own scope.
     pub fn mint(&self, tenant: &str, session_id: &str, id: &JobId) -> String {
         let scope = JobScope::for_session(Some(tenant), session_id);
-        let tag = self.tag(tenant, session_id, scope.name(), id.as_str());
+        let tag = self
+            .current
+            .tag(tenant, session_id, scope.name(), id.as_str());
         let mut token = String::with_capacity(VERSION.len() + 2 + KID_LEN + MAC_LEN);
         token.push_str(VERSION);
         token.push('.');
-        token.push_str(&self.kid);
+        token.push_str(&self.current.kid);
         token.push('.');
         URL_SAFE_NO_PAD.encode_string(tag, &mut token);
         token
@@ -149,16 +182,22 @@ impl NotifyKey {
         let Some((kid, tag)) = parse(token) else {
             return Verdict::Malformed;
         };
-        if kid != self.kid {
+        let Some(key) = [Some(&self.current), self.previous.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|d| d.kid == kid)
+        else {
             return Verdict::UnknownKid;
-        }
-        // `m` carries this key's kid, which the check above made equal to the token's.
-        match self.mac(tenant, session_id, scope, id).verify_slice(&tag) {
+        };
+        // `m` carries the key's kid, which the lookup above made equal to the token's.
+        match key.mac(tenant, session_id, scope, id).verify_slice(&tag) {
             Ok(()) => Verdict::Valid,
             Err(_) => Verdict::BadMac,
         }
     }
+}
 
+impl Derived {
     /// HMAC-SHA256(K, m), finalized.
     fn tag(&self, tenant: &str, session_id: &str, scope: &str, id: &str) -> [u8; 32] {
         self.mac(tenant, session_id, scope, id)
@@ -172,7 +211,15 @@ impl NotifyKey {
     #[allow(clippy::expect_used)]
     fn mac(&self, tenant: &str, session_id: &str, scope: &str, id: &str) -> HmacSha256 {
         let mut mac = HmacSha256::new_from_slice(self.key.as_ref()).expect("HMAC takes any key");
-        for field in [VERSION, self.kid(), PURPOSE, tenant, session_id, scope, id] {
+        for field in [
+            VERSION,
+            self.kid.as_str(),
+            PURPOSE,
+            tenant,
+            session_id,
+            scope,
+            id,
+        ] {
             let len = u32::try_from(field.len()).unwrap_or(u32::MAX);
             mac.update(&len.to_be_bytes());
             mac.update(field.as_bytes());

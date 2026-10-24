@@ -400,6 +400,9 @@ pub struct GrantVerifier {
     fleet_secret: StaticSecret,
     /// `fleet_secret`'s public half — half of the HKDF salt, so derived once here.
     fleet_public: PublicKey,
+    /// The seal secret this fleet rotated away from, during a rotation. Only the notify key
+    /// consults it: a grant's seal names no key, and a grant is re-minted for each connection.
+    previous_seal: Option<StaticSecret>,
 }
 
 impl GrantVerifier {
@@ -409,7 +412,15 @@ impl GrantVerifier {
             keys,
             fleet_secret,
             fleet_public,
+            previous_seal: None,
         }
+    }
+
+    /// Also accept notify tokens minted under `previous`, the seal secret being rotated out.
+    #[must_use]
+    pub fn with_previous_seal(mut self, previous: StaticSecret) -> Self {
+        self.previous_seal = Some(previous);
+        self
     }
 
     /// Build from `serve`'s `--grant-key` (repeatable) and `--seal-key` flags. Neither ⇒ `Ok(None)`:
@@ -437,9 +448,13 @@ impl GrantVerifier {
     }
 
     /// The exec v1.4 notify key, derived from the fleet seal secret this verifier holds
-    /// ([`crate::notify_token`]).
+    /// ([`crate::notify_token`]); it also verifies under the previous seal secret, if one is set.
     pub fn notify_key(&self) -> crate::notify_token::NotifyKey {
-        crate::notify_token::NotifyKey::from_seal_secret(&self.fleet_secret)
+        let key = crate::notify_token::NotifyKey::from_seal_secret(&self.fleet_secret);
+        match &self.previous_seal {
+            Some(previous) => key.with_previous(previous),
+            None => key,
+        }
     }
 
     /// Verify `token` and open its secrets. `now` is unix seconds (a parameter so tests pin it).
@@ -629,6 +644,40 @@ impl<'a> SealKeySource<'a> {
             Self::File(path) => read_seal_key(path),
             Self::Base64(b64) => parse_seal_key_b64(b64),
         }
+    }
+}
+
+/// The environment variable that carries the previous seal key (base64), as [`SEAL_KEY_B64_ENV`]
+/// carries the current one.
+pub const SEAL_KEY_PREVIOUS_B64_ENV: &str = "AI_AGENT_SEAL_KEY_PREVIOUS_B64";
+
+/// Load the previous seal key, given as a file (`--seal-key-previous`) or inline base64
+/// ([`SEAL_KEY_PREVIOUS_B64_ENV`]); neither ⇒ `None`, both ⇒ an error, as for the current key.
+pub fn load_previous_seal_key(
+    file: Option<&Path>,
+    b64: Option<&str>,
+) -> Result<Option<StaticSecret>, String> {
+    match (file, b64) {
+        (Some(_), Some(_)) => Err(format!(
+            "--seal-key-previous (or AI_AGENT_SEAL_KEY_PREVIOUS) and {SEAL_KEY_PREVIOUS_B64_ENV} \
+             are both set: give the previous seal key one way"
+        )),
+        (Some(path), None) => {
+            let contents = Zeroizing::new(
+                std::fs::read_to_string(path)
+                    .map_err(|e| format!("--seal-key-previous {}: {e}", path.display()))?,
+            );
+            secret_from(&contents).map(Some).ok_or_else(|| {
+                format!(
+                    "--seal-key-previous {}: expected base64 of a 32-byte X25519 secret",
+                    path.display()
+                )
+            })
+        }
+        (None, Some(b64)) => secret_from(b64).map(Some).ok_or_else(|| {
+            format!("{SEAL_KEY_PREVIOUS_B64_ENV}: expected base64 of a 32-byte X25519 secret")
+        }),
+        (None, None) => Ok(None),
     }
 }
 
@@ -1550,6 +1599,30 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(verifier.keys.len(), 1);
+    }
+
+    #[test]
+    fn previous_seal_key_loads_one_way_only_and_reaches_the_notify_key() {
+        let b64 = STANDARD.encode([0x22; 32]);
+        assert!(load_previous_seal_key(None, None).unwrap().is_none());
+        assert!(load_previous_seal_key(None, Some("nope")).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prev.key");
+        std::fs::write(&path, &b64).unwrap();
+        assert!(load_previous_seal_key(Some(&path), Some(&b64)).is_err());
+        let prev = load_previous_seal_key(Some(&path), None).unwrap().unwrap();
+        assert_eq!(prev.to_bytes(), [0x22; 32]);
+        let v = GrantVerifier::new(HashMap::new(), StaticSecret::from([0x11; 32]))
+            .with_previous_seal(prev);
+        let old = crate::notify_token::NotifyKey::from_secret_bytes(&[0x22; 32]);
+        let job = crate::exec_endpoint::jobs::JobId::parse("0123456789abcdef").unwrap();
+        let scope = crate::exec_endpoint::jobs::JobScope::for_session(Some("t"), "s");
+        let token = old.mint("t", "s", &job);
+        assert_eq!(
+            v.notify_key()
+                .verify(&token, "t", "s", scope.name(), job.as_str()),
+            crate::notify_token::Verdict::Valid
+        );
     }
 
     #[test]

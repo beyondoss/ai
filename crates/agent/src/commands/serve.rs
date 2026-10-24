@@ -112,6 +112,7 @@ fn validate(cmd: Command) -> Result<(ServeTrust, ServeTransport), Box<dyn std::e
         listen_uds,
         grant_key,
         seal_key,
+        seal_key_previous,
         service,
         shard,
         metrics_listen,
@@ -200,9 +201,33 @@ fn validate(cmd: Command) -> Result<(ServeTrust, ServeTransport), Box<dyn std::e
         seal_key.as_deref(),
         seal_b64.as_deref().map(String::as_str),
     )?;
+    let previous_b64 = match std::env::var("AI_AGENT_SEAL_KEY_PREVIOUS_B64") {
+        Ok(v) if !v.is_empty() => Some(zeroize::Zeroizing::new(v)),
+        Ok(_) | Err(std::env::VarError::NotPresent) => None,
+        Err(_) => {
+            return Err(format!(
+                "{}: not valid UTF-8",
+                beyond_ai_agent::grant::SEAL_KEY_PREVIOUS_B64_ENV
+            )
+            .into());
+        }
+    };
+    let previous_seal = beyond_ai_agent::grant::load_previous_seal_key(
+        seal_key_previous.as_deref(),
+        previous_b64.as_deref().map(String::as_str),
+    )?;
+    if previous_seal.is_some() && seal_source.is_none() {
+        return Err("--seal-key-previous needs --seal-key".into());
+    }
     let grant_verifier =
-        beyond_ai_agent::grant::GrantVerifier::from_flags(&grant_key, seal_source)?.map(Arc::new);
+        beyond_ai_agent::grant::GrantVerifier::from_flags(&grant_key, seal_source)?.map(|v| {
+            Arc::new(match previous_seal {
+                Some(previous) => v.with_previous_seal(previous),
+                None => v,
+            })
+        });
     drop(seal_b64);
+    drop(previous_b64);
     // Service mode: validated here, before anything is bound or opened, because every one
     // of these is a way for the replica to reach a tenant (or the reverse). A refusal names
     // the flag, so an operator fixes the deployment rather than discovering at runtime that
