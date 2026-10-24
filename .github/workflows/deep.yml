@@ -15,6 +15,9 @@ on:
         description: "Skip the property and catalog jobs"
         type: boolean
         default: false
+# Least privilege: the jobs only read the repository (artifact upload needs no scope).
+permissions:
+  contents: read
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"

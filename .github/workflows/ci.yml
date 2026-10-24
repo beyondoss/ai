@@ -8,6 +8,10 @@ on:
   # The merge queue tests each PR on top of main and the PRs queued ahead of it, then merges it;
   # the required `Check` has to report on that run too.
   merge_group:
+# Least privilege: every job only reads the repository. Checkout, the caches and artifact upload use
+# the runner's own tokens, not GITHUB_TOKEN scopes. Nothing here comments, pushes or writes checks.
+permissions:
+  contents: read
 # A newer push to the same PR cancels the superseded run — no pile-ups (which is how a single wedged
 # runner blocked everything), faster feedback, fewer wasted runner-minutes.
 concurrency:
