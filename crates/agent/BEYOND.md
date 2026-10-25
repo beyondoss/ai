@@ -60,7 +60,8 @@ there. Clients reach the agent cells through the fleet's own front, which owns t
 and the ring routing in [FLEET.md](FLEET.md). Beyond's edge does neither.
 
 1. **Room key.** Reuse Beyond's existing agent token (`bagt_v1`, `rustlib/agent-token`): Ed25519 by
-   kid, minted by the API, scoped to one sandbox, with the lifetime in decision 2. The edge checks it on
+   kid, minted by the API, scoped to one session (its `aud` is the session handle), with the lifetime in
+   decision 2. The same token opens the session's sandbox and any sandbox that replaces it after a loss. The edge checks it on
    every sandbox path, sandbox health checks included, and `sandbox-exec` checks it again inside the VM.
    The agent cells' own `/livez` and `/readyz` are the fleet's and need no grant. The grant's exec
    headers carry it, and it is the only bearer on the exec path: there is no second per-sandbox exec
@@ -73,15 +74,17 @@ and the ring routing in [FLEET.md](FLEET.md). Beyond's edge does neither.
    VM check means a bug at the edge is not a breach. One bearer per door is less to leak.
 2. **Token lifetimes.** The grant is a ticket to open: valid for 5 minutes, re-minted on resume. The
    tokens inside it expire at the session's end or after 24 h, whichever comes first. Revocation is a
-   per-sandbox token epoch: each `bagt_v1` carries one, and the edge and `sandbox-exec` refuse any token
-   below the sandbox's current epoch. The edge learns the epoch through the key channel it already
-   watches and refuses at once. `sandbox-exec` has no channel: it raises its floor from the tokens it
-   accepts, so the first token of a new epoch retires every older one inside the VM. The edge is
+   per-session token epoch: each `bagt_v1` carries one, and the edge and `sandbox-exec` refuse any token
+   below the session's current epoch. The edge learns the epoch through the key channel it already
+   watches and refuses at once. `sandbox-exec` has no channel: it starts from the epoch sealed into the
+   sandbox when it was created, and raises its floor from the tokens it accepts, so a re-created sandbox
+   refuses revoked tokens on its first request and the first token of a new epoch retires every older one
+   inside the VM. The edge is
    therefore where revocation takes effect immediately, and the VM check closes the gap at the next
-   newer token. Ending a session bumps the epoch. Both only ever raise a sandbox's epoch and never
+   newer token. Ending a session bumps the epoch. Both only ever raise an epoch and never
    accept a lower one, so nothing that can write the key channel can bring a revoked token back.
    _Why:_ a leaked grant is useless within minutes; a leaked token is useless once the session is gone.
-   An epoch is one number per sandbox, takes effect at once, and needs no denylist. 5 minutes covers
+   An epoch is one number per session, takes effect at once, and needs no denylist. 5 minutes covers
    clock skew and the open; the grant has no leeway.
 3. **`bmc_v1`.** It expires with the same 24 h ceiling, which is never shorter than the grant that
    carries it. It is revoked at the broker: every call checks the session's binding, deleting a session
