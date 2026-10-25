@@ -1,13 +1,40 @@
 # Beyond AI
 
-Beyond's open-source AI stack, a Rust workspace for Linux:
+Beyond's open-source AI stack, a Rust workspace for Linux: a **gateway** between
+your apps and LLM providers, and a **coding agent** that runs a model with file,
+shell and MCP tools as a one-shot CLI, a headless server, or a multi-tenant
+service.
 
-- a **gateway** that sits between apps and LLM providers, authenticates the
-  caller, swaps in the real provider key, and bills every request;
-- a **coding agent** that runs a model with file, shell and MCP tools: as a
-  one-shot CLI, a headless server, or a multi-tenant service;
-- the **libraries** they share, and the **contracts, proofs and demos** that
-  show the pieces hold together.
+**The hard parts of running agents in production (durable sessions, scale,
+security, portability) are built, proven on real infrastructure, and open.**
+
+| The problem you no longer have                  | The answer, in numbers                                                                                                                                                                                                                                                             | Rerun the evidence                                                                                                                               |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Sessions die with their process**             | Kill a replica mid-job and another resumes the session from the shared store; an epoch fence keeps two writers out. On real ECS and EFS no acknowledged write was lost across 142,755 turns through rolling deploys and hard kills, and the network-partition takeover passes too. | [`deploy/efs-proof`](deploy/efs-proof/README.md), `mise run sim:matrix`, [fencing](crates/agent/ARCHITECTURE.md#ownership-the-epoch-fence)       |
+| **Disconnects lose your place**                 | A connection is only a view. Reattach from another device or watch from several; jobs keep running in the sandbox and report back when they end. Over stdio, SSH, WebSocket, HTTP or a Unix socket.                                                                                | [`crates/agent`](crates/agent/README.md#serve), [`exec-notify`](crates/exec-notify/README.md)                                                    |
+| **Scaling is your distributed-systems project** | One 0.5 vCPU, 1 GB Fargate replica held about 2,900 live sessions with 0 failed opens and 520 MB peak anonymous memory (about 170 KB per session). Replicas share a store; routing, failover and sizing are written down.                                                          | [`deploy/demo/load.sh`](deploy/demo/load.sh), [`FLEET.md`](crates/agent/FLEET.md)                                                                |
+| **Security will not sign off**                  | The agent never holds a provider or connector secret. The sandbox cannot open a connection to the session store. Sessions are ciphertext at rest under a per-tenant key, and deleting the key erases them.                                                                         | [`deploy/demo`](deploy/demo/README.md) checks `sandbox-cannot-reach-store` and `sealed-at-rest`, [Sealing](crates/agent/ARCHITECTURE.md#sealing) |
+| **Lock-in**                                     | Any model, with sessions that resume across providers. Any sandbox: Beyond, E2B, SSH, Docker or your own, behind one exec protocol with a conformance kit. The agent runs inside the sandbox or outside it, from one binary.                                                       | [`BEYOND.md`](crates/agent/BEYOND.md), [`providers`](crates/providers/README.md)                                                                 |
+| **LLM egress means a pile of glue**             | Keep your OpenAI or Anthropic SDK and change the base URL. Virtual keys verify in about 28 µs with no lookup, models fail over across providers, and every request writes one priced row at the serving host's cost.                                                               | [`crates/gateway`](crates/gateway/README.md), [`verify/`](verify/README.md)                                                                      |
+| **An agent that is actually good**              | Read, write, edit, shell and background-job tools, an MCP client, skills, memory, compaction, approval gates.                                                                                                                                                                      | [`crates/agent`](crates/agent/README.md#tools)                                                                                                   |
+
+None of this rests on our say-so. The claim registry and defect ledger, the
+fleet simulator, the real-infrastructure runs and the conformance kits are in
+the repo, and you can run them: `mise run verify:status`,
+`mise run sim:matrix`, `deploy/demo/demo.sh`.
+
+## Quick start
+
+```sh
+# the agent, with your own provider key
+ANTHROPIC_API_KEY=sk-ant-... cargo run -p beyond-ai-agent -- run "add a CHANGELOG entry"
+
+# the gateway, in front of any OpenAI client (BYO keys need no config)
+cargo run -p beyond-ai --release &
+curl localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $OPENAI_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-5-mini","messages":[{"role":"user","content":"hi"}]}'
+```
 
 ## Packages
 

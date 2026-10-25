@@ -8,6 +8,17 @@ priced billing row (`ai.usage`) per request.
 It is stateless: no database, no session store. Identity is a signed token it
 verifies without a lookup; revocation and quota arrive as small sets from NATS.
 
+**One base URL change, and the hard parts of LLM egress are done.**
+
+|                                                | The fact                                                                                                                                                                                                               | The proof                                                                                                  |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| **Stateless, so it scales by adding replicas** | No database and no session store. A `bai_v1` virtual key is an Ed25519-signed token verified in about 28 µs with no lookup, and a forged-key flood is rejected in tens of nanoseconds before that cost is paid.        | [Verification cost](ARCHITECTURE.md#core-mechanism), [Benchmarking](ARCHITECTURE.md#benchmarking)          |
+| **Your SDKs, unchanged**                       | OpenAI and Anthropic clients keep working, and a request is translated between Chat Completions, Messages and Responses when the chosen model lives on a different wire.                                               | [Routing](#routing), [`verify/`](../../verify/README.md)                                                   |
+| **Name a model, get failover**                 | `/auto` and managed `/v1` walk a catalog: the gateway picks the provider, fails over, and opens a per-provider circuit breaker after 20 failures in 10 s.                                                              | [Routing](#routing), [Model routing](ARCHITECTURE.md#model-routing-auto-managed-v1-providerscatalog)       |
+| **Every request priced at cost**               | One `ai.usage` row per request, priced pass-through at the serving host's card from rates generated out of the vendors' own pricing sources and re-checked daily. A stream cut short is billed an estimate, flagged.   | [What it records](#what-it-records-and-enforces), [`rates-drift`](../../.github/workflows/rates-drift.yml) |
+| **Keys never reach the app**                   | Apps hold a virtual key; the provider key stays in the gateway and is swapped in per request. Revocation and quota arrive as small sets over NATS.                                                                     | [Two kinds of caller](#two-kinds-of-caller)                                                                |
+| **Checked against real clients**               | Every claim the gateway makes is a registered claim with tests that carry its id, run against real SDKs and providers; every defect found is in a ledger and settled. Rerun it yourself with `mise run verify:status`. | [`verify/`](../../verify/README.md), [Verification](ARCHITECTURE.md#verification)                          |
+
 ## Two kinds of caller
 
 | Key                                          | What the gateway does                                                                                                  |
