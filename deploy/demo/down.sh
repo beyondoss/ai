@@ -181,7 +181,13 @@ if [ -n "$VPC" ]; then
   for sub in $(aws ec2 describe-subnets --filters "$FILTER" --query 'Subnets[].SubnetId' 2>/dev/null); do
     retry 12 aws ec2 delete-subnet --subnet-id "$sub" && echo "deleted $sub"
   done
-  # The two groups reference each other, so a pass can fail on whichever the listing returns first.
+  # The groups reference each other in their rules (agent <-> sandbox, tasks <-> agent), and a group
+  # another still names cannot be deleted: empty every group's ingress rules first.
+  for sg in $(aws ec2 describe-security-groups --filters "$FILTER" --query 'SecurityGroups[].GroupId' 2>/dev/null); do
+    rules=$(command aws --region "$REGION" ec2 describe-security-groups --group-ids "$sg" --output json \
+      --query 'SecurityGroups[0].IpPermissions' 2>/dev/null || echo '[]')
+    [ "$rules" = '[]' ] || quiet aws ec2 revoke-security-group-ingress --group-id "$sg" --ip-permissions "$rules"
+  done
   for _ in 1 2 3; do
     for sg in $(aws ec2 describe-security-groups --filters "$FILTER" --query 'SecurityGroups[].GroupId' 2>/dev/null); do
       quiet aws ec2 delete-security-group --group-id "$sg" && echo "deleted $sg"

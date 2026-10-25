@@ -489,10 +489,10 @@ check_sandbox_cannot_reach_store() {
   fs=$(q efs describe-file-systems --creation-token "$P" --query 'FileSystems[0].FileSystemId')
   ip=$(q efs describe-mount-targets --file-system-id "$fs" --query 'MountTargets[0].IpAddress')
   if [ -z "$ip" ]; then result 0 "no mount target address found"; return; fi
-  out=$(raw_bash "${1:-$SESS_MAIN}" "if timeout 8 nc -w 5 $ip 2049 </dev/null >/dev/null 2>&1; then echo NFS-CONNECT=open; else echo NFS-CONNECT=failed; fi; echo MOUNTS=\$(grep -c ' nfs' /proc/mounts)")
+  out=$(raw_bash "${1:-$SESS_MAIN}" "command -v nc >/dev/null && command -v timeout >/dev/null || echo NO-NC; if timeout 8 nc -w 5 $ip 2049 </dev/null >/dev/null 2>&1; then echo NFS-CONNECT=open; else echo NFS-CONNECT=failed; fi; echo MOUNTS=\$(grep -c ' nfs' /proc/mounts)")
   echo "  from the sandbox: connect to $ip:2049 -> $(sed -n 's/^NFS-CONNECT=//p' <<<"$out" | head -1); nfs mounts in the sandbox: $(sed -n 's/^MOUNTS=//p' <<<"$out" | head -1)"
   tl sandbox nfs_connect_refused '["sandbox","efs"]' "$(jq -nc --arg ip "$ip" '{target:($ip+":2049")}')"
-  if [[ $out == *NFS-CONNECT=failed* && $out == *MOUNTS=0* ]]; then
+  if [[ $out == *NFS-CONNECT=failed* && $out == *MOUNTS=0* && $out != *NO-NC* ]]; then
     result 1 "a TCP connect from the sandbox to the session store's mount target ($ip:2049) failed, and the sandbox mounts no NFS" \
       "$(jq -nc --arg ip "$ip" '{mount_target:$ip, port:2049, connect:"failed", sandbox_nfs_mounts:0}')" \
       '{"label":"sandbox to session store","value":"no route","unit":""}'
