@@ -266,9 +266,11 @@ jobs:
       # spawn a sibling binary bake its absolute path in at compile time (`env!("CARGO_BIN_EXE_…")`),
       # so it has to exist right where the archive job built it. The runs below read the archive's
       # metadata instead of re-extracting it, which keeps the unpack out of the run step's time limit.
+      # `target/tmp` is `CARGO_TARGET_TMPDIR`, baked in the same way: cargo creates it during the
+      # build, the archive carries only files, and rates-sync's `pricing_reference` writes into it.
       - name: unpack tests
         if: matrix.name != 'agent-code-mode'
-        run: tar -I zstd -xf "$RUNNER_TEMP/tests.tar.zst"
+        run: tar -I zstd -xf "$RUNNER_TEMP/tests.tar.zst" && mkdir -p target/tmp
         timeout-minutes: 10
       - name: compile tests
         if: matrix.name == 'agent-code-mode'
@@ -380,7 +382,7 @@ jobs:
           name: tests-archive
           path: ${{ runner.temp }}
       - name: unpack tests
-        run: tar -I zstd -xf "$RUNNER_TEMP/tests.tar.zst"
+        run: tar -I zstd -xf "$RUNNER_TEMP/tests.tar.zst" && mkdir -p target/tmp
         timeout-minutes: 10
       # Same pipe rules as `test`: nextest writes to a file, and the hogs get /dev/null for all
       # three streams, so no grandchild holds GitHub's stdout pipe open past the step.
