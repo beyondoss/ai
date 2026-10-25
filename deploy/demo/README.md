@@ -56,8 +56,7 @@ the demo's throwaway CA has a certificate for `*.sslip.io`, and each VM trusts t
 is open to the world in this mode; it accepts only a callback token the agent's fleet key minted.
 `sslip.io` is a public wildcard DNS service that resolves `1-2-3-4.sslip.io` to `1.2.3.4`.
 
-The E2B VMs have no EFS, so `sealed-at-rest` reads the session's bytes with a one-off Fargate task of
-the agent's image that mounts the same access point. Two more checks join the list in this mode:
+Two more checks join the list in this mode:
 `sandbox-per-session` (each session's commands run in the VM E2B made for it, the ids differ, and a file written in one session's VM is not
 visible in another's) and `sandbox-auth-required` (no bearer or a wrong one: 401).
 
@@ -176,19 +175,20 @@ Their checks are in `usecases.sh`, added the same way as any other (see "Adding 
 
 `demo.sh` runs a list of named checks and prints each as it goes:
 
-| check                   | what it shows                                                                                                                                                               |
-| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `grant-refused`         | a tampered session grant is refused (401) at connect                                                                                                                        |
-| `real-model-turn`       | a real model answers through the gateway; first-token latency, tokens                                                                                                       |
-| `sandbox-exec`          | the model runs `uname -a; ls /` in the sandbox container, not on the agent                                                                                                  |
-| `background-job-notify` | `sleep 20` runs in the background; the sandbox calls the agent back (`job_ended`) and the agent tells the model: the moment is printed, with the callback-to-notice latency |
-| `notify-forged-refused` | a `job_ended` with the right kid and a wrong tag, sent while the session is open, is refused (401) and changes nothing                                                      |
-| `kill-and-recover`      | a 140 s background job starts, the agent task is stopped (ECS SIGKILLs it), ECS replaces it, the same session reattaches from EFS and the job's end is reported             |
-| `sealed-at-rest`        | the phrase you saw does not appear in the session's bytes on EFS; a hex excerpt is recorded                                                                                 |
-| `billing-rows`          | every model call has exactly one `ai.usage` row, complete, and the cost adds up                                                                                             |
-| `teardown-zero`         | filled in by `down.sh`: every resource type counted 0                                                                                                                       |
+| check                        | what it shows                                                                                                                                                               |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `grant-refused`              | a tampered session grant is refused (401) at connect                                                                                                                        |
+| `real-model-turn`            | a real model answers through the gateway; first-token latency, tokens                                                                                                       |
+| `sandbox-exec`               | the model runs `uname -a; ls /` in the sandbox container, not on the agent                                                                                                  |
+| `background-job-notify`      | `sleep 20` runs in the background; the sandbox calls the agent back (`job_ended`) and the agent tells the model: the moment is printed, with the callback-to-notice latency |
+| `notify-forged-refused`      | a `job_ended` with the right kid and a wrong tag, sent while the session is open, is refused (401) and changes nothing                                                      |
+| `kill-and-recover`           | a 140 s background job starts, the agent task is stopped (ECS SIGKILLs it), ECS replaces it, the same session reattaches from EFS and the job's end is reported             |
+| `sandbox-cannot-reach-store` | a TCP connect from inside the sandbox to the EFS mount target's port 2049 fails, and the sandbox mounts no NFS                                                              |
+| `sealed-at-rest`             | the phrase you saw does not appear in the session's bytes on EFS, read from a one-off task with the agent's role and group; a hex excerpt is recorded                       |
+| `billing-rows`               | every model call has exactly one `ai.usage` row, complete, and the cost adds up                                                                                             |
+| `teardown-zero`              | filled in by `down.sh`: every resource type counted 0                                                                                                                       |
 
-`demo.sh` runs the first seven and `billing-rows`; `demo.sh kill` runs `kill-and-recover` and
+`demo.sh` runs the first seven (with `sandbox-cannot-reach-store`) and `billing-rows`; `demo.sh kill` runs `kill-and-recover` and
 `billing-rows`; `demo.sh all` runs everything in one record.
 
 Each run writes `results/<UTC timestamp>/run.json` (the commit, region, model, each check with its
@@ -276,8 +276,18 @@ gateway, no load balancer), plus the model: a full `demo.sh all` spends about on
   hard kill with nothing but `aws ecs stop-task`.
 - **sandbox** task: `beyond-ai-demo exec-stub`, the repo's reference exec endpoint
   (`crates/test-support`), which passes the exec conformance suite, notify included
-  (`crates/demo/tests/stub_conformance.rs`). It mounts the EFS read-only, which is how `sealed-at-rest`
-  reads the bytes.
+  (`crates/demo/tests/stub_conformance.rs`). It runs agent-controlled code, so it has its own security
+  group and no EFS mount: nothing admits it to the session store (see "The session store" below).
+- **the session store**: the EFS file system admits one identity, the agent task's role, through the
+  agent's access point, over TLS. Three layers say so: the mount target's security group admits NFS (2049)
+  from the agent's group alone (the sandbox is in a group of its own, reachable only from the agent's); the
+  volume has `iam: ENABLED`, so the mount helper signs in as the task role; and the file system's policy
+  allows `ClientMount` + `ClientWrite` only to that role, only with that access point, and denies any
+  connection without TLS. A process in the sandbox that spoke NFS by itself (no root needed) would find no
+  route, and if it found one, no identity: encryption keeps session contents secret, not intact, so
+  anything that could reach the store could delete or roll back any tenant's sessions. `sandbox-cannot-reach-store`
+  shows a TCP connect from the sandbox to the mount target failing; `sealed-at-rest` reads the bytes from a
+  one-off task with the agent's definition (role and group) instead of from the sandbox.
 - **oidc** task (`SANDBOX=oidc`): a Keycloak container (`start-dev`, the realm imported from
   `oidc/realm.template.json` through an SSM parameter) and the broker container (`beyond-ai-demo
   oidc-endpoint`, `crates/demo/src/oidc/`) side by side. The broker's managed port is public like the

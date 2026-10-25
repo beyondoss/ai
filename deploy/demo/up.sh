@@ -12,7 +12,9 @@
 #
 #   VPC, one public subnet     tasks get public IPs, so no NAT gateway (it would cost more than the demo)
 #   Cloud Map namespace        gateway/agent/sandbox.<name>.local: names that survive a task being replaced
-#   EFS                        the agent's sessions, sealed per tenant; the sandbox mounts it read-only
+#   EFS                        the agent's sessions, sealed per tenant; only the agent's task role may mount it
+#                              (IAM + a file-system policy), through its access point, over TLS, and only the
+#                              agent's security group reaches the mount target: the sandbox has no route to it
 #   gateway task               the real gateway (crates/gateway) + a NATS sidecar its allowance set needs;
 #                              the ONLY task that references the provider key (SSM -> `secrets`)
 #   agent task                 `serve --service`, grants verified, sessions on EFS, https callback listener
@@ -237,9 +239,12 @@ sg_for() { # name, description -> id
   echo "$id"
 }
 SG_TASKS=$(sg_for "$P-tasks" "beyond-ai-demo tasks")
+SG_AGENT=$(sg_for "$P-agent" "beyond-ai-demo agent replicas")
+SG_SANDBOX=$(sg_for "$P-sandbox" "beyond-ai-demo sandbox")
 SG_EFS=$(sg_for "$P-efs" "beyond-ai-demo efs mount target")
-# Tasks talk to each other freely; the only way in from outside is the agent's websocket port, from
-# the caller's address alone.
+# Three groups. The agent's holds the only identity the session store admits; the sandbox runs
+# agent-controlled code and has no route to the store; every other task (gateway, stand-ins, ...) sits
+# in the third. The only way in from outside is the agent's websocket port, from the caller's address.
 sg_rule() { # group, extra authorize args...; counts only a rule that was new
   local out
   if out=$(command aws --region "$REGION" ec2 authorize-security-group-ingress --group-id "$1" "${@:2}" 2>&1); then
@@ -249,16 +254,22 @@ sg_rule() { # group, extra authorize args...; counts only a rule that was new
     return 1
   fi
 }
-sg_rule "$SG_TASKS" --ip-permissions "IpProtocol=-1,UserIdGroupPairs=[{GroupId=$SG_TASKS}]"
-sg_rule "$SG_EFS" --protocol tcp --port 2049 --source-group "$SG_TASKS"
+sg_rule "$SG_TASKS" --ip-permissions "IpProtocol=-1,UserIdGroupPairs=[{GroupId=$SG_TASKS},{GroupId=$SG_AGENT}]"
+sg_rule "$SG_AGENT" --ip-permissions "IpProtocol=-1,UserIdGroupPairs=[{GroupId=$SG_TASKS}]"
+# The agent calls the sandbox's exec endpoint (and the exec front); the sandbox calls back (job_ended)
+# over TLS and may reach nothing else of ours.
+sg_rule "$SG_SANDBOX" --ip-permissions "IpProtocol=-1,UserIdGroupPairs=[{GroupId=$SG_AGENT}]"
+sg_rule "$SG_AGENT" --protocol tcp --port "$AGENT_TLS_PORT" --source-group "$SG_SANDBOX"
+# The session store admits the agent's group alone.
+sg_rule "$SG_EFS" --protocol tcp --port 2049 --source-group "$SG_AGENT"
 CALLER=${DEMO_ALLOW_CIDR:-}
 if [ -z "$CALLER" ]; then
   CALLER="$(curl -fsS https://checkip.amazonaws.com | tr -d '[:space:]')/32"
 fi
-sg_rule "$SG_TASKS" --protocol tcp --port "$AGENT_PORT" --cidr "$CALLER"
+sg_rule "$SG_AGENT" --protocol tcp --port "$AGENT_PORT" --cidr "$CALLER"
 # E2B's microVMs call back (job_ended) from addresses nobody can list, so the https port is open to
 # the world in that mode: it accepts only a callback token the agent's fleet key minted.
-[ "$USE_E2B" = 0 ] || sg_rule "$SG_TASKS" --protocol tcp --port "$AGENT_TLS_PORT" --cidr 0.0.0.0/0
+[ "$USE_E2B" = 0 ] || sg_rule "$SG_AGENT" --protocol tcp --port "$AGENT_TLS_PORT" --cidr 0.0.0.0/0
 # The stand-in managed-MCP endpoint is a public service, like Beyond's would be: it answers only a
 # request carrying a valid bmc_v1 token. (Public, so the agent's MCP egress policy needs no exception.)
 { [ "$USECASES" = 1 ] || [ "$OIDC" = 1 ]; } && sg_rule "$SG_TASKS" --protocol tcp --port "$STANDIN_PORT" --cidr 0.0.0.0/0
@@ -306,8 +317,9 @@ if [ -z "$MT" ]; then
   MT=$(aws efs create-mount-target --file-system-id "$FS" --subnet-id "$SUBNET" --security-groups "$SG_EFS" --query MountTargetId)
   made "mount target $MT"
 fi
-# The agent runs as uid 10001 (Dockerfile.agent); the access point pins every caller to it, the
-# sandbox included, so what the sandbox reads is what the agent could.
+# A mount target keeps the groups it was made with; say again which one it has.
+aws efs modify-mount-target-security-groups --mount-target-id "$MT" --security-groups "$SG_EFS"
+# The agent runs as uid 10001 (Dockerfile.agent); the access point pins every caller to it.
 AP=$(q efs describe-access-points --file-system-id "$FS" --query 'AccessPoints[0].AccessPointId')
 if [ -z "$AP" ]; then
   AP=$(aws efs create-access-point --file-system-id "$FS" --posix-user Uid=10001,Gid=10001 \
@@ -347,17 +359,34 @@ role agent-exec "fleet-secret tls-key"
 [ "$LOAD" = 0 ] || role loadhost-exec "load-token"
 # The identity provider's realm (its users' passwords) and the broker's keys: this stack's task alone.
 [ "$OIDC" = 0 ] || role oidc-exec "managed-secret broker-master broker-admin oidc-client-secret oidc-realm"
-# ECS Exec on the agent (`demo.sh assistant` and `demo.sh oidc` scan the agent process's memory through
-# it): the task role may open the SSM message channel and nothing else.
+# The agent's task role. It is the one identity the session store admits (the file-system policy below
+# names it), and with ECS Exec on (`demo.sh assistant` and `demo.sh oidc` scan the agent process's memory
+# through it) it may also open the SSM message channel and nothing else.
+if ! aws iam get-role --role-name "$P-agent-task" >/dev/null 2>&1; then
+  aws iam create-role --role-name "$P-agent-task" --assume-role-policy-document "$TRUST" --tags "Key=$TAG_KEY,Value=$NAME" >/dev/null
+  made "role $P-agent-task"
+  sleep 10
+fi
+AGENT_TASK_ROLE="arn:aws:iam::$ACCOUNT:role/$P-agent-task"
+FS_ARN="arn:aws:elasticfilesystem:$REGION:$ACCOUNT:file-system/$FS"
+AP_ARN="arn:aws:elasticfilesystem:$REGION:$ACCOUNT:access-point/$AP"
+aws iam put-role-policy --role-name "$P-agent-task" --policy-name mount-sessions --policy-document \
+  "$(jq -n --arg fs "$FS_ARN" --arg ap "$AP_ARN" '{Version:"2012-10-17",Statement:[{Effect:"Allow",Action:["elasticfilesystem:ClientMount","elasticfilesystem:ClientWrite"],Resource:$fs,Condition:{StringEquals:{"elasticfilesystem:AccessPointArn":$ap}}}]}')"
 if [ "$EXECSCAN" = 1 ]; then
-  if ! aws iam get-role --role-name "$P-agent-task" >/dev/null 2>&1; then
-    aws iam create-role --role-name "$P-agent-task" --assume-role-policy-document "$TRUST" --tags "Key=$TAG_KEY,Value=$NAME" >/dev/null
-    made "role $P-agent-task"
-    sleep 10
-  fi
   aws iam put-role-policy --role-name "$P-agent-task" --policy-name ecs-exec --policy-document \
     '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ssmmessages:CreateControlChannel","ssmmessages:CreateDataChannel","ssmmessages:OpenControlChannel","ssmmessages:OpenDataChannel"],"Resource":"*"}]}'
 fi
+# The session store's own policy: only that role mounts it, only through the access point (so never the
+# file system root), and never without TLS. Anything else, a sandbox that found the mount target
+# included, is refused by EFS itself. (Applied every run: the document is the same, so put is a no-op.)
+aws efs put-file-system-policy --file-system-id "$FS" --policy "$(jq -n --arg role "$AGENT_TASK_ROLE" --arg fs "$FS_ARN" --arg ap "$AP_ARN" '{
+  Version:"2012-10-17",
+  Statement:[
+    {Sid:"AgentMountsThroughItsAccessPoint", Effect:"Allow", Principal:{AWS:$role},
+     Action:["elasticfilesystem:ClientMount","elasticfilesystem:ClientWrite"], Resource:$fs,
+     Condition:{StringEquals:{"elasticfilesystem:AccessPointArn":$ap}}},
+    {Sid:"NeverWithoutTls", Effect:"Deny", Principal:{AWS:"*"}, Action:"*", Resource:$fs,
+     Condition:{Bool:{"aws:SecureTransport":"false"}}}]}')" >/dev/null
 EXEC() { echo "arn:aws:iam::$ACCOUNT:role/$P-$1-exec"; }
 
 # ---------------------------------------------------------------------------------------------
@@ -401,7 +430,7 @@ say "task definitions"
 LOGS() { jq -n --arg g "$LOG_GROUP" --arg r "$REGION" --arg p "$1" \
   '{logDriver:"awslogs",options:{"awslogs-group":$g,"awslogs-region":$r,"awslogs-stream-prefix":$p}}'; }
 EFSVOL=$(jq -n --arg fs "$FS" --arg ap "$AP" \
-  '[{name:"efs",efsVolumeConfiguration:{fileSystemId:$fs,transitEncryption:"ENABLED",authorizationConfig:{accessPointId:$ap,iam:"DISABLED"}}}]')
+  '[{name:"efs",efsVolumeConfiguration:{fileSystemId:$fs,transitEncryption:"ENABLED",authorizationConfig:{accessPointId:$ap,iam:"ENABLED"}}}]')
 
 # Registered only when the definition changed (its hash is a tag on the revision), so a rerun does
 # not mint a new revision.
@@ -454,8 +483,6 @@ if [ "$USE_E2B" = 1 ]; then
 NOTIFY_ORIGIN="https://$(printf %s "$IP" | tr . -).sslip.io:8443"; echo "notify origin: $NOTIFY_ORIGIN"
 '"$AGENT_SCRIPT"
 fi
-AGENT_TASK_ROLE=
-[ "$EXECSCAN" = 0 ] || AGENT_TASK_ROLE="arn:aws:iam::$ACCOUNT:role/$P-agent-task"
 if [ "$LOAD" = 1 ]; then
   # shellcheck source=load-tasks.sh
   . "$HERE/load-tasks.sh"
@@ -463,7 +490,7 @@ else
 TD_AGENT=$(jq -n --arg family "$P-agent" --arg exec "$(EXEC agent)" --arg taskrole "$AGENT_TASK_ROLE" --argjson logs "$(LOGS agent)" \
   --arg img "$ECR/$P-agent:latest" --argjson vol "$EFSVOL" --arg script "$AGENT_SCRIPT" \
   --arg gw "http://gateway.$DNS:$GATEWAY_PORT" --arg model "$MODEL" --arg origin "https://agent.$DNS:$AGENT_TLS_PORT" \
-  --arg grant "$GRANT_KEY_FLAG" --arg cert "$TLS_CERT" --arg seal "$(param_arn fleet-secret)" --arg tlskey "$(param_arn tls-key)" '{
+  --arg execscan "$EXECSCAN" --arg grant "$GRANT_KEY_FLAG" --arg cert "$TLS_CERT" --arg seal "$(param_arn fleet-secret)" --arg tlskey "$(param_arn tls-key)" '{
   family:$family, networkMode:"awsvpc", requiresCompatibilities:["FARGATE"], cpu:"512", memory:"1024",
   executionRoleArn:$exec, volumes:$vol,
   containerDefinitions:[
@@ -473,24 +500,23 @@ TD_AGENT=$(jq -n --arg family "$P-agent" --arg exec "$(EXEC agent)" --arg taskro
      environment:[{name:"HOME",value:"/tmp"},{name:"GATEWAY_URL",value:$gw},{name:"MODEL",value:$model},
        {name:"NOTIFY_ORIGIN",value:$origin},{name:"GRANT_KEY_FLAG",value:$grant},{name:"TLS_CERT",value:$cert}],
      secrets:[{name:"AI_AGENT_SEAL_KEY_B64",valueFrom:$seal},{name:"TLS_KEY",valueFrom:$tlskey}],
-     logConfiguration:$logs}]} + (if $taskrole == "" then {} else {taskRoleArn:$taskrole} end)
+     logConfiguration:$logs}]} + {taskRoleArn:$taskrole}
   # The use cases scan the agent process'"'"'s memory through ECS Exec, which Linux allows a non-parent
   # only with CAP_SYS_PTRACE (Yama scope 1 on Fargate): granted for that, in this mode only.
-  | if $taskrole == "" then . else .containerDefinitions[0].linuxParameters = {capabilities:{add:["SYS_PTRACE"]}} end' | register "$P-agent")
+  | if $execscan == "1" then .containerDefinitions[0].linuxParameters = {capabilities:{add:["SYS_PTRACE"]}} else . end' | register "$P-agent")
 fi
 
 if [ "$USE_FARGATE" = 1 ]; then
 SANDBOX_SCRIPT='printf "%s" "$CA_PEM" > /tmp/ca.pem
 exec /usr/local/bin/beyond-ai-demo exec-stub --listen 0.0.0.0:8081 --root /workspace --home /home/sandbox'
 TD_SANDBOX=$(jq -n --arg family "$P-sandbox" --arg exec "$(EXEC sandbox)" --argjson logs "$(LOGS sandbox)" \
-  --arg img "$ECR/$P-sandbox:latest" --argjson vol "$EFSVOL" --arg script "$SANDBOX_SCRIPT" --arg ca "$CA_PEM" \
+  --arg img "$ECR/$P-sandbox:latest" --arg script "$SANDBOX_SCRIPT" --arg ca "$CA_PEM" \
   --arg usecases "$USECASES" --argjson flogs "$(LOGS front)" --arg fimg "$ECR/$P-front:latest" --arg ek "$(param_arn e2b-key)" --arg name "$NAME" --arg btpl "${BROWSER_TEMPLATE:-}" '{
   family:$family, networkMode:"awsvpc", requiresCompatibilities:["FARGATE"], cpu:"256", memory:(if $usecases == "1" then "1024" else "512" end),
-  executionRoleArn:$exec, volumes:$vol,
+  executionRoleArn:$exec,
   containerDefinitions:[
     {name:"sandbox", image:$img, essential:true, entryPoint:["/bin/sh","-c"], command:[$script],
      portMappings:[{containerPort:8081}],
-     mountPoints:[{sourceVolume:"efs",containerPath:"/mnt/efs",readOnly:true}],
      environment:[{name:"CA_PEM",value:$ca},{name:"SSL_CERT_FILE",value:"/tmp/ca.pem"}],
      logConfiguration:$logs}]}
   # The use cases'"'"' exec front, beside the sandbox: the address a coding session'"'"'s grant names. It
@@ -535,20 +561,21 @@ fi
 
 # ---------------------------------------------------------------------------------------------
 say "services"
-service() { # name, task definition arn, port
-  local name="$P-$1" td=$2 cur
+service() { # name, task definition arn, security group (default: the shared tasks group)
+  local name="$P-$1" td=$2 sg=${3:-$SG_TASKS} cur
   local reg
   reg=$(registry "$1")
   cur=$(q ecs describe-services --cluster "$CLUSTER" --services "$name" --query 'services[?status==`ACTIVE`].taskDefinition|[0]')
   if [ -z "$cur" ]; then
     aws ecs create-service --cluster "$CLUSTER" --service-name "$name" --task-definition "$td" --desired-count 1 \
       --launch-type FARGATE --platform-version LATEST ${EXEC_FLAG:+--enable-execute-command} \
-      --network-configuration "awsvpcConfiguration={subnets=[$SUBNET],securityGroups=[$SG_TASKS],assignPublicIp=ENABLED}" \
+      --network-configuration "awsvpcConfiguration={subnets=[$SUBNET],securityGroups=[$sg],assignPublicIp=ENABLED}" \
       --service-registries "registryArn=$reg" --propagate-tags SERVICE --enable-ecs-managed-tags \
       --tags "key=$TAG_KEY,value=$NAME" >/dev/null
     made "service $name"
   elif [ "$cur" != "$td" ] || [ -n "$IMAGES_CHANGED" ]; then
     aws ecs update-service --cluster "$CLUSTER" --service "$name" --task-definition "$td" --desired-count 1 \
+      --network-configuration "awsvpcConfiguration={subnets=[$SUBNET],securityGroups=[$sg],assignPublicIp=ENABLED}" \
       ${IMAGES_CHANGED:+--force-new-deployment} >/dev/null
     echo "  ~ redeploying $name"
   fi
@@ -558,12 +585,12 @@ service() { # name, task definition arn, port
 [ "$LOAD" = 1 ] || service gateway "$TD_GATEWAY"
 EXEC_FLAG=
 [ "$EXECSCAN" = 0 ] || EXEC_FLAG=1
-service agent "$TD_AGENT"
+service agent "$TD_AGENT" "$SG_AGENT"
 EXEC_FLAG=
 SERVICES=("$P-gateway" "$P-agent")
 [ "$LOAD" = 0 ] || SERVICES=("$P-agent")
 if [ "$USE_FARGATE" = 1 ]; then
-  service sandbox "$TD_SANDBOX"
+  service sandbox "$TD_SANDBOX" "$SG_SANDBOX"
   SERVICES+=("$P-sandbox")
 fi
 if [ "$USECASES" = 1 ]; then
