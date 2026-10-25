@@ -4,6 +4,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use rates_sync::dec::Rate;
 use rates_sync::{GENERATED, SOURCES, diff, repo_root, vendors};
 
 fn snapshot(file: &str) -> String {
@@ -73,6 +74,19 @@ fn readers_fail_loudly_on_layout_changes() {
 
     let o = snapshot("openai/pricing.md");
     assert!(vendors::openai(&o).is_ok());
+    // Both published cache-write lifetimes are read: 30 minutes into `cache_write`, 12 hours into
+    // the extended-write slot, short and long context alike.
+    let sol = vendors::openai(&o)
+        .unwrap()
+        .tier("standard", "gpt-6.1-sol")
+        .unwrap()
+        .unwrap();
+    let usd = |r: Option<Rate>| r.map(|r| r.table_text().unwrap());
+    assert_eq!(usd(sol.short.cache_write).as_deref(), Some("2.5"));
+    assert_eq!(usd(sol.short.cache_write_1h).as_deref(), Some("5"));
+    let long = sol.long.unwrap();
+    assert_eq!(usd(long.cache_write).as_deref(), Some("5"));
+    assert_eq!(usd(long.cache_write_1h).as_deref(), Some("10"));
     assert!(vendors::openai(&o.replace("#### Flex", "#### Flexible")).is_err());
     let dup = o.replace("| gpt-5-mini | $0.25 |", "| gpt-5-nano | $0.25 |");
     assert!(

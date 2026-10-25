@@ -1946,12 +1946,12 @@ in `upstream_peer` → connected in `upstream_request_filter`) is what tells the
 
 **Priced variants and per-call fees** ride on the row next to the token counts:
 
-| Row field                    | Source                                                                                                                                                                |
-| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cache_write_1h_tokens`      | Anthropic `usage.cache_creation.ephemeral_1h_input_tokens`, or every write when the Chat Completions body asked for `1h` only — a subset of `cache_write_tokens` (2×) |
-| `gateway_cache_write_tokens` | Cache writes caused by breakpoints the gateway added: already in `input_tokens`, not in `cache_write_tokens` (priced as the 5-minute writes the vendor bills)         |
-| `server_tool_calls`          | Billable web searches (Anthropic `usage.server_tool_use.web_search_requests`, cumulative on `message_delta`); every kind is in `server_tools`                         |
-| `service_tier`               | `service_tier` as echoed: Chat Completions root, Responses `response`, Anthropic `usage`; absent if not echoed or not `[a-z0-9_-]{1,16}`                              |
+| Row field                    | Source                                                                                                                                                                                                                                                                   |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `cache_write_1h_tokens`      | Anthropic `usage.cache_creation.ephemeral_1h_input_tokens`, or OpenAI Responses `usage.input_tokens_details.cache_write_tokens_details.ttl_12h_tokens`, or every write when the Chat Completions body asked for `1h` only — a subset of `cache_write_tokens` (2× / 2.5×) |
+| `gateway_cache_write_tokens` | Cache writes caused by breakpoints the gateway added: already in `input_tokens`, not in `cache_write_tokens` (priced as the 5-minute writes the vendor bills)                                                                                                            |
+| `server_tool_calls`          | Billable web searches (Anthropic `usage.server_tool_use.web_search_requests`, cumulative on `message_delta`); every kind is in `server_tools`                                                                                                                            |
+| `service_tier`               | `service_tier` as echoed: Chat Completions root, Responses `response`, Anthropic `usage`; absent if not echoed or not `[a-z0-9_-]{1,16}`                                                                                                                                 |
 
 OpenAI reports no hosted-tool call count in `usage`; the gateway counts its hosted-tool items
 instead (see "The `ai.usage` row"). A malformed `service_tier` never fails the usage parse: it reads
@@ -2190,7 +2190,7 @@ and when no provider was called.
 | `output_tokens`              | integer | Output tokens, reasoning included (xAI's reported-beside reasoning is added in, see "Reasoning tokens outside `completion_tokens`").                                                                  |
 | `cache_read_tokens`          | integer | Prompt tokens read from the provider's cache.                                                                                                                                                         |
 | `cache_write_tokens`         | integer | Prompt tokens written to the provider's cache, at the client's request (all TTLs).                                                                                                                    |
-| `cache_write_1h_tokens`      | integer | The 1-hour-TTL share of `cache_write_tokens` (Anthropic). A subset, not additional.                                                                                                                   |
+| `cache_write_1h_tokens`      | integer | The extended-TTL share of `cache_write_tokens`: 1 hour (Anthropic) or 12 hours (OpenAI Responses). A subset, not additional.                                                                          |
 | `gateway_cache_write_tokens` | integer | Cache writes caused by breakpoints the gateway added. Already counted in `input_tokens`, not in `cache_write_tokens`; the vendor bills them as 5-minute writes, and so does the price (pass-through). |
 | `reasoning_tokens`           | Debug   | `Some(n)` when the provider reported a reasoning count (a subset of `output_tokens`), `None` when it did not. Logged as Debug text so `Some(0)` stays distinct.                                       |
 | `usage_wire`                 | string  | `openai` or `anthropic`: which convention `input_tokens` follows.                                                                                                                                     |

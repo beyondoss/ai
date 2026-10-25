@@ -209,8 +209,8 @@ pub struct OpenAi {
     specialized: BTreeMap<&'static str, Table>,
 }
 
-/// Cache writes are published per retention: 30 minutes (the cache write rate this reader
-/// returns) and 12 hours (read for the header check only; the rate table has no 12-hour tier).
+/// Cache writes are published per retention: 30 minutes (the table's default cache write) and
+/// 12 hours (the table's extended write, the slot Anthropic's 1-hour write uses).
 const OA_FLAGSHIP: &[&str] = &[
     "Model",
     "Short context input",
@@ -325,7 +325,7 @@ impl OpenAi {
                     cache_read: opt_dollars(&r[3])?,
                     cache_write: opt_dollars(&r[4])?,
                     output: Some(dollars(&r[2])?),
-                    cache_write_1h: None,
+                    cache_write_1h: opt_dollars(&r[5])?,
                 };
                 let long_cells = [&r[6], &r[7], &r[8], &r[9]];
                 let long = if long_cells.iter().all(|c| opt_dollars(c).ok() == Some(None)) {
@@ -336,7 +336,7 @@ impl OpenAi {
                         cache_read: opt_dollars(&r[8])?,
                         cache_write: opt_dollars(&r[9])?,
                         output: Some(dollars(&r[7])?),
-                        cache_write_1h: None,
+                        cache_write_1h: opt_dollars(&r[10])?,
                     })
                 };
                 Ok(Some(OaTier { short, long }))

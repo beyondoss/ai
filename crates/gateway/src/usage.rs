@@ -55,8 +55,10 @@ pub struct Usage {
     /// that distinction is unrecoverable once the request completes, so absence must not collapse to
     /// zero.
     pub reasoning_tokens: Option<u64>,
-    /// Cache writes at the 1-hour TTL (Anthropic `cache_creation.ephemeral_1h_input_tokens`): a
-    /// subset of `cache_write_tokens`, priced at 2× input where the 5-minute ones are 1.25×.
+    /// Cache writes at the extended TTL: Anthropic `cache_creation.ephemeral_1h_input_tokens`
+    /// (priced at 2× input where the 5-minute ones are 1.25×), or OpenAI Responses
+    /// `cache_write_tokens_details.ttl_12h_tokens` (2.5× where its 30-minute ones are 1.25×). A
+    /// subset of `cache_write_tokens`.
     pub cache_write_1h_tokens: u64,
     /// Cache writes caused by breakpoints the gateway added (the client sent no `cache_control`).
     /// Already folded into `input_tokens` and absent from `cache_write_tokens`. The pricer bills them
@@ -412,6 +414,16 @@ struct OpenAiResponsesInputDetails {
     /// OpenRouter's Claude cache writes, on its Responses mount (see [`OpenAiUsage`]).
     #[serde(default)]
     cache_write_tokens: u64,
+    /// OpenAI's split of `cache_write_tokens` by lifetime (`prompt_cache_options.ttl`).
+    #[serde(default)]
+    cache_write_tokens_details: OpenAiCacheWriteTtls,
+}
+
+/// The two lifetimes OpenAI sells cache writes at; the 12-hour share is the dearer one.
+#[derive(Deserialize, Default)]
+struct OpenAiCacheWriteTtls {
+    #[serde(default)]
+    ttl_12h_tokens: u64,
 }
 
 #[derive(Deserialize, Default)]
@@ -460,6 +472,11 @@ impl Usage {
                 .saturating_add(if reasoning_outside { reasoning } else { 0 }),
             cache_read_tokens: u.input_tokens_details.cached_tokens,
             cache_write_tokens: u.input_tokens_details.cache_write_tokens,
+            // The 12-hour writes ride the extended-write slot, as Anthropic's 1-hour ones do.
+            cache_write_1h_tokens: u
+                .input_tokens_details
+                .cache_write_tokens_details
+                .ttl_12h_tokens,
             reasoning_tokens: u.output_tokens_details.reasoning_tokens,
             wire: Some(Dialect::OpenAi),
             ..Usage::default()
@@ -3257,6 +3274,30 @@ data: [DONE]\n\n";
         let body = br#"{"usage":{"input_tokens":100,"output_tokens":5,"total_tokens":105,"input_tokens_details":{"cached_tokens":10,"cache_write_tokens":40}}}"#;
         let u = openai_body(body).unwrap();
         assert_eq!((u.cache_read_tokens, u.cache_write_tokens), (10, 40));
+    }
+
+    /// OpenAI splits a Responses call's cache writes by lifetime; the 12-hour share is the dearer
+    /// rate, so it lands in the extended-write slot, body and stream alike.
+    /// claim: BIL-8
+    #[test]
+    fn a_responses_usage_reads_12h_cache_writes() {
+        let usage = r#""usage":{"input_tokens":100,"output_tokens":5,"total_tokens":105,"input_tokens_details":{"cached_tokens":10,"cache_write_tokens":40,"cache_write_tokens_details":{"ttl_30m_tokens":30,"ttl_12h_tokens":10}}}"#;
+        let body = format!("{{{usage}}}");
+        let u = openai_body(body.as_bytes()).unwrap();
+        assert_eq!(
+            (u.cache_write_tokens, u.cache_write_1h_tokens),
+            (40, 10),
+            "body"
+        );
+        let sse = format!(
+            "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{{usage}}}}}\n\n"
+        );
+        let u = openai_stream(sse.as_bytes()).unwrap();
+        assert_eq!(
+            (u.cache_write_tokens, u.cache_write_1h_tokens),
+            (40, 10),
+            "stream"
+        );
     }
 
     /// One stray name from the other wire does not reclassify a usage block: a Chat block with an
