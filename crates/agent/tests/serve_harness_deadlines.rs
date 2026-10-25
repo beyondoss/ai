@@ -5,7 +5,7 @@
 //! `common::child_frames`, WebSockets through `common::ws_next_frame`, and `skills_env::Serve`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};

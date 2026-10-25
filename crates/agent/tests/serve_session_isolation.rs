@@ -7,7 +7,7 @@
 //! two live sessions on the same daemon, asserted not to see each other's private state.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::Stdio;
 

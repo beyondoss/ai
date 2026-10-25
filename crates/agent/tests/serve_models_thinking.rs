@@ -1,7 +1,7 @@
 //! `serve` e2e: Model and thinking-level/reasoning-effort selection, cycling, and `--models` scoping.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::Write;
 use std::process::{Command, Stdio};

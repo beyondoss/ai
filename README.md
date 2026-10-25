@@ -249,7 +249,7 @@ run:
 ```sh
 AGENT_CONFORMANCE_EXEC_URL=https://exec.internal/run \
 AGENT_CONFORMANCE_EXEC_HEADER='Authorization: Bearer …' \
-  cargo test -p beyond-ai-agent --test exec_conformance -- --nocapture
+  cargo nextest run -p beyond-ai-agent -E 'test(/^exec_conformance::/)' --no-capture
 ```
 
 The decoding vectors are in `crates/agent/tests/fixtures/exec/v1.2-frames.json`.
@@ -512,7 +512,10 @@ summary, so a green run never silently means a flaky one.
 
 The test binaries are compiled once (a `cargo nextest archive` job) and every shard runs its slice
 of that archive; the exception is `agent-code-mode`, which needs `--features code-mode` and compiles
-only the agent's own dependency graph. The Rust caches are written only by a push to main
+only the agent's own dependency graph. The agent's integration tests are one test binary
+(`crates/agent/tests/it.rs`, a module per `tests/*.rs` file), so the shard filters select by module path.
+Run one file's tests with `cargo nextest run -p beyond-ai-agent -E 'test(/^serve_approval::/)'`; plain
+`cargo test` would put every file in one process, which nextest does not. The Rust caches are written only by a push to main
 (`cache-warm.yml`) and restored by every other run. `gateway-stress` and `build (release)` run in the
 merge queue, not on the pull request; `Check` accepts those two as skipped on a `pull_request` only.
 

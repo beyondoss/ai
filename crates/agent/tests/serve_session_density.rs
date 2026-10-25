@@ -8,11 +8,11 @@
 //!
 //! Run the sweep:
 //! ```text
-//! cargo test -p beyond-ai-agent --test serve_session_density density_sweep -- --ignored --nocapture
+//! cargo nextest run -p beyond-ai-agent -E 'test(/^serve_session_density::density_sweep/)' --run-ignored only --no-capture
 //! ```
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -197,7 +197,7 @@ async fn idle_sessions_do_not_take_a_thread_each() {
 /// the numbers are the measurement, and RSS floors are host-dependent. The thread invariant above
 /// is the regression gate.
 #[tokio::test]
-#[ignore = "density sweep: cargo test -p beyond-ai-agent --test serve_session_density density_sweep -- --ignored --nocapture"]
+#[ignore = "density sweep: cargo nextest run -p beyond-ai-agent -E 'test(/^serve_session_density::density_sweep/)' --run-ignored only --no-capture"]
 async fn density_sweep() {
     let (base, _r) = spawn_model_server(vec![turn_text("unused")]);
     let dir = tempfile::tempdir().unwrap();

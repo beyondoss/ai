@@ -6,7 +6,7 @@
 //! derives: `i32::MAX` ms on a stream, 30 minutes on v1.1.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -5,7 +5,7 @@
 //! In both cases serve answers via `elicit` and the tool completes with the accepted content.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::{BufRead, Write};
 use std::path::Path;

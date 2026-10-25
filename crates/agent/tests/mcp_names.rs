@@ -5,7 +5,7 @@
 //! knows, and that a server name that can't be split back out of `mcp__<server>__<tool>` is refused.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 

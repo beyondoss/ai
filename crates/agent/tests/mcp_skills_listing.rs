@@ -11,7 +11,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use common::skills_env::{Env, Serve, is_response, system_text, turn_bodies};
 use common::{spawn_model_server_routed, turn_text, turn_tool_use};

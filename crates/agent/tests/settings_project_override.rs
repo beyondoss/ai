@@ -1,7 +1,7 @@
 //! `agent settings` must say when a project tier overrides what it just printed.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use common::agent_cmd;
 

@@ -11,7 +11,7 @@
 //! real fixtures; each test takes the 10 s fallback.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

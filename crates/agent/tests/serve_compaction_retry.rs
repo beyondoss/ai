@@ -1,7 +1,7 @@
 //! `serve` e2e: Compaction (manual/proactive) and whole-run auto-retry/backoff.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::{BufRead, Write};
 use std::process::Stdio;

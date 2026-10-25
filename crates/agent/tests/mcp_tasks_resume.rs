@@ -4,8 +4,8 @@
 //! survive `serve` being killed.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
-mod mcp_tasks_env;
+use crate::common;
+use crate::mcp_tasks_env;
 
 use std::io::Write as _;
 use std::process::ChildStdin;

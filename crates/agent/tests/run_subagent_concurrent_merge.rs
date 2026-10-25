@@ -7,7 +7,7 @@
 //! timing-dependent.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::{Command, Stdio};
 

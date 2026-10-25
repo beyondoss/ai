@@ -4,7 +4,7 @@
 //! actually blocked, by having the forbidden command try to create a file and asserting it never appears.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::Stdio;
 

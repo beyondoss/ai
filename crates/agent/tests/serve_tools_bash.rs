@@ -1,7 +1,7 @@
 //! `serve` e2e: Tool registration/exclusion and the host `bash` RPC command.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::{Read, Write};
 use std::process::Stdio;

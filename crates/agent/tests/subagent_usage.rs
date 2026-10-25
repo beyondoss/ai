@@ -3,7 +3,7 @@
 //! `get_session_stats` reported only the parent's own turns — delegated work looked free.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::Write;
 use std::process::Stdio;

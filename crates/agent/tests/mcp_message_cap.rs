@@ -5,7 +5,7 @@
 //! over-cap `events/stream` event. Real `serve`, a real fixture server, a mock model.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::Stdio;
 

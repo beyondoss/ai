@@ -7,7 +7,7 @@
 //! behalf. Both egress clients ignore the environment's proxies; these prove the proxy sees nothing.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -1,7 +1,7 @@
 //! `run` e2e: `--session`/`--continue`/`--name` flag semantics for a one-shot `run`: persistence, resume, naming, validation.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::Stdio;
 

@@ -1,7 +1,7 @@
 //! `serve` e2e: Process/session-file lifecycle: startup defaults, resume/reattach, crash recovery, jsonl framing, HTML export.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};

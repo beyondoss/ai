@@ -2,7 +2,7 @@
 //! outgrown its old length reloads the compacted transcript and its provenance, not a corrupt one.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::Write;
 use std::process::Stdio;

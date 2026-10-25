@@ -5,7 +5,7 @@
 //!
 //! ```sh
 //! AGENT_CONFORMANCE_BUNDLE_HOOK=/path/to/operator-hook \
-//!   cargo test -p beyond-ai-agent --test bundle_conformance -- --nocapture
+//!   cargo nextest run -p beyond-ai-agent -E 'test(/^bundle_conformance::/)' --no-capture
 //! ```
 //!
 //! - `AGENT_CONFORMANCE_BUNDLE_HOOK`: the operator hook, below.

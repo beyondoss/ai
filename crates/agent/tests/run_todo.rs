@@ -3,7 +3,7 @@
 //! validation errors the model is expected to correct, and the `--exclude-tools` opt-out.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use common::{run_cmd, spawn_model_server, turn_text, turn_tool_use};
 use serde_json::{Value, json};

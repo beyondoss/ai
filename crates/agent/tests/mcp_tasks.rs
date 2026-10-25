@@ -1,7 +1,7 @@
 //! SEP-2663 MCP tasks e2e: happy path + edges (in-task elicitation, failed/cancelled, abort→cancel).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::{BufRead, Write};
 use std::path::Path;

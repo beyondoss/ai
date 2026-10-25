@@ -7,7 +7,7 @@
 //! start kept and are polled) and a template transport whose far side lives in its own session.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

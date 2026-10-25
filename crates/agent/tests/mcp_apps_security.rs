@@ -8,7 +8,7 @@
 //! - model-context caps, `mime_types` validation, `ui://`-only views, oversized views, CSP logging.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use common::mcp_apps::{
     app_request, command, daemon, daemon_opts, daemon_with, declare_apps, home_with_fixture,

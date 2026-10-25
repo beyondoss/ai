@@ -3,7 +3,7 @@
 //! `switch_session`/`switch_branch`), not just `run`'s one-shot `run_task` construction.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::Write;
 

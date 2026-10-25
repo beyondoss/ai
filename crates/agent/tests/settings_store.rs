@@ -1,7 +1,7 @@
 //! `agent settings` CLI subcommand and its consumption as a stored default by `run`/`serve`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::{Read, Write};
 use std::process::Stdio;

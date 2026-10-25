@@ -7,7 +7,7 @@
 //! never takes the session down with it when it fails.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::Write;
 

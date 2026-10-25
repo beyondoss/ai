@@ -7,7 +7,7 @@
 //! honest partial result, and the error says the command ran so it is narrowed rather than repeated.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use common::SpawnGuarded as _;
 use std::sync::Arc;

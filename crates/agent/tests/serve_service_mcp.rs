@@ -8,7 +8,7 @@
 //! connector that merely shares its name, or a connector URL reaching something internal.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 

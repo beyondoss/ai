@@ -7,7 +7,7 @@
 //! - view HTML is read once per connection and re-read after `resources/list_changed`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

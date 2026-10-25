@@ -2,7 +2,7 @@
 //! progress frames on the parent's event stream (coalesced, not one frame per child token).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::Write;
 

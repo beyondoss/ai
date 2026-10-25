@@ -4,7 +4,7 @@
 //! server-initiated termination, and what an event does while a run is busy.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::Stdio;
 use std::time::Duration;

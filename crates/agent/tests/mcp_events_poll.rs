@@ -3,7 +3,7 @@
 //! model-visible follow-up, and the "server without the extension" cases.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::Stdio;
 use std::time::Duration;

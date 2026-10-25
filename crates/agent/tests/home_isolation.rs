@@ -14,7 +14,7 @@
 //!   the real `$HOME/.beyond` or `$HOME/.claude`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;

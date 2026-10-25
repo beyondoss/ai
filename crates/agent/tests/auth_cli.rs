@@ -6,8 +6,6 @@
 //! reporting against a hand-seeded `auth.json` fixture.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
-
 fn write_auth_json(home: &std::path::Path, body: &str) {
     let dir = home.join(".beyond");
     std::fs::create_dir_all(&dir).unwrap();

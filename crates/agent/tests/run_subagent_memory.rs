@@ -4,7 +4,7 @@
 //! spawned later sees that write through the shared store's auto-injected index.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;

@@ -10,7 +10,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use common::skills_env::{Env, Serve, bash, is_response, last_message_text, read_skill};
 use common::{spawn_model_server_routed, turn_text};

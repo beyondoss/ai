@@ -1,7 +1,7 @@
 //! `serve` e2e: The session tree: branches, forks, clone, delete, `get_tree`/`get_messages` by id.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::{BufRead, Write};
 use std::process::Stdio;

@@ -6,7 +6,7 @@
 //! `~/.claude/SYSTEM.md`. Each of those is a one-line change that breaks nothing else.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 

@@ -6,7 +6,7 @@
 //! speaking that feature, and pins one piece of the routing.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::{BufRead, Write};
 use std::sync::atomic::Ordering;

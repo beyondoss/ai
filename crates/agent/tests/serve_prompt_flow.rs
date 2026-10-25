@@ -1,7 +1,7 @@
 //! `serve` e2e: The live `prompt`/`steer`/`follow_up` request path: queuing, busy semantics, refusal, abort.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::{BufRead, Write};
 

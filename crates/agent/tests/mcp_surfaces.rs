@@ -1,7 +1,7 @@
 //! MCP resources / prompts / completions e2e — proves the surfaces added beyond tools/list+call.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::Write;
 use std::path::Path;

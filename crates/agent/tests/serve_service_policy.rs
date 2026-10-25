@@ -6,7 +6,7 @@
 //! resolution differs between the two worlds — and require the deny to still land.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use common::service::{Options, Service};
 use common::{

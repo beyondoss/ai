@@ -16,7 +16,7 @@
 //! Rust kernel by `exec_notify`'s differential test); these check the wiring around it.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

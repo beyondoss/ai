@@ -1,7 +1,7 @@
 //! `run` e2e: Skill/prompt-template expansion in a one-shot `run`, trust gating, ad-hoc discovery roots, project instructions.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::Stdio;
 

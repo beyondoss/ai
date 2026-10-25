@@ -6,7 +6,7 @@
 //! ```sh
 //! AGENT_CONFORMANCE_EXEC_URL=https://exec.example/run \
 //! AGENT_CONFORMANCE_EXEC_HEADER='Authorization: Bearer …' \
-//!   cargo test -p beyond-ai-agent --test exec_conformance -- --nocapture
+//!   cargo nextest run -p beyond-ai-agent -E 'test(/^exec_conformance::/)' --no-capture
 //! ```
 //!
 //! It requires v1.2; set `AGENT_CONFORMANCE_ALLOW_V11=1` to accept a v1.1 endpoint (whose streaming
@@ -24,7 +24,7 @@
 //! — otherwise a green run against a real endpoint would mean nothing.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

@@ -6,7 +6,7 @@
 //! and a bad certificate setup stops the daemon before it serves anything.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};

@@ -12,7 +12,7 @@
 //!    the previous tenant's box" is a breach.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use common::{
     SpawnGuarded, read_until_response, serve_dir_cmd, spawn_model_server, turn_text, turn_tool_use,

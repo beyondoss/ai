@@ -4,7 +4,7 @@
 //! a bundle and no exec endpoint is a session with no sandbox at all.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use beyond_ai_test_support::bundle::{BundleServer, Entry, dir, file, sha256_hex, tar};
 use common::grant::Bundle;

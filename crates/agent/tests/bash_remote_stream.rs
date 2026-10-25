@@ -4,7 +4,7 @@
 //! the far side. Over a v1.1 endpoint the call still waits for the exit, and says so.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

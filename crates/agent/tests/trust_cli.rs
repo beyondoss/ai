@@ -3,8 +3,6 @@
 //! indirectly via `serve`'s own trust-gating tests in `serve_trust_prompts.rs`).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
-
 #[test]
 fn trust_status_reports_unknown_for_a_never_mentioned_directory() {
     // Pi-parity audit: `TrustStore::lookup`'s tri-state result was fully built and used internally,

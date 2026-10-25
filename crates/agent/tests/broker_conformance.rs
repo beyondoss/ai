@@ -6,7 +6,7 @@
 //! AGENT_CONFORMANCE_BROKER_URL='https://broker.example/managed/notes/mcp' \
 //! AGENT_CONFORMANCE_BROKER_HOOK=/path/to/operator-hook \
 //! AGENT_CONFORMANCE_BROKER_TOOL=my_notes \
-//!   cargo test -p beyond-ai-agent --test broker_conformance -- --nocapture
+//!   cargo nextest run -p beyond-ai-agent -E 'test(/^broker_conformance::/)' --no-capture
 //! ```
 //!
 //! The module doc of `conformance::broker` lists every variable and the hook's ops. Skipped when the
@@ -16,7 +16,7 @@
 //! each way a broker gets a requirement wrong, by the check's name.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use beyond_ai_agent::conformance::broker::{self, BrokerTarget, verify};
 use beyond_ai_agent::conformance::{CommandHook, Report};

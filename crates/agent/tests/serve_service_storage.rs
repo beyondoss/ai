@@ -7,7 +7,7 @@
 //! carries its shard, because an id is the only address a client ever holds.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use beyond_ai_agent::memory::{MemPath, MemoryBackend, View};
 use common::service::{Service, files_under};

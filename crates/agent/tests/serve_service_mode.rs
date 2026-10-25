@@ -7,7 +7,7 @@
 //! who passes one must find out at startup, not from an audit months later.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::process::{Command, Stdio};

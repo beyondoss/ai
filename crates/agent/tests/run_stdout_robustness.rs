@@ -8,7 +8,7 @@
 //! rather than panicking.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::{BufRead, BufReader, Read as _};
 use std::process::Stdio;

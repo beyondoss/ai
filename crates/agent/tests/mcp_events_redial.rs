@@ -3,7 +3,7 @@
 //! would leave a configured trigger silently dead until `serve` restarts.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::Stdio;
 use std::time::{Duration, Instant};

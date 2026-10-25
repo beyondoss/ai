@@ -6,7 +6,7 @@
 //! now get the same bound (`BEYOND_AI_AGENT_MCP_HANDSHAKE_SECS`, shortened here).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::Stdio;
 use std::time::{Duration, Instant};

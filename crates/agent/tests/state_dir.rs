@@ -5,7 +5,7 @@
 //! its bytes, its mode and its mtime — must be identical afterwards.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;

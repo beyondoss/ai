@@ -6,7 +6,7 @@
 //! reconnecting client re-attaches to the same still-running run.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;

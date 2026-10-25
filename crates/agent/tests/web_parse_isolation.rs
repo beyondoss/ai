@@ -21,8 +21,6 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
-
 use std::io::Write as _;
 use std::process::Stdio;
 

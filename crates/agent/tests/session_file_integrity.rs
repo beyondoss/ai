@@ -252,10 +252,16 @@ fn a_failed_append_leaves_the_file_as_it_was() {
     // ignored, so the over-limit write fails with EFBIG after writing what fits instead of killing
     // the child. Both survive the exec.
     let blocks = fs::metadata(&path).unwrap().len() / 512 + 1;
+    // The child is this binary re-run on one test, whose libtest name carries the module path
+    // (`module_path!()` is `it::<this module>`; the test name has no crate segment).
+    let child = format!(
+        "{}::failed_append_child",
+        module_path!().split_once("::").unwrap().1
+    );
     let out = std::process::Command::new("sh")
         .arg("-c")
         .arg(format!(
-            "ulimit -f {blocks} && trap '' XFSZ && exec \"$0\" --exact failed_append_child --ignored --nocapture"
+            "ulimit -f {blocks} && trap '' XFSZ && exec \"$0\" --exact {child} --ignored --nocapture"
         ))
         .arg(std::env::current_exe().unwrap())
         .env(ROLLBACK_CHILD, &path)

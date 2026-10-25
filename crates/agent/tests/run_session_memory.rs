@@ -5,7 +5,7 @@
 //! file. The compaction-survival + reminder path is proven on the `serve` surface (serve_session_memory).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 

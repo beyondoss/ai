@@ -11,7 +11,7 @@
 //! for real, only the human clicking "Allow" is skipped.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::{BufReader, Write};
 use std::path::Path;

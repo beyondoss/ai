@@ -6,7 +6,7 @@
 //! first boot and never re-listed, and the notification was ignored. Real fixture server throughout.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::time::{Duration, Instant};
 
