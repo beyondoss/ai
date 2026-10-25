@@ -120,19 +120,48 @@ pub(super) fn strip_beyond_headers(req: &mut pingora::http::RequestHeader) {
     remove_headers_where(req, |name| name.starts_with("x-beyond-"));
 }
 
+/// A request or response head: what [`remove_headers_where`] needs of either.
+pub(super) trait HeaderBlock {
+    fn map(&self) -> &http::HeaderMap;
+    fn remove(&mut self, name: &str);
+}
+
+impl HeaderBlock for pingora::http::RequestHeader {
+    fn map(&self) -> &http::HeaderMap {
+        &self.headers
+    }
+    fn remove(&mut self, name: &str) {
+        self.remove_header(name);
+    }
+}
+
+impl HeaderBlock for pingora::http::ResponseHeader {
+    fn map(&self) -> &http::HeaderMap {
+        &self.headers
+    }
+    fn remove(&mut self, name: &str) {
+        self.remove_header(name);
+    }
+}
+
+/// True for a provider rate-limit header: the quota of the key the request rode on. On Beyond's
+/// pool key that is the shared pool's, not the tenant's, so it is not relayed. `retry-after*` and
+/// `x-should-retry` are backoff signals, not quota, and are not matched. `name` is lower-case.
+/// Families: `x-ratelimit-` (OpenAI, xAI and others) and `anthropic-ratelimit-` (Anthropic).
+pub(super) fn is_rate_limit_header(name: &str) -> bool {
+    name.starts_with("x-ratelimit-") || name.starts_with("anthropic-ratelimit-")
+}
+
 /// Remove every header whose (lower-case) name `drop` matches, allocating nothing: names are
 /// copied in batches onto the stack, since the map cannot be borrowed while it is edited. A name
 /// past the stack slot's length (no real header) is cloned instead.
-pub(super) fn remove_headers_where(
-    req: &mut pingora::http::RequestHeader,
-    drop: impl Fn(&str) -> bool,
-) {
+pub(super) fn remove_headers_where(req: &mut impl HeaderBlock, drop: impl Fn(&str) -> bool) {
     const BATCH: usize = 16;
     loop {
         let mut names = ArrayVec::<ArrayString<64>, BATCH>::new();
         let mut long = None;
         let mut more = false;
-        for k in req.headers.keys().map(http::HeaderName::as_str) {
+        for k in req.map().keys().map(http::HeaderName::as_str) {
             if !drop(k) {
                 continue;
             }
@@ -150,10 +179,10 @@ pub(super) fn remove_headers_where(
             }
         }
         for name in &names {
-            req.remove_header(name.as_str());
+            req.remove(name.as_str());
         }
         if let Some(name) = long {
-            req.remove_header(&name);
+            req.remove(name.as_str());
         }
         if !more {
             return;

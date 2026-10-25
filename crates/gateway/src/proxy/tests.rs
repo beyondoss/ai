@@ -418,6 +418,41 @@ fn remove_headers_where_removes_every_match_in_stack_batches() {
     assert!(left.contains(&"content-type") && left.contains(&"accept"));
 }
 
+/// The rate-limit predicate matches the quota families by prefix and nothing that SDKs back off on.
+#[test]
+fn rate_limit_predicate_matches_quota_headers_only() {
+    for yes in [
+        "x-ratelimit-remaining-tokens",
+        "x-ratelimit-limit-requests",
+        "anthropic-ratelimit-requests-remaining",
+        "anthropic-ratelimit-unified-status",
+    ] {
+        assert!(is_rate_limit_header(yes), "{yes}");
+    }
+    for no in [
+        "retry-after",
+        "retry-after-ms",
+        "x-should-retry",
+        "x-request-id",
+        "openai-organization",
+        "anthropic-organization-id",
+        "x-ratelimited",
+        "ratelimit",
+        "ratelimit-remaining",
+        "ratelimited",
+        "content-type",
+    ] {
+        assert!(!is_rate_limit_header(no), "{no}");
+    }
+    let mut resp = pingora::http::ResponseHeader::build(200, None).unwrap();
+    resp.insert_header("x-ratelimit-remaining-tokens", "9")
+        .unwrap();
+    resp.insert_header("retry-after", "3").unwrap();
+    remove_headers_where(&mut resp, is_rate_limit_header);
+    assert!(resp.headers.get("x-ratelimit-remaining-tokens").is_none());
+    assert!(resp.headers.get("retry-after").is_some());
+}
+
 /// Each pool key's echo searcher is built once at boot, for exactly the bare key a provider
 /// would echo: `response_filter` and `Redact` borrow it rather than rebuild it per
 /// response or per chunk.

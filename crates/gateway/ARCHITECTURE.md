@@ -2590,6 +2590,9 @@ The namespace is the gateway's. Any `x-beyond-*` header on the upstream response
 the gateway adds its own, so a provider (or anything between us and it) cannot tell the client who
 served a request or that it was a cache replay.
 
+On a managed response the provider's rate-limit headers (`x-ratelimit-*`, `anthropic-ratelimit-*`) are removed too: they describe Beyond's shared pool key, not the
+tenant's limits. `retry-after*` and `x-should-retry` stay. A BYO response relays all of them.
+
 Cost is deliberately **not** returned. The gateway prices the row in `logging` (see "The price
 (authoritative)"), after the response head has gone and, on a stream, once the final usage is in,
 so no response header could carry it. A per-request cost lookup belongs to the control plane,

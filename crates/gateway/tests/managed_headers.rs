@@ -334,6 +334,59 @@ async fn upstream_x_beyond_headers_never_reach_the_client() {
     }
 }
 
+/// Provider rate-limit headers describe Beyond's shared pool key, so a managed response drops them
+/// while keeping the backoff and tracing headers; a BYO response is the caller's own key and keeps
+/// everything.
+/// claim: SEC-8
+#[tokio::test]
+async fn managed_responses_drop_provider_rate_limit_headers() {
+    let (pubkey, sk) = test_keypair(1);
+    let body = br#"{"id":"chatcmpl-mock","object":"chat.completion","model":"gpt-4o-mini","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+    let reply = {
+        let mut r = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\
+             x-ratelimit-remaining-tokens: 99\r\nanthropic-ratelimit-requests-remaining: 7\r\n\
+             retry-after: 2\r\nx-request-id: req-upstream\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        r.extend_from_slice(body);
+        r
+    };
+    let upstream = ScriptedUpstream::start(move |_, _| vec![Step::Write(reply.clone())]).await;
+    let gw = Gateway::builder(unused_nats_port(), &upstream.authority(), &b64(&pubkey))
+        .providers(&["openai"])
+        .start()
+        .await;
+    for (managed, auth) in [
+        (true, format!("Bearer {}", managed_key(&sk))),
+        (false, "Bearer sk-byo".to_owned()),
+    ] {
+        let resp = test_client()
+            .post(format!("{}/openai/v1/chat/completions", gw.url()))
+            .header("authorization", &auth)
+            .header("content-type", "application/json")
+            .body(CHAT)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let h = resp.headers();
+        assert_eq!(h.get("retry-after").unwrap(), "2");
+        assert_eq!(h.get("x-request-id").unwrap(), "req-upstream");
+        assert_eq!(
+            h.get("x-ratelimit-remaining-tokens").is_some(),
+            !managed,
+            "managed={managed}"
+        );
+        assert_eq!(
+            h.get("anthropic-ratelimit-requests-remaining").is_some(),
+            !managed,
+            "managed={managed}"
+        );
+    }
+}
+
 /// Pool keys over a plaintext upstream are sent in cleartext on every managed request. Legitimate
 /// only against a local mock (as here), so it boots, but loudly.
 /// claim: SEC-22

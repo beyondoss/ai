@@ -1048,15 +1048,12 @@ impl ProxyHttp for AiProxy {
         // `x-beyond-*` is the gateway's namespace. A provider (or anything between us and it)
         // that sent its own `x-beyond-provider` or `x-beyond-cache-status` would otherwise reach
         // the client beside, or instead of, ours. Allocates only when one is present.
-        let spoofed: Vec<http::HeaderName> = upstream_response
-            .headers
-            .keys()
-            .filter(|k| k.as_str().starts_with("x-beyond-"))
-            .cloned()
-            .collect();
-        for name in &spoofed {
-            upstream_response.remove_header(name);
-        }
+        // Managed responses also lose the provider's rate-limit headers: they describe Beyond's
+        // shared pool key, not the tenant's limits. A BYO response keeps them (the caller's own key).
+        let managed = rc.managed();
+        remove_headers_where(upstream_response, |name| {
+            name.starts_with("x-beyond-") || (managed && is_rate_limit_header(name))
+        });
 
         // The pool key never reaches the client. A provider, or anything between us and
         // it, that echoes the credential it was sent would otherwise hand Beyond's key to a
