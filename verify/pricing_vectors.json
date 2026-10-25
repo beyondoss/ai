@@ -1,6 +1,6 @@
 {
   "about": "Golden vectors for the pricing contract (crates/providers/ARCHITECTURE.md, 'Pricing contract'). Each row is an ai.usage row; expect is what price(row) must return. An implementation must reproduce every one exactly. Absent row fields take their defaults: usage_wire anthropic, counts 0, strings null, booleans false, server_tools {}.",
-  "rate_version": "2026-10-25.e8b43883a4c177f2",
+  "rate_version": "2026-10-25.c5346cef7b9dbacc",
   "vectors": [
     {
       "name": "anthropic_basic",
@@ -744,6 +744,31 @@
         "basis": "tokens",
         "cost_micros": 112500,
         "price_micros": 112500,
+        "cost_class": "standard",
+        "price_class": "standard",
+        "cost_long": false,
+        "price_long": false
+      }
+    },
+    {
+      "name": "openai_cache_writes_12h",
+      "why": "A Responses request with prompt_cache_options.ttl 12h is billed 12-hour writes at 2.5x input where 30-minute writes are 1.25x; the 12-hour tokens are a subset of cache_write_tokens.",
+      "row": {
+        "price_model": "gpt-5.6-terra",
+        "provider": "openai",
+        "input_tokens": 50000,
+        "cache_read_tokens": 20000,
+        "cache_write_tokens": 25000,
+        "cache_write_1h_tokens": 10000,
+        "output_tokens": 3000,
+        "usage_wire": "openai",
+        "unix_secs": 1791806400
+      },
+      "expect": {
+        "status": "priced",
+        "basis": "tokens",
+        "cost_micros": 137500,
+        "price_micros": 137500,
         "cost_class": "standard",
         "price_class": "standard",
         "cost_long": false,

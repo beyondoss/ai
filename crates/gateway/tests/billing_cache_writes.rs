@@ -234,3 +234,23 @@ async fn a_1h_request_failed_over_to_openrouter_records_1h_writes() {
         assert_eq!(n(row, "/cache_write_1h_tokens"), Some(want_1h), "{row}");
     }
 }
+
+/// A Responses call on a GPT-5.6 row with `prompt_cache_options.ttl: "12h"`: OpenAI splits the writes
+/// by lifetime in `cache_write_tokens_details`, and the 12-hour share bills at its own, dearer card
+/// rate (2.5x input; the 30-minute writes are 1.25x). 50 000 input = 5 000 uncached at $2, 20 000
+/// read at $0.20, 15 000 30-minute writes at $2.50 and 10 000 12-hour writes at $5, plus 3 000
+/// output at $12: 10 000 + 4 000 + 37 500 + 50 000 + 36 000 = 137 500 micro-dollars.
+/// claim: BIL-8
+#[tokio::test]
+async fn a_12h_responses_cache_write_bills_at_the_12h_rate() {
+    const OPENAI_12H: &str = r#"{"id":"resp_1","object":"response","model":"gpt-5.6-terra","output":[],"usage":{"input_tokens":50000,"input_tokens_details":{"cached_tokens":20000,"cache_write_tokens":25000,"cache_write_tokens_details":{"ttl_30m_tokens":15000,"ttl_12h_tokens":10000}},"output_tokens":3000,"total_tokens":53000}}"#;
+    let up = ScriptedUpstream::reply(200, "application/json", OPENAI_12H.to_owned()).await;
+    let req = r#"{"model":"gpt-5.6-terra","input":"hi","store":false,"prompt_cache_options":{"mode":"implicit","ttl":"12h"}}"#;
+    let (row, _text, _gw) = call(&up, "/v1/responses", req).await;
+    let sent = String::from_utf8(up.bodies()[0].clone()).unwrap();
+    assert!(sent.contains(r#""ttl":"12h""#), "forwarded: {sent}");
+    assert_eq!(n(&row, "/cache_write_tokens"), Some(25_000), "{row}");
+    assert_eq!(n(&row, "/cache_write_1h_tokens"), Some(10_000), "{row}");
+    assert_eq!(n(&row, "/cost_micros"), Some(137_500), "{row}");
+    assert_eq!(n(&row, "/price_micros"), Some(137_500), "{row}");
+}

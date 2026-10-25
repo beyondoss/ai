@@ -445,111 +445,111 @@ const OPENAI_GPT_5_5_PRO: Card = Card {
 
 /// `openai:gpt-5.6-luna`.
 const OPENAI_GPT_5_6_LUNA: Card = Card {
-    long: Some(tr("0.4", "1.8", "0.04", "0.5", None)),
-    fast: Some(tr("0.4", "2.4", "0.04", "0.5", None)),
-    fast_long: Some(tr("0.8", "3.6", "0.08", "1", None)),
-    flex: Some(tr("0.1", "0.6", "0.01", "0.125", None)),
-    flex_long: Some(tr("0.2", "0.9", "0.02", "0.25", None)),
+    long: Some(tr("0.4", "1.8", "0.04", "0.5", Some("1"))),
+    fast: Some(tr("0.4", "2.4", "0.04", "0.5", Some("1"))),
+    fast_long: Some(tr("0.8", "3.6", "0.08", "1", Some("2"))),
+    flex: Some(tr("0.1", "0.6", "0.01", "0.125", Some("0.25"))),
+    flex_long: Some(tr("0.2", "0.9", "0.02", "0.25", Some("0.5"))),
     long_context: Some(LongContext {
         threshold: 272000,
         inclusive: false,
     }),
     tools: OPENAI_TOOLS,
-    ..Card::new(tr("0.2", "1.2", "0.02", "0.25", None))
+    ..Card::new(tr("0.2", "1.2", "0.02", "0.25", Some("0.5")))
 };
 
 /// `openai:gpt-5.6-sol`.
 const OPENAI_GPT_5_6_SOL: Card = Card {
-    long: Some(tr("8", "30", "0.8", "10", None)),
-    fast: Some(tr("8", "40", "0.8", "10", None)),
-    fast_long: Some(tr("16", "60", "1.6", "20", None)),
-    flex: Some(tr("2", "10", "0.2", "2.5", None)),
-    flex_long: Some(tr("4", "15", "0.4", "5", None)),
+    long: Some(tr("8", "30", "0.8", "10", Some("20"))),
+    fast: Some(tr("8", "40", "0.8", "10", Some("20"))),
+    fast_long: Some(tr("16", "60", "1.6", "20", Some("40"))),
+    flex: Some(tr("2", "10", "0.2", "2.5", Some("5"))),
+    flex_long: Some(tr("4", "15", "0.4", "5", Some("10"))),
     long_context: Some(LongContext {
         threshold: 272000,
         inclusive: false,
     }),
     tools: OPENAI_TOOLS,
-    ..Card::new(tr("4", "20", "0.4", "5", None))
+    ..Card::new(tr("4", "20", "0.4", "5", Some("10")))
 };
 
 /// `openai:gpt-5.6-terra`.
 const OPENAI_GPT_5_6_TERRA: Card = Card {
-    long: Some(tr("4", "18", "0.4", "5", None)),
-    fast: Some(tr("4", "24", "0.4", "5", None)),
-    fast_long: Some(tr("8", "36", "0.8", "10", None)),
-    flex: Some(tr("1", "6", "0.1", "1.25", None)),
-    flex_long: Some(tr("2", "9", "0.2", "2.5", None)),
+    long: Some(tr("4", "18", "0.4", "5", Some("10"))),
+    fast: Some(tr("4", "24", "0.4", "5", Some("10"))),
+    fast_long: Some(tr("8", "36", "0.8", "10", Some("20"))),
+    flex: Some(tr("1", "6", "0.1", "1.25", Some("2.5"))),
+    flex_long: Some(tr("2", "9", "0.2", "2.5", Some("5"))),
     long_context: Some(LongContext {
         threshold: 272000,
         inclusive: false,
     }),
     tools: OPENAI_TOOLS,
-    ..Card::new(tr("2", "12", "0.2", "2.5", None))
+    ..Card::new(tr("2", "12", "0.2", "2.5", Some("5")))
 };
 
 /// `openai:gpt-6-astra`.
 const OPENAI_GPT_6_ASTRA: Card = Card {
-    long: Some(tr("20", "75", "2", "25", None)),
-    fast: Some(tr("20", "100", "2", "25", None)),
-    fast_long: Some(tr("40", "150", "4", "50", None)),
-    ultrafast: Some(tr("60", "300", "6", "75", None)),
-    ultrafast_long: Some(tr("120", "450", "12", "150", None)),
-    flex: Some(tr("5", "25", "0.5", "6.25", None)),
-    flex_long: Some(tr("10", "37.5", "1", "12.5", None)),
+    long: Some(tr("20", "75", "2", "25", Some("50"))),
+    fast: Some(tr("20", "100", "2", "25", Some("50"))),
+    fast_long: Some(tr("40", "150", "4", "50", Some("100"))),
+    ultrafast: Some(tr("60", "300", "6", "75", Some("150"))),
+    ultrafast_long: Some(tr("120", "450", "12", "150", Some("300"))),
+    flex: Some(tr("5", "25", "0.5", "6.25", Some("12.5"))),
+    flex_long: Some(tr("10", "37.5", "1", "12.5", Some("25"))),
     long_context: Some(LongContext {
         threshold: 272000,
         inclusive: false,
     }),
     tools: OPENAI_TOOLS,
-    ..Card::new(tr("10", "50", "1", "12.5", None))
+    ..Card::new(tr("10", "50", "1", "12.5", Some("25")))
 };
 
 /// `openai:gpt-6-luna`.
 const OPENAI_GPT_6_LUNA: Card = Card {
-    long: Some(tr("0.2", "0.75", "0.02", "0.25", None)),
-    fast: Some(tr("0.2", "1", "0.02", "0.25", None)),
-    fast_long: Some(tr("0.4", "1.5", "0.04", "0.5", None)),
-    flex: Some(tr("0.05", "0.25", "0.005", "0.0625", None)),
-    flex_long: Some(tr("0.1", "0.375", "0.01", "0.125", None)),
+    long: Some(tr("0.2", "0.75", "0.02", "0.25", Some("0.5"))),
+    fast: Some(tr("0.2", "1", "0.02", "0.25", Some("0.5"))),
+    fast_long: Some(tr("0.4", "1.5", "0.04", "0.5", Some("1"))),
+    flex: Some(tr("0.05", "0.25", "0.005", "0.0625", Some("0.125"))),
+    flex_long: Some(tr("0.1", "0.375", "0.01", "0.125", Some("0.25"))),
     long_context: Some(LongContext {
         threshold: 272000,
         inclusive: false,
     }),
     tools: OPENAI_TOOLS,
-    ..Card::new(tr("0.1", "0.5", "0.01", "0.125", None))
+    ..Card::new(tr("0.1", "0.5", "0.01", "0.125", Some("0.25")))
 };
 
 /// `openai:gpt-6-sol`.
 const OPENAI_GPT_6_SOL: Card = Card {
-    long: Some(tr("4", "15", "0.4", "5", None)),
-    fast: Some(tr("4", "20", "0.4", "5", None)),
-    fast_long: Some(tr("8", "30", "0.8", "10", None)),
-    flex: Some(tr("1", "5", "0.1", "1.25", None)),
-    flex_long: Some(tr("2", "7.5", "0.2", "2.5", None)),
+    long: Some(tr("4", "15", "0.4", "5", Some("10"))),
+    fast: Some(tr("4", "20", "0.4", "5", Some("10"))),
+    fast_long: Some(tr("8", "30", "0.8", "10", Some("20"))),
+    flex: Some(tr("1", "5", "0.1", "1.25", Some("2.5"))),
+    flex_long: Some(tr("2", "7.5", "0.2", "2.5", Some("5"))),
     long_context: Some(LongContext {
         threshold: 272000,
         inclusive: false,
     }),
     tools: OPENAI_TOOLS,
-    ..Card::new(tr("2", "10", "0.2", "2.5", None))
+    ..Card::new(tr("2", "10", "0.2", "2.5", Some("5")))
 };
 
 /// `openai:gpt-6.1-sol`.
 const OPENAI_GPT_6_1_SOL: Card = Card {
-    long: Some(tr("4", "15", "0.2", "5", None)),
-    fast: Some(tr("4", "20", "0.2", "5", None)),
-    fast_long: Some(tr("8", "30", "0.4", "10", None)),
-    ultrafast: Some(tr("12", "60", "0.6", "15", None)),
-    ultrafast_long: Some(tr("24", "90", "1.2", "30", None)),
-    flex: Some(tr("1", "5", "0.05", "1.25", None)),
-    flex_long: Some(tr("2", "7.5", "0.1", "2.5", None)),
+    long: Some(tr("4", "15", "0.2", "5", Some("10"))),
+    fast: Some(tr("4", "20", "0.2", "5", Some("10"))),
+    fast_long: Some(tr("8", "30", "0.4", "10", Some("20"))),
+    ultrafast: Some(tr("12", "60", "0.6", "15", Some("30"))),
+    ultrafast_long: Some(tr("24", "90", "1.2", "30", Some("60"))),
+    flex: Some(tr("1", "5", "0.05", "1.25", Some("2.5"))),
+    flex_long: Some(tr("2", "7.5", "0.1", "2.5", Some("5"))),
     long_context: Some(LongContext {
         threshold: 272000,
         inclusive: false,
     }),
     tools: OPENAI_TOOLS,
-    ..Card::new(tr("2", "10", "0.1", "2.5", None))
+    ..Card::new(tr("2", "10", "0.1", "2.5", Some("5")))
 };
 
 /// `xai:grok-4.20`.
