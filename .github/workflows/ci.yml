@@ -135,8 +135,15 @@ jobs:
           - name: agent-serve
             filter: package(beyond-ai-agent) and kind(test) and binary(~serve)
             extra: ""
-          - name: core-providers
-            filter: package(beyond-ai-agent-core) or package(beyond-ai-providers) or package(beyond-ai-rates-sync) or package(beyond-ai-exec-notify)
+          # The catch-all: every package the shards above do not own, selected by complement rather
+          # than by name. Every shard compiles the whole workspace, so a crate missing from a
+          # name list looks covered and is run by no one — demo, fleet-sim, test-support and verify
+          # sat in exactly that state. Naming the two packages the other shards carve up means a new
+          # crate lands here by default. The verify `*_live` binaries are in this set but list no
+          # cells without VERIFY_LIVE=1 (they spend real money), so they run zero tests here; they
+          # run under the `verify` tasks, not in PR CI.
+          - name: workspace-rest
+            filter: not (package(beyond-ai) or package(beyond-ai-agent))
             extra: ""
           # The remote-exec path against a **real, isolated target**, not a mock. Every other test of
           # it runs commands on the same machine, which proves the wiring and nothing about a
