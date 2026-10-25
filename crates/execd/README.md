@@ -29,6 +29,7 @@ It passes the agent's conformance verifier, the same one that grades every other
 | `--kept-jobs-survive-idle` | `EXECD_KEPT_JOBS_SURVIVE_IDLE` | advertise v1.4 job-end notify; say so only if this sandbox is not stopped when idle                 |
 | `--max-response-bytes`     | `EXECD_MAX_RESPONSE_BYTES`     | most output one v1.1 answer carries (default 16 MiB); match the agent's `--exec-max-response-bytes` |
 | `--log-level`              | `EXECD_LOG`                    | `error`, `warn`, `info`, `debug` or `trace`                                                         |
+| `--log-format`             | `EXECD_LOG_FORMAT`             | `text` (default) or `json`: one object per line, the event's fields beside `timestamp`              |
 
 `GET /livez` answers 200 without authentication. `SIGTERM` and `SIGINT` kill every running process group and exit.
 

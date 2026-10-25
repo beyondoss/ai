@@ -181,6 +181,15 @@ async fn run_attempt(
                 Ok(s) => (Some(s), None),
                 Err(e) => (None, Some(e)),
             };
+            tracing::info!(
+                kind = "callback",
+                job = %key.1,
+                attempt = n,
+                status,
+                error = error.as_deref(),
+                ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "request"
+            );
             if let Some(o) = &ctx.opts.observer {
                 o.callback(&CallbackAttempt {
                     scope: key.0.clone(),
@@ -194,7 +203,6 @@ async fn run_attempt(
                     error,
                 });
             }
-            tracing::info!(kind = "callback", job = %key.1, attempt = n, status, "request");
             status.map_or(exec_notify::Outcome::Failed, exec_notify::Outcome::Status)
         }
         None => exec_notify::Outcome::Failed,
