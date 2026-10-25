@@ -1312,16 +1312,17 @@ defects = []
 id = "SEC-25"
 priority = "P0"
 group = "Security and isolation"
-text = "Responses state a provider keeps under the pool key is tenant-bound: managed ids are signed for the tenant, and another tenant's, a raw or an altered id is refused before any upstream"
+text = "Responses state a provider keeps under the pool key is tenant-bound: managed ids are signed for the tenant, and another tenant's, a raw or an altered id is refused before any upstream; a managed body naming a stored file, vector store or prompt is refused too, since a managed key can create none"
 layer = "both"
 clients = ["openai-py"]
 touches = [
+  "crates/gateway/src/unpriced.rs",
   "crates/gateway/src/signed_id.rs",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
   "crates/gateway/src/config.rs",
 ]
-defects = ["D230", "D231"]
+defects = ["D230", "D231", "D300"]
 
 # --- Billing integrity -------------------------------------------------------------------------
 [[claim]]

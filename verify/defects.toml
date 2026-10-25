@@ -3073,3 +3073,17 @@ state = "fixed"
 test = "redact_userinfo_hides_credentials_wherever_a_url_is_printed"
 fix = "b996f4ee"
 note = "Fixed with config::redact_userinfo, applied to the URL and to the connect error doctor prints. AiConfig's derived Debug still shows the raw URL; the config is not logged whole."
+
+[[defect]]
+id = "D300"
+severity = "med"
+area = "Security"
+title = "A managed request could name another organization's stored file, vector store or prompt"
+impact = "A managed key sends Beyond's shared provider account key but cannot create files, vector stores or prompts, so any id it names belongs to someone else in that account. A generation body could still carry one: the file_search tool with vector_store_ids, a file_id on an input_file, input_image, Chat Completions file or Messages file-source part, or a Responses prompt id."
+confidence = "high"
+evidence = "Code: unpriced.rs allowed file_search as a metered server tool and read no content part or prompt member."
+claims = ["SEC-25"]
+state = "fixed"
+test = "a_managed_key_cannot_name_a_stored_provider_object"
+fix = "324e75d6"
+note = "Fixed: unpriced::inspect refuses the file_search tool (no longer allowlisted), a non-null file_id on any messages or input content part (on the part, in its file or source object, and inside tool results), and a root prompt object, with a 400 before any upstream and ai_rejections_total{reason=\"unpriced_feature\"}. BYO is unchecked. Also tested: unpriced::tests::a_stored_provider_object_is_refused and inline_content_is_not_a_stored_object."
