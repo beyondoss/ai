@@ -159,3 +159,85 @@ double, and these are the places this crate differs from it on purpose:
 - Job output is a ring of whole chunks, not a `Vec` drained on every read of the pipe.
 - A job's table entry is the claim on its id, taken before the process is spawned, so two starts of one id cannot both run.
 - The orphan reaper, the subreaper, the signal-driven shutdown and the request limit exist only here.
+
+## Performance
+
+execd against the endpoint it replaces, measured by `benches/exec_compare.rs` over HTTP on loopback. **A** is
+`beyond-ai-demo exec-stub` built from `origin/main` at 0b1ac87b, before execd (the reference mock); **B** is `execd` from this
+branch. Both are release builds started with the same flags on fresh root and home directories. The run is 5 rounds; in each,
+A and B run the whole battery back to back, in alternating order (AB, BA, AB, ...), so drift in the load of this shared host
+lands on both. Spreads below are the lowest and highest per-round median (latencies) or the lowest and highest round
+(throughput, CPU). Date 2026-10-25, AMD Ryzen 7 255 (16 threads), Linux 6.12, a host running other work (load average 7 to 9).
+Raw samples are in `benches/results/2026-10-25-sandbox.json` and `benches/results/2026-10-25-host.json`.
+
+To rerun: build the baseline from a checkout of the commit before execd (`cargo build --release -p beyond-ai-demo`), then
+
+```sh
+EXEC_BENCH_A=/path/to/beyond-ai-demo mise run bench:execd:sandbox   # the numbers below, first table
+EXEC_BENCH_A=/path/to/beyond-ai-demo mise run bench:execd           # on the host as it is, second table
+```
+
+`bench:execd:sandbox` runs the same harness in a fresh PID namespace, where `/proc` lists a few processes, as it does in the
+sandbox execd is built for. The baseline answers every request with `Connection: close`, so it cannot hold a kept-alive
+connection; its sequential round trips include a connect on each request, and the "new connection each" row gives execd the
+same.
+
+### Sandbox-like host (few processes in `/proc`)
+
+| metric                                          | N (each side) | A: reference mock         | B: execd                  |
+| ----------------------------------------------- | ------------- | ------------------------- | ------------------------- |
+| v1.1 `true`, sequential p50 / p99 / max         | 2000          | 0.53 / 1.04 / 11.6 ms     | 0.55 / 1.05 / 1.2 ms      |
+| v1.1 `cat` of 4 KiB, sequential p50 / p99 / max | 2000          | 0.63 / 1.23 / 10.5 ms     | 0.64 / 1.19 / 1.7 ms      |
+| v1.1 `true`, new connection each p50 / p99      | 2000          | 0.57 / 1.07 ms            | 0.63 / 1.07 ms            |
+| v1.1 `true`, 16 concurrent p50 / p99 / max      | 3200          | 0.89 / 5.3 / 36 ms        | 2.8 / 53 / 128 ms         |
+| v1.1 `cat` of 4 KiB, 16 concurrent p50 / p99    | 3200          | 1.06 / 2.3 ms             | 2.7 / 56 ms               |
+| time to first frame p50 / p99 / max             | 200           | 2.25 / 2.94 / 13.5 ms     | 0.49 / 1.54 / 1.9 ms      |
+| kill on disconnect, whole group gone p50 / p99  | 50            | 1.20 / 2.13 ms            | 1.12 / 2.16 ms            |
+| stream `/dev/zero`, 1 GiB, decoded MB/s         | 5             | 954 (740 to 1088)         | 1396 (426 to 1409)        |
+| stream random file, 1 GiB, decoded MB/s         | 5             | 958 (809 to 1026)         | 1396 (491 to 1461)        |
+| server CPU per GB, zeros                        | 5             | 2.08 s (1.89 to 2.50)     | 1.29 s (1.29 to 1.77)     |
+| server CPU per GB, random                       | 5             | 1.88 s (1.74 to 2.23)     | 1.14 s (1.09 to 1.66)     |
+| RSS idle after start                            | 2             | 5.9 MiB                   | 5.9 MiB                   |
+| RSS with 100 idle streams (`sleep 30`)          | 2             | 15.3 MiB                  | 11.9 MiB                  |
+| peak RSS, 16 slow readers of 256 MiB streams    | 1             | 9838 MiB (VmHWM 9920 MiB) | 33.5 MiB (VmHWM 33.6 MiB) |
+
+Read this table as follows.
+
+- The sequential v1.1 round trip is a tie: the median differs by 0.02 ms and the per-round medians overlap (A 0.44 to 0.75, B
+  0.52 to 0.68). B's slowest request was 1.2 ms; A's was 11.6 ms.
+- Streaming is faster and cheaper: B moves about 1.4 GB/s against about 1.0 GB/s and spends about 40% less server CPU per GB.
+  The throughput minimums (426 and 491 MB/s) are single rounds that overlapped another session's load on the host; the other
+  four rounds are 1246 to 1461 MB/s.
+- A slow reader shows backpressure: 16 clients reading 256 MiB streams at about 1 MB/s each make A buffer them in memory (9.8
+  GiB at the sample peak) and leave B flat at 33.5 MiB.
+- Concurrent v1.1 is **slower** in B: 2.8 ms against 0.9 ms at the median, and a p99 of 53 ms against 5 ms. One round of B's
+  five was hit by other work on the host (its median was 22.7 ms, the other four 2.5 to 3.2 ms), which is the spread to read
+  the p99 against; it does not explain the 3x at the median. A likely cause is that `proc::spawn` holds the global `OWNED`
+  lock across `fork` and `exec`, so concurrent commands spawn one at a time; this was not isolated by an experiment.
+- Kill on disconnect is a tie at about 1.1 ms (the harness polls every 0.5 ms on a 1 ms timer, so differences under 1 ms are
+  not resolved). The spec allows 10 s.
+
+### What a busy `/proc` costs: the regression
+
+execd's orphan reaper (`proc::reap_once`) scans all of `/proc` on every `SIGCHLD`, holding the `OWNED` lock for the whole
+scan. Every command's exit raises `SIGCHLD`, and the next spawn, and the `Proc` drop of the command that just exited, both take
+that lock, so the scan sits on the critical path of every v1.1 and v1.2 request. The scan costs about 10 us for each process
+visible in `/proc`, so execd's round trip is the baseline's plus that.
+
+| `true` round trip, sequential, p50 / p99 | N (each side) | A: reference mock | B: execd       |
+| ---------------------------------------- | ------------- | ----------------- | -------------- |
+| 2 processes in `/proc`                   | 1000          | 0.51 / 1.04 ms    | 0.55 / 1.07 ms |
+| plus 100 idle `sleep` processes          | 1000          | 0.44 / 1.00 ms    | 1.67 / 4.1 ms  |
+| plus 1000 idle `sleep` processes         | 1000          | 0.45 / 1.03 ms    | 10.2 / 29.5 ms |
+| this host as it is, 2457 processes       | 2000          | 0.54 / 0.98 ms    | 25.5 / 53.3 ms |
+| same, 16 concurrent                      | 3200          | 0.87 / 2.7 ms     | 55 / 106 ms    |
+| same, time to first frame                | 200           | 1.95 / 6.3 ms     | 25.7 / 53.1 ms |
+
+Cause, shown two ways. With the reaper's task disabled, execd's sequential `true` round trip on this host fell from 24.2 ms to
+0.45 ms (same host, 600 requests each, the build reverted afterward), and `strace` shows the response `writev` landing right
+after the reaper's `getdents64` and per-pid `stat` reads of the scan that the request's own `SIGCHLD` started. The baseline
+spawns commands without such a scan and does not move with the process count. A sandbox with tens of processes pays about 0.1
+to 0.5 ms; a build host or a shared machine with thousands pays tens of milliseconds on every command, and the fs tools run
+one command per call. It is not fixed on this branch: a fix is a change to the reaper's locking (take `OWNED` only around the
+check and `waitpid` of an actual zombie child, found without the lock, and let spawns hold it shared), which belongs with the
+rest of execd's process model.
