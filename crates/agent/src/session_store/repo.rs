@@ -603,7 +603,17 @@ impl SessionRepo {
         // message — not `src.meta.title` (the source's whole-file-latest rename, blindly copied here
         // previously) — see `title_at_or_root`'s own doc comment for why that matters once a rename has
         // happened anywhere relative to the fork point.
-        meta.title = src.title_at_or_root(target_id).map(str::to_string);
+        // A copy that ends at the source's own tip (a whole-transcript clone) also takes a rename made
+        // since that tip: it is anchored *at* the tip, so `title_at_or_root`, which describes the
+        // title in effect *while* the target was written, skips it. An earlier fork point still must
+        // not inherit a rename recorded after it.
+        let at_tip =
+            target_id.is_some() && target_id == src.active_ids().last().map(String::as_str);
+        meta.title = at_tip
+            .then(|| src.title_anchored_at(target_id))
+            .flatten()
+            .unwrap_or_else(|| src.title_at_or_root(target_id))
+            .map(str::to_string);
         // Thinking-level analogue of the model/title fixes just above — see
         // `thinking_level_at_or_created`'s own doc comment.
         let thinking_level = src

@@ -827,7 +827,10 @@ The harness layers several capabilities over the bare tools + loop:
   landing at a point that never saw a rename on its own path (or whose most recent rename there
   explicitly cleared the title) simply gets no title at all, matching pi's own
   `createBranchedSession`/`getEntriesToFork`, which only ever copy `session_info` entries physically
-  present on the path being forked. `rewrite_compacted` re-anchors a resolved title onto the new chain's
+  present on the path being forked. The one exception is `SessionRepo::fork` copying through the source's
+  tip (`new_session` archiving a pinned slot clones the whole transcript): a rename anchored at that tip
+  (the usual shape of an auto-generated title) is part of what was copied, so it comes along.
+  `rewrite_compacted` re-anchors a resolved title onto the new chain's
   `None` baseline exactly like it already does for model/thinking-level, so a rename made before a
   compaction remains resolvable by a fork landing after it.
 

@@ -618,6 +618,15 @@ impl SessionStore {
             .and_then(|title| title.as_deref())
     }
 
+    /// The title a rename recorded directly at `anchor` set: `None` when no rename is anchored there,
+    /// `Some(None)` when it cleared the title. For a fork copying through the source's tip, where that rename is
+    /// part of what was copied — see [`SessionRepo::fork`].
+    pub(super) fn title_anchored_at(&self, anchor: Option<&str>) -> Option<Option<&str>> {
+        self.title_changes
+            .get(&anchor.map(str::to_string))
+            .map(Option::as_deref)
+    }
+
     /// The thinking level that was actually active at `target_id` (or, when `None`, at the tree's own
     /// root) — the thinking-level analogue of [`Self::model_at_or_created`], for the same fork-header
     /// use. Mirrors its three-tier fallback exactly (an anchored change reaching `target_id`, then

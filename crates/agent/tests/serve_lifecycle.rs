@@ -731,6 +731,11 @@ fn new_session_on_an_addressed_session_posts_session_archived_and_the_slot_is_na
     assert_eq!(ev["session_id"], sibling.id.as_str(), "{ev:#?}");
     assert_eq!(ev["parent_session_id"], "routed", "{ev:#?}");
     assert_eq!(ev["title"], common::SCRIPTED_SESSION_TITLE, "{ev:#?}");
+    assert_eq!(
+        sibling.title.as_deref(),
+        Some(common::SCRIPTED_SESSION_TITLE),
+        "the archived conversation keeps its title on disk: {sibling:#?}"
+    );
     assert!(ev["ts"].as_u64().is_some_and(|t| t > 0), "{ev:#?}");
     assert!(ev.get("tenant").is_none(), "{ev:#?}");
 
