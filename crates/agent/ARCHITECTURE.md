@@ -2943,7 +2943,32 @@ run finishing and its terminal event — so it is deliberately _not_ gated on th
 `started` and the terminal events rather than latest-wins progress: a consumer that misses it never
 learns the title, because nothing regenerates one. It is a **session** fact rather than a run one,
 which is why it is its own event instead of a field smeared across every terminal event — it becomes
-true exactly once, and the consumer's job is a single upsert.
+true exactly once, and the consumer's job is a single upsert. "Once per session" means once per
+conversation: `new_session` on an addressed (pinned) session blanks the slot while keeping its id, so
+the once-guard is reset there and the slot's next conversation emits `session_named` again for the
+same `session_id`.
+
+`session_archived` is the other session-level event. `new_session` on an addressed session archives
+the outgoing conversation into a sibling session and blanks the slot; the sibling's id appears in no
+other event, so this is how a catalog learns it exists:
+
+```json
+{
+  "type": "session_archived",
+  "session_id": "<sibling id>",
+  "parent_session_id": "<slot id>",
+  "tenant": "<service mode only>",
+  "ts": 1792895528,
+  "title": "<archived conversation's title, if it had one>"
+}
+```
+
+`parent_session_id` is the id the client keeps addressing. There is no `run_id`: `new_session` is a
+command, not a run. Nothing is emitted when the slot was empty (nothing was archived). It rides the
+same delivery path as `started`/terminal/`session_named`: an in-memory queue bounded by
+`DURABLE_CAP` (256; a full queue logs and drops), each event retried `HTTP_RETRIES` (3) times with
+backoff, then logged and dropped. It is best-effort across a crash or a prolonged consumer outage;
+there is no on-disk outbox.
 
 Terminal kind matches that host's client contract:
 

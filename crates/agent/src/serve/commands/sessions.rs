@@ -382,8 +382,22 @@ impl SessionLoop {
             &self.current_model,
             cmd.get("parent_session").and_then(Value::as_str),
         ) {
-            Ok(s) => {
+            Ok((s, archived)) => {
                 self.session = s;
+                // The slot is blank again, so it is eligible for a title of its own: the once-guard
+                // is keyed on the session id, and a pinned session keeps its id across this.
+                self.title_attempted_for = None;
+                if let Some(a) = archived
+                    && self.cfg.lifecycle.enabled()
+                {
+                    crate::lifecycle::archived(
+                        self.cfg.lifecycle.as_ref(),
+                        a.id,
+                        self.persistence.session_id().to_string(),
+                        self.mode.tenant().map(str::to_owned),
+                        a.title,
+                    );
+                }
                 self.repoint_session_memory();
                 self.reset_exec_endpoint().await;
                 self.reset_mcp_enabled();

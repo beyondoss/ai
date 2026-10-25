@@ -291,8 +291,11 @@ answer a catalog query.
 
 The one piece it cannot assemble on its own is the **title** — that is derived from conversation
 content, and nothing outside the replica holds both the transcript and the tenant's key. So the
-agent generates it and announces it on the `session_named` lifecycle event, once per session. See
-ARCHITECTURE.md, "Session titles".
+agent generates it and announces it on the `session_named` lifecycle event, once per conversation (again
+after `new_session` blanks an addressed session). When `new_session` archives a conversation into a
+sibling session, the agent announces it on the `session_archived` lifecycle event (`session_id`,
+`parent_session_id`, `title`), the only place the sibling's id appears. See ARCHITECTURE.md, "Session
+titles" and the lifecycle section.
 
 What the agent keeps is a bounded, recency-ordered listing with substring matching over
 `title`/`id`/`preview`/`cwd` — a picker for a client that already holds a grant, not a catalog.

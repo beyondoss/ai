@@ -204,6 +204,23 @@ pub enum RunEvent {
         ts: u64,
         title: String,
     },
+    /// `new_session` on an addressed session archived the outgoing conversation into a sibling
+    /// session of its own.
+    ///
+    /// The slot's id (`parent_session_id`) is the one the client keeps addressing, so the sibling's
+    /// id appears in no other event: this is the only way a catalog learns it exists. A **session**
+    /// fact like [`Self::SessionNamed`], and like it durable. There is no `run_id`: `new_session` is
+    /// a command, not a run, and nothing here belongs to one. `title` is the archived
+    /// conversation's, absent when it never got one.
+    SessionArchived {
+        session_id: String,
+        parent_session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
+        ts: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
     Progress {
         run_id: String,
         session_id: String,
@@ -278,8 +295,10 @@ pub enum RunEvent {
 }
 
 impl RunEvent {
+    /// The run this event belongs to; empty for [`Self::SessionArchived`], which has none.
     pub fn run_id(&self) -> &str {
         match self {
+            Self::SessionArchived { .. } => "",
             Self::Started { run_id, .. }
             | Self::Progress { run_id, .. }
             | Self::SessionNamed { run_id, .. }
@@ -299,6 +318,24 @@ impl RunEvent {
             Self::Succeeded { .. } | Self::Failed { .. } | Self::Aborted { .. }
         )
     }
+}
+
+/// Announce that `new_session` archived the slot's conversation as `session_id`. Durable, on the
+/// same queue as `started`/terminal/`session_named` ([`HttpLifecycle`]).
+pub fn archived(
+    sink: &dyn RunLifecycle,
+    session_id: String,
+    parent_session_id: String,
+    tenant: Option<String>,
+    title: Option<String>,
+) {
+    sink.emit(RunEvent::SessionArchived {
+        session_id,
+        parent_session_id,
+        tenant,
+        ts: now_ts(),
+        title,
+    });
 }
 
 /// One user-facing run: a `serve` prompt (including whole-run retries) or one CLI `run` invocation.
