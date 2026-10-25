@@ -9,12 +9,23 @@
 ignore = [
   # rustls-webpki 0.102.8: reachable panic in CRL parsing; name-constraint acceptance bugs (URI /
   # wildcard); CRL distribution-point matching; acceptance of distrusted intermediates (0382).
-  # Pulled ONLY by async-nats 0.46 (pinned by beyond-slipstream `^0.46`), used for the
-  # NATS/slipstream control-channel TLS — NOT the client- or provider-facing TLS, which resolve the
-  # patched rustls-webpki 0.103.16. Blast radius is limited to MITM of the deny-set channel, which
-  # is fail-open and carries only deny entries. The distrusted-intermediates bug (0382) only matters
-  # when a CA that root programs have distrusted is still trusted by the NATS server's chain; our
-  # NATS endpoints use operator-chosen roots. Fix path: a beyond-slipstream release on
+  # Pulled ONLY by async-nats 0.46 (pinned by beyond-slipstream `^0.46`). Not exposed, checked in
+  # the async-nats 0.46.0 source: it names webpki 0.102 in two places only. `connector.rs` builds a
+  # `ServerName` (a rustls-pki-types type, no verification), and `tls.rs` calls
+  # `anchor_from_trusted_cert` to parse trust anchors out of certificate files the CALLER passes
+  # (`ConnectOptions::add_root_certificates`). Neither beyond-slipstream nor the gateway passes
+  # any, so that call never runs; the system roots async-nats loads instead (`load_native_certs`)
+  # go to `RootCertStore::add_parsable_certificates` in rustls. The handshake and every chain, CRL
+  # and name check run in tokio-rustls -> rustls 0.23 -> rustls-webpki 0.103.16 (patched), which
+  # is also what the client- and provider-facing TLS use. The 0.102 code with these bugs
+  # (verification, CRLs, name constraints) is linked but not called.
+  #
+  # If that changes (a caller passes root certificates, or async-nats verifies through 0.102), the
+  # exposure is MITM of the NATS connection. That is wider than the deny-set: the same KV bucket
+  # carries the allowance and capture entries and the live signing keys (`signing_key.*`), so a
+  # MITM that is accepted could add a trusted signing key or drop deny entries, as well as stream
+  # tenant traffic. The distrusted-intermediates bug (0382) would matter when a CA the root
+  # programs distrust is still in the system roots. Fix path: a beyond-slipstream release on
   # async-nats >= 0.47 (uses rustls-webpki 0.103+).
   "RUSTSEC-2026-0382",
   "RUSTSEC-2026-0104",
@@ -34,3 +45,9 @@ ignore = [
   "RUSTSEC-2024-0388", # derivative (proc-macro, build time only; via pingora-core 0.9)
   "RUSTSEC-2024-0449", # unsafe-libyaml (via serde_yaml 0.9, used by beyond-ai-agent and pingora-core 0.9)
 ]
+
+# Unsound advisories (a safe API that can cause UB) are not vulnerabilities, so `cargo audit` would
+# only warn about them. Fail on them too; a real exposure assessment goes in `ignore` above.
+[output]
+deny = ["unsound"]
+quiet = false # cargo-audit 0.22.1 requires every [output] field once the table exists

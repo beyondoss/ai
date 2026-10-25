@@ -8,6 +8,10 @@ on:
   # The merge queue tests each PR on top of main and the PRs queued ahead of it, then merges it;
   # the required `Check` has to report on that run too.
   merge_group:
+# Least privilege: every job only reads the repository. Checkout, the caches and artifact upload use
+# the runner's own tokens, not GITHUB_TOKEN scopes. Nothing here comments, pushes or writes checks.
+permissions:
+  contents: read
 # A newer push to the same PR cancels the superseded run — no pile-ups (which is how a single wedged
 # runner blocked everything), faster feedback, fewer wasted runner-minutes.
 concurrency:
@@ -67,7 +71,7 @@ jobs:
       - run: mise check:rs
       # Code Mode is a cargo feature so default/release binaries do not link QuickJS (agent VM
       # density: idle RSS is resident `.text`). The feature-gated paths still have to clippy clean.
-      - run: cargo clippy -p beyond-ai-agent --all-targets --features code-mode -- -D warnings
+      - run: cargo clippy -p beyond-ai-agent --all-targets --features code-mode --locked -- -D warnings
   # Unit + integration tests via nextest: it runs the whole suite in parallel across the runner's
   # cores, and — crucially — its per-test `slow-timeout` (see .config/nextest.toml) TERMINATES and
   # *names* a test that hangs, so a deadlock fails the job in a couple of minutes with the culprit
@@ -201,7 +205,7 @@ jobs:
               sleep 5
             done'
       - name: compile tests
-        run: cargo nextest run --workspace --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}' --no-run
+        run: cargo nextest run --workspace --locked --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}' --no-run
         timeout-minutes: 20
       # The run is a transient system unit (`systemd-run --wait`), not a child of the step. The
       # wedge leaves the test step `in_progress` past the nextest global-timeout, the step timeout and
@@ -231,7 +235,7 @@ jobs:
             -p MemoryMax=8G -p MemorySwapMax=0 -p TasksMax=4096 -p RuntimeMaxSec=11min \
             -p StandardInput=null -p StandardOutput=append:"$LOG" -p StandardError=append:"$LOG" \
             "${env_args[@]}" \
-            "$(command -v cargo)" nextest run --workspace --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}'
+            "$(command -v cargo)" nextest run --workspace --locked --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}'
           status=$?
           echo "--- last 200 lines of the log file ---"
           tail -200 "$LOG"
@@ -296,7 +300,7 @@ jobs:
         with:
           tool: nextest
       - name: compile tests
-        run: cargo nextest run --profile ci -p beyond-ai -E "$STRESS_FILTER" --no-run
+        run: cargo nextest run --locked --profile ci -p beyond-ai -E "$STRESS_FILTER" --no-run
         timeout-minutes: 20
       # Same pipe rules as `test`: nextest writes to a file, and the hogs get /dev/null for all
       # three streams, so no grandchild holds GitHub's stdout pipe open past the step.
@@ -316,7 +320,7 @@ jobs:
             echo "=== run $i/$STRESS_RUNS ===" >> "$LOG"
             start=$SECONDS
             rm -f target/nextest/ci/junit.xml
-            cargo nextest run --color never --profile ci -p beyond-ai -E "$STRESS_FILTER" >> "$LOG" 2>&1 </dev/null
+            cargo nextest run --locked --color never --profile ci -p beyond-ai -E "$STRESS_FILTER" >> "$LOG" 2>&1 </dev/null
             rc=$?
             # Each run overwrites the JUnit report; keep one per run for the flaky report below.
             cp target/nextest/ci/junit.xml "$RUNNER_TEMP/junit-$i.xml" 2>/dev/null
@@ -355,8 +359,12 @@ jobs:
   # Dependency advisories are checked only on a PR that touches dependencies. An advisory is
   # published on its own schedule, so an unrelated PR must never turn red because one landed since
   # main last changed; advisories.yml bumps main's lockfile daily instead. `deps` is true when the
-  # PR changes Cargo.lock, a Cargo.toml, or .cargo/audit.toml. A merge-queue run skips it (the PR
-  # ran it); a dispatched run (a bot PR) compares with main.
+  # change touches what decides the dependency set or what is built from it: Cargo.lock, a
+  # Cargo.toml, .cargo/audit.toml, .cargo/config(.toml), rust-toolchain(.toml) or a Dockerfile. A
+  # merge-queue run compares the queued tree with the queue's base commit rather than always
+  # running: it still catches deps that change only in combination (two queued PRs, a merge that
+  # alters the lock) without turning the queue red, for a PR that touches no dependency, over an
+  # advisory published since main last changed. A dispatched run (a bot PR) compares with main.
   changes:
     name: changes
     runs-on: ubuntu-latest
@@ -370,12 +378,12 @@ jobs:
       - id: diff
         env:
           EVENT: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
           deps=false
-          if [ "$EVENT" = pull_request ] || [ "$EVENT" = workflow_dispatch ]; then
+          if [ "$EVENT" = pull_request ] || [ "$EVENT" = workflow_dispatch ] || [ "$EVENT" = merge_group ]; then
             base=${BASE_SHA:-$(git rev-parse origin/main)}
-            if git diff --name-only "$base"...HEAD | grep -qE '(^|/)Cargo\.toml$|^Cargo\.lock$|^\.cargo/audit\.toml$'; then
+            if git diff --name-only "$base"...HEAD | grep -qE '(^|/)Cargo\.toml$|^Cargo\.lock$|^\.cargo/(audit\.toml|config(\.toml)?)$|(^|/)rust-toolchain(\.toml)?$|(^|/)Dockerfile[^/]*$'; then
               deps=true
             fi
           fi

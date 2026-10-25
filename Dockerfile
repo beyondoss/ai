@@ -44,14 +44,14 @@ COPY --from=planner /app/recipe.json recipe.json
 # no extra apt packages are needed (pure-rustls, no OpenSSL/protobuf).
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo chef cook --release --recipe-path recipe.json
+    cargo chef cook --release --locked --recipe-path recipe.json
 
 # Now copy the full source and build just the gateway member of the workspace.
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    cargo build --release -p beyond-ai --bin beyond-ai \
+    cargo build --release --locked -p beyond-ai --bin beyond-ai \
     && cp /app/target/release/beyond-ai /usr/local/bin/beyond-ai
 
 # ---------------------------------------------------------------------------

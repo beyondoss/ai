@@ -16,7 +16,7 @@ cargo-binstall = "latest"
 run = "cargo build"
 
 [tasks."build:rs:release"]
-run = "cargo build --release"
+run = "cargo build --release --locked"
 
 [tasks."check:release-seams"]
 description = "Fail if a release binary carries a test seam's name (run after build:rs:release)."
@@ -62,7 +62,7 @@ description = "Before/after no-regression gate: build BASE and CAND (commit SHAs
 run = 'python3 crates/agent/eval/longctx/ab.py run --base "${BASE:?set BASE=<sha>}" --cand "${CAND:?set CAND=<sha>}" "$@"'
 
 [tasks."check:rs"]
-run = "cargo clippy --all-targets -- -D warnings"
+run = "cargo clippy --all-targets --locked -- -D warnings"
 
 [tasks."check:fmt"]
 run = "dprint check"

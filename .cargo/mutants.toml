@@ -13,6 +13,13 @@ examine_globs = [
   "crates/gateway/src/translate.rs",
   "crates/gateway/src/circuit_breaker.rs",
   "crates/gateway/src/peek.rs",
+  # The verifier: a surviving mutant here is a forged or wrongly refused key, deny entry or
+  # allowance.
+  "crates/gateway/src/key.rs",
+  "crates/gateway/src/live_keys.rs",
+  "crates/gateway/src/deny.rs",
+  "crates/gateway/src/signed_id.rs",
+  "crates/gateway/src/allowance.rs",
 ]
 # Equivalent mutants, each with the reason at its source.
 exclude_re = [
