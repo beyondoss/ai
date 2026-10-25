@@ -252,7 +252,7 @@ fn rate_version(root: &Path) -> Result<()> {
         }
         std::fs::write(&path, text.replacen(from, to, 1)).map_err(|e| format!("{rel}: {e}"))
     };
-    let decl = |v: &str| format!("pub const RATE_VERSION: &str = \"{v}\";");
+    let decl = |v: &str| format!("pub const RATE_VERSION: &str = {v:?};");
     rewrite("crates/providers/src/rates.rs", &decl(cur), &decl(&v))?;
     let vectors = "verify/pricing_vectors.json";
     let doc: serde_json::Value = serde_json::from_str(
@@ -262,7 +262,7 @@ fn rate_version(root: &Path) -> Result<()> {
     let had = doc["rate_version"]
         .as_str()
         .ok_or_else(|| format!("{vectors}: no rate_version"))?;
-    let field = |v: &str| format!("\"rate_version\": \"{v}\"");
+    let field = |v: &str| format!("\"rate_version\": {}", serde_json::Value::from(v));
     rewrite(vectors, &field(had), &field(&v))?;
     println!("{v}");
     Ok(())
