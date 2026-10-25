@@ -124,18 +124,6 @@
         "provider_name": "SambaNova",
         "quantization": "unknown",
         "tag": "sambanova-turbo"
-      },
-      {
-        "context_length": 131072,
-        "max_prompt_tokens": null,
-        "pricing": {
-          "completion": "0.00000104",
-          "discount": 0,
-          "prompt": "0.00000104"
-        },
-        "provider_name": "Together",
-        "quantization": "unknown",
-        "tag": "together"
       }
     ],
     "id": "meta-llama/llama-3.3-70b-instruct"

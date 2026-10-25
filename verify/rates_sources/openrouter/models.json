@@ -209,6 +209,87 @@
       "pricing": {
         "completion": "0.00000198",
         "input_cache_read": "0.000000022",
+        "overrides": [
+          {
+            "completion": "0.00000198",
+            "input_cache_read": "0.000000022",
+            "prompt": "0.00000066",
+            "utc_days": [
+              "saturday",
+              "sunday"
+            ]
+          },
+          {
+            "completion": "0.00000198",
+            "input_cache_read": "0.000000022",
+            "prompt": "0.00000066",
+            "utc_days": [
+              "monday",
+              "tuesday",
+              "wednesday",
+              "thursday",
+              "friday"
+            ],
+            "utc_end": 100,
+            "utc_start": 0
+          },
+          {
+            "completion": "0.00000396",
+            "input_cache_read": "0.000000044",
+            "prompt": "0.00000132",
+            "utc_days": [
+              "monday",
+              "tuesday",
+              "wednesday",
+              "thursday",
+              "friday"
+            ],
+            "utc_end": 400,
+            "utc_start": 100
+          },
+          {
+            "completion": "0.00000198",
+            "input_cache_read": "0.000000022",
+            "prompt": "0.00000066",
+            "utc_days": [
+              "monday",
+              "tuesday",
+              "wednesday",
+              "thursday",
+              "friday"
+            ],
+            "utc_end": 600,
+            "utc_start": 400
+          },
+          {
+            "completion": "0.00000396",
+            "input_cache_read": "0.000000044",
+            "prompt": "0.00000132",
+            "utc_days": [
+              "monday",
+              "tuesday",
+              "wednesday",
+              "thursday",
+              "friday"
+            ],
+            "utc_end": 1000,
+            "utc_start": 600
+          },
+          {
+            "completion": "0.00000198",
+            "input_cache_read": "0.000000022",
+            "prompt": "0.00000066",
+            "utc_days": [
+              "monday",
+              "tuesday",
+              "wednesday",
+              "thursday",
+              "friday"
+            ],
+            "utc_end": 0,
+            "utc_start": 1000
+          }
+        ],
         "prompt": "0.00000066"
       }
     },
@@ -217,9 +298,9 @@
       "id": "deepseek/deepseek-v4.1-flash",
       "name": "DeepSeek: DeepSeek V4.1 Flash",
       "pricing": {
-        "completion": "0.00000012",
-        "input_cache_read": "0.0000000016",
-        "prompt": "0.000000056"
+        "completion": "0.000001",
+        "input_cache_read": "0.000000015",
+        "prompt": "0.00000002"
       }
     },
     {
@@ -227,9 +308,9 @@
       "id": "google/gemma-4-26b-a4b-it",
       "name": "Google: Gemma 4 26B A4B ",
       "pricing": {
-        "completion": "0.0000003",
-        "input_cache_read": "0.00000005",
-        "prompt": "0.00000009"
+        "completion": "0.000000225",
+        "input_cache_read": "0.0000000375",
+        "prompt": "0.0000000675"
       }
     },
     {
@@ -337,7 +418,7 @@
       "name": "MoonshotAI: Kimi K2.7 Code",
       "pricing": {
         "completion": "0.00000335",
-        "input_cache_read": "0.00000018",
+        "input_cache_read": "0.00000015",
         "prompt": "0.0000006712"
       }
     },
@@ -346,7 +427,7 @@
       "id": "moonshotai/kimi-k3",
       "name": "MoonshotAI: Kimi K3",
       "pricing": {
-        "completion": "0.000011936",
+        "completion": "0.0000108",
         "input_cache_read": "0.00000021",
         "prompt": "0.000000239"
       }
@@ -999,9 +1080,9 @@
       "id": "qwen/qwen3.8-27b",
       "name": "Qwen: Qwen3.8 27B",
       "pricing": {
-        "completion": "0.00000135",
-        "input_cache_read": "0.000000018",
-        "prompt": "0.00000004"
+        "completion": "0.0000025",
+        "input_cache_read": "0.00000009",
+        "prompt": "0.0000002"
       }
     },
     {
@@ -1182,9 +1263,9 @@
       "id": "z-ai/glm-5.1",
       "name": "Z.ai: GLM 5.1",
       "pricing": {
-        "completion": "0.000003036",
-        "input_cache_read": "0.0000001794",
-        "prompt": "0.000000966"
+        "completion": "0.0000044",
+        "input_cache_read": "0.00000026",
+        "prompt": "0.0000014"
       }
     },
     {
@@ -1192,9 +1273,9 @@
       "id": "z-ai/glm-5.2",
       "name": "Z.ai: GLM 5.2",
       "pricing": {
-        "completion": "0.00000242",
-        "input_cache_read": "0.00000014",
-        "prompt": "0.00000062"
+        "completion": "0.000007",
+        "input_cache_read": "0.000000033",
+        "prompt": "0.0000000341"
       }
     },
     {
@@ -1212,9 +1293,9 @@
       "id": "z-ai/glm-5.3-flash",
       "name": "Z.ai: GLM 5.3 Flash",
       "pricing": {
-        "completion": "0.00000016",
-        "input_cache_read": "0.000000006",
-        "prompt": "0.000000047076"
+        "completion": "0.0000005",
+        "input_cache_read": "0.00000003",
+        "prompt": "0.00000015"
       }
     }
   ]

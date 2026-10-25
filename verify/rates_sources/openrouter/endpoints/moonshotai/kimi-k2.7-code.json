@@ -59,7 +59,7 @@
         "pricing": {
           "completion": "0.00000335",
           "discount": 0,
-          "input_cache_read": "0.00000018",
+          "input_cache_read": "0.00000015",
           "prompt": "0.0000006712"
         },
         "provider_name": "Inceptron",
@@ -98,6 +98,7 @@
         "pricing": {
           "completion": "0.000004",
           "discount": 0,
+          "input_cache_read": "0.00000015",
           "prompt": "0.00000095"
         },
         "provider_name": "Nebius",
@@ -116,19 +117,6 @@
         "provider_name": "Novita",
         "quantization": "int4",
         "tag": "novita/int4"
-      },
-      {
-        "context_length": 262144,
-        "max_prompt_tokens": null,
-        "pricing": {
-          "completion": "0.000004",
-          "discount": 0,
-          "input_cache_read": "0.00000019",
-          "prompt": "0.00000095"
-        },
-        "provider_name": "Phala",
-        "quantization": "unknown",
-        "tag": "phala"
       },
       {
         "context_length": 262144,

@@ -10,31 +10,29 @@ Serverless models are the fastest way to run inference on Together. You call any
 
 ## Models
 
-If you're not sure which model to use, see [Recommended models](/docs/inference/recommended-models) for our picks by use case.
+If you're not sure which model to use, see [Recommended models](https://docs.together.ai/docs/inference/recommended-models.md) for our picks by use case.
 
-<Columns cols={4}>
-  <Card title="Chat" icon="message-circle" horizontal href="#chat-models" />
+> **[Chat](#chat-models)**
 
-  <Card title="Image" icon="photo" horizontal href="#image-models" />
+> **[Image](#image-models)**
 
-  <Card title="Vision" icon="eye" horizontal href="#vision-models" />
+> **[Vision](#vision-models)**
 
-  <Card title="Video" icon="video" horizontal href="#video-models" />
+> **[Video](#video-models)**
 
-  <Card title="Audio" icon="volume" horizontal href="#audio-models" />
+> **[Audio](#audio-models)**
 
-  <Card title="Embedding" icon="vector-bezier-2" horizontal href="#embedding-models" />
+> **[Embedding](#embedding-models)**
 
-  <Card title="Rerank" icon="arrows-sort" horizontal href="#rerank-models" />
+> **[Rerank](#rerank-models)**
 
-  <Card title="Moderation" icon="shield-check" horizontal href="#moderation-models" />
-</Columns>
+> **[Moderation](#moderation-models)**
 
-<Note>
-  Serverless and dedicated model inference support different sets of models. See the [dedicated model inference catalog](/docs/dedicated-endpoints/models) for details.
-</Note>
+> [!NOTE]
+>
+> Serverless and dedicated model inference support different sets of models. See the [dedicated model inference catalog](https://docs.together.ai/docs/dedicated-endpoints/models.md) for details.
 
-For rate limits and pricing, see the [Serverless overview](/docs/serverless/overview).
+For rate limits and pricing, see the [Serverless overview](https://docs.together.ai/docs/serverless/overview.md).
 
 ## Chat models
 
@@ -46,6 +44,7 @@ For rate limits and pricing, see the [Serverless overview](/docs/serverless/over
 | Meta | Muse Glimmer 30B | meta-models/Muse-Glimmer-30B | 131072 | \$0.35 | \$0.04 | \$1.50 | FP8 | Yes | Yes |
 | Meta | Muse Spark Open 816B A42B | meta-models/Muse-Spark-Open-816B-A42B | 1048576 | \$1.25 | \$0.15 | \$4.25 | NVFP4 | Yes | Yes |
 | Minimax | Minimax M3 | MiniMaxAI/MiniMax-M3 | 524288 | \$0.30 | \$0.06 | \$1.20 | FP4 | Yes | Yes |
+| Minimax | Minimax M3.1 Flash | MiniMaxAI/MiniMax-M3.1-Flash | 1048576 | \$0.15 | \$0.015 | \$0.60 | NVFP4 | Yes | Yes |
 | Moonshot | Kimi K3 | moonshotai/Kimi-K3 | 1048576 | \$3.00 | \$0.30 | \$15.00 | - | Yes | Yes |
 | NVIDIA | NVIDIA Nemotron 3.5 Super VL | nvidia/NVIDIA-Nemotron-3.5-Super-VL | 262144 | \$0.15 | \$0.02 | \$0.50 | NVFP4 | Yes | Yes |
 | OpenAI | GPT-OSS 120B | openai/gpt-oss-120b | 131072 | \$0.15 | - | \$0.60 | MXFP4 | Yes | Yes |
@@ -70,42 +69,68 @@ For rate limits and pricing, see the [Serverless overview](/docs/serverless/over
 * [Fine-tuning chat models notebook](https://github.com/togethercomputer/together-cookbook/blob/main/fine-tuning/Finetuning_Guide.ipynb): Tune language models for conversation.
 * [Building agents](https://github.com/togethercomputer/together-cookbook/tree/main/agents): Agent workflows with language models.
 
+## US-only inference
+
+[Geo-specific inference](https://docs.together.ai/docs/serverless/geo-specific-inference.md) keeps inference processing in the United States for requests sent to `us-api.together.ai`. These requests cost 25% more than the standard rates in the [chat models](#chat-models) table. All prices are in USD per 1M tokens.
+
+| Model | Input | Cached input | Output |
+| :- | -: | -: | -: |
+| Kimi K3 (US-only) | \$3.75 | \$0.375 | \$18.75 |
+| GLM-5.3 (US-only) | \$1.75 | \$0.325 | \$5.50 |
+| GLM-5.2 (US-only) | \$1.75 | \$0.325 | \$5.50 |
+| DeepSeek V4.1 Flash (US-only) | \$0.375 | \$0.0075 | \$1.50 |
+| DeepSeek V4.1 Flash 1017 (US-only) | \$0.375 | \$0.0075 | \$1.50 |
+| DeepSeek V4 Pro 0813 (US-only) | \$1.65 | \$0.1625 | \$4.95 |
+| MiniMax M3 (US-only) | \$0.375 | \$0.075 | \$1.50 |
+
+## Canada-only inference
+
+[Geo-specific inference](https://docs.together.ai/docs/serverless/geo-specific-inference.md) keeps inference processing in Canada for requests sent to `ca-api.together.ai`. These requests cost 1.25× standard serverless rates (a 25% premium) for input, cached input, and output tokens. All prices are in USD per 1M tokens.
+
+| Model | Input | Cached input | Output |
+| :- | -: | -: | -: |
+| GLM-5.3 (Canada-only) | \$1.75 | \$0.325 | \$5.50 |
+| GLM-5.3 Flash (Canada-only) | \$0.1875 | \$0.0375 | \$0.625 |
+| GLM-5.2 (Canada-only) | \$1.75 | \$0.325 | \$5.50 |
+| DeepSeek V4.1 Flash (Canada-only) | \$0.375 | \$0.0075 | \$1.50 |
+| DeepSeek V4 Pro 0813 (Canada-only) | \$1.65 | \$0.1625 | \$4.95 |
+
 ## Image models
 
-Use our [Images](/reference/post-images-generations) endpoint for image models. Calling image models requires a positive credit balance.
+Use our [Images](https://docs.together.ai/reference/post-images-generations.md) endpoint for image models. Calling image models requires a positive credit balance.
 
-<Note>
-  Prices for models billed by `image` are estimates, not rates. These models pass through the provider's own per-request charge, which varies with the resolution, quality, and other parameters you send. Models billed by `megapixel` use the [formula below](#per-megapixel-cost-formula). For more details, see [How image models bill](/docs/serverless/overview#how-image-models-bill).
-</Note>
+> [!NOTE]
+>
+> Prices for models billed by `image` are estimates, not rates. These models pass through the provider's own per-request charge, which varies with the resolution, quality, and other parameters you send. Models billed by `megapixel` use the [formula below](#per-megapixel-cost-formula). For more details, see [How image models bill](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill).
 
 | Organization | Model name | Model string for API | Unit | Price | Output per \$1 |
 | :- | :- | :- | :- | :- | :- |
 | Black Forest Labs | Flux.1 Kontext \[max] | black-forest-labs/FLUX.1-kontext-max | `megapixel` | \$0.08 | 12 megapixels |
 | Black Forest Labs | Flux.1 Kontext \[pro] | black-forest-labs/FLUX.1-kontext-pro | `megapixel` | \$0.04 | 25 megapixels |
 | Black Forest Labs | Flux1.1 \[pro] | black-forest-labs/FLUX.1.1-pro | `megapixel` | \$0.04 | 25 megapixels |
-| Black Forest Labs | FLUX.2 \[dev] | black-forest-labs/FLUX.2-dev | `image` | \$0.0154+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 65 images |
-| Black Forest Labs | FLUX.2 \[flex] | black-forest-labs/FLUX.2-flex | `image` | \$0.03+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 33 images |
+| Black Forest Labs | FLUX.2 \[dev] | black-forest-labs/FLUX.2-dev | `image` | \$0.0154+ ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 65 images |
+| Black Forest Labs | FLUX.2 \[flex] | black-forest-labs/FLUX.2-flex | `image` | \$0.03+ ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 33 images |
 | Black Forest Labs | FLUX.2 \[max] | black-forest-labs/FLUX.2-max | `megapixel` | \$0.07 at 50 steps | 14 megapixels |
-| Black Forest Labs | FLUX.2 \[pro] | black-forest-labs/FLUX.2-pro | `image` | \$0.03+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 33 images |
-| ByteDance | Seedream 3.0 | ByteDance-Seed/Seedream-3.0 | `image` | \$0.018+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 56 images |
-| ByteDance | Seedream 4.0 | ByteDance-Seed/Seedream-4.0 | `image` | \$0.03+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 33 images |
-| ByteDance | Seedream 5.0 Lite | ByteDance/Seedream-5.0-lite | `image` | \$0.035+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 29 images |
-| Google | Flash Image 2.5 (Nano Banana) | google/flash-image-2.5 | `image` | \$0.039+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 26 images |
-| Google | Gemini 3 Pro Image (Nano Banana Pro) | google/gemini-3-pro-image | `image` | \$0.134 at 1K or 2K ([varies](/docs/serverless/overview#how-image-models-bill)) | 7.5 images |
-| Google | Gemini 3.1 Flash Image (Nano Banana 2) | google/flash-image-3.1 | `image` | \$0.04657 at 512×512 ([varies](/docs/serverless/overview#how-image-models-bill)) | 21 images |
-| Google | Gemini 3.1 Flash-Lite Image (Nano Banana 2 Lite) | google/flash-image-3.1-lite | `image` | \$0.069+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 14 images |
-| Ideogram | Ideogram 3.0 | ideogram/ideogram-3.0 | `image` | \$0.06+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 17 images |
-| Ideogram | Ideogram 4.0 | ideogram/ideogram-4.0 | `image` | \$0.06+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 17 images |
-| OpenAI | GPT Image 1.5 | openai/gpt-image-1.5 | `image` | \$0.034+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 29 images |
-| OpenAI | GPT Image 2 | openai/gpt-image-2 | `image` | \$0.053+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 19 images |
-| Pruna AI | P-Image-Ideogram | prunaai/p-image-ideogram | `image` | \$0.00225+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 444 images |
-| Qwen | Qwen Image | Qwen/Qwen-Image | `image` | \$0.0058+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 172 images |
-| Qwen | Qwen Image 2.0 | Qwen/Qwen-Image-2.0 | `image` | \$0.035+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 29 images |
-| Qwen | Qwen Image 2.0 Pro | Qwen/Qwen-Image-2.0-Pro | `image` | \$0.075+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 13 images |
-| RunDiffusion | Juggernaut Lightning Flux | Rundiffusion/Juggernaut-Lightning-Flux | `image` | \$0.0017+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 588 images |
-| RunDiffusion | Juggernaut Pro Flux | RunDiffusion/Juggernaut-pro-flux | `image` | \$0.0049+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 204 images |
-| Stability AI | SD XL | stabilityai/stable-diffusion-xl-base-1.0 | `image` | \$0.0019+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 526 images |
-| Wan-AI | Wan 2.6 Image | Wan-AI/Wan2.6-image | `image` | \$0.03+ ([varies](/docs/serverless/overview#how-image-models-bill)) | 33 images |
+| Black Forest Labs | FLUX.2 \[pro] | black-forest-labs/FLUX.2-pro | `image` | \$0.03+ ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 33 images |
+| ByteDance | Seedream 3.0 | ByteDance-Seed/Seedream-3.0 | `image` | \$0.018+ ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 56 images |
+| ByteDance | Seedream 4.0 | ByteDance-Seed/Seedream-4.0 | `image` | \$0.03+ ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 33 images |
+| ByteDance | Seedream 5.0 Lite | ByteDance/Seedream-5.0-lite | `image` | \$0.035+ ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 29 images |
+| Google | Flash Image 2.5 (Nano Banana) | google/flash-image-2.5 | `image` | \$0.039+ ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 26 images |
+| Google | Gemini 3 Pro Image (Nano Banana Pro) | google/gemini-3-pro-image | `image` | \$0.134 at 1K or 2K ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 7.5 images |
+| Google | Gemini 3.1 Flash Image (Nano Banana 2) | google/flash-image-3.1 | `image` | \$0.04657 at 512×512 ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 21 images |
+| Google | Gemini 3.1 Flash-Lite Image (Nano Banana 2 Lite) | google/flash-image-3.1-lite | `image` | \$0.069+ ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 14 images |
+| Ideogram | Ideogram 3.0 | ideogram/ideogram-3.0 | `image` | \$0.06+ ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 17 images |
+| Ideogram | Ideogram 4.0 | ideogram/ideogram-4.0 | `image` | \$0.06+ ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 17 images |
+| OpenAI | GPT Image 1.5 | openai/gpt-image-1.5 | `image` | \$0.034+ ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 29 images |
+| OpenAI | GPT Image 2 | openai/gpt-image-2 | `image` | \$0.053+ ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 19 images |
+| Pruna AI | P-Image-Ideogram | prunaai/p-image-ideogram | `image` | \$0.00225+ ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 444 images |
+| Qwen | Qwen Image | Qwen/Qwen-Image | `image` | \$0.0058+ ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 172 images |
+| Qwen | Qwen Image 2.0 | Qwen/Qwen-Image-2.0 | `image` | \$0.035+ ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 29 images |
+| Qwen | Qwen Image 2.0 Pro | Qwen/Qwen-Image-2.0-Pro | `image` | \$0.075+ ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 13 images |
+| RunDiffusion | Juggernaut Lightning Flux | Rundiffusion/Juggernaut-Lightning-Flux | `image` | \$0.0017+ ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 588 images |
+| RunDiffusion | Juggernaut Pro Flux | RunDiffusion/Juggernaut-pro-flux | `image` | \$0.0049+ ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 204 images |
+| Stability AI | SD XL | stabilityai/stable-diffusion-xl-base-1.0 | `image` | \$0.0019+ ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 526 images |
+| Wan-AI | Wan 2.6 Image | Wan-AI/Wan2.6-image | `image` | \$0.03+ ([varies](https://docs.together.ai/docs/serverless/overview.md#how-image-models-bill)) | 33 images |
 
 ### **Image model examples**
 
@@ -146,7 +171,7 @@ Supported dimensions: 1K: 1024×1024 (1:1), 1264×848 (3:2), 848×1264 (2:3), 12
 
 ## Vision models
 
-If you're not sure which vision model to use, start with **Qwen3.5 9B** (`Qwen/Qwen3.5-9B`). For model-specific rate limits, see [Rate limits](/docs/serverless/rate-limits).
+If you're not sure which vision model to use, start with **Qwen3.5 9B** (`Qwen/Qwen3.5-9B`). For model-specific rate limits, see [Rate limits](https://docs.together.ai/docs/serverless/rate-limits.md).
 
 | Organization | Model name | API model string | Context length | Input pricing (per 1M tokens) | Output pricing (per 1M tokens) |
 | :- | :- | :- | :- | :- | :- |
@@ -193,7 +218,7 @@ If you're not sure which vision model to use, start with **Qwen3.5 9B** (`Qwen/Q
 
 ## Audio models
 
-Use our [Audio](/reference/audio-speech) endpoint for text-to-speech models. For speech-to-text models see [Transcription](/reference/audio-transcriptions) and [Translations](/reference/audio-translations).
+Use our [Audio](https://docs.together.ai/reference/audio-speech.md) endpoint for text-to-speech models. For speech-to-text models see [Transcription](https://docs.together.ai/reference/audio-transcriptions.md) and [Translations](https://docs.together.ai/reference/audio-translations.md).
 
 | Organization | Modality | Model name | Model string for API | Pricing |
 | :- | :- | :- | :- | :- |
@@ -204,8 +229,6 @@ Use our [Audio](/reference/audio-speech) endpoint for text-to-speech models. For
 | Kokoro | Text-to-Speech | Kokoro | hexgrad/Kokoro-82M | \$4.00 per 1M chars |
 | NVIDIA | Speech-to-Text | NVIDIA Nemotron 3 ASR Streaming 0.6B | nvidia/nemotron-3-asr-streaming-0.6b | \$0.0015 per audio min |
 | NVIDIA | Speech-to-Text | NVIDIA Nemotron 3.5 ASR Streaming 0.6B | nvidia/nemotron-3.5-asr-streaming-0.6b | \$0.0015 per audio min |
-| NVIDIA | Speech-to-Text | Parakeet TDT 0.6B v3 | nvidia/parakeet-tdt-0.6b-v3 | \$0.0015 per audio min |
-| OpenAI | Speech-to-Text | Whisper Large v3 | openai/whisper-large-v3 | \$0.0015 per audio min |
 
 **Audio model examples**
 
@@ -218,7 +241,7 @@ There are currently no embedding models offered via serverless.
 
 ## Rerank models
 
-There are currently no rerank models offered via serverless. Rerank models like `mixedbread-ai/mxbai-rerank-large-v2` are only available with [dedicated model inference](/docs/dedicated-endpoints/models).
+There are currently no rerank models offered via serverless. Rerank models like `mixedbread-ai/mxbai-rerank-large-v2` are only available with [dedicated model inference](https://docs.together.ai/docs/dedicated-endpoints/models.md).
 
 ## Moderation models
 

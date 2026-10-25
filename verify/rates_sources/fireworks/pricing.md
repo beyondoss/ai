@@ -8,12 +8,12 @@
 
 ## Overview
 
-Serverless inference is priced per token. For how Standard, Priority, and Fast modes work and how to select one, see [Serverless Modes](/serverless/serverless-modes).
+Serverless inference is priced per token. For how Standard, Priority, and Fast modes work and how to select one, see [Serverless Modes](https://docs.fireworks.ai/serverless/serverless-modes.md).
 
 Every text or vision request is billed across three dimensions:
 
 * **Input tokens** — what you send to the model.
-* **Cached input tokens** — input tokens served from [prompt cache](/guides/prompt-caching), priced lower.
+* **Cached input tokens** — input tokens served from [prompt cache](https://docs.fireworks.ai/guides/prompt-caching.md), priced lower.
 * **Output tokens** — what the model generates.
 
 Embeddings are billed only on input tokens.
@@ -21,7 +21,7 @@ Embeddings are billed only on input tokens.
 ## How pricing works
 
 * Prices below are **per 1 million tokens** in US dollars.
-* **Batch inference** is billed at **50% of serverless pricing** on both input and output. See [Batch inference](/guides/batch-inference).
+* **Batch inference** is billed at **50% of serverless pricing** on both input and output. See [Batch inference](https://docs.fireworks.ai/guides/batch-inference.md).
 
 ## Text and vision models
 
@@ -30,12 +30,14 @@ Per-model pricing for headline models. Fast variants appear as adjacent rows. In
 | Model | Standard | Priority |
 | - | - | - |
 | [Ember-1](https://app.fireworks.ai/models/fireworks/ember-1) | \$3.00 / \$0.30 / \$15.00 | \$3.75 / \$0.375 / \$18.75 |
+| [Muse Spark Open](https://app.fireworks.ai/models/fireworks/muse-spark-open) | \$1.25 / \$0.15 / \$4.25 | \$1.875 / \$0.225 / \$6.375 |
 | [Kimi K3](https://app.fireworks.ai/models/fireworks/kimi-k3) | \$3.00 / \$0.30 / \$15.00 | \$3.75 / \$0.375 / \$18.75 |
 | [Kimi K3 Fast](https://app.fireworks.ai/models/fireworks/kimi-k3) | \$4.50 / \$0.45 / \$22.50 | — |
 | [Kimi K3 (US)](https://app.fireworks.ai/models/fireworks/kimi-k3) | \$4.50 / \$0.45 / \$22.50 | \$5.625 / \$0.5625 / \$28.125 |
 | [DeepSeek V4.1 Flash](https://app.fireworks.ai/models/fireworks/deepseek-v4p1-flash) | \$0.30 / \$0.006 / \$1.20 | \$0.375 / \$0.0075 / \$1.50 |
 | [DeepSeek V4.1 Flash (US)](https://app.fireworks.ai/models/fireworks/deepseek-v4p1-flash) | \$0.45 / \$0.009 / \$1.80 | \$0.5625 / \$0.01125 / \$2.25 |
 | [DeepSeek V4.1 Flash 1017](https://app.fireworks.ai/models/fireworks/deepseek-v4p1-flash-1017) | \$0.30 / \$0.006 / \$1.20 | \$0.375 / \$0.0075 / \$1.50 |
+| [DeepSeek V4.1 Flash 1017 (US)](https://app.fireworks.ai/models/fireworks/deepseek-v4p1-flash-1017) | \$0.45 / \$0.009 / \$1.80 | \$0.5625 / \$0.01125 / \$2.25 |
 | [GLM 5.3 Flash](https://app.fireworks.ai/models/fireworks/glm-5p3-flash) | \$0.15 / \$0.03 / \$0.50 | \$0.1875 / \$0.0375 / \$0.625 |
 | [GLM 5.3 Flash (US)](https://app.fireworks.ai/models/fireworks/glm-5p3-flash) | \$0.225 / \$0.045 / \$0.75 | \$0.28125 / \$0.05625 / \$0.9375 |
 | [GLM 5.3](https://app.fireworks.ai/models/fireworks/glm-5p3) | \$1.40 / \$0.26 / \$4.40 | \$1.75 / \$0.325 / \$5.50 |
@@ -48,6 +50,8 @@ Per-model pricing for headline models. Fast variants appear as adjacent rows. In
 | [NVIDIA Nemotron 3 Ultra (Preview)](https://app.fireworks.ai/models/fireworks/nemotron-3-ultra-nvfp4) | \$0.60 / \$0.12 / \$2.40 | \$0.75 / \$0.15 / \$3.00 |
 
 **—** in the Priority column means Priority is not available for that model. This pricing table is the source of truth for Priority availability.
+
+Muse Spark Open runs on US-only capacity. The 50% US-only premium is waived, so the rates in that row are what you pay.
 
 ## Other base models — by size and architecture
 
@@ -73,4 +77,4 @@ Embeddings are billed per 1M input tokens.
 
 ## Notes
 
-* For account-level controls (spend tiers, monthly spend limits, on-demand GPU quotas), see [Account quotas](/guides/quotas_usage/account-quotas).
+* For account-level controls (spend tiers, monthly spend limits, on-demand GPU quotas), see [Account quotas](https://docs.fireworks.ai/guides/quotas_usage/account-quotas.md).

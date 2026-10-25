@@ -73,9 +73,7 @@ fn readers_fail_loudly_on_layout_changes() {
 
     let o = snapshot("openai/pricing.md");
     assert!(vendors::openai(&o).is_ok());
-    assert!(
-        vendors::openai(&o.replace("### Flex pricing data", "### Flexible pricing data")).is_err()
-    );
+    assert!(vendors::openai(&o.replace("#### Flex", "#### Flexible")).is_err());
     let dup = o.replace("| gpt-5-mini | $0.25 |", "| gpt-5-nano | $0.25 |");
     assert!(
         vendors::openai(&dup)

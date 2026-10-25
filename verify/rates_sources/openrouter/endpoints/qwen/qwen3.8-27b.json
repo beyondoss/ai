@@ -138,7 +138,7 @@
         "pricing": {
           "completion": "0.0000025",
           "discount": 0,
-          "prompt": "0.0000002"
+          "prompt": "0.00000018"
         },
         "provider_name": "Mancer 2",
         "quantization": "fp8",

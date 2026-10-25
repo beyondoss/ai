@@ -482,7 +482,7 @@ means the rate is in the generated table. Where the row cannot observe a dimensi
 | Usage-guideline violation                     | $0.05 per request                                                             | an error response                    | —                                | Unobserved; bounded at $0.05 a request           |
 | Reported cost                                 | `cost_in_usd_ticks` (1e-10 USD)                                               | `usage`                              | `upstream_cost_usd`              | The cost of goods when present                   |
 
-#### DeepSeek: https://api-docs.deepseek.com/quick_start/pricing
+#### DeepSeek: https://api-docs.deepseek.com/quick_start/pricing/
 
 | Dimension        | Rate                                                                                        | Observed via | Row field   | Pricer / prevent                  |
 | ---------------- | ------------------------------------------------------------------------------------------- | ------------ | ----------- | --------------------------------- |

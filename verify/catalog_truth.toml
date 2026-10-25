@@ -302,7 +302,7 @@ max_output_tokens = 128_000
 [[row]]
 model = "deepseek-flash"
 source = [
-  "https://api-docs.deepseek.com/quick_start/pricing",
+  "https://api-docs.deepseek.com/quick_start/pricing/",
   "https://docs.together.ai/docs/serverless/models",
 ]
 date = "2026-10-01"
@@ -317,7 +317,7 @@ note = "DeepSeek-V4.1-Flash. Vision supported. Off-peak $0.15 / $0.003 / $0.60. 
 [[row]]
 model = "deepseek-v4-pro"
 source = [
-  "https://api-docs.deepseek.com/quick_start/pricing",
+  "https://api-docs.deepseek.com/quick_start/pricing/",
   "https://docs.together.ai/docs/serverless/models",
 ]
 date = "2026-10-01"
@@ -2167,7 +2167,7 @@ quote = "Claude Haiku 5.5 is priced by prompt length: a request whose prompt is 
 id = "bedrock.regional"
 value = "1.1"
 url = "https://platform.claude.com/docs/en/about-claude/pricing.md"
-quote = "Regional and multi-region endpoints include a 10% premium over global endpoints."
+quote = "Regional and multi-region endpoints include a 10 percent premium over global endpoints."
 
 [[prose]]
 id = "openai.long_context"
@@ -2190,7 +2190,7 @@ quote = "Priority requests are billed at a **2x** premium over standard rates."
 [[prose]]
 id = "deepseek.peak"
 value = "Mon-Fri 01:00-04:00,06:00-10:00"
-url = "https://api-docs.deepseek.com/quick_start/pricing"
+url = "https://api-docs.deepseek.com/quick_start/pricing/"
 quote = "Peak hours are 01:00 - 04:00 and 06:00 - 10:00 UTC, Monday through Friday, excluding Chinese public holidays. All other hours are off-peak, including weekends and Chinese public holidays in full."
 
 [[prose]]
@@ -2221,7 +2221,7 @@ quote = "OpenRouter's fee is charged when you buy credits, 5.5% on Standard and 
 id = "anthropic"
 url = "https://platform.claude.com/docs/en/about-claude/pricing.md"
 fees = [
-  { tool = "web_search", usd = "0.01", quote = "Web search is available on the Claude API for **$10 per 1,000 searches**" },
+  { tool = "web_search", usd = "0.01", quote = "Web search is available on the Claude API for **$10 USD per 1,000 searches**" },
   { tool = "web_fetch", usd = "0", quote = "The web fetch tool is available on the Claude API at **no additional cost**." },
 ]
 
