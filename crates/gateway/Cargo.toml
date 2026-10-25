@@ -3,6 +3,7 @@ name = "beyond-ai"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+readme = "README.md"
 rust-version.workspace = true
 description = "Beyond AI gateway — egress L7 proxy to LLM providers"
 

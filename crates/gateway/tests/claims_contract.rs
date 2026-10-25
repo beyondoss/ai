@@ -927,13 +927,14 @@ fn literal(s: &str) -> Value {
     Value::String(s.trim_matches('"').to_owned())
 }
 
-/// Mechanically checkable statements in the README and the example config: the provider count
+/// Mechanically checkable statements in the gateway README (crates/gateway/README.md) and the
+/// example config: the provider count
 /// and list, the config keys the README names, its relative links, and every key the example config
 /// sets (or shows commented out) being a real field at the value it claims is the default.
 /// claim: CAT-15
 #[test]
 fn readme_and_example_config_statements_hold() {
-    let readme = repo_file("README.md");
+    let readme = repo_file("crates/gateway/README.md");
     let providers: BTreeSet<&str> = providers::gateway_providers().map(|p| p.name).collect();
 
     // "**12 providers, zero config**: openai, anthropic, …"
@@ -989,7 +990,7 @@ fn readme_and_example_config_statements_hold() {
             continue;
         }
         let path = target.split('#').next().unwrap();
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         assert!(root.join(path).exists(), "README links to missing {path}");
     }
 

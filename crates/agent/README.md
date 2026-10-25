@@ -1,0 +1,293 @@
+# beyond-ai-agent
+
+A coding agent in one static binary. It reads a task, calls a model, and runs
+tools (file edits, search, shell) until the task is done. Three ways to run it:
+
+| Command           | Use                                                                        |
+| ----------------- | -------------------------------------------------------------------------- |
+| `run "<task>"`    | One task, output streamed to stdout, exit when done.                       |
+| `serve`           | A JSON-lines control protocol: stdio, WebSocket, HTTP POST or Unix socket. |
+| `serve --service` | One replica serving many tenants, each connection carrying a signed grant. |
+
+The agent needs a model. It reaches one directly with your provider key, or
+through a [Beyond AI gateway](../gateway/README.md) with a virtual key. It
+runs Linux only.
+
+## Install
+
+Static `linux-amd64` and `linux-arm64` binaries are attached to each
+[GitHub release](https://github.com/beyondoss/ai/releases):
+
+```sh
+V=v0.1.10   # or any other release tag
+curl -fsSL "https://github.com/beyondoss/ai/releases/download/$V/beyond-ai-agent-$V-linux-amd64.tar.gz" \
+  | tar xz
+./beyond-ai-agent --version
+```
+
+From a checkout, `cargo run -p beyond-ai-agent -- <args>` runs the same binary.
+
+## Try it
+
+Export a provider key. The agent picks the provider from the model id and
+sends the key in the header that provider expects.
+
+```sh
+ANTHROPIC_API_KEY=sk-ant-... beyond-ai-agent run "add a CHANGELOG entry"
+OPENAI_API_KEY=sk-...        beyond-ai-agent run --model gpt-5 "explain src/main.rs"
+beyond-ai-agent list-models   # known model ids and their capabilities
+```
+
+The default model is `claude-opus-4-8`; `--model`, `AI_AGENT_MODEL` or
+`settings --model` change it.
+
+| You have                                    | Set                                                                                                              |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| A provider key (OpenAI, Anthropic, Groq, …) | The provider's variable, for example `ANTHROPIC_API_KEY`                                                         |
+| A subscription                              | `beyond-ai-agent login anthropic` (or `github-copilot`, `openai-codex`)                                          |
+| An aggregator key (OpenRouter, Together, …) | `AI_PROVIDER=openrouter` and its key; aggregators serve other vendors' model ids, so the agent cannot infer them |
+| An OpenAI-compatible server (vLLM, Ollama)  | `AI_BASE_URL=http://localhost:8000/v1 AI_API_KEY=local`                                                          |
+| A Beyond AI gateway                         | `AI_GATEWAY_URL=http://ai.internal AI_AGENT_KEY=bai_v1...`                                                       |
+
+The provider variables are listed in
+[`providers`](../providers/README.md#providers). A configured gateway is
+never bypassed because a provider key is also set; `AI_DIRECT=1` overrides
+that. The order in which these are tried when several are set is in
+[Provider routing](ARCHITECTURE.md#provider-routing--the-gateway-is-optional).
+
+A model run needs a live provider. To see the control protocol without one,
+set a dummy key and ask for state:
+
+```sh
+echo '{"id":"1","type":"get_state"}' \
+  | ANTHROPIC_API_KEY=dummy beyond-ai-agent serve --session-file /tmp/agent.json
+# {"type":"ready",...} then {"command":"get_state","data":{...},"success":true,...}
+```
+
+## Tools
+
+| Tool                                          | Offered                                                                                                                                                                                                              |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `read`, `write`, `edit`, `ls`, `grep`, `find` | Always. `grep` and `find` honor `.gitignore`.                                                                                                                                                                        |
+| `bash`, `bash_job`                            | Always. A command silent for 60 s, or past its `timeout_ms`, returns as a numbered job that `bash_job` waits on or kills; `run_in_background` starts a server or watcher as one. The model is told when a job exits. |
+| `todo`                                        | Always.                                                                                                                                                                                                              |
+| `web`                                         | Only when named: `--tools read,bash,web`. Fetches, converts to markdown, extracts rows. Refuses loopback and private addresses unless `--web-allow-private` or `--web-allow-host`.                                   |
+| `memory`                                      | Unless `--no-memory`. Durable notes, per project.                                                                                                                                                                    |
+| `subagent`                                    | When an agent definition exists (`.claude/agents/*.md`, `~/.claude/agents/*.md`): runs a nested agent in-process, optionally in a git worktree.                                                                      |
+| `structured_output`                           | With `run --output-schema <schema>`: the last stdout line is JSON matching the schema.                                                                                                                               |
+| `mcp__<server>__<tool>`                       | One per tool of each MCP server in `mcp_servers` or `.mcp.json`.                                                                                                                                                     |
+
+`beyond-ai-agent tools` prints the default set with schemas. `--tools`,
+`--exclude-tools`, `--no-tools`, `--deny-tool`, `--deny-bash-pattern` and
+`--deny-path` narrow what the model may call.
+
+Around the tools:
+
+- **MCP client.** stdio and HTTP servers, OAuth (`mcp-login <name>`), tool
+  search for large catalogs, MCP Apps, MCP Events. See
+  [MCP tool names](ARCHITECTURE.md#mcp-tool-names) and
+  [`.mcp.json`](ARCHITECTURE.md#mcpjson).
+- **Skills, prompt templates and `AGENTS.md`/`CLAUDE.md`** are read from the
+  project and from `~/.claude`. An `AGENTS.md` may open with frontmatter that
+  picks the model and tools
+  ([`AGENTS.md` frontmatter](ARCHITECTURE.md#agentsmd-frontmatter--the-agents-own-definition)).
+- **Compaction.** When the prompt nears the context window, old tool output is
+  masked and older turns are summarized. `--no-compaction` turns it off.
+- **Approval.** `serve --approve writes|all|tools:<name>` asks attached clients
+  before running tools
+  ([Interactive approval](ARCHITECTURE.md#interactive-approval--the-human-in-the-loop-gate)).
+- **Trust.** A project's `.claude/SYSTEM.md` and settings apply only after
+  `beyond-ai-agent trust` (or `-a` for one run). Trust gates which instructions
+  the model sees, not what it can do.
+
+## Sessions
+
+A session id is an address. `run` and `serve` take the same three forms:
+
+```sh
+beyond-ai-agent run "..."                       # a new session
+beyond-ai-agent run --continue "..."            # this directory's latest session
+beyond-ai-agent run --session-id build-42 "..." # open build-42, or create it
+```
+
+`--session-id` outranks `--continue` and is idempotent, so a restarted
+`serve --session-id X` lands on the same conversation. A bare launch always
+starts its own session, so two shells in one directory do not share a
+transcript. Sessions are JSON-lines files under `~/.beyond/sessions/<cwd>/`;
+`--session-dir` moves them, `--no-session-persistence` skips them, and
+`export <file.jsonl>` renders one as HTML.
+
+## State
+
+The agent writes only under `~/.beyond` (or `$AI_AGENT_CONFIG_DIR`): settings,
+logins, trust grants, `models.json`, memory, the MCP cache and sessions. A
+project's own settings are `<project>/.beyond/settings.json`. `~/.claude`
+belongs to Claude Code; the agent reads skills, agents, prompt templates and
+`CLAUDE.md` from it and never writes there. The file table is in
+[Where state lives](ARCHITECTURE.md#where-state-lives--beyond-and-claude-read-only).
+
+## Serve
+
+```sh
+# stdio: one JSON command per line in, one JSON frame per line out
+beyond-ai-agent serve --session-file /tmp/agent.json
+# {"type":"prompt","message":"..."} -> ack, event frames, then a response
+
+# loopback socket: WebSocket (GET) and one-shot commands (POST)
+beyond-ai-agent serve --listen 127.0.0.1:8787 --session-dir /tmp/sessions
+curl -D- -H 'Content-Type: application/json' \
+  --data '{"type":"prompt","message":"add a CHANGELOG entry"}' \
+  'http://127.0.0.1:8787/_beyond/agent?session_id=build-42'
+# 202 + X-Session-Id: the run continues without the connection
+```
+
+One `serve --listen` process holds many sessions, one per `session_id`. A
+POST returns the command's `ack` (a `prompt` is 202) or `response` (200); a
+WebSocket on the same id sees the same session. `--listen-uds <path>` serves
+the same protocol on a Unix socket whose file mode decides who connects, and
+`--tls-listen` with `--tls-cert` and `--tls-key` adds TLS. `--lifecycle-url`
+POSTs `started`, `progress` and `finished` events for each prompt. The command
+and frame reference is the module doc of `src/serve/mod.rs` and
+[`serve`](ARCHITECTURE.md#serve--headless-ndjson-control-protocol).
+
+## Run the tools somewhere else
+
+`--exec-url <URL>` sends every tool call, `bash` included, to a remote
+endpoint instead of running it on the host. The model sees the same tools. The
+agent knows one protocol; it does not create or destroy sandboxes.
+
+```sh
+beyond-ai-agent run \
+  --exec-url https://exec.internal/run \
+  --exec-header 'Authorization: Bearer ...' \
+  "fix the failing test under /srv/app"
+```
+
+The base protocol (v1.1) is one `POST`:
+
+```jsonc
+// request; cwd and stdin_base64 (standard base64, written to stdin) are optional
+{ "command": "rg", "args": ["--files"], "cwd": "/work", "timeout_ms": 120000 }
+// response, 200
+{ "exit_code": 0, "stdout": "...", "stderr": "..." }
+```
+
+Later versions are opt-in per endpoint, probed at attach: v1.2 streams
+output as NDJSON frames and treats a closed connection as the kill signal;
+v1.3 lets the endpoint own background jobs so they outlive an agent replica;
+v1.4 has the sandbox call back when a kept job ends
+([`exec-notify`](../exec-notify/README.md)). The spec is the module doc of
+`src/exec_endpoint.rs`; the prose is
+[Running the tools against a remote exec endpoint](ARCHITECTURE.md#running-the-tools-against-a-remote-exec-endpoint).
+An endpoint's response is capped at 16 MiB (`--exec-max-response-bytes`); a
+larger one is an error, not a truncation.
+
+Try it with the reference endpoint from `crates/demo`, no model needed. In one
+terminal:
+
+```sh
+mkdir -p /tmp/ws /tmp/ws-home
+cargo run -p beyond-ai-demo -- exec-stub \
+  --listen 127.0.0.1:8081 --root /tmp/ws --home /tmp/ws-home
+```
+
+In another, run `bash` through it with a `serve` command (the dummy key only
+satisfies startup):
+
+```sh
+(echo '{"id":"1","type":"bash","command":"pwd"}'; sleep 3) \
+  | ANTHROPIC_API_KEY=dummy beyond-ai-agent serve --exec-url http://127.0.0.1:8081/
+# ... "result":"/tmp/ws\n" ...
+```
+
+For a target with no HTTP surface, `--exec-cmd` takes an argv template; `{}`
+becomes separate argv entries, never a shell string:
+
+```sh
+--exec-cmd 'ssh build-host -- {}'
+--exec-cmd 'docker exec -i my-container {}'
+```
+
+Install `ripgrep` on the target: without it `grep` falls back to POSIX `grep`,
+which ignores `.gitignore` and skips files holding non-UTF-8 bytes. Paths are
+the target's, so skills and the system prompt resolve only if the working tree
+sits at the same absolute path.
+
+In `serve`, an endpoint is per session: `set_exec_endpoint` attaches one,
+a session switch never inherits the previous session's, and a resumed session
+reattaches its own.
+
+Check an endpoint against the protocol (framing, heartbeats, kill on
+disconnect, leftover processes, job scopes):
+
+```sh
+AGENT_CONFORMANCE_EXEC_URL=https://exec.internal/run \
+AGENT_CONFORMANCE_EXEC_HEADER='Authorization: Bearer ...' \
+  cargo nextest run -p beyond-ai-agent -E 'test(/^exec_conformance::/)' --no-capture
+```
+
+[`BEYOND.md`](BEYOND.md) lists the other conformance kits (exec front,
+connector broker, bundles) and the contract a hosting platform implements.
+
+## Service mode
+
+`serve --service` is the multi-tenant deployment. Every connection carries a
+verified `x-beyond-grant` naming the tenant, the session, its sandbox and,
+sealed, the credentials to reach them. Nothing of the replica's reaches a
+tenant: not its `$HOME`, settings, cwd or filesystem. The mechanism is
+[Service mode](ARCHITECTURE.md#service-mode--one-replica-many-tenants); running
+many replicas (routing, sizing, alerts, cost) is [`FLEET.md`](FLEET.md).
+
+`Dockerfile.agent` builds a static musl binary in an Alpine image (non-root,
+uid 10001, entrypoint `serve --service`). Multi-arch images are published as
+`ghcr.io/beyondoss/ai-agent`, tagged `latest` and by commit SHA.
+
+```sh
+docker build -f Dockerfile.agent -t beyond-ai-agent .
+docker run --rm -p 8080:8080 \
+  -v /mnt/efs/a07-s1:/mnt/efs/a07-s1 \
+  -v /etc/beyond/grant:/etc/beyond/grant:ro \
+  beyond-ai-agent \
+  --listen 0.0.0.0:8080 \
+  --gateway-url https://gateway.internal \
+  --grant-key "1=$(cat /etc/beyond/grant/k1.pub)" \
+  --seal-key /etc/beyond/grant/seal.key \
+  --shard a07-s1=/mnt/efs/a07-s1
+```
+
+| Flag                              | Meaning                                                                                                                                                          |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--grant-key <kid>=<base64>`      | Ed25519 public key that signs grants; `kid` is a decimal integer. Repeatable.                                                                                    |
+| `--seal-key <file>`               | X25519 secret that opens a grant's sealed secrets. `AI_AGENT_SEAL_KEY_B64` carries it as an env secret instead; not both.                                        |
+| `--seal-key-previous`             | The old key during a rotation.                                                                                                                                   |
+| `--shard <name>=</abs/path>`      | A tenant-data mount; at least one. Data lives at `<shard>/<tenant>/{sessions,memory}/`.                                                                          |
+| `--listen`, `--listen-uds`        | A listener is required; stdio `--service` is refused, as are flags that would make one tenant's setting everybody's (`--key`, `--session-dir`, `--exec-url`, …). |
+| `--metrics-listen 127.0.0.1:9095` | `GET /metrics` on its own listener. Loopback only; no tenant or session id appears in a label.                                                                   |
+| `--session-idle-timeout`          | Default 60 s in service mode: a detached session releases its lock fast so a failed-over session is not kept waiting.                                            |
+| `--drain-grace <secs>`            | On SIGTERM, finish in-flight sessions and take no new ones; `/readyz` answers 503 while `/livez` stays 200.                                                      |
+| `--max-live-sessions`             | Refuse new sessions past this count. Default 20000; `0` is no limit.                                                                                             |
+| `--notify-origin`                 | Where sandboxes report a kept job's end (exec v1.4).                                                                                                             |
+
+`GET /livez` answers 200 once the process serves. `GET /readyz` answers 200,
+or 503 with a reason (`draining`, or a shard that is missing or not writable,
+checked by writing). Point the readiness probe at `/readyz` and the liveness
+probe at `/livez`; the image's `HEALTHCHECK` uses `/readyz` on `AGENT_PORT`
+(default 8080).
+
+`list_sessions` and `list_all_sessions` take `query`, `limit` (default 50,
+at most 500) and `offset`, and return `total` with `sessions`. Listings carry
+metadata, never session text.
+
+## Reference
+
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): how the agent works and why.
+- [`FLEET.md`](FLEET.md): running service-mode replicas as a fleet.
+- [`BEYOND.md`](BEYOND.md): what a hosting platform must provide, with the
+  conformance kits.
+- [`beyond-ai-agent-core`](../agent-core/README.md): the loop this crate
+  builds on.
+- `beyond-ai-agent <command> --help`: every flag, with its `AI_AGENT_*`
+  variable.
+
+The agent is modeled on [pi](https://github.com/badlogic/pi-mono); see
+[`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md).
