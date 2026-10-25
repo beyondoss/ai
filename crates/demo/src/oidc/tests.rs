@@ -373,6 +373,8 @@ async fn call(tools: &McpTools, name: &str, args: Value) -> Result<String, Strin
         .map_err(|e| e.to_string())
 }
 
+mod kit;
+
 // ---- the tests -------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
