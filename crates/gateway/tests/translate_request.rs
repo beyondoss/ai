@@ -127,7 +127,7 @@ async fn responses_client_parallel_tool_calls_reach_chat_as_one_turn() {
         "max_output_tokens": 64,
         "tools": [
             {"type": "function", "name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}},
-            {"type": "file_search", "vector_store_ids": ["vs_1"]}
+            {"type": "tool_search"}
         ],
         "tool_choice": {"type": "function", "name": "get_weather"},
         "input": [
@@ -153,7 +153,7 @@ async fn responses_client_parallel_tool_calls_reach_chat_as_one_turn() {
     );
     assert_eq!(
         got["tools"][1],
-        json!({"type": "file_search", "vector_store_ids": ["vs_1"]}),
+        json!({"type": "tool_search"}),
         "a hosted tool is forwarded for the provider to reject by name, not dropped (web_search aside: D78)"
     );
     assert_eq!(got["max_tokens"], 64);

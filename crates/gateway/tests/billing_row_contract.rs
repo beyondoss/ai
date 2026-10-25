@@ -508,7 +508,7 @@ async fn a_responses_walk_counts_tool_items() {
     let status = post(
         format!("{}/v1/responses", gw.url()),
         bearer(&sk, 163),
-        r#"{"model":"gpt-5","stream":true,"input":"hi","tools":[{"type":"file_search","vector_store_ids":["vs_1"]}]}"#,
+        r#"{"model":"gpt-5","stream":true,"input":"hi"}"#,
         &[],
     )
     .await;
