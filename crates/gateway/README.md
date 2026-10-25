@@ -147,9 +147,28 @@ Every response carries `x-beyond-request-id` (the billing row's `request_id`),
 
 On SIGTERM the gateway stops accepting, lets in-flight requests finish for up
 to `shutdown_grace_period_secs` (default 600), and exits as soon as none remain.
-`config.example.toml` documents every key and its default; scalar keys take an
+
+**12 providers, zero config**: openai, anthropic, openrouter, fireworks, groq, deepseek, together, cerebras, mistral, xai, bedrock and openai-codex (BYO only). Add more in `config.toml` under `[provider_authorities]`.
+
+`config.example.toml` documents every key and its default. Scalar keys take an
 `AI_` prefix, and pool and signing keys come from `AI_POOL_KEY_<NAME>` and
-`AI_SIGNING_KEY_<KID>`.
+`AI_SIGNING_KEY_<KID>`. Map keys (`provider_authorities.*`, `provider_dialects.*`,
+`provider_auth_schemes.*`) are config-file only.
+
+Required to serve managed traffic:
+
+| Key                  | Source        | Purpose                                                |
+| -------------------- | ------------- | ------------------------------------------------------ |
+| `signing_keys`       | `config.toml` | Ed25519 public keys by `kid`, verifies `bai_v1` tokens |
+| `AI_POOL_KEY_<NAME>` | env (SSM)     | Provider key swapped in for managed requests           |
+
+Optional:
+
+| Key                      | Default   | Purpose                                                                 |
+| ------------------------ | --------- | ----------------------------------------------------------------------- |
+| `snapshot_path`          | unset     | On-disk deny-set snapshot; set on durable nodes, leave unset on Fargate |
+| `rate_limit_rps`         | `100`     | Per-key request ceiling; `0` disables                                   |
+| `[provider_authorities]` | built-ins | Override or add upstream hosts                                          |
 
 ### Vercel AI SDK
 
