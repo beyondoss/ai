@@ -2,7 +2,7 @@
 //! persists — reloaded from disk by an independent `SessionStore::open`, not read back in memory.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::Write;
 use std::process::Stdio;

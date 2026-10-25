@@ -2,7 +2,7 @@
 //! flags fails at startup, naming the problem, before any model call.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::{Read, Write};
 use std::process::Stdio;

@@ -6,7 +6,7 @@
 //! the model answered without tools the stranded reminder forced a whole extra request.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::Stdio;
 

@@ -5,7 +5,7 @@
 //! and serve the byte-identical control protocol over it. Skips cleanly where the helper isn't present.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

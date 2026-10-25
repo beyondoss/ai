@@ -6,7 +6,7 @@
 //! backgrounded grandchild process the tool call itself spawned.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::Read;
 use std::process::Stdio;

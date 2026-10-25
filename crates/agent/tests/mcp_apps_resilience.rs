@@ -10,7 +10,7 @@
 //! - service mode dials a session's own apps pool from its grant.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::time::{Duration, Instant};
 

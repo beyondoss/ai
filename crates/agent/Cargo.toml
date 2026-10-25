@@ -1,6 +1,7 @@
 [package]
 name = "beyond-ai-agent"
 version = "0.1.0"
+autotests = false
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -258,6 +259,11 @@ code-mode = ["dep:rquickjs"]
 # Catalog-token + composition evals (and the ignored live Grok/OpenRouter eval). Requires the
 # feature so `CARGO_BIN_EXE_beyond-ai-agent` is the binary that actually links QuickJS;
 # `--code-mode` on the density-default binary is a hard error.
+# Every integration test file is a module of this one binary (see the header of `tests/it.rs`).
+[[test]]
+name = "it"
+path = "tests/it.rs"
+
 [[test]]
 name = "code_mode_eval"
 path = "tests/code_mode_eval.rs"

@@ -21,7 +21,7 @@ use beyond_ai_agent::tools::{ToolConfig, default_registry_with_config};
 use common::exec_mock::ExecMock;
 use serde_json::{Value, json};
 
-mod common;
+use crate::common;
 
 /// 200 KiB — comfortably past the 128 KiB single-argv cap even before base64's 4/3 growth.
 const BIG: usize = 200 * 1024;

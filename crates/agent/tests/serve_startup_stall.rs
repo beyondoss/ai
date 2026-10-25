@@ -17,7 +17,7 @@
 //! long it takes: a real transcript big enough to cost whole seconds is neither cheap to build nor
 //! stable across machines, and a tight timing threshold is how a suite gets flaky.
 
-mod common;
+use crate::common;
 
 use std::process::Stdio;
 use std::time::{Duration, Instant};

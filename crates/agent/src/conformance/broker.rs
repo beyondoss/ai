@@ -6,7 +6,7 @@
 //! AGENT_CONFORMANCE_BROKER_URL='https://broker.example/managed/notes/mcp' \
 //! AGENT_CONFORMANCE_BROKER_HOOK=/path/to/operator-hook \
 //! AGENT_CONFORMANCE_BROKER_TOOL=my_notes \
-//!   cargo test -p beyond-ai-agent --test broker_conformance -- --nocapture
+//!   cargo nextest run -p beyond-ai-agent -E 'test(/^broker_conformance::/)' --no-capture
 //! ```
 //!
 //! - `AGENT_CONFORMANCE_BROKER_URL`: the broker's managed endpoint for one connector, as a grant

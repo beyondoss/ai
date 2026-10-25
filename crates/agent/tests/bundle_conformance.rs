@@ -4,7 +4,7 @@
 //!
 //! ```sh
 //! AGENT_CONFORMANCE_BUNDLE_HOOK=/path/to/operator-hook \
-//!   cargo test -p beyond-ai-agent --test bundle_conformance -- --nocapture
+//!   cargo nextest run -p beyond-ai-agent -E 'test(/^bundle_conformance::/)' --no-capture
 //! ```
 //!
 //! The module doc of `conformance::bundle` lists the variables and the hook's ops. A full run waits
@@ -14,7 +14,7 @@
 //! fail each way one gets a requirement wrong, by the check's name.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

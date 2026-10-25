@@ -3,8 +3,8 @@
 //! resumes its tasks (see `crate::mcp_resume::JournalAuth`).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
-mod mcp_tasks_env;
+use crate::common;
+use crate::mcp_tasks_env;
 
 use std::time::{Duration, Instant};
 

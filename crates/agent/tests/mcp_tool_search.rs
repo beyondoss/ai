@@ -10,7 +10,7 @@
 //! Code Mode taking precedence is in `code_mode_eval.rs`, which needs `--features code-mode`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 

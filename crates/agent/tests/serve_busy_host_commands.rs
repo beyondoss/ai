@@ -6,7 +6,7 @@
 //! from under the command, which was then cancelled and lost.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};

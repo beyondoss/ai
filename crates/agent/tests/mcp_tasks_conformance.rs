@@ -9,7 +9,7 @@
 //! unsupported request, and the same flow through `run` and a subagent.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};

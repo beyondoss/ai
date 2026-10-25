@@ -5,7 +5,7 @@
 //! the store lives in the `<...>.memory/` sibling of the session file, and `--no-session-memory` opts out.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::Write;
 use std::path::Path;

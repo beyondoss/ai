@@ -6,7 +6,7 @@
 //! parent can act on, never panic and never take the fan-out down with it.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::Stdio;
 

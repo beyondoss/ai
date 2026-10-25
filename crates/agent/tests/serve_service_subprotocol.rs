@@ -6,7 +6,7 @@
 //! and a grant in both carriers is a 400 rather than a silent choice.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use common::service::Service;
 use common::{

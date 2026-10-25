@@ -5,7 +5,7 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use beyond_ai_test_support::bundle::{BundleServer, file, sha256_hex, tar};
 use common::grant::Bundle;

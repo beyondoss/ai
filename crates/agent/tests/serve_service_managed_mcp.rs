@@ -7,7 +7,7 @@
 //! session store, the transcript, the replica's logs, or the replica's memory.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::sync::atomic::Ordering;
 

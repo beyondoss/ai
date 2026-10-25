@@ -12,7 +12,7 @@
 //! public key + token are fixed constants — no dependency on the gateway crate.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::{Command, Stdio};
 

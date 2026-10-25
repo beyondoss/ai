@@ -7,7 +7,7 @@
 //! unset rather than failing. Run with whatever keys you have:
 //!
 //!   mise run test:smoke:agent          # auto-loads .env (ANTHROPIC_API_KEY, OPENAI_API_KEY, …)
-//!   ANTHROPIC_API_KEY=… OPENAI_API_KEY=… cargo test -p beyond-ai-agent --test smoke -- --ignored --nocapture
+//!   ANTHROPIC_API_KEY=… OPENAI_API_KEY=… cargo nextest run -p beyond-ai-agent -E 'test(/^smoke::/)' --run-ignored only --no-capture
 //!
 //! These validate the dialect decoders against *real* provider SSE: the gateway boots with the
 //! caller's key as the managed pool key (and the dev signing key), then the agent — holding only a
@@ -15,7 +15,7 @@
 //! not a harness bug (adjust the provider's `model`).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::{BufRead, Write};
 use std::net::TcpStream;

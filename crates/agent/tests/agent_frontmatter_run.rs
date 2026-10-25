@@ -3,7 +3,7 @@
 //! file, and an untrusted project's file configures nothing.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::Stdio;
 

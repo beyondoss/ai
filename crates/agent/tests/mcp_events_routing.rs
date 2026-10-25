@@ -6,7 +6,7 @@
 //! (runtime) subscription has terminated becomes reapable. Real `serve --listen`, a real streamable-HTTP fixture, a mock model.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

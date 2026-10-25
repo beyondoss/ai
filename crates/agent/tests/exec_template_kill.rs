@@ -9,7 +9,7 @@
 //! live suite (`exec_endpoint_live`) repeats the bash kill against a real container.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::sync::Arc;

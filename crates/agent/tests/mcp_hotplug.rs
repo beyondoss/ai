@@ -4,7 +4,7 @@
 //! restarting the process — the certainty test for the hot-plug gap vs Claude Code.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::Write;
 use std::path::Path;

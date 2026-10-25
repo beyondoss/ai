@@ -5,7 +5,7 @@
 //! the daemon was down still land. Real `serve --listen`, a real fixture, a mock model.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::time::{Duration, Instant};
 

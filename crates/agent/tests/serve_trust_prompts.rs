@@ -1,7 +1,7 @@
 //! `serve` e2e: Project trust gating for skills/prompt-templates, and the system prompt.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::{Read, Write};
 use std::process::Stdio;

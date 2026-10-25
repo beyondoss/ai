@@ -22,7 +22,7 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -698,7 +698,7 @@ async fn guarded(mut f: E2e, seed: u64) -> (Option<E2e>, Result<Outcome, String>
 
 fn replay_command(seed: u64) -> String {
     format!(
-        "NOTIFY_E2E_SEED={seed} cargo nextest run -p beyond-ai-agent --test notify_e2e_orderings replay --no-capture"
+        "NOTIFY_E2E_SEED={seed} cargo nextest run -p beyond-ai-agent -E 'test(/^notify_e2e_orderings::/ and test(replay))' --no-capture"
     )
 }
 

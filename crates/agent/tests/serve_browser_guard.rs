@@ -10,7 +10,7 @@
 //! a front door splices onto with the browser's own headers, is deliberately not guarded.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::process::Stdio;

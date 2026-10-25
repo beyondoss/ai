@@ -7,7 +7,7 @@
 //! unit tests (`tools::web`); here we prove the whole path end to end through the real binary.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};

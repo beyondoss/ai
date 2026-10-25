@@ -6,7 +6,7 @@
 //! (`exec_endpoint_live`) repeats the essentials inside CI's busybox container.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

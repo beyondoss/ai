@@ -7,7 +7,7 @@
 //! be present next to one that must not.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use common::service::{Options, Service, host_claude_home};
 use common::{

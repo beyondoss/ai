@@ -175,28 +175,33 @@ jobs:
           # new test binary lands in agent-rest by default and the shards cannot drift apart or
           # overlap. Area filters, not a hash partition (see above).
           #
+          # The agent's integration tests are ONE test binary (`it`, crates/agent/tests/it.rs), one
+          # module per tests/*.rs file, so the area filters select by module path
+          # (`test(/^[^:]*serve[^:]*::/)` is "every file whose name contains serve"), always paired with
+          # `binary(=it)` so they cannot reach the lib's `serve::` unit tests.
+          #
           # Why two and not one: exec + jobs + notify as a single shard wedged the runner in the
           # test step on both attempts, twice (past nextest's global-timeout, RuntimeMaxSec and the
           # step timeout, with no log), though the same tests pass together in agent-rest, in a local
           # run (196 tests, 228s), and as these two halves. Cause not found; the halves are the
           # measured-good grouping.
           - name: agent-exec
-            filter: package(beyond-ai-agent) and kind(test) and (binary(~conformance) or binary(~exec_)) and not binary(~serve) and not binary(exec_endpoint_live) and not binary(sandbox_jobs_notify) and not binary(~notify_e2e)
+            filter: package(beyond-ai-agent) and binary(=it) and (test(/^[^:]*conformance[^:]*::/) or test(/^[^:]*exec_[^:]*::/)) and not test(/^[^:]*serve[^:]*::/) and not test(/^exec_endpoint_live::/) and not test(/^sandbox_jobs_notify::/) and not test(/^[^:]*notify_e2e[^:]*::/)
             extra: ""
           - name: agent-jobs
-            filter: package(beyond-ai-agent) and kind(test) and (binary(~jobs) or binary(~notify)) and not (binary(~conformance) or binary(~exec_)) and not binary(~serve) and not binary(exec_endpoint_live) and not binary(sandbox_jobs_notify) and not binary(~notify_e2e)
+            filter: package(beyond-ai-agent) and binary(=it) and (test(/^[^:]*jobs[^:]*::/) or test(/^[^:]*notify[^:]*::/)) and not (test(/^[^:]*conformance[^:]*::/) or test(/^[^:]*exec_[^:]*::/)) and not test(/^[^:]*serve[^:]*::/) and not test(/^exec_endpoint_live::/) and not test(/^sandbox_jobs_notify::/) and not test(/^[^:]*notify_e2e[^:]*::/)
             extra: ""
           - name: agent-rest
-            filter: package(beyond-ai-agent) and kind(test) and not (binary(~conformance) or binary(~exec_) or binary(~jobs) or binary(~notify)) and not binary(~serve) and not binary(exec_endpoint_live) and not binary(sandbox_jobs_notify) and not binary(~notify_e2e)
+            filter: package(beyond-ai-agent) and binary(=it) and not (test(/^[^:]*conformance[^:]*::/) or test(/^[^:]*exec_[^:]*::/) or test(/^[^:]*jobs[^:]*::/) or test(/^[^:]*notify[^:]*::/)) and not test(/^[^:]*serve[^:]*::/) and not test(/^exec_endpoint_live::/) and not test(/^sandbox_jobs_notify::/) and not test(/^[^:]*notify_e2e[^:]*::/)
             extra: ""
           # exec v1.4's end-to-end matrix and randomized orderings: real replicas behind a ring,
           # each case in three endpoint modes. Minutes of wall clock between them, so their own
           # shard rather than a slice of agent-rest's 10-minute budget.
           - name: agent-notify-e2e
-            filter: package(beyond-ai-agent) and binary(~notify_e2e)
+            filter: package(beyond-ai-agent) and binary(=it) and test(/^[^:]*notify_e2e[^:]*::/)
             extra: ""
           - name: agent-serve
-            filter: package(beyond-ai-agent) and kind(test) and binary(~serve)
+            filter: package(beyond-ai-agent) and binary(=it) and test(/^[^:]*serve[^:]*::/)
             extra: ""
           # The catch-all: every package the shards above do not own, selected by complement rather
           # than by name. Every shard compiles the whole workspace, so a crate missing from a
@@ -215,7 +220,7 @@ jobs:
           # — and it is what a large share of real sandboxes actually are. Running against a
           # GNU-flavoured image would quietly skip the code path most likely to be wrong.
           - name: exec-live
-            filter: package(beyond-ai-agent) and (binary(exec_endpoint_live) or binary(sandbox_jobs_notify))
+            filter: package(beyond-ai-agent) and binary(=it) and (test(/^exec_endpoint_live::/) or test(/^sandbox_jobs_notify::/))
             extra: ""
     steps:
       - uses: actions/checkout@v7

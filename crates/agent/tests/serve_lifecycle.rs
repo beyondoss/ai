@@ -6,7 +6,7 @@
 //! connection, and an unconfigured process does not POST at all.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::{Read, Write};
 use std::process::Stdio;

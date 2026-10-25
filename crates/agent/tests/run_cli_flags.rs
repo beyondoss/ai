@@ -1,7 +1,7 @@
 //! `run` e2e: Standalone CLI surface: `--version`/`--help`/`list-models`/`export`, and flags that reach the wire request untouched by a live turn.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::Write;
 use std::process::Stdio;

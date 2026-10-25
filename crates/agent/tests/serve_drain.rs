@@ -12,7 +12,7 @@
 //! - an in-flight run is given its grace to finish rather than being cut.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};

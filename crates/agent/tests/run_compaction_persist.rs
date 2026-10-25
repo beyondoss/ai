@@ -1,7 +1,7 @@
 //! `run` e2e: a compaction is persisted, and a session resumed past one reloads what the run held.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::Stdio;
 

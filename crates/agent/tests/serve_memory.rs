@@ -3,7 +3,7 @@
 //! covered on both surfaces (every other tool has a `run_*` and a `serve_*` e2e).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

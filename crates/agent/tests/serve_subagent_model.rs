@@ -3,7 +3,7 @@
 //! model, so after `set_model` every delegated child still ran on the model the session began with.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::Write;
 

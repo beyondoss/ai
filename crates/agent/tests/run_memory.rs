@@ -6,7 +6,7 @@
 //! backend seam.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 

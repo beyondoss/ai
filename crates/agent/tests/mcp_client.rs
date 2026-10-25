@@ -12,7 +12,7 @@
 //! matching `common::spawn_model_server`'s own idiom) since that transport can't be a subprocess.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::Write;
 use std::path::Path;

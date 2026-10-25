@@ -9,7 +9,7 @@
 //! Real `serve` processes, a real fixture that outlives them, a mock model.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

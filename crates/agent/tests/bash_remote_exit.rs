@@ -3,11 +3,12 @@
 //! on a streaming exec endpoint must be reached by it exactly as a local process group is: its
 //! stream closed, the endpoint killing the group.
 //!
-//! Its own test binary: `kill_live_jobs` kills every job in the process, which would take down any
-//! other suite's jobs running beside it.
+//! Needs its own process: `kill_live_jobs` kills every job in the process, which would take down any
+//! other suite's jobs running beside it. nextest runs each test in its own process; plain `cargo test`
+//! would put every suite in one.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::Stdio;
 use std::sync::Arc;

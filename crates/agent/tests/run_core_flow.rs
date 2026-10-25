@@ -1,7 +1,7 @@
 //! `run` e2e: One-shot `run` execution: tool round trips, refusal exit codes, text vs json mode, multi-message turns, stdin/@file input.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::Write;
 use std::process::Stdio;

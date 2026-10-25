@@ -6,8 +6,8 @@
 //! questions were refused. Each session now has its own hub, found by the calls its runs make.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
-mod mcp_tasks_env;
+use crate::common;
+use crate::mcp_tasks_env;
 
 use std::process::Stdio;
 use std::time::Duration;

@@ -11,11 +11,11 @@
 //! ```sh
 //! # any transparent transport (docker, ssh, kubectl, podman …)
 //! AGENT_LIVE_EXEC_CMD='docker exec my-container {}' \
-//!   cargo test -p beyond-ai-agent --test exec_endpoint_live -- --nocapture
+//!   cargo nextest run -p beyond-ai-agent -E 'test(/^exec_endpoint_live::/)' --no-capture
 //!
 //! # any HTTP endpoint speaking the exec protocol
 //! AGENT_LIVE_EXEC_URL=https://exec.example/run AGENT_LIVE_EXEC_HEADER='Authorization: Bearer …' \
-//!   cargo test -p beyond-ai-agent --test exec_endpoint_live -- --nocapture
+//!   cargo nextest run -p beyond-ai-agent -E 'test(/^exec_endpoint_live::/)' --no-capture
 //! ```
 //!
 //! `AGENT_LIVE_WORKDIR` names a directory that exists **on the target and not on this host** (default
@@ -32,7 +32,7 @@
 //! silent pass would be worse than no test.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use serde_json::json;
 

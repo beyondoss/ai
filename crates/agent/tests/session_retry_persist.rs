@@ -9,7 +9,7 @@
 // Test target: `.unwrap()`/`panic!` are how a test reports a failed setup.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashSet;
 use std::io::Write;

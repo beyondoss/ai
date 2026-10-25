@@ -6,7 +6,7 @@
 //! map HTTP-level errors (404/405/400) without breaking the existing upgrade path.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::process::Stdio;
 use std::time::{Duration, Instant};

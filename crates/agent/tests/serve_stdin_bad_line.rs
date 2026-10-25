@@ -8,7 +8,7 @@
 //! is discarded as it streams past, and the commands either side of them are answered.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::Write;
 

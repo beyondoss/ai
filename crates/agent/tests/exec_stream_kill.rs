@@ -3,7 +3,7 @@
 //! killing the command's whole process group, a backgrounded grandchild included.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

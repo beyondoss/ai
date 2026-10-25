@@ -116,7 +116,7 @@ cargo test -p beyond-ai --test smoke -- --ignored --nocapture
 description = "Live agent smoke: the real agent binary → real gateway → REAL Anthropic. Auto-loads .env; needs ANTHROPIC_API_KEY. Skips if unset. Bills a tiny real request."
 run = """
 if [ -f .env ]; then set -a; . ./.env; set +a; fi
-cargo test -p beyond-ai-agent --test smoke -- --ignored --nocapture
+cargo nextest run -p beyond-ai-agent -E 'test(/^smoke::/)' --run-ignored only --no-capture
 """
 
 [tasks."rates:sync"]

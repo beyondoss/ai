@@ -6,7 +6,7 @@
 //! (403) from "wrong replica, try another" (421) without speaking the agent protocol.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use common::grant::{Claims, Minter, Secrets};
 use common::service::{Options, Service};

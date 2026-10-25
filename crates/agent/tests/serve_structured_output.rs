@@ -5,7 +5,7 @@
 //! guarantee that one prompt's answer can never be reported as another's.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
+use crate::common;
 
 use std::io::{BufRead, Write};
 use std::process::ChildStdin;
