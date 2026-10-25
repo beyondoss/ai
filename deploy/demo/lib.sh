@@ -26,7 +26,7 @@ SANDBOX_PORT=8081
 # Where the sandbox runs: `fargate` (default, one shared sandbox service), `e2b` (one E2B microVM per
 # session, made by demo.sh) or `both`: everything the three use-case agents need (the Fargate sandbox
 # as the assistant's workspace host, E2B for the coding and browser agents, the stand-in managed-MCP
-# endpoint, and ECS exec on the agent). The same exec-stub either way.
+# endpoint, and ECS exec on the agent). The same execd either way.
 SANDBOX=${SANDBOX:-fargate}
 # `oidc` is a stack of its own for `demo.sh oidc`: no sandbox at all, an identity provider (Keycloak) and
 # the broker that signs users in and acts as them, and ECS Exec on the agent for its memory scan.
@@ -71,7 +71,7 @@ q() {
 }
 say() { echo "── $* ──"; }
 
-# The repo's own tools (sandbox, grant minter, chat client), built once from this checkout.
+# The repo's own tools (grant minter, chat client), built once from this checkout.
 demo_bin() {
   (cd "$ROOT" && cargo build -q -p beyond-ai-demo >&2) || return 1
   local dir

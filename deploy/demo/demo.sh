@@ -91,7 +91,7 @@ VMDIR=$WORK/vm                      # one file per session's E2B sandbox (e2b mo
 mkdir -p "$VMDIR"
 if [ "$USE_E2B" = 1 ]; then
   e2b_need_key || exit 2
-  STUB=$(stub_bin) || { echo "demo: could not build the static exec-stub" >&2; exit 1; }
+  EXECD=$(execd_bin) || { echo "demo: could not build the static execd" >&2; exit 1; }
   CA_FILE=$WORK/ca.pem
 fi
 
@@ -185,16 +185,21 @@ run_check() {
 
 # CloudWatch, filtered: [{t, m}] for a stream prefix since a time.
 cw() { # stream-prefix since-ms [filter-pattern]
+  local a b
+  case "${1:-}" in
+    sandbox/*)
+      # The sandbox's lines are execd's, turned into events by cw_aws and vm_logs (execd.jq). The pattern
+      # is applied to those events, not to the raw lines, so it is not sent to CloudWatch. An E2B sandbox's
+      # own log is in its VM; a Fargate one (the use cases' workspace host) is in CloudWatch. Both, merged
+      # by time.
+      a=$(cw_aws "$1" "$2")
+      b='[]'
+      [ "$USE_E2B" != 1 ] || b=$(vm_logs "" "$2")
+      jq -nc --argjson a "$a" --argjson b "$b" --arg sub "${3//\"/}" '($a + $b)|map(select(.m|contains($sub)))|sort_by(.t)'
+      return ;;
+  esac
   if [ "$USE_E2B" = 1 ]; then
-    # An E2B sandbox's own log is in its VM, not CloudWatch; a Fargate one (the use cases' workspace
-    # host) is in CloudWatch. Both, merged by time.
-    local a b
     case "${1:-}" in
-      sandbox/*)
-        a=$(cw_aws "$@")
-        b=$(vm_logs "${3//\"/}" "$2")
-        jq -nc --argjson a "$a" --argjson b "$b" '($a + $b)|sort_by(.t)'
-        return ;;
       "")
         a=$(cw_aws "$@")
         b=$(vm_logs "" "$2")
@@ -204,10 +209,13 @@ cw() { # stream-prefix since-ms [filter-pattern]
   fi
   cw_aws "$@"
 }
+# A line execd wrote becomes the events it stands for (execd.jq); every other line is kept as it is.
 cw_aws() {
-  command aws --region "$REGION" --output json logs filter-log-events --log-group-name "$LOG_GROUP" \
+  local out
+  out=$(command aws --region "$REGION" --output json logs filter-log-events --log-group-name "$LOG_GROUP" \
     ${1:+--log-stream-name-prefix "$1"} --start-time "$2" ${3:+--filter-pattern "$3"} \
-    --query 'events[].{t:timestamp,m:message}' 2>/dev/null || echo '[]'
+    --query 'events[].{t:timestamp,m:message}' 2>/dev/null) || out='[]'
+  jq -L "$HERE" -c 'include "execd"; [.[] | . as $e | [$e.m | execd_events | {t: .ts_ms, m: tojson}] as $x | if ($x | length) > 0 then $x[] else $e end]' <<<"$out"
 }
 
 # ---- the checks --------------------------------------------------------------------------------------

@@ -177,7 +177,7 @@ esac
 ''')
         os.chmod(curl, os.stat(curl).st_mode | stat.S_IXUSR)
         env = dict(os.environ, PATH=bindir + ":" + os.environ["PATH"], E2B_API_KEY="k", VMDIR=VMDIR,
-                   SANDBOX_PORT="8081", TAG_KEY="k", NAME="n", VM_PRIVATE="1", STUB="/dev/null", CA_FILE="/dev/null")
+                   SANDBOX_PORT="8081", TAG_KEY="k", NAME="n", VM_PRIVATE="1", EXECD="/dev/null", CA_FILE="/dev/null")
         p = subprocess.run(["bash", "-c", f'. "{HERE}/e2b.sh"; vm_for sess'], env=env, capture_output=True, text=True)
         self.assertNotEqual(p.returncode, 0)
         self.assertTrue(any("sandboxes/vmX" in l for l in lines("deleted")), p.stderr)

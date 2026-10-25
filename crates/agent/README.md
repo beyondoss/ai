@@ -206,12 +206,12 @@ v1.4 has the sandbox call back when a kept job ends
 An endpoint's response is capped at 16 MiB (`--exec-max-response-bytes`); a
 larger one is an error, not a truncation.
 
-Try it with the reference endpoint from `crates/demo`, no model needed. In one
+Try it with the `execd` endpoint, no model needed. In one
 terminal:
 
 ```sh
 mkdir -p /tmp/ws /tmp/ws-home
-cargo run -p beyond-ai-demo -- exec-stub \
+cargo run -p beyond-ai-execd -- \
   --listen 127.0.0.1:8081 --root /tmp/ws --home /tmp/ws-home
 ```
 

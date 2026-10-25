@@ -337,8 +337,10 @@ const kill = sorted.find(e => e.event === "agent_killed");
 const ready = sorted.find(e => e.event === "agent_ready");
 const reatt = sorted.find(e => e.event === "session_reattached");
 const jobs = [];
-for (const e of sorted) if (e.src === "sandbox" && e.event === "exec_start" && /sleep \d/.test((e.detail && e.detail.command) || "")) jobs.push({ from: e.t_ms, to: null });
-for (const j of jobs) { const end = sorted.find(e => e.event === "job_ended_callback" && e.t_ms > j.from && e.detail && e.detail.kind === "job_end" && e.detail.status === 200); j.to = end ? end.t_ms : run.run.ended_ms; }
+// A job's window: from its first callback (the proof of its `keep`, sent as the job is kept, so the
+// callback's start is when the job began) to the callback that ended it and the agent answered 200.
+for (const e of sorted) if (e.src === "sandbox" && e.event === "job_ended_callback" && e.detail && e.detail.kind === "keep_proof") jobs.push({ from: e.t_ms - (e.detail.took_ms || 0), job: e.detail.job, to: null });
+for (const j of jobs) { const end = sorted.find(e => e.event === "job_ended_callback" && e.t_ms > j.from && e.detail && e.detail.job === j.job && e.detail.kind === "job_end" && e.detail.status === 200); j.to = end ? end.t_ms : run.run.ended_ms; }
 
 /* ---- the clock, packets ---- */
 let t = END;            // virtual ms since T0; starts at the end so the page is complete on load

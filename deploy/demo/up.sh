@@ -508,7 +508,7 @@ fi
 
 if [ "$USE_FARGATE" = 1 ]; then
 SANDBOX_SCRIPT='printf "%s" "$CA_PEM" > /tmp/ca.pem
-exec /usr/local/bin/beyond-ai-demo exec-stub --listen 0.0.0.0:8081 --root /workspace --home /home/sandbox'
+exec /usr/local/bin/execd --listen 0.0.0.0:8081 --root /workspace --home /home/sandbox --kept-jobs-survive-idle --log-format json'
 TD_SANDBOX=$(jq -n --arg family "$P-sandbox" --arg exec "$(EXEC sandbox)" --argjson logs "$(LOGS sandbox)" \
   --arg img "$ECR/$P-sandbox:latest" --arg script "$SANDBOX_SCRIPT" --arg ca "$CA_PEM" \
   --arg usecases "$USECASES" --argjson flogs "$(LOGS front)" --arg fimg "$ECR/$P-front:latest" --arg ek "$(param_arn e2b-key)" --arg name "$NAME" --arg btpl "${BROWSER_TEMPLATE:-}" '{
@@ -627,7 +627,7 @@ case "$SANDBOX" in
     echo "          and the stand-in managed-MCP endpoint at $(svc_ip standin):$STANDIN_PORT" ;;
   load) echo "  sandbox none (the load proof: assistant-style bundles, no exec endpoint)" ;;
   oidc) echo "  sandbox none. The identity provider (Keycloak) and the broker are one task at $(svc_ip oidc):$OIDC_IDP_PORT / :$STANDIN_PORT / :$OIDC_CONTROL_PORT" ;;
-  *) echo "  sandbox Fargate: one shared exec-stub service" ;;
+  *) echo "  sandbox Fargate: one shared execd service" ;;
 esac
 echo "  next    ./deploy/demo/demo.sh        a scripted conversation, with a run record and report"
 echo "          ./deploy/demo/demo.sh kill   kill the agent mid-job; the session survives"
