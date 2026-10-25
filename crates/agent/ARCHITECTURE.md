@@ -5591,8 +5591,14 @@ counts how many sessions needed the walk; in a run with rolling deploys it is mo
 moved, not a rare case.
 
 **Empty session directories.** `take_session_lock` has to create `<id>/` before it can know this
-replica will own the session, because the lock lives inside it. A session that then never wrote a
-segment gives that directory back on **its own exit path**, where it still holds the lock: if the
+replica will own the session, because the lock lives inside it. Every session's exit path releases
+the lock, and a session that wrote a segment — one `stat` of `000001.jsonl` says so — does only that:
+no directory read, which on EFS is a round trip per ending session. Releases are also admitted
+**16 at a time** (`SESSION_UNLOCK_SLOTS`; the rest wait as async tasks, a slot is freed when its job
+ends): on a mount the replica's releases drain at about 100 sessions per second whatever the
+concurrency, so a mass close of 400 sessions otherwise parks 400 blocking-pool threads for 3 to 4 s
+each and every open behind them waits for a thread. A session that then never wrote a segment gives that directory back on
+the same path, where it still holds the lock: if the
 directory holds nothing but `lock`, the lock file is unlinked and `remove_dir` is attempted —
 `ENOTEMPTY` being the atomic "someone got a segment in after all, leave it alone" check, since
 `000001.jsonl` is created with `O_EXCL` before anything else and never deleted. This is the only

@@ -163,6 +163,33 @@ const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// every other transient session refusal gives.
 const SESSION_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many session releases may be on the blocking pool at once. A release is a few round trips to the
+/// session store's mount, and on EFS a mass close (hundreds of sessions ending in the same second)
+/// measured about 100 sessions per second however many ran at once: 24 at a time took 0.2 s each, 400
+/// at a time 3 to 4 s each, every one of them holding a pool thread until opens could no longer get
+/// one. Sixteen in flight drains the same close at the same rate and leaves the pool, and the mount's
+/// queue, to the opens. The waiters are the ending sessions' own tasks, already counted by
+/// `--max-live-sessions`; each slot is freed when its job ends.
+const SESSION_UNLOCK_SLOTS: usize = 16;
+static SESSION_UNLOCK: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(SESSION_UNLOCK_SLOTS);
+
+/// Run a release on the blocking pool once one of `slots` is free. The permit moves into the job, so a
+/// waiter that is dropped mid-job cannot free a slot while the job still runs.
+async fn run_release_bounded<F>(slots: &'static tokio::sync::Semaphore, f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    let Ok(permit) = slots.acquire().await else {
+        return;
+    };
+    let _ = crate::blocking::spawn(crate::blocking::Site::SessionUnlock, move || {
+        let _permit = permit;
+        f();
+    })
+    .await;
+}
+
 /// How often the server sends an unsolicited `Ping` so an idle mobile connection isn't reaped by
 /// NAT/proxies. Also the granularity at which a wholly-dead socket is noticed (the ping send fails).
 const PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -601,15 +628,21 @@ where
     }
 }
 
-/// Release a session's lock and, if the session never got far enough to write a segment, take the
-/// directory [`take_session_lock`] had to create in order to hold that lock.
+/// Release a session's lock — on **every** session end — and, if the session never got far enough to
+/// write a segment, take the directory [`take_session_lock`] had to create in order to hold that lock.
 ///
-/// This runs **only on the creator's own failure path** — this task holds the lock, and the session
-/// body has already ended — which is what makes it safe. A would-be creator evaluating a delete
-/// predicate could not do this: its `rmdir` races another replica's `create_dir_all` + `O_EXCL`
-/// segment create, and on NFS/EFS attribute staleness would let it delete a directory whose fresh
-/// segment it simply had not seen yet. Anything this misses (a lock that could not be taken at all,
-/// a replica that died mid-start) is left for an out-of-band sweep; see ARCHITECTURE.md.
+/// A session that wrote a segment (one `stat` of `000001.jsonl` says so; it is created before
+/// anything else and never deleted) only has its lock dropped: no directory read, since on a network
+/// filesystem that is a round trip per session end and a mass close puts hundreds of them on the
+/// blocking pool at once. Only a session with no first segment goes on to look at the directory.
+///
+/// The directory is given back **only on the creator's own failure path** — this task holds the lock,
+/// and the session body has already ended — which is what makes it safe. A would-be creator
+/// evaluating a delete predicate could not do this: its `rmdir` races another replica's
+/// `create_dir_all` + `O_EXCL` segment create, and on NFS/EFS attribute staleness would let it delete
+/// a directory whose fresh segment it simply had not seen yet. Anything this misses (a lock that
+/// could not be taken at all, a replica that died mid-start) is left for an out-of-band sweep; see
+/// ARCHITECTURE.md.
 ///
 /// `remove_dir` *is* the emptiness check, and an atomic one: `000001.jsonl` is created with `O_EXCL`
 /// before anything else and never deleted, so a directory holding nothing but its lock files has never been
@@ -621,8 +654,12 @@ async fn release_session_lock(lock: Option<SessionLock>, path: Option<std::path:
     let (Some(lock), Some(path)) = (lock, path) else {
         return;
     };
-    // Off the runtime thread: three network-filesystem calls and a descriptor close.
-    let _ = crate::blocking::spawn(crate::blocking::Site::SessionUnlock, move || {
+    // Off the runtime thread: network-filesystem calls and descriptor closes.
+    run_release_bounded(&SESSION_UNLOCK, move || {
+        if crate::session_store::session_has_first_segment(&path) {
+            drop(lock);
+            return;
+        }
         // The lock files are `file_lock`'s to name and unlink. Released (descriptors closed) before
         // they are unlinked: an NFS client silly-renames a file it still holds open to `.nfs*`, and
         // that leftover would keep the directory from ever being removed.
@@ -4059,6 +4096,33 @@ mod tests {
             !path.exists(),
             "an empty session directory must not outlive its start"
         );
+    }
+
+    /// A mass close ends hundreds of sessions in the same instant. Each release is a few filesystem
+    /// round trips, and on a network mount they all queue behind each other, so releases are admitted
+    /// [`SESSION_UNLOCK_SLOTS`] at a time rather than each taking a blocking-pool thread for the
+    /// whole drain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_releases_run_a_bounded_number_at_a_time() {
+        use std::sync::atomic::AtomicUsize;
+        static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+        let (running, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let mut all = Vec::new();
+        for _ in 0..64 {
+            let (running, peak) = (running.clone(), peak.clone());
+            all.push(tokio::spawn(run_release_bounded(&SLOTS, move || {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(5));
+                running.fetch_sub(1, Ordering::SeqCst);
+            })));
+        }
+        for t in all {
+            t.await.unwrap();
+        }
+        assert_eq!(running.load(Ordering::SeqCst), 0);
+        let peak = peak.load(Ordering::SeqCst);
+        assert!((1..=4).contains(&peak), "at most 4 at once, saw {peak}");
     }
 
     /// The other half of the same rule: a directory that holds a segment is a real session, so it is
