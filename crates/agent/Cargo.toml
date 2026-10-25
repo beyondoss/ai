@@ -4,6 +4,7 @@ version = "0.1.0"
 autotests = false
 edition.workspace = true
 license.workspace = true
+readme = "README.md"
 rust-version.workspace = true
 description = "Beyond agent harness — CLI (one-shot `run` and headless `serve`)"
 

@@ -3,7 +3,9 @@ name = "beyond-ai-providers"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+readme = "README.md"
 rust-version.workspace = true
+description = "Provider table, model catalog and pricing contract shared by the Beyond AI gateway and agent"
 
 [lib]
 name = "providers"
