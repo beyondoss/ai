@@ -510,6 +510,12 @@ CI runs on Linux only — the only platform this project ships or supports (see 
 once; a test that passes only on the retry is reported as a flaky-test warning and counted in the job
 summary, so a green run never silently means a flaky one.
 
+The test binaries are compiled once (a `cargo nextest archive` job) and every shard runs its slice
+of that archive; the exception is `agent-code-mode`, which needs `--features code-mode` and compiles
+only the agent's own dependency graph. The Rust caches are written only by a push to main
+(`cache-warm.yml`) and restored by every other run. `gateway-stress` and `build (release)` run in the
+merge queue, not on the pull request; `Check` accepts those two as skipped on a `pull_request` only.
+
 ### Dependency advisories
 
 `mise run audit` runs `cargo audit` (RustSec advisories only; no license or duplicate-version

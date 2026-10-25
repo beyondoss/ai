@@ -1,0 +1,113 @@
+name: Cache warm
+# Writes the Rust build caches that ci.yml restores. Nothing is tested here.
+#
+# Why a separate workflow on main: GitHub lets a run restore caches only from its own ref or the
+# default branch. CI never ran on main (pull_request runs are `refs/pull/N/merge`, merge-queue runs
+# `refs/heads/gh-readonly-queue/main/pr-*`), so every cache it saved sat under a ref no later run
+# could read, and every Swatinem/rust-cache restore logged `No cache found.` (runs 40155114591,
+# 40154570805, 40152991962). Those per-PR entries were also 450-630 MB each, ~9 GB of the 10 GB cache
+# budget, so the repo was over budget and entries churned. Now only a push to main saves (`save-if` in
+# ci.yml is false everywhere else), and pull_request and merge_group runs restore main's entries.
+#
+# The bound: one entry per shared key, so four (`tests`, `clippy`, `code-mode`, `release`). The key
+# rotates when Cargo.lock, the toolchain or RUSTFLAGS change; the older entry is not used again and
+# is evicted after 7 days unused. Restore falls back to the newest entry of the same shared key, so
+# a PR that changes the lock still starts from a near-complete cache. rust-cache saves only
+# dependencies (it deletes the workspace crates' own artifacts first), so main's own commits do not
+# make an entry stale: when the exact key already exists the build below is skipped.
+#
+# Each job builds exactly what its consumer in ci.yml builds (same RUSTFLAGS, profile, features),
+# or the entry would hold artifacts the consumer never reuses. Keep them in step with ci.yml.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+# Two pushes to main in quick succession: let the running one finish (cancelling would save nothing)
+# and keep only the newest waiting.
+concurrency:
+  group: cache-warm
+  cancel-in-progress: false
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CARGO_INCREMENTAL: "0"
+  # No debuginfo in test/dev builds. Line tables were ~70% of every test binary (a gateway test
+  # binary: 72 MB, of which .debug_line 22 + .debug_str 17 + .debug_info 10), and the binaries are the
+  # tests archive that every shard downloads: gateway-only archive 1.31 GiB -> 479 MiB, compile CPU
+  # time -22%. A panic still names its file:line (that comes from the panic location, not debuginfo);
+  # only RUST_BACKTRACE frames lose theirs.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+jobs:
+  tests:
+    name: warm (tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+        id: cache
+        with:
+          shared-key: tests
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@v2
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          tool: nextest
+      # The archive build of ci.yml's `archive` job, minus the archive.
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: cargo nextest run --workspace --locked --profile ci --no-run
+  clippy:
+    name: warm (clippy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - run: rustup component add clippy
+      - uses: Swatinem/rust-cache@v2
+        id: cache
+        with:
+          shared-key: clippy
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Both invocations of ci.yml's `clippy` job: the default graph and the `code-mode` one.
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: mise check:rs
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: cargo clippy -p beyond-ai-agent --all-targets --features code-mode --locked -- -D warnings
+  code-mode:
+    name: warm (code-mode)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+        id: cache
+        with:
+          shared-key: code-mode
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@v2
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          tool: nextest
+      # The `agent-code-mode` shard's compile in ci.yml.
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: cargo nextest run -p beyond-ai-agent --locked --profile ci --features code-mode --no-run
+  release:
+    name: warm (release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+        id: cache
+        with:
+          shared-key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: mise build:rs:release
