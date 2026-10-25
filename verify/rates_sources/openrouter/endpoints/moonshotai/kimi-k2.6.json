@@ -18,10 +18,10 @@
         "context_length": 262144,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000004",
-          "discount": 0,
-          "input_cache_read": "0.00000016",
-          "prompt": "0.00000095"
+          "completion": "0.000001892",
+          "discount": 0.527,
+          "input_cache_read": "0.00000007568",
+          "prompt": "0.00000044935"
         },
         "provider_name": "Baidu",
         "quantization": "fp4",
@@ -124,8 +124,8 @@
         "pricing": {
           "completion": "0.0000032",
           "discount": 0,
-          "input_cache_read": "0.0000001215",
-          "prompt": "0.000000441"
+          "input_cache_read": "0.000000169",
+          "prompt": "0.0000006026"
         },
         "provider_name": "Inceptron",
         "quantization": "int4",

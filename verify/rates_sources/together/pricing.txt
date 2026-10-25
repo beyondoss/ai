@@ -37,6 +37,7 @@ Managed Storage
 Store model weights & data securely
 GB300
 GB200
+B300
 B200
 H200
 H100
@@ -70,40 +71,24 @@ Show all
 Developers
 Documentation
 Technical docs for Together AI
+Blog
+Our latest news & blog posts
 Demos
 Our open-source demo apps
 Cookbooks
 Practical implementation guides
-Voice Agents
-Build voice agents for production
 Open-source AI
 Build better with open models
 Together Link
 Run open models in your harness
+Events
+Explore our events calendar
 Model Library
 Playground
 Together Chat
 Which LLM to use
 Open-source ROI calculator
-Company
-Resources
-Customer stories
-Testimonials from AI Natives
-Startup accelerator
-Build and scale your startup
-Customer support
-Find answers to your questions
-Blog
-Our latest news & blog posts
-Events
-Explore our events calendar
-Company
-About
-Get to know us
-Careers
-Join our mission
-Press
-Together in the news
+Customers
 Pricing
 Serverless Inference
 High-performance inference as APIs
@@ -137,6 +122,7 @@ Managed Storage
 Store model weights & data securely
 GB300
 GB200
+B300
 B200
 H200
 H100
@@ -167,39 +153,23 @@ DSGym
 Show all
 Documentation
 Technical docs for Together AI
+Blog
+Our latest news & blog posts
 Demos
 Our open-source demo apps
 Cookbooks
 Practical implementation guides
-Voice Agents
-Build voice agents for production
 Open-source AI
 Build better with open models
 Together Link
 Run open models in your harness
+Events
+Explore our events calendar
 Model Library
 Playground
 Together Chat
 Which LLM to use
 Open-source ROI calculator
-Resources
-Customer stories
-Testimonials from AI Natives
-Startup accelerator
-Build and scale your startup
-Customer support
-Find answers to your questions
-Blog
-Our latest news & blog posts
-Events
-Explore our events calendar
-Company
-About
-Get to know us
-Careers
-Join our mission
-Press
-Together in the news
 Contact sales
 Contact sales
 Sign in
@@ -245,10 +215,6 @@ Qwen3.8-2.4T-A95B
 $2.00
 $0.25 (cached)
 $6.00
-DeepSeek V4 Pro 0813
-$1.32
-$0.13 (cached)
-$3.96
 GLM-5.3
 $1.40
 $0.26 (cached)
@@ -257,10 +223,6 @@ GLM-5.3-Flash
 $0.15
 $0.03 (cached)
 $0.50
-DeepSeek V4.1 Flash
-$0.30
-$0.006 (cached)
-$1.20
 Muse Spark Open
 $1.25
 $0.15 (cached)
@@ -272,13 +234,14 @@ Reflection Beam
 $0.40
 $0.04 (cached)
 $1.20
+MiniMax M3.1 Flash
+$0.15
+$0.015 (cached)
+$0.60
 DeepSeek V4.1 Flash 1017
 $0.30
 $0.006 (cached)
 $1.20
-Gemma 4 31B
-$0.39
-$0.97
 MiniMax M3
 $0.30
 $0.06 (cached)
@@ -297,10 +260,10 @@ Inkling
 $1.00
 $0.17 (cached)
 $4.05
-DeepSeek V4 Flash 0731
-$0.14
-$0.03 (cached)
-$0.28
+DeepSeek V4 Pro 0813
+$1.32
+$0.13 (cached)
+$3.96
 Qwen3.8 Flash
 $0.15
 $0.47
@@ -312,6 +275,10 @@ Qwen3.7-Max
 $1.50
 $0.30 (cached)
 $4.50
+DeepSeek V4.1 Flash
+$0.30
+$0.006 (cached)
+$1.20
 Muse Glimmer 30B
 $0.35
 $0.04 (cached)
@@ -332,13 +299,6 @@ $1.25
 Rnj-1 Instruct
 $0.15
 $0.15
-Llama 3.3 70B
-$1.04
-$1.04
-MiniMax M2.7
-$0.30
-$0.06 (cached)
-$1.20
 Qwen3.6-Plus
 $0.50
 $3.00
@@ -368,21 +328,18 @@ GLM-5.3-Flash
 $0.15
 $0.03 (cached)
 $0.50
-DeepSeek V4.1 Flash
-$0.30
-$0.006 (cached)
-$1.20
 Muse Spark Open
 $1.25
 $0.15 (cached)
 $4.25
+MiniMax M3.1 Flash
+$0.15
+$0.015 (cached)
+$0.60
 DeepSeek V4.1 Flash 1017
 $0.30
 $0.006 (cached)
 $1.20
-Gemma 4 31B
-$0.39
-$0.97
 MiniMax M3
 $0.30
 $0.06 (cached)
@@ -404,6 +361,10 @@ NVIDIA Nemotron 3.5 Super VL
 $0.15
 $0.02 (cached)
 $0.50
+DeepSeek V4.1 Flash
+$0.30
+$0.006 (cached)
+$1.20
 Muse Glimmer 30B
 $0.35
 $0.04 (cached)
@@ -503,25 +464,13 @@ Qwen Image
 $0.0058
 -
 -
-Google Imagen 4.0 Fast
-$0.02
--
--
 ByteDance Seedream 4.0
 $0.03
--
--
-Google Imagen 4.0 Preview
-$0.04
 -
 -
 Gemini Flash Image 2.5 (Nano Banana)
 -
 $0.039
--
-Google Imagen 4.0 Ultra
-$0.06
--
 -
 ByteDance Seedream 3.0
 $0.018
@@ -564,28 +513,16 @@ HappyHorse 1.1 I2V
 $0.14
 HappyHorse 1.1 R2V
 $0.14
-Kling 1.6 Standard
-$0.19
-Kling 2.1 Master
-$0.92
-Kling 2.1 Pro
-$0.32
-Kling 2.1 Standard
-$0.18
 Vidu Q1
 $0.22
 Qwen3.6-Plus
 $0.50
-Sora 2
-$0.80
 PixVerse v5
 $0.30
 ByteDance Seedance 1.0 Lite
 $0.14
 ByteDance Seedance 1.0 Pro
 $0.57
-Google Veo 2.0
-$2.50
 MiniMax Hailuo 02
 $0.49
 MiniMax 01 Director
@@ -951,19 +888,25 @@ Start building on Together AI
 From optimized training and model shaping to large-scale production inference
 Get Started now
 Products
-Accelerated Compute
-Together Link
 Serverless Inference
+Batch Inference
 Provisioned Throughput
-Dedicated Inference
+Dedicated Model Inference
+Dedicated Container Inference
+Together Link
 Fine-Tuning
-Sandbox
+Post-Training
 Evaluations
+GPU Clusters
+Sandbox
 Models
 See all models
+ZAI
+Moonshot AI
+MiniMax AI
 DeepSeek
-Meta
 Qwen
+Meta
 Google
 OpenAI
 Mistral AI
@@ -973,6 +916,7 @@ Research
 Docs
 Open-source AI
 OSS ROI calculator
+Voice Agents
 Pricing
 Pricing overview
 Inference
@@ -980,10 +924,14 @@ Fine-Tuning
 GPU Clusters
 Resources
 Blog
+Customer Stories
+Startup Accelerator
+Support
+Company
 About us
 Careers
-Customer Stories
-Support
+Events
+Press
 Privacy Policy
 Terms of service
 Cookie Policy

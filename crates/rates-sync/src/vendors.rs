@@ -209,31 +209,57 @@ pub struct OpenAi {
     specialized: BTreeMap<&'static str, Table>,
 }
 
+/// Cache writes are published per retention: 30 minutes (the cache write rate this reader
+/// returns) and 12 hours (read for the header check only; the rate table has no 12-hour tier).
 const OA_FLAGSHIP: &[&str] = &[
     "Model",
     "Short context input",
-    "Short context cached input",
-    "Short context cache writes",
     "Short context output",
+    "Short context cached input",
+    "Short context 30m write",
+    "Short context 12h write",
     "Long context input",
-    "Long context cached input",
-    "Long context cache writes",
     "Long context output",
+    "Long context cached input",
+    "Long context 30m write",
+    "Long context 12h write",
 ];
-const OA_SPECIALIZED: &[&str] = &["Category", "Model", "Input", "Cached input", "Output"];
+const OA_NARROW: &[&str] = &["Model", "Input", "Output", "Cached input"];
+const OA_SPECIALIZED: &[&str] = &["Category", "Model", "Input", "Output", "Cached input"];
 
 pub fn openai(md: &str) -> Result<OpenAi> {
     let ts = tables(md)?;
     let mut flagship = BTreeMap::new();
     for (tier, label) in [
         ("standard", "### Standard pricing data"),
-        ("flex", "### Flex pricing data"),
+        ("flex", "#### Flex"),
         ("fast", "### Fast pricing data"),
         ("ultrafast", "### Ultrafast pricing data"),
     ] {
-        let t = md::table_labelled(&ts, label).map_err(|e| format!("OpenAI pricing: {e}"))?;
+        // The page repeats a tier's heading under its other model groups (the cyber models carry
+        // their own "Standard pricing data"); the flagship table is the first in the document.
+        let i = ts
+            .iter()
+            .position(|t| t.context.first().map(String::as_str) == Some(label))
+            .ok_or_else(|| format!("OpenAI pricing: no table under {label:?}"))?;
+        let mut t = ts[i].clone();
         t.expect_header(OA_FLAGSHIP, label)?;
-        flagship.insert(tier, t.clone());
+        // The older models follow in a narrow table with no heading of its own, right after the
+        // wide one: input, output and cached input only. Its rows join the tier, no long context
+        // and no cache write.
+        if let Some(n) = ts.get(i + 1).filter(|n| {
+            n.header
+                .iter()
+                .map(String::as_str)
+                .eq(OA_NARROW.iter().copied())
+        }) {
+            for r in &n.rows {
+                let mut row = r.clone();
+                row.resize(OA_FLAGSHIP.len(), "-".to_owned());
+                t.rows.push(row);
+            }
+        }
+        flagship.insert(tier, t);
     }
     let mut specialized = BTreeMap::new();
     let spec: Vec<&Table> = ts
@@ -296,20 +322,20 @@ impl OpenAi {
             ([r], []) => {
                 let short = Published {
                     input: dollars(&r[1])?,
-                    cache_read: opt_dollars(&r[2])?,
-                    cache_write: opt_dollars(&r[3])?,
-                    output: Some(dollars(&r[4])?),
+                    cache_read: opt_dollars(&r[3])?,
+                    cache_write: opt_dollars(&r[4])?,
+                    output: Some(dollars(&r[2])?),
                     cache_write_1h: None,
                 };
-                let long_cells = [&r[5], &r[6], &r[7], &r[8]];
+                let long_cells = [&r[6], &r[7], &r[8], &r[9]];
                 let long = if long_cells.iter().all(|c| opt_dollars(c).ok() == Some(None)) {
                     None
                 } else {
                     Some(Published {
-                        input: dollars(&r[5])?,
-                        cache_read: opt_dollars(&r[6])?,
-                        cache_write: opt_dollars(&r[7])?,
-                        output: Some(dollars(&r[8])?),
+                        input: dollars(&r[6])?,
+                        cache_read: opt_dollars(&r[8])?,
+                        cache_write: opt_dollars(&r[9])?,
+                        output: Some(dollars(&r[7])?),
                         cache_write_1h: None,
                     })
                 };
@@ -318,8 +344,8 @@ impl OpenAi {
             ([], [r]) => Ok(Some(OaTier {
                 short: Published {
                     input: dollars(&r[2])?,
-                    cache_read: opt_dollars(&r[3])?,
-                    output: opt_dollars(&r[4])?,
+                    cache_read: opt_dollars(&r[4])?,
+                    output: opt_dollars(&r[3])?,
                     cache_write: None,
                     cache_write_1h: None,
                 },
@@ -453,7 +479,7 @@ pub fn xai_page(md: &str, id: &str) -> Result<(Published, Published, u64)> {
     }
 }
 
-// --- DeepSeek: api-docs.deepseek.com/quick_start/pricing (HTML only) --------------------------
+// --- DeepSeek: api-docs.deepseek.com/quick_start/pricing/ (HTML only) --------------------------
 
 #[derive(Clone, Copy, Debug)]
 pub struct DeepSeekModel {

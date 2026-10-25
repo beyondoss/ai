@@ -5,9 +5,9 @@
         "context_length": 1000000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000132",
+          "completion": "0.00000066",
           "discount": 0,
-          "input_cache_read": "0.000000033",
+          "input_cache_read": "0.0000000165",
           "overrides": [
             {
               "completion": "0.00000132",
@@ -24,7 +24,7 @@
               "utc_start": 1400
             }
           ],
-          "prompt": "0.00000033"
+          "prompt": "0.000000165"
         },
         "provider_name": "Alibaba",
         "quantization": "unknown",
@@ -47,10 +47,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000012",
-          "discount": 0,
-          "input_cache_read": "0.000000006",
-          "prompt": "0.0000003"
+          "completion": "0.0000002148",
+          "discount": 0.821,
+          "input_cache_read": "0.000000001074",
+          "prompt": "0.0000000537"
         },
         "provider_name": "Baidu",
         "quantization": "fp8",
@@ -94,6 +94,19 @@
         "provider_name": "BaseTen",
         "quantization": "unknown",
         "tag": "baseten/us"
+      },
+      {
+        "context_length": 1048576,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000012",
+          "discount": 0,
+          "input_cache_read": "0.000000003",
+          "prompt": "0.0000003"
+        },
+        "provider_name": "Cohere",
+        "quantization": "unknown",
+        "tag": "cohere"
       },
       {
         "context_length": 1048576,
@@ -177,10 +190,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000009",
+          "completion": "0.00000066",
           "discount": 0,
           "input_cache_read": "0.000000006",
-          "prompt": "0.000000225"
+          "prompt": "0.000000165"
         },
         "provider_name": "DigitalOcean",
         "quantization": "unknown",
@@ -210,7 +223,7 @@
         },
         "provider_name": "Fireworks",
         "quantization": "unknown",
-        "tag": "fireworks/flex"
+        "tag": "fireworks/spot"
       },
       {
         "context_length": 1048576,
@@ -239,6 +252,32 @@
         "tag": "gmicloud/fp8"
       },
       {
+        "context_length": 1048576,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.0000012",
+          "discount": 0,
+          "input_cache_read": "0.00000003",
+          "prompt": "0.0000003"
+        },
+        "provider_name": "Google",
+        "quantization": "unknown",
+        "tag": "google-vertex/global"
+      },
+      {
+        "context_length": 1040000,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.000000645",
+          "discount": 0,
+          "input_cache_read": "0.000000008",
+          "prompt": "0.000000103"
+        },
+        "provider_name": "InferenceNet",
+        "quantization": "fp8",
+        "tag": "inference-net/fp8"
+      },
+      {
         "context_length": 1040000,
         "max_prompt_tokens": null,
         "pricing": {
@@ -249,20 +288,7 @@
         },
         "provider_name": "InferenceNet",
         "quantization": "fp8",
-        "tag": "inference-net/fp8"
-      },
-      {
-        "context_length": 1048576,
-        "max_prompt_tokens": null,
-        "pricing": {
-          "completion": "0.00000075",
-          "discount": 0,
-          "input_cache_read": "0.000000006",
-          "prompt": "0.00000027"
-        },
-        "provider_name": "Ionstream",
-        "quantization": "unknown",
-        "tag": "ionstream"
+        "tag": "inference-net/us"
       },
       {
         "context_length": 1048576,
@@ -281,6 +307,18 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
+          "completion": "0.000001",
+          "discount": 0,
+          "prompt": "0.0000002"
+        },
+        "provider_name": "Mancer 2",
+        "quantization": "fp8",
+        "tag": "mancer/fp8"
+      },
+      {
+        "context_length": 1048576,
+        "max_prompt_tokens": null,
+        "pricing": {
           "completion": "0.0000012",
           "discount": 0,
           "input_cache_read": "0.00000003",
@@ -294,10 +332,23 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
+          "completion": "0.00000067",
+          "discount": 0,
+          "input_cache_read": "0.000000006",
+          "prompt": "0.00000017"
+        },
+        "provider_name": "ModelRun",
+        "quantization": "fp4",
+        "tag": "modelrun/fp4"
+      },
+      {
+        "context_length": 1048576,
+        "max_prompt_tokens": null,
+        "pricing": {
           "completion": "0.0000006",
           "discount": 0,
-          "input_cache_read": "0.000000007",
-          "prompt": "0.000000084"
+          "input_cache_read": "0.00000001",
+          "prompt": "0.0000001"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -309,6 +360,7 @@
         "pricing": {
           "completion": "0.0000012",
           "discount": 0,
+          "input_cache_read": "0.00000001",
           "prompt": "0.0000003"
         },
         "provider_name": "Nebius",
@@ -332,10 +384,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000012",
+          "completion": "0.000001",
           "discount": 0,
-          "input_cache_read": "0.0000000016",
-          "prompt": "0.000000056"
+          "input_cache_read": "0.000000015",
+          "prompt": "0.00000002"
         },
         "provider_name": "OpenInference",
         "quantization": "fp4",
@@ -373,12 +425,25 @@
         "pricing": {
           "completion": "0.0000012",
           "discount": 0,
-          "input_cache_read": "0.00000003",
+          "input_cache_read": "0.000000006",
           "prompt": "0.0000003"
         },
         "provider_name": "PrimeIntellect",
         "quantization": "unknown",
         "tag": "primeintellect"
+      },
+      {
+        "context_length": 1048576,
+        "max_prompt_tokens": null,
+        "pricing": {
+          "completion": "0.00000084",
+          "discount": 0.3,
+          "input_cache_read": "0.000000007",
+          "prompt": "0.000000105"
+        },
+        "provider_name": "Reka",
+        "quantization": "unknown",
+        "tag": "reka"
       },
       {
         "context_length": 1048576,
@@ -397,10 +462,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000015",
+          "completion": "0.00000025",
           "discount": 0,
-          "input_cache_read": "0.000000006735",
-          "prompt": "0.000000101"
+          "input_cache_read": "0.000000006",
+          "prompt": "0.00000009"
         },
         "provider_name": "Sail Research",
         "quantization": "fp4",
@@ -410,10 +475,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000015",
+          "completion": "0.00000025",
           "discount": 0,
-          "input_cache_read": "0.000000006735",
-          "prompt": "0.000000101"
+          "input_cache_read": "0.000000006",
+          "prompt": "0.00000009"
         },
         "provider_name": "Sail Research",
         "quantization": "fp4",
@@ -477,8 +542,8 @@
         "pricing": {
           "completion": "0.00000065",
           "discount": 0,
-          "input_cache_read": "0.000000006",
-          "prompt": "0.00000016"
+          "input_cache_read": "0.0000000079",
+          "prompt": "0.0000001"
         },
         "provider_name": "Wafer",
         "quantization": "mxfp4",
