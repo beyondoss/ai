@@ -259,6 +259,7 @@ impl Broker {
         match (req.method.as_str(), seg.as_slice()) {
             ("POST", ["connect", "start"]) => self.connect_start(&body),
             ("POST", ["sessions", "bind"]) => self.bind(&body),
+            ("POST", ["sessions", "unbind"]) => self.unbind(&body),
             ("GET", ["connections", id]) => {
                 self.connection_view(id, req.query("audit").is_some()).await
             }
@@ -534,6 +535,29 @@ impl Broker {
             200,
             json!({"bound": true, "connection": connection, "sub": sub}),
         )
+    }
+
+    /// A session ended: every binding it has goes, so its token reaches nothing from the next call.
+    /// Unbinding a session with none is fine.
+    fn unbind(&self, body: &Value) -> Resp {
+        let (Some(tenant), Some(session)) = (body["tenant"].as_str(), body["session"].as_str())
+        else {
+            return reply(400, json!({"error": "tenant and session are required"}));
+        };
+        let prefix = bind_key(tenant, session, "");
+        let mut st = self.lock();
+        let before = st.bindings.len();
+        st.bindings.retain(|k, _| !k.starts_with(&prefix));
+        let removed = before - st.bindings.len();
+        if removed > 0 {
+            self.persist_bindings(&st.bindings);
+        }
+        drop(st);
+        line(
+            "session_unbound",
+            json!({"tenant": tenant, "session": session, "bindings": removed}),
+        );
+        reply(200, json!({"unbound": removed}))
     }
 
     async fn connection_view(&self, id: &str, audit: bool) -> Resp {

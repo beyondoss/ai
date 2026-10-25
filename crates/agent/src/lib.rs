@@ -21,6 +21,7 @@ pub mod approval;
 pub mod auth_credential_source;
 pub mod auth_store;
 pub mod bundle;
+pub mod conformance;
 pub mod exec_endpoint;
 pub mod export;
 pub mod file_lock;

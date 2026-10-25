@@ -55,6 +55,10 @@ connection is unknown (404), belongs to another tenant or connector (403), is no
 is already bound to a different connection (409). Binding the same pair again is a no-op. The binding is
 persisted. A session has **exactly one** connection per connector, for its life.
 
+`POST /sessions/unbind {tenant, session}` (control plane) is what a deleted session does: every binding of
+the session goes, persisted, and its token reaches nothing from the next call. Unbinding a session with no
+bindings is a no-op.
+
 ### 3. A call
 
 `POST /managed/<connector>/mcp` with `Authorization: Bearer bmc_v1…`:
