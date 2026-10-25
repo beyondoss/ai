@@ -113,6 +113,9 @@ folder (about 32 round trips at every open without one).
   names it. `python3 deploy/demo/front_conformance.py` runs the exec front conformance kit against
   `front.py` with a local substrate (no E2B) and lists what the demo front does not do: no tenants or
   VM cap, no agent token, and a VM that dies is noticed by the next request, not at once.
+  `python3 deploy/demo/bundle_conformance.py` does the same for the bundle path (`uc_bundle`) with a local
+  stand-in for S3: nothing reads the source at build, so unsafe entries become bundles; the S3 link is
+  https and signed but lasts 6 h.
 - **browser**: the browser connector is the sandbox, and its address is the front too
   (`/mcp/<session>`). The agent offers the browser's tools at open from a list saved in the bundle
   (`.mcp-tools.json`, made at bundle build by `mcp-tools.sh` running `rustwright-mcp` once), so nothing

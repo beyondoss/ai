@@ -28,6 +28,8 @@ pub const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
 /// A reference connector broker, and its broken modes, for the broker conformance kit's own tests.
 pub mod broker_mock;
+/// A reference bundle deploy and store, and its broken modes, for the bundle conformance kit's own tests.
+pub mod bundle_mock;
 /// A stand-in exec endpoint (the sandbox side of the exec protocol).
 pub mod exec_mock;
 /// A reference exec front, and its broken modes, for the front conformance kit's own tests.

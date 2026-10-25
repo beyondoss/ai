@@ -1,6 +1,6 @@
 //! The conformance kits for the parts of Beyond that sit behind this repo's contracts (`BEYOND.md`,
-//! "Conformance"): [`broker`] for the connector broker. (The exec protocol's kit is
-//! `exec_endpoint::conformance`.)
+//! "Conformance"): [`broker`] for the connector broker and [`bundle`] for the bundle store. (The exec
+//! protocol's kit is `exec_endpoint::conformance`.)
 //!
 //! A kit is a list of named checks, each a short function that says which `BEYOND.md` line it
 //! proves, and a verdict per check. A kit that needs to see or provoke state only the implementer can
@@ -11,6 +11,7 @@
 use crate::exec_endpoint::conformance::{Check, Verdict};
 
 pub mod broker;
+pub mod bundle;
 
 pub(crate) fn pass(name: &'static str, detail: impl Into<String>) -> Check {
     Check {
@@ -80,6 +81,14 @@ pub struct CommandHook(pub String);
 
 impl CommandHook {
     pub async fn run(&self, op: &str, args: &[&str]) -> Result<String, String> {
+        match self.run_status(op, args).await? {
+            (0, out) => Ok(out),
+            (code, _) => Err(format!("hook `{op}` exited {code}")),
+        }
+    }
+
+    /// Like [`Self::run`], but a non-zero exit is an answer, not an error: its code and stdout.
+    pub async fn run_status(&self, op: &str, args: &[&str]) -> Result<(i32, String), String> {
         let out = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(format!("{} \"$@\"", self.0))
@@ -89,13 +98,15 @@ impl CommandHook {
             .output()
             .await
             .map_err(|e| format!("hook `{op}` did not start: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "hook `{op}` exited {}: {}",
-                out.status,
+        let Some(code) = out.status.code() else {
+            return Err(format!("hook `{op}` was killed"));
+        };
+        if code != 0 && !String::from_utf8_lossy(&out.stderr).trim().is_empty() {
+            eprintln!(
+                "hook `{op}` exited {code}: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
-            ));
+            );
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        Ok((code, String::from_utf8_lossy(&out.stdout).into_owned()))
     }
 }
