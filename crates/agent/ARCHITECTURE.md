@@ -138,16 +138,11 @@ The harness layers several capabilities over the bare tools + loop:
   ticker on the runtime lost up to 3.3 s at a time. Those gaps land where a wave's sessions end together
   (about 400 sessions closed within seconds, descriptors falling by about 1,000), and the sampled CPU of the
   whole process drops to about 4% in them: no thread is running, so the process is waiting in the kernel
-  (the EFS-backed filesystem), not short of CPU or of async workers. The thread count says where the
-  waiting piles up: it sits near 90 and, in the sample at the first stall, jumps to 500 and then 516 in
-  every run (4 plus tokio's 512-thread blocking-pool cap), which means every blocking-pool thread was
-  stuck in a call and new work spawned another until the cap. On a quiet host the pool never gets there;
-  on Fargate it does, and opens queue behind it. The blocking calls that touch EFS, and so the likely occupants, are the session store's
-  persist and fsync and the bundle unpack and reads. Fargate offers no kernel tracing, so the run cannot
-  say which of them holds the pool; that is where the tuning stops. The next lever, if anyone picks it up:
-  take EFS-bound blocking work (persist, fsync, bundle IO) out of the shared blocking pool into its own
-  small bounded pool (or lower `max_blocking_threads`), so a slow EFS call cannot queue an open behind
-  it; measure it with the same ticker and `load.sh`. CPU-bound tool work stays on `spawn_blocking`. **Multiple
+  (the EFS-backed filesystem), not short of CPU or of async workers. Threads sat near 90 and, at the
+  first stall in every run, jumped to 516 (4 plus tokio's 512-thread blocking-pool cap): the blocking pool
+  saturates on Fargate. The hypothesis under test is that EFS-bound blocking work (session persist and
+  fsync, bundle unpack and reads) fills that pool and queues opens behind it; run 1 cannot confirm it,
+  because Fargate offers no kernel tracing to name the call. CPU-bound tool work stays on `spawn_blocking`. **Multiple
   connections can attach to one session at once** (the user's own
   phone + TUI): the session's output is **broadcast** to every attached connection (`serve::OutFanout`,
   with a zero-copy fast path for the single-connection case) and input is shared (any device drives; the
