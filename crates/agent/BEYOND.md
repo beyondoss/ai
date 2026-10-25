@@ -227,6 +227,7 @@ kit enforces.
 | Exec protocol     | `src/exec_endpoint/conformance.rs`                                                     | `AGENT_CONFORMANCE_EXEC_URL=… cargo test -p beyond-ai-agent --test exec_conformance`                                                                                             |
 | Exec front / edge | `src/exec_endpoint/conformance/front.rs` (module doc: variables and the operator hook) | `AGENT_CONFORMANCE_FRONT_URL=…/exec/{session} AGENT_CONFORMANCE_FRONT_HOOK=… cargo test -p beyond-ai-agent --test exec_front_conformance`                                        |
 | Connector broker  | `src/conformance/broker.rs` (module doc: variables and the operator hook)              | `AGENT_CONFORMANCE_BROKER_URL=…/managed/<connector>/mcp AGENT_CONFORMANCE_BROKER_HOOK=… AGENT_CONFORMANCE_BROKER_TOOL=… cargo test -p beyond-ai-agent --test broker_conformance` |
+| Bundles and store | `src/conformance/bundle.rs` (module doc: variables and the operator hook)              | `AGENT_CONFORMANCE_BUNDLE_HOOK=… cargo test -p beyond-ai-agent --test bundle_conformance` (about two minutes: it waits out a URL's expiry)                                       |
 
 Beyond tracks every requirement this repo places on it, with its
 source line and the proof it needs, in the
