@@ -168,8 +168,17 @@ jobs:
           - name: agent-code-mode
             filter: package(beyond-ai-agent) and (kind(lib) or kind(bin) or binary(code_mode_eval))
             extra: "--features code-mode"
+          # agent-rest was one shard, 369-447s of test time: the critical path of the whole run once
+          # the build is shared (below). Its per-binary time (junit, 4 test threads) is dominated by
+          # the exec, job and notify tests: exec_conformance alone is 475s of the 1548s summed. Those
+          # areas get their own shard (~960s summed, ~240s wall); agent-rest keeps the complement
+          # (~590s, ~150s), so a new test binary lands in agent-rest by default and the two cannot
+          # drift apart or overlap. Area filters, not a hash partition (see above).
+          - name: agent-exec
+            filter: package(beyond-ai-agent) and kind(test) and (binary(~conformance) or binary(~exec_) or binary(~jobs) or binary(~notify)) and not binary(~serve) and not binary(exec_endpoint_live) and not binary(sandbox_jobs_notify) and not binary(~notify_e2e)
+            extra: ""
           - name: agent-rest
-            filter: package(beyond-ai-agent) and kind(test) and not binary(~serve) and not binary(exec_endpoint_live) and not binary(sandbox_jobs_notify) and not binary(~notify_e2e)
+            filter: package(beyond-ai-agent) and kind(test) and not (binary(~conformance) or binary(~exec_) or binary(~jobs) or binary(~notify)) and not binary(~serve) and not binary(exec_endpoint_live) and not binary(sandbox_jobs_notify) and not binary(~notify_e2e)
             extra: ""
           # exec v1.4's end-to-end matrix and randomized orderings: real replicas behind a ring,
           # each case in three endpoint modes. Minutes of wall clock between them, so their own
