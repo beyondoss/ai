@@ -66,7 +66,7 @@ pub struct FrontMock {
 
 impl FrontMock {
     pub async fn start(fault: Fault, cap: usize) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = beyond_ai_test_support::ports::tokio_listener().await;
         let addr = listener.local_addr().unwrap();
         let inner = Arc::new(Mutex::new(Inner {
             stale_routes: fault == Fault::StaleRoute,
