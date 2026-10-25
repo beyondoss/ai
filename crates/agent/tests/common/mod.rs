@@ -28,6 +28,8 @@ pub const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
 
 /// A stand-in exec endpoint (the sandbox side of the exec protocol).
 pub mod exec_mock;
+/// A reference exec front, and its broken modes, for the front conformance kit's own tests.
+pub mod front_mock;
 /// A `bsg_v1` session-grant minter, written independently of `src/grant.rs`.
 pub mod grant;
 /// A provider that accepts only its real key, and a managed-MCP endpoint that injects it.

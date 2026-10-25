@@ -110,7 +110,9 @@ folder (about 32 round trips at every open without one).
   request and every later one, streaming. `vm-created-on-first-tool` shows that no VM existed when the
   session opened, and times open to VM create, and VM create to the first tool result. The browser
   needs the VM's address, so the browser check opens a second session on the same VM with a grant that
-  names it.
+  names it. `python3 deploy/demo/front_conformance.py` runs the exec front conformance kit against
+  `front.py` with a local substrate (no E2B) and lists what the demo front does not do: no tenants or
+  VM cap, no agent token, and a VM that dies is noticed by the next request, not at once.
 - **browser**: the browser connector is the sandbox, and its address is the front too
   (`/mcp/<session>`). The agent offers the browser's tools at open from a list saved in the bundle
   (`.mcp-tools.json`, made at bundle build by `mcp-tools.sh` running `rustwright-mcp` once), so nothing

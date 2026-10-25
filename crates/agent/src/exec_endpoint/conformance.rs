@@ -40,6 +40,10 @@ use super::stream::{self, Frame, FrameReader, HEARTBEAT_INTERVAL};
 /// The v1.4 (job notify) checks; their names are this module's constants.
 pub mod notify;
 
+/// The exec front / edge kit: the front's behavior in front of the endpoints (single-flight create,
+/// the tenant cap, tokens, wake), with the operator hook it needs.
+pub mod front;
+
 /// What the verifier holds the endpoint to. [`Default`] is the spec; a test of the verifier itself
 /// shrinks the intervals so it runs in seconds.
 #[derive(Debug, Clone)]
