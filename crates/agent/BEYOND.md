@@ -74,10 +74,12 @@ and the ring routing in [FLEET.md](FLEET.md). Beyond's edge does neither.
 2. **Token lifetimes.** The grant is a ticket to open: valid for 5 minutes, re-minted on resume. The
    tokens inside it expire at the session's end or after 24 h, whichever comes first. Revocation is a
    per-sandbox token epoch: each `bagt_v1` carries one, and the edge and `sandbox-exec` refuse any token
-   below the sandbox's current epoch, which they learn through the key channel they already watch.
-   Ending a session bumps the epoch. The edge and `sandbox-exec` only ever raise a sandbox's epoch
-   and never accept a lower one, so nothing that can write the key channel can bring a revoked token
-   back.
+   below the sandbox's current epoch. The edge learns the epoch through the key channel it already
+   watches and refuses at once. `sandbox-exec` has no channel: it raises its floor from the tokens it
+   accepts, so the first token of a new epoch retires every older one inside the VM. The edge is
+   therefore where revocation takes effect immediately, and the VM check closes the gap at the next
+   newer token. Ending a session bumps the epoch. Both only ever raise a sandbox's epoch and never
+   accept a lower one, so nothing that can write the key channel can bring a revoked token back.
    _Why:_ a leaked grant is useless within minutes; a leaked token is useless once the session is gone.
    An epoch is one number per sandbox, takes effect at once, and needs no denylist. 5 minutes covers
    clock skew and the open; the grant has no leeway.
@@ -137,15 +139,20 @@ and the ring routing in [FLEET.md](FLEET.md). Beyond's edge does neither.
    its first frame, inside the agent's 10 s probe and 30 s silence limits.
    _Why:_ these are the statuses the agent's suspect-and-re-probe logic already reads, so the front's
    vocabulary is part of the contract.
-10. **Kept jobs and sleep.** A running kept job keeps its sandbox awake until the job ends, and nothing
-    of Beyond's contacts a sandbox with unheld jobs on a timer. The agent's 60 s idle reap is not a
+10. **Kept jobs and sleep.** A running kept job that is doing work keeps its sandbox awake until the
+    job ends. A kept job that is only waiting for a connection (a server blocked on a listening socket)
+    may sleep, because an inbound connection through the gateway wakes it. Nothing of Beyond's contacts
+    a sandbox with unheld jobs on a timer, with one exception: the inactivity sweep wakes a sandbox idle
+    for its window (7 days by default) once per window, to check whether a job is still alive before
+    deleting it. The agent's 60 s idle reap is not a
     session end and leaves jobs alone. Deleting a session wipes its jobs or destroys its sandbox. Beyond's
     native endpoint advertises notify, because its kept jobs survive sleep; an adapter for another
     provider advertises it only once a live test shows that provider keeps jobs alive while idle (N1).
     _Why:_ a paused VM runs nothing, and the fleet expects a build to finish with no agent attached.
 11. **Keys Beyond holds.** Beyond's minter derives the same per-tenant `dek` on every re-mint, stores it
-    durably, rotates it by plan and destroys it when the tenant is deleted, which crypto-erases the
-    tenant's sessions. Beyond holds the seal key's public half and the managed-MCP secret. The seal key
+    durably wrapped under Beyond's rotating KEK, and destroys it when the tenant is deleted, which
+    crypto-erases the tenant's sessions. The `dek` itself never rotates: a grant carries one `dek`,
+    and rotating it would strand every stored session. Beyond holds the seal key's public half and the managed-MCP secret. The seal key
     also derives the `bjn_v1` notify key, so one seal key per replica would strand every outstanding
     notify token at a rotation; that is why the agent accepts two (#495, #498), the way it already
     trusts two signing kids. Grants carry no seal kid, so a rotation goes replicas first, then Beyond's
