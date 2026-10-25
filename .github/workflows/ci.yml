@@ -76,7 +76,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: clippy
-          save-if: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # clippy `-D warnings` across all targets; `[lints.clippy]` denies the panic surface
       # (unwrap/expect/panic/todo/unimplemented), so a new `.unwrap()` in production code fails here.
       - run: mise check:rs
@@ -103,7 +103,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: tests
-          save-if: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
@@ -170,10 +170,16 @@ jobs:
             extra: "--features code-mode"
           # agent-rest was one shard, 369-447s of test time: the critical path of the whole run once
           # the build is shared (below). Its per-binary time (junit, 4 test threads) is dominated by
-          # the exec, job and notify tests: exec_conformance alone is 475s of the 1548s summed. Those
-          # areas get their own shard (~960s summed, ~240s wall); agent-rest keeps the complement
-          # (~590s, ~150s), so a new test binary lands in agent-rest by default and the two cannot
-          # drift apart or overlap. Area filters, not a hash partition (see above).
+          # the exec, job and notify tests: exec_conformance alone is 475s of the 1548s summed. They
+          # are two shards (exec: 142s, jobs: 82s), and agent-rest keeps the complement (139s), so a
+          # new test binary lands in agent-rest by default and the shards cannot drift apart or
+          # overlap. Area filters, not a hash partition (see above).
+          #
+          # Why two and not one: exec + jobs + notify as a single shard wedged the runner in the
+          # test step on both attempts, twice (past nextest's global-timeout, RuntimeMaxSec and the
+          # step timeout, with no log), though the same tests pass together in agent-rest, in a local
+          # run (196 tests, 228s), and as these two halves. Cause not found; the halves are the
+          # measured-good grouping.
           - name: agent-exec
             filter: package(beyond-ai-agent) and kind(test) and (binary(~conformance) or binary(~exec_)) and not binary(~serve) and not binary(exec_endpoint_live) and not binary(sandbox_jobs_notify) and not binary(~notify_e2e)
             extra: ""
@@ -222,7 +228,7 @@ jobs:
         if: matrix.name == 'agent-code-mode'
         with:
           shared-key: code-mode
-          save-if: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Prebuilt binary in seconds — no compiling nextest from source.
       - uses: taiki-e/install-action@v2
         with:
@@ -460,7 +466,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release
-          save-if: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: mise build:rs:release
       # The authority on "no test seam ships": the release binaries themselves, scanned for the
       # seam prefix (a grep over what was just built; seconds).
