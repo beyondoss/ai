@@ -247,6 +247,12 @@ impl<'a> SessionSelect<'a> {
     }
 }
 
+/// The sibling session `new_session` archived a pinned slot's conversation into.
+pub(super) struct Archived {
+    pub(super) id: String,
+    pub(super) title: Option<String>,
+}
+
 /// Where the server persists sessions: a multi-session [`SessionRepo`] (`--session-dir`), a single
 /// JSONL file (`--session-file`), or nowhere (in-memory). It always carries the current session's
 /// [`SessionMeta`] so the session id is stable across reattaches.
@@ -613,6 +619,8 @@ impl Persistence {
     /// (nothing persists a "previous" id anywhere a client could look it up later), matching pi's own
     /// `this.persist ? previousSessionFile : undefined`.
     ///
+    /// The second half of the result is the sibling a pinned session archived into, if it did.
+    ///
     /// On failure, nothing is mutated (no partial state) — the caller keeps whatever session was
     /// already active, matching the source of truth still on disk. This matters: silently returning a
     /// fresh in-memory `Session` while the on-disk reset actually failed would desync `SessionStore`'s
@@ -623,7 +631,7 @@ impl Persistence {
         &mut self,
         model: &str,
         parent_session: Option<&str>,
-    ) -> std::io::Result<Session> {
+    ) -> std::io::Result<(Session, Option<Archived>)> {
         let cwd = Self::cwd();
         if let Some(repo) = &self.repo {
             if let Some(pinned) = self.pinned_id.clone() {
@@ -651,7 +659,7 @@ impl Persistence {
             self.meta = SessionMeta::new(&cwd, model);
         }
         self.transcript += 1;
-        Ok(Session::new())
+        Ok((Session::new(), None))
     }
 
     /// [`Self::new_session`] for a pinned (caller-addressed) session: archive the current conversation
@@ -661,7 +669,10 @@ impl Persistence {
     /// ordinary session — it appears in `list_sessions`, can be `switch_session`ed into, and records
     /// `parent = <pinned id>`, leaving the lineage back to this slot legible. An empty session has
     /// nothing worth archiving, so that's skipped and blanking an already-blank slot stays cheap.
-    pub(super) fn blank_pinned_session(&mut self, pinned: &str) -> std::io::Result<Session> {
+    pub(super) fn blank_pinned_session(
+        &mut self,
+        pinned: &str,
+    ) -> std::io::Result<(Session, Option<Archived>)> {
         let Self {
             repo: Some(repo),
             store: Some(store),
@@ -670,14 +681,25 @@ impl Persistence {
         else {
             // Not repo mode with a live store: single-file and in-memory both keep their id anyway, so
             // the caller's own arms already do the right thing.
-            return Ok(Session::new());
+            return Ok((Session::new(), None));
         };
+        let mut archived = None;
+        // The slot's own title, read before anything is cleared: it is the archived conversation's.
+        let title = store.meta().title.clone();
         if !store.active_ids().is_empty() {
             // Copied from what's on disk, *before* anything is cleared — a failure here leaves the
             // session exactly as it was rather than half-reset with its history already gone.
-            if let Err(e) = repo.fork(pinned, usize::MAX) {
-                eprintln!("serve: failed to archive session {pinned} before reset: {e}");
-                return Err(e);
+            match repo.fork(pinned, usize::MAX) {
+                Ok((sibling, _)) => {
+                    archived = Some(Archived {
+                        id: sibling.meta().id.clone(),
+                        title,
+                    });
+                }
+                Err(e) => {
+                    eprintln!("serve: failed to archive session {pinned} before reset: {e}");
+                    return Err(e);
+                }
             }
         }
         if let Err(e) = store.reset_for_new_session() {
@@ -686,7 +708,7 @@ impl Persistence {
         }
         let meta = store.meta().clone();
         self.meta = meta;
-        Ok(Session::new())
+        Ok((Session::new(), archived))
     }
 
     /// Switch to another session by id (repo mode only).

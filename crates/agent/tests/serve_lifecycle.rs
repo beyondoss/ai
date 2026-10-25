@@ -694,3 +694,54 @@ fn run_json_mode_refusal_posts_succeeded_with_refused() {
     assert_eq!(done["refused"], true, "{bodies:#?}");
     assert_eq!(of_type(&bodies, "failed").len(), 0, "{bodies:#?}");
 }
+
+/// `new_session` on an addressed session archives the conversation into a sibling the client never
+/// addresses, so its id appears in no other event. The lifecycle receiver must be told, and told
+/// again when the blanked slot earns a title of its own.
+#[test]
+fn new_session_on_an_addressed_session_posts_session_archived_and_the_slot_is_named_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_dir = dir.path().to_string_lossy().into_owned();
+    let collector = Collector::spawn();
+    let (base, _bodies) = spawn_model_server(vec![turn_text("first"), turn_text("second")]);
+
+    let mut child = common::serve_dir_cmd(BIN, &base, &session_dir)
+        .args(["--lifecycle-url", &collector.url, "--session-id", "routed"])
+        .spawn_guarded();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = common::child_frames(&mut child);
+
+    send(&mut stdin, json!({ "type": "prompt", "message": "one" }));
+    read_until_response(&mut stdout, "prompt");
+    collector.wait_until(|b| of_type(b, "session_named").len() == 1);
+
+    send(&mut stdin, json!({ "type": "new_session" }));
+    let frames = read_until_response(&mut stdout, "new_session");
+    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+    let bodies = collector.wait_until(|b| of_type(b, "session_archived").len() == 1);
+    let ev = of_type(&bodies, "session_archived")[0];
+
+    let sibling = beyond_ai_agent::session_store::SessionRepo::open(dir.path())
+        .unwrap()
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|m| m.id != "routed")
+        .expect("an archived sibling session on disk");
+    assert_eq!(ev["session_id"], sibling.id.as_str(), "{ev:#?}");
+    assert_eq!(ev["parent_session_id"], "routed", "{ev:#?}");
+    assert_eq!(ev["title"], common::SCRIPTED_SESSION_TITLE, "{ev:#?}");
+    assert!(ev["ts"].as_u64().is_some_and(|t| t > 0), "{ev:#?}");
+    assert!(ev.get("tenant").is_none(), "{ev:#?}");
+
+    // The blanked slot is a new conversation, so its title is generated and announced again.
+    send(&mut stdin, json!({ "type": "prompt", "message": "two" }));
+    read_until_response(&mut stdout, "prompt");
+    let bodies = collector.wait_until(|b| of_type(b, "session_named").len() == 2);
+    for named in of_type(&bodies, "session_named") {
+        assert_eq!(named["session_id"], "routed", "{bodies:#?}");
+    }
+
+    drop(stdin);
+    child.wait().unwrap();
+}
