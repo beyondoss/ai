@@ -455,6 +455,31 @@ fn fork_inherits_the_title_in_effect_at_the_fork_point_not_a_later_rename() {
 }
 
 #[test]
+fn whole_transcript_fork_keeps_a_rename_made_after_the_last_message() {
+    // A rename lands anchored at the newest message (the usual auto-title shape: generated after
+    // the turn persisted). Cloning the whole transcript copies that moment, so the title comes along;
+    // forking one message earlier must still not see it, and a cleared title stays cleared.
+    let dir = tmpdir();
+    let repo = SessionRepo::open(dir.path()).unwrap();
+    let mut store = repo.create(SessionMeta::new("/w", "m")).unwrap();
+    let mut session = Session::new();
+    session.user("a");
+    session.user("b");
+    store.append_new(&session.messages).unwrap();
+    store.set_title("Named After B").unwrap();
+    let id = store.meta().id.clone();
+
+    let (whole, _) = repo.fork(&id, usize::MAX).unwrap();
+    assert_eq!(whole.meta().title.as_deref(), Some("Named After B"));
+    let (earlier, _) = repo.fork(&id, 1).unwrap();
+    assert_eq!(earlier.meta().title, None);
+
+    store.set_title("").unwrap();
+    let (cleared, _) = repo.fork(&id, usize::MAX).unwrap();
+    assert_eq!(cleared.meta().title, None);
+}
+
+#[test]
 fn fork_at_entry_resolves_title_path_scoped_not_whole_file_latest() {
     // `fork_at_entry_prefix` computes its own path (possibly off the active branch entirely, and
     // via a different resolution than `fork`'s `upto` count) — a rename recorded after the target
