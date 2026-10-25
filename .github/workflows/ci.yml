@@ -69,7 +69,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: clippy
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true
       # clippy `-D warnings` across all targets; `[lints.clippy]` denies the panic surface
       # (unwrap/expect/panic/todo/unimplemented), so a new `.unwrap()` in production code fails here.
       - run: mise check:rs
@@ -96,7 +96,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: tests
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
@@ -203,7 +203,7 @@ jobs:
         if: matrix.name == 'agent-code-mode'
         with:
           shared-key: code-mode
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true
       # Prebuilt binary in seconds — no compiling nextest from source.
       - uses: taiki-e/install-action@v2
         with:
@@ -439,7 +439,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true
       - run: mise build:rs:release
       # The authority on "no test seam ships": the release binaries themselves, scanned for the
       # seam prefix (a grep over what was just built; seconds).

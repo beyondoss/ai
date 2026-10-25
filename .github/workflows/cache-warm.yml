@@ -22,6 +22,8 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  pull_request:
+    branches: [main]
 permissions:
   contents: read
 # Two pushes to main in quick succession: let the running one finish (cancelling would save nothing)
@@ -45,7 +47,7 @@ jobs:
         id: cache
         with:
           shared-key: tests
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true
       - uses: taiki-e/install-action@v2
         if: steps.cache.outputs.cache-hit != 'true'
         with:
@@ -65,7 +67,7 @@ jobs:
         id: cache
         with:
           shared-key: clippy
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true
       # Both invocations of ci.yml's `clippy` job: the default graph and the `code-mode` one.
       - if: steps.cache.outputs.cache-hit != 'true'
         run: mise check:rs
@@ -82,7 +84,7 @@ jobs:
         id: cache
         with:
           shared-key: code-mode
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true
       - uses: taiki-e/install-action@v2
         if: steps.cache.outputs.cache-hit != 'true'
         with:
@@ -101,6 +103,6 @@ jobs:
         id: cache
         with:
           shared-key: release
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true
       - if: steps.cache.outputs.cache-hit != 'true'
         run: mise build:rs:release
