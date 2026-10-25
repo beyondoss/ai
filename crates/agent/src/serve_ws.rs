@@ -585,7 +585,7 @@ where
     F: FnOnce() -> std::io::Result<Option<SessionLock>> + Send + 'static,
 {
     let (tx, rx) = oneshot::channel();
-    tokio::task::spawn_blocking(move || {
+    crate::blocking::spawn(crate::blocking::Site::SessionLock, move || {
         // `send` returning `Err` *is* the release: the value comes back here and drops before this
         // thread returns.
         let _ = tx.send(take());
@@ -622,7 +622,7 @@ async fn release_session_lock(lock: Option<SessionLock>, path: Option<std::path:
         return;
     };
     // Off the runtime thread: three network-filesystem calls and a descriptor close.
-    let _ = tokio::task::spawn_blocking(move || {
+    let _ = crate::blocking::spawn(crate::blocking::Site::SessionUnlock, move || {
         // The lock files are `file_lock`'s to name and unlink. Released (descriptors closed) before
         // they are unlinked: an NFS client silly-renames a file it still holds open to `.nfs*`, and
         // that leftover would keep the directory from ever being removed.
@@ -1984,7 +1984,7 @@ pub async fn serve_ws(
     let runtime_sessions: Vec<String> = match supervisor.session_dir.clone() {
         Some(dir) => {
             let events_id = events_session_id.clone();
-            tokio::task::spawn_blocking(move || {
+            crate::blocking::spawn(crate::blocking::Site::Serve, move || {
                 // Bounded: a pile of old sessions cannot all be woken at every boot.
                 crate::tools::mcp_events::sessions_with_runtime_subscriptions(
                     std::path::Path::new(&dir),
@@ -2043,7 +2043,7 @@ pub async fn serve_ws(
                     Some(dir) => {
                         let dir = dir.clone();
                         let probe = id.clone();
-                        tokio::task::spawn_blocking(move || {
+                        crate::blocking::spawn(crate::blocking::Site::Serve, move || {
                             crate::tools::mcp_events::sessions_with_runtime_subscriptions(
                                 std::path::Path::new(&dir),
                                 usize::MAX,
@@ -2256,6 +2256,7 @@ async fn handle_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let accepted = Instant::now();
     let (mut head, leftover) = match read_http_head(&mut stream).await {
         Ok(v) => v,
         Err((e, raw)) => {
@@ -2270,6 +2271,7 @@ where
         }
     };
     let arrived = tokio::time::Instant::now();
+    let head_ms = accepted.elapsed().as_secs_f64() * 1e3;
 
     // exec v1.4's `job_ended` callbacks are told apart by their head alone, before any other check
     // — the `Content-Length` rules and the grant included — and never reach the front door below.
@@ -2388,6 +2390,7 @@ where
     }
 
     // Before the method branch, so the WebSocket and POST paths cannot diverge on who is allowed in.
+    let mut grant_ms = 0.0;
     let service = match &supervisor.service {
         None => None,
         Some(svc) => {
@@ -2404,13 +2407,16 @@ where
                     return Ok(());
                 }
             };
-            match crate::service::authorize(
+            let grant_began = Instant::now();
+            let authorized = crate::service::authorize(
                 &svc.verifier,
                 &svc.shards,
                 grant.as_deref(),
                 requested_id.as_deref(),
                 crate::service::now_unix(),
-            ) {
+            );
+            grant_ms = grant_began.elapsed().as_secs_f64() * 1e3;
+            match authorized {
                 Ok(session) => Some(Arc::new(session)),
                 Err(refusal) => {
                     refuse(&mut stream, &head, &leftover, HttpError::from(refusal)).await;
@@ -2437,8 +2443,16 @@ where
             Ok(())
         }
         "GET" => {
-            handle_websocket_upgrade(supervisor, stream, &head, leftover, requested_id, service)
-                .await
+            handle_websocket_upgrade(
+                supervisor,
+                stream,
+                &head,
+                leftover,
+                requested_id,
+                service,
+                (head_ms, grant_ms),
+            )
+            .await
         }
         _ => {
             refuse(&mut stream, &head, &leftover, HttpError::MethodNotAllowed).await;
@@ -2574,9 +2588,12 @@ impl ReadyCache {
                     // I/O that stalls when an EFS mount hiccups. Blocking here would wedge every
                     // session on the replica on behalf of a probe.
                     tokio::spawn(async move {
-                        let reason = tokio::task::spawn_blocking(probe)
-                            .await
-                            .unwrap_or_else(|_| Some("shard probe did not complete".to_string()));
+                        let reason =
+                            crate::blocking::spawn(crate::blocking::Site::ReadyProbe, probe)
+                                .await
+                                .unwrap_or_else(|_| {
+                                    Some("shard probe did not complete".to_string())
+                                });
                         // Memo and in-flight slot move together under one lock, so a caller can never
                         // observe "no probe running" alongside a stale answer and start a second one.
                         {
@@ -2645,6 +2662,8 @@ async fn handle_websocket_upgrade<S>(
     leftover: Vec<u8>,
     requested_id: Option<String>,
     service: Option<Arc<ServiceSession>>,
+    // Milliseconds spent reading the request head and verifying the grant, for the `OPEN front` line.
+    (head_ms, grant_ms): (f64, f64),
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -2659,6 +2678,7 @@ where
     // Pin **before** writing the 101: the session slot is where the tenant check and the
     // still-stopping wait live, and both of their answers are HTTP statuses (403, 503). Past the
     // upgrade the only vocabulary left is a close code.
+    let pin_began = Instant::now();
     let pinned = match supervisor.pin(requested_id, service.clone()).await {
         Ok(pinned) => pinned,
         Err(e) => {
@@ -2666,6 +2686,7 @@ where
             return Ok(());
         }
     };
+    let pin_ms = pin_began.elapsed().as_secs_f64() * 1e3;
     let response = match create_response(&request) {
         Ok(mut r) => {
             // The grant was stripped from `request` by `take_grant`, so nothing can echo it; name
@@ -2691,6 +2712,18 @@ where
         return Err(e.into());
     }
 
+    // The front door's half of a service open: the session's own start-up logs the other half
+    // (`OPEN setup`) under the same id. `pin` includes taking the session's lock.
+    if service.is_some() {
+        crate::timing::open_line(
+            "front",
+            &pinned.id,
+            &format!(
+                "head={head_ms:.1} grant={grant_ms:.1} pin={pin_ms:.1} upgrade={:.1}",
+                pin_began.elapsed().as_secs_f64() * 1e3 - pin_ms
+            ),
+        );
+    }
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_INBOUND_MESSAGE_BYTES))
         .max_frame_size(Some(MAX_INBOUND_MESSAGE_BYTES));

@@ -264,9 +264,11 @@ impl Cache {
             ));
         }
         let (root, dest) = (self.root.clone(), self.root.join(&bundle.sha256));
-        let size = tokio::task::spawn_blocking(move || install(&root, &dest, &bytes))
-            .await
-            .map_err(|e| format!("bundle: unpacking failed: {e}"))??;
+        let size = crate::blocking::spawn(crate::blocking::Site::BundleInstall, move || {
+            install(&root, &dest, &bytes)
+        })
+        .await
+        .map_err(|e| format!("bundle: unpacking failed: {e}"))??;
         let (pin, doomed) = {
             let mut state = self.lock();
             state.entries.insert(
@@ -285,7 +287,7 @@ impl Cache {
             (pin, self.evict(&mut state))
         };
         if !doomed.is_empty() {
-            let _ = tokio::task::spawn_blocking(move || {
+            let _ = crate::blocking::spawn(crate::blocking::Site::BundleReap, move || {
                 for trash in doomed {
                     let _ = std::fs::remove_dir_all(trash);
                 }

@@ -1260,7 +1260,7 @@ impl SessionLoop {
         // to the client before the terminal response, like `run`'s `--json` line.
         let stopped_jobs = {
             let jobs = self.bash_jobs.clone();
-            tokio::task::spawn_blocking(move || jobs.end_turn())
+            crate::blocking::spawn(crate::blocking::Site::Serve, move || jobs.end_turn())
                 .await
                 .unwrap_or_default()
         };

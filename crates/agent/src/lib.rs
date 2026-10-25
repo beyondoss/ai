@@ -20,6 +20,7 @@ pub mod agents;
 pub mod approval;
 pub mod auth_credential_source;
 pub mod auth_store;
+pub mod blocking;
 pub mod bundle;
 pub mod conformance;
 pub mod exec_endpoint;

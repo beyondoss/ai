@@ -77,11 +77,178 @@ def with_cpu(samples):
     return samples
 
 
+BOUNDS = [("0.001", 0.001), ("0.01", 0.01), ("0.1", 0.1), ("0.5", 0.5), ("1", 1.0), ("5", 5.0), ("+Inf", 1000.0)]
+
+
+def blocking_sites(samples):
+    """The blocking-pool sites the replica reported anywhere in the run."""
+    return sorted({k.split("|")[1] for s in samples for k in s if k.split("|")[0] in ("running", "queued", "wait_sum", "run_sum")})
+
+
+def inflight_at(s):
+    """Jobs queued or running across every site in one sample, and how many of those were still queued."""
+    q = sum(v for k, v in s.items() if k.startswith("queued|"))
+    r = sum(v for k, v in s.items() if k.startswith("running|"))
+    return q + r, q
+
+
+def wait_max_at(s):
+    """The longest any job waited in the queue during the 2 s before this sample, and at which site."""
+    best, site = 0.0, ""
+    for k, v in s.items():
+        if k.startswith("wait_max|") and v > best:
+            best, site = v, k.split("|")[1]
+    return best, site
+
+
+def quantile(buckets, q):
+    """The upper bound of the cumulative bucket holding quantile `q` (the +Inf bucket reports 1000)."""
+    total = buckets.get("+Inf", 0)
+    if total <= 0:
+        return 0.0
+    for le, bound in BOUNDS:
+        if buckets.get(le, 0) >= q * total:
+            return bound
+    return float("inf")
+
+
+def site_stats(samples, lo, hi, site):
+    """One site over [lo, hi]: how many jobs, and the wait and run time they saw. Counters are
+    cumulative, so the window is the last sample inside it minus the last one before it."""
+    win = within(samples, lo, hi)
+    before = [s for s in samples if s["t"] < lo]
+    if not win:
+        return None
+    a, b = (before[-1] if before else {}), win[-1]
+    out = {"site": site}
+    for what in ("wait", "run"):
+        bk = {le: b.get(f"{what}_bucket|{site}|{le}", 0) - a.get(f"{what}_bucket|{site}|{le}", 0) for le, _ in BOUNDS}
+        n = bk["+Inf"]
+        out[f"{what}_count"] = n
+        out[f"{what}_mean_s"] = (b.get(f"{what}_sum|{site}", 0) - a.get(f"{what}_sum|{site}", 0)) / n if n else 0.0
+        out[f"{what}_p99_s_upper_bound"] = quantile(bk, 0.99)
+        out[f"{what}_max_s"] = max([s.get(f"{what}_max|{site}", 0) for s in win] or [0])
+    out["inflight_peak"] = max([s.get(f"queued|{site}", 0) + s.get(f"running|{site}", 0) for s in win] or [0])
+    return out
+
+
+def blocking_window(samples, lo, hi, sites):
+    """The blocking pool over one phase: peak in-flight and queued, the longest queue wait, the
+    runtime's worst scheduling lag, and each site's numbers, the slowest first."""
+    win = within(samples, lo, hi)
+    per = [x for x in (site_stats(samples, lo, hi, st) for st in sites) if x and x["run_count"]]
+    per.sort(key=lambda x: (x["run_max_s"], x["run_p99_s_upper_bound"]), reverse=True)
+    wait = max((wait_max_at(s) for s in win), default=(0.0, ""))
+    return {
+        "inflight_peak": max([inflight_at(s)[0] for s in win] or [0]),
+        "queued_peak": max([inflight_at(s)[1] for s in win] or [0]),
+        "wait_max_s": wait[0], "wait_max_site": wait[1],
+        "runtime_lag_max_s": max([s.get("agent_runtime_lag_max_seconds", 0) for s in win] or [0]),
+        "sites": per,
+    }
+
+
+CLOSE_BEFORE_MS, CLOSE_AFTER_MS = 30_000, 45_000
+
+
+def close_window(samples, end_ms, sites):
+    """The pool and the runtime around a wave's mass close: the same numbers as `blocking_window`,
+    plus a timeline of every sample in it (seconds from the wave's end), so a stall can be lined up with
+    the jump in threads, in-flight jobs and queue wait."""
+    lo, hi = end_ms - CLOSE_BEFORE_MS, end_ms + CLOSE_AFTER_MS
+    out = blocking_window(samples, lo, hi, sites)
+    out["timeline"] = [{
+        "dt_s": (s["t"] - end_ms) / 1000.0, "threads": s.get("Threads", 0), "sessions_live": s.get("agent_sessions_live", 0),
+        "inflight": inflight_at(s)[0], "queued": inflight_at(s)[1], "wait_max_s": wait_max_at(s)[0],
+        "wait_max_site": wait_max_at(s)[1], "runtime_lag_max_s": s.get("agent_runtime_lag_max_seconds", 0),
+        "cpu_pct": s.get("cpu_pct", 0),
+    } for s in within(samples, lo, hi)]
+    return out
+
+
+def parse_opens(path):
+    """The replica's `OPEN front|setup sid=.. t=.. name=ms ... blk=inflight/queued` lines, per session id."""
+    out = {}
+    if not path:
+        return out
+    for line in open(path):
+        parts = line.split()
+        if len(parts) < 4 or parts[0] != "OPEN":
+            continue
+        rec = out.setdefault(parts[2][4:], {"phases": {}, "blk": []})
+        for kv in parts[3:]:
+            k, _, v = kv.partition("=")
+            if k == "blk":
+                i, _, q = v.partition("/")
+                rec["blk"].append((int(i), int(q)))
+            elif k == "t":
+                rec["t_" + parts[1]] = int(v)
+            elif k != "sid":
+                rec["phases"][k] = float(v)
+    return out
+
+
+def median_of(xs):
+    return statistics.median(xs) if xs else 0.0
+
+
+def tail_of_opens(driver, samples, replica_opens, name):
+    """Join one phase's slow opens (at or above its p99) to the phase of the open that took the time,
+    and to the blocking pool while they ran. `other` is what the replica did not time: the wait for the
+    accept loop, the 101 and the first answer on the wire, and the loop answering get_state."""
+    rows = [r for r in driver["opens"] if r.get("phase") == name and r.get("ok") is True]
+    if not rows:
+        return None
+    ready = sorted(r["ready_ms"] for r in rows)
+    cut = ready[int(round((len(ready) - 1) * 0.99))]
+    joined = []
+    for r in rows:
+        rec = replica_opens.get(r["session"])
+        start, end = r["at_ms"] - r["ready_ms"], r["at_ms"]
+        ph = dict(rec["phases"]) if rec else {}
+        accounted = sum(ph.values())
+        ph["other"] = max(r["ready_ms"] - accounted, 0.0) if rec else r["ready_ms"]
+        win = [s for s in samples if start <= s["t"] <= end + 2000]
+        wmax = max((wait_max_at(s)[0] for s in win), default=0.0)
+        joined.append({
+            "session": r["session"], "ready_ms": r["ready_ms"], "connect_ms": r.get("connect_ms"),
+            "phases": ph, "has_replica_line": bool(rec),
+            "blk_inflight_in_line": max([b[0] for b in rec["blk"]], default=None) if rec else None,
+            "blk_queued_in_line": max([b[1] for b in rec["blk"]], default=None) if rec else None,
+            "blk_inflight_in_samples": max([inflight_at(s)[0] for s in win] or [0]),
+            "blk_wait_max_s_in_samples": wmax,
+        })
+    slow = [j for j in joined if j["ready_ms"] >= cut]
+    rest = [j for j in joined if j["ready_ms"] < cut]
+    names = sorted({k for j in joined for k in j["phases"]})
+    dom = {}
+    for j in slow:
+        d = max(j["phases"], key=lambda k: j["phases"][k]) if j["phases"] else "none"
+        dom[d] = dom.get(d, 0) + 1
+    return {
+        "p99_cut_ms": cut, "opens": len(joined), "slow": len(slow),
+        "with_replica_line": sum(1 for j in joined if j["has_replica_line"]),
+        "dominant_phase_of_slow": dom,
+        "phase_median_ms": {"slow": {k: median_of([j["phases"].get(k, 0.0) for j in slow]) for k in names},
+                            "rest": {k: median_of([j["phases"].get(k, 0.0) for j in rest]) for k in names}},
+        "blocking_at_slow": {"inflight_in_samples_median": median_of([j["blk_inflight_in_samples"] for j in slow]),
+                             "inflight_in_samples_max": max([j["blk_inflight_in_samples"] for j in slow] or [0]),
+                             "wait_max_s_median": median_of([j["blk_wait_max_s_in_samples"] for j in slow]),
+                             "wait_max_s_max": max([j["blk_wait_max_s_in_samples"] for j in slow] or [0]),
+                             "inflight_in_line_median": median_of([j["blk_inflight_in_line"] for j in slow if j["blk_inflight_in_line"] is not None])},
+        "blocking_at_rest": {"inflight_in_samples_median": median_of([j["blk_inflight_in_samples"] for j in rest]),
+                             "wait_max_s_median": median_of([j["blk_wait_max_s_in_samples"] for j in rest]),
+                             "inflight_in_line_median": median_of([j["blk_inflight_in_line"] for j in rest if j["blk_inflight_in_line"] is not None])},
+        "slowest": sorted(slow, key=lambda j: -j["ready_ms"])[:15],
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--driver", required=True)
     ap.add_argument("--samples", required=True)
     ap.add_argument("--meta", required=True)
+    ap.add_argument("--opens", help="the replica's OPEN lines (one per phase half of every open)")
     a = ap.parse_args()
     driver = json.load(open(a.driver))
     meta = json.load(open(a.meta))
@@ -89,6 +256,8 @@ def main():
     phases = {p["name"]: p for p in driver["phases"]}
     budget_kb = meta["cache_budget_mb"] * 1024
     first_t = driver["phases"][0]["start_ms"]
+    sites = blocking_sites(samples)
+    replica_opens = parse_opens(a.opens)
 
     # Before anything ran.
     before = settled(samples, {"end_ms": first_t}, 30)
@@ -118,6 +287,10 @@ def main():
             "open_p50_ms": p["open_p50_ms"], "open_p99_ms": p["open_p99_ms"],
             "open_p50_ms_net_of_rtt": max(p["open_p50_ms"] - driver["rtt_ms"], 0),
             "open_p99_ms_net_of_rtt": max(p["open_p99_ms"] - driver["rtt_ms"], 0),
+            "open_max_ms": p.get("open_max_ms", 0),
+            "blocking": blocking_window(samples, p["start_ms"], p["end_ms"], sites),
+            "tail": tail_of_opens(driver, samples, replica_opens, f"wave{w}"),
+            "close": close_window(samples, p["end_ms"], sites),
             "opens": p["opens"], "open_failures": p["open_failures"], "turns": p["turns"],
             "turns_that_read_the_skill": p["turns_that_read_the_skill"],
             "after_idle": settled(samples, idle),
@@ -224,6 +397,7 @@ def main():
         "kind": "load",
         "commit": meta["commit"], "region": meta["region"], "name": meta["name"], "started_at": meta["started_at"],
         "task": meta["task"], "cache_budget_mb": meta["cache_budget_mb"],
+        "store": meta.get("store", "efs"),
         "config": driver["config"], "rtt_ms": driver["rtt_ms"],
         "phases": driver["phases"], "host": driver["host"],
         "samples": samples, "client_open_sessions": driver["client_open_sessions"],
@@ -234,6 +408,10 @@ def main():
                       "refetches": refetches, "directories_removed": dir_drops},
             "fetch_peak": fetch_peak, "burst_fetch_peak": burst_fetch_peak,
             "burst": {"open_p50_ms": burst["open_p50_ms"], "open_p99_ms": burst["open_p99_ms"],
+                      "open_max_ms": burst.get("open_max_ms", 0),
+                      "blocking": blocking_window(samples, burst["start_ms"], burst["end_ms"], sites),
+                      "tail": tail_of_opens(driver, samples, replica_opens, "burst"),
+                      "threads_peak": max([s.get("Threads", 0) for s in burst_win] or [0]),
                       "peak_rss_anon_mb": max([s.get("RssAnon", 0) for s in burst_win] or [0]) / KB} if burst else None,
         },
         "checks": checks, "teardown": None,

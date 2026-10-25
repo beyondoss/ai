@@ -220,6 +220,11 @@ and the bundle host. There is no gateway, no sandbox and no provider key.
 ./deploy/demo/load.sh down    # down.sh, with its counts merged into the same record
 ```
 
+`LOAD_STORE=local` puts the session store on the task's own ephemeral volume instead of EFS and changes nothing else,
+so a run with and without it says what the network filesystem costs. The record also carries the replica's
+blocking-pool instruments and its per-phase `OPEN` lines (`analysis.waves[].blocking` and `.tail`), and the
+raw `driver.json` and `opens.log` sit beside it.
+
 The load: 150 bundles (50 tenants, three versions each, 10 with 5 MB of skills) and 100 more for the
 burst. Two waves, each ramping to 500 sessions open at once (60% long-lived; 40% churning through a second
 set of bundles, so the cache has something to evict), a few turns each, every turn reading a skill; hold,

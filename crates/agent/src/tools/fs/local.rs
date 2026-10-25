@@ -78,9 +78,11 @@ impl FsBackend for LocalFs {
         let this = self.clone();
         let q = q.clone();
         // The walk blocks (its own thread pool, synchronous reads); keep it off the async runtime.
-        tokio::task::spawn_blocking(move || this.search_blocking(&q))
-            .await
-            .map_err(|e| FsError::Backend(format!("grep task failed: {e}")))?
+        crate::blocking::spawn(crate::blocking::Site::FileTool, move || {
+            this.search_blocking(&q)
+        })
+        .await
+        .map_err(|e| FsError::Backend(format!("grep task failed: {e}")))?
     }
 
     async fn stat(&self, path: &Path) -> Result<Option<Meta>, FsError> {
@@ -213,7 +215,7 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, FsError> + Send + 'static,
 {
-    tokio::task::spawn_blocking(f)
+    crate::blocking::spawn(crate::blocking::Site::FileTool, f)
         .await
         .map_err(|e| FsError::Backend(format!("{what} task failed: {e}")))?
 }

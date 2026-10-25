@@ -27,7 +27,15 @@ while :; do
     kb=$(du -sk "$CACHE_DIR" 2>/dev/null | cut -f1)
     dirs=$(find "$CACHE_DIR" -mindepth 2 -maxdepth 2 -type d ! -name '.*' 2>/dev/null | wc -l)
     trash=$(find "$CACHE_DIR" -mindepth 2 -maxdepth 2 -type d -name '.trash-*' 2>/dev/null | wc -l)
-    m=$(wget -q -T 2 -O - "$METRICS_URL" 2>/dev/null | awk '/^agent_(sessions_live|threads|runs_in_flight) / { printf "\"%s\":%s,", $1, $2 }')
+    # The gauges, plus the blocking pool (agent_blocking_*, one key per site and bucket as
+    # `<what>|<site>[|<le>]`, zeros left out) and the runtime's worst scheduling lag since the last scrape.
+    m=$(wget -q -T 2 -O - "$METRICS_URL" 2>/dev/null | awk '
+      /^agent_(sessions_live|threads|runs_in_flight|runtime_lag_max_seconds) / { printf "\"%s\":%s,", $1, $2 }
+      /^agent_blocking_/ && $1 !~ /_count[{]/ && $2 != 0 {
+        k = $1; sub(/^agent_blocking_/, "", k); sub(/_seconds/, "", k)
+        gsub(/[{]site="/, "|", k); gsub(/",le="/, "|", k); gsub(/"[}]/, "", k)
+        printf "\"%s\":%s,", k, $2
+      }')
     printf 'LOAD {"t":%s000,"pid":%s,%s%s"cpu_ticks":%s,"AnonHugePages":%s,"fds":%s,"cache_kb":%s,"cache_dirs":%s,"cache_trash":%s,%s}\n' \
       "$(date +%s)" "$pid" "$st" "$m" "${cpu:-0}" "${huge:-0}" "$fds" "${kb:-0}" "$dirs" "$trash" "$net"
   fi

@@ -148,7 +148,7 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, MemoryError> + Send + 'static,
 {
-    match tokio::task::spawn_blocking(f).await {
+    match crate::blocking::spawn(crate::blocking::Site::Store, f).await {
         Ok(r) => r,
         Err(e) => Err(MemoryError::Backend(format!(
             "memory operation failed: {e}"

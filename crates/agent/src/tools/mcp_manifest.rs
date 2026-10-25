@@ -237,7 +237,11 @@ async fn update_store_off_runtime(
 ) {
     let path = dir.file();
     let dir = dir.clone();
-    if let Err(e) = tokio::task::spawn_blocking(move || update_store(&dir, change)).await {
+    if let Err(e) = crate::blocking::spawn(crate::blocking::Site::Store, move || {
+        update_store(&dir, change)
+    })
+    .await
+    {
         tracing::warn!(
             manifest = %path.display(),
             error = %e,

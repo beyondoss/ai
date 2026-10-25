@@ -615,7 +615,7 @@ pub(crate) async fn scan_session_dirs(
     layout: crate::session_store::Layout,
     on_progress: impl Fn(usize, usize) + Send + Sync + 'static,
 ) -> Vec<SessionMeta> {
-    match tokio::task::spawn_blocking(move || {
+    match crate::blocking::spawn(crate::blocking::Site::SessionList, move || {
         let paths: Vec<std::path::PathBuf> = dirs
             .iter()
             .flat_map(|dir| crate::session_store::scan_session_dir_in(dir, &layout))
@@ -1248,7 +1248,7 @@ impl SessionLoop {
         let stopped_jobs = {
             let jobs = self.bash_jobs.clone();
             let host_jobs = self.host_bash_jobs.clone();
-            tokio::task::spawn_blocking(move || {
+            crate::blocking::spawn(crate::blocking::Site::Serve, move || {
                 // The client's are stopped too, but not reported as the model's jobs.
                 host_jobs.stop_all();
                 // Not ended, only closed: the jobs the sandbox owns run on for the next replica to
@@ -1640,9 +1640,11 @@ async fn stop_survivors(jobs: &Arc<crate::tools::bash_jobs::BashJobs>, persisten
     }
     let session = persistence.session_id().to_string();
     let jobs = jobs.clone();
-    let fates = tokio::task::spawn_blocking(move || jobs.stop_survivors(&records))
-        .await
-        .unwrap_or_default();
+    let fates = crate::blocking::spawn(crate::blocking::Site::Serve, move || {
+        jobs.stop_survivors(&records)
+    })
+    .await
+    .unwrap_or_default();
     if !fates.is_empty() {
         tracing::info!(%session, ?fates, "stopped bash jobs a killed process left running");
     }

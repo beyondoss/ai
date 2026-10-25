@@ -25,7 +25,8 @@ export DEMO_NAME=${DEMO_NAME:-load} SANDBOX=load
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 LOAD_CACHE_MB=${LOAD_CACHE_MB:-16}
-export LOAD_CACHE_MB
+LOAD_STORE=${LOAD_STORE:-efs} # efs (the default) or local: the session store on the task's ephemeral disk
+export LOAD_CACHE_MB LOAD_STORE
 SESSIONS=${LOAD_SESSIONS:-500}
 BURST=${LOAD_BURST:-200}
 RAMP=${LOAD_RAMP_SECS:-60}
@@ -97,11 +98,19 @@ cmd_run() {
     | jq -r '.events[].message | select(startswith("LOAD ")) | sub("^LOAD "; "")' > "$work/samples.jsonl"
   echo "  $(wc -l < "$work/samples.jsonl") samples"
 
+  say "the replica's own OPEN lines (one per phase half of every open)"
+  command aws --region "$REGION" --output json logs filter-log-events --log-group-name "$LOG_GROUP" \
+    --log-stream-name-prefix agent --filter-pattern OPEN --start-time "$((start_ms - 120000))" --end-time "$((end_ms + 15000))" \
+    | jq -r '.events[].message | select(startswith("OPEN "))' > "$work/opens.log"
+  echo "  $(wc -l < "$work/opens.log") lines"
+
   jq -n --arg commit "$(git -C "$ROOT" rev-parse --short HEAD)" --arg region "$REGION" --arg name "$NAME" \
-    --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson budget "$LOAD_CACHE_MB" \
-    '{commit:$commit, region:$region, name:$name, started_at:$at, cache_budget_mb:$budget,
+    --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson budget "$LOAD_CACHE_MB" --arg store "$LOAD_STORE" \
+    '{commit:$commit, region:$region, name:$name, started_at:$at, cache_budget_mb:$budget, store:$store,
       task:{vcpu:0.5, memory_mb:1024, flags:"serve --service --bundle-cache-mb \($budget)"}}' > "$work/meta.json"
-  python3 -I "$HERE/load-analyze.py" --driver "$work/driver.json" --samples "$work/samples.jsonl" --meta "$work/meta.json" > "$dir/run.json"
+  python3 -I "$HERE/load-analyze.py" --driver "$work/driver.json" --samples "$work/samples.jsonl" --opens "$work/opens.log" --meta "$work/meta.json" > "$dir/run.json"
+  # What the analysis was made from, for re-running it: the client's per-open rows and the replica's lines.
+  cp "$work/driver.json" "$work/opens.log" "$dir/"
   "$HERE/report.sh" "$dir"
   jq -r '.checks[] | "  \(.status | ascii_upcase)  \(.name): \(.detail)"' "$dir/run.json"
   echo "load: record $dir/run.json"

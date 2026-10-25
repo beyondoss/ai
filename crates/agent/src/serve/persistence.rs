@@ -30,7 +30,7 @@ pub(super) async fn persist_blocking(
     // (always awaited directly, never `.abort()`ed) — so a `JoinError` here can only mean the closure
     // panicked. Re-raise that panic rather than `.expect()`ing (denied by the workspace's
     // panic-surface lints) on what would otherwise look like an ordinary recoverable error.
-    match tokio::task::spawn_blocking(move || {
+    match crate::blocking::spawn(crate::blocking::Site::SessionPersist, move || {
         let r = persistence.persist(&session);
         (persistence, r)
     })
@@ -51,7 +51,7 @@ pub(super) async fn persist_messages_blocking(
     edited: Vec<usize>,
     cuts: agent_core::Cuts,
 ) -> (Persistence, std::io::Result<()>) {
-    match tokio::task::spawn_blocking(move || {
+    match crate::blocking::spawn(crate::blocking::Site::SessionCheckpoint, move || {
         let r = simulated_checkpoint_write(&persistence.meta.id)
             .and_then(|()| persistence.persist_messages(&messages, &provenance, &edited, &cuts));
         (persistence, r)
@@ -81,7 +81,7 @@ pub(super) async fn persist_messages_blocking(
 pub(super) async fn open_persistence_blocking(
     cfg: ServeConfig,
 ) -> (ServeConfig, std::io::Result<(Persistence, Session)>) {
-    match tokio::task::spawn_blocking(move || {
+    match crate::blocking::spawn(crate::blocking::Site::SessionOpen, move || {
         let r = Persistence::open(&cfg);
         (cfg, r)
     })
@@ -988,17 +988,20 @@ impl Persistence {
             return Vec::new();
         };
         let cwd = self.meta.cwd.clone();
-        let sessions =
-            match tokio::task::spawn_blocking(move || repo.list_with_progress(on_progress)).await {
-                Ok(Ok(sessions)) => sessions,
-                Ok(Err(e)) => {
-                    eprintln!("serve: failed to list sessions: {e}");
-                    Vec::new()
-                }
-                // `list_with_progress` never panics itself and this task is never cancelled — same
-                // reasoning as `persist_blocking`'s identical re-raise.
-                Err(e) => std::panic::resume_unwind(e.into_panic()),
-            };
+        let sessions = match crate::blocking::spawn(crate::blocking::Site::SessionList, move || {
+            repo.list_with_progress(on_progress)
+        })
+        .await
+        {
+            Ok(Ok(sessions)) => sessions,
+            Ok(Err(e)) => {
+                eprintln!("serve: failed to list sessions: {e}");
+                Vec::new()
+            }
+            // `list_with_progress` never panics itself and this task is never cancelled — same
+            // reasoning as `persist_blocking`'s identical re-raise.
+            Err(e) => std::panic::resume_unwind(e.into_panic()),
+        };
         sessions.into_iter().filter(|m| m.cwd == cwd).collect()
     }
 
@@ -1036,7 +1039,7 @@ impl Persistence {
                 )
             })?
             .to_path_buf();
-        match tokio::task::spawn_blocking(move || {
+        match crate::blocking::spawn(crate::blocking::Site::SessionList, move || {
             SessionRepo::list_all_with_progress(&root, on_progress)
         })
         .await
