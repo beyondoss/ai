@@ -59,6 +59,36 @@ pub struct Removal {
     pub retired: Vec<String>,
 }
 
+/// `s` as a Rust string literal, quotes included and escaped: listing values are data, never code.
+fn rs(s: &str) -> String {
+    format!("{s:?}")
+}
+
+/// A TOML key: bare when it can be, else a quoted string.
+fn tk(s: &str) -> String {
+    if !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        s.to_owned()
+    } else {
+        ts(s)
+    }
+}
+
+/// `s` as a one-line TOML string, quotes included, escaped by the `toml` crate. The crate writes a
+/// string with a newline as a `"""` block, which is not valid as a key or inside an inline table
+/// (`cost = {..}`), so those take JSON's escapes, which TOML's basic strings share (but for DEL).
+pub(crate) fn ts(s: &str) -> String {
+    let t = toml::Value::String(s.to_owned()).to_string();
+    if !t.contains('\n') {
+        return t;
+    }
+    serde_json::to_string(s)
+        .unwrap_or_default()
+        .replace('\u{7f}', "\\u007F")
+}
+
 /// What a generated row is made of.
 pub struct NewRow<'a> {
     pub model: &'a str,
@@ -103,8 +133,10 @@ fn bits(v: u8, table: &[(u8, &str)], prefix: &str) -> String {
 pub fn candidates(c: &[NewCand]) -> String {
     let one = |c: &NewCand, pad: &str| {
         format!(
-            "Candidate {{\n{pad}    provider: ProviderId::{:?},\n{pad}    upstream_model: \"{}\",\n{pad}    path: \"{}\",\n{pad}}}",
-            c.provider, c.id, c.path
+            "Candidate {{\n{pad}    provider: ProviderId::{:?},\n{pad}    upstream_model: {},\n{pad}    path: {},\n{pad}}}",
+            c.provider,
+            rs(&c.id),
+            rs(c.path)
         )
     };
     match c {
@@ -131,9 +163,9 @@ pub fn row(r: &NewRow<'_>) -> String {
     };
     let card = if c.max_output_published || c.max_output_tokens != UNPUBLISHED_MAX_OUTPUT {
         format!(
-            "card(\n            \"{}\",\n            \"{}\",\n            {},\n            {},\n            {},\n            {},\n            {},\n        )",
-            r.name,
-            c.owned_by,
+            "card(\n            {},\n            {},\n            {},\n            {},\n            {},\n            {},\n            {},\n        )",
+            rs(r.name),
+            rs(c.owned_by),
             r.created,
             grouped(c.context_window),
             grouped(c.max_output_tokens),
@@ -142,9 +174,9 @@ pub fn row(r: &NewRow<'_>) -> String {
         )
     } else {
         format!(
-            "card_unpublished_output(\n            \"{}\",\n            \"{}\",\n            {},\n            {},\n            {},\n            {},\n        )",
-            r.name,
-            c.owned_by,
+            "card_unpublished_output(\n            {},\n            {},\n            {},\n            {},\n            {},\n            {},\n        )",
+            rs(r.name),
+            rs(c.owned_by),
             r.created,
             grouped(c.context_window),
             bits(c.input, &INPUT_NAMES, "IN_"),
@@ -152,23 +184,27 @@ pub fn row(r: &NewRow<'_>) -> String {
         )
     };
     format!(
-        "    ModelRoute {{\n        model: \"{}\",\n        wire: WireFormat::{wire},\n        candidates: {},\n        responses: {},\n        price: price(\"{i}\", \"{o}\", \"{cr}\", \"{cw}\"),\n        card: {card},\n    }},\n",
-        r.model,
+        "    ModelRoute {{\n        model: {},\n        wire: WireFormat::{wire},\n        candidates: {},\n        responses: {},\n        price: price({}, {}, {}, {}),\n        card: {card},\n    }},\n",
+        rs(r.model),
         candidates(r.candidates),
         candidates(r.responses),
+        rs(i),
+        rs(o),
+        rs(cr),
+        rs(cw),
     )
 }
 
 /// A `[[card]]` block.
 pub fn card_block(c: &crate::spec::CardSpec) -> String {
-    let mut s = format!("[[card]]\nname = \"{}\"\nrow = \"{}\"\n", c.name, c.row);
+    let mut s = format!("[[card]]\nname = {}\nrow = {}\n", ts(&c.name), ts(&c.row));
     for (k, v) in [
         ("geo_us", &c.geo_us),
         ("tools", &c.tools),
         ("unpublished_output", &c.unpublished_output),
     ] {
         if let Some(v) = v {
-            let _ = writeln!(s, "{k} = \"{v}\"");
+            let _ = writeln!(s, "{k} = {}", ts(v));
         }
     }
     s
@@ -186,10 +222,17 @@ pub fn truth_row(
 ) -> String {
     let [i, o, cr, cw] = price;
     let mut s = format!(
-        "[[row]]\nmodel = \"{model}\"\nsource = [\"{source}\"]\ndate = \"{date}\"\ninput = \"{i}\"\noutput = \"{o}\"\ncache_read = \"{cr}\"\ncache_write = \"{cw}\"\ncreated = {created}\n"
+        "[[row]]\nmodel = {}\nsource = [{}]\ndate = {}\ninput = {}\noutput = {}\ncache_read = {}\ncache_write = {}\ncreated = {created}\n",
+        ts(model),
+        ts(source),
+        ts(date),
+        ts(i),
+        ts(o),
+        ts(cr),
+        ts(cw),
     );
     if let Some(v) = pred.get("owned_by").and_then(toml::Value::as_str) {
-        let _ = writeln!(s, "owned_by = \"{v}\"");
+        let _ = writeln!(s, "owned_by = {}", ts(v));
     }
     for k in [
         "input_present",
@@ -198,10 +241,7 @@ pub fn truth_row(
         "features_absent",
     ] {
         if let Some(a) = pred.get(k).and_then(toml::Value::as_array) {
-            let names: Vec<String> = a
-                .iter()
-                .filter_map(|x| x.as_str().map(|x| format!("\"{x}\"")))
-                .collect();
+            let names: Vec<String> = a.iter().filter_map(|x| x.as_str().map(ts)).collect();
             let _ = writeln!(s, "{k} = [{}]", names.join(", "));
         }
     }
@@ -210,14 +250,19 @@ pub fn truth_row(
 
 /// `cost = { anthropic = "list", openrouter = "openrouter:…" }`.
 pub fn cost_line(cost: &[(String, String)]) -> String {
-    let parts: Vec<String> = cost.iter().map(|(h, c)| format!("{h} = \"{c}\"")).collect();
+    let parts: Vec<String> = cost
+        .iter()
+        .map(|(h, c)| format!("{} = {}", tk(h), ts(c)))
+        .collect();
     format!("cost = {{ {} }}", parts.join(", "))
 }
 
 /// A `[[pricing]]` block.
 pub fn pricing_block(model: &str, list_card: &str, cost: &[(String, String)]) -> String {
     format!(
-        "[[pricing]]\nmodel = \"{model}\"\nlist_card = \"{list_card}\"\n{}\n",
+        "[[pricing]]\nmodel = {}\nlist_card = {}\n{}\n",
+        ts(model),
+        ts(list_card),
         cost_line(cost)
     )
 }
@@ -234,13 +279,17 @@ pub fn retired_block(
 ) -> String {
     let mut s = String::from("[[retired]]\n");
     if let Some(m) = model {
-        let _ = writeln!(s, "model = \"{m}\"");
+        let _ = writeln!(s, "model = {}", ts(m));
     }
     let key = if date <= today { "retired" } else { "retires" };
     let _ = write!(
         s,
-        "provider = \"{provider}\"\nid = \"{id}\"\nsource = \"{source}\"\n{key} = \"{date}\"\nnote = \"{}\"\n",
-        note.replace('\\', "\\\\").replace('"', "\\\"")
+        "provider = {}\nid = {}\nsource = {}\n{key} = {}\nnote = {}\n",
+        ts(provider),
+        ts(id),
+        ts(source),
+        ts(date),
+        ts(note)
     );
     s
 }
@@ -260,7 +309,7 @@ fn one_at(hay: &str, needle: &str, what: &str) -> Result<usize> {
 
 /// The byte range of a `MODEL_ROUTES` entry, from its `    ModelRoute {` line through `    },\n`.
 fn row_range(text: &str, model: &str) -> Result<(usize, usize)> {
-    let at = one_at(text, &format!("\n        model: \"{model}\",\n"), model)?;
+    let at = one_at(text, &format!("\n        model: {},\n", rs(model)), model)?;
     let start = text[..=at]
         .rfind("\n    ModelRoute {\n")
         .ok_or_else(|| format!("{model}: no `ModelRoute {{` before it"))?
@@ -341,7 +390,7 @@ fn add_alias(text: &str, old: &str, new: &str) -> Result<String> {
     pairs.sort();
     let mut body = String::from("\n");
     for (a, b) in &pairs {
-        let _ = writeln!(body, "    (\"{a}\", \"{b}\"),");
+        let _ = writeln!(body, "    ({}, {}),", rs(a), rs(b));
     }
     Ok(format!("{}{body}{}", &text[..start], &text[end..]))
 }
@@ -351,7 +400,7 @@ fn add_alias(text: &str, old: &str, new: &str) -> Result<String> {
 pub fn remove_conflict(text: &str, card: &str, field: &str) -> Result<String> {
     let start = one_at(
         text,
-        &format!("[[conflict]]\ncard = \"{card}\"\nfield = \"{field}\"\n"),
+        &format!("[[conflict]]\ncard = {}\nfield = {}\n", ts(card), ts(field)),
         &format!("[[conflict]] {card} {field}"),
     )?;
     let end = text[start..]
@@ -365,7 +414,7 @@ pub fn remove_conflict(text: &str, card: &str, field: &str) -> Result<String> {
 fn block_range(text: &str, kind: &str, key: &str, value: &str) -> Result<(usize, usize)> {
     let start = one_at(
         text,
-        &format!("[[{kind}]]\n{key} = \"{value}\"\n"),
+        &format!("[[{kind}]]\n{key} = {}\n", ts(value)),
         &format!("[[{kind}]] {value}"),
     )?;
     if start > 0 && !text[..start].ends_with('\n') {
@@ -456,6 +505,7 @@ pub fn apply_truth(text: &str, edit: &Edit) -> Result<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -475,5 +525,141 @@ mod tests {
             t,
             "pub const ALIASES: &[(&str, &str)] = &[\n    (\"a-1\", \"a-2\"),\n    (\"b-1\", \"b-2\"),\n];\n"
         );
+    }
+
+    /// Undo a Rust string literal as `{:?}` writes it (`\\`, `\"`, `\n`, `\r`, `\t`, `\u{..}`).
+    fn unrust(lit: &str) -> String {
+        let inner = lit
+            .strip_prefix('"')
+            .and_then(|l| l.strip_suffix('"'))
+            .unwrap_or_default();
+        assert!(!inner.contains('\n'), "raw newline in {lit}");
+        let mut out = String::new();
+        let mut it = inner.chars();
+        while let Some(c) = it.next() {
+            match c {
+                '"' => panic!("unescaped quote in {lit}"),
+                '\\' => match it.next() {
+                    Some('n') => out.push('\n'),
+                    Some('r') => out.push('\r'),
+                    Some('t') => out.push('\t'),
+                    Some('u') => {
+                        let hex: String = it.by_ref().skip(1).take_while(|&c| c != '}').collect();
+                        out.push(char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap());
+                    }
+                    Some(e) => out.push(e),
+                    None => panic!("dangling backslash in {lit}"),
+                },
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    const HOSTILE: [&str; 5] = [
+        "a\"b",
+        "a\\b",
+        "a\nb",
+        "a}b",
+        "x\", path: \"/evil\" }, Candidate { upstream_model: \"y",
+    ];
+
+    #[test]
+    fn candidate_ids_come_out_as_one_escaped_literal() {
+        for id in HOSTILE {
+            let one = [NewCand {
+                provider: ProviderId::Anthropic,
+                id: id.to_owned(),
+                path: "/v1/messages",
+            }];
+            let text = candidates(&one);
+            let line = text
+                .lines()
+                .find(|l| l.trim_start().starts_with("upstream_model: "))
+                .unwrap();
+            let lit = line
+                .trim_start()
+                .strip_prefix("upstream_model: ")
+                .and_then(|l| l.strip_suffix(','))
+                .unwrap();
+            assert_eq!(unrust(lit), id, "{text}");
+            // The layout is unchanged: one field per line, exactly three fields.
+            assert_eq!(text.lines().count(), 5, "{text}");
+        }
+    }
+
+    #[test]
+    fn plain_candidates_keep_rustfmts_layout() {
+        let one = [NewCand {
+            provider: ProviderId::Anthropic,
+            id: "claude-x".into(),
+            path: "/v1/messages",
+        }];
+        assert_eq!(
+            candidates(&one),
+            "&[Candidate {\n            provider: ProviderId::Anthropic,\n            upstream_model: \"claude-x\",\n            path: \"/v1/messages\",\n        }]"
+        );
+    }
+
+    #[test]
+    fn toml_blocks_parse_back_to_the_same_strings() {
+        for v in HOSTILE
+            .into_iter()
+            .chain(["plain", "tab\there", "é", "del\u{7f}\r\n"])
+        {
+            let pricing = pricing_block(v, v, &[(v.to_owned(), v.to_owned())]);
+            let t: toml::Table = pricing.parse().unwrap();
+            let p = &t["pricing"][0];
+            assert_eq!(p["model"].as_str(), Some(v));
+            assert_eq!(p["list_card"].as_str(), Some(v));
+            assert_eq!(p["cost"][v].as_str(), Some(v));
+
+            let retired = retired_block(Some(v), v, v, v, "2026-01-01", "2026-02-01", v);
+            let t: toml::Table = retired.parse().unwrap();
+            let r = &t["retired"][0];
+            for k in ["model", "provider", "id", "source", "retired", "note"] {
+                let want = if k == "retired" { "2026-01-01" } else { v };
+                assert_eq!(r[k].as_str(), Some(want), "{k}");
+            }
+
+            let pred: toml::Table = format!("owned_by = {}\ninput_present = [{}]", ts(v), ts(v))
+                .parse()
+                .unwrap();
+            let row = truth_row(
+                v,
+                v,
+                v,
+                &[v.into(), v.into(), v.into(), v.into()],
+                7,
+                &toml::Value::Table(pred),
+            );
+            let t: toml::Table = row.parse().unwrap();
+            let r = &t["row"][0];
+            for k in [
+                "model",
+                "date",
+                "input",
+                "output",
+                "cache_read",
+                "cache_write",
+                "owned_by",
+            ] {
+                assert_eq!(r[k].as_str(), Some(v), "{k}");
+            }
+            assert_eq!(r["source"][0].as_str(), Some(v));
+            assert_eq!(r["input_present"][0].as_str(), Some(v));
+        }
+    }
+
+    #[test]
+    fn plain_toml_is_still_double_quoted() {
+        assert_eq!(ts("claude-x"), "\"claude-x\"");
+    }
+
+    #[test]
+    fn splice_needles_match_what_the_blocks_write() {
+        let block = pricing_block("m\"x", "l", &[]);
+        let text = format!("{block}\n");
+        assert!(block_range(&text, "pricing", "model", "m\"x").is_ok());
     }
 }

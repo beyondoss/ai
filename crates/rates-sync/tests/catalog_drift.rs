@@ -644,3 +644,58 @@ fn needs_human_alias_onto_a_row_that_trains_on_inputs() {
         "claude-sonata-4-8 trains on inputs",
     );
 }
+
+#[test]
+fn plain_ids_are_letters_digits_and_a_few_marks() {
+    use rates_sync::catalog_drift::is_plain_id;
+    for ok in [
+        "claude-opus-4-8",
+        "anthropic/claude-opus-4.8",
+        "us.anthropic.claude-x:0",
+        "@cf/meta/llama-3.1-8b+x",
+    ] {
+        assert!(is_plain_id(ok), "{ok}");
+    }
+    let long = "a".repeat(129);
+    for bad in [
+        "",
+        "a b",
+        "a\"b",
+        "a\\b",
+        "a\nb",
+        "a}b",
+        "a\tb",
+        "é",
+        long.as_str(),
+    ] {
+        assert!(!is_plain_id(bad), "{bad:?}");
+    }
+    assert!(is_plain_id(&"a".repeat(128)));
+}
+
+#[test]
+fn an_unplain_id_is_a_needs_human_reason_not_an_edit() {
+    // `successor` turns this reason into a needs-human finding with no edit (a non-empty `reasons`
+    // is what makes a successor needs-human). Listed ids that reach it already share the
+    // predecessor's line, so this is the guard behind that, not a path a fixture listing can
+    // reach: the reason is the unit.
+    let r = rates_sync::catalog_drift::unplain_id_reason("openrouter", "a\"b\nc");
+    assert!(r.contains("not a plain model id"), "{r}");
+    assert!(r.contains("\\\"b\\n"), "the id is shown escaped: {r}");
+}
+
+#[test]
+fn every_catalog_id_and_path_is_plain() {
+    use rates_sync::catalog_drift::is_plain_id;
+    for r in providers::catalog::MODEL_ROUTES {
+        for c in r.candidates.iter().chain(r.responses) {
+            assert!(
+                is_plain_id(c.upstream_model),
+                "{}: upstream_model {:?}",
+                r.model,
+                c.upstream_model
+            );
+            assert!(is_plain_id(c.path), "{}: path {:?}", r.model, c.path);
+        }
+    }
+}

@@ -795,6 +795,27 @@ fn discover(hosts: &Hosts, cat: &Catalog<'_>) -> Discovery {
     }
 }
 
+/// The longest model id or path that is written into the catalog automatically.
+const MAX_ID_LEN: usize = 128;
+
+/// Whether a model id (or path) from a host's listing is plain enough to generate code from:
+/// ASCII letters, digits and `._:/@+-`, no whitespace, at most [`MAX_ID_LEN`] bytes. Anything else
+/// goes to a human, as an unusual name does.
+pub fn is_plain_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_ID_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:/@+-".contains(&b))
+}
+
+/// Why a host's id is not written into the catalog automatically.
+pub fn unplain_id_reason(host: &str, id: &str) -> String {
+    format!(
+        "{host} lists the id {id:?}, which is not a plain model id (ASCII letters, digits and `._:/@+-`, up to {MAX_ID_LEN} bytes): it is not written into the catalog automatically"
+    )
+}
+
 /// Every finding, sorted by slug.
 pub fn detect(inputs: &Inputs, cat: &Catalog<'_>) -> Result<Vec<Finding>> {
     let hosts = Hosts::read(inputs)?;
@@ -928,6 +949,7 @@ fn successor(
             continue;
         };
         match derive(list, c.upstream_model, v) {
+            Derived::One(id) if !is_plain_id(&id) => reasons.push(unplain_id_reason(h, &id)),
             Derived::One(id) => {
                 ids.insert(h, id.clone());
                 kept.push((
@@ -1104,7 +1126,7 @@ fn successor(
     let mut add_card = |old: &str, spec: &CardSpec, refresh: &mut BTreeSet<String>| {
         if !cards
             .iter()
-            .any(|(_, b)| b.contains(&format!("name = \"{}\"\n", spec.name)))
+            .any(|(_, b)| b.contains(&format!("name = {}\n", catalog_edit::ts(&spec.name))))
         {
             cards.push((old.to_owned(), catalog_edit::card_block(spec)));
         }
