@@ -25,14 +25,14 @@ STUB_E2B = os.path.join(TMP, "e2b.sh")
 with open(STUB_E2B, "w") as f:
     f.write(f'''
 vm_for() {{
-  echo x >> "{TMP}/creates"
+  echo "$1" >> "{TMP}/creates"
   n=$(wc -l < "{TMP}/creates")
   echo '{{"id":"vm'$n'","envd_token":"t","bearer":"b","traffic_token":"","url":"https://127.0.0.1:1/exec"}}' > "$VMDIR/$1.json"
   [ -z "${{STUB_SLOW:-}}" ] || sleep "$STUB_SLOW"
 }}
 vm_field() {{ jq -r ".$2" "$VMDIR/$1.json"; }}
 e2b_kill() {{ echo "$1" >> "{TMP}/kills"; }}
-vm_run() {{ echo seeded; }}
+vm_run() {{ [ -f "{TMP}/fail_seed" ] || echo seeded; }}
 vm_browser_start() {{ echo "$3" >> "{TMP}/browser_up"; echo started >> "{TMP}/bridge_start"; }}
 vm_site_start() {{ echo "$3" >> "{TMP}/site_start"; }}
 ''')
@@ -69,7 +69,7 @@ def post(srv, session):
 class FrontTest(unittest.TestCase):
     def setUp(self):
         front.sessions.clear()
-        for n in ("creates", "kills", "deleted", "browser_up", "bridge_start", "site_start"):
+        for n in ("creates", "kills", "deleted", "fail_seed", "browser_up", "bridge_start", "site_start"):
             try:
                 os.remove(os.path.join(TMP, n))
             except FileNotFoundError:
@@ -78,14 +78,28 @@ class FrontTest(unittest.TestCase):
             os.remove(os.path.join(VMDIR, n))
         os.environ.pop("STUB_SLOW", None)
 
-    def test_a_vm_that_cannot_be_reached_is_dropped_and_the_next_request_makes_a_fresh_one(self):
+    def test_a_vm_that_cannot_be_reached_is_dropped_and_the_request_retried_on_a_fresh_one(self):
         srv = serve()
+        # The request never reached the dead VM, so the front makes a fresh one and tries once more.
         self.assertEqual(post(srv, "s1"), 502)
         self.assertNotIn("s1", front.sessions)
         self.assertFalse(os.path.exists(f"{VMDIR}/s1.json"))
-        self.assertEqual(lines("kills"), ["vm1"])
+        self.assertEqual(lines("kills"), ["vm1", "vm2"])
         self.assertEqual(post(srv, "s1"), 502)
-        self.assertEqual(len(lines("creates")), 2, "the second request must not reuse the dead entry")
+        self.assertEqual(len(lines("creates")), 4, "the second request must not reuse the dead entry")
+        srv.shutdown()
+
+    def test_a_create_that_fails_after_the_vm_exists_kills_it_and_leaves_no_record(self):
+        open(os.path.join(TMP, "fail_seed"), "w").close()
+        srv = serve()
+        c = http.client.HTTPConnection("127.0.0.1", srv.server_port, timeout=20)
+        c.request("POST", "/exec/s9?bundle=https://b/t.tar", body=b"{}")
+        r = c.getresponse()
+        r.read()
+        c.close()
+        self.assertEqual(r.status, 502)
+        self.assertEqual(lines("kills"), ["vm1"], "the half-made VM must not outlive the failed create")
+        self.assertFalse(os.path.exists(f"{VMDIR}/s9.json"), "a record would make the next request reuse it")
         srv.shutdown()
 
     def test_an_mcp_request_creates_the_vm_and_installs_the_browser_stack_and_an_exec_request_does_not(self):
@@ -95,7 +109,7 @@ class FrontTest(unittest.TestCase):
             c.request("POST", path, body=b"{}")
             c.getresponse().read()
             c.close()
-        self.assertEqual(len(lines("creates")), 2)
+        self.assertEqual(set(lines("creates")), {"e1", "m1"})
         self.assertEqual(lines("browser_up"), ["https://b/rw"], "only the MCP request installs the stack")
         self.assertTrue(lines("site_start")[0].endswith("/workspace/site"), lines("site_start"))
         srv.shutdown()

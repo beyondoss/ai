@@ -104,9 +104,29 @@ def make_vm(session, bundle, browser="", site=""):
             log("browser_ready", session=session)
     err = p.stderr.read()
     if p.wait() != 0:
+        # vm_for kills its own failures; one that came later (seeding, the browser) left a live VM and
+        # its record, and the record would make the next request reuse a half-made VM.
+        try:
+            with open(f"{VMDIR}/{session}.json") as f:
+                vm_id = json.load(f)["id"]
+        except (FileNotFoundError, ValueError, KeyError):
+            vm_id = None
+        kill_vm(session, vm_id)
         raise RuntimeError(f"creating the sandbox failed ({p.returncode}): {err[-300:]}")
     with open(f"{VMDIR}/{session}.json") as f:
         return json.load(f)
+
+
+def kill_vm(session, vm_id):
+    """Forget a session's VM record and kill the VM, best effort."""
+    try:
+        os.remove(f"{VMDIR}/{session}.json")
+    except FileNotFoundError:
+        pass
+    if vm_id:
+        env = dict(os.environ, E2B_SH=E2B_SH, VMDIR=VMDIR, VM_PRIVATE="1", SANDBOX_PORT="8081", TAG_KEY="", NAME="")
+        subprocess.run(["bash", "-c", '. "$E2B_SH"; e2b_kill "$1"', "front", vm_id], env=env,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
 
 
 def drop(session, s, kill=True):
@@ -115,14 +135,7 @@ def drop(session, s, kill=True):
         if sessions.get(session) is s:
             del sessions[session]
     vm, s["vm"] = s["vm"], None
-    try:
-        os.remove(f"{VMDIR}/{session}.json")
-    except FileNotFoundError:
-        pass
-    if kill and vm:
-        env = dict(os.environ, E2B_SH=E2B_SH, VMDIR=VMDIR, VM_PRIVATE="1", SANDBOX_PORT="8081", TAG_KEY="", NAME="")
-        subprocess.run(["bash", "-c", '. "$E2B_SH"; e2b_kill "$1"', "front", vm["id"]], env=env,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
+    kill_vm(session, vm["id"] if kill and vm else None)
     log("vm_dropped", session=session)
 
 
@@ -186,29 +199,37 @@ class Front(BaseHTTPRequestHandler):
             site = (q.get("site") or [""])[0]
             if (browser and not browser.startswith("https://")) or not re.fullmatch(r"[A-Za-z0-9._/-]*", site) or ".." in site:
                 return self.reply(400, {"error": "browser must be an https URL; site a relative directory"})
-        try:
-            vm, entry = vm_for(session, bundle, browser, site)
-        except Exception as e:  # the next request tries again
-            with sessions_lock:
-                sessions.pop(session, None)
-            log("vm_failed", session=session, error=str(e))
-            return self.reply(502, {"error": str(e)})
-        log("mcp_request" if kind == "mcp" else "exec_request", session=session)
-        # An MCP request goes to the bridge's port on the same VM, which takes no bearer; an exec
-        # request goes to the exec stub, which does.
-        up = urlsplit(f"https://{BRIDGE_PORT}-{vm['id']}.e2b.app/mcp" if kind == "mcp" else vm["url"])
-        headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP | {"authorization"}}
-        if kind == "exec":
-            headers["Authorization"] = "Bearer " + vm["bearer"]
-        if vm.get("traffic_token"):
-            headers["e2b-traffic-access-token"] = vm["traffic_token"]
-        conn = http.client.HTTPSConnection(up.hostname, timeout=3700)
-        try:
-            conn.connect()
-        except OSError as e:  # the VM is gone (past its timeout, or killed): the next request makes a new one
-            log("proxy_failed", session=session, error=str(e))
-            drop(session, entry)
-            return self.reply(502, {"error": str(e)})
+        # A VM that cannot be reached (past its timeout, or killed) never saw the request, so the
+        # request is safe to repeat on a fresh one: a sandbox that has gone is woken, not answered
+        # with an error. A second failure in a row is the caller's to retry.
+        for attempt in (1, 2):
+            try:
+                vm, entry = vm_for(session, bundle, browser, site)
+            except Exception as e:  # the next request tries again
+                with sessions_lock:
+                    sessions.pop(session, None)
+                log("vm_failed", session=session, error=str(e))
+                return self.reply(502, {"error": str(e)})
+            log("mcp_request" if kind == "mcp" else "exec_request", session=session)
+            # An MCP request goes to the bridge's port on the same VM, which takes no bearer; an exec
+            # request goes to the exec stub, which does.
+            up = urlsplit(f"https://{BRIDGE_PORT}-{vm['id']}.e2b.app/mcp" if kind == "mcp" else vm["url"])
+            headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP | {"authorization"}}
+            if kind == "exec":
+                headers["Authorization"] = "Bearer " + vm["bearer"]
+            if vm.get("traffic_token"):
+                headers["e2b-traffic-access-token"] = vm["traffic_token"]
+            # E2B's address is https on 443; a local substrate (the conformance run) is plain http.
+            conn_class = http.client.HTTPSConnection if up.scheme == "https" else http.client.HTTPConnection
+            conn = conn_class(up.hostname, up.port, timeout=3700)
+            try:
+                conn.connect()
+                break
+            except OSError as e:
+                log("proxy_failed", session=session, error=str(e))
+                drop(session, entry)
+                if attempt == 2:
+                    return self.reply(502, {"error": str(e)})
         try:
             conn.request(self.command, up.path, body=body, headers=headers)
             resp = conn.getresponse()

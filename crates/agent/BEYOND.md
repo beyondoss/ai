@@ -215,7 +215,18 @@ is deleted.
 
 ## Conformance
 
-A conformance kit in this repo will check each part against these contracts. Until it lands, the
-acceptance checks above are the bar. Beyond tracks every requirement this repo places on it, with its
+This repo owns the tests Beyond runs against its own implementation to prove each part meets the
+contract. Each kit is a list of named checks, each tagged with the line of this document it proves, and
+each is checked against a reference implementation that passes and broken ones that fail by name. Where
+a check needs state only the implementer can reach, the kit asks an operator hook (a command the
+implementer supplies) and never learns Beyond's internals. The acceptance checks above are the bar each
+kit enforces.
+
+| Part              | Kit                                                                                    | Run                                                                                                                                       |
+| ----------------- | -------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Exec protocol     | `src/exec_endpoint/conformance.rs`                                                     | `AGENT_CONFORMANCE_EXEC_URL=… cargo test -p beyond-ai-agent --test exec_conformance`                                                      |
+| Exec front / edge | `src/exec_endpoint/conformance/front.rs` (module doc: variables and the operator hook) | `AGENT_CONFORMANCE_FRONT_URL=…/exec/{session} AGENT_CONFORMANCE_FRONT_HOOK=… cargo test -p beyond-ai-agent --test exec_front_conformance` |
+
+Beyond tracks every requirement this repo places on it, with its
 source line and the proof it needs, in the
 [Hosted Agents Ledger](https://claude.ai/artifact/9QK7W4NSWQYVeWBoAEyA3e).
