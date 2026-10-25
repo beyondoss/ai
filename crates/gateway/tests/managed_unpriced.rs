@@ -216,3 +216,94 @@ async fn a_catalog_walk_cannot_run_an_unpriced_feature() {
     .await;
     assert_eq!(status, 200, "{text}");
 }
+
+/// `(path, body)`: each names a provider-stored object, which a managed key (generation endpoints
+/// only) can never have created in the shared account.
+const STORED: [(&str, &str); 7] = [
+    (
+        "/openai/v1/responses",
+        r#"{"model":"gpt-5","input":"hi","tools":[{"type":"file_search","vector_store_ids":["vs_1"]}]}"#,
+    ),
+    (
+        "/openai/v1/responses",
+        r#"{"model":"gpt-5","input":[{"role":"user","content":[{"type":"input_file","file_id":"file-abc"}]}]}"#,
+    ),
+    (
+        "/openai/v1/responses",
+        r#"{"model":"gpt-5","input":[{"role":"user","content":[{"type":"input_image","file_id":"file-abc"}]}]}"#,
+    ),
+    (
+        "/openai/v1/responses",
+        r#"{"model":"gpt-5","input":"hi","prompt":{"id":"pmpt_1","version":"2"}}"#,
+    ),
+    (
+        "/openai/v1/chat/completions",
+        r#"{"model":"gpt-5","messages":[{"role":"user","content":[{"type":"file","file":{"file_id":"file-abc"}}]}]}"#,
+    ),
+    (
+        "/anthropic/v1/messages",
+        r#"{"model":"claude-opus-4-8","max_tokens":16,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"file","file_id":"file_011"}}]}]}"#,
+    ),
+    (
+        "/anthropic/v1/messages",
+        r#"{"model":"claude-opus-4-8","max_tokens":16,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"image","source":{"type":"file","file_id":"file_011"}}]}]}]}"#,
+    ),
+];
+
+/// A managed key cannot name a stored file, vector store or prompt: a 400 with no upstream hit and
+/// no billing row. The same body on a BYO key, whose account the caller owns, is forwarded.
+/// claim: SEC-25
+/// defect: D300
+#[tokio::test]
+async fn a_managed_key_cannot_name_a_stored_provider_object() {
+    let (pubkey, sk) = test_keypair(162);
+    let mock = ScriptedUpstream::reply(200, "application/json", OK.to_owned()).await;
+    let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
+        .providers(&["openai", "anthropic"])
+        .start()
+        .await;
+    let managed = format!("Bearer {}", billing_vkey(&sk, 162));
+    let mut failures = Vec::new();
+    for (path, body) in STORED {
+        let before = mock.hits();
+        let (status, text) = send(
+            format!("{}{path}", gw.url()),
+            ("authorization", managed.clone()),
+            body,
+        )
+        .await;
+        if status != 400 || !text.contains("stored provider objects") || mock.hits() != before {
+            failures.push(format!(
+                "managed {path} {body}: {status} {text} (upstream hits {})",
+                mock.hits() - before
+            ));
+        }
+        let (status, text) = send(
+            format!("{}{path}", gw.url()),
+            ("authorization", "Bearer sk-caller-own-key".to_owned()),
+            body,
+        )
+        .await;
+        if status != 200 || mock.hits() != before + 1 {
+            failures.push(format!("BYO {path} {body}: {status} {text}"));
+        }
+    }
+    let metrics = gw.metrics().await;
+    if !metrics.contains(&format!(
+        r#"ai_rejections_total{{reason="unpriced_feature"}} {}"#,
+        STORED.len()
+    )) {
+        failures.push("every refusal is counted as unpriced_feature".to_owned());
+    }
+    // Inline content on the same managed key still goes through.
+    let (status, text) = send(
+        format!("{}/openai/v1/responses", gw.url()),
+        ("authorization", managed),
+        r#"{"model":"gpt-5","input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}]}"#,
+    )
+    .await;
+    if status != 200 {
+        failures.push(format!("managed inline image: {status} {text}"));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

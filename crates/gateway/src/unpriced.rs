@@ -14,7 +14,12 @@
 //! | Groq `browser_search` (and `code_interpreter`)                   | no published fee                                          |
 //! | OpenRouter `plugins` (web, file-parser), `:online` models, `web_search_options`, `openrouter:web_search` | engine and result count unreported |
 //! | Messages `service_tier: "priority"`                              | Anthropic Priority Tier is contract-priced                |
+//! | `file_search` tool, a content part's `file_id`, a root `prompt` object | names an object in a provider account a managed key cannot have created |
 //! | any other tool type                                              | not one the gateway meters (see [`allowed_tool`])         |
+//!
+//! The stored-object row is not about price. A managed key can only POST generation endpoints, so
+//! it can never have uploaded a file, built a vector store or saved a prompt in Beyond's shared
+//! provider account; a body naming one by id is reaching for another organization's object.
 //!
 //! Read structurally from the client's body (root members only, and each `tools` element's own
 //! `type`), so a prompt that mentions a tool cannot trip it.
@@ -44,6 +49,7 @@ pub const ADVISOR: &str = "a managed key cannot use the advisor tool: the adviso
 pub const GROQ_TOOLS: &str = "a managed key cannot use Groq's browser_search tool: it has no published price; use your own provider key";
 pub const OPENROUTER_WEB: &str = "a managed key cannot use OpenRouter web search or plugins (plugins, :online models, web_search_options, openrouter:web_search): their engine and results are billed outside the usage the gateway meters; use your own provider key";
 pub const UNLISTED_TOOL: &str = "a managed key cannot use a tool the gateway does not meter: its usage could be billed outside what the gateway can price; use your own provider key";
+pub const STORED_OBJECTS: &str = "a managed key cannot reference stored provider objects (the file_search tool, a content part's file_id, or a prompt object): they live in an account a managed key cannot upload to; send the content inline or use your own provider key";
 pub const PRIORITY_TIER: &str = "a managed key cannot use Anthropic Priority Tier (service_tier: priority): it is priced by contract; omit service_tier or use your own provider key";
 
 /// Inspect a managed request's body. `model` is the model it names (the catalog row or the
@@ -68,6 +74,12 @@ pub fn inspect(body: &[u8], model: &str, messages: bool) -> Inspection {
         } else if m.key_is(body, "container") {
             // `null` asks for nothing.
             (!matches!(body.get(span.0..span.1), Some(b"null"))).then_some(CODE_EXECUTION)
+        } else if m.key_is(body, "messages") || m.key_is(body, "input") {
+            names_stored_file(body, span.0, 0).then_some(STORED_OBJECTS)
+        } else if m.key_is(body, "prompt") {
+            // A Responses stored prompt is an object (`{"id": ...}`); a string is a legacy
+            // completion prompt, and `null` asks for nothing.
+            (body.get(span.0) == Some(&b'{')).then_some(STORED_OBJECTS)
         } else if messages && m.key_is(body, "service_tier") {
             peek::str_is(body, span, "priority").then_some(PRIORITY_TIER)
         } else {
@@ -79,6 +91,39 @@ pub fn inspect(body: &[u8], model: &str, messages: bool) -> Inspection {
         }
     }
     out
+}
+
+/// How deep [`names_stored_file`] follows nested arrays and `content` / `output` members: a
+/// Messages `tool_result` holding an image part is `messages > message > content > tool_result >
+/// content > part`. Deeper is not a shape any API sends.
+const MAX_PART_DEPTH: u8 = 6;
+
+/// Whether the value at `at` (a `messages` / `input` array, a message's `content` array, or a part)
+/// holds a content part carrying a non-null `file_id`: on the part itself (Responses `input_file` /
+/// `input_image`), in its `file` object (Chat Completions) or its `source` object (Messages). It
+/// follows only `content` and `output` into tool results, so a tool call's own arguments, which a
+/// client may name anything, are never read. No allocation: spans over the client's bytes.
+fn names_stored_file(body: &[u8], at: usize, depth: u8) -> bool {
+    match body.get(at) {
+        Some(b'[') if depth <= MAX_PART_DEPTH => peek::elements(body, at)
+            .map_while(|e| e)
+            .any(|(start, _)| names_stored_file(body, start, depth.saturating_add(1))),
+        Some(b'{') if depth <= MAX_PART_DEPTH => {
+            peek::members(body, at).map_while(|m| m).any(|m| {
+                if m.key_is(body, "file_id") {
+                    !matches!(body.get(m.value.0..m.value.1), Some(b"null"))
+                } else if m.key_is(body, "file") || m.key_is(body, "source") {
+                    body.get(m.value.0) == Some(&b'{')
+                        && names_stored_file(body, m.value.0, depth.saturating_add(1))
+                } else if m.key_is(body, "content") || m.key_is(body, "output") {
+                    names_stored_file(body, m.value.0, depth.saturating_add(1))
+                } else {
+                    false
+                }
+            })
+        }
+        _ => false,
+    }
 }
 
 /// The first refused tool in a `tools` array whose value starts at `open`.
@@ -107,6 +152,7 @@ fn tools(body: &[u8], open: usize, model: &str, preview: &mut bool) -> Option<&'
         let refused = match ty {
             "code_interpreter" | "shell" => Some(CONTAINERS),
             "image_generation" => Some(IMAGE_GENERATION),
+            "file_search" => Some(STORED_OBJECTS),
             "browser_search" => Some(GROQ_TOOLS),
             "openrouter:web_search" => Some(OPENROUTER_WEB),
             t if t.starts_with("web_search") && mini => Some(MINI_WEB_SEARCH),
@@ -127,7 +173,7 @@ fn tools(body: &[u8], open: usize, model: &str, preview: &mut bool) -> Option<&'
 ///
 /// A family matches its exact name, or its name followed by `_` and a version or variant
 /// (`web_search_20250305`, `web_search_preview`, `computer_use_preview`, `text_editor_20250728`).
-/// `bashful_x` is not `bash`. Names listed as exact-only (`file_search`, `tool_search`, `x_search`,
+/// `bashful_x` is not `bash`. Names listed as exact-only (`tool_search`, `x_search`,
 /// `function`, ...) take no suffix, so Anthropic's hosted `tool_search_tool_*` is refused.
 /// A tool with no `type` (Anthropic's `{name, input_schema}` client tool) is passed by the caller.
 ///
@@ -137,13 +183,12 @@ fn tools(body: &[u8], open: usize, model: &str, preview: &mut bool) -> Option<&'
 /// refused there (`shell`, `code_execution`) stays refused.
 fn allowed_tool(ty: &str) -> bool {
     // One spelling each: the function-call shapes and the server tools with no version suffix.
-    const EXACT: [&str; 8] = [
+    const EXACT: [&str; 7] = [
         "function",
         "custom",
         "namespace",
         "apply_patch",
         "local_shell",
-        "file_search",
         "tool_search",
         "x_search",
     ];
@@ -311,7 +356,7 @@ mod tests {
     fn priced_features_and_lookalikes_pass() {
         let cases: [(&str, &str, bool); 11] = [
             (
-                r#"{"tools":[{"type":"web_search"},{"type":"file_search"}]}"#,
+                r#"{"tools":[{"type":"web_search"},{"type":"function","name":"file_search"}]}"#,
                 "gpt-5",
                 false,
             ),
@@ -360,6 +405,66 @@ mod tests {
         ];
         for (body, model, messages) in cases {
             assert_eq!(refused(body, model, messages), None, "{body} on {model}");
+        }
+    }
+
+    /// A managed key can create no stored object, so a body naming one is refused: the
+    /// `file_search` tool, a `file_id` on any content part (Responses, Chat Completions, Messages;
+    /// also inside a tool result), and a root `prompt` object.
+    /// claim: SEC-25
+    /// defect: D300
+    #[test]
+    fn a_stored_provider_object_is_refused() {
+        for body in [
+            r#"{"tools":[{"type":"file_search","vector_store_ids":["vs_1"]}],"input":"hi"}"#,
+            r#"{"tools":[{"type":"web_search"},{"type":"file_search"}],"input":"hi"}"#,
+            // Responses parts, on the part or on an item.
+            r#"{"input":[{"role":"user","content":[{"type":"input_file","file_id":"file-abc"}]}]}"#,
+            r#"{"input":[{"role":"user","content":[{"type":"input_text","text":"x"},{"type":"input_image","file_id":"file-abc"}]}]}"#,
+            r#"{"input":[{"type":"function_call_output","call_id":"c","output":[{"type":"input_file","file_id":"file-abc"}]}]}"#,
+            r#"{"input":[{"type":"input_file","file_id":"file-abc"}]}"#,
+            // Chat Completions `file` part.
+            r#"{"messages":[{"role":"user","content":[{"type":"file","file":{"file_id":"file-abc"}}]}]}"#,
+            r#"{"messages":[{"role":"user","content":[{"type":"file","file":{"filename":"a.pdf","file_id":"file-abc"}}]}]}"#,
+            // Messages `source` of type file, also in a tool result.
+            r#"{"messages":[{"role":"user","content":[{"type":"document","source":{"type":"file","file_id":"file_011"}}]}]}"#,
+            r#"{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"image","source":{"type":"file","file_id":"file_011"}}]}]}]}"#,
+            // A stored prompt.
+            r#"{"prompt":{"id":"pmpt_1","version":"2"},"input":"hi"}"#,
+            r#"{"input":"hi","prompt":{"id":"pmpt_1","variables":{}}}"#,
+        ] {
+            for messages in [false, true] {
+                assert_eq!(
+                    refused(body, "gpt-5", messages),
+                    Some(STORED_OBJECTS),
+                    "{body}"
+                );
+            }
+        }
+    }
+
+    /// Content that names no stored object passes: text, an image by URL or data URI, a null
+    /// `file_id`, a tool call's own arguments or a tool schema property called `file_id`, a prompt
+    /// that is only text, and a `file_id` mentioned inside a string.
+    #[test]
+    fn inline_content_is_not_a_stored_object() {
+        for body in [
+            r#"{"input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#,
+            r#"{"input":[{"role":"user","content":[{"type":"input_image","image_url":"https://x.test/a.png"}]}]}"#,
+            r#"{"input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}]}"#,
+            r#"{"input":[{"role":"user","content":[{"type":"input_file","filename":"a.pdf","file_data":"data:application/pdf;base64,AAAA"}]}]}"#,
+            r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://x.test/a.png"}}]}]}"#,
+            r#"{"messages":[{"role":"user","content":[{"type":"file","file":{"filename":"a.pdf","file_data":"data:application/pdf;base64,AAAA"}}]}]}"#,
+            r#"{"messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"https://x.test/a.png"}}]}]}"#,
+            r#"{"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}"#,
+            r#"{"messages":[{"role":"user","content":[{"type":"input_file","file_id":null}]}]}"#,
+            r#"{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"read","input":{"file_id":"mine"}}]}]}"#,
+            r#"{"messages":[{"role":"user","content":"what is {\"file_id\":\"file-abc\"}?"}]}"#,
+            r#"{"tools":[{"type":"function","name":"read","parameters":{"properties":{"file_id":{"type":"string"}}}}],"input":"hi"}"#,
+            r#"{"prompt":"say hi","model":"gpt-5"}"#,
+            r#"{"prompt":null,"input":"hi"}"#,
+        ] {
+            assert_eq!(refused(body, "gpt-5", false), None, "{body}");
         }
     }
 
@@ -474,7 +579,6 @@ mod tests {
             "web_search_20250305",
             "web_search_preview",
             "web_fetch_20260209",
-            "file_search",
             "tool_search",
         ] {
             let body = format!(r#"{{"tools":[{{"type":"{ty}"}}],"messages":[]}}"#);

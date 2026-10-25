@@ -2316,6 +2316,16 @@ and each `tools` element's own `type`, so a prompt that names a tool cannot trip
 | Groq `browser_search` tool                                                                                                                              | no published fee                                              |
 | OpenRouter `plugins` other than `context-compression` and `response-healing`, a `:online` model, `web_search_options`, the `openrouter:web_search` tool | the search engine and result count are unreported             |
 | Messages `service_tier: "priority"`                                                                                                                     | Anthropic Priority Tier is priced by contract                 |
+| the `file_search` tool, a content part's `file_id`, a root `prompt` object                                                                              | not about price: names a stored object (see below)            |
+
+The last row is a trust boundary, not a pricing one (D300). A managed key can only POST generation
+endpoints, so it can never have created a file, vector store or stored prompt in the shared
+provider account; a body that names one by id is reaching for another organization's object, and is
+refused with the same 400 and metric reason. The `file_id` is read on any `messages` or `input`
+content part (on the part for Responses `input_file` / `input_image`; in its `file` object for Chat
+Completions; in its `source` object for Messages), and inside a tool result's `content` / `output`
+parts; a tool call's own arguments are never read. A `prompt` is refused only as an object (a string
+is a legacy completion prompt). Inline content (text, an image by URL, a data URI) is untouched.
 
 So on a managed row `requested_container` is always absent and `requested_plugins` names only free
 plugins; both are kept for the day either is priced.
@@ -3595,8 +3605,9 @@ to serve.
   `_` suffix (`web_search_20250305`, `web_search_preview`, `computer_use_preview`,
   `text_editor_20250728`); `bashful_x` is not `bash`. Client-run families: `function`, `custom`,
   `namespace`, `apply_patch`, `local_shell`, `bash`, `text_editor`, `computer`, `memory`. Metered
-  server families (the usage meter counts them): `web_search`, `web_fetch`, `mcp`, `file_search`,
-  `tool_search`, `x_search`; the last four take no suffix. Anthropic's hosted
+  server families (the usage meter counts them): `web_search`, `web_fetch`, `mcp`, `tool_search`,
+  `x_search`; the last three take no suffix. `file_search` is not listed: it is refused by name
+  (D300). Anthropic's hosted
   `tool_search_tool_*` is refused: the gateway neither meters it nor carries its result blocks. A
   tool with no `type` (Anthropic's `{name, input_schema}` client tool) passes; a non-string `type`,
   or any other type, is refused with a 400 (`UNLISTED_TOOL`), so a new billed tool fails closed until
@@ -3725,7 +3736,9 @@ is kept once for all of them:
    such id the gateway returns is signed for the tenant, and an id that does not verify for the
    caller is a 400 before any upstream (see [Tenant-bound Responses ids](#tenant-bound-responses-ids-signed_idrs)). Other organization resources (files,
    vector stores, stored prompts, batches) are out of reach: a managed key reaches only POST
-   generation endpoints, so no tenant can create or list them.
+   generation endpoints, so no tenant can create or list them, and a generation body that names
+   one by id (the `file_search` tool, a content part's `file_id`, a `prompt` object) is a 400 before
+   any upstream (`unpriced::inspect`, D300).
 
 **What the catalog allowlists (managed `/v1` and `/auto` only):**
 
@@ -4016,7 +4029,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `usage/tools`     | `ToolTally`: hosted-tool calls in an OpenAI Responses answer, counted chunk by chunk (`memmem` for `_call"` + structural check, bounded carry), since `usage` has none                                                                                                                | unit ✓ + e2e ✓ |
 | `body_rules`      | The body refusal rules in one precedence order (`Rule::ORDER`), each declaring the points it applies at; read extracted `Facts`, never bytes                                                                                                                                          | unit ✓ + e2e ✓ |
 | `refusal`         | `Refusal`: every gateway-made refusal as one closed type (status, type, message, compile-time body, metric label, `Retry-After`), carried through pingora as an error's cause                                                                                                         | unit ✓ + e2e ✓ |
-| `unpriced`        | Managed-request refusal (400, before the body goes upstream) of features a provider bills outside metered usage (`code_interpreter`, `image_generation`, …); BYO never checked                                                                                                        | unit ✓ + e2e ✓ |
+| `unpriced`        | Managed-request refusal (400, before the body goes upstream) of features a provider bills outside metered usage (`code_interpreter`, `image_generation`, …) and stored-object references (`file_search`, `file_id`, `prompt`); BYO never checked                                      | unit ✓ + e2e ✓ |
 | `terminal`        | Whether the bytes sent to a client end with the stream's terminal event (`[DONE]`, `message_stop`, `response.completed`)                                                                                                                                                              | unit ✓ + e2e ✓ |
 | `deny`            | Sparse deny-set, default-allow, reason → HTTP status                                                                                                                                                                                                                                  | unit ✓         |
 | `allowance`       | Sparse remaining-ok / exhausted set; fail-closed until seeded (503); 402 when exhausted                                                                                                                                                                                               | unit ✓ + e2e ✓ |
