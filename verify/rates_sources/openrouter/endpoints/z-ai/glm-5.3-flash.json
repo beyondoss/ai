@@ -254,8 +254,8 @@
         "pricing": {
           "completion": "0.00000065",
           "discount": 0,
-          "input_cache_read": "0.000000093",
-          "prompt": "0.000000332"
+          "input_cache_read": "0.000000089",
+          "prompt": "0.000000316"
         },
         "provider_name": "Morph",
         "quantization": "fp8",

@@ -293,8 +293,8 @@
         "pricing": {
           "completion": "0.0000044",
           "discount": 0,
-          "input_cache_read": "0.000000191",
-          "prompt": "0.000000765"
+          "input_cache_read": "0.000000182",
+          "prompt": "0.000000727"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -356,10 +356,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000004",
+          "completion": "0.0000071524",
           "discount": 0,
-          "input_cache_read": "0.00000008",
-          "prompt": "0.0000004"
+          "input_cache_read": "0.0000000324",
+          "prompt": "0.0000000324"
         },
         "provider_name": "Relace",
         "quantization": "unknown",

@@ -255,8 +255,8 @@
         "pricing": {
           "completion": "0.0000149",
           "discount": 0,
-          "input_cache_read": "0.00000025",
-          "prompt": "0.0000009"
+          "input_cache_read": "0.000000262",
+          "prompt": "0.000000945"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -305,10 +305,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000081113",
+          "completion": "0.0000076972",
           "discount": 0,
-          "input_cache_read": "0.00000019",
-          "prompt": "0.0000001919"
+          "input_cache_read": "0.0000002",
+          "prompt": "0.0000002033"
         },
         "provider_name": "Relace",
         "quantization": "fp4",
@@ -359,8 +359,8 @@
         "pricing": {
           "completion": "0.000016",
           "discount": 0,
-          "input_cache_read": "0.000000181",
-          "prompt": "0.000000191"
+          "input_cache_read": "0.000000204",
+          "prompt": "0.000000214"
         },
         "provider_name": "Wafer",
         "quantization": "mxfp4",
