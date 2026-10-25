@@ -2297,6 +2297,7 @@ fn a_rerun_walks_the_parents_row() {
 /// but POST is a 405.
 /// claim: SEC-1
 /// defect: D289
+/// defect: D295
 #[test]
 fn managed_endpoint_holds_a_managed_key_to_metered_calls() {
     let state = phase_state();
@@ -2351,6 +2352,11 @@ fn managed_endpoint_holds_a_managed_key_to_metered_calls() {
         "/v1/x/messages/count_tokens",
         "/openai/deployments/a/b/chat/completions",
         "/openai/deployments//chat/completions",
+        "/openai/deployments/..%2Fv1%2Fthreads%2Ft/chat/completions",
+        "/openai/deployments/..%2fv1%2fthreads%2ft/chat/completions",
+        "/openai/deployments/../chat/completions",
+        "/openai/deployments/./chat/completions",
+        "/openai/deployments/%2e%2e/chat/completions",
         "/chat/completions",
         "//v1/messages",
     ] {
@@ -2377,6 +2383,7 @@ fn managed_endpoint_holds_a_managed_key_to_metered_calls() {
         "/anthropic/v1/messages",
         "/backend-api/codex/responses",
         "/openai/deployments/d/chat/completions?api-version=1",
+        "/openai/deployments/gpt-4.1_mini.v2/chat/completions",
     ] {
         assert!(
             managed_endpoint(&req(http::Method::POST, "/p"), &on(path)).is_ok(),

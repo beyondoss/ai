@@ -151,6 +151,12 @@ pub enum ConfigError {
     #[error("invalid signing public key for kid {kid}")]
     SigningPublicKey { kid: Kid },
 
+    #[error(
+        "signing key for kid {kid} is the public dev key (seed [7u8; 32], examples/mint_dev_key.rs) \
+         — refusing to boot a release build: anyone can mint any tenant under it. Configure a real key."
+    )]
+    DevSigningKey { kid: String },
+
     #[error(transparent)]
     IdSigner(#[from] SignerError),
 
@@ -160,6 +166,13 @@ pub enum ConfigError {
          to the base64 of 32 random bytes (e.g. `openssl rand -base64 32`)."
     )]
     IdSigningKeysMissing,
+
+    #[error(
+        "nats_url names a plaintext connection to {host:?}, which is not loopback — refusing to \
+         boot: the NATS channel carries signing keys and deny entries, and async-nats upgrades to \
+         TLS only if the server demands it. Use a tls:// URL (or nats://localhost for a local server)."
+    )]
+    NatsPlaintext { host: String },
 
     #[error(
         "require_signing_keys is set but no signing_keys are configured — refusing to boot into a \

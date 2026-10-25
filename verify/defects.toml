@@ -3003,3 +3003,73 @@ state = "fixed"
 test = "managed_endpoint_holds_a_managed_key_to_metered_calls"
 fix = "8f78fe98"
 note = "Fixed with route::anchored_forward_endpoint, used only by the managed allowlist: everything before the endpoint suffix must be exactly one of /v1, /api/v1, /openai/v1, /inference/v1, /anthropic/v1, /backend-api/codex, or Azure's /openai/deployments/{one segment}. forward_endpoint (wire selection, sub-resources, BYO) is unchanged."
+
+[[defect]]
+id = "D295"
+severity = "med"
+area = "Security"
+title = "A percent-encoded Azure deployment segment reached the pool key on a non-generation path"
+impact = "The managed allowlist took any non-empty /openai/deployments/{d} segment without a literal slash, so ..%2Fv1%2Fthreads%2Ft was admitted; an upstream that decodes %2F and removes dot-segments would serve a non-generation endpoint on the shared pool key."
+confidence = "high"
+evidence = "Code: route::is_mount. Reproduced by managed_endpoint_holds_a_managed_key_to_metered_calls with the escaped, dot and dot-dot spellings, and by an_azure_deployment_segment_admits_only_plain_names at the mock upstream (zero hits)."
+claims = ["SEC-1"]
+state = "fixed"
+test = "an_azure_deployment_segment_admits_only_plain_names"
+fix = "25d87429"
+note = "Fixed in route.rs: a deployment name matches [A-Za-z0-9._-]+ and is not . or .."
+
+[[defect]]
+id = "D296"
+severity = "high"
+area = "Security"
+title = "A plaintext nats_url to a remote host was accepted"
+impact = "The NATS channel delivers signing keys and deny entries; async-nats upgrades to TLS only if the server requires it, so a remote nats:// URL put the trust anchors on the wire in the clear."
+confidence = "high"
+evidence = "Code: nats_url defaulted to nats://localhost:4222 and nothing in AiConfig::check inspected it."
+claims = ["SEC-22"]
+state = "fixed"
+test = "nats_url_plaintext_is_loopback_only"
+fix = "6dd357bb"
+note = "Fixed in AiConfig::check: a nats:// URL, or one with no scheme, must name a loopback host (localhost, 127.0.0.0/8, ::1); tls:// is accepted anywhere. The error names the host, not the URL."
+
+[[defect]]
+id = "D297"
+severity = "high"
+area = "Security"
+title = "The public dev signing key was accepted as a production trust anchor"
+impact = "examples/mint_dev_key.rs derives its key from the public seed [7u8; 32]; configuring its public key let anyone mint a valid key for any tenant."
+confidence = "high"
+evidence = "Code: nothing compared a configured or KV signing key with the dev public key. The key is in verify/key_vectors.json."
+claims = ["SEC-12"]
+state = "fixed"
+test = "the_public_dev_signing_key_is_refused_as_a_trust_anchor"
+fix = "1d563b60"
+note = "Fixed: a release build (cfg(not(debug_assertions))) refuses to boot with the dev public key in signing_keys or AI_SIGNING_KEY_*, and LiveKeys::put ignores it from KV (live_keys test a_release_ring_ignores_the_public_dev_key). Debug builds keep it: every cargo test, and the verify live harness (target/debug/beyond-ai), run debug. key::the_dev_public_key_is_what_the_dev_seed_derives pins the constant to the seed."
+
+[[defect]]
+id = "D298"
+severity = "med"
+area = "Security"
+title = "A pre-epoch wall clock made every bai_v3 key valid"
+impact = "unix_now mapped a SystemTime error to 0, and now = 0 passes every exp check, so a host whose clock read before the epoch admitted expired v3 keys."
+confidence = "high"
+evidence = "Code: key.rs unix_now used map_or(0, ..)."
+claims = ["A5"]
+state = "fixed"
+test = "an_unreadable_clock_refuses_a_v3_key"
+fix = "bceffcf5"
+note = "Fixed: unix_now returns Option and verify_with refuses a v3 key as expired when the clock is None. v1 and v2 never read the clock."
+
+[[defect]]
+id = "D299"
+severity = "low"
+area = "Security"
+title = "doctor printed a nats_url with its credentials"
+impact = "nats://user:pass@host was printed whole in doctor's connected message and could be in a connect error it printed."
+confidence = "high"
+evidence = "Code: doctor.rs formatted config.nats_url directly."
+claims = ["SEC-22"]
+state = "fixed"
+test = "redact_userinfo_hides_credentials_wherever_a_url_is_printed"
+fix = "b996f4ee"
+note = "Fixed with config::redact_userinfo, applied to the URL and to the connect error doctor prints. AiConfig's derived Debug still shows the raw URL; the config is not logged whole."

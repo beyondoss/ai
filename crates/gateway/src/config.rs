@@ -965,6 +965,11 @@ impl AiConfig {
             .into());
         }
         self.validate_tls()?;
+        check_nats_url(&self.nats_url)?;
+        // Debug builds (every test, `cargo run`) keep the dev key; a release build never trusts it.
+        if !cfg!(debug_assertions) {
+            self.check_no_dev_signing_key()?;
+        }
         // A malformed id signing key is a boot failure, not a 503 on every managed Responses turn.
         self.build_id_signer()?;
         Ok(())
@@ -1100,6 +1105,20 @@ impl AiConfig {
         if known(&hyphenated) { hyphenated } else { name }
     }
 
+    /// Refuse the public dev signing key ([`crate::key::is_public_dev_key`]) in any configured
+    /// `signing_keys` entry, whether it came from the file or `AI_SIGNING_KEY_<KID>`. Called from
+    /// [`Self::check`] in release builds only.
+    fn check_no_dev_signing_key(&self) -> Result<()> {
+        for (kid, value) in &self.signing_keys {
+            if crate::key::verifying_key_from_value(value.as_bytes())
+                .is_some_and(|vk| crate::key::is_public_dev_key(&vk))
+            {
+                return Err(ConfigError::DevSigningKey { kid: kid.clone() }.into());
+            }
+        }
+        Ok(())
+    }
+
     /// Build the trusted keyring from the configured signing public keys.
     pub fn build_keyring(&self) -> Result<Keyring> {
         let mut ring = Keyring::new();
@@ -1113,6 +1132,67 @@ impl AiConfig {
         }
         Ok(ring)
     }
+}
+
+/// `text` with the userinfo of every `scheme://user:pass@host` URL in it replaced by `***`, so a
+/// `nats_url` carrying credentials can be printed or logged. Applies to a bare URL, a comma-separated
+/// list, and free text that embeds one (an error message). Text with no URL userinfo is returned as is.
+pub fn redact_userinfo(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('@') || !text.contains("://") {
+        return text.into();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("://") {
+        let (head, tail) = rest.split_at(i + 3);
+        out.push_str(head);
+        // The authority ends at the first `/`, `?`, `#`, `,` or whitespace; userinfo is what
+        // precedes the last `@` inside it (a password may itself hold an `@`).
+        let end = tail
+            .find(|c: char| matches!(c, '/' | '?' | '#' | ',') || c.is_whitespace())
+            .unwrap_or(tail.len());
+        match tail[..end].rfind('@') {
+            Some(at) => {
+                out.push_str("***");
+                rest = &tail[at..];
+            }
+            None => rest = tail,
+        }
+    }
+    out.push_str(rest);
+    out.into()
+}
+
+/// Refuse a `nats_url` that is plaintext to a host off this machine. The NATS channel delivers
+/// signing keys (`signing_key.{kid}`) and deny entries, and async-nats upgrades to TLS only when the
+/// server asks, so a `nats://` URL to a remote host is an unauthenticated trust anchor on the wire.
+/// `tls://` and `wss://` are fine anywhere; any other scheme (or none) needs a loopback host
+/// (`localhost`, `127.0.0.0/8`, `::1`). A comma-separated list is checked entry by entry. The error
+/// names the host only, never the URL, which may carry credentials.
+fn check_nats_url(url: &str) -> Result<()> {
+    for entry in url.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let (scheme, rest) = entry.split_once("://").unwrap_or(("", entry));
+        if scheme.eq_ignore_ascii_case("tls") || scheme.eq_ignore_ascii_case("wss") {
+            continue;
+        }
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+        let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+        let host = match hostport.strip_prefix('[') {
+            Some(v6) => v6.split(']').next().unwrap_or(v6),
+            None => hostport.split(':').next().unwrap_or(hostport),
+        };
+        let loopback = host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        if !loopback {
+            return Err(ConfigError::NatsPlaintext {
+                host: host.to_owned(),
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// `names` with every key lowercased, for the table `table` (named in the error). See
@@ -1297,6 +1377,93 @@ mod tests {
         // Read timeout must comfortably exceed a long stream.
         assert!(c.read_timeout_secs >= 300);
         assert_eq!(c.config_bucket, "ai-gateway");
+    }
+
+    /// claim: SEC-22
+    /// defect: D296
+    #[test]
+    fn nats_url_plaintext_is_loopback_only() {
+        for ok in [
+            "nats://localhost:4222",
+            "nats://127.0.0.1:4222",
+            "nats://127.5.6.7",
+            "nats://[::1]:4222",
+            "localhost:4222",
+            "nats://user:pass@localhost:4222",
+            "tls://connect.ngs.global",
+            "tls://user:pass@nats.example.com:4222",
+            "nats://localhost:4222,nats://127.0.0.1:4223",
+        ] {
+            assert!(check_nats_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "nats://nats.example.com:4222",
+            "nats://10.0.0.5:4222",
+            "nats.example.com:4222",
+            "nats://localhost.evil.example:4222",
+            "nats://user:pass@nats.example.com:4222",
+            "nats://localhost:4222,nats://nats.example.com:4222",
+            "ws://nats.example.com",
+        ] {
+            let e = check_nats_url(bad).unwrap_err().to_string();
+            assert!(e.contains("plaintext"), "{bad}: {e}");
+            assert!(
+                !e.contains("pass"),
+                "the error must not echo credentials: {e}"
+            );
+        }
+        let cfg = |u: &str| AiConfig {
+            nats_url: u.to_owned(),
+            ..Default::default()
+        };
+        assert!(cfg("nats://localhost:4222").validate().is_ok());
+        assert!(cfg("nats://nats.example.com:4222").validate().is_err());
+    }
+
+    /// claim: SEC-12
+    /// defect: D297
+    #[test]
+    fn the_public_dev_signing_key_is_refused_as_a_trust_anchor() {
+        use base64::Engine;
+        let b64 = |seed: u8| {
+            let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+            base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes())
+        };
+        let with = |v: String| AiConfig {
+            signing_keys: HashMap::from([("1".to_string(), v)]),
+            ..Default::default()
+        };
+        // Seed 7 is the mint_dev_key example's; the constant must be what it derives.
+        assert_eq!(b64(7), "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=");
+        let e = with(b64(7)).check_no_dev_signing_key().unwrap_err();
+        assert!(e.to_string().contains("dev key"), "{e}");
+        assert!(with(b64(8)).check_no_dev_signing_key().is_ok());
+        // `check` applies the rule in release builds only; debug builds (all tests) keep the key.
+        assert_eq!(with(b64(7)).check().is_err(), !cfg!(debug_assertions));
+    }
+
+    /// claim: SEC-22
+    /// defect: D299
+    #[test]
+    fn redact_userinfo_hides_credentials_wherever_a_url_is_printed() {
+        for (input, want) in [
+            ("nats://localhost:4222", "nats://localhost:4222"),
+            ("nats://user:pw@host:4222", "nats://***@host:4222"),
+            ("tls://tok@host", "tls://***@host"),
+            ("nats://u:p@w@host:4222/x", "nats://***@host:4222/x"),
+            (
+                "nats://a:b@one:4222,nats://c:d@two:4222",
+                "nats://***@one:4222,nats://***@two:4222",
+            ),
+            (
+                "connect to nats://u:secret@host:4222 failed: refused",
+                "connect to nats://***@host:4222 failed: refused",
+            ),
+            ("mail me@example.com", "mail me@example.com"),
+            ("nats://host/path@x", "nats://host/path@x"),
+        ] {
+            assert_eq!(redact_userinfo(input), want, "{input}");
+        }
     }
 
     #[test]

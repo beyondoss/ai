@@ -147,6 +147,42 @@ async fn a_managed_key_reaches_only_generation_endpoints_on_a_provider_route() {
     );
 }
 
+/// claim: SEC-1
+/// defect: D295
+#[tokio::test]
+async fn an_azure_deployment_segment_admits_only_plain_names() {
+    let nats_port = unused_nats_port();
+    let (pubkey, sk) = test_keypair(1);
+    let mock = MockUpstream::start(Mode::Json).await;
+    let gw = Gateway::builder(nats_port, &mock.authority(), &b64(&pubkey))
+        .providers(&["azure"])
+        .start()
+        .await;
+    let bearer = || ("authorization", format!("Bearer {}", managed_key(&sk)));
+
+    for d in [
+        "..%2Fv1%2Fthreads%2Ft",
+        "..%2fv1%2fthreads%2ft",
+        "..",
+        ".",
+        "%2e%2e",
+    ] {
+        let path = format!("/azure/openai/deployments/{d}/chat/completions");
+        let (status, text, _) = send(&gw, reqwest::Method::POST, &path, bearer(), Some(CHAT)).await;
+        assert_eq!(status, 404, "{path}: {text}");
+    }
+    assert_eq!(
+        mock.hits(),
+        0,
+        "no refused deployment may reach the pool key"
+    );
+
+    let path = "/azure/openai/deployments/gpt-4.1_mini.v2/chat/completions";
+    let (status, text, _) = send(&gw, reqwest::Method::POST, path, bearer(), Some(CHAT)).await;
+    assert_eq!(status, 200, "{path}: {text}");
+    assert_eq!(mock.hits(), 1);
+}
+
 /// claim: SEC-2
 /// defect: D02
 #[tokio::test]
