@@ -382,7 +382,7 @@ impl Read {
                 .await?;
             let path_for_task = path.clone();
             let auto_resize = self.image_auto_resize;
-            let result = tokio::task::spawn_blocking(move || {
+            let result = crate::blocking::spawn(crate::blocking::Site::FileTool, move || {
                 read_image(&path_for_task, bytes, format, auto_resize)
             })
             .await
@@ -454,7 +454,7 @@ impl Read {
             let chunk = backend.read_bytes(file, pos, READ_CHUNK).await?;
             pos += chunk.len() as u64;
             let eof = chunk.len() < READ_CHUNK;
-            (window, utf16) = tokio::task::spawn_blocking(move || {
+            (window, utf16) = crate::blocking::spawn(crate::blocking::Site::FileTool, move || {
                 match utf16.as_mut() {
                     Some(d) => {
                         let mut text = d.push(&chunk);

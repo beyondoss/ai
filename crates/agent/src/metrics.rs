@@ -444,6 +444,11 @@ impl Metrics {
         let encoder = TextEncoder::new();
         // Encoding fails only on a broken writer; a `Vec` is not one.
         let _ = encoder.encode(&self.registry.gather(), &mut buf);
+        // The blocking-pool instruments are process-wide statics, not registry children: they are
+        // written from call sites that have no `Metrics` handle. See [`crate::blocking`].
+        let mut blocking = String::new();
+        crate::blocking::render(&mut blocking);
+        buf.extend_from_slice(blocking.as_bytes());
         buf
     }
 }

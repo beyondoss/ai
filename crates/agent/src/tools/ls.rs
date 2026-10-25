@@ -261,7 +261,7 @@ impl Tool for Ls {
         if entry_count <= RENDER_INLINE_MAX {
             render()
         } else {
-            tokio::task::spawn_blocking(render)
+            crate::blocking::spawn(crate::blocking::Site::FileTool, render)
                 .await
                 .map_err(|e| ToolError::Execution(format!("ls render failed: {e}")))?
         }

@@ -1003,6 +1003,7 @@ async fn run_transport(
                 .await
                 .map_err(|e| format!("--metrics-listen {addr}: {e}"))?;
             tokio::spawn(beyond_ai_agent::metrics::serve_metrics(listener, metrics));
+            beyond_ai_agent::blocking::spawn_lag_probe();
         }
         let listeners = serve_ws::ServeListeners {
             tcp: serve_cfg.listen,

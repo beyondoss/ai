@@ -103,7 +103,7 @@ impl SessionLoop {
             self.bash_jobs_transcript = self.persistence.transcript();
             let stopped_jobs = {
                 let jobs = self.bash_jobs.clone();
-                tokio::task::spawn_blocking(move || jobs.stop_all())
+                crate::blocking::spawn(crate::blocking::Site::Serve, move || jobs.stop_all())
                     .await
                     .unwrap_or_default()
             };

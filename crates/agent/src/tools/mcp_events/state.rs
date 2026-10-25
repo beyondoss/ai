@@ -654,7 +654,8 @@ async fn writer(
     changed: Arc<Notify>,
 ) {
     if let Some(path) = path
-        && let Ok(l) = tokio::task::spawn_blocking(move || load(&path)).await
+        && let Ok(l) =
+            crate::blocking::spawn(crate::blocking::Site::Store, move || load(&path)).await
     {
         let mut d = lock(&data);
         d.next_seq = l.pending.iter().map(|p| p.seq).max().unwrap_or(0) + 1;
@@ -779,7 +780,7 @@ async fn flush(data: &Arc<Mutex<Data>>) -> Result<(), String> {
         return Ok(());
     }
     let task_path = path.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
+    let outcome = crate::blocking::spawn(crate::blocking::Site::Store, move || {
         let log = log_path(&task_path);
         let written = match &log_write {
             LogWrite::None => Ok(None),
@@ -841,7 +842,7 @@ async fn relocate(data: &Arc<Mutex<Data>>, target: Option<PathBuf>) {
         return;
     };
     let read_target = target.clone();
-    let theirs = tokio::task::spawn_blocking(move || load(&read_target))
+    let theirs = crate::blocking::spawn(crate::blocking::Site::Store, move || load(&read_target))
         .await
         .unwrap_or_default();
     let (snapshot, log) = {
@@ -887,17 +888,20 @@ async fn relocate(data: &Arc<Mutex<Data>>, target: Option<PathBuf>) {
             )
         }
     };
-    let written = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        if let (Some(s), Some(log)) = (snapshot, log) {
-            write_atomic(&log_path(&target), &log)?;
-            write_atomic(&target, &serde_json::to_vec(&s)?)?;
-        }
-        if let Some(old) = old {
-            let _ = std::fs::remove_file(log_path(&old));
-            let _ = std::fs::remove_file(&old);
-        }
-        Ok(())
-    })
+    let written = crate::blocking::spawn(
+        crate::blocking::Site::Store,
+        move || -> std::io::Result<()> {
+            if let (Some(s), Some(log)) = (snapshot, log) {
+                write_atomic(&log_path(&target), &log)?;
+                write_atomic(&target, &serde_json::to_vec(&s)?)?;
+            }
+            if let Some(old) = old {
+                let _ = std::fs::remove_file(log_path(&old));
+                let _ = std::fs::remove_file(&old);
+            }
+            Ok(())
+        },
+    )
     .await;
     if !matches!(written, Ok(Ok(()))) {
         tracing::warn!("could not move the MCP Events state to the new transcript; will retry");

@@ -211,6 +211,7 @@ async fn setup_exec(
     mode.load_bundle(cfg.mcp_http.as_ref()).await.map_err(
         |e| -> Box<dyn std::error::Error + Send + Sync> { format!("service: {e}").into() },
     )?;
+    timing.mark("load bundle");
     let sandbox_snapshot = mode.load_sandbox_snapshot(
         persistence.session_file(),
         persistence.session_id(),
@@ -1297,7 +1298,7 @@ impl SessionLoop {
         // reaper leaves such a session alone (unless `--mcp-events-reapable`). Inert over stdio.
         keep_alive: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, SetupError> {
-        let mut timing = crate::timing::StartupTiming::new();
+        let mut timing = crate::timing::StartupTiming::recording();
         let Opened {
             mut cfg,
             persistence,
@@ -1460,6 +1461,12 @@ impl SessionLoop {
             &mcp_task_tx,
         )
         .await;
+
+        // One line per service open: where the session's own start-up spent its time. The front
+        // door's half is `serve_ws`'s `OPEN front` line for the same id.
+        if mode.verifies_grants() {
+            crate::timing::open_line("setup", persistence.session_id(), &timing.summary());
+        }
 
         Ok(Self {
             cfg,

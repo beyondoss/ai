@@ -81,9 +81,11 @@ impl CredentialStore for ScopedMcpCredentialStore {
         // `auth_credential_source.rs` applies for `AuthStore`) so it can't stall the reactor.
         let path = self.path.clone();
         let server_name = self.server_name.clone();
-        tokio::task::spawn_blocking(move || read_store_file(&path).0.get(&server_name).cloned())
-            .await
-            .map_err(|e| AuthError::InternalError(e.to_string()))
+        crate::blocking::spawn(crate::blocking::Site::Store, move || {
+            read_store_file(&path).0.get(&server_name).cloned()
+        })
+        .await
+        .map_err(|e| AuthError::InternalError(e.to_string()))
     }
 
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
@@ -91,7 +93,7 @@ impl CredentialStore for ScopedMcpCredentialStore {
         // `LOCK_TIMEOUT` under contention — never on a tokio worker; hand it to `spawn_blocking`.
         let path = self.path.clone();
         let server_name = self.server_name.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::blocking::spawn(crate::blocking::Site::Store, move || {
             let value = serde_json::to_value(&credentials).map_err(std::io::Error::other)?;
             mutate_locked(&path, |raw| {
                 raw.insert(server_name, value);
@@ -107,7 +109,7 @@ impl CredentialStore for ScopedMcpCredentialStore {
         // Same blocking-under-lock concern as `save` — run off the reactor.
         let path = self.path.clone();
         let server_name = self.server_name.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::blocking::spawn(crate::blocking::Site::Store, move || {
             mutate_locked(&path, |raw| raw.remove(&server_name).is_some())
         })
         .await
