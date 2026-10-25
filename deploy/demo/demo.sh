@@ -35,9 +35,9 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 # ---- the checks, in one place --------------------------------------------------------------------
-CHECKS_core=(grant-refused real-model-turn sandbox-exec background-job-notify notify-forged-refused sealed-at-rest billing-rows)
+CHECKS_core=(grant-refused real-model-turn sandbox-exec background-job-notify notify-forged-refused sandbox-cannot-reach-store sealed-at-rest billing-rows)
 CHECKS_kill=(kill-and-recover billing-rows)
-CHECKS_all=(grant-refused real-model-turn sandbox-exec background-job-notify notify-forged-refused kill-and-recover sealed-at-rest billing-rows)
+CHECKS_all=(grant-refused real-model-turn sandbox-exec background-job-notify notify-forged-refused sandbox-cannot-reach-store kill-and-recover sealed-at-rest billing-rows)
 declare -A CHECK_TITLE=(
   [grant-refused]="A tampered session grant is refused at connect"
   [real-model-turn]="A real model answers, through the real gateway"
@@ -47,6 +47,7 @@ declare -A CHECK_TITLE=(
   [background-job-notify]="A background job ends and the agent is told (exec v1.4)"
   [notify-forged-refused]="A forged job_ended is refused and changes nothing"
   [kill-and-recover]="The agent is SIGKILLed mid-job; the session survives"
+  [sandbox-cannot-reach-store]="The sandbox cannot connect to the session store"
   [sealed-at-rest]="Session bytes on EFS are ciphertext"
   [billing-rows]="Every model call has exactly one ai.usage row"
   [teardown-zero]="Teardown leaves nothing behind"
@@ -54,8 +55,8 @@ declare -A CHECK_TITLE=(
 
 # With SANDBOX=e2b each session gets its own E2B microVM, and two checks about that join the list.
 if [ "$SANDBOX" = e2b ]; then
-  CHECKS_core=(grant-refused real-model-turn sandbox-exec sandbox-per-session sandbox-auth-required background-job-notify notify-forged-refused sealed-at-rest billing-rows)
-  CHECKS_all=(grant-refused real-model-turn sandbox-exec sandbox-per-session sandbox-auth-required background-job-notify notify-forged-refused kill-and-recover sealed-at-rest billing-rows)
+  CHECKS_core=(grant-refused real-model-turn sandbox-exec sandbox-per-session sandbox-auth-required background-job-notify notify-forged-refused sandbox-cannot-reach-store sealed-at-rest billing-rows)
+  CHECKS_all=(grant-refused real-model-turn sandbox-exec sandbox-per-session sandbox-auth-required background-job-notify notify-forged-refused sandbox-cannot-reach-store kill-and-recover sealed-at-rest billing-rows)
 fi
 # shellcheck source=usecases.sh
 . "$HERE/usecases.sh"
@@ -249,7 +250,7 @@ check_sandbox_exec() {
   note_calls "$SESS_MAIN" "$out"
   tool=$(jq -c '[.tools[]|select(.name=="bash")][0]' <<<"$out")
   output=$(jq -r '.output // ""' <<<"$tool")
-  # Only the sandbox has /workspace and /mnt/efs (Fargate) or the host name e2b (E2B); the agent's own
+  # Only the sandbox has /workspace (Fargate) or the host name e2b (E2B); the agent's own
   # container has neither.
   if [[ $output == *Linux* && ( ( $SANDBOX == fargate && $output == *workspace* && $output == *mnt* ) || ( $SANDBOX == e2b && $output == *e2b* ) ) ]]; then
     result 1 "ran in the sandbox ($SANDBOX), not on the agent" \
@@ -457,13 +458,14 @@ check_kill_and_recover() {
   fi
 }
 
-# Run a shell script in a one-off task of the agent's image, which mounts the sessions' EFS, and print
-# its output (from CloudWatch). Only the script is overridden: the agent itself is not started.
+# Run a shell script in a one-off task of the agent's definition (its image, its task role, its security
+# group: the replica's identity, which is the only one the sessions' EFS admits), and print its output
+# (from CloudWatch). Only the script is overridden: the agent itself is not started.
 efs_task_output() { # script
   local td subnet sg task id since lines
   td=$(q ecs describe-task-definition --task-definition "$P-agent" --query taskDefinition.taskDefinitionArn)
   subnet=$(q ec2 describe-subnets --filters "Name=tag:$TAG_KEY,Values=$NAME" --query 'Subnets[0].SubnetId')
-  sg=$(q ec2 describe-security-groups --filters "Name=tag:$TAG_KEY,Values=$NAME" "Name=group-name,Values=$P-tasks" --query 'SecurityGroups[0].GroupId')
+  sg=$(q ec2 describe-security-groups --filters "Name=tag:$TAG_KEY,Values=$NAME" "Name=group-name,Values=$P-agent" --query 'SecurityGroups[0].GroupId')
   since=$(now_ms)
   task=$(q ecs run-task --cluster "$CLUSTER" --task-definition "$td" --launch-type FARGATE --count 1 \
     --network-configuration "awsvpcConfiguration={subnets=[$subnet],securityGroups=[$sg],assignPublicIp=ENABLED}" \
@@ -480,16 +482,31 @@ efs_task_output() { # script
   printf '%s\n' "$lines"
 }
 
+# The sandbox runs code the model wrote. It has no security-group path to the session store's mount target
+# and no identity EFS admits, so a plain TCP connect to the mount target's NFS port from inside it fails.
+check_sandbox_cannot_reach_store() {
+  local fs ip out
+  fs=$(q efs describe-file-systems --creation-token "$P" --query 'FileSystems[0].FileSystemId')
+  ip=$(q efs describe-mount-targets --file-system-id "$fs" --query 'MountTargets[0].IpAddress')
+  if [ -z "$ip" ]; then result 0 "no mount target address found"; return; fi
+  out=$(raw_bash "${1:-$SESS_MAIN}" "if timeout 8 nc -w 5 $ip 2049 </dev/null >/dev/null 2>&1; then echo NFS-CONNECT=open; else echo NFS-CONNECT=failed; fi; echo MOUNTS=\$(grep -c ' nfs' /proc/mounts)")
+  echo "  from the sandbox: connect to $ip:2049 -> $(sed -n 's/^NFS-CONNECT=//p' <<<"$out" | head -1); nfs mounts in the sandbox: $(sed -n 's/^MOUNTS=//p' <<<"$out" | head -1)"
+  tl sandbox nfs_connect_refused '["sandbox","efs"]' "$(jq -nc --arg ip "$ip" '{target:($ip+":2049")}')"
+  if [[ $out == *NFS-CONNECT=failed* && $out == *MOUNTS=0* ]]; then
+    result 1 "a TCP connect from the sandbox to the session store's mount target ($ip:2049) failed, and the sandbox mounts no NFS" \
+      "$(jq -nc --arg ip "$ip" '{mount_target:$ip, port:2049, connect:"failed", sandbox_nfs_mounts:0}')" \
+      '{"label":"sandbox to session store","value":"no route","unit":""}'
+  else
+    result 0 "the sandbox reached the store or mounts it: ${out:0:300}"
+  fi
+}
+
 check_sealed_at_rest() {
   local s=${1:-$SESS_MAIN} cmd out res hex plain bytes line
   cmd="d=/mnt/efs/$TENANT/sessions/$s; f=\$(ls \$d/*.jsonl | head -1); echo FILE=\$f; echo BYTES=\$(wc -c < \$f); \
 echo PLAINTEXT_MATCHES=\$(cat \$d/* | grep -c 'SEALED-$M1'); echo LINE2_PREFIX=\$(sed -n 2p \$f | head -c 24); echo HEX; sed -n 2p \$f | head -c 96 | od -An -tx1"
-  if [ "$SANDBOX" = e2b ]; then
-    # The E2B VMs have no EFS. A one-off task of the agent's image mounts it and reads the same bytes.
-    res=$(efs_task_output "$cmd")
-  else
-    res=$(raw_bash "$s" "$cmd")
-  fi
+  # The sandbox has no route to the store, so the bytes are read from the agent's side.
+  res=$(efs_task_output "$cmd")
   plain=$(sed -n 's/^PLAINTEXT_MATCHES=//p' <<<"$res" | head -1)
   bytes=$(sed -n 's/^BYTES=//p' <<<"$res" | head -1)
   line=$(sed -n 's/^LINE2_PREFIX=//p' <<<"$res" | head -1)
@@ -498,7 +515,7 @@ echo PLAINTEXT_MATCHES=\$(cat \$d/* | grep -c 'SEALED-$M1'); echo LINE2_PREFIX=\
   echo "  hex: ${hex:0:96}…"
   DISK=$(jq -nc --arg s "$s" --arg m "SEALED-$M1" --arg hex "$hex" --arg pre "$line" --argjson bytes "${bytes:-0}" --argjson plain "${plain:-1}" \
     '{session:$s, plaintext_seen_by_user:$m, hex_excerpt:$hex, ascii_prefix:$pre, file_bytes:$bytes, plaintext_matches:$plain}')
-  tl agent session_read_from_efs '["efs","sandbox"]' null
+  tl agent session_read_from_efs '["efs","agent"]' null
   if [ "${plain:-1}" = 0 ] && [ -n "$hex" ] && [ "${bytes:-0}" -gt 0 ]; then
     result 1 "the phrase the user saw appears 0 times in the session's $bytes bytes on EFS" \
       "$(jq -c '{plaintext_matches, file_bytes}' <<<"$DISK")" '{"label":"plaintext on disk","value":"0","unit":"matches"}'

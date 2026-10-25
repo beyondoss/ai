@@ -41,10 +41,10 @@ SAMPLER_SCRIPT=$(cat "$HERE/sampler.sh")
 TD_AGENT=$(jq -n --arg family "$P-agent" --arg exec "$(EXEC agent)" --argjson logs "$(LOGS agent)" --argjson slogs "$(LOGS sampler)" \
   --arg img "$ECR/$P-agent:latest" --arg simg "$ECR/$P-standin:latest" --argjson vol "$EFSVOL" \
   --arg script "$AGENT_SCRIPT" --arg sscript "$SAMPLER_SCRIPT" --arg gw "http://loadhost.$DNS:$LOADMODEL_PORT" \
-  --arg model "$MODEL" --arg grant "$GRANT_KEY_FLAG" --arg seal "$(param_arn fleet-secret)" \
+  --arg taskrole "$AGENT_TASK_ROLE" --arg model "$MODEL" --arg grant "$GRANT_KEY_FLAG" --arg seal "$(param_arn fleet-secret)" \
   --arg cache "$LOAD_CACHE_MB" --arg store_dir "$STORE_DIR" --arg lport "$LOADHOST_PORT" '{
   family:$family, networkMode:"awsvpc", requiresCompatibilities:["FARGATE"], cpu:"512", memory:"1024",
-  pidMode:"task", executionRoleArn:$exec, volumes:($vol + [{name:"scratch"}]),
+  pidMode:"task", executionRoleArn:$exec, taskRoleArn:$taskrole, volumes:($vol + [{name:"scratch"}]),
   containerDefinitions:[
     {name:"agent", image:$img, essential:true, stopTimeout:2, entryPoint:["/bin/sh","-c"], command:[$script],
      portMappings:[{containerPort:8080}],

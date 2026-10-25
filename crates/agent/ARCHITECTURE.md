@@ -6520,6 +6520,13 @@ client. Job-end callbacks must be `https` off loopback, so `up.sh` issues a thro
 certificate for the agent's Cloud Map name. Each `demo.sh` run writes a `run.json` and a replayable
 `report.html`; `down.sh` verifies teardown per resource type.
 
+The session store is reachable by the agent alone. The sandbox runs model-written code, so it sits in a
+security group of its own, mounts no EFS and has no route to the mount target (whose group admits NFS from the
+agent's group only). The agent's volume uses EFS IAM authorization, and the file system's policy allows
+`ClientMount` + `ClientWrite` only to the agent's task role, only through the access point, and denies any
+connection without TLS. `demo.sh` shows a TCP connect from the sandbox to port 2049 failing, and reads the
+sealed session bytes from a one-off task with the agent's definition rather than from the sandbox.
+
 `SANDBOX=e2b` runs the sandbox as one E2B microVM per session instead of the shared Fargate service:
 `demo.sh` creates each VM through E2B's REST API and envd, uploads the same static `exec-stub`, and
 mints the session's grant with that VM's public port URL and a bearer in its exec headers. The stub

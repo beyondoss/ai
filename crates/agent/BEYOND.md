@@ -175,6 +175,10 @@ and the ring routing in [FLEET.md](FLEET.md). Beyond's edge does neither.
     entries, and bills its usage rows.
     _Why:_ placement stays the fleet's and minting stays Beyond's; the gateway's key, limits and usage
     are one Beyond-owned loop.
+13. **The session store.** A sandbox has no network route to the session store. Only the agent
+    replica's identity may mount it, through its access point, over TLS.
+    _Why:_ the store's encryption keeps contents secret but not intact: anything that can reach the store
+    can delete or roll back any tenant's sessions.
 
 ## Gateway credentials: expiry and signing keys
 
