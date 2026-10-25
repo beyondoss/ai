@@ -32,6 +32,11 @@ struct Cli {
     #[arg(long, env = "EXECD_KEPT_JOBS_SURVIVE_IDLE")]
     kept_jobs_survive_idle: bool,
 
+    /// The most output one v1.1 answer carries, in bytes; past it the answer is an error saying
+    /// the command ran. Match the agent's `--exec-max-response-bytes`.
+    #[arg(long, env = "EXECD_MAX_RESPONSE_BYTES", default_value_t = execd::MAX_RESPONSE_BYTES)]
+    max_response_bytes: usize,
+
     /// Log level: error, warn, info, debug or trace (or a tracing filter).
     #[arg(long, env = "EXECD_LOG", default_value = "info")]
     log_level: String,
@@ -82,6 +87,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut opts = execd::Options::new(root);
     opts.home = cli.home;
+    opts.max_response_bytes = cli.max_response_bytes;
     opts.kept_jobs_survive_idle = cli.kept_jobs_survive_idle;
     let secured = bearer.is_some();
     opts.bearer = bearer;

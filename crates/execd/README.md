@@ -20,14 +20,15 @@ It passes the agent's conformance verifier, the same one that grades every other
 
 ## Options
 
-| flag                       | environment                    | meaning                                                                                   |
-| -------------------------- | ------------------------------ | ----------------------------------------------------------------------------------------- |
-| `--listen`                 | `EXECD_LISTEN`                 | address to listen on (default `127.0.0.1:8080`)                                           |
-| `--root`                   | `EXECD_ROOT`                   | where a command runs when its request names no directory (default: the current directory) |
-| `--home`                   | `EXECD_HOME`                   | `HOME` for every command                                                                  |
-| `--bearer-file`            | `EXECD_BEARER_FILE`            | a file holding the bearer token; `EXECD_BEARER` holds the token itself                    |
-| `--kept-jobs-survive-idle` | `EXECD_KEPT_JOBS_SURVIVE_IDLE` | advertise v1.4 job-end notify; say so only if this sandbox is not stopped when idle       |
-| `--log-level`              | `EXECD_LOG`                    | `error`, `warn`, `info`, `debug` or `trace`                                               |
+| flag                       | environment                    | meaning                                                                                             |
+| -------------------------- | ------------------------------ | --------------------------------------------------------------------------------------------------- |
+| `--listen`                 | `EXECD_LISTEN`                 | address to listen on (default `127.0.0.1:8080`)                                                     |
+| `--root`                   | `EXECD_ROOT`                   | where a command runs when its request names no directory (default: the current directory)           |
+| `--home`                   | `EXECD_HOME`                   | `HOME` for every command                                                                            |
+| `--bearer-file`            | `EXECD_BEARER_FILE`            | a file holding the bearer token; `EXECD_BEARER` holds the token itself                              |
+| `--kept-jobs-survive-idle` | `EXECD_KEPT_JOBS_SURVIVE_IDLE` | advertise v1.4 job-end notify; say so only if this sandbox is not stopped when idle                 |
+| `--max-response-bytes`     | `EXECD_MAX_RESPONSE_BYTES`     | most output one v1.1 answer carries (default 16 MiB); match the agent's `--exec-max-response-bytes` |
+| `--log-level`              | `EXECD_LOG`                    | `error`, `warn`, `info`, `debug` or `trace`                                                         |
 
 `GET /livez` answers 200 without authentication. `SIGTERM` and `SIGINT` kill every running process group and exit.
 

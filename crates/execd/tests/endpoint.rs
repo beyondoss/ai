@@ -361,3 +361,52 @@ async fn job_output_past_the_retention_is_a_gap() {
     assert!((100_000..100_000 + 65_536).contains(&kept), "kept {kept}");
     server.shutdown().await;
 }
+
+/// Output past the cap is never answered as the result: a 422 that says the command ran, and its
+/// group is gone. Exactly at the cap is a 200 with everything.
+#[tokio::test]
+async fn output_over_the_cap_is_an_error_and_exactly_at_it_is_the_whole_output() {
+    let (server, dir) = start(|o| o.max_response_bytes = 1000).await;
+    let addr = server.local_addr();
+    let a = post(
+        addr,
+        &[],
+        &run("sh", &["-c", "head -c 1000 /dev/zero | tr '\\0' x"]),
+    )
+    .await;
+    assert_eq!(a.status, 200);
+    assert_eq!(a.json()["stdout"].as_str().unwrap().len(), 1000);
+    let pidfile = dir.path().join("pid");
+    let script = format!(
+        "echo $$ > {}; head -c 1001 /dev/zero | tr '\\0' x; (sleep 300 &) ; echo done",
+        pidfile.display()
+    );
+    let a = post(addr, &[], &run("sh", &["-c", &script])).await;
+    assert_eq!(a.status, 422);
+    let msg = a.json()["error"].as_str().unwrap().to_string();
+    assert!(
+        msg.contains("the command ran") && msg.contains("1000-byte"),
+        "{msg}"
+    );
+    assert!(!a.json().as_object().unwrap().contains_key("stdout"));
+    // The group, backgrounded sleep included, was killed.
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let leftovers = std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|e| std::fs::read_to_string(e.path().join("stat")).ok())
+        .filter(|st| {
+            st.rsplit_once(')').is_some_and(|(_, r)| {
+                let f: Vec<&str> = r.split_whitespace().collect();
+                f.first() != Some(&"Z") && f.get(2).and_then(|g| g.parse::<i32>().ok()) == Some(pid)
+            })
+        })
+        .count();
+    assert_eq!(leftovers, 0);
+    server.shutdown().await;
+}

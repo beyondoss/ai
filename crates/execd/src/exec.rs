@@ -5,9 +5,10 @@
 //!
 //! - v1.1: the captured output, at most [`crate::Options::max_response_bytes`] (16 MiB, the agent's
 //!   own cap) across both pipes. Output past it is read and dropped so the command never blocks on
-//!   a full pipe; the agent refuses an answer that big, and a JSON string is never shorter than the
-//!   bytes it encodes, so nothing the agent would have accepted is lost. Freed when the answer is
-//!   built. N concurrent cold callers hold up to N times that.
+//!   a full pipe, and the exchange is then answered `422` saying the command ran and its output was
+//!   too large, never with the prefix as if it were the output (the agent refuses an answer that
+//!   big anyway, and a JSON string is never shorter than the bytes it encodes). Freed when the
+//!   answer is built. N concurrent cold callers hold up to N times that.
 //! - v1.2: two pipe readers with one 64 KiB buffer each, a channel of depth 1 between them and the
 //!   writer, a channel of depth 1 to hyper, and hyper's own write buffer (400 KiB by default). The
 //!   channels are bounded, so a client that stops reading stalls the readers, the pipes fill and the
@@ -20,7 +21,7 @@ use std::os::unix::process::ExitStatusExt as _;
 use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -103,6 +104,7 @@ async fn capture<R: tokio::io::AsyncRead + Unpin>(
     mut pipe: R,
     into: Arc<std::sync::Mutex<Vec<u8>>>,
     budget: Arc<AtomicUsize>,
+    dropped: Arc<AtomicBool>,
 ) {
     let mut buf = vec![0u8; FRAME_MAX];
     while let Ok(n) = pipe.read(&mut buf).await {
@@ -111,6 +113,9 @@ async fn capture<R: tokio::io::AsyncRead + Unpin>(
         }
         let left = budget.load(Ordering::Relaxed);
         let take = n.min(left);
+        if take < n {
+            dropped.store(true, Ordering::Relaxed);
+        }
         if take > 0 {
             budget.fetch_sub(take, Ordering::Relaxed);
             if let Ok(mut v) = into.lock() {
@@ -160,17 +165,18 @@ pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
         }
     });
     let budget = Arc::new(AtomicUsize::new(ctx.opts.max_response_bytes));
+    let dropped = Arc::new(AtomicBool::new(false));
     let out = Arc::new(std::sync::Mutex::new(Vec::new()));
     let err = Arc::new(std::sync::Mutex::new(Vec::new()));
     let readers = [
         proc.child
             .stdout
             .take()
-            .map(|p| tokio::spawn(capture(p, out.clone(), budget.clone()))),
+            .map(|p| tokio::spawn(capture(p, out.clone(), budget.clone(), dropped.clone()))),
         proc.child
             .stderr
             .take()
-            .map(|p| tokio::spawn(capture(p, err.clone(), budget.clone()))),
+            .map(|p| tokio::spawn(capture(p, err.clone(), budget.clone(), dropped.clone()))),
     ];
     let status = proc.child.wait().await;
     // The command is done. Pipes a descendant holds open are given the grace, then let go.
@@ -188,6 +194,22 @@ pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
             .map(|v| String::from_utf8_lossy(&v).into_owned())
             .unwrap_or_default()
     };
+    if dropped.load(Ordering::Relaxed) {
+        // Output past the cap was thrown away, so there is no honest result to return: a prefix
+        // presented as the output would be a confident wrong answer. 422, not 5xx or 413: the
+        // agent reads 400 and 422 as "this request, as written, is declined" and does not rebuild
+        // the sandbox target, as it does for any other refusal. The message says the command ran.
+        let cap = ctx.opts.max_response_bytes;
+        line.done(422, "output over the cap");
+        return http::error_response(
+            422,
+            &format!(
+                "the command ran, but its output exceeded the {cap}-byte response cap and was \
+                 discarded; narrow the output (for example pipe it through `head`) instead of \
+                 running it again unchanged"
+            ),
+        );
+    }
     let payload = match status {
         Ok(s) => {
             line.done(200, "exit");
