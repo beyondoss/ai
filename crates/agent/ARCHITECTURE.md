@@ -131,7 +131,18 @@ The harness layers several capabilities over the bare tools + loop:
   runtime those tasks land on is `current_thread` for a local daemon and work-stealing (one worker
   per core) for a `--service` replica (`main.rs::build_runtime`/`runtime_workers` — at 120 sessions
   the single thread was the replica's bottleneck); `BEYOND_AI_AGENT_TOKIO_WORKER_THREADS` overrides
-  either direction (`benches/serve_runtime.rs`). CPU-bound tool work stays on `spawn_blocking`. **Multiple
+  either direction (`benches/serve_runtime.rs`). A `--service` replica on a 0.5 vCPU Fargate task (one
+  worker) opens 500-session waves with p50 0.40 s but p99 about 6 s (max about 8 s) with CPU never above 45%
+  (`deploy/demo/load.sh`). Two AWS runs on the same task shape found that the tail is not the worker count:
+  a second worker, a pre-grown descriptor table and an off-thread `stat` together changed nothing (p99 7.2 s and 6.7 s), and a 500 ms
+  ticker on the runtime lost up to 3.3 s at a time. Those gaps land where a wave's sessions end together
+  (about 400 sessions closed within seconds, descriptors falling by about 1,000), and the sampled CPU of the
+  whole process drops to about 4% in them: no thread is running, so the process is waiting in the kernel
+  (the EFS-backed filesystem), not short of CPU or of async workers. Threads sat near 90 and, at the
+  first stall in every run, jumped to 516 (4 plus tokio's 512-thread blocking-pool cap): the blocking pool
+  saturates on Fargate. The hypothesis under test is that EFS-bound blocking work (session persist and
+  fsync, bundle unpack and reads) fills that pool and queues opens behind it; run 1 cannot confirm it,
+  because Fargate offers no kernel tracing to name the call. CPU-bound tool work stays on `spawn_blocking`. **Multiple
   connections can attach to one session at once** (the user's own
   phone + TUI): the session's output is **broadcast** to every attached connection (`serve::OutFanout`,
   with a zero-copy fast path for the single-connection case) and input is shared (any device drives; the
@@ -6247,7 +6258,8 @@ fetch it, `bundle.sha256` what it must hash to). `bundle.rs` does the rest:
   MiB of unpacked bundles. `Cache` records each directory's size as it unpacks, measured once as the
   disk it occupies (allocated blocks of every file and directory, as `du` counts them, not the bytes
   of content: a bundle of a few small files holds tens of KiB of blocks), and never walks the disk
-  afterwards. `ensure` returns a `Pin` that the session's `BundleFs` holds for its life,
+  afterwards. `ensure`'s cache hit checks the disk (`Cache::pin_cached`) on the blocking pool, so a slow
+  `stat` never stops the async threads every other session shares. `ensure` returns a `Pin` that the session's `BundleFs` holds for its life,
   since it keeps reading skills from the directory; dropping it stamps the entry's last release. After
   every install, while over budget, the unpinned entry released longest ago is evicted: renamed to
   `.trash-*` under the cache lock (a request that then finds no entry fetches afresh, and nothing is
