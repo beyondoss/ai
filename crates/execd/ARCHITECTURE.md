@@ -96,12 +96,19 @@ no answer, no argument and no environment; `Debug` for it prints `<redacted>`.
 
 - **Groups.** Every command and job is the leader of a new process group. Liveness is `kill(-pgid, 0)`; a kill is `killpg`. Both
   are syscalls (the `nix` crate; the workspace forbids `unsafe`). `kill(2)` counts zombies, and the spec says a zombie is not a
-  live member, so a group that `kill(-pgid, 0)` reports as present is then read from `/proc` and only non-zombie members count.
-  A group that is gone is never signalled again, because its number may be reused.
-- **Orphans.** The binary makes itself the child subreaper and runs `reap_orphans`: on every `SIGCHLD` it scans `/proc` for
-  zombie children of its own and `waitpid`s them. It reaps only pids it did not spawn. Every spawn registers its pid in a set
-  under a lock the scan also takes, so a command being spawned is never seen unregistered, and a command execd awaits is never
-  reaped out from under its owner. There is no `waitpid(-1)`.
+  live member, so a group that `kill(-pgid, 0)` reports as present is then checked member by member and only non-zombie members
+  count. As the subreaper, execd is the ancestor of every group member, so the members are found by walking its own process tree
+  through the kernel's per-process `children` lists (`/proc/<pid>/task/*/children`), which costs the size of that tree and not
+  the number of processes on the host; without a subreaper, or on a kernel without those files, it reads all of `/proc`, and it
+  does so too when the tree shows an existing group with no live member, because "empty" ends a stream. A group that is gone is
+  never signalled again, because its number may be reused.
+- **Orphans.** The binary makes itself the child subreaper and runs `reap_orphans`: on every `SIGCHLD` it lists its own
+  children (the same `children` files) and `waitpid`s the zombies among them that it did not spawn. There is no `waitpid(-1)` and
+  no scan of `/proc`. Every spawn holds the `SPAWNING` lock shared from before the child exists until its pid is in the `OWNED`
+  set, so spawns do not wait for each other; the reaper takes it exclusively, for one `waitpid` at a time, before it reads
+  `OWNED`. A child is therefore either already registered when the reaper looks (and skipped, so a command execd awaits is never
+  reaped out from under its owner) or not yet created; there is no moment at which a forked child is visible to the reaper and
+  unregistered. The reaper holds nothing while it looks for zombies.
 - **Shutdown.** `SIGTERM` or `SIGINT` stops the accept loop, drops every open connection (which drops every in-flight handler, and
   with it the guard that kills that handler's group), then kills every group still registered, commands and jobs alike, and
   exits.
@@ -120,7 +127,7 @@ cold callers. No limit here is invented: each is the spec's, the agent's own, or
 | v1.1 stdin                    | the decoded request body                                                                                                      | already counted in the request body                                                                                                                                                                                                                                                                                                                                                                                 | the handler returning                                             | as above                                                                                                                                                                                          |
 | v1.2 stream buffers           | two 64 KiB read buffers, one frame in each of two depth-1 channels, hyper's write buffer (400 KiB, its default)               | A frame carries at most 64 KiB (the spec). Depth 1 is the least that lets the next frame be built while the last is written; nothing observable depends on it.                                                                                                                                                                                                                                                      | the stream ending                                                 | N streams hold N times a few hundred KiB. A stalled client holds the same, and stalls its command.                                                                                                |
 | Settle on exit                | 100 ms quiet, or one pipe capacity of further bytes (`F_GETPIPE_SZ`, 64 KiB by default)                                       | The spec's grace is 100 ms (the client's). A command can only have written, and not been read, as much as its pipes hold.                                                                                                                                                                                                                                                                                           | the settle returning                                              | one timer per exiting stream                                                                                                                                                                      |
-| Leftover poll                 | every 50 ms while a shell has exited and its group lives                                                                      | It only sets how soon the final frame follows the last member; it caps nothing.                                                                                                                                                                                                                                                                                                                                     | the group emptying, the deadline, or the client leaving           | one `/proc` scan per polling stream per tick, only while leftovers live                                                                                                                           |
+| Leftover poll                 | every 50 ms while a shell has exited and its group lives                                                                      | It only sets how soon the final frame follows the last member; it caps nothing.                                                                                                                                                                                                                                                                                                                                     | the group emptying, the deadline, or the client leaving           | one walk of execd's process tree per polling stream per tick, only while leftovers live                                                                                                           |
 | Heartbeat                     | every 5 s of silence                                                                                                          | The spec.                                                                                                                                                                                                                                                                                                                                                                                                           | the stream ending                                                 | one timer per stream                                                                                                                                                                              |
 | Stream lifetime               | the command's `timeout_ms` (a job stream has none)                                                                            | The spec: the endpoint enforces it and kills the group. A request without `timeout_ms`, or one too large to represent, waits 30 years, tokio's own "never".                                                                                                                                                                                                                                                         | the deadline, the client leaving, or the command ending           | bounded by the clients                                                                                                                                                                            |
 | Job output                    | the last 8 MiB per job (`JOB_OUTPUT_RETENTION`), in whole chunks of at most 64 KiB, so between 8 MiB and 8 MiB plus one chunk | The spec: the endpoint keeps at least the last 8 MiB.                                                                                                                                                                                                                                                                                                                                                               | the job's `remove`, `kill` with `remove`, or `wipe`               | N jobs hold N times 8 MiB                                                                                                                                                                         |
@@ -210,34 +217,60 @@ Read this table as follows.
   four rounds are 1246 to 1461 MB/s.
 - A slow reader shows backpressure: 16 clients reading 256 MiB streams at about 1 MB/s each make A buffer them in memory (9.8
   GiB at the sample peak) and leave B flat at 33.5 MiB.
-- Concurrent v1.1 is **slower** in B: 2.8 ms against 0.9 ms at the median, and a p99 of 53 ms against 5 ms. One round of B's
-  five was hit by other work on the host (its median was 22.7 ms, the other four 2.5 to 3.2 ms), which is the spread to read
-  the p99 against; it does not explain the 3x at the median. A likely cause is that `proc::spawn` holds the global `OWNED`
-  lock across `fork` and `exec`, so concurrent commands spawn one at a time; this was not isolated by an experiment.
+- Concurrent v1.1 was **slower** in B when this table was measured: 2.8 ms against 0.9 ms at the median, and a p99 of 53 ms
+  against 5 ms (one of B's five rounds was hit by other work on the host: its median was 22.7 ms, the other four 2.5 to 3.2
+  ms). The cause was `proc::spawn` holding a global lock across the spawn, so concurrent commands spawned one at a time. It is
+  fixed; see below.
 - Kill on disconnect is a tie at about 1.1 ms (the harness polls every 0.5 ms on a 1 ms timer, so differences under 1 ms are
   not resolved). The spec allows 10 s.
 
-### What a busy `/proc` costs: the regression
+### What a busy `/proc` cost, and the fix
 
-execd's orphan reaper (`proc::reap_once`) scans all of `/proc` on every `SIGCHLD`, holding the `OWNED` lock for the whole
-scan. Every command's exit raises `SIGCHLD`, and the next spawn, and the `Proc` drop of the command that just exited, both take
-that lock, so the scan sits on the critical path of every v1.1 and v1.2 request. The scan costs about 10 us for each process
-visible in `/proc`, so execd's round trip is the baseline's plus that.
+The first measurement (above, and the "before" columns below) found execd's round trip growing with the number of processes on
+the host. The orphan reaper scanned all of `/proc` on every `SIGCHLD`, holding the `OWNED` lock for the whole scan; the next
+spawn and the exiting command's own `Proc` drop both take that lock, so the scan sat on the critical path of every request, at
+about 10 us for each process visible. With the reaper's task disabled, a sequential `true` on this host fell from 24.2 ms to
+0.45 ms, and `strace` showed the response landing right after the scan's `getdents64` and per-pid `stat` reads. The same scan
+ran at 20 Hz for every stream whose command had left a process behind. The fix is in "Process model" (the reaper and the
+liveness check read execd's own children; spawns hold a lock shared and the reaper holds it exclusively only around one
+`waitpid`).
 
-| `true` round trip, sequential, p50 / p99 | N (each side) | A: reference mock | B: execd       |
-| ---------------------------------------- | ------------- | ----------------- | -------------- |
-| 2 processes in `/proc`                   | 1000          | 0.51 / 1.04 ms    | 0.55 / 1.07 ms |
-| plus 100 idle `sleep` processes          | 1000          | 0.44 / 1.00 ms    | 1.67 / 4.1 ms  |
-| plus 1000 idle `sleep` processes         | 1000          | 0.45 / 1.03 ms    | 10.2 / 29.5 ms |
-| this host as it is, 2457 processes       | 2000          | 0.54 / 0.98 ms    | 25.5 / 53.3 ms |
-| same, 16 concurrent                      | 3200          | 0.87 / 2.7 ms     | 55 / 106 ms    |
-| same, time to first frame                | 200           | 1.95 / 6.3 ms     | 25.7 / 53.1 ms |
+Before and after, same harness, 5 rounds with A and B interleaved. After: 2026-10-25, `benches/results/2026-10-25-*-reaper.json`.
+Before: `benches/results/2026-10-25-{sandbox,host}.json`. Each cell is B's p50 / p99 in ms against the reference mock A in the
+same run; N is per side.
 
-Cause, shown two ways. With the reaper's task disabled, execd's sequential `true` round trip on this host fell from 24.2 ms to
-0.45 ms (same host, 600 requests each, the build reverted afterward), and `strace` shows the response `writev` landing right
-after the reaper's `getdents64` and per-pid `stat` reads of the scan that the request's own `SIGCHLD` started. The baseline
-spawns commands without such a scan and does not move with the process count. A sandbox with tens of processes pays about 0.1
-to 0.5 ms; a build host or a shared machine with thousands pays tens of milliseconds on every command, and the fs tools run
-one command per call. It is not fixed on this branch: a fix is a change to the reaper's locking (take `OWNED` only around the
-check and `waitpid` of an actual zombie child, found without the lock, and let spawns hold it shared), which belongs with the
-rest of execd's process model.
+| `true` sequential                   | N    | A, after    | B, before   | B, after    |
+| ----------------------------------- | ---- | ----------- | ----------- | ----------- |
+| 2 processes in `/proc`              | 1000 | 0.76 / 1.48 | 0.55 / 1.07 | 0.44 / 0.90 |
+| plus 100 idle `sleep` processes     | 1000 | 0.45 / 1.08 | 1.67 / 4.1  | 0.43 / 0.88 |
+| plus 1000 idle `sleep` processes    | 1000 | 0.43 / 0.98 | 10.2 / 29.5 | 0.41 / 0.88 |
+| this host as it is (2471 processes) | 2000 | 0.54 / 1.00 | 25.5 / 53.3 | 0.45 / 1.10 |
+
+| host as it is (2471 processes) | N    | A, after   | B, before   | B, after    |
+| ------------------------------ | ---- | ---------- | ----------- | ----------- |
+| `true`, 16 concurrent          | 3200 | 0.88 / 3.4 | 55.3 / 106  | 0.87 / 1.7  |
+| `cat` of 4 KiB, 16 concurrent  | 3200 | 1.10 / 3.6 | 57.0 / 108  | 1.07 / 2.2  |
+| time to first frame            | 200  | 1.89 / 2.9 | 25.7 / 53.1 | 0.43 / 0.88 |
+
+| `true`, 16 concurrent, 2 processes in `/proc` | N    | A, after   | B, before | B, after   |
+| --------------------------------------------- | ---- | ---------- | --------- | ---------- |
+| p50 / p99                                     | 3200 | 0.93 / 7.6 | 2.8 / 53  | 0.95 / 2.2 |
+
+Reading these: after the fix B is within the noise of A at every process count (the per-round medians overlap, or B is lower),
+and the concurrency-16 gap is closed on a small `/proc` too, which confirms the cause was the lock held across the spawn (and
+the scan under it), not anything in the request path. Streaming, RSS and kill-on-disconnect did not change (host run after the
+fix: 1418 MB/s zeros and 1441 MB/s random against A's 1042 and 1074; 1.30 and 1.11 server CPU-s per GB against A's 2.09 and
+1.79; peak RSS with 16 slow readers 34 MiB against A's 10.0 GiB).
+
+A stream whose command exited leaving a process running (a kept dev server) is polled every 50 ms for the group to empty. The
+server's CPU over 30 s with one such stream, on this host (2471 processes), N=1 per side:
+
+| reference mock A | execd before | execd after |
+| ---------------- | ------------ | ----------- |
+| 1.25 s           | 15.86 s      | 0.25 s      |
+
+Before, that was more than half a core spent for as long as the dev server lived. After, it is a tenth of a percent of a core
+(the walk of execd's few descendants every 50 ms, 0.25 s in 30 s) and does not depend on the host's process count; it is not
+zero, and the reference mock spends five times as much. The `children` files need `CONFIG_PROC_CHILDREN` in the kernel (it
+exists on this 6.12 kernel); where they are missing, `/proc` is read as before, correct but at the old cost. This was not
+checked on the Fargate or E2B kernels.
