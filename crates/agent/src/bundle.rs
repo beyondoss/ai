@@ -191,8 +191,19 @@ impl Cache {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Pin the entry for `sha256` if it is cached and still on disk.
-    fn pin_cached(self: &Arc<Self>, sha256: &str) -> Option<Pin> {
+    /// Pin the entry for `sha256` if it is cached and still on disk. The `stat` that checks the disk
+    /// runs on the blocking pool: on a replica with one async worker, a `stat` stuck behind a slow
+    /// filesystem would otherwise stop every other session's open until it returned.
+    async fn pin_cached(self: &Arc<Self>, sha256: &str) -> Option<Pin> {
+        let (cache, sha256) = (Arc::clone(self), sha256.to_owned());
+        // A join error is a panic in the closure or a runtime shutting down: either way, no pin.
+        tokio::task::spawn_blocking(move || cache.pin_cached_blocking(&sha256))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    fn pin_cached_blocking(self: &Arc<Self>, sha256: &str) -> Option<Pin> {
         let mut state = self.lock();
         let dir = self.root.join(sha256);
         // An entry is removed under this lock before its directory is renamed away, so a missing
@@ -219,7 +230,7 @@ impl Cache {
         if !bundle.is_well_formed() {
             return Err("bundle: the grant's bundle is not a url and a lowercase sha256".into());
         }
-        if let Some(pin) = self.pin_cached(&bundle.sha256) {
+        if let Some(pin) = self.pin_cached(&bundle.sha256).await {
             return Ok(pin);
         }
         let egress = egress.ok_or("bundle: this replica has no egress client to fetch it with")?;
@@ -248,7 +259,7 @@ impl Cache {
         bundle: &Bundle,
         egress: &crate::tools::mcp::McpEgress,
     ) -> Result<Pin, String> {
-        if let Some(pin) = self.pin_cached(&bundle.sha256) {
+        if let Some(pin) = self.pin_cached(&bundle.sha256).await {
             return Ok(pin);
         }
         let _permit = self.fetches.acquire().await.map_err(|e| e.to_string())?;
@@ -723,6 +734,39 @@ mod tests {
             assert!(pin.unwrap().dir().join("AGENTS.md").is_file());
         }
         assert_eq!(server.hits(), 1, "one fetch for one hash");
+    }
+
+    /// Opening a session on a bundle that is already cached checks the disk from the blocking pool,
+    /// never from the async thread that every other session shares.
+    #[test]
+    fn a_cached_bundle_is_checked_off_the_runtime_thread() {
+        let bytes = tar(&[file("AGENTS.md", "hello")]);
+        let server = BundleServer::start(bytes.clone());
+        let bundle = Bundle {
+            url: server.url.clone(),
+            sha256: sha256_hex(&bytes),
+        };
+        let root = tempfile::tempdir().unwrap();
+        let cache = Cache::new(root.path(), u64::MAX);
+        let warm = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        warm.block_on(cache.ensure(&bundle, Some(&egress())))
+            .unwrap();
+        // A current-thread runtime starts threads only for blocking work, so a hit that starts none
+        // did its `stat` on the async thread.
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&started);
+        let hit = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .on_thread_start(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+            .build()
+            .unwrap();
+        hit.block_on(cache.ensure(&bundle, None)).unwrap();
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
