@@ -147,15 +147,9 @@ impl HeaderBlock for pingora::http::ResponseHeader {
 /// True for a provider rate-limit header: the quota of the key the request rode on. On Beyond's
 /// pool key that is the shared pool's, not the tenant's, so it is not relayed. `retry-after*` and
 /// `x-should-retry` are backoff signals, not quota, and are not matched. `name` is lower-case.
-/// Families: `x-ratelimit-` (OpenAI, Groq, Together, xAI, Mistral, Fireworks, Cerebras,
-/// OpenRouter, Azure), `anthropic-ratelimit-` (Anthropic API docs, "Rate limits: response
-/// headers"), and `ratelimit` / `ratelimit-*` (IETF RateLimit fields, which Hugging Face's
-/// inference providers document: huggingface.co/docs/hub/rate-limits).
+/// Families: `x-ratelimit-` (OpenAI, xAI and others) and `anthropic-ratelimit-` (Anthropic).
 pub(super) fn is_rate_limit_header(name: &str) -> bool {
-    name.starts_with("x-ratelimit-")
-        || name.starts_with("anthropic-ratelimit-")
-        || name == "ratelimit"
-        || name.starts_with("ratelimit-")
+    name.starts_with("x-ratelimit-") || name.starts_with("anthropic-ratelimit-")
 }
 
 /// Remove every header whose (lower-case) name `drop` matches, allocating nothing: names are

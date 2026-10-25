@@ -426,8 +426,6 @@ fn rate_limit_predicate_matches_quota_headers_only() {
         "x-ratelimit-limit-requests",
         "anthropic-ratelimit-requests-remaining",
         "anthropic-ratelimit-unified-status",
-        "ratelimit",
-        "ratelimit-remaining",
     ] {
         assert!(is_rate_limit_header(yes), "{yes}");
     }
@@ -439,6 +437,8 @@ fn rate_limit_predicate_matches_quota_headers_only() {
         "openai-organization",
         "anthropic-organization-id",
         "x-ratelimited",
+        "ratelimit",
+        "ratelimit-remaining",
         "ratelimited",
         "content-type",
     ] {
