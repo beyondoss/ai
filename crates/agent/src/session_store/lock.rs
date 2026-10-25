@@ -27,6 +27,14 @@ pub fn acquire_session_lock(session_path: &Path) -> std::io::Result<Option<Sessi
     })
 }
 
+/// Whether the session directory at `session_path` has ever held a segment: one `stat` of
+/// `000001.jsonl`, which is created with `O_EXCL` before anything else and never deleted. A session
+/// that is ending knows the answer without listing the directory, which on a network filesystem is a
+/// round trip per call.
+pub fn session_has_first_segment(session_path: &Path) -> bool {
+    session_path.join(super::segment_name(1)).is_file()
+}
+
 /// The single-writer lock a process holds on a single-file session for as long as it may write it —
 /// `run`, and `serve` outside service mode, take it right after opening (before any write; see
 /// `Log::File::torn_at`) and keep it with the store. A second process asking for a session already
