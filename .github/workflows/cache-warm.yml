@@ -35,6 +35,13 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
   CARGO_INCREMENTAL: "0"
+  # No debuginfo in test/dev builds. Line tables were ~70% of every test binary (a gateway test
+  # binary: 72 MB, of which .debug_line 22 + .debug_str 17 + .debug_info 10), and the binaries are the
+  # tests archive that every shard downloads: gateway-only archive 1.31 GiB -> 479 MiB, compile CPU
+  # time -22%. A panic still names its file:line (that comes from the panic location, not debuginfo);
+  # only RUST_BACKTRACE frames lose theirs.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 jobs:
   tests:
     name: warm (tests)
