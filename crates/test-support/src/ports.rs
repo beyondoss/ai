@@ -26,6 +26,10 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::Path;
 
+/// The `--listen` value that asks a child to bind a loopback port of its own choosing; the test
+/// reads it back with [`listening_on`].
+pub const CHILD_LISTEN: &str = "127.0.0.1:0";
+
 /// A loopback listener on a port the kernel picks, held for as long as the value lives.
 #[track_caller]
 pub fn listener() -> std::net::TcpListener {

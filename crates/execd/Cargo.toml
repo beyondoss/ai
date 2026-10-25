@@ -1,0 +1,55 @@
+[package]
+name = "beyond-ai-execd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+description = "execd: a production exec endpoint that runs inside a sandbox and speaks the agent's exec protocol (v1.1 to v1.4)"
+
+[lib]
+name = "execd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "execd"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+base64.workspace = true
+# The v1.4 timing kernel: when a callback is owed, retried or given up. Every endpoint drives the
+# same pure function.
+beyond-ai-exec-notify = { path = "../exec-notify", version = "0.1.0" }
+bytes.workspace = true
+clap.workspace = true
+# The jitter draw for a retry's wait (one u32 per failed attempt).
+getrandom = { version = "0.3", features = ["std"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+# `server-auto` serves HTTP/1.1 and prior-knowledge HTTP/2 (h2c) on the one listener.
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+# Process groups, subreaper, the pipe-size query and the socket's user timeout, as safe wrappers:
+# the workspace forbids `unsafe_code`.
+nix = { version = "0.31", default-features = false, features = ["fs", "net", "process", "signal", "socket"] }
+# Job-end callbacks over HTTPS that verify the server and never follow a redirect: rustls with
+# `ring` and the OS trust store, as the agent's own client. The provider is installed before the
+# client is built (`rustls-no-provider` has no default).
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# The conformance verifier lives in the agent, the only client of the protocol; the test runs it
+# against the real binary. A dev-dependency only: execd itself links neither.
+beyond-ai-agent = { path = "../agent" }
+beyond-ai-test-support = { path = "../test-support" }
+hyper = { version = "1", features = ["client", "http2"] }
+tempfile = "3"

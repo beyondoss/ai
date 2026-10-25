@@ -11,6 +11,14 @@
 //! ([`ExecMock::streams`]), and the endpoints that get v1.2 wrong in each way the probe and the
 //! conformance verifier must catch ([`Protocol`], [`MockOptions::kills_on_disconnect`]).
 //!
+//! **A conforming configuration runs execd**, the production endpoint (`crates/execd`): the same code
+//! the shipping binary runs, with an observer filling [`ExecMock::requests`], [`ExecMock::streams`]
+//! and [`ExecMock::callbacks`]. Only the configurations that get the protocol wrong on purpose (the
+//! v1 endpoint that ignores stdin, [`Protocol::V11`] and [`Protocol::Buffered`], the non-killing and
+//! non-tracking variants, [`MockOptions::idle_kill`], lost callbacks, a slow `keep`, no egress, the
+//! [`NotifyFaults`], a front that refuses the extensions) keep this module's own server below, which
+//! exists to be wrong in those ways. [`MockOptions::is_conforming`] says which is which.
+//!
 //! The default is a conforming v1.3 endpoint — v1.2 streaming plus native sandbox jobs
 //! ([`MockOptions::jobs`]): what a real sandbox should be, so every suite that does not ask for
 //! something else exercises the newest path. `jobs: false` is a v1.2-only endpoint, on which the
@@ -140,7 +148,7 @@ pub struct MockOptions {
 
 /// One way per v1.4 conformance check for an endpoint to get the spec wrong. Each is a change to
 /// what the mock feeds the kernel, or to the request it makes, never to the kernel.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct NotifyFaults {
     /// Advertise `notify` as this value instead of `"v1.4"`.
     pub probe_notify: Option<Value>,
@@ -211,6 +219,25 @@ impl Default for MockOptions {
 }
 
 impl MockOptions {
+    /// Whether this configuration is a conforming endpoint with nothing broken on purpose, which is
+    /// what execd is. Every field that makes the mock non-conforming, or that execd has no business
+    /// offering (a sandbox that kills idle jobs, a callback path that loses its callbacks, a front
+    /// that refuses the extensions, a v1 endpoint that ignores stdin), keeps the mock's own server.
+    pub fn is_conforming(&self) -> bool {
+        self.honors_stdin
+            && self.protocol == Protocol::Streaming
+            && self.kills_on_disconnect
+            && self.tracks_leftovers
+            && self.jobs_hold_kills
+            && self.notify
+            && self.idle_kill.is_none()
+            && self.egress
+            && self.lose_callbacks == LoseCallbacks::None
+            && self.keep_delay.is_zero()
+            && self.faults == NotifyFaults::default()
+            && !self.refuses_extensions
+    }
+
     /// A conforming v1.4 endpoint: v1.3 jobs, and notify advertised (its deployment says kept jobs
     /// survive idling).
     pub fn notifying() -> Self {
@@ -232,18 +259,6 @@ impl MockOptions {
             .clone()
             .unwrap_or_else(|| json!(NOTIFY_VERSION))
     }
-}
-
-/// How a streamed command's exchange ended, as the endpoint saw it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StreamEnd {
-    /// The command exited (or was signalled) and its final frame was sent.
-    Finished,
-    /// The endpoint enforced `timeout_ms`.
-    TimedOut,
-    /// The client went away before the final frame. `killed` is whether the endpoint then killed
-    /// the process group (always, unless [`MockOptions::kills_on_disconnect`] is off).
-    Disconnected { killed: bool },
 }
 
 /// One streamed command, as the endpoint ran it.
@@ -346,8 +361,15 @@ impl ExecMock {
     }
 
     /// Serve on `listener`, which the endpoint holds for as long as it runs.
+    ///
+    /// A conforming configuration ([`MockOptions::is_conforming`]) runs execd, the code that ships;
+    /// the fault variants run the mock's own server below, which exists to get the protocol wrong
+    /// in the ways the conformance verifier must catch.
     fn serve(listener: tokio::net::TcpListener, root: &Path, opts: MockOptions) -> Self {
         let url = format!("http://{}/exec", listener.local_addr().unwrap());
+        if opts.is_conforming() {
+            return Self::delegate(listener, root, url, &opts);
+        }
         let shared = Shared {
             root: root.to_path_buf(),
             opts,
@@ -373,6 +395,38 @@ impl ExecMock {
                 tokio::spawn(serve_one(sock, shared.clone()));
             }
         });
+        mock
+    }
+
+    /// Run execd on `listener`, recording what the suites ask of [`Self::requests`],
+    /// [`Self::streams`] and [`Self::callbacks`] through its observer.
+    fn delegate(
+        listener: tokio::net::TcpListener,
+        root: &Path,
+        url: String,
+        opts: &MockOptions,
+    ) -> Self {
+        let mock = Self {
+            url,
+            requests: Arc::default(),
+            streams: Arc::default(),
+            callbacks: Arc::default(),
+        };
+        let mut o = execd::Options::new(root);
+        o.home = opts.home.clone();
+        o.bearer = opts.require_bearer.clone();
+        o.heartbeat = opts.heartbeat;
+        o.native_jobs = opts.jobs;
+        o.kept_jobs_survive_idle = opts.kept_jobs_survive_idle;
+        o.job_output_retention = opts.job_output_cap;
+        o.observer = Some(Arc::new(Recorder {
+            requests: mock.requests.clone(),
+            streams: mock.streams.clone(),
+            callbacks: mock.callbacks.clone(),
+            index: Mutex::default(),
+        }));
+        // The handle is dropped: the server runs until the test's runtime ends, as the mock always has.
+        execd::serve(listener, o).expect("execd serves");
         mock
     }
 
@@ -498,6 +552,49 @@ async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<(Vec<(String, 
     let req: Value =
         serde_json::from_slice(&buf[head_end.unwrap_or(buf.len())..]).unwrap_or(json!({}));
     Some((headers, req))
+}
+
+/// What execd tells its observer, kept for the suites that ask what the endpoint saw.
+struct Recorder {
+    requests: Arc<Mutex<Vec<ExecRequest>>>,
+    streams: Arc<Mutex<Vec<StreamRecord>>>,
+    callbacks: Arc<Mutex<Vec<CallbackAttempt>>>,
+    /// Which record each running stream is, by execd's number for it.
+    index: Mutex<std::collections::HashMap<u64, usize>>,
+}
+
+impl execd::Observer for Recorder {
+    fn request(&self, headers: &[(String, String)], body: &Value) {
+        self.requests.lock().unwrap().push(ExecRequest {
+            headers: headers.to_vec(),
+            body: body.clone(),
+        });
+    }
+
+    fn stream_started(&self, start: &execd::StreamStart) {
+        let mut streams = self.streams.lock().unwrap();
+        streams.push(StreamRecord {
+            pgid: start.pgid,
+            command: start.command.clone(),
+            args: start.args.clone(),
+            started: start.at,
+            end: None,
+        });
+        self.index
+            .lock()
+            .unwrap()
+            .insert(start.seq, streams.len() - 1);
+    }
+
+    fn stream_ended(&self, seq: u64, end: StreamEnd, at: Instant) {
+        if let Some(i) = self.index.lock().unwrap().remove(&seq) {
+            self.streams.lock().unwrap()[i].end = Some((end, at));
+        }
+    }
+
+    fn callback(&self, attempt: &CallbackAttempt) {
+        self.callbacks.lock().unwrap().push(attempt.clone());
+    }
 }
 
 /// Counts a request as open for as long as it lives — for [`MockOptions::idle_kill`].
@@ -1397,72 +1494,11 @@ async fn stream_job(
 // to say (`exec_notify::step`, the function every endpoint shares): this side makes the requests.
 // ---------------------------------------------------------------------------------------------
 
-/// What an endpoint that offers v1.4 adds to its probe answer.
-pub const NOTIFY_VERSION: &str = "v1.4";
-
-/// How long one attempt may take before it is abandoned as a connection error.
-pub const ATTEMPT_TIMEOUT: Duration = Duration::from_millis(exec_notify::ATTEMPT_TIMEOUT_MS);
-
-/// `keep`'s `notify`, as recorded. `Debug` never shows the token.
-#[derive(Clone, PartialEq, Eq)]
-pub struct NotifyTarget {
-    pub url: String,
-    pub token: String,
-}
-
-impl std::fmt::Debug for NotifyTarget {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NotifyTarget")
-            .field("url", &self.url)
-            .field("token", &"<redacted>")
-            .finish()
-    }
-}
-
-/// What an attempt carried: the proof at `keep`, or a state change owed since.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CallbackKind {
-    /// At `keep`: the proof of reach.
-    Proof,
-    /// A state change: the shell exited leaving its group alive, or the job's end is observable.
-    Change,
-}
-
-/// One callback attempt, as the endpoint made it.
-#[derive(Clone, Debug)]
-pub struct CallbackAttempt {
-    pub scope: String,
-    pub id: String,
-    pub url: String,
-    pub kind: CallbackKind,
-    /// 1 for a count's first attempt.
-    pub n: u32,
-    pub started: Instant,
-    pub ended: Instant,
-    /// The answer's status; `None` for a connection error, a TLS failure or no answer in 30 s.
-    pub status: Option<u16>,
-    /// Why there was no status, when there was none: the client's error and its causes.
-    pub error: Option<String>,
-}
-
-/// Check `keep`'s `notify`: its members' types here, the grammar by the shared kernel
-/// ([`exec_notify::check_notify`]). The rule it breaks, if any, never quoting the token.
-pub fn parse_notify(v: &Value) -> Result<NotifyTarget, &'static str> {
-    let obj = v.as_object().ok_or("notify type")?;
-    let url = match obj.get("url") {
-        None => return Err("url missing"),
-        Some(u) => u.as_str().ok_or("url type")?,
-    };
-    let token = match obj.get("token") {
-        None => return Err("token missing"),
-        Some(t) => t.as_str().ok_or("token type")?,
-    };
-    exec_notify::check_notify(url, token)?;
-    Ok(NotifyTarget {
-        url: url.to_string(),
-        token: token.to_string(),
-    })
-}
+// The pieces of v1.4 the endpoint and its observers share are execd's own, re-exported here.
+pub use execd::{
+    ATTEMPT_TIMEOUT, CallbackAttempt, CallbackKind, NOTIFY_VERSION, NotifyTarget, StreamEnd,
+    parse_notify,
+};
 
 /// A task the job owns: dropped (by the kernel's `Abandon`, a new timer, or the job's removal), it
 /// is aborted.
