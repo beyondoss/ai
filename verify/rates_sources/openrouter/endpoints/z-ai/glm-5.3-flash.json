@@ -254,8 +254,8 @@
         "pricing": {
           "completion": "0.00000065",
           "discount": 0,
-          "input_cache_read": "0.000000089",
-          "prompt": "0.000000316"
+          "input_cache_read": "0.000000043",
+          "prompt": "0.000000153"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -317,10 +317,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000000069786",
+          "completion": "0.00000001",
           "discount": 0,
-          "input_cache_read": "0.000000017825",
-          "prompt": "0.000000066466"
+          "input_cache_read": "0.00000002242",
+          "prompt": "0.000000110038"
         },
         "provider_name": "OpenInference",
         "quantization": "fp4",
@@ -382,10 +382,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000000701",
+          "completion": "0.0000000758",
           "discount": 0,
           "input_cache_read": "0.00000003",
-          "prompt": "0.0000000513"
+          "prompt": "0.0000000413"
         },
         "provider_name": "Relace",
         "quantization": "unknown",
@@ -434,10 +434,10 @@
         "context_length": 1024000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000025",
-          "discount": 0.5,
-          "input_cache_read": "0.000000015",
-          "prompt": "0.000000075"
+          "completion": "0.000000145",
+          "discount": 0.71,
+          "input_cache_read": "0.0000000087",
+          "prompt": "0.0000000435"
         },
         "provider_name": "StreamLake",
         "quantization": "fp8",
