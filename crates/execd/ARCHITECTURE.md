@@ -418,8 +418,9 @@ host differs from a VM; "2 CPUs" rows pin the server with `taskset -c 0,1`.
 (a) ships. (b) was already true: the callback client is built on the first v1.4 attempt, so nothing of reqwest, rustls or ring
 runs at startup. (c) and (d) are bounds, measured by removing the code, not by a replacement: an `EnvFilter` pulls in a regex
 engine, and clap's parser accounts for the 284 KiB of (d). Replacing them changes behaviour (a filter language, `--help`
-and error text), so they wait for a decision. PGO follows `release-agent.yml` and `.github/pgo-train-execd.py` trains it; it
-belongs in the distribution build (`Dockerfile.execd`, `release-execd.yml`, on #536), not in a cargo profile. On 2 CPUs the
+and error text), so they wait for a decision. (f) ships in the distribution build: `release-execd.yml` and `Dockerfile.execd` follow
+`release-agent.yml`, and `.github/pgo-train-execd.py` trains it (re-measured on the shipped musl binary, n=3: 2728 to 2544 KiB, -185). It
+belongs there, not in a cargo profile. On 2 CPUs the
 multi-thread build idles at 2960 and `current_thread` at 2852 (-108), because tokio then starts 2 workers, not 16.
 
 **Marginal cost** (medians of 3, in the JSON):
@@ -500,7 +501,7 @@ memory win for a rate loss nothing in a sandbox reaches, so it ships as the defa
 per CPU. mimalloc is a large throughput win on one thread (+60%, -40% CPU per GB), because musl's malloc is the cost of the
 64 KiB frame buffers, but it costs 408 KiB at idle and keeps 4 MiB after a burst, so it is not enabled; the `mimalloc` cargo
 feature builds it. Reusing the frame buffer would take the allocator out of the stream path without either cost; that is a
-change to the stream code and is not made here. PGO and the replacements for (c) and (d) are the remaining levers, worth about
+change to the stream code and is not made here. The replacements for (c) and (d) are the remaining levers, worth about
 0.3 MiB each of a 2.8 MiB process.
 
 **Wakeups** (context switches per second over a window, all threads, static musl build; `benches/wakeups.py`,

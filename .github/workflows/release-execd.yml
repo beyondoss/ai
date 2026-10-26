@@ -3,8 +3,8 @@ name: Release execd
 # and linux/arm64 and attaches execd-<tag>-linux-<arch>.tar.gz (+ .sha256) and install-execd.sh to
 # the tag's GitHub Release. Sibling of release-agent.yml, same reasoning: native musl-gcc on a native
 # runner per arch (no cross-linker), and `relocation-model=static` because a static-pie musl binary
-# segfaults at startup in some environments. execd runs in arbitrary provider sandbox images, so
-# unlike the agent it is a plain release build: no PGO, nothing that needs a particular libc.
+# segfaults at startup in some environments. Profile-guided like the agent (see below); execd runs in
+# arbitrary provider sandbox images, so nothing in the build needs a particular libc.
 on:
   push:
     tags: ["v*"]
@@ -32,13 +32,37 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
           rustup target add ${{ matrix.target }}
-      - name: Build execd (static musl)
+      - name: Build execd (static musl, PGO)
         run: |
           linker_env="CARGO_TARGET_$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_LINKER"
           cc_env="CC_$(echo '${{ matrix.target }}' | tr '-' '_')"
           export "$linker_env=musl-gcc"
           export "$cc_env=musl-gcc"
-          RUSTFLAGS="-C relocation-model=static" \
+
+          # Profile-guided optimization, for MEMORY: an idle execd's resident set is mostly code, and
+          # PGO groups the code that runs so the kernel's fault-around drags in fewer neighbours
+          # (about 300 KiB less idle PSS). Same three stages as release-agent.yml, trained per arch
+          # on the native runner (profiles are architecture-specific) and generated fresh each
+          # release rather than checked in.
+          #
+          # A RUSTFLAGS variable REPLACES any rustflags in cargo config, so
+          # `-C relocation-model=static` (static-pie musl segfaults in some environments, and
+          # non-PIE is also the smaller resident set) is carried in every stage.
+          PROFDIR="$RUNNER_TEMP/pgo"
+          rm -rf "$PROFDIR"; mkdir -p "$PROFDIR/raw"
+          host="$(rustc -vV | awk '/^host: /{print $2}')"
+          profdata="$(rustc --print sysroot)/lib/rustlib/$host/bin/llvm-profdata"
+          test -x "$profdata" || { echo "llvm-profdata missing at $profdata"; exit 1; }
+
+          RUSTFLAGS="-Cprofile-generate=$PROFDIR/raw -C relocation-model=static" \
+            cargo build --release --locked -p beyond-ai-execd --target ${{ matrix.target }}
+          python3 .github/pgo-train-execd.py \
+            "target/${{ matrix.target }}/release/execd" "$PROFDIR/raw"
+          "$profdata" merge -o "$PROFDIR/merged.profdata" "$PROFDIR"/raw/*.profraw
+
+          # Never let the shipped binary inherit instrumentation.
+          rm -rf "target/${{ matrix.target }}/release"
+          RUSTFLAGS="-Cprofile-use=$PROFDIR/merged.profdata -C relocation-model=static" \
             cargo build --release --locked -p beyond-ai-execd --target ${{ matrix.target }}
       - name: Verify the binary is static
         run: |
