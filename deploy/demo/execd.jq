@@ -1,6 +1,6 @@
 # The sandbox's log lines, in the shape the demo's checks and report read.
 #
-# execd (run with `--log-format json`) writes one object per request, when the request finishes:
+# execd (run with `EXECD_LOG_FORMAT=json`) writes one object per request, when the request finishes:
 #   {"timestamp":"…Z","level":"INFO","message":"request","kind":"exec|job|stream|callback",
 #    "command":"bash","status":200,"outcome":"exit","ms":12}
 # and `{"message":"execd listening",…}` once at startup. A callback line also carries `job`,

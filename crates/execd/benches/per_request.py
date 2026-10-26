@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""What one request costs execd: its own CPU per v1.1 `true`, and the latency, with and without --run-as.
+"""What one request costs execd: its own CPU per v1.1 `true`, and the latency, with and without --run-as (EXECD_RUN_AS).
 
     benches/per_request.py --bin /path/to/execd [--n 2000] [--run-as nobody]
 
@@ -36,13 +36,15 @@ def main():
     port = free_port()
     root = tempfile.mkdtemp()
     os.chmod(root, 0o777)
+    env = dict(os.environ, EXECD_LISTEN=f"127.0.0.1:{port}", EXECD_ROOT=root, EXECD_HOME=root,
+               EXECD_LOG=a.log_level)
     cmd = []
     if a.run_as:
-        cmd += ["sudo", "-n"]
-    cmd += [a.bin, "--listen", f"127.0.0.1:{port}", "--root", root, "--home", root, "--log-level", a.log_level]
-    if a.run_as:
-        cmd += ["--run-as", a.run_as]
-    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        env["EXECD_RUN_AS"] = a.run_as
+        # sudo drops the environment unless told to keep these names.
+        cmd += ["sudo", "-n", "--preserve-env=" + ",".join(k for k in env if k.startswith("EXECD_"))]
+    cmd += [a.bin]
+    p = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         for _ in range(500):
             try:

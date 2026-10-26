@@ -6,7 +6,7 @@
 #     COPY --from=ghcr.io/beyondoss/execd:latest /execd /usr/local/bin/execd
 #
 # It is `FROM scratch`: no shell, no libc, so it cannot run commands itself. Running it directly
-# (`docker run ghcr.io/beyondoss/execd --help`) works, but the commands it would exec need a real
+# (`docker run -e EXECD_BEARER=… ghcr.io/beyondoss/execd`) works, but the commands it would exec need a real
 # userland, which is what the image you copy it into provides. Build from the workspace root:
 #
 #     docker build -f Dockerfile.execd -t execd .

@@ -516,7 +516,8 @@ fi
 
 if [ "$USE_FARGATE" = 1 ]; then
 SANDBOX_SCRIPT='printf "%s" "$CA_PEM" > /tmp/ca.pem
-exec /usr/local/bin/execd --listen 0.0.0.0:8081 --root /workspace --home /home/sandbox --kept-jobs-survive-idle --log-format json'
+EXECD_LISTEN=0.0.0.0:8081 EXECD_ROOT=/workspace EXECD_HOME=/home/sandbox EXECD_KEPT_JOBS_SURVIVE_IDLE=1 EXECD_LOG_FORMAT=json \
+exec /usr/local/bin/execd'
 TD_SANDBOX=$(jq -n --arg family "$P-sandbox" --arg exec "$(EXEC sandbox)" --argjson logs "$(LOGS sandbox)" \
   --arg img "$ECR/$P-sandbox:latest" --arg script "$SANDBOX_SCRIPT" --arg ca "$CA_PEM" \
   --arg bearer "$(param_arn sandbox-bearer)" --arg usecases "$USECASES" --argjson flogs "$(LOGS front)" --arg fimg "$ECR/$P-front:latest" --arg ek "$(param_arn e2b-key)" --arg name "$NAME" --arg btpl "${BROWSER_TEMPLATE:-}" '{

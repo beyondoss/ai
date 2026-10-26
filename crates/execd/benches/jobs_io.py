@@ -79,9 +79,10 @@ def main():
     for kv in a.env:
         k, v = kv.split("=", 1)
         env[k] = v
-    cmd = (["taskset", "-c", a.cpus] if a.cpus else []) + [a.bin, "--listen", f"127.0.0.1:{port}"]
+    cmd = (["taskset", "-c", a.cpus] if a.cpus else []) + [a.bin]
+    env["EXECD_LISTEN"] = f"127.0.0.1:{port}"
     with tempfile.TemporaryDirectory() as root:
-        cmd += ["--root", root, "--home", root]
+        env["EXECD_ROOT"] = env["EXECD_HOME"] = root
         p = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
         try:

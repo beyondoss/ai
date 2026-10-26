@@ -1,4 +1,4 @@
-//! `--run-as`: every command runs as another uid and gid than execd's own.
+//! `EXECD_RUN_AS`: every command runs as another uid and gid than execd's own.
 //!
 //! Without it a command is a child of execd with execd's uid, so it can read execd's memory and
 //! `/proc/<execd>/environ`, and any file execd owns (a 0600 bearer file included). With it execd
@@ -38,7 +38,7 @@ pub struct RunAs {
     pub groups: Vec<u32>,
 }
 
-/// What `--run-as` named, with the account's home directory when it has a passwd entry.
+/// What `EXECD_RUN_AS` named, with the account's home directory when it has a passwd entry.
 pub struct Resolved {
     pub run_as: RunAs,
     pub home: Option<PathBuf>,
@@ -54,25 +54,25 @@ impl RunAs {
             None => (spec, None),
         };
         if user.is_empty() || group.is_some_and(str::is_empty) {
-            return Err(format!("--run-as {spec:?}: empty user or group"));
+            return Err(format!("EXECD_RUN_AS {spec:?}: empty user or group"));
         }
         let numeric = user.parse::<u32>().ok();
         let entry = match numeric {
             Some(n) => User::from_uid(Uid::from_raw(n)),
             None => User::from_name(user),
         }
-        .map_err(|e| format!("--run-as: looking up user {user:?}: {e}"))?;
+        .map_err(|e| format!("EXECD_RUN_AS: looking up user {user:?}: {e}"))?;
         let uid = match (&entry, numeric) {
             (Some(u), _) => u.uid.as_raw(),
             (None, Some(n)) => n,
-            (None, None) => return Err(format!("--run-as: no such user {user:?}")),
+            (None, None) => return Err(format!("EXECD_RUN_AS: no such user {user:?}")),
         };
         let gid = match group {
             Some(g) => match g.parse::<u32>() {
                 Ok(n) => n,
                 Err(_) => Group::from_name(g)
-                    .map_err(|e| format!("--run-as: looking up group {g:?}: {e}"))?
-                    .ok_or_else(|| format!("--run-as: no such group {g:?}"))?
+                    .map_err(|e| format!("EXECD_RUN_AS: looking up group {g:?}: {e}"))?
+                    .ok_or_else(|| format!("EXECD_RUN_AS: no such group {g:?}"))?
                     .gid
                     .as_raw(),
             },
@@ -80,7 +80,7 @@ impl RunAs {
                 Some(u) => u.gid.as_raw(),
                 None => {
                     return Err(format!(
-                        "--run-as {spec:?}: uid {uid} has no passwd entry, so name its gid (uid:gid)"
+                        "EXECD_RUN_AS {spec:?}: uid {uid} has no passwd entry, so name its gid (uid:gid)"
                     ));
                 }
             },
@@ -104,14 +104,14 @@ impl RunAs {
 
     /// Refuse a target that is execd's own identity, then prove execd can switch to the target and
     /// still signal what it started: a helper switches, and execd sends it signal 0 (the kernel's
-    /// permission check for `SIGKILL`). The `Ok` carries a warning when `root` (execd's `--root`,
+    /// permission check for `SIGKILL`). The `Ok` carries a warning when `root` (execd's `EXECD_ROOT`,
     /// where a command with no `cwd` runs) is not writable by the target.
     pub fn check(&self, root: &Path) -> Result<Option<String>, String> {
         let real = Uid::current().as_raw();
         let eff = Uid::effective().as_raw();
         if self.uid == real || self.uid == eff {
             return Err(format!(
-                "--run-as uid {} is execd's own uid, which would protect nothing. Run execd as \
+                "EXECD_RUN_AS uid {} is execd's own uid, which would protect nothing. Run execd as \
                  root (or with CAP_SETUID, CAP_SETGID and CAP_KILL) and name another user",
                 self.uid
             ));
@@ -125,7 +125,7 @@ impl RunAs {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("--run-as: cannot start the switch helper: {e}"))?;
+            .map_err(|e| format!("EXECD_RUN_AS: cannot start the switch helper: {e}"))?;
         // The helper answers one line once it has switched, then waits for stdin to close.
         let mut line = String::new();
         if let Some(out) = child.stdout.as_mut() {
@@ -139,26 +139,26 @@ impl RunAs {
         drop(child.stdin.take());
         let out = child
             .wait_with_output()
-            .map_err(|e| format!("--run-as: switch helper: {e}"))?;
+            .map_err(|e| format!("EXECD_RUN_AS: switch helper: {e}"))?;
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         if !matches!(line.trim(), "ok" | "root-not-writable") {
             return Err(format!(
-                "--run-as: execd cannot switch to uid {} gid {}: {err}. Run execd as root (or \
+                "EXECD_RUN_AS: execd cannot switch to uid {} gid {}: {err}. Run execd as root (or \
                  with CAP_SETUID, CAP_SETGID and CAP_KILL)",
                 self.uid, self.gid
             ));
         }
         if let Err(e) = signalable {
             return Err(format!(
-                "--run-as: execd cannot signal processes of uid {} ({e}), so it could not kill a \
+                "EXECD_RUN_AS: execd cannot signal processes of uid {} ({e}), so it could not kill a \
                  timed-out command or job. Run execd as root (or with CAP_KILL)",
                 self.uid
             ));
         }
         Ok((line.trim() == "root-not-writable").then(|| {
             format!(
-                "--root {} is not writable by uid {} gid {}: commands that write there will fail \
-                 (chown it, or name another --root)",
+                "EXECD_ROOT {} is not writable by uid {} gid {}: commands that write there will fail \
+                 (chown it, or name another EXECD_ROOT)",
                 root.display(),
                 self.uid,
                 self.gid

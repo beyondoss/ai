@@ -42,7 +42,7 @@ pub(crate) const PIPE_GRACE: Duration = Duration::from_millis(100);
 
 /// The command a request describes, ready to spawn: its `cwd` (default: the root), `HOME`, and
 /// piped output. Nothing of execd's own secrets reaches it: every `EXECD_*` variable is removed
-/// (the bearer must not be in a command's environment). Under `--run-as` the switch helper becomes
+/// (the bearer must not be in a command's environment). Under `EXECD_RUN_AS` the switch helper becomes
 /// the command, as the target user.
 pub(crate) fn command_for(ctx: &Ctx, req: &Request) -> tokio::process::Command {
     let cwd = req

@@ -44,10 +44,11 @@ class Server:
         elif a.style == "busybox":  # the C reference: `busybox httpd -f -p PORT -h DIR`
             cmd += ["httpd", "-f", "-p", f"127.0.0.1:{self.port}", "-h", root]
         else:
-            if a.stub:
-                cmd += ["exec-stub"]
-            cmd += ["--listen", f"127.0.0.1:{self.port}", "--root", root, "--home", root]
+            if a.stub:  # the stub predates the environment-only configuration: flags
+                cmd += ["exec-stub", "--listen", f"127.0.0.1:{self.port}", "--root", root, "--home", root]
         env = dict(os.environ)
+        if a.style == "execd" and not a.stub:
+            env.update(EXECD_LISTEN=f"127.0.0.1:{self.port}", EXECD_ROOT=root, EXECD_HOME=root)
         for kv in a.env:
             k, v = kv.split("=", 1)
             env[k] = v

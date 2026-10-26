@@ -48,7 +48,8 @@ def start(a, root):
     for kv in a.env:
         k, v = kv.split("=", 1)
         env[k] = v
-    p = subprocess.Popen([a.bin, "--listen", f"127.0.0.1:{port}", "--root", root, "--home", root],
+    env.update(EXECD_LISTEN=f"127.0.0.1:{port}", EXECD_ROOT=root, EXECD_HOME=root)
+    p = subprocess.Popen([a.bin],
                          env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL)
     for _ in range(500):

@@ -211,8 +211,8 @@ terminal:
 
 ```sh
 mkdir -p /tmp/ws /tmp/ws-home
-cargo run -p beyond-ai-execd -- \
-  --listen 127.0.0.1:8081 --root /tmp/ws --home /tmp/ws-home
+EXECD_LISTEN=127.0.0.1:8081 EXECD_ROOT=/tmp/ws EXECD_HOME=/tmp/ws-home \
+  cargo run -p beyond-ai-execd
 ```
 
 In another, run `bash` through it with a `serve` command (the dummy key only

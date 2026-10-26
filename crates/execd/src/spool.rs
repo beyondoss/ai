@@ -13,7 +13,7 @@
 //! **Safety.** The directories are created `0700` and the files `0600`, each with `create_new`
 //! (`O_EXCL`) and `O_NOFOLLOW`, and a job's directory is named by a counter, never by anything a
 //! client sends, so a command cannot plant a symlink that redirects a write nor name its way out.
-//! Without `--run-as` a command runs as execd's own uid and can read what execd can; with it the
+//! Without `EXECD_RUN_AS` a command runs as execd's own uid and can read what execd can; with it the
 //! commands run as another uid and the `0700` directory is closed to them.
 //!
 //! **Stale directories.** At startup, a directory in the base that is named like this, is a real
@@ -70,7 +70,7 @@ impl JobsDir {
         if kind == TMPFS_MAGIC || (kind.0 as u64) & 0xffff_ffff == RAMFS_MAGIC {
             crate::log_warn!(
                 "the jobs directory {} is on tmpfs, so retained job output (up to 8 MiB per job) \
-                 is RAM here; point --jobs-dir (EXECD_JOBS_DIR) at a disk-backed directory",
+                 is RAM here; point EXECD_JOBS_DIR at a disk-backed directory",
                 self.path.display()
             );
         } else {

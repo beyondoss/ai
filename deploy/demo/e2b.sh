@@ -115,11 +115,11 @@ vm_for() { # session
     (umask 077; printf '%s' "$bearer" > "$f.bearer")
     vm_put "$id" "$tok" "$f.bearer" "$VM_HOME/bearer" || { rm -f "$f.bearer"; echo "E2B: could not upload to $id" >&2; exit 1; }
     rm -f "$f.bearer"
-    # --kept-jobs-survive-idle: this VM is not stopped while a kept job runs, so it advertises v1.4 notify.
+    # EXECD_KEPT_JOBS_SURVIVE_IDLE=1: this VM is not stopped while a kept job runs, so it advertises v1.4 notify.
     # SSL_CERT_FILE is the demo CA that signed the agent's https callback listener; execd's callback client
     # takes its roots from the OS trust store, which honors it.
     vm_run "$id" "$tok" "chmod +x $VM_HOME/execd; chmod 600 $VM_HOME/bearer; mkdir -p $VM_HOME/workspace
-setsid nohup $VM_HOME/execd --listen 0.0.0.0:$VM_PORT --root $VM_HOME/workspace --home $VM_HOME --bearer-file $VM_HOME/bearer --kept-jobs-survive-idle --log-format json >/tmp/execd.log 2>&1 < /dev/null &
+EXECD_LISTEN=0.0.0.0:$VM_PORT EXECD_ROOT=$VM_HOME/workspace EXECD_HOME=$VM_HOME EXECD_BEARER_FILE=$VM_HOME/bearer EXECD_KEPT_JOBS_SURVIVE_IDLE=1 EXECD_LOG_FORMAT=json setsid nohup $VM_HOME/execd >/tmp/execd.log 2>&1 < /dev/null &
 sleep 1; rm -f $VM_HOME/bearer" "$(jq -nc '{SSL_CERT_FILE:"'"$VM_HOME"'/ca.pem"}')" >/dev/null
     # Up when the public URL answers, and answers 401 to a caller without the bearer.
     for i in $(seq 1 40); do

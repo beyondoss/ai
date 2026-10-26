@@ -77,16 +77,19 @@ impl Server {
             Err(_) => Command::new(&side.bin),
         };
         cmd.envs(side.env.iter().map(|(k, v)| (k, v)));
-        if side.stub {
-            cmd.arg("exec-stub");
-        }
         // port-0: the server binds it and keeps it; the port is read back from its own sockets.
-        cmd.args(["--listen", "127.0.0.1:0"])
-            .arg("--root")
-            .arg(&root)
-            .arg("--home")
-            .arg(&home)
-            .stdin(Stdio::null())
+        if side.stub {
+            // The baseline stub predates execd's environment-only configuration: it takes flags.
+            cmd.args(["exec-stub", "--listen", "127.0.0.1:0", "--root"])
+                .arg(&root)
+                .arg("--home")
+                .arg(&home);
+        } else {
+            cmd.env("EXECD_LISTEN", "127.0.0.1:0")
+                .env("EXECD_ROOT", &root)
+                .env("EXECD_HOME", &home);
+        }
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut child = cmd.spawn()?;
