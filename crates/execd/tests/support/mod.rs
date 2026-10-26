@@ -89,7 +89,7 @@ impl Execd {
         let mut me = Self {
             _watchdog: Watchdog::new(&child.id().to_string(), false),
             child,
-            addr: std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
+            addr: std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 1),
             dir,
             root_pid: None,
         };
@@ -203,7 +203,7 @@ impl Execd {
         let mut me = Self {
             _watchdog: Watchdog::new(pidfile.to_str().unwrap(), true),
             child,
-            addr: std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
+            addr: std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 1),
             dir,
             root_pid: None,
         };
