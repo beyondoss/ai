@@ -5,9 +5,9 @@
         "context_length": 1000000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000066",
+          "completion": "0.00000132",
           "discount": 0,
-          "input_cache_read": "0.0000000165",
+          "input_cache_read": "0.000000033",
           "overrides": [
             {
               "completion": "0.00000132",
@@ -24,7 +24,7 @@
               "utc_start": 1400
             }
           ],
-          "prompt": "0.000000165"
+          "prompt": "0.00000033"
         },
         "provider_name": "Alibaba",
         "quantization": "unknown",
@@ -47,10 +47,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000002148",
-          "discount": 0.821,
-          "input_cache_read": "0.000000001074",
-          "prompt": "0.0000000537"
+          "completion": "0.0000012",
+          "discount": 0,
+          "input_cache_read": "0.000000006",
+          "prompt": "0.0000003"
         },
         "provider_name": "Baidu",
         "quantization": "fp8",
@@ -281,7 +281,7 @@
         "context_length": 1040000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000000715",
+          "completion": "0.000000645",
           "discount": 0,
           "input_cache_read": "0.000000008",
           "prompt": "0.000000103"
@@ -348,7 +348,7 @@
           "completion": "0.0000006",
           "discount": 0,
           "input_cache_read": "0.00000001",
-          "prompt": "0.000000105"
+          "prompt": "0.0000001"
         },
         "provider_name": "Morph",
         "quantization": "fp8",

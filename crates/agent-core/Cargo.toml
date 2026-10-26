@@ -84,12 +84,12 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # Compresses the Codex SSE-fallback request body (`codex_websocket`'s HTTP/SSE path, used when the live
 # WebSocket transport above can't be used for a turn) — matches pi's own `zstdCompressSync` call in
 # `openai-codex-responses.ts`, which the real Codex backend's SSE endpoint accepts via
-# `Content-Encoding: zstd`. Already resolved in this workspace's lock file as a transitive dependency
-# (`pingora-core`); pinned directly here rather than left implicit since this crate now calls it itself.
+# `Content-Encoding: zstd`. Pinned at 0.14 (not pingora's 0.13) because 0.14.3 carries the fixes
+# for the zstd-safe 7.x memory-safety advisories (RUSTSEC-2026-0391, 0395-0406).
 # Deliberately not `default-features = false`: the default `legacy`/`arrays`/`zdict_builder` features
 # aren't needed for a plain one-shot `encode_all`, but trimming them buys nothing worth the extra
 # Cargo.toml surface for a dependency already in the build graph at these defaults.
-zstd = "0.13"
+zstd = "0.14"
 
 [dev-dependencies]
 # Loopback listeners for the socket tests (`ports`): the one place a test binds port 0.

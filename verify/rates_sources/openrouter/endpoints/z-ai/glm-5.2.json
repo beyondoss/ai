@@ -70,10 +70,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000002167",
-          "discount": 0.725,
-          "input_cache_read": "0.000000154",
-          "prompt": "0.00000061875"
+          "completion": "0.00000788",
+          "discount": 0,
+          "input_cache_read": "0.00000056",
+          "prompt": "0.00000225"
         },
         "provider_name": "Baidu",
         "quantization": "fp4",
@@ -83,10 +83,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000000594",
-          "discount": 0.865,
-          "input_cache_read": "0.0000000351",
-          "prompt": "0.000000189"
+          "completion": "0.0000044",
+          "discount": 0,
+          "input_cache_read": "0.00000026",
+          "prompt": "0.0000014"
         },
         "provider_name": "Baidu",
         "quantization": "fp8",
@@ -252,7 +252,7 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000001188",
+          "completion": "0.00000288",
           "discount": 0,
           "input_cache_read": "0.00000016",
           "prompt": "0.00000099"
@@ -293,8 +293,8 @@
         "pricing": {
           "completion": "0.0000044",
           "discount": 0,
-          "input_cache_read": "0.000000182",
-          "prompt": "0.000000727"
+          "input_cache_read": "0.000000167",
+          "prompt": "0.000000669"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -343,19 +343,6 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000003",
-          "discount": 0,
-          "input_cache_read": "0.00000022",
-          "prompt": "0.00000126"
-        },
-        "provider_name": "Phala",
-        "quantization": "fp8",
-        "tag": "phala/fp8"
-      },
-      {
-        "context_length": 1048576,
-        "max_prompt_tokens": null,
-        "pricing": {
           "completion": "0.0000071524",
           "discount": 0,
           "input_cache_read": "0.0000000324",
@@ -382,10 +369,10 @@
         "context_length": 1024000,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.00000088",
-          "discount": 0.8,
-          "input_cache_read": "0.000000052",
-          "prompt": "0.00000028"
+          "completion": "0.00000192676",
+          "discount": 0.5621,
+          "input_cache_read": "0.000000113854",
+          "prompt": "0.00000061306"
         },
         "provider_name": "StreamLake",
         "quantization": "fp8",

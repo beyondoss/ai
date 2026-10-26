@@ -188,7 +188,7 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000011936",
+          "completion": "0.0000108",
           "discount": 0,
           "input_cache_read": "0.00000021",
           "prompt": "0.000000239"
@@ -253,10 +253,10 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.0000149",
+          "completion": "0.000017379",
           "discount": 0,
-          "input_cache_read": "0.000000262",
-          "prompt": "0.000000945"
+          "input_cache_read": "0.00000032",
+          "prompt": "0.0000009"
         },
         "provider_name": "Morph",
         "quantization": "fp8",
@@ -307,8 +307,8 @@
         "pricing": {
           "completion": "0.0000076972",
           "discount": 0,
-          "input_cache_read": "0.0000002",
-          "prompt": "0.0000002033"
+          "input_cache_read": "0.00000021",
+          "prompt": "0.0000002147"
         },
         "provider_name": "Relace",
         "quantization": "fp4",
@@ -357,7 +357,7 @@
         "context_length": 1048576,
         "max_prompt_tokens": null,
         "pricing": {
-          "completion": "0.000016",
+          "completion": "0.00002",
           "discount": 0,
           "input_cache_read": "0.000000204",
           "prompt": "0.000000214"
