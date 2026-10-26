@@ -254,6 +254,8 @@ async fn attempt(ctx: &Ctx, target: &NotifyTarget, key: &Key) -> Result<u16, Str
         .await
         .map(|r| r.status().as_u16())
         .map_err(|e| {
+            // The url carries the receiver's signature: it must not reach the log or an observer.
+            let e = e.without_url();
             let mut msg = e.to_string();
             let mut cause = std::error::Error::source(&e);
             while let Some(c) = cause {
