@@ -132,10 +132,12 @@ impl RunAs {
             use std::io::BufRead as _;
             let _ = std::io::BufReader::new(out).read_line(&mut line);
         }
-        let signalable = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap_or(0)),
-            None,
-        );
+        let Ok(helper) = i32::try_from(child.id()) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("EXECD_RUN_AS: the switch helper's pid is out of range".to_string());
+        };
+        let signalable = nix::sys::signal::kill(nix::unistd::Pid::from_raw(helper), None);
         drop(child.stdin.take());
         let out = child
             .wait_with_output()

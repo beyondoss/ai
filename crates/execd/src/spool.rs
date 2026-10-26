@@ -73,6 +73,13 @@ impl JobsDir {
                  is RAM here; point EXECD_JOBS_DIR at a disk-backed directory",
                 self.path.display()
             );
+        } else if let Some(name) = network_fs(kind.0 as u64 & 0xffff_ffff) {
+            crate::log_warn!(
+                "the jobs directory {} is on {name}; spool writes and unlinks run on the one event \
+                 thread, so a stall there stalls every connection; set EXECD_JOBS_DIR to a local \
+                 disk",
+                self.path.display()
+            );
         } else {
             crate::log_info!(
                 "jobs directory {} fs_type={:#x}",
@@ -92,6 +99,22 @@ impl Drop for JobsDir {
     fn drop(&mut self) {
         self.clean();
     }
+}
+
+/// The name of a network or FUSE filesystem given its `f_type` (low 32 bits), else `None`.
+fn network_fs(kind: u64) -> Option<&'static str> {
+    Some(match kind {
+        0x6969 => "NFS",
+        0x517B => "SMB",
+        0xFF53_4D42 => "CIFS",
+        0xFE53_4D42 => "SMB2",
+        0x6573_5546 => "FUSE",
+        0x0102_1997 => "9p",
+        0x00C3_6400 => "Ceph",
+        0x5346_414F => "AFS",
+        0x0BD0_0BD0 => "Lustre",
+        _ => return None,
+    })
 }
 
 fn base_dir(base: Option<&Path>) -> PathBuf {
@@ -189,6 +212,17 @@ pub(crate) fn read_chunk(path: &Path, pos: u64, buf: &mut [u8]) -> io::Result<us
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    #[test]
+    fn network_filesystems_are_named() {
+        use super::network_fs;
+        assert_eq!(network_fs(0xEF53), None); // ext4
+        assert_eq!(network_fs(0x0102_1994), None); // tmpfs
+        assert_eq!(network_fs(0x6969), Some("NFS"));
+        assert_eq!(network_fs(0xFF53_4D42), Some("CIFS"));
+        assert_eq!(network_fs(0x6573_5546), Some("FUSE"));
+        assert_eq!(network_fs(0x0102_1997), Some("9p"));
+    }
+
     use super::*;
 
     fn dead_pid() -> u32 {
