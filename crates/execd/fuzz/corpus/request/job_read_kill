@@ -1,0 +1,1 @@
+{"command":"true","job":{"op":"read","scope":"s","id":"a1","offset":18446744073709551615,"max":18446744073709551615,"ids":["a","b"],"remove":true,"grace_ms":300}}

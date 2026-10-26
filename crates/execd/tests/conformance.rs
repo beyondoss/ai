@@ -18,8 +18,9 @@ use support::Execd;
 /// the verifier has, behind a bearer.
 #[tokio::test]
 async fn the_binary_passes_every_check_v11_to_v14() {
+    // At trace level, so the log holds everything every crate underneath would say.
     let execd = Execd::start(
-        &["--kept-jobs-survive-idle"],
+        &["--kept-jobs-survive-idle", "--log-level", "trace"],
         &[("EXECD_BEARER", "s3cret-bearer")],
     );
     let headers = [(
@@ -39,6 +40,51 @@ async fn the_binary_passes_every_check_v11_to_v14() {
         .collect();
     assert!(not_passed.is_empty(), "{not_passed:?}\n{}", report.render());
     assert_eq!(report.checks.len(), 17 + conformance::notify::CHECKS.len());
+    // The whole run's log, at trace, never held the bearer; and it is a real trace, not an empty one.
+    let log = execd.log();
+    assert!(
+        log.lines().count() > 200,
+        "a trace log is not this short: {}",
+        log.lines().count()
+    );
+    assert!(log.contains("TRACE"), "the log is not at trace level");
+    assert!(!log.contains("s3cret-bearer"), "the bearer is in the log");
+    assert!(
+        !log.to_lowercase().contains("bearer "),
+        "an authorization value is in the log"
+    );
+}
+
+/// The verifier cannot tell it is talking to an endpoint whose commands run as another user: every
+/// check passes under `--run-as`, with the bearer in the environment. Needs root (or `sudo -n`).
+#[tokio::test]
+async fn the_binary_passes_every_check_under_run_as() {
+    let Some(execd) = Execd::start_as_root(
+        &["--kept-jobs-survive-idle", "--run-as", "nobody"],
+        &[("EXECD_BEARER", "s3cret-run-as-bearer")],
+    ) else {
+        return;
+    };
+    let headers = [(
+        "Authorization".to_string(),
+        "Bearer s3cret-run-as-bearer".to_string(),
+    )];
+    let report = verify(&execd.url(), &headers, &Expectations::default()).await;
+    println!("{}", report.render());
+    assert!(
+        report.streams && report.jobs && report.notify,
+        "{}",
+        report.render()
+    );
+    let not_passed: Vec<_> = report
+        .checks
+        .iter()
+        .filter(|c| c.verdict != Verdict::Pass)
+        .map(|c| (c.name, c.verdict))
+        .collect();
+    assert!(not_passed.is_empty(), "{not_passed:?}\n{}", report.render());
+    assert_eq!(report.checks.len(), 17 + conformance::notify::CHECKS.len());
+    assert!(!execd.log().contains("s3cret-run-as-bearer"));
 }
 
 /// With the deployment setting off (the default) notify is not advertised, and everything else

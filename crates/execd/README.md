@@ -34,8 +34,11 @@ Daytona, Fargate, docker, Kubernetes or your own.
   it stalls and stays stalled.
 - **PID 1 ready.** It adopts and reaps orphans without ever stealing the exit status of a command it awaits, and a zombie never
   counts as a live process ([`tests/reaper.rs`](tests/reaper.rs)).
-- **Safe to expose.** An optional bearer, compared in constant time, read from a file or the environment and never from argv.
-  With none set it says so at startup.
+- **Safe to expose.** A bearer compared in constant time, read from a file or the environment and never from argv, and never
+  passed to the commands it runs. With none set it refuses to start on any address but loopback. `--run-as` runs every command as
+  another user, so a prompt-injected command cannot read the bearer, execd's memory or its environment. Hundreds of hostile
+  requests over HTTP/1.1 and h2c are tested to be refused and to run nothing
+  ([`tests/auth_matrix.rs`](tests/auth_matrix.rs), [what is and is not guaranteed](ARCHITECTURE.md#security)).
 
 ## Run it
 
@@ -69,17 +72,24 @@ Run execd as PID 1 in a container, or under any init: it makes itself the subrea
 
 ## Options
 
-| flag                       | environment                    | meaning                                                                                             |
-| -------------------------- | ------------------------------ | --------------------------------------------------------------------------------------------------- |
-| `--listen`                 | `EXECD_LISTEN`                 | address to listen on (default `127.0.0.1:8080`)                                                     |
-| `--root`                   | `EXECD_ROOT`                   | where a command runs when its request names no directory (default: the current directory)           |
-| `--home`                   | `EXECD_HOME`                   | `HOME` for every command                                                                            |
-| `--bearer-file`            | `EXECD_BEARER_FILE`            | a file holding the bearer token; `EXECD_BEARER` holds the token itself                              |
-| `--kept-jobs-survive-idle` | `EXECD_KEPT_JOBS_SURVIVE_IDLE` | advertise v1.4 job-end notify; say so only if this sandbox is not stopped when idle                 |
-| `--max-response-bytes`     | `EXECD_MAX_RESPONSE_BYTES`     | most output one v1.1 answer carries (default 16 MiB); match the agent's `--exec-max-response-bytes` |
-| `--log-level`              | `EXECD_LOG`                    | `error`, `warn`, `info`, `debug` or `trace`                                                         |
+| flag                       | environment                    | meaning                                                                                                  |
+| -------------------------- | ------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| `--listen`                 | `EXECD_LISTEN`                 | address to listen on (default `127.0.0.1:8080`)                                                          |
+| `--root`                   | `EXECD_ROOT`                   | where a command runs when its request names no directory (default: the current directory)                |
+| `--home`                   | `EXECD_HOME`                   | `HOME` for every command                                                                                 |
+| `--bearer-file`            | `EXECD_BEARER_FILE`            | a file holding the bearer token (mode 0600); `EXECD_BEARER` holds the token itself, a weaker way         |
+| `--insecure-no-auth`       | `EXECD_INSECURE_NO_AUTH`       | serve with no bearer on a non-loopback address; without it execd refuses to start                        |
+| `--run-as`                 | `EXECD_RUN_AS`                 | run every command as `user`, `uid`, `user:group` or `uid:gid` with the user's groups; execd must be root |
+| `--kept-jobs-survive-idle` | `EXECD_KEPT_JOBS_SURVIVE_IDLE` | advertise v1.4 job-end notify; say so only if this sandbox is not stopped when idle                      |
+| `--max-response-bytes`     | `EXECD_MAX_RESPONSE_BYTES`     | most output one v1.1 answer carries (default 16 MiB); match the agent's `--exec-max-response-bytes`      |
+| `--log-level`              | `EXECD_LOG`                    | `error`, `warn`, `info`, `debug` or `trace`                                                              |
 
-`GET /livez` answers 200 without authentication. `SIGTERM` and `SIGINT` kill every running process group and exit.
+`GET /livez` answers 200 without authentication, and nothing else is open. `SIGTERM` and `SIGINT` kill every running process
+group and exit.
+
+Without `--run-as` a command is the same user as execd and can read its memory and any file it owns, the bearer file included.
+With it, and with the token in a root-owned 0600 file, it cannot. `--root` must be writable by the `--run-as` user (execd says at
+startup when it is not). See [ARCHITECTURE.md](ARCHITECTURE.md#security) for what each control guarantees and what it does not.
 
 ## Embedding
 

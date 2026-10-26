@@ -30,6 +30,18 @@ use std::path::Path;
 /// reads it back with [`listening_on`].
 pub const CHILD_LISTEN: &str = "127.0.0.1:0";
 
+/// [`CHILD_LISTEN`] on every interface, for a test of what a server does when it is reachable from
+/// the network (the child still reports its port, and the test still connects over loopback).
+pub const CHILD_LISTEN_ALL: &str = "0.0.0.0:0";
+
+/// A tokio listener on every interface and a port the kernel picks, held for as long as the value
+/// lives: [`tokio_listener`] for a test of what a server does when it is reachable from the network.
+pub async fn tokio_listener_all() -> tokio::net::TcpListener {
+    tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .await
+        .expect("bind a port on every interface")
+}
+
 /// A loopback listener on a port the kernel picks, held for as long as the value lives.
 #[track_caller]
 pub fn listener() -> std::net::TcpListener {

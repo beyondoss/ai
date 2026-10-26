@@ -169,3 +169,55 @@ jobs:
           name: fuzz-crash-${{ matrix.target }}
           path: crates/gateway/fuzz/artifacts/${{ matrix.target }}/
           if-no-files-found: ignore
+  # Coverage-guided fuzzing of execd's request parser (envelope, job operations, `notify`, stdin and
+  # the frames it feeds) and of the job output ring against a plain buffer, four minutes per target.
+  # Same pinned nightly and crash handling as the gateway targets above.
+  fuzz-execd:
+    name: fuzz execd (${{ matrix.target }})
+    if: ${{ !inputs.only_mutants }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [request, ring]
+    env:
+      FUZZ_NIGHTLY: nightly-2026-04-01
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install "$FUZZ_NIGHTLY" --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/execd/fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: fuzz
+        working-directory: crates/execd/fuzz
+        run: cargo "+$FUZZ_NIGHTLY" fuzz run ${{ matrix.target }} -- -max_total_time=240 -timeout=10 -rss_limit_mb=2048 -max_len=4096
+      - name: upload crash inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-execd-${{ matrix.target }}
+          path: crates/execd/fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+  # execd's stateful job-table test (random v1.3 operations across scopes with colliding and hostile
+  # ids against the real binary, a model beside it, every invariant checked after every step) for
+  # ten minutes of fresh seeds, then the seeded parser test for two. A failure prints its seed and
+  # the shrunk operation list; replay with EXECD_JOBS_SEED / EXECD_PARSE_SEED. The tests that need
+  # root use passwordless sudo, which the runner has.
+  execd-stress:
+    name: execd job table and parsers (long run)
+    if: ${{ !inputs.only_mutants }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p beyond-ai-execd --test jobtable --test parsers -- --nocapture </dev/null
+        env:
+          EXECD_JOBS_SECS: "600"
+          EXECD_JOBS_OPS: "120"
+          EXECD_PARSE_SECS: "120"
