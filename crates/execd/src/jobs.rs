@@ -582,7 +582,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         cell
     };
     let mut cmd = exec::command_for(ctx, req);
-    cmd.stdin(Stdio::null()).kill_on_drop(false);
+    cmd.stdin(Stdio::null());
     let mut proc = match proc::spawn(&mut cmd) {
         Ok(p) => p,
         Err(e) => {
@@ -599,11 +599,11 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     let progress = Arc::new(AtomicUsize::new(0));
     let mut pipes = Vec::new();
     let mut cap = 0;
-    if let Some(p) = proc.child.stdout.take() {
+    if let Some(p) = proc.stdout.take() {
         cap += proc::pipe_capacity(&p);
         pipes.push(pump(ctx.clone(), cell.clone(), p, progress.clone()));
     }
-    if let Some(p) = proc.child.stderr.take() {
+    if let Some(p) = proc.stderr.take() {
         cap += proc::pipe_capacity(&p);
         pipes.push(pump(ctx.clone(), cell.clone(), p, progress.clone()));
     }
@@ -681,7 +681,11 @@ async fn drain_pumps(
     loop {
         let all = async {
             for p in pipes.iter_mut() {
-                let _ = p.await;
+                // A pump that finished was awaited by an earlier call (one is made before and one
+                // after the group empties); a join handle must not be polled again.
+                if !p.is_finished() {
+                    let _ = p.await;
+                }
             }
         };
         if tokio::time::timeout(PIPE_GRACE, all).await.is_ok() {
@@ -707,14 +711,14 @@ async fn supervise(
     cap: usize,
 ) {
     let pgid = proc.pgid;
-    let status = proc.child.wait().await;
+    let status = proc.wait().await;
     let code = status.map_or(-1, |s| {
         use std::os::unix::process::ExitStatusExt as _;
         s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
     });
     drain_pumps(&mut pipes, &progress, cap).await;
     let mut exits = proc::ChildEvents::new();
-    if !proc::live_members_async(pgid).await.is_empty() {
+    if !proc::group_gone(pgid, false).await {
         // The moment a held stream would send `shell_exit`: v1.4 calls back.
         {
             let mut j = locked(&cell);
@@ -722,8 +726,11 @@ async fn supervise(
             notify::change(&ctx, &cell, &key, &mut j);
         }
         ctx.jobs.bump();
-        while !proc::live_members_async(pgid).await.is_empty() {
-            exits.next().await;
+        loop {
+            let wake = exits.next().await;
+            if proc::group_gone(pgid, wake == proc::Wake::Tick).await {
+                break;
+            }
         }
         drain_pumps(&mut pipes, &progress, cap).await;
     }

@@ -561,6 +561,7 @@ dependencies = [
  "memchr",
  "mimalloc",
  "nix",
+ "openssl-probe 0.1.6",
  "reqwest",
  "rustls",
  "serde",
