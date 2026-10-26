@@ -84,6 +84,10 @@ pub const MAX_REQUEST_BYTES: usize = (64 * 1024 * 1024usize).div_ceil(3) * 4 + 2
 /// inline on the connection's task, so it must be quick and must not block.
 pub type Authorizer = Arc<dyn Fn(&HeaderMap) -> bool + Send + Sync>;
 
+/// Answers a `job` op this server does not implement: `Some((status, body))`, or `None` for the
+/// usual 400. See [`Options::job_op_hook`].
+pub type JobOpHook = Arc<dyn Fn(&str, &Value) -> Option<(u16, Value)> + Send + Sync>;
+
 /// What the deployment tells execd. [`Options::new`] is a conforming v1.4 endpoint with the spec's
 /// numbers and notify off, as an operator's deployment setting starts out.
 #[derive(Clone)]
@@ -137,6 +141,11 @@ pub struct Options {
     /// (the default) starts no timer at all. For a sandbox that sleeps when it has no network
     /// traffic behind a proxy that pools connections.
     pub idle_timeout: Option<Duration>,
+    /// Asked about a `job` op execd does not implement, with the op's name and the whole `job`
+    /// object: `Some((status, body))` is sent as a JSON response, `None` gets the usual 400. Called
+    /// only for an unknown op, after authentication and request parsing, never for one execd handles.
+    /// It is synchronous and runs on the server's own thread, so it must be quick and must not block.
+    pub job_op_hook: Option<JobOpHook>,
 }
 
 impl Options {
@@ -157,6 +166,7 @@ impl Options {
             max_request_bytes: MAX_REQUEST_BYTES,
             observer: None,
             idle_timeout: None,
+            job_op_hook: None,
         }
     }
 
@@ -185,6 +195,7 @@ impl std::fmt::Debug for Options {
             .field("max_request_bytes", &self.max_request_bytes)
             .field("observer", &self.observer.is_some())
             .field("idle_timeout", &self.idle_timeout)
+            .field("job_op_hook", &self.job_op_hook.is_some())
             .finish()
     }
 }
@@ -245,6 +256,8 @@ pub struct Activity {
     pub in_flight: usize,
     /// Every job that was kept and has not ended, with its process group.
     pub running_kept: Vec<KeptJob>,
+    /// Every job in the table that has not ended, in any scope, held or kept.
+    pub jobs_alive: usize,
 }
 
 /// Everything a request handler shares.
@@ -290,9 +303,11 @@ impl Handle {
 
     /// What the server is doing now.
     pub fn activity(&self) -> Activity {
+        let (jobs_alive, running_kept) = self.ctx.jobs.alive();
         Activity {
             in_flight: self.ctx.in_flight.load(Ordering::Acquire),
-            running_kept: self.ctx.jobs.running_kept(),
+            running_kept,
+            jobs_alive,
         }
     }
 
