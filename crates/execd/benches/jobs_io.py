@@ -49,6 +49,25 @@ def call(port, body, until_len=True):
     return json.loads(b"".join(chunks))
 
 
+def kill_tree(pid):
+    """Kill a server and the process groups of its children, and nothing else."""
+    kids = []
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                st = open(f"/proc/{d}/stat").read()
+                if int(st.rsplit(")", 1)[1].split()[1]) == pid:
+                    kids.append(int(d))
+            except (OSError, ValueError, IndexError):
+                pass
+    os.kill(pid, 9)
+    for k in kids:
+        try:
+            os.killpg(k, 9)
+        except OSError:
+            pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True)
@@ -140,9 +159,8 @@ def main():
             out["true_while_16_jobs_write_flat_out"] = lat(300)
             print(json.dumps(out, indent=1))
         finally:
-            p.kill()
+            kill_tree(p.pid)
             p.wait()
-            subprocess.run(["pkill", "-9", "-x", "head"])
 
 
 if __name__ == "__main__":

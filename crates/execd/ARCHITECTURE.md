@@ -497,3 +497,18 @@ change to the stream code and is not made here. PGO and the replacements for (c)
 What would remove the rest of the reaper's work: a pidfd per spawned child would let each command's exit be awaited without the
 `SIGCHLD` path, but the orphan pass still needs the signal, since orphans are not children execd spawned and so have no pidfd
 until found. It would save the per-exit wake-up, not the pass.
+
+**Wakeups** (context switches per second over a window, all threads, static musl build; `benches/wakeups.py`,
+`benches/results/2026-10-25-wakeups.json`):
+
+| state                                       | before (30 s) | after (60 s) |
+| ------------------------------------------- | ------------- | ------------ |
+| idle                                        | 2.2           | 0.0          |
+| one open stream (`sleep 3600`)              | 2.5           | 0.6          |
+| one stream whose shell left `sleep 3600` up | 36.3          | 0.6          |
+
+Idle execd does not wake. The reaper slept one second between passes as a backstop, which was not needed: a `SIGCHLD` that
+arrives while a pass runs is kept by tokio's signal stream and wakes the next wait. A stream's 0.6 is the spec's 5 s heartbeat.
+A held leftover used to be polled at 20 Hz; it now sleeps until a `SIGCHLD` (the 0.6 is the heartbeat again) and looks every
+5 s in case its last member's live parent is neither execd nor in the group. An embedding host without the subreaper still
+polls every 50 ms, because its orphans go to init and nothing signals their exit.

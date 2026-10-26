@@ -301,6 +301,7 @@ pub(crate) fn fuzz_ring(bytes: &[u8]) {
         RUNS.fetch_add(1, Ordering::Relaxed)
     ));
     let _cleanup = scopeguard_remove(dir.clone());
+    let _ = std::fs::create_dir_all(&dir);
     let mut ring = Ring::new(retain, dir.join("ring"));
     let mut all: Vec<u8> = Vec::new();
     while let Some(op) = it.next() {

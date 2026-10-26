@@ -69,6 +69,25 @@ def stream(port, root, cmd, args):
     return s
 
 
+def kill_tree(pid):
+    """Kill a server and the process groups of its children, and nothing else."""
+    kids = []
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                st = open(f"/proc/{d}/stat").read()
+                if int(st.rsplit(")", 1)[1].split()[1]) == pid:
+                    kids.append(int(d))
+            except (OSError, ValueError, IndexError):
+                pass
+    os.kill(pid, 9)
+    for k in kids:
+        try:
+            os.killpg(k, 9)
+        except OSError:
+            pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True)
@@ -93,9 +112,8 @@ def main():
                                       for n, (p, _) in servers.items()}
         print(json.dumps(out, indent=1))
         for p, _ in servers.values():
-            p.kill()
+            kill_tree(p.pid)
             p.wait()
-        subprocess.run(["pkill", "-9", "-x", "sleep"])
 
 
 if __name__ == "__main__":
