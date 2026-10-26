@@ -168,7 +168,7 @@ branch. Both are release builds started with the same flags on fresh root and ho
 A and B run the whole battery back to back, in alternating order (AB, BA, AB, ...), so drift in the load of this shared host
 lands on both. Spreads below are the lowest and highest per-round median (latencies) or the lowest and highest round
 (throughput, CPU). Date 2026-10-25, AMD Ryzen 7 255 (16 threads), Linux 6.12, a host running other work (load average 7 to 9).
-Raw samples are in `benches/results/2026-10-25-sandbox.json` and `benches/results/2026-10-25-host.json`.
+Per-round summaries (n, p50, p90, p99, max, mean) are in `benches/results/2026-10-25-sandbox.json` and `benches/results/2026-10-25-host.json`; `EXEC_BENCH_RAW=1` keeps every sample, outside the repository.
 
 To rerun: build the baseline from a checkout of the commit before execd (`cargo build --release -p beyond-ai-demo`), then
 
