@@ -65,15 +65,12 @@ impl Server {
         std::fs::create_dir_all(&root)?;
         std::fs::create_dir_all(&home)?;
         std::fs::write(root.join("f4k"), vec![b'x'; 4096])?;
-        let port = std::net::TcpListener::bind("127.0.0.1:0")?
-            .local_addr()?
-            .port();
-        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
         let mut cmd = Command::new(&side.bin);
         if side.stub {
             cmd.arg("exec-stub");
         }
-        cmd.args(["--listen", &addr.to_string()])
+        // port-0: the server binds it and keeps it; the port is read back from its own sockets.
+        cmd.args(["--listen", "127.0.0.1:0"])
             .arg("--root")
             .arg(&root)
             .arg("--home")
@@ -81,21 +78,25 @@ impl Server {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let child = cmd.spawn()?;
-        let s = Server {
+        let mut child = cmd.spawn()?;
+        let t = Instant::now();
+        let addr = loop {
+            if let Some(a) = beyond_ai_test_support::ports::listening_on(child.id()).first() {
+                break std::net::SocketAddr::V4(*a);
+            }
+            if t.elapsed() > Duration::from_secs(20) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("server did not listen".into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        Ok(Server {
             child,
             addr,
             root,
             _dir: dir,
-        };
-        let t = Instant::now();
-        while std::net::TcpStream::connect(addr).is_err() {
-            if t.elapsed() > Duration::from_secs(20) {
-                return Err("server did not listen".into());
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        Ok(s)
+        })
     }
 
     fn pid(&self) -> u32 {
