@@ -516,7 +516,10 @@ fi
 
 if [ "$USE_FARGATE" = 1 ]; then
 SANDBOX_SCRIPT='printf "%s" "$CA_PEM" > /tmp/ca.pem
-EXECD_LISTEN=0.0.0.0:8081 EXECD_ROOT=/workspace EXECD_HOME=/home/sandbox EXECD_KEPT_JOBS_SURVIVE_IDLE=1 EXECD_LOG_FORMAT=json \
+# The bearer moves from the environment (where the secret arrives) into a root-owned 0600 file: with
+# EXECD_RUN_AS the commands cannot read it, and it is in nobody'"'"'s environment.
+(umask 077; printf "%s" "$EXECD_BEARER" > /run/execd-bearer); unset EXECD_BEARER
+EXECD_BEARER_FILE=/run/execd-bearer EXECD_LISTEN=0.0.0.0:8081 EXECD_ROOT=/workspace EXECD_HOME=/home/sandbox EXECD_RUN_AS=sandbox EXECD_KEPT_JOBS_SURVIVE_IDLE=1 EXECD_LOG_FORMAT=json \
 exec /usr/local/bin/execd'
 TD_SANDBOX=$(jq -n --arg family "$P-sandbox" --arg exec "$(EXEC sandbox)" --argjson logs "$(LOGS sandbox)" \
   --arg img "$ECR/$P-sandbox:latest" --arg script "$SANDBOX_SCRIPT" --arg ca "$CA_PEM" \

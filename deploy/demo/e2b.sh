@@ -110,17 +110,22 @@ vm_for() { # session
       sleep 1
     done
     vm_put "$id" "$tok" "$CA_FILE" "$VM_HOME/ca.pem" || { echo "E2B: could not upload to $id" >&2; exit 1; }
-    # The bearer goes up as a file, never on a command line, and is deleted once execd has read it: after
-    # that neither the disk nor the environment of the commands it runs holds it.
+    # The bearer goes up as a file, never on a command line; below it becomes root's, mode 0600, so the
+    # commands (which run as the VM's user) cannot read it, and it is in no command's environment.
     (umask 077; printf '%s' "$bearer" > "$f.bearer")
     vm_put "$id" "$tok" "$f.bearer" "$VM_HOME/bearer" || { rm -f "$f.bearer"; echo "E2B: could not upload to $id" >&2; exit 1; }
     rm -f "$f.bearer"
+    # execd runs as root (through the VM's passwordless sudo) with EXECD_RUN_AS=user, so the commands it
+    # runs are the VM's ordinary unprivileged user and cannot read execd's memory, its environment or its
+    # bearer file: the bearer file and the binary are root's, mode 0600 and 0755 (the file stays: the user
+    # cannot read it).
     # EXECD_KEPT_JOBS_SURVIVE_IDLE=1: this VM is not stopped while a kept job runs, so it advertises v1.4 notify.
     # SSL_CERT_FILE is the demo CA that signed the agent's https callback listener; execd's callback client
     # takes its roots from the OS trust store, which honors it.
-    vm_run "$id" "$tok" "chmod +x $VM_HOME/execd; chmod 600 $VM_HOME/bearer; mkdir -p $VM_HOME/workspace
-EXECD_LISTEN=0.0.0.0:$VM_PORT EXECD_ROOT=$VM_HOME/workspace EXECD_HOME=$VM_HOME EXECD_BEARER_FILE=$VM_HOME/bearer EXECD_KEPT_JOBS_SURVIVE_IDLE=1 EXECD_LOG_FORMAT=json setsid nohup $VM_HOME/execd >/tmp/execd.log 2>&1 < /dev/null &
-sleep 1; rm -f $VM_HOME/bearer" "$(jq -nc '{SSL_CERT_FILE:"'"$VM_HOME"'/ca.pem"}')" >/dev/null
+    vm_run "$id" "$tok" "chmod +x $VM_HOME/execd; mkdir -p $VM_HOME/workspace
+sudo chown root:root $VM_HOME/execd $VM_HOME/bearer && sudo chmod 600 $VM_HOME/bearer || exit 1
+sudo env EXECD_LISTEN=0.0.0.0:$VM_PORT EXECD_ROOT=$VM_HOME/workspace EXECD_HOME=$VM_HOME EXECD_RUN_AS=user EXECD_BEARER_FILE=$VM_HOME/bearer EXECD_KEPT_JOBS_SURVIVE_IDLE=1 EXECD_LOG_FORMAT=json SSL_CERT_FILE=$VM_HOME/ca.pem setsid nohup $VM_HOME/execd >/tmp/execd.log 2>&1 < /dev/null &
+sleep 1" >/dev/null
     # Up when the public URL answers, and answers 401 to a caller without the bearer.
     for i in $(seq 1 40); do
       [ "$(curl -s -m 5 -o /dev/null -w '%{http_code}' -X POST "${hdr[@]}" "https://$VM_PORT-$id.e2b.app/exec" -d '{}')" = 401 ] && break
