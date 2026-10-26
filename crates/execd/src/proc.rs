@@ -341,14 +341,15 @@ impl ChildEvents {
     /// Wait for a child to exit, or for [`GROUP_FALLBACK`].
     pub async fn next(&mut self) {
         match &mut self.0 {
-            Some(sig) => {
+            // Without the subreaper an orphan goes to the host's init, and no signal says that it
+            // exited: look often, as an embedding host that does not set one has to accept.
+            Some(sig) if SUBREAPER.load(Ordering::Relaxed) => {
                 tokio::select! {
                     _ = sig.recv() => {}
                     () = tokio::time::sleep(GROUP_FALLBACK) => {}
                 }
             }
-            // No signal to wait on: look often.
-            None => tokio::time::sleep(Duration::from_millis(50)).await,
+            _ => tokio::time::sleep(Duration::from_millis(50)).await,
         }
     }
 }
