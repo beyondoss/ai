@@ -132,6 +132,8 @@ DEMO_FLEET_SECRET=$(ssm_get fleet-secret)
 DEMO_DEK=$(ssm_get dek)
 DEMO_GATEWAY_KEY=$(ssm_get gateway-key)
 export DEMO_GRANT_SEED DEMO_FLEET_SECRET DEMO_DEK DEMO_GATEWAY_KEY
+SANDBOX_BEARER=
+[ "$USE_FARGATE" = 0 ] || SANDBOX_BEARER=$(ssm_get sandbox-bearer)
 [ "$USE_E2B" = 0 ] || ssm_get public | jq -r .ca_pem > "$CA_FILE"
 
 grant() { # session [tamper]
@@ -141,8 +143,9 @@ grant() { # session [tamper]
     DEMO_EXEC_BEARER=$(vm_field "$1" bearer) "$DEMO" mint-grant --tenant "$TENANT" --session "$1" --shard demo \
       --workspace "$VM_HOME/workspace" --exec-url "$(vm_field "$1" url)" --exec-bearer ${2:+--tamper}
   else
-    "$DEMO" mint-grant --tenant "$TENANT" --session "$1" --shard demo --workspace /workspace \
-      --exec-url "http://sandbox.$DNS:$SANDBOX_PORT/exec" ${2:+--tamper}
+    # The Fargate sandbox requires its stack's bearer; the grant carries it sealed, as an exec header.
+    DEMO_EXEC_BEARER=$SANDBOX_BEARER "$DEMO" mint-grant --tenant "$TENANT" --session "$1" --shard demo --workspace /workspace \
+      --exec-url "http://sandbox.$DNS:$SANDBOX_PORT/exec" --exec-bearer ${2:+--tamper}
   fi
 }
 # One conversation step; the JSON summary on stdout, the live view on stderr. A use case sets GRANT_FN

@@ -99,6 +99,13 @@ if [ "$LOAD" = 1 ]; then
   param_exists load-token || openssl rand -hex 24 | tr -d "\n" | put_param load-token SecureString
 fi
 
+# The Fargate sandbox is on a private subnet but runs agent-controlled code and listens beyond loopback,
+# so execd requires a bearer: a per-stack secret that only the sandbox task (as EXECD_BEARER) and the
+# grant minter (demo.sh) can read. Created once, and kept by reruns.
+if [ "$USE_FARGATE" = 1 ]; then
+  param_exists sandbox-bearer || openssl rand -hex 24 | tr -d '\n' | put_param sandbox-bearer SecureString
+fi
+
 # For the use cases: the secret the stand-in managed-MCP endpoint shares with the grant minter, and the
 # "third party's" real key, which only the stand-in's task can read. Created once, and kept by reruns.
 if [ "$USECASES" = 1 ]; then
@@ -350,10 +357,11 @@ role() { # suffix, space-separated parameter names it may read (empty: none)
   [ -z "$fresh" ] || sleep 10   # a new role is not assumable by ECS for a few seconds
 }
 # The gateway's role reads the provider key and its id-signing key and nothing else; the agent's
-# reads its own seal and TLS keys; the sandbox's reads nothing. No role can read the whole prefix.
+# reads its own seal and TLS keys; the sandbox's reads its bearer (and the front's E2B key). No role can
+# read the whole prefix.
 [ "$LOAD" = 1 ] || role gateway-exec "$PROVIDER-key id-signing-key"
 role agent-exec "fleet-secret tls-key"
-[ "$USE_FARGATE" = 0 ] || role sandbox-exec "$([ "$USECASES" = 0 ] || echo e2b-key)"
+[ "$USE_FARGATE" = 0 ] || role sandbox-exec "sandbox-bearer$([ "$USECASES" = 0 ] || echo ' e2b-key')"
 # The stand-in's role is the only one that can read the "third party's" key.
 [ "$USECASES" = 0 ] || role standin-exec "managed-secret provider-secret"
 [ "$LOAD" = 0 ] || role loadhost-exec "load-token"
@@ -511,13 +519,14 @@ SANDBOX_SCRIPT='printf "%s" "$CA_PEM" > /tmp/ca.pem
 exec /usr/local/bin/execd --listen 0.0.0.0:8081 --root /workspace --home /home/sandbox --kept-jobs-survive-idle --log-format json'
 TD_SANDBOX=$(jq -n --arg family "$P-sandbox" --arg exec "$(EXEC sandbox)" --argjson logs "$(LOGS sandbox)" \
   --arg img "$ECR/$P-sandbox:latest" --arg script "$SANDBOX_SCRIPT" --arg ca "$CA_PEM" \
-  --arg usecases "$USECASES" --argjson flogs "$(LOGS front)" --arg fimg "$ECR/$P-front:latest" --arg ek "$(param_arn e2b-key)" --arg name "$NAME" --arg btpl "${BROWSER_TEMPLATE:-}" '{
+  --arg bearer "$(param_arn sandbox-bearer)" --arg usecases "$USECASES" --argjson flogs "$(LOGS front)" --arg fimg "$ECR/$P-front:latest" --arg ek "$(param_arn e2b-key)" --arg name "$NAME" --arg btpl "${BROWSER_TEMPLATE:-}" '{
   family:$family, networkMode:"awsvpc", requiresCompatibilities:["FARGATE"], cpu:"256", memory:(if $usecases == "1" then "1024" else "512" end),
   executionRoleArn:$exec,
   containerDefinitions:[
     {name:"sandbox", image:$img, essential:true, entryPoint:["/bin/sh","-c"], command:[$script],
      portMappings:[{containerPort:8081}],
      environment:[{name:"CA_PEM",value:$ca},{name:"SSL_CERT_FILE",value:"/tmp/ca.pem"}],
+     secrets:[{name:"EXECD_BEARER",valueFrom:$bearer}],
      logConfiguration:$logs}]}
   # The use cases'"'"' exec front, beside the sandbox: the address a coding session'"'"'s grant names. It
   # makes that session'"'"'s E2B microVM when the first request arrives (front.py).
