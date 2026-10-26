@@ -177,13 +177,8 @@ impl RunAs {
 
     /// The command that runs `command` as this identity, from `cwd`: execd's own binary as the
     /// helper.
-    pub(crate) fn wrap(
-        &self,
-        command: &str,
-        args: &[String],
-        cwd: &Path,
-    ) -> tokio::process::Command {
-        let mut cmd = tokio::process::Command::new("/proc/self/exe");
+    pub(crate) fn wrap(&self, command: &str, args: &[String], cwd: &Path) -> std::process::Command {
+        let mut cmd = std::process::Command::new("/proc/self/exe");
         cmd.arg(HELPER_FLAG)
             .arg("run")
             .args(self.identity_args())
