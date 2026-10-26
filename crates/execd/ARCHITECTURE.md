@@ -10,17 +10,18 @@ It is one crate: a library (`execd`) that embeds in a test or a larger host, and
 
 ## Modules
 
-| file            | role                                                                                            |
-| --------------- | ----------------------------------------------------------------------------------------------- |
-| `src/lib.rs`    | `Options`, the `Observer` trait, `serve` and `Handle`, and the derived limits                   |
-| `src/main.rs`   | the CLI: flags, bearer sources and the environment scrub, fail-closed start, subreaper, signals |
-| `src/runas.rs`  | `--run-as`: resolving the user, proving execd can switch, the switch helper                     |
-| `src/http.rs`   | hyper (HTTP/1.1 and h2c), routing, `/livez`, the bearer check, the request limit, the log line  |
-| `src/exec.rs`   | v1.1 envelope and v1.2 stream: pumps, the sink, heartbeat, leftovers, timeout, disconnect       |
-| `src/jobs.rs`   | v1.3 jobs: the table, the output ring, the supervisor, job streams                              |
-| `src/notify.rs` | v1.4: the sender that drives the `exec-notify` kernel                                           |
-| `src/proc.rs`   | process groups by syscall, the spawn registry, the subreaper and orphan reaper                  |
-| `src/frame.rs`  | v1.2 frame encoding                                                                             |
+| file            | role                                                                                                     |
+| --------------- | -------------------------------------------------------------------------------------------------------- |
+| `src/lib.rs`    | `Options`, the `Observer` trait, `serve` and `Handle`, and the derived limits                            |
+| `src/main.rs`   | the CLI: flags, bearer sources and the environment scrub, fail-closed start, subreaper, signals          |
+| `src/runas.rs`  | `--run-as`: resolving the user, proving execd can switch, the switch helper                              |
+| `src/http.rs`   | hyper (HTTP/1.1 and h2c), routing, `/livez`, the bearer check, the request limit, the log line           |
+| `src/exec.rs`   | v1.1 envelope and v1.2 stream: pumps, the sink, heartbeat, leftovers, timeout, disconnect                |
+| `src/jobs.rs`   | v1.3 jobs: the table, the output ring, the supervisor, job streams                                       |
+| `src/notify.rs` | v1.4: the sender that drives the `exec-notify` kernel                                                    |
+| `src/proc.rs`   | process groups by syscall, the spawn registry, the subreaper and orphan reaper                           |
+| `src/spool.rs`  | the jobs directory: where a kept job's retained output lives as chunk files, and stale-directory cleanup |
+| `src/frame.rs`  | v1.2 frame encoding                                                                                      |
 
 ## Request flow
 
