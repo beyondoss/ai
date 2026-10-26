@@ -20,6 +20,9 @@ def ts_ms:
   capture("^(?<s>[^.Z]+)(\\.(?<f>[0-9]+))?Z$")
   | (((.s + "Z") | fromdateiso8601) * 1000) + (((.f // "0") + "000")[0:3] | tonumber);
 
+# execd logs a command name and a job id with `?`, so in JSON each is a string holding a quoted string.
+def unq: if type == "string" and startswith("\"") then (fromjson? // .) else . end;
+
 def sandbox($ts; $event; $detail): {ts_ms: $ts, src: "sandbox", event: $event, detail: $detail};
 
 def execd_events:
@@ -33,12 +36,12 @@ def execd_events:
       | ($end - ($l.ms // 0)) as $start
       | if $l.kind == "callback" then
           sandbox($end; "job_ended_callback";
-            {job: $l.job, attempt: $l.attempt, status: ($l.status // null), error: ($l.error // null), took_ms: $l.ms})
+            {job: ($l.job | unq), attempt: $l.attempt, status: ($l.status // null), error: ($l.error // null), took_ms: $l.ms})
         elif $l.kind == "exec" or $l.kind == "job" or $l.kind == "stream" then
-          sandbox($start; "exec_request"; {command: $l.command}),
+          sandbox($start; "exec_request"; {command: ($l.command | unq)}),
           (if $l.kind == "stream" then
-             sandbox($start; "exec_start"; {command: $l.command}),
-             sandbox($end; "exec_end"; {command: $l.command})
+             sandbox($start; "exec_start"; {command: ($l.command | unq)}),
+             sandbox($end; "exec_end"; {command: ($l.command | unq)})
            else empty end)
         else empty end
     end;

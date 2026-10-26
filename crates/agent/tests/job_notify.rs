@@ -520,6 +520,25 @@ async fn new_session_ends_the_unheld_job() {
         common::exec_mock::wait_group_gone(pgid, Duration::from_secs(15)).await,
         "the old transcript's job was ended"
     );
+    // The job's group being gone is not the switch being done: the session stops the old jobs,
+    // then tells the kernel the transcript changed, then wipes the old scope. The wipe is the
+    // sandbox seeing that last step, so a callback sent after it meets a finished switch. Before
+    // it the session is mid-switch and may answer 503, which the sandbox retries (N24), as for
+    // any callback that arrives while its job is being taken.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !f
+        .svc
+        .exec
+        .requests()
+        .iter()
+        .any(|r| r.body["job"]["op"] == "wipe")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the old scope was never wiped"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let key = seal_key(&f.svc);
     let id = beyond_ai_agent::exec_endpoint::jobs::JobId::parse(&job).unwrap();
     let scope = beyond_ai_agent::exec_endpoint::jobs::JobScope::for_session(Some(TENANT), SESSION);

@@ -76,6 +76,8 @@ const ALLOWED: &[(&str, usize)] = &[
     ("agent/tests/serve_service_tls.rs", 1),
     ("agent/benches/serve_runtime.rs", 1),
     ("fleet-sim/src/replica.rs", 2),
+    // The execd benchmark starts each server on port 0 and reads the port from its sockets.
+    ("execd/benches/exec_compare.rs", 1),
 ];
 
 /// A source file with comments blanked out (newlines kept) and its string literals located.

@@ -143,7 +143,7 @@ impl Line {
     pub fn done(self, status: u16, outcome: &str) {
         tracing::info!(
             kind = self.kind,
-            command = %self.command,
+            command = ?self.command,
             status,
             outcome,
             ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -164,15 +164,25 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Whether the request carries the bearer. Strict, and fail closed: exactly one `Authorization`
+/// header (two are ambiguous, so neither order is believed), whose value is `Bearer`, one space and
+/// the token. The scheme is matched case-sensitively, as the agent sends it; `bearer <token>`,
+/// `Bearer  <token>` and a token with a prefix, suffix or trailing bytes of its own are all refused.
+/// (HTTP/1.1 strips optional whitespace around a header value before this sees it, so a trailing
+/// space on the wire is not part of the credential; over HTTP/2 nothing is stripped.) Nothing but
+/// `Authorization` is consulted: `Proxy-Authorization` is for a proxy.
 fn authorized(ctx: &Ctx, headers: &hyper::HeaderMap) -> bool {
     let Some(want) = &ctx.opts.bearer else {
         return true;
     };
-    headers
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|got| ct_eq(got.as_bytes(), want.as_bytes()))
+    let mut all = headers.get_all(AUTHORIZATION).iter();
+    let (Some(value), None) = (all.next(), all.next()) else {
+        return false;
+    };
+    value
+        .as_bytes()
+        .strip_prefix(b"Bearer ")
+        .is_some_and(|got| ct_eq(got, want.as_bytes()))
 }
 
 /// Accept connections until `stop`.
@@ -239,7 +249,9 @@ async fn handle(ctx: Arc<Ctx>, req: HttpRequest<Incoming>) -> Result<Resp, Infal
 
 async fn route(ctx: Arc<Ctx>, req: HttpRequest<Incoming>) -> Resp {
     let (parts, body) = req.into_parts();
-    if parts.uri.path() == "/livez" {
+    // The one unauthenticated answer, and only to a read: it says the process is up and nothing
+    // else. A POST to this path is an exec request like any other, and is authenticated.
+    if parts.uri.path() == "/livez" && matches!(parts.method, Method::GET | Method::HEAD) {
         return json_response(200, &json!({ "ok": true }));
     }
     if parts.method != Method::POST {
@@ -305,6 +317,28 @@ async fn route(ctx: Arc<Ctx>, req: HttpRequest<Incoming>) -> Resp {
     } else {
         crate::exec::envelope(&ctx, req).await
     }
+}
+
+/// The parsing a request body goes through once the bearer is accepted, for the fuzz targets and
+/// the parser test: the envelope, a `job` object's operation and `notify`, and `stdin_base64`.
+/// Whether the body was accepted (the server answers `400` for one that is not). Never panics.
+pub(crate) fn fuzz_request(bytes: &[u8]) -> bool {
+    use base64::Engine as _;
+    let Ok(req) = serde_json::from_slice::<Request>(bytes) else {
+        return false;
+    };
+    if let Some(job) = req.job.as_ref().filter(|j| j.is_object())
+        && !crate::jobs::fuzz_job(job)
+    {
+        return false;
+    }
+    if let Some(b) = &req.stdin_base64 {
+        match base64::engine::general_purpose::STANDARD.decode(b) {
+            Ok(data) => crate::frame::fuzz(&data),
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]

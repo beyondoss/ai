@@ -45,6 +45,7 @@ curl localhost:8080/v1/chat/completions \
 | [`crates/agent-core`](crates/agent-core)   | `beyond-ai-agent-core`   | The agent loop as a library: messages, tool dispatch, compaction, three provider wires. |
 | [`crates/providers`](crates/providers)     | `beyond-ai-providers`    | Provider table, model catalog and the pricing contract. No dependencies.                |
 | [`crates/exec-notify`](crates/exec-notify) | `beyond-ai-exec-notify`  | Exec protocol v1.4 job-end callback rules as a pure function. No dependencies.          |
+| [`crates/execd`](crates/execd)             | `beyond-ai-execd`        | The exec endpoint for a sandbox: exec protocol v1.1 to v1.4 in one static binary.       |
 | `crates/demo`                              | `beyond-ai-demo`         | Sandbox exec endpoint, key and grant minters, chat client for `deploy/demo`.            |
 | `crates/fleet-sim`                         | `beyond-ai-fleet-sim`    | Runs a replica set against a shared filesystem and checks the fleet design's claims.    |
 | `crates/test-support`                      | `beyond-ai-test-support` | Test doubles shared by the agent's tests and the simulator.                             |

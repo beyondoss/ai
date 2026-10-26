@@ -30,6 +30,22 @@ pub(crate) fn heartbeat() -> Bytes {
     Bytes::from_static(b"{}\n")
 }
 
+/// Fuzz seam: every frame of `data` is one line of JSON whose payload decodes back to the bytes.
+#[allow(clippy::expect_used)]
+pub(crate) fn fuzz(data: &[u8]) {
+    for chunk in data.chunks(FRAME_MAX) {
+        let f = output("stdout", chunk);
+        let (line, nl) = f.split_at(f.len() - 1);
+        assert_eq!(nl, b"\n");
+        assert!(!line.contains(&b'\n'));
+        let v: Value = serde_json::from_slice(line).expect("a frame is JSON");
+        let back = base64::engine::general_purpose::STANDARD
+            .decode(v["stdout"].as_str().expect("a string payload"))
+            .expect("the payload is base64");
+        assert_eq!(back, chunk);
+    }
+}
+
 /// Standard base64 with padding.
 pub(crate) fn b64(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)

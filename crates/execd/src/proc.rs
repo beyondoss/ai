@@ -32,9 +32,7 @@ pub(crate) struct Proc {
 
 impl Drop for Proc {
     fn drop(&mut self) {
-        if let Ok(mut owned) = OWNED.lock() {
-            owned.remove(&self.pid);
-        }
+        locked(&OWNED).remove(&self.pid);
     }
 }
 
@@ -44,9 +42,7 @@ impl Drop for Proc {
 /// child as an unowned zombie in the gap between `fork` and registration.
 pub(crate) fn spawn(cmd: &mut tokio::process::Command) -> io::Result<Proc> {
     cmd.process_group(0);
-    let mut owned = OWNED
-        .lock()
-        .map_err(|_| io::Error::other("process registry poisoned"))?;
+    let mut owned = locked(&OWNED);
     let child = cmd.spawn()?;
     let pid = child.id().unwrap_or(0);
     owned.insert(pid);
@@ -140,33 +136,49 @@ pub(crate) fn pipe_capacity<F: AsFd>(pipe: &F) -> usize {
         .unwrap_or(64 * 1024)
 }
 
+/// Lock `m`, whatever a panicking holder left: the data these locks guard stays valid after a
+/// panic (plain inserts and removes), and a poisoned lock must never stop a kill or a shutdown.
+pub(crate) fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// The process groups a server has running, so a shutdown can kill them all.
 ///
 /// Bounded by the number of running commands and jobs; each entry is freed when its command or
-/// job ends ([`GroupSlot`] drops, or the job's supervisor finishes).
+/// job ends ([`GroupSlot`] drops, or the job's supervisor finishes). Once [`Self::kill_all`] has
+/// run the set is closed: a group registered after it (a spawn that raced the shutdown) is killed
+/// at once instead of surviving it.
 #[derive(Default)]
-pub(crate) struct Groups(Mutex<BTreeSet<i32>>);
+pub(crate) struct Groups(Mutex<GroupSet>);
+
+#[derive(Default)]
+struct GroupSet {
+    live: BTreeSet<i32>,
+    closed: bool,
+}
 
 impl Groups {
     pub fn insert(&self, pgid: i32) {
-        if let Ok(mut g) = self.0.lock() {
-            g.insert(pgid);
+        let mut g = locked(&self.0);
+        if g.closed {
+            drop(g);
+            kill_group(pgid);
+        } else {
+            g.live.insert(pgid);
         }
     }
 
     pub fn remove(&self, pgid: i32) {
-        if let Ok(mut g) = self.0.lock() {
-            g.remove(&pgid);
-        }
+        locked(&self.0).live.remove(&pgid);
     }
 
-    /// SIGKILL every registered group, and forget them.
+    /// SIGKILL every registered group, forget them, and close the set. How many it killed.
     pub fn kill_all(&self) -> usize {
-        let all = self
-            .0
-            .lock()
-            .map(|mut g| std::mem::take(&mut *g))
-            .unwrap_or_default();
+        let all = {
+            let mut g = locked(&self.0);
+            g.closed = true;
+            std::mem::take(&mut g.live)
+        };
         for &g in &all {
             kill_group(g);
         }
@@ -213,9 +225,7 @@ pub fn reap_once() -> usize {
     use nix::sys::wait::{WaitPidFlag, waitpid};
     let me = i32::try_from(std::process::id()).unwrap_or(0);
     // Held for the whole pass, so a child being spawned cannot be seen unregistered.
-    let Ok(owned) = OWNED.lock() else {
-        return 0;
-    };
+    let owned = locked(&OWNED);
     let Ok(dir) = std::fs::read_dir("/proc") else {
         return 0;
     };

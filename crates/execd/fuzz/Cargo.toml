@@ -1,0 +1,36 @@
+[package]
+name = "beyond-ai-execd-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace: libFuzzer needs a nightly toolchain and sanitizer flags, so this crate is built
+# only by `cargo fuzz` (deep.yml), never by the main workspace's `cargo build`.
+[workspace]
+
+[dependencies]
+beyond-ai-execd = { path = ".." }
+libfuzzer-sys = "0.4"
+
+# The shipped binary checks overflow in release; the fuzzed build must too.
+[profile.release]
+debug = 1
+overflow-checks = true
+
+[[bin]]
+name = "request"
+path = "fuzz_targets/request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ring"
+path = "fuzz_targets/ring.rs"
+test = false
+doc = false
+bench = false

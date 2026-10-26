@@ -558,6 +558,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "memchr",
  "nix",
  "reqwest",
  "rustls",

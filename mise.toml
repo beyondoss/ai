@@ -79,7 +79,7 @@ run = "cargo audit"
 run = "dprint fmt && cargo fmt"
 
 [tasks."fuzz"]
-description = "Coverage-guided fuzzing of the gateway's byte parsers: `mise run fuzz -- <lex|peek|usage|translate|key|signed_id> [secs]` (default 60s). Crashes land in crates/gateway/fuzz/artifacts/<target>/."
+description = "Coverage-guided fuzzing of the gateway's byte parsers (`lex|peek|usage|translate|key|signed_id`) and execd's (`request|ring`): `mise run fuzz -- <target> [secs]` (default 60s). Crashes land in crates/{gateway,execd}/fuzz/artifacts/<target>/."
 run = """
 set -eu
 target="${1:?usage: mise run fuzz -- <target> [secs]}"
@@ -87,7 +87,10 @@ secs="${2:-60}"
 # The dated nightly libFuzzer needs; deep.yml pins the same one.
 tc="${FUZZ_NIGHTLY:-nightly-2026-04-01}"
 rustup toolchain list | grep -q "^$tc" || rustup toolchain install "$tc" --profile minimal
-cd crates/gateway/fuzz
+case "$target" in
+  request|ring) cd crates/execd/fuzz ;;
+  *) cd crates/gateway/fuzz ;;
+esac
 cargo "+$tc" fuzz run "$target" -- -max_total_time="$secs" -timeout=10 -rss_limit_mb=2048
 """
 
@@ -193,6 +196,14 @@ run = "cargo bench -p beyond-ai-agent --bench persistence"
 [tasks."bench:serve-runtime"]
 description = "Process-level Tokio runtime A/B: current_thread vs multi_thread under concurrent serve WebSocket load (RSS, throughput, p95, CPU)."
 run = "cargo bench -p beyond-ai-agent --bench serve_runtime"
+
+[tasks."bench:execd"]
+description = "execd vs the baseline exec endpoint, A/B over HTTP on loopback (v1.1 round trip, stream throughput, first frame, RSS, kill-on-disconnect). Set EXEC_BENCH_A to a baseline `beyond-ai-demo` binary built from the commit before execd."
+run = "cargo bench -p beyond-ai-execd --bench exec_compare"
+
+[tasks."bench:execd:sandbox"]
+description = "bench:execd inside a fresh PID namespace, where /proc holds a handful of processes like a sandbox's does (a busy host's thousands of processes slow execd's orphan reaper)."
+run = "unshare -Urpf --mount-proc bash -c 'EXEC_BENCH_LABEL=sandbox cargo bench -p beyond-ai-execd --bench exec_compare & wait'"
 
 [tasks."bench"]
 description = "Run both bench harnesses (unit micro + e2e macro)."

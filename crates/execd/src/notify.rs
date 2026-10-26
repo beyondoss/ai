@@ -16,6 +16,7 @@ use serde_json::Value;
 
 use crate::Ctx;
 use crate::jobs::{Job, JobCell, Key};
+use crate::proc::locked;
 
 /// What an endpoint that offers v1.4 adds to its probe answer.
 pub const NOTIFY_VERSION: &str = "v1.4";
@@ -148,7 +149,7 @@ pub(crate) fn feed(
                     (ctx.clone(), cell.clone(), key.clone(), j.notifier.seq);
                 let task = tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(at.saturating_sub(now))).await;
-                    let Ok(mut j) = cell2.lock() else { return };
+                    let mut j = locked(&cell2);
                     if !j.removed && j.notifier.seq == seq {
                         feed(&ctx2, &cell2, &key2, &mut j, exec_notify::Event::Wake);
                     }
@@ -183,7 +184,7 @@ async fn run_attempt(
             };
             tracing::info!(
                 kind = "callback",
-                job = %key.1,
+                job = ?key.1,
                 attempt = n,
                 status,
                 error = error.as_deref(),
@@ -209,7 +210,7 @@ async fn run_attempt(
     };
     let mut draw = [0u8; 4];
     let _ = getrandom::fill(&mut draw);
-    let Ok(mut j) = cell.lock() else { return };
+    let mut j = locked(&cell);
     if !j.removed && j.notifier.seq == seq {
         j.notifier.attempt = None;
         feed(
