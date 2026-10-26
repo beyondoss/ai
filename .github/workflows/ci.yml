@@ -491,6 +491,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       deps: ${{ steps.diff.outputs.deps }}
+      execd: ${{ steps.diff.outputs.execd }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -501,13 +502,53 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
           deps=false
+          execd=false
           if [ "$EVENT" = pull_request ] || [ "$EVENT" = workflow_dispatch ] || [ "$EVENT" = merge_group ]; then
             base=${BASE_SHA:-$(git rev-parse origin/main)}
             if git diff --name-only "$base"...HEAD | grep -qE '(^|/)Cargo\.toml$|^Cargo\.lock$|^\.cargo/(audit\.toml|config(\.toml)?)$|(^|/)rust-toolchain(\.toml)?$|(^|/)Dockerfile[^/]*$'; then
               deps=true
             fi
+            # execd's own code, its timing kernel, and the agent's side of the protocol it is
+            # verified against, and this workflow (an edit to the job runs the job).
+            if git diff --name-only "$base"...HEAD | grep -qE '^crates/(execd|exec-notify)/|^crates/agent/src/exec_endpoint|^\.github/workflows/ci\.yml$'; then
+              execd=true
+            fi
           fi
           echo "deps=$deps" >>"$GITHUB_OUTPUT"
+          echo "execd=$execd" >>"$GITHUB_OUTPUT"
+  # execd on a native arm64 machine. execd ships for arm64 (release-execd.yml) and is Linux-syscall
+  # code (subreaper, process groups, /proc, waits) whose struct layouts and syscall numbers differ
+  # per arch, so x86 green says nothing about it. The suite runs here as on amd64, including the
+  # conformance test against the real `execd` binary and the root-only tests (`sudo -n` is
+  # passwordless on hosted runners, arm included). Only when the change touches execd, the
+  # exec-notify kernel or the agent's exec endpoint (the `changes` job; a merge-queue run compares
+  # the queued tree with the queue's base, so the queue runs it for exactly those PRs), not on every
+  # PR. Restore-only cache, written by cache-warm.yml on main.
+  execd-arm64:
+    name: execd (arm64)
+    needs: changes
+    if: needs.changes.outputs.execd == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: execd-arm64
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: test
+        run: cargo nextest run -p beyond-ai-execd --locked --profile ci
+        timeout-minutes: 15
+      - name: report flaky tests
+        if: always()
+        run: python3 -I .github/scripts/flaky-report.py "execd-arm64" target/nextest/ci/junit.xml
+      - name: what was left running
+        if: always()
+        run: ps -eo pid,etime,rss,args | grep -E "execd|beyond-ai" | grep -v grep || echo "  none"
   # Advisories only: no license or duplicate-version checks. Ignores live in .cargo/audit.toml.
   advisories:
     name: advisories
@@ -524,21 +565,21 @@ jobs:
   # Mutation testing is not a PR check: a missed mutant is a test gap, not a bug, and the per-PR
   # run added about an hour to every gateway change. The full mutation sweep is weekly (deep.yml).
   # Single required status check. Branch protection can require just `Check`; it stays green only if
-  # every parallel job above did. Two kinds of skip are allowed: `advisories` may be skipped on any
-  # event (it must pass only when it ran: the PR touched dependencies), and `gateway-stress` and
+  # every parallel job above did. Two kinds of skip are allowed: `advisories` and `execd-arm64` may be
+  # skipped on any event (each must pass only when it ran: the change touched dependencies / execd), and `gateway-stress` and
   # `build` may be skipped on a pull_request only (they run in the merge queue, so every commit that
   # reaches main passed them). Cheap (no build), and keeps the required-check name stable.
   Check:
     name: Check
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, archive, test, gateway-stress, build, changes, advisories]
+    needs: [fmt, clippy, archive, test, gateway-stress, build, changes, advisories, execd-arm64]
     if: always()
     steps:
       - name: Gate on all checks
         env:
           EVENT: ${{ github.event_name }}
         run: |
-          echo "event=$EVENT fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} archive=${{ needs.archive.result }} test=${{ needs.test.result }} gateway-stress=${{ needs.gateway-stress.result }} build=${{ needs.build.result }} changes=${{ needs.changes.result }} advisories=${{ needs.advisories.result }}"
+          echo "event=$EVENT fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} archive=${{ needs.archive.result }} test=${{ needs.test.result }} gateway-stress=${{ needs.gateway-stress.result }} build=${{ needs.build.result }} changes=${{ needs.changes.result }} advisories=${{ needs.advisories.result }} execd-arm64=${{ needs.execd-arm64.result }}"
           # gateway-stress and build are skipped on a pull_request and nowhere else: a skip on the
           # merge queue or a dispatch is a job that never ran, which must not read as green.
           pr_only() { [ "$1" = "success" ] || { [ "$EVENT" = pull_request ] && [ "$1" = "skipped" ]; }; }
@@ -549,4 +590,5 @@ jobs:
             && pr_only "${{ needs.gateway-stress.result }}" \
             && pr_only "${{ needs.build.result }}" \
             && [ "${{ needs.changes.result }}" = "success" ] \
-            && { [ "${{ needs.advisories.result }}" = "success" ] || [ "${{ needs.advisories.result }}" = "skipped" ]; }
+            && { [ "${{ needs.advisories.result }}" = "success" ] || [ "${{ needs.advisories.result }}" = "skipped" ]; } \
+            && { [ "${{ needs.execd-arm64.result }}" = "success" ] || [ "${{ needs.execd-arm64.result }}" = "skipped" ]; }
