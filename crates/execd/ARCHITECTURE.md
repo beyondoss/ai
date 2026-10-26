@@ -30,7 +30,7 @@ variables alone ([Configuration](#configuration)).
 execd has no command-line flags. It is configured by `EXECD_*` environment variables, each read once at startup in
 `src/config.rs` and nowhere else: `EXECD_LISTEN`, `EXECD_ROOT`, `EXECD_HOME`, `EXECD_BEARER_FILE`, `EXECD_BEARER`,
 `EXECD_INSECURE_NO_AUTH`, `EXECD_RUN_AS`, `EXECD_KEPT_JOBS_SURVIVE_IDLE`, `EXECD_MAX_RESPONSE_BYTES`, `EXECD_JOBS_DIR`,
-`EXECD_LOG`, `EXECD_LOG_FORMAT` and `EXECD_WORKER_THREADS` (the table is in the README). A value that does not parse is an error
+`EXECD_LOG` and `EXECD_WORKER_THREADS` (the table is in the README). A value that does not parse is an error
 naming the variable and the value, with exit status 2; a boolean is `1`, `true`, `0` or `false`; an empty variable is unset.
 Any argument other than the internal `--execd-run-as-helper` re-exec marker (handled before anything else) prints the variable
 list to stderr and exits 2. There is no `--help` or `--version`: the startup line carries the version.

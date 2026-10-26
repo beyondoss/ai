@@ -36,10 +36,12 @@ ENTRYPOINT ["python3", "/opt/demo/front.py"]
 
 FROM alpine:${ALPINE_VERSION} AS runtime
 COPY --from=build /usr/local/bin/execd /usr/local/bin/execd
-# Where commands start and their HOME: execd does not create them.
-RUN mkdir -p /workspace /home/sandbox
+# Commands run as the unprivileged `sandbox` user (EXECD_RUN_AS) while execd stays root, so a command
+# cannot read execd's memory, its environment or its bearer. Where they start and their HOME: execd does
+# not create them.
+RUN adduser -D -h /home/sandbox sandbox && mkdir -p /workspace && chown sandbox:sandbox /workspace /home/sandbox
 # The defaults a bare `docker run` gets: a v1.4 endpoint (kept jobs survive idling, which is what lets it
 # advertise notify) logging JSON. It listens beyond loopback, so it needs EXECD_BEARER (or a bearer
 # file): `docker run -e EXECD_BEARER=... `. up.sh starts it with the demo's CA and a per-stack bearer.
-ENV EXECD_LISTEN=0.0.0.0:8081 EXECD_ROOT=/workspace EXECD_HOME=/home/sandbox EXECD_KEPT_JOBS_SURVIVE_IDLE=1 EXECD_LOG_FORMAT=json
+ENV EXECD_LISTEN=0.0.0.0:8081 EXECD_ROOT=/workspace EXECD_HOME=/home/sandbox EXECD_RUN_AS=sandbox EXECD_KEPT_JOBS_SURVIVE_IDLE=1
 ENTRYPOINT ["/usr/local/bin/execd"]

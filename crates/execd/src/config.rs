@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use execd::log::{Format, Level};
+use execd::log::Level;
 
 /// What the environment asked for.
 #[derive(Debug, PartialEq)]
@@ -22,7 +22,6 @@ pub struct Config {
     pub max_response_bytes: usize,
     pub jobs_dir: Option<PathBuf>,
     pub log_level: Level,
-    pub log_format: Format,
     pub worker_threads: usize,
 }
 
@@ -41,7 +40,6 @@ execd takes no arguments; it is configured by environment variables:
   EXECD_MAX_RESPONSE_BYTES        the most output one v1.1 answer carries (default 16777216)
   EXECD_JOBS_DIR                  where a kept job's last 8 MiB of output is spooled (default $TMPDIR, else /tmp)
   EXECD_LOG                       off, error, warn, info, debug or trace (default info)
-  EXECD_LOG_FORMAT                text (default) or json
   EXECD_WORKER_THREADS            1 (default) one thread, 0 a worker per CPU, N workers
 ";
 
@@ -85,11 +83,6 @@ pub fn parse<E: Fn(&str) -> Option<String>>(env: E) -> Result<Config, String> {
                 format!("EXECD_LOG={s:?} is not off, error, warn, info, debug or trace")
             })?,
         },
-        log_format: match get("EXECD_LOG_FORMAT").as_deref() {
-            None | Some("text") => Format::Text,
-            Some("json") => Format::Json,
-            Some(s) => return Err(format!("EXECD_LOG_FORMAT={s:?} is not text or json")),
-        },
         worker_threads: number("EXECD_WORKER_THREADS", get("EXECD_WORKER_THREADS"))?.unwrap_or(1),
     })
 }
@@ -116,7 +109,6 @@ mod tests {
         assert!(!c.insecure_no_auth && !c.kept_jobs_survive_idle);
         assert_eq!(c.max_response_bytes, execd::MAX_RESPONSE_BYTES);
         assert_eq!(c.log_level, Level::Info);
-        assert_eq!(c.log_format, Format::Text);
         assert_eq!(c.worker_threads, 1);
     }
 
@@ -133,7 +125,6 @@ mod tests {
             ("EXECD_MAX_RESPONSE_BYTES", "1024"),
             ("EXECD_JOBS_DIR", "/var/jobs"),
             ("EXECD_LOG", "debug"),
-            ("EXECD_LOG_FORMAT", "json"),
             ("EXECD_WORKER_THREADS", "0"),
         ])
         .unwrap();
@@ -146,7 +137,6 @@ mod tests {
         assert_eq!(c.max_response_bytes, 1024);
         assert_eq!(c.jobs_dir, Some("/var/jobs".into()));
         assert_eq!(c.log_level, Level::Debug);
-        assert_eq!(c.log_format, Format::Json);
         assert_eq!(c.worker_threads, 0);
     }
 
@@ -184,7 +174,6 @@ mod tests {
             ("EXECD_MAX_RESPONSE_BYTES", "lots"),
             ("EXECD_WORKER_THREADS", "-1"),
             ("EXECD_LOG", "info,foo=debug"),
-            ("EXECD_LOG_FORMAT", "yaml"),
             ("EXECD_INSECURE_NO_AUTH", "maybe"),
         ] {
             let e = cfg(&[(k, v)]).unwrap_err();
