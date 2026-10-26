@@ -157,6 +157,14 @@ command blocks on a full pipe and writes nothing further. The command's own `tim
 the kernel drops a peer that stopped acknowledging after 10 s of unsent heartbeat. `tests/endpoint.rs` runs a command that
 writes 256 MiB against a client that never reads and asserts it stalls and stays stalled.
 
+### How it is tested against a plain process
+
+`tests/differential.rs` generates seeded shell programs (arbitrary bytes on both streams, sizes from 0 to several MiB, stdin,
+exit codes, self-kills, background children) and runs each directly with `std::process::Command` and through a real server over
+v1.1 and v1.2. Stdout, stderr, exit code and signal must agree per stream; the spec's allowances (lossy UTF-8 in v1.1, `128 + S`
+for a signal in v1.1, a late background write possibly lost in v1.1) are encoded in the comparison. A failure prints its seed
+(`EXECD_DIFF_SEED`, `EXECD_DIFF_CASES`) and a shrunk program.
+
 ## Deviations from the reference mock
 
 The reference mock in `crates/test-support` (`exec_mock`) now runs this code for its conforming configuration. It was a test
