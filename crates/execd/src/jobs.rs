@@ -185,20 +185,45 @@ pub(crate) struct Job {
 pub(crate) struct Jobs {
     map: Mutex<HashMap<Key, JobCell>>,
     changed: watch::Sender<u64>,
-}
-
-impl Default for Jobs {
-    fn default() -> Self {
-        Self {
-            map: Mutex::default(),
-            changed: watch::Sender::new(0),
-        }
-    }
+    /// [`crate::Handle::activity_changed`]'s counter.
+    activity: Arc<watch::Sender<u64>>,
 }
 
 impl Jobs {
+    pub fn new(activity: Arc<watch::Sender<u64>>) -> Self {
+        Self {
+            map: Mutex::default(),
+            changed: watch::Sender::new(0),
+            activity,
+        }
+    }
+
     fn bump(&self) {
         self.changed.send_modify(|v| *v = v.wrapping_add(1));
+        self.bump_activity();
+    }
+
+    fn bump_activity(&self) {
+        self.activity.send_modify(|v| *v = v.wrapping_add(1));
+    }
+
+    /// Every kept job that has not ended.
+    pub fn running_kept(&self) -> Vec<crate::KeptJob> {
+        let cells: Vec<(Key, JobCell)> = locked(&self.map)
+            .iter()
+            .map(|(k, c)| (k.clone(), c.clone()))
+            .collect();
+        cells
+            .into_iter()
+            .filter_map(|((scope, id), cell)| {
+                let j = locked(&cell);
+                (j.kept && j.end.is_none() && !j.removed && j.pgid != 0).then(|| crate::KeptJob {
+                    pgid: j.pgid,
+                    scope,
+                    id,
+                })
+            })
+            .collect()
     }
 
     fn get(&self, key: &Key) -> Option<JobCell> {
@@ -544,6 +569,9 @@ fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq) -> Resp {
         j.seen = job.offset;
     }
     drop(j);
+    if keep {
+        ctx.jobs.bump_activity();
+    }
     http::json_response(200, &json!({}))
 }
 
@@ -589,6 +617,9 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     let pgid = proc.pgid;
     locked(&cell).pgid = pgid;
     ctx.groups.insert(pgid);
+    if !job.hold {
+        ctx.jobs.bump_activity();
+    }
 
     // Both pipes into one ring, in arrival order. `progress` counts what the pumps have read, so
     // the supervisor can tell when they have gone quiet.

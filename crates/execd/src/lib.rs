@@ -21,7 +21,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -55,6 +55,7 @@ pub mod __fuzz {
     }
 }
 
+pub use hyper::HeaderMap;
 pub use proc::become_subreaper;
 pub use runas::{HELPER_FLAG, Resolved, RunAs, helper_main};
 pub use spool::remove_stale_jobs_dirs;
@@ -79,6 +80,10 @@ pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// the JSON that carries them, even at its worst, fits in that much again.
 pub const MAX_REQUEST_BYTES: usize = (64 * 1024 * 1024usize).div_ceil(3) * 4 + 2 * 1024 * 1024;
 
+/// Decides whether a request may run, from its headers alone: see [`Options::authorizer`]. Called
+/// inline on the connection's task, so it must be quick and must not block.
+pub type Authorizer = Arc<dyn Fn(&HeaderMap) -> bool + Send + Sync>;
+
 /// What the deployment tells execd. [`Options::new`] is a conforming v1.4 endpoint with the spec's
 /// numbers and notify off, as an operator's deployment setting starts out.
 #[derive(Clone)]
@@ -91,6 +96,13 @@ pub struct Options {
     /// `None` accepts everything, which [`serve`] allows only on a loopback listener unless
     /// [`Self::insecure_no_auth`] says otherwise.
     pub bearer: Option<String>,
+    /// The embedder's own authentication, instead of [`Self::bearer`]: every request except the
+    /// health paths (`/livez`, `/healthz`) is allowed if and only if this returns `true`, and is
+    /// answered `401` (exactly as for a bad bearer) otherwise. Called once per request, before its
+    /// body is read. It counts as authentication for [`serve`]'s fail-closed rule, so a non-loopback
+    /// listener needs no bearer with it. Setting both this and [`Self::bearer`] is a configuration
+    /// error: [`serve`] returns `InvalidInput`. The binary has no way to set it.
+    pub authorizer: Option<Authorizer>,
     /// Allow [`serve`] with no bearer on a listener that is not loopback: anyone who can reach it
     /// runs commands. Off by default, so an embedding host cannot do it by forgetting the bearer.
     pub insecure_no_auth: bool,
@@ -119,6 +131,12 @@ pub struct Options {
     pub max_request_bytes: usize,
     /// Told of every request, stream and callback attempt. `None` costs one branch per event.
     pub observer: Option<Arc<dyn Observer>>,
+    /// Close a connection that has had no request in flight for this long: HTTP/1.1 is closed, HTTP/2
+    /// is sent a GOAWAY. A request in flight (a v1.2 stream or a held job, however long, even while it
+    /// only sends heartbeats) is never cut, and the clock starts again when its answer ends. `None`
+    /// (the default) starts no timer at all. For a sandbox that sleeps when it has no network
+    /// traffic behind a proxy that pools connections.
+    pub idle_timeout: Option<Duration>,
 }
 
 impl Options {
@@ -127,6 +145,7 @@ impl Options {
             root: root.into(),
             home: None,
             bearer: None,
+            authorizer: None,
             insecure_no_auth: false,
             heartbeat: HEARTBEAT_INTERVAL,
             native_jobs: true,
@@ -137,6 +156,7 @@ impl Options {
             max_response_bytes: MAX_RESPONSE_BYTES,
             max_request_bytes: MAX_REQUEST_BYTES,
             observer: None,
+            idle_timeout: None,
         }
     }
 
@@ -153,6 +173,7 @@ impl std::fmt::Debug for Options {
             .field("root", &self.root)
             .field("home", &self.home)
             .field("bearer", &self.bearer.as_ref().map(|_| "<redacted>"))
+            .field("authorizer", &self.authorizer.is_some())
             .field("insecure_no_auth", &self.insecure_no_auth)
             .field("heartbeat", &self.heartbeat)
             .field("native_jobs", &self.native_jobs)
@@ -163,6 +184,7 @@ impl std::fmt::Debug for Options {
             .field("max_response_bytes", &self.max_response_bytes)
             .field("max_request_bytes", &self.max_request_bytes)
             .field("observer", &self.observer.is_some())
+            .field("idle_timeout", &self.idle_timeout)
             .finish()
     }
 }
@@ -206,6 +228,25 @@ pub trait Observer: Send + Sync + 'static {
     fn callback(&self, _attempt: &CallbackAttempt) {}
 }
 
+/// A kept v1.3 job that has not ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeptJob {
+    /// The job's process group.
+    pub pgid: i32,
+    pub scope: String,
+    pub id: String,
+}
+
+/// What the server is doing now.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Activity {
+    /// Requests from handler start until the response body is dropped: an open stream, an `attach`,
+    /// a held `start` and a long v1.1 command all count. `/livez` and `/healthz` never do.
+    pub in_flight: usize,
+    /// Every job that was kept and has not ended, with its process group.
+    pub running_kept: Vec<KeptJob>,
+}
+
 /// Everything a request handler shares.
 pub(crate) struct Ctx {
     pub opts: Options,
@@ -221,6 +262,16 @@ pub(crate) struct Ctx {
     /// The kernel's clock starts here.
     pub epoch: Instant,
     pub next_seq: AtomicU64,
+    /// Requests in flight, server-wide: the sum of every connection's own count.
+    pub in_flight: AtomicUsize,
+    /// Bumped whenever [`Handle::activity`] may have changed (shared with `jobs`).
+    pub activity: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+impl Ctx {
+    pub fn activity_changed(&self) {
+        self.activity.send_modify(|v| *v = v.wrapping_add(1));
+    }
 }
 
 /// A running server.
@@ -235,6 +286,20 @@ pub struct Handle {
 impl Handle {
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// What the server is doing now.
+    pub fn activity(&self) -> Activity {
+        Activity {
+            in_flight: self.ctx.in_flight.load(Ordering::Acquire),
+            running_kept: self.ctx.jobs.running_kept(),
+        }
+    }
+
+    /// Bumps whenever [`Self::activity`] may have changed: a request starts or ends, a job is kept,
+    /// a kept job ends, a job is removed. A bump with no subscriber costs a store.
+    pub fn activity_changed(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.ctx.activity.subscribe()
     }
 
     /// Stop accepting, drop every open connection, kill every process group still running (the
@@ -253,14 +318,24 @@ impl Handle {
 /// tokio runtime.
 pub fn serve(listener: tokio::net::TcpListener, opts: Options) -> std::io::Result<Handle> {
     let addr = listener.local_addr()?;
+    if opts.bearer.is_some() && opts.authorizer.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Options::bearer and Options::authorizer are both set: choose one way to authenticate",
+        ));
+    }
     let spool = spool::JobsDir::open(opts.jobs_dir.as_deref())?;
-    // Fail closed: no bearer is only for a listener that only this host can reach.
-    if opts.bearer.is_none() && !opts.insecure_no_auth && !addr.ip().to_canonical().is_loopback() {
+    // Fail closed: no authentication is only for a listener that only this host can reach.
+    if opts.bearer.is_none()
+        && opts.authorizer.is_none()
+        && !opts.insecure_no_auth
+        && !addr.ip().to_canonical().is_loopback()
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!(
                 "refusing to serve on {addr} with no bearer: anyone who can reach it could run \
-                 commands (set Options::bearer, listen on loopback, or set Options::insecure_no_auth)"
+                 commands (set Options::bearer or Options::authorizer, listen on loopback, or set Options::insecure_no_auth)"
             ),
         ));
     }
@@ -268,15 +343,18 @@ pub fn serve(listener: tokio::net::TcpListener, opts: Options) -> std::io::Resul
         .map(|(k, _)| k)
         .filter(|k| k.as_encoded_bytes().starts_with(b"EXECD_"))
         .collect();
+    let activity = Arc::new(tokio::sync::watch::Sender::new(0));
     let ctx = Arc::new(Ctx {
         opts,
         scrub,
-        jobs: jobs::Jobs::default(),
+        jobs: jobs::Jobs::new(activity.clone()),
         spool,
         groups: proc::Groups::default(),
         client: tokio::sync::OnceCell::new(),
         epoch: Instant::now(),
         next_seq: AtomicU64::new(0),
+        in_flight: AtomicUsize::new(0),
+        activity,
     });
     // The reaper collects every command's exit (see `proc`); it runs before the first can start.
     let reaper = CancellationToken::new();

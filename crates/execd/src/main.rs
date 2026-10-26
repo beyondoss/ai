@@ -201,6 +201,7 @@ async fn run(cli: Config, inherited: Option<String>) -> Result<(), Box<dyn std::
     let secured = bearer.is_some();
     opts.bearer = bearer;
     opts.insecure_no_auth = cli.insecure_no_auth;
+    opts.idle_timeout = cli.idle_timeout;
     let switched = run_as.is_some();
     opts.run_as = run_as;
 

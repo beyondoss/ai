@@ -11,7 +11,8 @@
 
 use std::convert::Infallible;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -24,7 +25,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::Ctx;
@@ -170,6 +171,9 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// space on the wire is not part of the credential; over HTTP/2 nothing is stripped.) Nothing but
 /// `Authorization` is consulted: `Proxy-Authorization` is for a proxy.
 fn authorized(ctx: &Ctx, headers: &hyper::HeaderMap) -> bool {
+    if let Some(authorizer) = &ctx.opts.authorizer {
+        return authorizer(headers);
+    }
     let Some(want) = &ctx.opts.bearer else {
         return true;
     };
@@ -227,7 +231,23 @@ async fn connection(sock: tokio::net::TcpStream, ctx: Arc<Ctx>, stop: Cancellati
         nix::sys::socket::sockopt::TcpUserTimeout,
         &user_timeout,
     );
-    let svc = hyper::service::service_fn(move |req| handle(ctx.clone(), req));
+    let idle_timeout = ctx.opts.idle_timeout;
+    let activity = Arc::new(ConnActivity::new());
+    let tracked = activity.clone();
+    let ctx_for_svc = ctx.clone();
+    let svc = hyper::service::service_fn(move |req| {
+        // The health paths are not work: they neither count nor keep a connection awake.
+        let guard = (!is_health(&req)).then(|| InFlight::enter(&tracked, &ctx_for_svc));
+        let ctx = ctx_for_svc.clone();
+        async move {
+            let resp = route(ctx, req).await;
+            // The guard rides the body: a stream is in flight until its last frame is written.
+            Ok::<_, Infallible>(resp.map(|body| Tracked {
+                body,
+                _guard: guard,
+            }))
+        }
+    });
     let mut builder = auto::Builder::new(TokioExecutor::new());
     builder
         .http1()
@@ -235,26 +255,136 @@ async fn connection(sock: tokio::net::TcpStream, ctx: Arc<Ctx>, stop: Cancellati
         .max_buf_size(HTTP_BUF)
         .header_read_timeout(HEAD_TIMEOUT);
     let conn = builder.serve_connection(TokioIo::new(sock), svc);
-    tokio::select! {
-        r = conn => {
-            if let Err(e) = r {
-                crate::log_debug!("connection ended error={e}");
+    tokio::pin!(conn);
+    // With no idle timeout this future never completes and never arms a timer.
+    let idle = async {
+        match idle_timeout {
+            Some(t) => activity.idle_for(t).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(idle);
+    let mut closing = false;
+    loop {
+        tokio::select! {
+            r = conn.as_mut() => {
+                if let Err(e) = r {
+                    crate::log_debug!("connection ended error={e}");
+                }
+                return;
+            }
+            // Dropping the connection drops its in-flight handlers, whose guards kill their groups.
+            () = stop.cancelled() => return,
+            // Idle: HTTP/1.1 closes once nothing is in flight, h2 sends GOAWAY and closes when its
+            // last stream ends. The connection then completes on its own.
+            () = &mut idle, if !closing => {
+                closing = true;
+                conn.as_mut().graceful_shutdown();
             }
         }
-        // Dropping the connection drops its in-flight handlers, whose guards kill their groups.
-        () = stop.cancelled() => {}
     }
 }
 
-async fn handle(ctx: Arc<Ctx>, req: HttpRequest<Incoming>) -> Result<Resp, Infallible> {
-    Ok(route(ctx, req).await)
+/// The one unauthenticated answer's paths, read with GET or HEAD: `/livez` and its common name.
+fn is_health<B>(req: &HttpRequest<B>) -> bool {
+    matches!(req.uri().path(), "/livez" | "/healthz")
+        && matches!(*req.method(), Method::GET | Method::HEAD)
+}
+
+/// What a connection has in flight, and when it last was not idle: the idle timeout's whole state.
+struct ConnActivity {
+    in_flight: AtomicUsize,
+    /// Set when the count returns to zero; the wait re-checks instead of cancelling a timer.
+    last: Mutex<Instant>,
+    zero: Notify,
+}
+
+impl ConnActivity {
+    fn new() -> Self {
+        Self {
+            in_flight: AtomicUsize::new(0),
+            last: Mutex::new(Instant::now()),
+            zero: Notify::new(),
+        }
+    }
+
+    /// Completes once no request has been in flight for `limit`. Sleeps to the deadline the last
+    /// activity implies, and again if there was more activity meanwhile: at most one timer at a time,
+    /// and none while a request is in flight.
+    async fn idle_for(&self, limit: Duration) {
+        loop {
+            if self.in_flight.load(Ordering::Acquire) > 0 {
+                self.zero.notified().await;
+                continue;
+            }
+            let deadline = *self.last.lock().unwrap_or_else(PoisonError::into_inner) + limit;
+            if Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+        }
+    }
+}
+
+/// A request in flight; ends when dropped (the answer fully written, or the connection gone).
+struct InFlight(Arc<ConnActivity>, Arc<Ctx>);
+
+impl InFlight {
+    /// Counted on the connection (for its idle timeout) and on the server ([`crate::Handle::activity`]),
+    /// by the one guard, so the two cannot disagree.
+    fn enter(a: &Arc<ConnActivity>, ctx: &Arc<Ctx>) -> Self {
+        a.in_flight.fetch_add(1, Ordering::AcqRel);
+        ctx.in_flight.fetch_add(1, Ordering::AcqRel);
+        ctx.activity_changed();
+        Self(a.clone(), ctx.clone())
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        *self.0.last.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+        if self.0.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // A permit is kept if nobody waits yet, so the wake-up cannot be lost.
+            self.0.zero.notify_one();
+        }
+        self.1.in_flight.fetch_sub(1, Ordering::AcqRel);
+        self.1.activity_changed();
+    }
+}
+
+/// A response body that keeps its request counted as in flight.
+struct Tracked {
+    body: Body,
+    _guard: Option<InFlight>,
+}
+
+impl HttpBody for Tracked {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        Pin::new(&mut self.body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
 }
 
 async fn route(ctx: Arc<Ctx>, req: HttpRequest<Incoming>) -> Resp {
     let (parts, body) = req.into_parts();
     // The one unauthenticated answer, and only to a read: it says the process is up and nothing
-    // else. A POST to this path is an exec request like any other, and is authenticated.
-    if parts.uri.path() == "/livez" && matches!(parts.method, Method::GET | Method::HEAD) {
+    // else. `/healthz` is the same answer under the common name. A POST to either path is an exec request like any other, and is authenticated.
+    if matches!(parts.uri.path(), "/livez" | "/healthz")
+        && matches!(parts.method, Method::GET | Method::HEAD)
+    {
         return json_response(200, &json!({ "ok": true }));
     }
     if parts.method != Method::POST {
