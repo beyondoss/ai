@@ -2,7 +2,7 @@
 
 `execd` is the in-sandbox exec endpoint the agent talks to (`--exec-url`). It ships as a single fully static musl binary (linux amd64 and arm64), so it runs in any sandbox image: Alpine, Debian, busybox, E2B templates.
 
-Start it with `execd --listen 0.0.0.0:8080 --bearer-file /path/to/token`. `--listen` defaults to `127.0.0.1:8080`. Without a bearer token (`--bearer-file`, or `EXECD_BEARER`) execd accepts anyone who can reach it. Other flags: `--root`, `--home`, `--kept-jobs-survive-idle`, `--max-response-bytes`, `--log-level`; each also reads an `EXECD_*` environment variable (see `crates/execd/README.md`).
+Start it with `execd --listen 0.0.0.0:8080 --bearer-file /path/to/token`. `--listen` defaults to `127.0.0.1:8080`. Without a bearer token (`--bearer-file`, or `EXECD_BEARER`) execd refuses to start on any non-loopback address, unless you pass `--insecure-no-auth`. Other flags: `--root`, `--home`, `--kept-jobs-survive-idle`, `--max-response-bytes`, `--log-level`; each also reads an `EXECD_*` environment variable (see `crates/execd/README.md`).
 
 ## Install
 
