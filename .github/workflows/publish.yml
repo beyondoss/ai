@@ -1,5 +1,5 @@
 name: Publish
-# Build the runtime images (gateway + agent) for linux/amd64 and linux/arm64 and push them to GHCR.
+# Build the runtime images (gateway, agent, execd) for linux/amd64 and linux/arm64 and push them to GHCR.
 # Kept separate from ci.yml's `check` job so image publishing only happens once a change has landed
 # on `main` (or is tagged) — never on an unmerged PR. On a PR that touches an image's inputs the
 # same matrix runs build-only (no login, no push), so an arm64 break is caught before merge.
@@ -15,6 +15,8 @@ on:
     paths:
       - Dockerfile
       - Dockerfile.agent
+      - Dockerfile.execd
+      - crates/execd/**
       - .github/workflows/publish.yml
 permissions:
   contents: read
@@ -26,13 +28,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [ai, ai-agent]
+        image: [ai, ai-agent, execd]
         arch: [amd64, arm64]
         include:
           - image: ai
             file: ./Dockerfile
           - image: ai-agent
             file: ./Dockerfile.agent
+          - image: execd
+            file: ./Dockerfile.execd
           - arch: amd64
             runner: ubuntu-latest
           - arch: arm64
@@ -86,7 +90,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [ai, ai-agent]
+        image: [ai, ai-agent, execd]
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -104,8 +108,11 @@ jobs:
         working-directory: ${{ runner.temp }}/digests
         run: |
           image="ghcr.io/beyondoss/${{ matrix.image }}"
+          # A release tag also tags the image, so `COPY --from=…/execd:v1.2.3` works.
+          tag_args=""
+          if [ "${{ github.ref_type }}" = tag ]; then tag_args="-t $image:${{ github.ref_name }}"; fi
           docker buildx imagetools create \
-            -t "$image:latest" -t "$image:${{ github.sha }}" \
+            -t "$image:latest" -t "$image:${{ github.sha }}" $tag_args \
             $(printf "$image@sha256:%s " *)
       - name: Inspect
         run: docker buildx imagetools inspect "ghcr.io/beyondoss/${{ matrix.image }}:${{ github.sha }}"

@@ -11,7 +11,8 @@
 use std::collections::BTreeSet;
 use std::io;
 use std::os::fd::AsFd;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
 use nix::errno::Errno;
@@ -21,6 +22,22 @@ use nix::unistd::Pid;
 /// The pids of children execd spawned and still awaits. The orphan reaper must leave these alone:
 /// reaping one would steal the exit status its owner is about to ask for.
 static OWNED: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
+
+/// Held shared across every spawn, from before the child exists until it is in [`OWNED`]; held
+/// exclusively by the reaper around the check and reap of one zombie. Spawns do not exclude each
+/// other; the reaper excludes them all, and only for as long as one `waitpid`.
+///
+/// **Why a child is never reaped between its creation and its registration.** The reaper takes
+/// this lock exclusively before it asks whether a pid is owned, and a spawn holds it shared from
+/// before it creates the child to after the insert. So when the reaper holds it, every spawn is
+/// either entirely before it (its child is in `OWNED`, and is skipped) or entirely after it (no
+/// such child exists yet). There is no moment at which a new child is both visible to the reaper
+/// and unregistered.
+static SPAWNING: RwLock<()> = RwLock::new(());
+
+/// Whether this process is its descendants' subreaper, so every orphaned group member is one of its
+/// own descendants (see [`live_members`]). Set by [`become_subreaper`].
+static SUBREAPER: AtomicBool = AtomicBool::new(false);
 
 /// A spawned command, leading a process group of its own.
 pub(crate) struct Proc {
@@ -38,14 +55,17 @@ impl Drop for Proc {
 
 /// Spawn `cmd` as the leader of a new process group.
 ///
-/// The registry lock is held across the spawn: the reaper takes it to scan, so it can never see the
-/// child as an unowned zombie in the gap between `fork` and registration.
+/// [`SPAWNING`] is held shared across the spawn, so the reaper can never see the child as an
+/// unowned zombie before it is registered, and concurrent spawns do not wait for each other.
 pub(crate) fn spawn(cmd: &mut tokio::process::Command) -> io::Result<Proc> {
     cmd.process_group(0);
-    let mut owned = locked(&OWNED);
+    // Poison is recovered, as for every lock here: a panic elsewhere must not stop a spawn.
+    let _spawning = SPAWNING
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let child = cmd.spawn()?;
     let pid = child.id().unwrap_or(0);
-    owned.insert(pid);
+    locked(&OWNED).insert(pid);
     Ok(Proc {
         child,
         pgid: i32::try_from(pid).unwrap_or(0),
@@ -72,13 +92,73 @@ pub(crate) fn group_exists(pgid: i32) -> bool {
 /// The live (non-zombie) members of group `pgid`. A zombie never counts: a sandbox whose pid 1 is
 /// not an init never reaps what it inherits, and the spec says such a group is empty.
 ///
-/// The syscall answers the common case, an empty group, without touching `/proc`; only a group
-/// that exists is scanned (one `stat` read per process on the host).
+/// The syscall answers the common case, an empty group, without touching `/proc`. For a group that
+/// exists, the members are found in execd's own process tree: as the subreaper, every orphan of a
+/// command is a descendant of execd, and the kernel lists a process's children
+/// (`/proc/<pid>/task/*/children`), so the cost follows the size of that tree and not the number of
+/// processes on the host. Without a subreaper, or on a kernel that does not list children, the
+/// whole of `/proc` is scanned. So is it when the tree shows no live member of a group that still
+/// exists: a member whose parent exited during the walk moves to execd unseen, and "empty" ends a
+/// stream, so that answer is confirmed. It is reached only while a zombie holds the group.
 pub(crate) fn live_members(pgid: i32) -> Vec<u32> {
-    let mut out = Vec::new();
     if !group_exists(pgid) {
-        return out;
+        return Vec::new();
     }
+    if SUBREAPER.load(Ordering::Relaxed)
+        && let Some(found) = live_members_in_tree(pgid)
+        && !found.is_empty()
+    {
+        return found;
+    }
+    live_members_scan(pgid)
+}
+
+fn is_live(state: char) -> bool {
+    state != 'Z' && state != 'X'
+}
+
+/// The children of `pid` (`"self"` for this process), from every thread's `children` file; `None`
+/// if the kernel has no such file.
+fn children_of(pid: &str) -> Option<Vec<u32>> {
+    let mut out = Vec::new();
+    for t in std::fs::read_dir(format!("/proc/{pid}/task"))
+        .ok()?
+        .flatten()
+    {
+        match std::fs::read_to_string(t.path().join("children")) {
+            Ok(text) => out.extend(
+                text.split_whitespace()
+                    .filter_map(|p| p.parse::<u32>().ok()),
+            ),
+            // The file is missing from a kernel without it, and so is a thread that just exited.
+            Err(e) if e.kind() == io::ErrorKind::NotFound && t.path().exists() => return None,
+            Err(_) => {}
+        }
+    }
+    Some(out)
+}
+
+fn live_members_in_tree(pgid: i32) -> Option<Vec<u32>> {
+    let mut out = Vec::new();
+    let mut todo = children_of("self")?;
+    while let Some(pid) = todo.pop() {
+        if let Some((state, _, pg)) = stat(pid)
+            && is_live(state)
+            && pg == pgid
+        {
+            out.push(pid);
+        }
+        // A process that is gone has no children to find.
+        if let Some(kids) = children_of(&pid.to_string()) {
+            todo.extend(kids);
+        }
+    }
+    Some(out)
+}
+
+/// [`live_members`] by reading every process in `/proc`.
+fn live_members_scan(pgid: i32) -> Vec<u32> {
+    let mut out = Vec::new();
     let Ok(dir) = std::fs::read_dir("/proc") else {
         return out;
     };
@@ -87,8 +167,7 @@ pub(crate) fn live_members(pgid: i32) -> Vec<u32> {
             continue;
         };
         if let Some((state, _, pg)) = stat(pid)
-            && state != 'Z'
-            && state != 'X'
+            && is_live(state)
             && pg == pgid
         {
             out.push(pid);
@@ -190,7 +269,9 @@ impl Groups {
 /// by execd rather than by the host's init, so [`reap_orphans`] can reap it. Meant for the binary;
 /// an embedding test harness has no business changing its process's reaping.
 pub fn become_subreaper() -> io::Result<()> {
-    nix::sys::prctl::set_child_subreaper(true).map_err(io::Error::from)
+    nix::sys::prctl::set_child_subreaper(true).map_err(io::Error::from)?;
+    SUBREAPER.store(true, Ordering::Relaxed);
+    Ok(())
 }
 
 /// Reap every zombie child of this process that execd did not spawn itself, on each `SIGCHLD`.
@@ -221,30 +302,38 @@ pub async fn reap_orphans(stop: tokio_util::sync::CancellationToken) {
 }
 
 /// One pass of [`reap_orphans`]; how many zombies it collected.
+///
+/// The candidates are this process's own children (listed by the kernel, so the pass costs the
+/// number of execd's threads and children, not of processes on the host; a full `/proc` scan is the
+/// fallback). Each zombie is checked and reaped under [`SPAWNING`] held exclusively, which is what
+/// keeps a child that is mid-spawn safe; nothing is held while looking.
 pub fn reap_once() -> usize {
-    use nix::sys::wait::{WaitPidFlag, waitpid};
     let me = i32::try_from(std::process::id()).unwrap_or(0);
-    // Held for the whole pass, so a child being spawned cannot be seen unregistered.
-    let owned = locked(&OWNED);
-    let Ok(dir) = std::fs::read_dir("/proc") else {
-        return 0;
+    let candidates = match children_of("self") {
+        Some(c) => c,
+        None => match std::fs::read_dir("/proc") {
+            Ok(dir) => dir
+                .flatten()
+                .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()))
+                .collect(),
+            Err(_) => return 0,
+        },
     };
-    let mut reaped = 0;
-    for e in dir.flatten() {
-        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
-            continue;
-        };
-        if owned.contains(&pid) {
-            continue;
-        }
-        if let Some(('Z', ppid, _)) = stat(pid)
-            && ppid == me
-            && waitpid(Pid::from_raw(pid as i32), Some(WaitPidFlag::WNOHANG)).is_ok()
-        {
-            reaped += 1;
-        }
-    }
-    reaped
+    candidates
+        .into_iter()
+        .filter(|&pid| matches!(stat(pid), Some(('Z', ppid, _)) if ppid == me))
+        .filter(|&pid| reap_unowned(pid))
+        .count()
+}
+
+/// Reap zombie `pid` unless execd spawned it.
+fn reap_unowned(pid: u32) -> bool {
+    use nix::sys::wait::{WaitPidFlag, waitpid};
+    let _exclusive = SPAWNING
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let owned = locked(&OWNED);
+    !owned.contains(&pid) && waitpid(Pid::from_raw(pid as i32), Some(WaitPidFlag::WNOHANG)).is_ok()
 }
 
 #[cfg(test)]
