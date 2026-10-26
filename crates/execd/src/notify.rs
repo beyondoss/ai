@@ -326,10 +326,9 @@ async fn attempt(ctx: &Ctx, target: &NotifyTarget, key: &Key) -> Result<u16, Str
         .get_or_init(|| async {
             let _ = rustls::crypto::ring::default_provider().install_default();
             if let Some(problem) = trust_store_problem() {
-                tracing::warn!(
-                    %problem,
+                crate::log_warn!(
                     "https callbacks may fail to verify their server: the trust store has a \
-                     problem; set SSL_CERT_FILE or SSL_CERT_DIR to a valid bundle"
+                     problem ({problem}); set SSL_CERT_FILE or SSL_CERT_DIR to a valid bundle"
                 );
             }
             reqwest::Client::builder()

@@ -754,7 +754,7 @@ async fn a_broken_trust_store_is_warned_about_by_name() {
     ] {
         let bearer = token(&format!("trust_{case}"));
         let execd = Execd::start(
-            &["--kept-jobs-survive-idle"],
+            &[("EXECD_KEPT_JOBS_SURVIVE_IDLE", "1")],
             &[("EXECD_BEARER", &bearer), ("SSL_CERT_FILE", &file)],
         );
         let addr = std::net::SocketAddr::V4(execd.addr);
