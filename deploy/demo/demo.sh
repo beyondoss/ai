@@ -263,7 +263,7 @@ check_sandbox_exec() {
   output=$(jq -r '.output // ""' <<<"$tool")
   # Only the sandbox has /workspace (Fargate) or the host name e2b (E2B); the agent's own
   # container has neither.
-  if [[ $output == *Linux* && ( ( $SANDBOX == fargate && $output == *workspace* && $output == *mnt* ) || ( $SANDBOX == e2b && $output == *e2b* ) ) ]]; then
+  if [[ $output == *Linux* && ( ( ( $SANDBOX == fargate || $SANDBOX == both ) && $output == *workspace* && $output == *mnt* ) || ( $SANDBOX == e2b && $output == *e2b* ) ) ]]; then
     result 1 "ran in the sandbox ($SANDBOX), not on the agent" \
       "$(jq -c --argjson t "$tool" '{tool_ms: (($t.end_ms // 0) - $t.t_ms), total_ms, first_token_ms}' <<<"$out")" \
       "$(jq -c --argjson t "$tool" '{label:"tool round trip",value:(($t.end_ms // 0) - $t.t_ms),unit:"ms"}' <<<"$out")"
