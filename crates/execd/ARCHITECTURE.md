@@ -704,6 +704,10 @@ that moves whenever that may have changed (a request starts or ends, a job start
   guard the idle timeout counts with, summed over connections, so the two cannot disagree.
 - `running_kept`: every job that was kept and has not ended, with its process group.
 - `jobs_alive`: every job in the table that has not ended, in any scope, held or kept.
+- `callbacks_owed`: the jobs whose v1.4 notification is owed and not settled, as the `exec-notify` kernel defines it (`notify` set,
+  `owed > settled`, not removed): an attempt in flight or a retry waiting on its backoff, from the moment a callback becomes owed
+  until it is settled, abandoned at the attempt limit, or the job is removed. A host that pauses idle machines must stay awake
+  while it is not zero, or a paused machine never sends the callback. Every kernel step bumps `activity_changed`.
 
 A host that pauses an idle machine subscribes and re-reads:
 

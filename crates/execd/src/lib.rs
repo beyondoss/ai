@@ -258,6 +258,11 @@ pub struct Activity {
     pub running_kept: Vec<KeptJob>,
     /// Every job in the table that has not ended, in any scope, held or kept.
     pub jobs_alive: usize,
+    /// Jobs whose v1.4 notification is owed and not yet settled: an attempt in flight or a retry
+    /// waiting on its backoff, from the moment a callback becomes owed until it is settled,
+    /// abandoned at the attempt limit, or the job is removed. A host that pauses idle machines
+    /// must stay awake while this is not zero.
+    pub callbacks_owed: usize,
 }
 
 /// Everything a request handler shares.
@@ -303,11 +308,12 @@ impl Handle {
 
     /// What the server is doing now.
     pub fn activity(&self) -> Activity {
-        let (jobs_alive, running_kept) = self.ctx.jobs.alive();
+        let (jobs_alive, running_kept, callbacks_owed) = self.ctx.jobs.alive();
         Activity {
             in_flight: self.ctx.in_flight.load(Ordering::Acquire),
             running_kept,
             jobs_alive,
+            callbacks_owed,
         }
     }
 
