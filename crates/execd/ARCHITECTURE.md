@@ -229,6 +229,8 @@ runs (ten minutes of job-table seeds, two of parser seeds, four of each fuzz tar
   child does not exist yet); the pid lookup is inside the pass because a pid is reused as soon as it is collected. Spawns do
   not wait for each other; with one thread the lock is never contended, and it stays for a host that runs `execd::serve` on a
   multi-thread runtime.
+  `std::sync::RwLock` has no writer preference, so in a host that embeds `execd::serve` in a multi-thread runtime, many
+  concurrent spawns can delay a reaper pass; that is liveness only, and impossible in the shipped one-thread binary.
 - **Runtime.** One thread: a tokio `current_thread` runtime. execd moves bytes between sockets and pipes and waits on timers and
   child exits; the little CPU work it has (copying, base64) is about 1 GB/s on one core, more than a sandbox's commands write.
   `EXECD_WORKER_THREADS` sets it: unset or `1` is one thread, `0` one worker per CPU, `N` N workers. The reaper's `waitpid` passes

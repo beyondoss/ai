@@ -105,6 +105,13 @@ pub(crate) fn spawn(cmd: &mut std::process::Command) -> io::Result<Proc> {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut child = cmd.spawn()?;
     let pid = child.id();
+    // A pid that is not an i32 cannot name a group; 0 would mean our own. Not registered, so
+    // nothing else will reap it: kill and collect it here.
+    let Ok(pgid) = i32::try_from(pid) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(io::Error::other(format!("pid {pid} is out of range")));
+    };
     let (tx, exit) = oneshot::channel();
     children().as_mut().map(|m| m.insert(pid, tx));
     let pipes = (|| -> io::Result<_> {
@@ -131,7 +138,7 @@ pub(crate) fn spawn(cmd: &mut std::process::Command) -> io::Result<Proc> {
             stdin,
             stdout,
             stderr,
-            pgid: i32::try_from(pid).unwrap_or(0),
+            pgid,
             exit,
             done: None,
         }),
@@ -388,10 +395,11 @@ fn sweep() -> usize {
         } else {
             // Only what execd spawned: the host may own other children.
             for pid in owned {
-                if let Ok(st) = waitpid(
-                    Pid::from_raw(i32::try_from(pid).unwrap_or(0)),
-                    Some(WaitPidFlag::WNOHANG),
-                ) {
+                // A pid that is not an i32 cannot be one of ours; 0 would wait on any child.
+                let Ok(raw) = i32::try_from(pid) else {
+                    continue;
+                };
+                if let Ok(st) = waitpid(Pid::from_raw(raw), Some(WaitPidFlag::WNOHANG)) {
                     take(st);
                 }
             }
