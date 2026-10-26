@@ -40,10 +40,6 @@ use crate::{Ctx, StreamEnd, StreamStart};
 /// open: the client's own grace (v1.2 "Ordering").
 pub(crate) const PIPE_GRACE: Duration = Duration::from_millis(100);
 
-/// How often a shell that exited leaving processes behind is checked for an empty group. It only
-/// sets how soon after the last member exits the final frame follows.
-const LEFTOVER_POLL: Duration = Duration::from_millis(50);
-
 /// The command a request describes, ready to spawn: its `cwd` (default: the root), `HOME`, and
 /// piped output. Nothing of execd's own secrets reaches it: every `EXECD_*` variable is removed
 /// (the bearer must not be in a command's environment). Under `--run-as` the switch helper becomes
@@ -506,6 +502,7 @@ async fn drive(
         }
     };
     let pgid = proc.pgid;
+    let mut exits = proc::ChildEvents::new();
     if proc::live_members_async(pgid).await.is_empty() {
         return Ok(status);
     }
@@ -514,7 +511,6 @@ async fn drive(
     settle(rx, sink, cap).await?;
     sink.put(frame::json(&json!({ "shell_exit": exit_code(status) })))
         .await?;
-    let mut poll = tokio::time::interval(LEFTOVER_POLL);
     loop {
         tokio::select! {
             biased;
@@ -526,7 +522,7 @@ async fn drive(
                 Some(f) => sink.put(f).await?,
                 None => readers_done = true,
             },
-            _ = poll.tick() => {
+            () = exits.next() => {
                 if proc::live_members_async(pgid).await.is_empty() {
                     return Ok(status);
                 }

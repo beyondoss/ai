@@ -6,8 +6,9 @@
 //! **Bounds.**
 //!
 //! - *Output*: the last [`crate::Options::job_output_retention`] bytes per job (8 MiB, the spec's
-//!   floor), in whole chunks of at most 64 KiB, so a job holds between that and that plus one
-//!   chunk. Older bytes are dropped and read back as a gap. A job's two pumps write into it
+//!   floor), as whole chunk files of 64 KiB under execd's jobs directory (see [`crate::spool`]),
+//!   so a job holds between that and that plus one chunk on disk, and in memory only its
+//!   unfinished chunk. Older bytes are dropped and read back as a gap. A job's two pumps write into it
 //!   directly; there is no channel to fill, and a slow `attach` never slows the job (it reads a gap
 //!   instead).
 //! - *The table*: one entry per job the agent has started and not removed. The agent keeps at most
@@ -23,7 +24,8 @@
 //! - *Pumps*: two per job, freed when their pipes close, when the job is removed, or when the
 //!   supervisor lets go of a pipe a descendant holds open after the grace.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,6 +43,7 @@ use crate::frame::{self, FRAME_MAX};
 use crate::http::{self, Line, Request, Resp};
 use crate::notify::{self, Notifier, NotifyTarget};
 use crate::proc::{self, locked};
+use crate::spool;
 use crate::{Ctx, StreamEnd, StreamStart};
 
 /// `(scope, id)`: a job's address.
@@ -49,83 +52,111 @@ pub(crate) type Key = (String, String);
 /// One job, shared between its supervisor, its pumps and the requests that name it.
 pub(crate) type JobCell = Arc<Mutex<Job>>;
 
-/// The last bytes of a job's output, by offset from its first byte. Whole chunks are evicted from
-/// the front, so the retention is a floor.
+/// The last bytes of a job's output, by offset from its first byte, kept as chunk files (see
+/// [`crate::spool`]). A chunk is the 64 KiB at a multiple of 64 KiB; whole chunks are evicted from
+/// the front, so the retention is a floor. In memory: a path and the unfinished chunk.
 pub(crate) struct Ring {
-    chunks: VecDeque<Vec<u8>>,
-    /// The offset of the first byte held.
+    /// This job's directory, created when the first chunk is written.
+    dir: PathBuf,
+    made: bool,
+    /// Full chunks on disk.
+    files: usize,
+    /// The bytes after them, fewer than a chunk.
+    tail: Vec<u8>,
+    /// The offset of the first byte held (a multiple of a chunk).
     base: u64,
-    len: usize,
     retain: usize,
 }
 
 impl Ring {
-    fn new(retain: usize) -> Self {
+    fn new(retain: usize, dir: PathBuf) -> Self {
         Self {
-            chunks: VecDeque::new(),
+            dir,
+            made: false,
+            files: 0,
+            tail: Vec::new(),
             base: 0,
-            len: 0,
             retain,
         }
     }
 
+    fn held(&self) -> usize {
+        self.files * FRAME_MAX + self.tail.len()
+    }
+
     /// The offset of the next byte.
     pub fn end(&self) -> u64 {
-        self.base + self.len as u64
+        self.base + self.held() as u64
     }
 
-    fn push(&mut self, mut data: &[u8]) {
-        // Fill the last chunk first, so many tiny writes do not make many tiny chunks.
-        if let Some(last) = self.chunks.back_mut() {
-            let room = FRAME_MAX.saturating_sub(last.len()).min(data.len());
-            last.extend_from_slice(&data[..room]);
-            self.len += room;
-            data = &data[room..];
-        }
-        for piece in data.chunks(FRAME_MAX) {
-            self.chunks.push_back(piece.to_vec());
-            self.len += piece.len();
-        }
-        while self.chunks.len() > 1
-            && self
-                .chunks
-                .front()
-                .is_some_and(|f| self.len - f.len() >= self.retain)
-        {
-            if let Some(f) = self.chunks.pop_front() {
-                self.len -= f.len();
-                self.base += f.len() as u64;
+    fn chunk_path(&self, offset: u64) -> PathBuf {
+        self.dir.join(format!("{:010x}", offset / FRAME_MAX as u64))
+    }
+
+    fn push(&mut self, data: &[u8]) {
+        self.tail.extend_from_slice(data);
+        while self.tail.len() >= FRAME_MAX {
+            let at = self.base + (self.files * FRAME_MAX) as u64;
+            let wrote = (self.made || spool::make_job_dir(&self.dir).is_ok())
+                && spool::write_chunk(&self.chunk_path(at), &self.tail[..FRAME_MAX]).is_ok();
+            self.made |= wrote;
+            self.tail.drain(..FRAME_MAX);
+            if wrote {
+                self.files += 1;
+            } else {
+                // The disk refused it: what was held and this chunk read back as a gap.
+                self.forget_files();
+                self.base = at + FRAME_MAX as u64;
             }
+        }
+        while self.files > 0 && self.held() - FRAME_MAX >= self.retain {
+            let _ = std::fs::remove_file(self.chunk_path(self.base));
+            self.base += FRAME_MAX as u64;
+            self.files -= 1;
         }
     }
 
-    /// Up to `max` contiguous bytes from `offset` (which must be at least `base`), within one chunk.
-    fn slice_at(&self, offset: u64, max: usize) -> &[u8] {
-        let mut at = (offset - self.base) as usize;
-        for c in &self.chunks {
-            if at < c.len() {
-                return &c[at..at.saturating_add(max).min(c.len())];
-            }
-            at -= c.len();
+    fn forget_files(&mut self) {
+        for i in 0..self.files {
+            let _ = std::fs::remove_file(self.chunk_path(self.base + (i * FRAME_MAX) as u64));
         }
-        &[]
+        self.files = 0;
     }
 
     /// Up to `max` bytes from `offset` (or from the oldest byte held, when that is later); where
     /// they start.
     fn read(&self, offset: u64, max: usize) -> (u64, Vec<u8>) {
         let from = offset.max(self.base);
-        let mut out = Vec::new();
-        let mut at = from;
-        while out.len() < max && at < self.end() {
-            let piece = self.slice_at(at, max - out.len());
-            if piece.is_empty() {
-                break;
+        let want = (self.end().saturating_sub(from) as usize).min(max);
+        let mut out = vec![0u8; want];
+        let mut done = 0;
+        let on_disk = self.base + (self.files * FRAME_MAX) as u64;
+        while done < want {
+            let at = from + done as u64;
+            if at >= on_disk {
+                let t = (at - on_disk) as usize;
+                let n = (want - done).min(self.tail.len() - t);
+                out[done..done + n].copy_from_slice(&self.tail[t..t + n]);
+                done += n;
+            } else {
+                let pos = at % FRAME_MAX as u64;
+                let n = (want - done).min(FRAME_MAX - pos as usize);
+                match spool::read_chunk(&self.chunk_path(at), pos, &mut out[done..done + n]) {
+                    Ok(k) if k > 0 => done += k,
+                    _ => break,
+                }
             }
-            out.extend_from_slice(piece);
-            at += piece.len() as u64;
         }
+        out.truncate(done);
         (from, out)
+    }
+}
+
+impl Drop for Ring {
+    fn drop(&mut self) {
+        if self.made {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -262,7 +293,16 @@ pub(crate) fn fuzz_job(job: &Value) -> bool {
 pub(crate) fn fuzz_ring(bytes: &[u8]) {
     let mut it = bytes.iter().copied();
     let retain = 1 + usize::from(it.next().unwrap_or(0)) * 1024;
-    let mut ring = Ring::new(retain);
+    // The ring spools to files: give this run a directory of its own, removed when it ends.
+    static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "execd-fuzz-ring-{}-{}",
+        std::process::id(),
+        RUNS.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _cleanup = scopeguard_remove(dir.clone());
+    let _ = std::fs::create_dir_all(&dir);
+    let mut ring = Ring::new(retain, dir.join("ring"));
     let mut all: Vec<u8> = Vec::new();
     while let Some(op) = it.next() {
         let a = u16::from_le_bytes([it.next().unwrap_or(0), it.next().unwrap_or(0)]);
@@ -301,6 +341,19 @@ pub(crate) fn fuzz_ring(bytes: &[u8]) {
         assert!(kept >= (all.len().min(retain)) as u64);
         assert!(kept < (retain + FRAME_MAX) as u64);
     }
+}
+
+/// Removes a directory tree when dropped.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scopeguard_remove(p: PathBuf) -> RemoveOnDrop {
+    RemoveOnDrop(p)
 }
 
 /// A job operation: the request's `job` object.
@@ -514,7 +567,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
             label: job.label.clone(),
             started: epoch(),
             ended: 0,
-            out: Ring::new(ctx.opts.job_output_retention),
+            out: Ring::new(ctx.opts.job_output_retention, ctx.spool.new_job()),
             shell_exit: None,
             end: None,
             kept: !job.hold,
@@ -660,6 +713,7 @@ async fn supervise(
         s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
     });
     drain_pumps(&mut pipes, &progress, cap).await;
+    let mut exits = proc::ChildEvents::new();
     if !proc::live_members_async(pgid).await.is_empty() {
         // The moment a held stream would send `shell_exit`: v1.4 calls back.
         {
@@ -669,7 +723,7 @@ async fn supervise(
         }
         ctx.jobs.bump();
         while !proc::live_members_async(pgid).await.is_empty() {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            exits.next().await;
         }
         drain_pumps(&mut pipes, &progress, cap).await;
     }
@@ -750,9 +804,16 @@ async fn follow(
                     sent = j.out.base;
                     Next::Frame(frame::json(&json!({ "gap": n })))
                 } else if sent < total {
-                    let piece = j.out.slice_at(sent, FRAME_MAX);
-                    sent += piece.len() as u64;
-                    Next::Frame(frame::output("stdout", piece))
+                    let (_, piece) = j.out.read(sent, FRAME_MAX);
+                    if piece.is_empty() {
+                        // The chunk went away under us: the rest is a gap.
+                        let n = total - sent;
+                        sent = total;
+                        Next::Frame(frame::json(&json!({ "gap": n })))
+                    } else {
+                        sent += piece.len() as u64;
+                        Next::Frame(frame::output("stdout", &piece))
+                    }
                 } else if let (Some(c), false) = (j.shell_exit, shell_told) {
                     shell_told = true;
                     Next::Frame(frame::json(&json!({ "shell_exit": c })))
@@ -794,6 +855,12 @@ async fn follow(
 mod tests {
     use super::*;
 
+    fn ring(retain: usize) -> (Ring, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let r = Ring::new(retain, dir.path().join("job"));
+        (r, dir)
+    }
+
     /// Write `n` bytes whose value at stream offset `i` is `i % 251`.
     fn fill(ring: &mut Ring, n: usize) {
         let mut at = 0usize;
@@ -807,7 +874,7 @@ mod tests {
 
     #[test]
     fn it_keeps_at_least_the_retention_and_never_more_than_a_chunk_over() {
-        let mut ring = Ring::new(200_000);
+        let (mut ring, _d) = ring(200_000);
         fill(&mut ring, 1_000_000);
         assert_eq!(ring.end(), 1_000_000);
         let kept = ring.end() - ring.base;
@@ -815,16 +882,19 @@ mod tests {
             (200_000..200_000 + FRAME_MAX as u64).contains(&kept),
             "kept {kept}"
         );
-        assert_eq!(ring.len as u64, kept);
+        assert_eq!(ring.held() as u64, kept);
         // The oldest bytes are gone: a read from 0 starts where the ring does.
         let (from, data) = ring.read(0, 5);
         assert_eq!(from, ring.base);
         assert_eq!(data.len(), 5);
+        // Evicted chunks are deleted: only what is held is on disk.
+        let n = std::fs::read_dir(&ring.dir).unwrap().count();
+        assert_eq!(n, ring.files);
     }
 
     #[test]
     fn a_read_spans_chunks_and_matches_what_was_written() {
-        let mut ring = Ring::new(10_000_000);
+        let (mut ring, _d) = ring(10_000_000);
         fill(&mut ring, 300_000);
         let (from, data) = ring.read(70_000, 200_000);
         assert_eq!(from, 70_000);
@@ -837,7 +907,7 @@ mod tests {
     /// of a read from inside a chunk: it panicked while holding the job's lock.
     #[test]
     fn a_read_of_any_size_from_any_offset_does_not_overflow() {
-        let mut ring = Ring::new(10_000_000);
+        let (mut ring, _d) = ring(10_000_000);
         fill(&mut ring, 1000);
         for offset in [0, 1, 500, 999, 1000, 5000, u64::MAX] {
             let (from, data) = ring.read(offset, usize::MAX);
@@ -851,11 +921,42 @@ mod tests {
     }
 
     #[test]
-    fn tiny_writes_do_not_make_tiny_chunks() {
-        let mut ring = Ring::new(10_000_000);
+    fn tiny_writes_do_not_make_tiny_chunks_and_a_small_job_touches_no_disk() {
+        let (mut ring, d) = ring(10_000_000);
         for _ in 0..100_000 {
             ring.push(b"x");
         }
-        assert_eq!(ring.chunks.len(), 2);
+        assert_eq!(ring.files, 1);
+        assert_eq!(ring.tail.len(), 100_000 - FRAME_MAX);
+        let (mut small, d2) = self::ring(10_000_000);
+        small.push(b"hello");
+        assert!(!d2.path().join("job").exists());
+        drop((small, d2));
+        // Dropping the ring removes its directory.
+        let path = ring.dir.clone();
+        assert!(path.exists());
+        drop(ring);
+        assert!(!path.exists());
+        drop(d);
+    }
+
+    #[test]
+    fn files_are_private_and_never_follow_a_link() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let (mut ring, _d) = ring(10_000_000);
+        ring.push(&vec![7u8; FRAME_MAX]);
+        let dir_mode = std::fs::metadata(&ring.dir).unwrap().mode() & 0o777;
+        let file_mode = std::fs::metadata(ring.chunk_path(0))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!((dir_mode, file_mode), (0o700, 0o600));
+        // A link planted where the next chunk goes is refused, and the bytes read back as a gap.
+        let target = ring.dir.join("elsewhere");
+        std::os::unix::fs::symlink(&target, ring.chunk_path(FRAME_MAX as u64)).unwrap();
+        ring.push(&vec![8u8; FRAME_MAX]);
+        assert!(!target.exists());
+        assert_eq!(ring.base, 2 * FRAME_MAX as u64);
     }
 }

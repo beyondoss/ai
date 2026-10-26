@@ -1,0 +1,18 @@
+{
+  "unit": "context switches per second, all threads of the server (benches/wakeups.py)",
+  "before": {
+    "window_s": 30,
+    "idle": 2.23,
+    "one_stream": 2.47,
+    "one_leftover": 36.27,
+    "what": "1 s reaper backstop sleep; 50 ms leftover poll"
+  },
+  "after": {
+    "window_s": 60,
+    "idle": 0.0,
+    "one_stream": 0.6,
+    "one_leftover": 0.63,
+    "what": "reaper and group waits sleep until SIGCHLD; 5 s fallback for a last member outside execd's tree"
+  },
+  "build": "static musl, non-PIE, release, one thread, 2026-10-25"
+}

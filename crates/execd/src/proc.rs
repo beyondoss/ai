@@ -181,10 +181,26 @@ pub(crate) fn group_empty(pgid: i32) -> bool {
     live_members(pgid).is_empty()
 }
 
-/// [`live_members`] without holding up the runtime for the `/proc` scan.
+/// Whether the kernel lists a process's children (`CONFIG_PROC_CHILDREN`), probed once. The reads
+/// that use them take microseconds, so they run on the calling thread; a full scan of `/proc`
+/// does not, and goes to the blocking pool.
+fn has_children_files() -> bool {
+    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| children_of("self").is_some())
+}
+
+/// [`live_members`] without holding up the runtime: the walk of execd's own tree runs inline, and
+/// only a scan of `/proc` is sent to the blocking pool.
 pub(crate) async fn live_members_async(pgid: i32) -> Vec<u32> {
     if !group_exists(pgid) {
         return Vec::new();
+    }
+    if SUBREAPER.load(Ordering::Relaxed)
+        && has_children_files()
+        && let Some(found) = live_members_in_tree(pgid)
+        && !found.is_empty()
+    {
+        return found;
     }
     tokio::task::spawn_blocking(move || live_members(pgid))
         .await
@@ -290,13 +306,50 @@ pub async fn reap_orphans(stop: tokio_util::sync::CancellationToken) {
         return;
     };
     loop {
-        let _ = tokio::task::spawn_blocking(reap_once).await;
+        if has_children_files() {
+            reap_once();
+        } else {
+            let _ = tokio::task::spawn_blocking(reap_once).await;
+        }
         tokio::select! {
             _ = sigchld.recv() => {}
             () = stop.cancelled() => return,
-            // A zombie created between a scan and the next signal registration is still caught: the
-            // signal is level-coalesced by tokio, and this is the backstop for the one it can miss.
-            () = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+}
+
+/// Child exits, as a wake-up for a task that waits for a process group to empty.
+///
+/// When the last member of a group exits, its parent is nearly always execd (the subreaper adopts
+/// every orphan) or the member's own parent in the group, and execd gets `SIGCHLD` for the first
+/// and, a moment later, for the second. So a waiter sleeps until a `SIGCHLD` and re-checks, with no
+/// timer running. The one case no signal covers is a last member whose live parent is neither
+/// execd nor in the group (a process that left the group and still has a child in it); for that
+/// there is a slow fallback, [`GROUP_FALLBACK`], which only decides how late the end of such a
+/// group is noticed. Create one before the first check, so an exit that races the check is kept.
+pub(crate) struct ChildEvents(Option<tokio::signal::unix::Signal>);
+
+/// How long a waiter sleeps without a `SIGCHLD` before it looks anyway: as long as a heartbeat, the
+/// delay the protocol already tolerates for a silent stream, and rare enough to cost nothing.
+pub(crate) const GROUP_FALLBACK: Duration = Duration::from_secs(5);
+
+impl ChildEvents {
+    pub fn new() -> Self {
+        Self(tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()).ok())
+    }
+
+    /// Wait for a child to exit, or for [`GROUP_FALLBACK`].
+    pub async fn next(&mut self) {
+        match &mut self.0 {
+            // Without the subreaper an orphan goes to the host's init, and no signal says that it
+            // exited: look often, as an embedding host that does not set one has to accept.
+            Some(sig) if SUBREAPER.load(Ordering::Relaxed) => {
+                tokio::select! {
+                    _ = sig.recv() => {}
+                    () = tokio::time::sleep(GROUP_FALLBACK) => {}
+                }
+            }
+            _ => tokio::time::sleep(Duration::from_millis(50)).await,
         }
     }
 }
