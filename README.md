@@ -69,6 +69,11 @@ Anthropic client, and the agent talks to a provider directly when no gateway is
 configured. Together, the agent holds a gateway-issued `bai_v1` virtual key and
 never sees a provider key.
 
+To run the agent's tools in a sandbox, put [`execd`](crates/execd/README.md)
+in the image (one 5 MB static binary, v1.1 to v1.4 conformance 32/32 live on
+AWS Fargate and E2B) and pass `--exec-url`. The recipes are in
+[Run the tools somewhere else](crates/agent/README.md#run-the-tools-somewhere-else).
+
 ## The gateway
 
 An app keeps its stock OpenAI or Anthropic SDK and changes the base URL. The

@@ -566,6 +566,34 @@ A held leftover used to be polled at 20 Hz; it now sleeps until a `SIGCHLD` (the
 5 s in case its last member's live parent is neither execd nor in the group. An embedding host without the subreaper still
 polls every 50 ms, because its orphans go to init and nothing signals their exit.
 
+### Startup and `EXECD_RUN_AS` cost
+
+Two numbers a launcher and a prompt-injected-command defence each need. Static musl release build (`-C relocation-model=static`,
+`musl-gcc`) of this change, on 2026-10-26 on an AMD Ryzen 7 255 (16 threads), Linux 6.12, a host running other work (load
+average 55 to 62). The run is a one-off script, not in the repository.
+
+**Startup to the first accepted connection** (spawn the binary, then connect in a loop until one succeeds; n=10 medians, repeated
+5 times for `EXECD_BEARER_FILE` and 4 times for `EXECD_BEARER`, the range is of those medians):
+
+| bearer                                   | median startup | range of medians |
+| ---------------------------------------- | -------------- | ---------------- |
+| `EXECD_BEARER_FILE`                      | 0.5 ms         | 0.45 to 0.83 ms  |
+| `EXECD_BEARER` (execd re-execs to scrub) | 0.8 ms         | 0.66 to 0.83 ms  |
+
+The environment form pays a second `exec` of the same binary, about 0.3 ms, to leave the token out of
+`/proc/<pid>/environ`. Both are far below a sandbox's own boot, so use whichever the launcher can do; the file is the better one.
+
+**`EXECD_RUN_AS` per command** (v1.1 `true` over one kept-alive connection to each of two execd processes, as root through
+`sudo -n`, one without `EXECD_RUN_AS` and one with it, n=2000 each, interleaved request by request; two runs):
+
+| run | without run-as, median | with run-as, median | added by run-as |
+| --- | ---------------------- | ------------------- | --------------- |
+| 1   | 776 us                 | 1026 us             | 250 us          |
+| 2   | 761 us                 | 1013 us             | 252 us          |
+
+The 0.25 ms is the second `exec` (the helper that switches identity, then `exec`s the command), paid once per command and not
+per byte. It does not touch an open stream or a job already running.
+
 ### Reaping without `/proc`
 
 The children-file walk of the previous section does not exist on the production kernels (Fargate 6.1.188 and E2B 6.1.158 both

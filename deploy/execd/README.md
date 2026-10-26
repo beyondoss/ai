@@ -2,7 +2,7 @@
 
 `execd` is the in-sandbox exec endpoint the agent talks to (`--exec-url`). It ships as a single fully static musl binary (linux amd64 and arm64), so it runs in any sandbox image: Alpine, Debian, busybox, E2B templates.
 
-Start it with `EXECD_LISTEN=0.0.0.0:8080 EXECD_BEARER_FILE=/path/to/token execd`. execd takes no command-line arguments: it is configured by `EXECD_*` environment variables, and `EXECD_LISTEN` defaults to `127.0.0.1:8080`. Without a bearer token (`EXECD_BEARER_FILE`, or `EXECD_BEARER`) execd refuses to start on any non-loopback address, unless you set `EXECD_INSECURE_NO_AUTH=1`. The others are `EXECD_ROOT`, `EXECD_HOME`, `EXECD_KEPT_JOBS_SURVIVE_IDLE`, `EXECD_MAX_RESPONSE_BYTES`, `EXECD_LOG` (see `crates/execd/README.md`).
+Start it with `EXECD_LISTEN=0.0.0.0:8080 EXECD_BEARER_FILE=/path/to/token execd`. execd takes no command-line arguments: it is configured only by `EXECD_*` environment variables, listed with their defaults in [`crates/execd/README.md`](../../crates/execd/README.md#configuration). Without a bearer token it refuses to start on any non-loopback address. For commands that cannot be trusted, run it as root with `EXECD_RUN_AS`. The recipes that pair it with the agent (Dockerfile, installer, E2B, `--exec-url`) are in [Run the tools somewhere else](../../crates/agent/README.md#run-the-tools-somewhere-else).
 
 ## Install
 
@@ -11,10 +11,10 @@ Three ways, all producing the same binary.
 ### 1. `COPY --from` (Dockerfile)
 
 ```dockerfile
-COPY --from=ghcr.io/beyondoss/execd:latest /execd /usr/local/bin/execd
+COPY --from=ghcr.io/beyondoss/execd:v0.1.11 /execd /usr/local/bin/execd
 ```
 
-Pin a release with `:<tag>` (for example `:v1.2.3`) or a commit with `:<sha>`. The image is `FROM scratch` with the binary at `/execd`; it has no shell, so it cannot run commands itself. It exists to be copied from.
+Pin a release with `:<tag>` (for example `:v0.1.11`) or a commit with `:<sha>`. The image is `FROM scratch` with the binary at `/execd`; it has no shell, so it cannot run commands itself. It exists to be copied from.
 
 ### 2. Installer script
 
@@ -35,7 +35,7 @@ The script checks the SHA-256, installs through a temp file and a rename, and re
 ### 3. Tarball
 
 ```sh
-tag=v1.2.3 arch=amd64 # or arm64
+tag=v0.1.11 arch=amd64 # or arm64
 base=https://github.com/beyondoss/ai/releases/download/$tag
 curl -fsSLO "$base/execd-$tag-linux-$arch.tar.gz"
 curl -fsSLO "$base/execd-$tag-linux-$arch.tar.gz.sha256"

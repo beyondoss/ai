@@ -14,6 +14,10 @@ from a hung one, and cannot kill. execd also speaks:
 | v1.3    | sandbox-native jobs: jobs live in the endpoint, survive the agent replica moving, and their output is readable from an offset                                                                                |
 | v1.4    | job-end notify: the sandbox calls back when a kept job ends                                                                                                                                                  |
 
+**Proven:** v1.1 to v1.4 conformance 32/32 live on AWS Fargate and E2B; a 5 MB static binary; 2,372 KiB idle PSS and zero
+idle wakeups ([measurements](ARCHITECTURE.md#performance)); commands isolated from execd's token and memory under `EXECD_RUN_AS`;
+it fails closed without a token.
+
 Lifecycle stays yours. execd never creates or destroys a sandbox, so it has nothing vendor-specific in it: E2B, Modal,
 Daytona, Fargate, docker, Kubernetes or your own.
 
@@ -42,33 +46,27 @@ Daytona, Fargate, docker, Kubernetes or your own.
 
 ## Run it
 
-Build from source (the crate is `beyond-ai-execd`, the binary `execd`):
+Every recipe, with the agent side (`--exec-url`, `--exec-header`), is in
+[Run the tools somewhere else](../agent/README.md#run-the-tools-somewhere-else). In short:
 
-```sh
-cargo install --path crates/execd           # or: cargo build -p beyond-ai-execd --release
+```dockerfile
+COPY --from=ghcr.io/beyondoss/execd:v0.1.11 /execd /usr/local/bin/execd
 ```
 
-Copy the binary into your image, then start it with a bearer:
-
 ```sh
-echo -n "$TOKEN" > /run/execd-bearer
-EXECD_LISTEN=0.0.0.0:8080 EXECD_BEARER_FILE=/run/execd-bearer execd
+curl -fsSL https://github.com/beyondoss/ai/releases/latest/download/install-execd.sh | sh   # Alpine, Debian, busybox
+echo -n "$TOKEN" > /run/execd-bearer && chmod 600 /run/execd-bearer
+EXECD_LISTEN=0.0.0.0:8080 EXECD_BEARER_FILE=/run/execd-bearer EXECD_RUN_AS=sandbox execd   # as root
 ```
 
-Point the agent at it:
+The tarballs, checksums and the other ways to install are in [`deploy/execd`](../../deploy/execd/README.md). To build from
+source (the crate is `beyond-ai-execd`, the binary `execd`): `cargo install --path crates/execd`.
 
-```sh
-beyond-ai-agent run \
-  --exec-url http://sandbox.internal:8080/ \
-  --exec-header "Authorization: Bearer $TOKEN" \
-  "fix the failing test under /srv/app"
-```
+**Security, in three lines.** Run execd as root with `EXECD_RUN_AS`. Give it a bearer file. Put TLS in front of it, or use the
+provider's (E2B does).
 
-`--exec-url` and `--exec-header` also work with `serve`, and read `AI_AGENT_EXEC_URL` and `AI_AGENT_EXEC_HEADER`. The agent
-probes the endpoint at attach and uses the highest version it finds. Keep `EXECD_MAX_RESPONSE_BYTES` equal to the agent's
-`--exec-max-response-bytes`.
-
-Run execd as PID 1 in a container, or under any init: it makes itself the subreaper either way.
+Keep `EXECD_MAX_RESPONSE_BYTES` equal to the agent's `--exec-max-response-bytes`. Run execd as PID 1 in a container, or under
+any init: it makes itself the subreaper either way.
 
 ## Configuration
 
@@ -76,20 +74,20 @@ execd takes no command-line arguments, only environment variables, read once at 
 error that names the variable and the value (exit 2), and so is any argument: execd prints this list and exits. A boolean is
 `1`, `true`, `0` or `false`; an empty variable is unset.
 
-| variable                       | meaning                                                                                                          |
-| ------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
-| `EXECD_LISTEN`                 | address to listen on (default `127.0.0.1:8080`)                                                                  |
-| `EXECD_ROOT`                   | where a command runs when its request names no directory (default: the current directory)                        |
-| `EXECD_HOME`                   | `HOME` for every command                                                                                         |
-| `EXECD_BEARER_FILE`            | a file holding the bearer token (mode 0600)                                                                      |
-| `EXECD_BEARER`                 | the bearer token itself, a weaker way: execd moves it out of its environment at once                             |
-| `EXECD_INSECURE_NO_AUTH`       | serve with no bearer on a non-loopback address; without it execd refuses to start                                |
-| `EXECD_RUN_AS`                 | run every command as `user`, `uid`, `user:group` or `uid:gid` with the user's groups; execd must be root         |
-| `EXECD_KEPT_JOBS_SURVIVE_IDLE` | advertise v1.4 job-end notify; say so only if this sandbox is not stopped when idle                              |
-| `EXECD_MAX_RESPONSE_BYTES`     | most output one v1.1 answer carries (default 16 MiB); match the agent's `--exec-max-response-bytes`              |
-| `EXECD_JOBS_DIR`               | where a kept job's last 8 MiB of output is spooled (default `$TMPDIR`, else `/tmp`); use a disk-backed directory |
-| `EXECD_LOG`                    | `off`, `error`, `warn`, `info` (default), `debug` or `trace`                                                     |
-| `EXECD_WORKER_THREADS`         | `1` (default) one thread; `0` a worker per CPU; `N` workers                                                      |
+| variable                       | default                                            | meaning                                                                                                  |
+| ------------------------------ | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `EXECD_LISTEN`                 | `127.0.0.1:8080`                                   | address to listen on                                                                                     |
+| `EXECD_ROOT`                   | the current directory                              | where a command runs when its request names no directory                                                 |
+| `EXECD_HOME`                   | execd's own `HOME`; the user's with `EXECD_RUN_AS` | `HOME` for every command                                                                                 |
+| `EXECD_BEARER_FILE`            | unset                                              | a file holding the bearer token (mode 0600)                                                              |
+| `EXECD_BEARER`                 | unset                                              | the bearer token itself, a weaker way: execd re-execs to move it out of its environment                  |
+| `EXECD_INSECURE_NO_AUTH`       | `false`                                            | serve with no bearer on a non-loopback address; without it execd refuses to start                        |
+| `EXECD_RUN_AS`                 | unset                                              | run every command as `user`, `uid`, `user:group` or `uid:gid` with the user's groups; execd must be root |
+| `EXECD_KEPT_JOBS_SURVIVE_IDLE` | `false`                                            | advertise v1.4 job-end notify; say so only if this sandbox is not stopped when idle                      |
+| `EXECD_MAX_RESPONSE_BYTES`     | 16 MiB                                             | most output one v1.1 answer carries; match the agent's `--exec-max-response-bytes`                       |
+| `EXECD_JOBS_DIR`               | `$TMPDIR`, else `/tmp`                             | where a kept job's last 8 MiB of output is spooled; use a disk-backed directory                          |
+| `EXECD_LOG`                    | `info`                                             | `off`, `error`, `warn`, `info`, `debug` or `trace`                                                       |
+| `EXECD_WORKER_THREADS`         | `1`                                                | `1` one thread; `0` a worker per CPU; `N` workers                                                        |
 
 No `EXECD_*` variable reaches the commands execd runs. The startup line logs execd's version.
 
