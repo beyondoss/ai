@@ -163,7 +163,14 @@ pub(crate) fn write_chunk(path: &Path, data: &[u8]) -> io::Result<()> {
         .mode(0o600)
         .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
         .open(path)?;
-    f.write_all(data)
+    let wrote = f.write_all(data);
+    if wrote.is_err() {
+        // A refused write (the disk is full) leaves a short or empty file; left alone, one would
+        // pile up per chunk the job produces for as long as the disk stays full.
+        drop(f);
+        let _ = fs::remove_file(path);
+    }
+    wrote
 }
 
 /// Read up to `buf.len()` bytes of a chunk file from `pos`.

@@ -681,7 +681,12 @@ async fn drain_pumps(
     loop {
         let all = async {
             for p in pipes.iter_mut() {
-                let _ = p.await;
+                // A pump that finished was awaited by an earlier pass (the supervisor drains twice,
+                // and a pass that timed out on one pipe restarts at the first); awaiting a
+                // `JoinHandle` again panics.
+                if !p.is_finished() {
+                    let _ = p.await;
+                }
             }
         };
         if tokio::time::timeout(PIPE_GRACE, all).await.is_ok() {
