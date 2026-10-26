@@ -6,7 +6,7 @@
 //!
 //! **A** is the baseline, a `beyond-ai-demo exec-stub` binary built from the commit before execd
 //! (`EXEC_BENCH_A`, required; the stub on a branch that has execd delegates to execd and is not a
-//! baseline). **B** is the `execd` binary of this build. Both are started with the same flags and
+//! baseline). **B** is the `execd` binary of this build. Both are configured with the same `EXECD_*` settings and
 //! fresh root and home directories. Work is split into rounds; within a round A and B each run the
 //! whole battery, in alternating order (AB, BA, AB...), so drift in this machine's load lands on
 //! both.

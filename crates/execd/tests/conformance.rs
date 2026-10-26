@@ -20,7 +20,10 @@ use support::Execd;
 async fn the_binary_passes_every_check_v11_to_v14() {
     // At the most verbose level, so the log holds everything execd would say.
     let execd = Execd::start(
-        &[("EXECD_KEPT_JOBS_SURVIVE_IDLE", "1"), ("EXECD_LOG", "debug")],
+        &[
+            ("EXECD_KEPT_JOBS_SURVIVE_IDLE", "1"),
+            ("EXECD_LOG", "debug"),
+        ],
         &[("EXECD_BEARER", "s3cret-bearer")],
     );
     let headers = [(
@@ -59,7 +62,10 @@ async fn the_binary_passes_every_check_v11_to_v14() {
 #[tokio::test]
 async fn the_binary_passes_every_check_under_run_as() {
     let Some(execd) = Execd::start_as_root(
-        &[("EXECD_KEPT_JOBS_SURVIVE_IDLE", "1"), ("EXECD_RUN_AS", "nobody")],
+        &[
+            ("EXECD_KEPT_JOBS_SURVIVE_IDLE", "1"),
+            ("EXECD_RUN_AS", "nobody"),
+        ],
         &[("EXECD_BEARER", "s3cret-run-as-bearer")],
     ) else {
         return;

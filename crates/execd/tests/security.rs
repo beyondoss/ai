@@ -207,7 +207,8 @@ async fn a_streamed_command_and_a_job_do_not_see_the_bearer_either() {
 
 #[test]
 fn it_refuses_to_start_open_on_a_network() {
-    let (status, log) = Execd::run_to_exit(&[("EXECD_LISTEN", ports::CHILD_LISTEN_ALL)], &[], false);
+    let (status, log) =
+        Execd::run_to_exit(&[("EXECD_LISTEN", ports::CHILD_LISTEN_ALL)], &[], false);
     assert!(!status.success(), "it started: {log}");
     assert!(log.contains("refusing to start"), "{log}");
     assert!(log.contains("EXECD_INSECURE_NO_AUTH"), "{log}");
@@ -226,7 +227,10 @@ fn it_refuses_to_start_open_on_a_network() {
     let empty = dir.path().join("empty");
     std::fs::write(&empty, "\n").unwrap();
     let (status, log) = Execd::run_to_exit(
-        &[("EXECD_LISTEN", ports::CHILD_LISTEN), ("EXECD_BEARER_FILE", empty.to_str().unwrap())],
+        &[
+            ("EXECD_LISTEN", ports::CHILD_LISTEN),
+            ("EXECD_BEARER_FILE", empty.to_str().unwrap()),
+        ],
         &[],
         false,
     );
@@ -245,7 +249,11 @@ async fn it_starts_open_on_loopback_and_on_a_network_only_when_told_or_secured()
     let req = json!({ "command": "true" });
     assert_eq!(post(addr, &[], &req).await.status, 401);
     // All interfaces with nothing, on purpose: allowed, and louder.
-    let deliberate = Execd::start_on(ports::CHILD_LISTEN_ALL, &[("EXECD_INSECURE_NO_AUTH", "1")], &[]);
+    let deliberate = Execd::start_on(
+        ports::CHILD_LISTEN_ALL,
+        &[("EXECD_INSECURE_NO_AUTH", "1")],
+        &[],
+    );
     assert!(deliberate.log().contains("NO BEARER CONFIGURED"));
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], deliberate.addr.port()));
     assert_eq!(post(addr, &[], &req).await.status, 200);
@@ -303,7 +311,10 @@ async fn run_as_refuses_root_when_execd_is_root() {
         return;
     }
     let (status, log) = Execd::run_to_exit(
-        &[("EXECD_LISTEN", ports::CHILD_LISTEN), ("EXECD_RUN_AS", "root")],
+        &[
+            ("EXECD_LISTEN", ports::CHILD_LISTEN),
+            ("EXECD_RUN_AS", "root"),
+        ],
         &[],
         true,
     );
@@ -326,7 +337,10 @@ async fn under_run_as_a_command_cannot_reach_execd() {
     sudo(&["chown", "root:root", file.to_str().unwrap()]);
     let decoy = Decoy::start(&bearer);
     let Some(execd) = Execd::start_as_root(
-        &[("EXECD_RUN_AS", "nobody"), ("EXECD_BEARER_FILE", file.to_str().unwrap())],
+        &[
+            ("EXECD_RUN_AS", "nobody"),
+            ("EXECD_BEARER_FILE", file.to_str().unwrap()),
+        ],
         &[],
     ) else {
         return;
@@ -411,7 +425,8 @@ async fn under_run_as_a_command_cannot_reach_execd() {
 /// commands of the user it switched to.
 #[tokio::test]
 async fn under_run_as_home_is_configurable_and_shutdown_kills_the_users_jobs() {
-    let Some(mut execd) = Execd::start_as_root(&[("EXECD_RUN_AS", "nobody"), ("EXECD_HOME", "/tmp")], &[])
+    let Some(mut execd) =
+        Execd::start_as_root(&[("EXECD_RUN_AS", "nobody"), ("EXECD_HOME", "/tmp")], &[])
     else {
         return;
     };
@@ -585,7 +600,10 @@ async fn notify_tokens_and_callback_urls_never_reach_the_log() {
         }
     });
     let execd = Execd::start(
-        &[("EXECD_KEPT_JOBS_SURVIVE_IDLE", "1"), ("EXECD_LOG", "trace")],
+        &[
+            ("EXECD_KEPT_JOBS_SURVIVE_IDLE", "1"),
+            ("EXECD_LOG", "trace"),
+        ],
         &[("EXECD_BEARER", &bearer)],
     );
     let addr = std::net::SocketAddr::V4(execd.addr);
@@ -646,7 +664,10 @@ async fn under_run_as_a_command_cannot_list_or_read_the_jobs_dir() {
     )
     .unwrap();
     let Some(execd) = Execd::start_as_root(
-        &[("EXECD_RUN_AS", "nobody"), ("EXECD_JOBS_DIR", base.path().to_str().unwrap())],
+        &[
+            ("EXECD_RUN_AS", "nobody"),
+            ("EXECD_JOBS_DIR", base.path().to_str().unwrap()),
+        ],
         &[],
     ) else {
         return;

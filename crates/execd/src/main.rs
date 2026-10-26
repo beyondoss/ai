@@ -218,7 +218,14 @@ async fn run(cli: Config, inherited: Option<String>) -> Result<(), Box<dyn std::
     // Off the serving path: it reads the whole of the jobs directory's parent (39 ms for a /tmp of
     // 9,500 entries), and a client that finds the port open expects the server to be ready.
     let jobs_dir = cli.jobs_dir.clone();
-    tokio::task::spawn_blocking(move || execd::remove_stale_jobs_dirs(jobs_dir.as_deref()));
+    // A thread of its own that ends with the scan, not the runtime's blocking pool, which keeps its
+    // thread for 10 s after.
+    if let Err(e) = std::thread::Builder::new()
+        .name("stale-jobs".into())
+        .spawn(move || execd::remove_stale_jobs_dirs(jobs_dir.as_deref()))
+    {
+        execd::log_warn!("cannot start the stale jobs directory scan: {e}");
+    }
     if !secured {
         execd::log_warn!(
             "NO BEARER CONFIGURED: anyone who can reach {} can run commands in this sandbox. \
