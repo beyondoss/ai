@@ -277,7 +277,7 @@ gateway, no load balancer), plus the model: a full `demo.sh all` spends about on
   (a shell is, and ignores SIGTERM), so a stopped task is SIGKILLed with no chance to seal or unlock: a
   hard kill with nothing but `aws ecs stop-task`.
 - **sandbox** task: `execd`, the repo's production exec endpoint (`crates/execd`), which passes the
-  exec conformance suite, notify included (`crates/execd/tests/conformance.rs`). It logs JSON; `execd.jq`
+  exec conformance suite, notify included (`crates/execd/tests/conformance.rs`). It listens beyond loopback, so it requires a bearer: `up.sh` stores a random `sandbox-bearer` in SSM, the task gets it as `EXECD_BEARER` (execd moves it out of its environment at start), and `demo.sh` seals it into every grant as the exec `Authorization` header. It logs JSON; `execd.jq`
   turns each line into the `exec_request`, `exec_start`, `exec_end`, `job_ended_callback` and
   `listening` events the checks and the report read. It runs agent-controlled code, so it has its own security
   group and no EFS mount: nothing admits it to the session store (see "The session store" below).
