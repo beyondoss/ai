@@ -1,5 +1,5 @@
 //! What the bearer and the sandbox are protected from, against the real binary: the token never
-//! reaches a command, execd refuses to start open on a network, and `--run-as` puts execd's memory,
+//! reaches a command, execd refuses to start open on a network, and `EXECD_RUN_AS` puts execd's memory,
 //! environment and files out of a command's reach.
 //!
 //! The root-only tests run execd through `sudo -n` (or as root) and say `SKIPPED` on a host that
@@ -116,15 +116,22 @@ async fn a_command_never_sees_the_bearer_delivered_in_a_file() {
     let file = dir.path().join("bearer");
     std::fs::write(&file, format!("{bearer}\n")).unwrap();
     std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
-    let execd = Execd::start(&["--bearer-file", file.to_str().unwrap()], &[]);
+    let execd = Execd::start(&[("EXECD_BEARER_FILE", file.to_str().unwrap())], &[]);
     let seen = out(&sh(&execd, Some(&bearer), LOOK).await);
     assert!(!seen.contains(bearer.as_str()), "the bearer leaked");
-    // No `EXECD_*` variable reaches a command, or is in its parent's environ (the walk is every
-    // process of every test running beside this one, so it is not read for that).
+    // No `EXECD_*` variable reaches a command's environment. execd's own environ (its parent's, to
+    // the command) still lists the settings it was started with, which are not secrets, but never
+    // the bearer. (The walk is every process of every test running beside this one, so it is not
+    // read for that.)
     let own = seen.split("---walk").next().unwrap();
+    let (env, ppid) = own.split_once("---ppid").unwrap();
     assert!(
-        !own.lines().any(|l| l.starts_with("EXECD_")),
+        !env.lines().any(|l| l.starts_with("EXECD_")),
         "an EXECD_ variable reached a command"
+    );
+    assert!(
+        !ppid.lines().any(|l| l.starts_with("EXECD_BEARER=")),
+        "the bearer is in execd's environ"
     );
 }
 
@@ -200,13 +207,14 @@ async fn a_streamed_command_and_a_job_do_not_see_the_bearer_either() {
 
 #[test]
 fn it_refuses_to_start_open_on_a_network() {
-    let (status, log) = Execd::run_to_exit(&["--listen", ports::CHILD_LISTEN_ALL], &[], false);
+    let (status, log) =
+        Execd::run_to_exit(&[("EXECD_LISTEN", ports::CHILD_LISTEN_ALL)], &[], false);
     assert!(!status.success(), "it started: {log}");
     assert!(log.contains("refusing to start"), "{log}");
-    assert!(log.contains("--insecure-no-auth"), "{log}");
+    assert!(log.contains("EXECD_INSECURE_NO_AUTH"), "{log}");
     // An empty bearer is no bearer.
     let (status, log) = Execd::run_to_exit(
-        &["--listen", ports::CHILD_LISTEN_ALL],
+        &[("EXECD_LISTEN", ports::CHILD_LISTEN_ALL)],
         &[("EXECD_BEARER", "")],
         false,
     );
@@ -220,10 +228,8 @@ fn it_refuses_to_start_open_on_a_network() {
     std::fs::write(&empty, "\n").unwrap();
     let (status, log) = Execd::run_to_exit(
         &[
-            "--listen",
-            ports::CHILD_LISTEN,
-            "--bearer-file",
-            empty.to_str().unwrap(),
+            ("EXECD_LISTEN", ports::CHILD_LISTEN),
+            ("EXECD_BEARER_FILE", empty.to_str().unwrap()),
         ],
         &[],
         false,
@@ -243,13 +249,17 @@ async fn it_starts_open_on_loopback_and_on_a_network_only_when_told_or_secured()
     let req = json!({ "command": "true" });
     assert_eq!(post(addr, &[], &req).await.status, 401);
     // All interfaces with nothing, on purpose: allowed, and louder.
-    let deliberate = Execd::start_on(ports::CHILD_LISTEN_ALL, &["--insecure-no-auth"], &[]);
+    let deliberate = Execd::start_on(
+        ports::CHILD_LISTEN_ALL,
+        &[("EXECD_INSECURE_NO_AUTH", "1")],
+        &[],
+    );
     assert!(deliberate.log().contains("NO BEARER CONFIGURED"));
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], deliberate.addr.port()));
     assert_eq!(post(addr, &[], &req).await.status, 200);
 }
 
-// --- --run-as, without root -------------------------------------------------------------------
+// --- EXECD_RUN_AS, without root -------------------------------------------------------------------
 
 fn my_uid() -> u32 {
     std::fs::metadata("/proc/self").unwrap().uid()
@@ -262,7 +272,7 @@ fn my_gid() -> u32 {
 #[test]
 fn run_as_refuses_the_uid_execd_already_has() {
     let me = format!("{}:{}", my_uid(), my_gid());
-    let (status, log) = Execd::run_to_exit(&["--run-as", &me], &[], false);
+    let (status, log) = Execd::run_to_exit(&[("EXECD_RUN_AS", &me)], &[], false);
     assert!(!status.success(), "{log}");
     assert!(log.contains("execd's own uid"), "{log}");
 }
@@ -273,16 +283,16 @@ fn run_as_refuses_when_execd_cannot_switch() {
         return;
     }
     // `nobody` exists on every host this runs on, and an unprivileged execd cannot become it.
-    let (status, log) = Execd::run_to_exit(&["--run-as", "nobody"], &[], false);
+    let (status, log) = Execd::run_to_exit(&[("EXECD_RUN_AS", "nobody")], &[], false);
     assert!(!status.success(), "it started: {log}");
     assert!(log.contains("cannot switch"), "{log}");
-    let (status, log) = Execd::run_to_exit(&["--run-as", "no-such-user-xyz"], &[], false);
+    let (status, log) = Execd::run_to_exit(&[("EXECD_RUN_AS", "no-such-user-xyz")], &[], false);
     assert!(!status.success() && log.contains("no such user"), "{log}");
-    let (status, log) = Execd::run_to_exit(&["--run-as", "4242"], &[], false);
+    let (status, log) = Execd::run_to_exit(&[("EXECD_RUN_AS", "4242")], &[], false);
     assert!(!status.success() && log.contains("name its gid"), "{log}");
 }
 
-// --- --run-as, as root ------------------------------------------------------------------------
+// --- EXECD_RUN_AS, as root ------------------------------------------------------------------------
 
 fn sudo(args: &[&str]) {
     let ok = Command::new("sudo")
@@ -301,7 +311,10 @@ async fn run_as_refuses_root_when_execd_is_root() {
         return;
     }
     let (status, log) = Execd::run_to_exit(
-        &["--listen", ports::CHILD_LISTEN, "--run-as", "root"],
+        &[
+            ("EXECD_LISTEN", ports::CHILD_LISTEN),
+            ("EXECD_RUN_AS", "root"),
+        ],
         &[],
         true,
     );
@@ -311,7 +324,7 @@ async fn run_as_refuses_root_when_execd_is_root() {
     );
 }
 
-/// Under `--run-as`, a command is another user and cannot read execd's memory, its environment or a
+/// Under `EXECD_RUN_AS`, a command is another user and cannot read execd's memory, its environment or a
 /// 0600 bearer file execd owns; a request still works end to end, from the right directory and home.
 #[tokio::test]
 async fn under_run_as_a_command_cannot_reach_execd() {
@@ -325,10 +338,8 @@ async fn under_run_as_a_command_cannot_reach_execd() {
     let decoy = Decoy::start(&bearer);
     let Some(execd) = Execd::start_as_root(
         &[
-            "--run-as",
-            "nobody",
-            "--bearer-file",
-            file.to_str().unwrap(),
+            ("EXECD_RUN_AS", "nobody"),
+            ("EXECD_BEARER_FILE", file.to_str().unwrap()),
         ],
         &[],
     ) else {
@@ -410,11 +421,12 @@ async fn under_run_as_a_command_cannot_reach_execd() {
     drop(decoy);
 }
 
-/// `--home` still wins over the user's own home, and a `SIGTERM` to execd (root) kills the jobs and
+/// `EXECD_HOME` still wins over the user's own home, and a `SIGTERM` to execd (root) kills the jobs and
 /// commands of the user it switched to.
 #[tokio::test]
 async fn under_run_as_home_is_configurable_and_shutdown_kills_the_users_jobs() {
-    let Some(mut execd) = Execd::start_as_root(&["--run-as", "nobody", "--home", "/tmp"], &[])
+    let Some(mut execd) =
+        Execd::start_as_root(&[("EXECD_RUN_AS", "nobody"), ("EXECD_HOME", "/tmp")], &[])
     else {
         return;
     };
@@ -472,11 +484,11 @@ async fn under_run_as_home_is_configurable_and_shutdown_kills_the_users_jobs() {
     }
 }
 
-/// Everything the spec lets a command depend on holds under `--run-as`: stdin, a `cwd` the user
+/// Everything the spec lets a command depend on holds under `EXECD_RUN_AS`: stdin, a `cwd` the user
 /// can enter, an exit status, a missing program, a directory the user may not enter.
 #[tokio::test]
 async fn under_run_as_the_envelope_behaves() {
-    let Some(execd) = Execd::start_as_root(&["--run-as", "nobody:daemon"], &[]) else {
+    let Some(execd) = Execd::start_as_root(&[("EXECD_RUN_AS", "nobody:daemon")], &[]) else {
         return;
     };
     let addr = std::net::SocketAddr::V4(execd.addr);
@@ -520,12 +532,12 @@ async fn under_run_as_the_envelope_behaves() {
     assert_eq!(frames.last().unwrap()["exit_code"], 3, "{frames:?}");
 }
 
-/// A `--root` the user cannot use is said so at startup, and a command then fails as the user.
+/// An `EXECD_ROOT` the user cannot use is said so at startup, and a command then fails as the user.
 #[tokio::test]
 async fn under_run_as_an_unusable_root_is_reported_at_startup() {
     let Some(execd) = Execd::start_as_root_in(
         Some(std::path::Path::new("/root")),
-        &["--run-as", "nobody"],
+        &[("EXECD_RUN_AS", "nobody")],
         &[],
     ) else {
         return;
@@ -588,7 +600,10 @@ async fn notify_tokens_and_callback_urls_never_reach_the_log() {
         }
     });
     let execd = Execd::start(
-        &["--kept-jobs-survive-idle", "--log-level", "trace"],
+        &[
+            ("EXECD_KEPT_JOBS_SURVIVE_IDLE", "1"),
+            ("EXECD_LOG", "trace"),
+        ],
         &[("EXECD_BEARER", &bearer)],
     );
     let addr = std::net::SocketAddr::V4(execd.addr);
@@ -631,13 +646,14 @@ async fn notify_tokens_and_callback_urls_never_reach_the_log() {
         log.contains("callback"),
         "the callbacks left no trace line: {log}"
     );
-    assert!(log.contains("TRACE"), "not a trace log");
+    // The most verbose level: execd has no events below debug, so this is every line it can write.
+    assert!(log.contains(" INFO "), "no log lines: {log}");
     for secret in [&token_secret, &url_secret, &bearer] {
         assert!(!log.contains(secret.as_str()), "a secret is in the log");
     }
 }
 
-/// Under `--run-as`, the jobs directory is execd's: a command (another user) can neither list it
+/// Under `EXECD_RUN_AS`, the jobs directory is execd's: a command (another user) can neither list it
 /// nor read a chunk file of a job's retained output, while execd itself still reads the output back.
 #[tokio::test]
 async fn under_run_as_a_command_cannot_list_or_read_the_jobs_dir() {
@@ -649,10 +665,8 @@ async fn under_run_as_a_command_cannot_list_or_read_the_jobs_dir() {
     .unwrap();
     let Some(execd) = Execd::start_as_root(
         &[
-            "--run-as",
-            "nobody",
-            "--jobs-dir",
-            base.path().to_str().unwrap(),
+            ("EXECD_RUN_AS", "nobody"),
+            ("EXECD_JOBS_DIR", base.path().to_str().unwrap()),
         ],
         &[],
     ) else {
@@ -740,7 +754,7 @@ async fn a_broken_trust_store_is_warned_about_by_name() {
     ] {
         let bearer = token(&format!("trust_{case}"));
         let execd = Execd::start(
-            &["--kept-jobs-survive-idle"],
+            &[("EXECD_KEPT_JOBS_SURVIVE_IDLE", "1")],
             &[("EXECD_BEARER", &bearer), ("SSL_CERT_FILE", &file)],
         );
         let addr = std::net::SocketAddr::V4(execd.addr);

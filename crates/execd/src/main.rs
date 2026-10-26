@@ -1,79 +1,13 @@
-//! The `execd` binary: `execd --listen 0.0.0.0:8080`.
+//! The `execd` binary: `EXECD_LISTEN=0.0.0.0:8080 execd`. It takes no arguments.
 
 use std::os::fd::IntoRawFd as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
-use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::Parser;
+mod config;
 
-/// An exec endpoint for a sandbox: runs the agent's commands and jobs (exec protocol v1.1 to v1.4).
-#[derive(Parser, Debug)]
-#[command(version)]
-struct Cli {
-    /// Address to listen on.
-    #[arg(long, env = "EXECD_LISTEN", default_value = "127.0.0.1:8080")]
-    listen: String,
-
-    /// Where a command runs when its request names no directory (default: the current directory).
-    #[arg(long, env = "EXECD_ROOT")]
-    root: Option<PathBuf>,
-
-    /// `HOME` for every command (default: execd's own, or with `--run-as` the user's own).
-    #[arg(long, env = "EXECD_HOME")]
-    home: Option<PathBuf>,
-
-    /// A file holding the bearer token every request must present (mode 0600 is best). The
-    /// environment variable `EXECD_BEARER` holds the token itself. Never a command-line argument:
-    /// argv is visible in `ps`. With neither, execd refuses to start unless it listens on a
-    /// loopback address or `--insecure-no-auth` says so.
-    #[arg(long, env = "EXECD_BEARER_FILE")]
-    bearer_file: Option<PathBuf>,
-
-    /// Serve without a bearer on a non-loopback address: anyone who can reach execd can run
-    /// commands in this sandbox. Only for a network that is itself the access control.
-    #[arg(long, env = "EXECD_INSECURE_NO_AUTH")]
-    insecure_no_auth: bool,
-
-    /// Run every command as this user, `user`, `uid`, `user:group` or `uid:gid`, with the user's
-    /// groups, instead of execd's own uid. Then a command cannot read execd's memory, its
-    /// environment or a bearer file execd owns. execd must be root (or hold CAP_SETUID, CAP_SETGID
-    /// and CAP_KILL) and the user must not be execd's own.
-    #[arg(long, env = "EXECD_RUN_AS")]
-    run_as: Option<String>,
-
-    /// Say that a kept job survives this sandbox going idle, which turns on advertising v1.4
-    /// job-end notify. Leave it off for a sandbox a vendor stops or kills when idle.
-    #[arg(long, env = "EXECD_KEPT_JOBS_SURVIVE_IDLE")]
-    kept_jobs_survive_idle: bool,
-
-    /// The most output one v1.1 answer carries, in bytes; past it the answer is an error saying
-    /// the command ran. Match the agent's `--exec-max-response-bytes`.
-    #[arg(long, env = "EXECD_MAX_RESPONSE_BYTES", default_value_t = execd::MAX_RESPONSE_BYTES)]
-    max_response_bytes: usize,
-
-    /// Where kept jobs' retained output (the last 8 MiB of each) is spooled, in a directory of
-    /// execd's own. Default: `$TMPDIR`, else `/tmp`. Use a disk-backed directory: on tmpfs the
-    /// output is RAM.
-    #[arg(long, env = "EXECD_JOBS_DIR")]
-    jobs_dir: Option<PathBuf>,
-
-    /// Log level: error, warn, info, debug or trace (or a tracing filter).
-    #[arg(long, env = "EXECD_LOG", default_value = "info")]
-    log_level: String,
-
-    /// Log format: `text` (for a person) or `json` (one object per line, the event's fields beside
-    /// `timestamp`, `level` and `message`, for a log pipeline).
-    #[arg(long, env = "EXECD_LOG_FORMAT", default_value = "text")]
-    log_format: LogFormat,
-}
-
-#[derive(clap::ValueEnum, Clone, Copy, Debug)]
-enum LogFormat {
-    Text,
-    Json,
-}
+use config::Config;
 
 /// The variable that carries the bearer across the re-exec that scrubs it from the environment: the
 /// number of an inherited descriptor holding it.
@@ -124,18 +58,15 @@ fn move_bearer_out_of_environ() {
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// `EXECD_WORKER_THREADS`: unset or `1` is the single-threaded scheduler, `0` is one worker per
-/// CPU, `N` is N workers. execd only moves bytes between sockets and pipes, so one thread carries
-/// more than any sandbox asks of it, and a thread per CPU costs a stack and a heap each (see
-/// ARCHITECTURE.md "Memory").
-fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    let mut b = match std::env::var("EXECD_WORKER_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-    {
-        None | Some(1) => tokio::runtime::Builder::new_current_thread(),
-        Some(0) => tokio::runtime::Builder::new_multi_thread(),
-        Some(n) => {
+/// `EXECD_WORKER_THREADS`: `1` (the default) is the single-threaded scheduler, `0` is one worker
+/// per CPU, `N` is N workers. execd only moves bytes between sockets and pipes, so one thread
+/// carries more than any sandbox asks of it, and a thread per CPU costs a stack and a heap each
+/// (see ARCHITECTURE.md "Memory").
+fn runtime(worker_threads: usize) -> std::io::Result<tokio::runtime::Runtime> {
+    let mut b = match worker_threads {
+        1 => tokio::runtime::Builder::new_current_thread(),
+        0 => tokio::runtime::Builder::new_multi_thread(),
+        n => {
             let mut b = tokio::runtime::Builder::new_multi_thread();
             b.worker_threads(n);
             b
@@ -152,9 +83,9 @@ fn take_inherited_bearer() -> Option<String> {
     token
 }
 
-/// What `--bearer-file` / the environment hold, with trailing newlines trimmed. `Err` for a file
+/// What `EXECD_BEARER_FILE` / `EXECD_BEARER` hold, with trailing newlines trimmed. `Err` for a file
 /// that is named but unreadable or empty: a bearer that was asked for must not silently vanish.
-fn bearer(cli: &Cli, inherited: Option<String>) -> Result<Option<String>, String> {
+fn bearer(cli: &Config, inherited: Option<String>) -> Result<Option<String>, String> {
     let trim = |s: String| s.trim_end_matches(['\n', '\r']).to_string();
     if let Some(path) = &cli.bearer_file {
         let text = std::fs::read_to_string(path)
@@ -166,10 +97,10 @@ fn bearer(cli: &Cli, inherited: Option<String>) -> Result<Option<String>, String
         if let Ok(meta) = std::fs::metadata(path)
             && meta.permissions().mode() & 0o077 != 0
         {
-            tracing::warn!(
-                path = %path.display(),
-                mode = format!("{:o}", meta.permissions().mode() & 0o777),
-                "the bearer file is readable by others: chmod 600 it"
+            execd::log_warn!(
+                "the bearer file {} is readable by others (mode {:o}): chmod 600 it",
+                path.display(),
+                meta.permissions().mode() & 0o777
             );
         }
         return Ok(Some(token));
@@ -184,29 +115,33 @@ fn main() -> ExitCode {
     if let Some(code) = execd::helper_main() {
         return code;
     }
+    // Configuration is the environment alone: any argument is a mistake, and the usage says so.
+    if std::env::args_os().nth(1).is_some() {
+        eprint!("{}", config::USAGE);
+        return ExitCode::from(2);
+    }
+    let cli = match config::parse(|k| std::env::var(k).ok()) {
+        Ok(cli) => cli,
+        Err(e) => {
+            eprintln!("execd: {e}");
+            return ExitCode::from(2);
+        }
+    };
     move_bearer_out_of_environ();
     let inherited = take_inherited_bearer();
-    let cli = Cli::parse();
-    let fmt = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(&cli.log_level))
-        .with_target(false)
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
-        .with_writer(std::io::stderr);
-    match cli.log_format {
-        LogFormat::Text => fmt.init(),
-        LogFormat::Json => fmt.json().flatten_event(true).init(),
-    }
-    let runtime = match runtime() {
+    execd::log::set_level(cli.log_level);
+    execd::log::set_format(cli.log_format);
+    let runtime = match runtime(cli.worker_threads) {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!(error = %e, "execd failed");
+            execd::log_error!("execd failed: {e}");
             return ExitCode::FAILURE;
         }
     };
     match runtime.block_on(run(cli, inherited)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            tracing::error!(error = %e, "execd failed");
+            execd::log_error!("execd failed: {e}");
             ExitCode::FAILURE
         }
     }
@@ -224,7 +159,7 @@ async fn listens_on_loopback(listen: &str) -> std::io::Result<bool> {
     Ok(any)
 }
 
-async fn run(cli: Cli, inherited: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(cli: Config, inherited: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let bearer = bearer(&cli, inherited)?;
     let root = match &cli.root {
         Some(r) => r.clone(),
@@ -236,7 +171,7 @@ async fn run(cli: Cli, inherited: Option<String>) -> Result<(), Box<dyn std::err
         return Err(format!(
             "refusing to start: no bearer is configured and {} is not a loopback address, so \
              anyone who can reach it could run commands. Set EXECD_BEARER_FILE (or EXECD_BEARER), \
-             listen on 127.0.0.1, or pass --insecure-no-auth to run open on purpose",
+             listen on 127.0.0.1, or set EXECD_INSECURE_NO_AUTH=1 to run open on purpose",
             cli.listen
         )
         .into());
@@ -247,7 +182,7 @@ async fn run(cli: Cli, inherited: Option<String>) -> Result<(), Box<dyn std::err
         Some(spec) => {
             let resolved = execd::RunAs::resolve(spec)?;
             if let Some(warning) = resolved.run_as.check(&root)? {
-                tracing::warn!("{warning}");
+                execd::log_warn!("{warning}");
             }
             home = home.or(resolved.home);
             Some(resolved.run_as)
@@ -256,7 +191,7 @@ async fn run(cli: Cli, inherited: Option<String>) -> Result<(), Box<dyn std::err
     // Orphans reparent to execd and are reaped here, so a PID 1 (a container, E2B) never fills the
     // sandbox with zombies, and a zombie never counts as a live member of a group.
     if let Err(e) = execd::become_subreaper() {
-        tracing::warn!(error = %e, "cannot become a subreaper; orphans go to the host's init");
+        execd::log_warn!("cannot become a subreaper; orphans go to the host's init: {e}");
     }
 
     let mut opts = execd::Options::new(root);
@@ -270,20 +205,27 @@ async fn run(cli: Cli, inherited: Option<String>) -> Result<(), Box<dyn std::err
     let switched = run_as.is_some();
     opts.run_as = run_as;
 
-    // Before the listener is bound: it reads the whole of /tmp, and a client that finds the port
-    // open expects the server to be ready.
-    execd::remove_stale_jobs_dirs(cli.jobs_dir.as_deref());
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     let server = execd::serve(listener, opts)?;
-    tracing::info!(
-        listen = %server.local_addr(),
-        bearer = secured,
-        run_as = switched,
-        notify = cli.kept_jobs_survive_idle,
-        "execd listening"
+    execd::log_info!(
+        "execd {} listening listen={} bearer={secured} run_as={switched} notify={}",
+        env!("CARGO_PKG_VERSION"),
+        server.local_addr(),
+        cli.kept_jobs_survive_idle
     );
+    // Off the serving path: it reads the whole of the jobs directory's parent (39 ms for a /tmp of
+    // 9,500 entries), and a client that finds the port open expects the server to be ready.
+    let jobs_dir = cli.jobs_dir.clone();
+    // A thread of its own that ends with the scan, not the runtime's blocking pool, which keeps its
+    // thread for 10 s after.
+    if let Err(e) = std::thread::Builder::new()
+        .name("stale-jobs".into())
+        .spawn(move || execd::remove_stale_jobs_dirs(jobs_dir.as_deref()))
+    {
+        execd::log_warn!("cannot start the stale jobs directory scan: {e}");
+    }
     if !secured {
-        tracing::warn!(
+        execd::log_warn!(
             "NO BEARER CONFIGURED: anyone who can reach {} can run commands in this sandbox. \
              Set EXECD_BEARER_FILE (or EXECD_BEARER) to require one.",
             server.local_addr()
@@ -292,7 +234,7 @@ async fn run(cli: Cli, inherited: Option<String>) -> Result<(), Box<dyn std::err
 
     wait_for_signal().await;
     let killed = server.shutdown().await;
-    tracing::info!(killed_groups = killed, "execd stopped");
+    execd::log_info!("execd stopped killed_groups={killed}");
     Ok(())
 }
 
@@ -307,8 +249,8 @@ async fn wait_for_signal() {
         return;
     };
     tokio::select! {
-        _ = term.recv() => tracing::info!("SIGTERM"),
-        _ = int.recv() => tracing::info!("SIGINT"),
+        _ = term.recv() => execd::log_info!("SIGTERM"),
+        _ = int.recv() => execd::log_info!("SIGINT"),
     }
 }
 

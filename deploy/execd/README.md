@@ -2,7 +2,7 @@
 
 `execd` is the in-sandbox exec endpoint the agent talks to (`--exec-url`). It ships as a single fully static musl binary (linux amd64 and arm64), so it runs in any sandbox image: Alpine, Debian, busybox, E2B templates.
 
-Start it with `execd --listen 0.0.0.0:8080 --bearer-file /path/to/token`. `--listen` defaults to `127.0.0.1:8080`. Without a bearer token (`--bearer-file`, or `EXECD_BEARER`) execd refuses to start on any non-loopback address, unless you pass `--insecure-no-auth`. Other flags: `--root`, `--home`, `--kept-jobs-survive-idle`, `--max-response-bytes`, `--log-level`; each also reads an `EXECD_*` environment variable (see `crates/execd/README.md`).
+Start it with `EXECD_LISTEN=0.0.0.0:8080 EXECD_BEARER_FILE=/path/to/token execd`. execd takes no command-line arguments: it is configured by `EXECD_*` environment variables, and `EXECD_LISTEN` defaults to `127.0.0.1:8080`. Without a bearer token (`EXECD_BEARER_FILE`, or `EXECD_BEARER`) execd refuses to start on any non-loopback address, unless you set `EXECD_INSECURE_NO_AUTH=1`. The others are `EXECD_ROOT`, `EXECD_HOME`, `EXECD_KEPT_JOBS_SURVIVE_IDLE`, `EXECD_MAX_RESPONSE_BYTES`, `EXECD_LOG` (see `crates/execd/README.md`).
 
 ## Install
 
@@ -54,7 +54,7 @@ ldd /usr/local/bin/execd  # not a dynamic executable (glibc); musl's ldd may pri
 Then start it, check that `/livez` answers without a token, and run a command with one:
 
 ```sh
-execd --listen 127.0.0.1:8080 --bearer-file /path/to/token &
+EXECD_LISTEN=127.0.0.1:8080 EXECD_BEARER_FILE=/path/to/token execd &
 curl -fs http://127.0.0.1:8080/livez
 curl -s -X POST -H "authorization: Bearer $(cat /path/to/token)" \
   -d '{"command":"sh","args":["-c","echo hi"]}' http://127.0.0.1:8080/

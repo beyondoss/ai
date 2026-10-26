@@ -7,7 +7,7 @@
 #   deploy/execd/test-install.sh target/x86_64-unknown-linux-musl/release/execd
 #
 # Set SKIP_IMAGE=1 to skip the Dockerfile.execd build, or BUILD_CONTEXT=<dir> to build that image
-# from a different workspace root (default: the repo root), or EXECD_ARGS for extra execd flags.
+# from a different workspace root (default: the repo root), or DOCKER_RUN_ARGS for extra `docker run` options (execd is configured by EXECD_* variables: `-e EXECD_LOG=debug`).
 set -euo pipefail
 
 bin="${1:?usage: test-install.sh <path to static execd binary>}"
@@ -108,7 +108,7 @@ echo "ok unsupported arch refused"
 if [ "$serve" = 1 ]; then
   # The installed binary actually serves, with a bearer file.
   printf 's3cret-token\n' >/tmp/token
-  /opt/bin/execd --listen 127.0.0.1:8099 --bearer-file /tmp/token >/tmp/execd.log 2>&1 &
+  EXECD_LISTEN=127.0.0.1:8099 EXECD_BEARER_FILE=/tmp/token /opt/bin/execd >/tmp/execd.log 2>&1 &
   for i in \$(seq 40); do curl -fs http://127.0.0.1:8099/livez >/dev/null && break; sleep 0.25; done
   BASE=http://127.0.0.1:8099 TOKEN=s3cret-token sh /probe.sh
 fi
@@ -130,10 +130,11 @@ COPY --from=$uniq-carrier /execd /usr/local/bin/execd
 EOF
   cport="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
   # shellcheck disable=SC2206
-  execd_args=(${EXECD_ARGS:-})
+  run_args=(${DOCKER_RUN_ARGS:-})
   printf 's3cret-token\n' >"$work/token"
-  docker run -d --name "$uniq-run" -v "$work/token:/token:ro" -p "127.0.0.1:$cport:8080" "$uniq-consumer" \
-    execd --listen 0.0.0.0:8080 --bearer-file /token "${execd_args[@]}" >/dev/null
+  docker run -d --name "$uniq-run" -v "$work/token:/token:ro" -p "127.0.0.1:$cport:8080" \
+    -e EXECD_LISTEN=0.0.0.0:8080 -e EXECD_BEARER_FILE=/token "${run_args[@]}" "$uniq-consumer" \
+    execd >/dev/null
   ok=""
   for _ in $(seq 50); do
     if curl -fs "http://127.0.0.1:$cport/livez" >/dev/null; then ok=1; break; fi

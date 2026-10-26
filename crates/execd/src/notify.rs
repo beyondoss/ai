@@ -182,14 +182,11 @@ async fn run_attempt(
                 Ok(s) => (Some(s), None),
                 Err(e) => (None, Some(e)),
             };
-            tracing::info!(
-                kind = "callback",
-                job = ?key.1,
-                attempt = n,
-                status,
-                error = error.as_deref(),
-                ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                "request"
+            crate::log_info!(
+                "request kind=callback job={:?} attempt={n} status={status:?} error={:?} ms={}",
+                key.1,
+                error.as_deref(),
+                started.elapsed().as_millis()
             );
             if let Some(o) = &ctx.opts.observer {
                 o.callback(&CallbackAttempt {
@@ -204,6 +201,10 @@ async fn run_attempt(
                     error,
                 });
             }
+            crate::log_info!(
+                "request kind=callback job={:?} attempt={n} status={status:?}",
+                key.1
+            );
             status.map_or(exec_notify::Outcome::Failed, exec_notify::Outcome::Status)
         }
         None => exec_notify::Outcome::Failed,
@@ -325,10 +326,9 @@ async fn attempt(ctx: &Ctx, target: &NotifyTarget, key: &Key) -> Result<u16, Str
         .get_or_init(|| async {
             let _ = rustls::crypto::ring::default_provider().install_default();
             if let Some(problem) = trust_store_problem() {
-                tracing::warn!(
-                    %problem,
+                crate::log_warn!(
                     "https callbacks may fail to verify their server: the trust store has a \
-                     problem; set SSL_CERT_FILE or SSL_CERT_DIR to a valid bundle"
+                     problem ({problem}); set SSL_CERT_FILE or SSL_CERT_DIR to a valid bundle"
                 );
             }
             reqwest::Client::builder()

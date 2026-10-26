@@ -45,11 +45,11 @@ stdin and is never written anywhere). Each VM
 - carries the metadata `beyond-ai-demo=<name>` and a 30 minute timeout (`E2B_TIMEOUT`), so `down.sh`
   can find it and it ends by itself if nothing does;
 - gets the same static `execd` binary, uploaded through E2B's envd file API and started with
-  envd's process API (`--kept-jobs-survive-idle`, so it advertises job-end notify), listening on 8081,
+  envd's process API (`EXECD_KEPT_JOBS_SURVIVE_IDLE=1`, so it advertises job-end notify), listening on 8081,
   which E2B exposes at `https://8081-<sandbox id>.e2b.app`;
 - is the exec endpoint of its session only: the session's grant carries that URL and a bearer token
   (an exec header, sealed in the grant), and `execd` answers 401 to anything without it, since the
-  endpoint is on the public internet. The bearer is uploaded as a file (`--bearer-file`) and deleted once
+  endpoint is on the public internet. The bearer is uploaded as a file (`EXECD_BEARER_FILE`) and deleted once
   `execd` has read it, so it is on no command line and in no command's environment.
 
 Job-end notify across the internet: the agent task announces `https://<its-public-ip-dashed>.sslip.io:8443`

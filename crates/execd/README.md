@@ -35,7 +35,7 @@ Daytona, Fargate, docker, Kubernetes or your own.
 - **PID 1 ready.** It adopts and reaps orphans without ever stealing the exit status of a command it awaits, and a zombie never
   counts as a live process ([`tests/reaper.rs`](tests/reaper.rs)).
 - **Safe to expose.** A bearer compared in constant time, read from a file or the environment and never from argv, and never
-  passed to the commands it runs. With none set it refuses to start on any address but loopback. `--run-as` runs every command as
+  passed to the commands it runs. With none set it refuses to start on any address but loopback. `EXECD_RUN_AS` runs every command as
   another user, so a prompt-injected command cannot read the bearer, execd's memory or its environment. Hundreds of hostile
   requests over HTTP/1.1 and h2c are tested to be refused and to run nothing
   ([`tests/auth_matrix.rs`](tests/auth_matrix.rs), [what is and is not guaranteed](ARCHITECTURE.md#security)).
@@ -52,7 +52,7 @@ Copy the binary into your image, then start it with a bearer:
 
 ```sh
 echo -n "$TOKEN" > /run/execd-bearer
-execd --listen 0.0.0.0:8080 --bearer-file /run/execd-bearer
+EXECD_LISTEN=0.0.0.0:8080 EXECD_BEARER_FILE=/run/execd-bearer execd
 ```
 
 Point the agent at it:
@@ -65,32 +65,40 @@ beyond-ai-agent run \
 ```
 
 `--exec-url` and `--exec-header` also work with `serve`, and read `AI_AGENT_EXEC_URL` and `AI_AGENT_EXEC_HEADER`. The agent
-probes the endpoint at attach and uses the highest version it finds. Keep `--max-response-bytes` equal to the agent's
+probes the endpoint at attach and uses the highest version it finds. Keep `EXECD_MAX_RESPONSE_BYTES` equal to the agent's
 `--exec-max-response-bytes`.
 
 Run execd as PID 1 in a container, or under any init: it makes itself the subreaper either way.
 
-## Options
+## Configuration
 
-| flag                       | environment                    | meaning                                                                                                          |
-| -------------------------- | ------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
-| `--listen`                 | `EXECD_LISTEN`                 | address to listen on (default `127.0.0.1:8080`)                                                                  |
-| `--root`                   | `EXECD_ROOT`                   | where a command runs when its request names no directory (default: the current directory)                        |
-| `--home`                   | `EXECD_HOME`                   | `HOME` for every command                                                                                         |
-| `--bearer-file`            | `EXECD_BEARER_FILE`            | a file holding the bearer token (mode 0600); `EXECD_BEARER` holds the token itself, a weaker way                 |
-| `--insecure-no-auth`       | `EXECD_INSECURE_NO_AUTH`       | serve with no bearer on a non-loopback address; without it execd refuses to start                                |
-| `--run-as`                 | `EXECD_RUN_AS`                 | run every command as `user`, `uid`, `user:group` or `uid:gid` with the user's groups; execd must be root         |
-| `--kept-jobs-survive-idle` | `EXECD_KEPT_JOBS_SURVIVE_IDLE` | advertise v1.4 job-end notify; say so only if this sandbox is not stopped when idle                              |
-| `--max-response-bytes`     | `EXECD_MAX_RESPONSE_BYTES`     | most output one v1.1 answer carries (default 16 MiB); match the agent's `--exec-max-response-bytes`              |
-| `--jobs-dir`               | `EXECD_JOBS_DIR`               | where a kept job's last 8 MiB of output is spooled (default `$TMPDIR`, else `/tmp`); use a disk-backed directory |
-| `--log-level`              | `EXECD_LOG`                    | `error`, `warn`, `info`, `debug` or `trace`                                                                      |
-| `--log-format`             | `EXECD_LOG_FORMAT`             | `text` (default) or `json`: one object per line, the event's fields beside `timestamp`                           |
+execd takes no command-line arguments, only environment variables, read once at startup. A value that does not parse is an
+error that names the variable and the value (exit 2), and so is any argument: execd prints this list and exits. A boolean is
+`1`, `true`, `0` or `false`; an empty variable is unset.
+
+| variable                       | meaning                                                                                                          |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `EXECD_LISTEN`                 | address to listen on (default `127.0.0.1:8080`)                                                                  |
+| `EXECD_ROOT`                   | where a command runs when its request names no directory (default: the current directory)                        |
+| `EXECD_HOME`                   | `HOME` for every command                                                                                         |
+| `EXECD_BEARER_FILE`            | a file holding the bearer token (mode 0600)                                                                      |
+| `EXECD_BEARER`                 | the bearer token itself, a weaker way: execd moves it out of its environment at once                             |
+| `EXECD_INSECURE_NO_AUTH`       | serve with no bearer on a non-loopback address; without it execd refuses to start                                |
+| `EXECD_RUN_AS`                 | run every command as `user`, `uid`, `user:group` or `uid:gid` with the user's groups; execd must be root         |
+| `EXECD_KEPT_JOBS_SURVIVE_IDLE` | advertise v1.4 job-end notify; say so only if this sandbox is not stopped when idle                              |
+| `EXECD_MAX_RESPONSE_BYTES`     | most output one v1.1 answer carries (default 16 MiB); match the agent's `--exec-max-response-bytes`              |
+| `EXECD_JOBS_DIR`               | where a kept job's last 8 MiB of output is spooled (default `$TMPDIR`, else `/tmp`); use a disk-backed directory |
+| `EXECD_LOG`                    | `off`, `error`, `warn`, `info` (default), `debug` or `trace`                                                     |
+| `EXECD_LOG_FORMAT`             | `text` (default) or `json`: one object per line with `timestamp`, `level` and `message`                          |
+| `EXECD_WORKER_THREADS`         | `1` (default) one thread; `0` a worker per CPU; `N` workers                                                      |
+
+No `EXECD_*` variable reaches the commands execd runs. The startup line logs execd's version.
 
 `GET /livez` answers 200 without authentication, and nothing else is open. `SIGTERM` and `SIGINT` kill every running process
 group and exit.
 
-Without `--run-as` a command is the same user as execd and can read its memory and any file it owns, the bearer file included.
-With it, and with the token in a root-owned 0600 file, it cannot. `--root` must be writable by the `--run-as` user (execd says at
+Without `EXECD_RUN_AS` a command is the same user as execd and can read its memory and any file it owns, the bearer file included.
+With it, and with the token in a root-owned 0600 file, it cannot. `EXECD_ROOT` must be writable by the `EXECD_RUN_AS` user (execd says at
 startup when it is not). See [ARCHITECTURE.md](ARCHITECTURE.md#security) for what each control guarantees and what it does not.
 
 ## Embedding

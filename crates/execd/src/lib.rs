@@ -31,6 +31,7 @@ mod exec;
 mod frame;
 mod http;
 mod jobs;
+pub mod log;
 mod notify;
 mod proc;
 mod runas;

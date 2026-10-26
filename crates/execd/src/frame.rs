@@ -7,6 +7,14 @@ use serde_json::Value;
 /// The most raw output one frame carries: the spec's ceiling (`stream::MAX_FRAME_PAYLOAD`, 64 KiB).
 pub(crate) const FRAME_MAX: usize = 64 * 1024;
 
+/// How much a pipe read asks for, and so the largest frame a streamed command produces (the spec
+/// allows 64 KiB; smaller is allowed too). Measured on static musl, 2 CPUs, 16 slow readers:
+/// 16 KiB frames cost 194 KiB per blocked stream against 1093 KiB at 64 KiB, and move more, not
+/// less (862 MB/s against 741, 1.14 against 1.32 server CPU-s/GB), because a 16 KiB buffer stays
+/// inside malloc's small-size path. 8 KiB lost 30% of the rate and 4 KiB 70%. See ARCHITECTURE.md
+/// "Memory".
+pub(crate) const READ_BUF: usize = 16 * 1024;
+
 /// An output frame, `{"<key>":"<base64>"}\n`. `data` must be non-empty and at most [`FRAME_MAX`].
 pub(crate) fn output(key: &str, data: &[u8]) -> Bytes {
     let mut s = String::with_capacity(key.len() + data.len().div_ceil(3) * 4 + 8);

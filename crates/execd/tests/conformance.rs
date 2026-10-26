@@ -18,9 +18,12 @@ use support::Execd;
 /// the verifier has, behind a bearer.
 #[tokio::test]
 async fn the_binary_passes_every_check_v11_to_v14() {
-    // At trace level, so the log holds everything every crate underneath would say.
+    // At the most verbose level, so the log holds everything execd would say.
     let execd = Execd::start(
-        &["--kept-jobs-survive-idle", "--log-level", "trace"],
+        &[
+            ("EXECD_KEPT_JOBS_SURVIVE_IDLE", "1"),
+            ("EXECD_LOG", "debug"),
+        ],
         &[("EXECD_BEARER", "s3cret-bearer")],
     );
     let headers = [(
@@ -40,14 +43,13 @@ async fn the_binary_passes_every_check_v11_to_v14() {
         .collect();
     assert!(not_passed.is_empty(), "{not_passed:?}\n{}", report.render());
     assert_eq!(report.checks.len(), 17 + conformance::notify::CHECKS.len());
-    // The whole run's log, at trace, never held the bearer; and it is a real trace, not an empty one.
+    // The whole run's log, at its most verbose, never held the bearer; and it is a real log, not an empty one.
     let log = execd.log();
     assert!(
-        log.lines().count() > 200,
-        "a trace log is not this short: {}",
+        log.lines().count() > 100,
+        "a verbose log is not this short: {}",
         log.lines().count()
     );
-    assert!(log.contains("TRACE"), "the log is not at trace level");
     assert!(!log.contains("s3cret-bearer"), "the bearer is in the log");
     assert!(
         !log.to_lowercase().contains("bearer "),
@@ -56,11 +58,14 @@ async fn the_binary_passes_every_check_v11_to_v14() {
 }
 
 /// The verifier cannot tell it is talking to an endpoint whose commands run as another user: every
-/// check passes under `--run-as`, with the bearer in the environment. Needs root (or `sudo -n`).
+/// check passes under `EXECD_RUN_AS`, with the bearer in the environment. Needs root (or `sudo -n`).
 #[tokio::test]
 async fn the_binary_passes_every_check_under_run_as() {
     let Some(execd) = Execd::start_as_root(
-        &["--kept-jobs-survive-idle", "--run-as", "nobody"],
+        &[
+            ("EXECD_KEPT_JOBS_SURVIVE_IDLE", "1"),
+            ("EXECD_RUN_AS", "nobody"),
+        ],
         &[("EXECD_BEARER", "s3cret-run-as-bearer")],
     ) else {
         return;

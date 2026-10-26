@@ -31,7 +31,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, Sleep};
 
-use crate::frame::{self, FRAME_MAX};
+use crate::frame::{self, READ_BUF};
 use crate::http::{self, Line, Request, Resp};
 use crate::proc::{self, Proc, locked};
 use crate::{Ctx, StreamEnd, StreamStart};
@@ -42,7 +42,7 @@ pub(crate) const PIPE_GRACE: Duration = Duration::from_millis(100);
 
 /// The command a request describes, ready to spawn: its `cwd` (default: the root), `HOME`, and
 /// piped output. Nothing of execd's own secrets reaches it: every `EXECD_*` variable is removed
-/// (the bearer must not be in a command's environment). Under `--run-as` the switch helper becomes
+/// (the bearer must not be in a command's environment). Under `EXECD_RUN_AS` the switch helper becomes
 /// the command, as the target user.
 pub(crate) fn command_for(ctx: &Ctx, req: &Request) -> std::process::Command {
     let cwd = req
@@ -112,7 +112,7 @@ async fn capture<R: tokio::io::AsyncRead + Unpin>(
     budget: Arc<AtomicUsize>,
     dropped: Arc<AtomicBool>,
 ) {
-    let mut buf = vec![0u8; FRAME_MAX];
+    let mut buf = vec![0u8; READ_BUF];
     while let Ok(n) = pipe.read(&mut buf).await {
         if n == 0 {
             break;
@@ -303,7 +303,7 @@ fn pump<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     tx: mpsc::Sender<Bytes>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut buf = vec![0u8; FRAME_MAX];
+        let mut buf = vec![0u8; READ_BUF];
         while let Ok(n) = pipe.read(&mut buf).await {
             if n == 0 || tx.send(frame::output(key, &buf[..n])).await.is_err() {
                 return;

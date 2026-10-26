@@ -13,7 +13,7 @@
 //! **Safety.** The directories are created `0700` and the files `0600`, each with `create_new`
 //! (`O_EXCL`) and `O_NOFOLLOW`, and a job's directory is named by a counter, never by anything a
 //! client sends, so a command cannot plant a symlink that redirects a write nor name its way out.
-//! Without `--run-as` a command runs as execd's own uid and can read what execd can; with it the
+//! Without `EXECD_RUN_AS` a command runs as execd's own uid and can read what execd can; with it the
 //! commands run as another uid and the `0700` directory is closed to them.
 //!
 //! **Stale directories.** At startup, a directory in the base that is named like this, is a real
@@ -68,13 +68,17 @@ impl JobsDir {
         let Ok(st) = statfs(&self.path) else { return };
         let kind = st.filesystem_type();
         if kind == TMPFS_MAGIC || (kind.0 as u64) & 0xffff_ffff == RAMFS_MAGIC {
-            tracing::warn!(
-                dir = %self.path.display(),
-                "the jobs directory is on tmpfs, so retained job output (up to 8 MiB per job) \
-                 is RAM here; point --jobs-dir (EXECD_JOBS_DIR) at a disk-backed directory"
+            crate::log_warn!(
+                "the jobs directory {} is on tmpfs, so retained job output (up to 8 MiB per job) \
+                 is RAM here; point EXECD_JOBS_DIR at a disk-backed directory",
+                self.path.display()
             );
         } else {
-            tracing::info!(dir = %self.path.display(), fs_type = format!("{:#x}", kind.0), "jobs directory");
+            crate::log_info!(
+                "jobs directory {} fs_type={:#x}",
+                self.path.display(),
+                kind.0
+            );
         }
     }
 
@@ -100,7 +104,7 @@ fn base_dir(base: Option<&Path>) -> PathBuf {
 }
 
 /// Remove the jobs directories of execds that are gone (see the module doc). A binary calls this
-/// once, before it starts serving; it reads the whole of the base directory.
+/// once, off its serving path; it reads the whole of the base directory.
 pub fn remove_stale_jobs_dirs(base: Option<&Path>) {
     if let Ok(meta) = fs::metadata("/proc/self") {
         remove_stale(&base_dir(base), meta.uid(), std::process::id());

@@ -646,7 +646,7 @@ fn pump<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     progress: Arc<AtomicUsize>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut buf = vec![0u8; FRAME_MAX];
+        let mut buf = vec![0u8; frame::READ_BUF];
         while let Ok(n) = pipe.read(&mut buf).await {
             if n == 0 {
                 break;

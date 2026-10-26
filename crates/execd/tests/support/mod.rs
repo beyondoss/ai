@@ -65,24 +65,23 @@ impl Drop for Watchdog {
 
 impl Execd {
     /// Start `execd` on a loopback port it picks, rooted in a fresh directory. `env` is added to its
-    /// environment, `args` to its command line.
-    pub fn start(args: &[&str], env: &[(&str, &str)]) -> Self {
-        Self::start_on(ports::CHILD_LISTEN, args, env)
+    /// environment, and `settings` (`EXECD_*` variables) too: execd takes no arguments.
+    pub fn start(settings: &[(&str, &str)], env: &[(&str, &str)]) -> Self {
+        Self::start_on(ports::CHILD_LISTEN, settings, env)
     }
 
     /// [`Self::start`], listening on `listen` (a port-0 address, read back from the socket).
-    pub fn start_on(listen: &str, args: &[&str], env: &[(&str, &str)]) -> Self {
+    pub fn start_on(listen: &str, settings: &[(&str, &str)], env: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut cmd = Command::new(BIN);
-        cmd.args(["--listen", listen, "--root"])
-            .arg(dir.path())
-            .args(args)
+        cmd.env("EXECD_LISTEN", listen)
+            .env("EXECD_ROOT", dir.path())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(dir.path().join("execd.log")).unwrap())
             .env_remove("EXECD_BEARER")
             .env_remove("EXECD_BEARER_FILE");
-        for (k, v) in env {
+        for (k, v) in settings.iter().chain(env) {
             cmd.env(k, v);
         }
         let child = cmd.spawn().unwrap();
@@ -105,11 +104,11 @@ impl Execd {
         me
     }
 
-    /// Run `execd` with these arguments (no `--listen` or `--root` added) until it exits on its own,
+    /// Run `execd` with these settings (no `EXECD_LISTEN` or `EXECD_ROOT` added) until it exits on its own,
     /// for a start that must be refused: its exit status and everything it logged. Killed after
     /// 20 s, which a test reads as "it did not refuse".
     pub fn run_to_exit(
-        args: &[&str],
+        settings: &[(&str, &str)],
         env: &[(&str, &str)],
         as_root: bool,
     ) -> (std::process::ExitStatus, String) {
@@ -118,19 +117,18 @@ impl Execd {
         let mut cmd = if as_root {
             let mut c = Command::new("sudo");
             c.arg("-n");
-            preserve(&mut c, env);
+            preserve(&mut c, &[settings, env].concat());
             c.arg(BIN);
             c
         } else {
             Command::new(BIN)
         };
-        cmd.args(args)
-            .stdin(Stdio::null())
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap())
             .env_remove("EXECD_BEARER")
             .env_remove("EXECD_BEARER_FILE");
-        for (k, v) in env {
+        for (k, v) in settings.iter().chain(env) {
             cmd.env(k, v);
         }
         let mut child = cmd.spawn().unwrap();
@@ -161,16 +159,16 @@ impl Execd {
 
     /// [`Self::start`], with execd running as root (through `sudo -n`, unless the test already is
     /// root), listening on a loopback port it picks, rooted in a fresh directory that anyone may
-    /// write (the `--run-as` user is not the test's). `None`, after saying so, when this host gives
+    /// write (the `EXECD_RUN_AS` user is not the test's). `None`, after saying so, when this host gives
     /// the tests no way to be root.
-    pub fn start_as_root(args: &[&str], env: &[(&str, &str)]) -> Option<Self> {
-        Self::start_as_root_in(None, args, env)
+    pub fn start_as_root(settings: &[(&str, &str)], env: &[(&str, &str)]) -> Option<Self> {
+        Self::start_as_root_in(None, settings, env)
     }
 
-    /// [`Self::start_as_root`], with `--root` set to `root` instead of the fresh directory.
+    /// [`Self::start_as_root`], with `EXECD_ROOT` set to `root` instead of the fresh directory.
     pub fn start_as_root_in(
         root: Option<&std::path::Path>,
-        args: &[&str],
+        settings: &[(&str, &str)],
         env: &[(&str, &str)],
     ) -> Option<Self> {
         if !Self::can_be_root() {
@@ -184,19 +182,25 @@ impl Execd {
         )
         .unwrap();
         let pidfile = dir.path().join("execd.pid");
+        let root_dir = root.unwrap_or(dir.path());
+        let settings = [
+            &[
+                ("EXECD_LISTEN", ports::CHILD_LISTEN),
+                ("EXECD_ROOT", root_dir.to_str().unwrap()),
+            ][..],
+            settings,
+        ]
+        .concat();
         let mut cmd = Command::new("sudo");
         cmd.arg("-n");
-        preserve(&mut cmd, env);
+        preserve(&mut cmd, &[&settings[..], env].concat());
         cmd.args(["sh", "-c", "echo $$ > \"$0\"; exec \"$@\""])
             .arg(&pidfile)
             .arg(BIN)
-            .args(["--listen", ports::CHILD_LISTEN, "--root"])
-            .arg(root.unwrap_or(dir.path()))
-            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(dir.path().join("execd.log")).unwrap());
-        for (k, v) in env {
+        for (k, v) in settings.iter().chain(env) {
             cmd.env(k, v);
         }
         let child = cmd.spawn().unwrap();
