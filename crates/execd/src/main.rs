@@ -53,6 +53,12 @@ struct Cli {
     #[arg(long, env = "EXECD_MAX_RESPONSE_BYTES", default_value_t = execd::MAX_RESPONSE_BYTES)]
     max_response_bytes: usize,
 
+    /// Where kept jobs' retained output (the last 8 MiB of each) is spooled, in a directory of
+    /// execd's own. Default: `$TMPDIR`, else `/tmp`. Use a disk-backed directory: on tmpfs the
+    /// output is RAM.
+    #[arg(long, env = "EXECD_JOBS_DIR")]
+    jobs_dir: Option<PathBuf>,
+
     /// Log level: error, warn, info, debug or trace (or a tracing filter).
     #[arg(long, env = "EXECD_LOG", default_value = "info")]
     log_level: String,
@@ -112,6 +118,32 @@ fn move_bearer_out_of_environ() {
     let _ = nix::unistd::close(fd);
 }
 
+/// `mimalloc` is a build option for measuring against the platform's malloc (a static musl
+/// binary's is slow under threads); see ARCHITECTURE.md "Memory".
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// `EXECD_WORKER_THREADS`: unset or `1` is the single-threaded scheduler, `0` is one worker per
+/// CPU, `N` is N workers. execd only moves bytes between sockets and pipes, so one thread carries
+/// more than any sandbox asks of it, and a thread per CPU costs a stack and a heap each (see
+/// ARCHITECTURE.md "Memory").
+fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    let mut b = match std::env::var("EXECD_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        None | Some(1) => tokio::runtime::Builder::new_current_thread(),
+        Some(0) => tokio::runtime::Builder::new_multi_thread(),
+        Some(n) => {
+            let mut b = tokio::runtime::Builder::new_multi_thread();
+            b.worker_threads(n);
+            b
+        }
+    };
+    b.enable_all().build()
+}
+
 /// The bearer a previous image of this process left in a descriptor, read and closed.
 fn take_inherited_bearer() -> Option<String> {
     let fd: i32 = std::env::var(BEARER_FD).ok()?.parse().ok()?;
@@ -164,10 +196,7 @@ fn main() -> ExitCode {
         LogFormat::Text => fmt.init(),
         LogFormat::Json => fmt.json().flatten_event(true).init(),
     }
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
+    let runtime = match runtime() {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(error = %e, "execd failed");
@@ -236,12 +265,16 @@ async fn run(cli: Cli, inherited: Option<String>) -> Result<(), Box<dyn std::err
     opts.home = home;
     opts.max_response_bytes = cli.max_response_bytes;
     opts.kept_jobs_survive_idle = cli.kept_jobs_survive_idle;
+    opts.jobs_dir = cli.jobs_dir.clone();
     let secured = bearer.is_some();
     opts.bearer = bearer;
     opts.insecure_no_auth = cli.insecure_no_auth;
     let switched = run_as.is_some();
     opts.run_as = run_as;
 
+    // Before the listener is bound: it reads the whole of /tmp, and a client that finds the port
+    // open expects the server to be ready.
+    execd::remove_stale_jobs_dirs(cli.jobs_dir.as_deref());
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     let server = execd::serve(listener, opts)?;
     tracing::info!(

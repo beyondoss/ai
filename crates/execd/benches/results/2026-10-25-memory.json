@@ -1,0 +1,3953 @@
+{
+  "date": "2026-10-25",
+  "host": "AMD Ryzen 7 255, Linux 6.12, THP=always on the host (servers run with PR_SET_THP_DISABLE where noted)",
+  "builds": "static musl, release profile, -C relocation-model=static, x86_64",
+  "memory_unit": "KiB, medians of n",
+  "memory": {
+    "unpinned": {
+      "A-reference": {
+        "bin": "/home/jared/execd-mem-bins/beyond-ai-demo",
+        "env": [],
+        "cpus": "",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 3552,
+            "Pss": 3548,
+            "Pss_Anon": 496,
+            "Pss_File": 3052,
+            "Private_Dirty": 3548,
+            "Anonymous": 496,
+            "AnonHugePages": 0,
+            "VmRSS": 3552,
+            "Threads": 17
+          },
+          "streams100": {
+            "Rss": 14120,
+            "Pss": 14116,
+            "Pss_Anon": 11064,
+            "Pss_File": 3052,
+            "Private_Dirty": 14116,
+            "Anonymous": 11064,
+            "AnonHugePages": 0,
+            "VmRSS": 14120,
+            "Threads": 17
+          },
+          "per_stream_pss_kib": 105.72,
+          "per_stream_rss_kib": 105.72,
+          "jobs20_9MiB": {
+            "Rss": 169624,
+            "Pss": 169620,
+            "Pss_Anon": 166504,
+            "Pss_File": 3116,
+            "Private_Dirty": 166612,
+            "Anonymous": 166504,
+            "AnonHugePages": 0,
+            "VmRSS": 169624,
+            "Threads": 17
+          },
+          "per_job_pss_kib": 8303.8,
+          "per_job_rss_kib": 8303.8
+        },
+        "thp_disabled_for_server": true
+      },
+      "B0-today-mt-malloc": {
+        "bin": "/home/jared/execd-mem-bins/execd-musl-malloc",
+        "env": [],
+        "cpus": "",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 3108,
+            "Pss": 3104,
+            "Pss_Anon": 352,
+            "Pss_File": 2752,
+            "Private_Dirty": 352,
+            "Anonymous": 352,
+            "AnonHugePages": 0,
+            "VmRSS": 3108,
+            "Threads": 17
+          },
+          "streams100": {
+            "Rss": 8864,
+            "Pss": 8860,
+            "Pss_Anon": 5980,
+            "Pss_File": 2880,
+            "Private_Dirty": 5980,
+            "Anonymous": 5980,
+            "AnonHugePages": 0,
+            "VmRSS": 8864,
+            "Threads": 17
+          },
+          "per_stream_pss_kib": 57.6,
+          "per_stream_rss_kib": 57.6,
+          "jobs20_9MiB": {
+            "Rss": 188328,
+            "Pss": 188324,
+            "Pss_Anon": 185380,
+            "Pss_File": 2944,
+            "Private_Dirty": 184328,
+            "Anonymous": 185380,
+            "AnonHugePages": 0,
+            "VmRSS": 188328,
+            "Threads": 17
+          },
+          "per_job_pss_kib": 9261.2,
+          "per_job_rss_kib": 9261.2
+        },
+        "thp_disabled_for_server": true
+      },
+      "B1-1t": {
+        "bin": "/home/jared/execd-mem-bins/execd-musl-malloc",
+        "env": [
+          "EXECD_WORKER_THREADS=1"
+        ],
+        "cpus": "",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 2848,
+            "Pss": 2844,
+            "Pss_Anon": 156,
+            "Pss_File": 2688,
+            "Private_Dirty": 156,
+            "Anonymous": 156,
+            "AnonHugePages": 0,
+            "VmRSS": 2848,
+            "Threads": 1
+          },
+          "streams100": {
+            "Rss": 8552,
+            "Pss": 8548,
+            "Pss_Anon": 5668,
+            "Pss_File": 2880,
+            "Private_Dirty": 5664,
+            "Anonymous": 5668,
+            "AnonHugePages": 0,
+            "VmRSS": 8552,
+            "Threads": 1
+          },
+          "per_stream_pss_kib": 57.0,
+          "per_stream_rss_kib": 57.0,
+          "jobs20_9MiB": {
+            "Rss": 192872,
+            "Pss": 192868,
+            "Pss_Anon": 189924,
+            "Pss_File": 2944,
+            "Private_Dirty": 186716,
+            "Anonymous": 189924,
+            "AnonHugePages": 0,
+            "VmRSS": 192872,
+            "Threads": 1
+          },
+          "per_job_pss_kib": 9501.0,
+          "per_job_rss_kib": 9501.0
+        },
+        "thp_disabled_for_server": true
+      },
+      "B2-1t-nolog": {
+        "bin": "/home/jared/execd-mem-bins/execd-hack-nolog",
+        "env": [
+          "EXECD_WORKER_THREADS=1"
+        ],
+        "cpus": "",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 2356,
+            "Pss": 2352,
+            "Pss_Anon": 120,
+            "Pss_File": 2232,
+            "Private_Dirty": 120,
+            "Anonymous": 120,
+            "AnonHugePages": 0,
+            "VmRSS": 2356,
+            "Threads": 1
+          },
+          "streams100": {
+            "Rss": 7980,
+            "Pss": 7976,
+            "Pss_Anon": 5616,
+            "Pss_File": 2360,
+            "Private_Dirty": 5616,
+            "Anonymous": 5616,
+            "AnonHugePages": 0,
+            "VmRSS": 7980,
+            "Threads": 1
+          },
+          "per_stream_pss_kib": 56.28,
+          "per_stream_rss_kib": 56.28,
+          "jobs20_9MiB": {
+            "Rss": 191504,
+            "Pss": 191500,
+            "Pss_Anon": 188948,
+            "Pss_File": 2552,
+            "Private_Dirty": 187204,
+            "Anonymous": 188948,
+            "AnonHugePages": 0,
+            "VmRSS": 191504,
+            "Threads": 1
+          },
+          "per_job_pss_kib": 9457.6,
+          "per_job_rss_kib": 9457.6
+        },
+        "thp_disabled_for_server": true
+      },
+      "B3-1t-nolog-noclap": {
+        "bin": "/home/jared/execd-mem-bins/execd-hack-nolog-noclap",
+        "env": [
+          "EXECD_WORKER_THREADS=1"
+        ],
+        "cpus": "",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 2072,
+            "Pss": 2068,
+            "Pss_Anon": 120,
+            "Pss_File": 1948,
+            "Private_Dirty": 120,
+            "Anonymous": 120,
+            "AnonHugePages": 0,
+            "VmRSS": 2072,
+            "Threads": 1
+          },
+          "streams100": {
+            "Rss": 7680,
+            "Pss": 7676,
+            "Pss_Anon": 5600,
+            "Pss_File": 2076,
+            "Private_Dirty": 5600,
+            "Anonymous": 5600,
+            "AnonHugePages": 0,
+            "VmRSS": 7680,
+            "Threads": 1
+          },
+          "per_stream_pss_kib": 56.12,
+          "per_stream_rss_kib": 56.12,
+          "jobs20_9MiB": {
+            "Rss": 191552,
+            "Pss": 191548,
+            "Pss_Anon": 189280,
+            "Pss_File": 2268,
+            "Private_Dirty": 187648,
+            "Anonymous": 189280,
+            "AnonHugePages": 0,
+            "VmRSS": 191552,
+            "Threads": 1
+          },
+          "per_job_pss_kib": 9474.0,
+          "per_job_rss_kib": 9474.0
+        },
+        "thp_disabled_for_server": true
+      },
+      "B4-1t-pgo": {
+        "bin": "/home/jared/execd-mem-bins/execd-musl-pgo",
+        "env": [
+          "EXECD_WORKER_THREADS=1"
+        ],
+        "cpus": "",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 2548,
+            "Pss": 2544,
+            "Pss_Anon": 168,
+            "Pss_File": 2376,
+            "Private_Dirty": 168,
+            "Anonymous": 168,
+            "AnonHugePages": 0,
+            "VmRSS": 2548,
+            "Threads": 1
+          },
+          "streams100": {
+            "Rss": 8184,
+            "Pss": 8180,
+            "Pss_Anon": 5676,
+            "Pss_File": 2504,
+            "Private_Dirty": 5672,
+            "Anonymous": 5676,
+            "AnonHugePages": 0,
+            "VmRSS": 8184,
+            "Threads": 1
+          },
+          "per_stream_pss_kib": 56.36,
+          "per_stream_rss_kib": 56.36,
+          "jobs20_9MiB": {
+            "Rss": 191248,
+            "Pss": 191244,
+            "Pss_Anon": 188612,
+            "Pss_File": 2632,
+            "Private_Dirty": 186576,
+            "Anonymous": 188612,
+            "AnonHugePages": 0,
+            "VmRSS": 191248,
+            "Threads": 1
+          },
+          "per_job_pss_kib": 9435.2,
+          "per_job_rss_kib": 9435.2
+        },
+        "thp_disabled_for_server": true
+      },
+      "B5-1t-mimalloc-noarena": {
+        "bin": "/home/jared/execd-mem-bins/execd-musl-mimalloc",
+        "env": [
+          "EXECD_WORKER_THREADS=1",
+          "MIMALLOC_DISALLOW_ARENA_ALLOC=1"
+        ],
+        "cpus": "",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 3256,
+            "Pss": 3252,
+            "Pss_Anon": 336,
+            "Pss_File": 2916,
+            "Private_Dirty": 336,
+            "Anonymous": 336,
+            "AnonHugePages": 0,
+            "VmRSS": 3256,
+            "Threads": 1
+          },
+          "streams100": {
+            "Rss": 7004,
+            "Pss": 7000,
+            "Pss_Anon": 3956,
+            "Pss_File": 3044,
+            "Private_Dirty": 3956,
+            "Anonymous": 3956,
+            "AnonHugePages": 0,
+            "VmRSS": 7004,
+            "Threads": 1
+          },
+          "per_stream_pss_kib": 37.44,
+          "per_stream_rss_kib": 37.44,
+          "jobs20_9MiB": {
+            "Rss": 173956,
+            "Pss": 173952,
+            "Pss_Anon": 170844,
+            "Pss_File": 3108,
+            "Private_Dirty": 170844,
+            "Anonymous": 170844,
+            "AnonHugePages": 0,
+            "VmRSS": 173956,
+            "Threads": 1
+          },
+          "per_job_pss_kib": 8534.8,
+          "per_job_rss_kib": 8534.8
+        },
+        "thp_disabled_for_server": true
+      },
+      "B6-1t-pgo-mimalloc-noarena": {
+        "bin": "/home/jared/execd-mem-bins/execd-musl-pgo-mimalloc",
+        "env": [
+          "EXECD_WORKER_THREADS=1",
+          "MIMALLOC_DISALLOW_ARENA_ALLOC=1"
+        ],
+        "cpus": "",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 3144,
+            "Pss": 3140,
+            "Pss_Anon": 336,
+            "Pss_File": 2804,
+            "Private_Dirty": 336,
+            "Anonymous": 336,
+            "AnonHugePages": 0,
+            "VmRSS": 3144,
+            "Threads": 1
+          },
+          "streams100": {
+            "Rss": 7024,
+            "Pss": 7020,
+            "Pss_Anon": 3960,
+            "Pss_File": 3060,
+            "Private_Dirty": 3960,
+            "Anonymous": 3960,
+            "AnonHugePages": 0,
+            "VmRSS": 7024,
+            "Threads": 1
+          },
+          "per_stream_pss_kib": 38.76,
+          "per_stream_rss_kib": 38.76,
+          "jobs20_9MiB": {
+            "Rss": 174336,
+            "Pss": 174332,
+            "Pss_Anon": 171080,
+            "Pss_File": 3252,
+            "Private_Dirty": 171080,
+            "Anonymous": 171080,
+            "AnonHugePages": 0,
+            "VmRSS": 174336,
+            "Threads": 1
+          },
+          "per_job_pss_kib": 8559.6,
+          "per_job_rss_kib": 8559.6
+        },
+        "thp_disabled_for_server": true
+      },
+      "B7-mt-mimalloc-arena": {
+        "bin": "/home/jared/execd-mem-bins/execd-musl-mimalloc",
+        "env": [],
+        "cpus": "",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 4048,
+            "Pss": 4044,
+            "Pss_Anon": 1064,
+            "Pss_File": 2980,
+            "Private_Dirty": 1064,
+            "Anonymous": 1064,
+            "AnonHugePages": 0,
+            "VmRSS": 4048,
+            "Threads": 17
+          },
+          "streams100": {
+            "Rss": 9216,
+            "Pss": 9212,
+            "Pss_Anon": 6168,
+            "Pss_File": 3044,
+            "Private_Dirty": 6168,
+            "Anonymous": 6168,
+            "AnonHugePages": 0,
+            "VmRSS": 9216,
+            "Threads": 17
+          },
+          "per_stream_pss_kib": 51.68,
+          "per_stream_rss_kib": 51.68,
+          "jobs20_9MiB": {
+            "Rss": 181888,
+            "Pss": 181884,
+            "Pss_Anon": 178776,
+            "Pss_File": 3108,
+            "Private_Dirty": 178776,
+            "Anonymous": 178776,
+            "AnonHugePages": 0,
+            "VmRSS": 181888,
+            "Threads": 17
+          },
+          "per_job_pss_kib": 8892.0,
+          "per_job_rss_kib": 8892.0
+        },
+        "thp_disabled_for_server": true
+      },
+      "busybox-httpd": {
+        "bin": "/usr/bin/busybox",
+        "env": [],
+        "cpus": "",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 2144,
+            "Pss": 492,
+            "Pss_Anon": 124,
+            "Pss_File": 368,
+            "Private_Dirty": 124,
+            "Anonymous": 124,
+            "AnonHugePages": 0,
+            "VmRSS": 2144,
+            "Threads": 1
+          }
+        },
+        "thp_disabled_for_server": true
+      },
+      "rust-floor": {
+        "bin": "/home/jared/execd-mem-bins/floor",
+        "env": [],
+        "cpus": "",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 976,
+            "Pss": 972,
+            "Pss_Anon": 96,
+            "Pss_File": 876,
+            "Private_Dirty": 96,
+            "Anonymous": 96,
+            "AnonHugePages": 0,
+            "VmRSS": 976,
+            "Threads": 1
+          }
+        },
+        "thp_disabled_for_server": true
+      }
+    },
+    "taskset_2cpus": {
+      "A-musl": {
+        "bin": "/tmp/claude-1000/-home-jared-ai/6c27c043-1605-40a4-b767-f2549cdc9782/scratchpad/base-musl/x86_64-unknown-linux-musl/release/beyond-ai-demo",
+        "env": [],
+        "cpus": "0,1",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 3344,
+            "Pss": 3340,
+            "Pss_Anon": 288,
+            "Pss_File": 0,
+            "Private_Dirty": 3340,
+            "Anonymous": 288,
+            "AnonHugePages": 0,
+            "VmRSS": 3344,
+            "Threads": 3
+          },
+          "streams100": {
+            "Rss": 13516,
+            "Pss": 13512,
+            "Pss_Anon": 10460,
+            "Pss_File": 0,
+            "Private_Dirty": 13512,
+            "Anonymous": 10460,
+            "AnonHugePages": 0,
+            "VmRSS": 13516,
+            "Threads": 3
+          },
+          "per_stream_pss_kib": 101.52,
+          "per_stream_rss_kib": 101.52,
+          "jobs20_9MiB": {
+            "Rss": 168864,
+            "Pss": 168860,
+            "Pss_Anon": 165744,
+            "Pss_File": 0,
+            "Private_Dirty": 168860,
+            "Anonymous": 165744,
+            "AnonHugePages": 2048,
+            "VmRSS": 168864,
+            "Threads": 3
+          },
+          "per_job_pss_kib": 8275.8,
+          "per_job_rss_kib": 8275.8
+        }
+      },
+      "B-malloc-1t": {
+        "bin": "/tmp/claude-1000/-home-jared-ai/6c27c043-1605-40a4-b767-f2549cdc9782/scratchpad/execd-musl-malloc",
+        "env": [
+          "EXECD_WORKER_THREADS=1"
+        ],
+        "cpus": "0,1",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 2856,
+            "Pss": 2852,
+            "Pss_Anon": 164,
+            "Pss_File": 0,
+            "Private_Dirty": 2852,
+            "Anonymous": 164,
+            "AnonHugePages": 0,
+            "VmRSS": 2856,
+            "Threads": 1
+          },
+          "streams100": {
+            "Rss": 8552,
+            "Pss": 8548,
+            "Pss_Anon": 5668,
+            "Pss_File": 0,
+            "Private_Dirty": 8544,
+            "Anonymous": 5668,
+            "AnonHugePages": 0,
+            "VmRSS": 8552,
+            "Threads": 1
+          },
+          "per_stream_pss_kib": 57.0,
+          "per_stream_rss_kib": 57.0,
+          "jobs20_9MiB": {
+            "Rss": 186656,
+            "Pss": 186652,
+            "Pss_Anon": 183708,
+            "Pss_File": 0,
+            "Private_Dirty": 186164,
+            "Anonymous": 183708,
+            "AnonHugePages": 0,
+            "VmRSS": 186656,
+            "Threads": 1
+          },
+          "per_job_pss_kib": 9190.0,
+          "per_job_rss_kib": 9190.0
+        }
+      },
+      "B-malloc-2t": {
+        "bin": "/tmp/claude-1000/-home-jared-ai/6c27c043-1605-40a4-b767-f2549cdc9782/scratchpad/execd-musl-malloc",
+        "env": [
+          "EXECD_WORKER_THREADS=2"
+        ],
+        "cpus": "0,1",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 2960,
+            "Pss": 2956,
+            "Pss_Anon": 204,
+            "Pss_File": 0,
+            "Private_Dirty": 2956,
+            "Anonymous": 204,
+            "AnonHugePages": 0,
+            "VmRSS": 2960,
+            "Threads": 3
+          },
+          "streams100": {
+            "Rss": 8572,
+            "Pss": 8568,
+            "Pss_Anon": 5688,
+            "Pss_File": 0,
+            "Private_Dirty": 8568,
+            "Anonymous": 5688,
+            "AnonHugePages": 0,
+            "VmRSS": 8572,
+            "Threads": 3
+          },
+          "per_stream_pss_kib": 56.08,
+          "per_stream_rss_kib": 56.08,
+          "jobs20_9MiB": {
+            "Rss": 188160,
+            "Pss": 188156,
+            "Pss_Anon": 185212,
+            "Pss_File": 0,
+            "Private_Dirty": 187692,
+            "Anonymous": 185212,
+            "AnonHugePages": 0,
+            "VmRSS": 188160,
+            "Threads": 3
+          },
+          "per_job_pss_kib": 9234.6,
+          "per_job_rss_kib": 9234.6
+        }
+      },
+      "B-malloc-mt": {
+        "bin": "/tmp/claude-1000/-home-jared-ai/6c27c043-1605-40a4-b767-f2549cdc9782/scratchpad/execd-musl-malloc",
+        "env": [],
+        "cpus": "0,1",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 2964,
+            "Pss": 2960,
+            "Pss_Anon": 208,
+            "Pss_File": 0,
+            "Private_Dirty": 2960,
+            "Anonymous": 208,
+            "AnonHugePages": 0,
+            "VmRSS": 2964,
+            "Threads": 3
+          },
+          "streams100": {
+            "Rss": 8556,
+            "Pss": 8552,
+            "Pss_Anon": 5672,
+            "Pss_File": 0,
+            "Private_Dirty": 8552,
+            "Anonymous": 5672,
+            "AnonHugePages": 0,
+            "VmRSS": 8556,
+            "Threads": 3
+          },
+          "per_stream_pss_kib": 55.92,
+          "per_stream_rss_kib": 55.92,
+          "jobs20_9MiB": {
+            "Rss": 186896,
+            "Pss": 186892,
+            "Pss_Anon": 183948,
+            "Pss_File": 0,
+            "Private_Dirty": 185796,
+            "Anonymous": 183948,
+            "AnonHugePages": 0,
+            "VmRSS": 186896,
+            "Threads": 3
+          },
+          "per_job_pss_kib": 9196.8,
+          "per_job_rss_kib": 9196.8
+        }
+      },
+      "B-mimalloc-1t-noarena": {
+        "bin": "/tmp/claude-1000/-home-jared-ai/6c27c043-1605-40a4-b767-f2549cdc9782/scratchpad/execd-musl-mimalloc",
+        "env": [
+          "MIMALLOC_DISALLOW_ARENA_ALLOC=1",
+          "EXECD_WORKER_THREADS=1"
+        ],
+        "cpus": "0,1",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 3260,
+            "Pss": 3256,
+            "Pss_Anon": 340,
+            "Pss_File": 0,
+            "Private_Dirty": 3256,
+            "Anonymous": 340,
+            "AnonHugePages": 0,
+            "VmRSS": 3260,
+            "Threads": 1
+          },
+          "streams100": {
+            "Rss": 7004,
+            "Pss": 7000,
+            "Pss_Anon": 3956,
+            "Pss_File": 0,
+            "Private_Dirty": 7000,
+            "Anonymous": 3956,
+            "AnonHugePages": 0,
+            "VmRSS": 7004,
+            "Threads": 1
+          },
+          "per_stream_pss_kib": 37.48,
+          "per_stream_rss_kib": 37.48,
+          "jobs20_9MiB": {
+            "Rss": 190956,
+            "Pss": 190952,
+            "Pss_Anon": 187844,
+            "Pss_File": 0,
+            "Private_Dirty": 190952,
+            "Anonymous": 187844,
+            "AnonHugePages": 36864,
+            "VmRSS": 190956,
+            "Threads": 1
+          },
+          "per_job_pss_kib": 9385.0,
+          "per_job_rss_kib": 9385.0
+        }
+      },
+      "B-mimalloc-mt-noarena": {
+        "bin": "/tmp/claude-1000/-home-jared-ai/6c27c043-1605-40a4-b767-f2549cdc9782/scratchpad/execd-musl-mimalloc",
+        "env": [
+          "MIMALLOC_DISALLOW_ARENA_ALLOC=1"
+        ],
+        "cpus": "0,1",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 3524,
+            "Pss": 3520,
+            "Pss_Anon": 540,
+            "Pss_File": 0,
+            "Private_Dirty": 3520,
+            "Anonymous": 540,
+            "AnonHugePages": 0,
+            "VmRSS": 3524,
+            "Threads": 3
+          },
+          "streams100": {
+            "Rss": 7352,
+            "Pss": 7348,
+            "Pss_Anon": 4304,
+            "Pss_File": 0,
+            "Private_Dirty": 7348,
+            "Anonymous": 4304,
+            "AnonHugePages": 0,
+            "VmRSS": 7352,
+            "Threads": 3
+          },
+          "per_stream_pss_kib": 38.32,
+          "per_stream_rss_kib": 38.32,
+          "jobs20_9MiB": {
+            "Rss": 191480,
+            "Pss": 191476,
+            "Pss_Anon": 188368,
+            "Pss_File": 0,
+            "Private_Dirty": 191476,
+            "Anonymous": 188368,
+            "AnonHugePages": 34816,
+            "VmRSS": 191480,
+            "Threads": 3
+          },
+          "per_job_pss_kib": 9397.2,
+          "per_job_rss_kib": 9397.2
+        }
+      },
+      "B-mimalloc-mt": {
+        "bin": "/tmp/claude-1000/-home-jared-ai/6c27c043-1605-40a4-b767-f2549cdc9782/scratchpad/execd-musl-mimalloc",
+        "env": [],
+        "cpus": "0,1",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 9248,
+            "Pss": 9244,
+            "Pss_Anon": 6264,
+            "Pss_File": 0,
+            "Private_Dirty": 9244,
+            "Anonymous": 6264,
+            "AnonHugePages": 6144,
+            "VmRSS": 9248,
+            "Threads": 3
+          },
+          "streams100": {
+            "Rss": 12912,
+            "Pss": 12908,
+            "Pss_Anon": 9864,
+            "Pss_File": 0,
+            "Private_Dirty": 12908,
+            "Anonymous": 9864,
+            "AnonHugePages": 6144,
+            "VmRSS": 12912,
+            "Threads": 3
+          },
+          "per_stream_pss_kib": 36.68,
+          "per_stream_rss_kib": 36.68,
+          "jobs20_9MiB": {
+            "Rss": 214244,
+            "Pss": 214240,
+            "Pss_Anon": 211132,
+            "Pss_File": 0,
+            "Private_Dirty": 214240,
+            "Anonymous": 211132,
+            "AnonHugePages": 210944,
+            "VmRSS": 214244,
+            "Threads": 3
+          },
+          "per_job_pss_kib": 10147.4,
+          "per_job_rss_kib": 10147.4
+        }
+      }
+    },
+    "burst_taskset_2cpus": {
+      "A-musl": {
+        "bin": "/tmp/claude-1000/-home-jared-ai/6c27c043-1605-40a4-b767-f2549cdc9782/scratchpad/base-musl/x86_64-unknown-linux-musl/release/beyond-ai-demo",
+        "env": [],
+        "cpus": "0,1",
+        "n": 2,
+        "thp": "[always] madvise never",
+        "results": {
+          "burst_peak_rss_kib": 4558220.0,
+          "burst_hwm_kib": 4593002.0,
+          "burst_after_drop": {
+            "Rss": 3806.0,
+            "Pss": 3802.0,
+            "Pss_Anon": 750.0,
+            "Pss_File": 0.0,
+            "Private_Dirty": 3802.0,
+            "Anonymous": 750.0,
+            "AnonHugePages": 0.0,
+            "VmRSS": 3806.0,
+            "Threads": 3.0
+          },
+          "burst_after_idle": {
+            "Rss": 3806.0,
+            "Pss": 3802.0,
+            "Pss_Anon": 750.0,
+            "Pss_File": 0.0,
+            "Private_Dirty": 3802.0,
+            "Anonymous": 750.0,
+            "AnonHugePages": 0.0,
+            "VmRSS": 3806.0,
+            "Threads": 3.0
+          },
+          "burst_baseline": {
+            "Rss": 3382.0,
+            "Pss": 3378.0,
+            "Pss_Anon": 326.0,
+            "Pss_File": 0.0,
+            "Private_Dirty": 3378.0,
+            "Anonymous": 326.0,
+            "AnonHugePages": 0.0,
+            "VmRSS": 3382.0,
+            "Threads": 3.0
+          }
+        }
+      },
+      "B-malloc-1t": {
+        "bin": "/tmp/claude-1000/-home-jared-ai/6c27c043-1605-40a4-b767-f2549cdc9782/scratchpad/execd-musl-malloc",
+        "env": [
+          "EXECD_WORKER_THREADS=1"
+        ],
+        "cpus": "0,1",
+        "n": 2,
+        "thp": "[always] madvise never",
+        "results": {
+          "burst_peak_rss_kib": 20490.0,
+          "burst_hwm_kib": 20328.0,
+          "burst_after_drop": {
+            "Rss": 3060.0,
+            "Pss": 3056.0,
+            "Pss_Anon": 176.0,
+            "Pss_File": 0.0,
+            "Private_Dirty": 3056.0,
+            "Anonymous": 176.0,
+            "AnonHugePages": 0.0,
+            "VmRSS": 3060.0,
+            "Threads": 1.0
+          },
+          "burst_after_idle": {
+            "Rss": 3060.0,
+            "Pss": 3056.0,
+            "Pss_Anon": 176.0,
+            "Pss_File": 0.0,
+            "Private_Dirty": 3056.0,
+            "Anonymous": 176.0,
+            "AnonHugePages": 0.0,
+            "VmRSS": 3060.0,
+            "Threads": 1.0
+          },
+          "burst_baseline": {
+            "Rss": 2850.0,
+            "Pss": 2846.0,
+            "Pss_Anon": 158.0,
+            "Pss_File": 0.0,
+            "Private_Dirty": 2846.0,
+            "Anonymous": 158.0,
+            "AnonHugePages": 0.0,
+            "VmRSS": 2850.0,
+            "Threads": 1.0
+          }
+        }
+      },
+      "B-mimalloc-1t-noarena": {
+        "bin": "/tmp/claude-1000/-home-jared-ai/6c27c043-1605-40a4-b767-f2549cdc9782/scratchpad/execd-musl-mimalloc",
+        "env": [
+          "EXECD_WORKER_THREADS=1",
+          "MIMALLOC_DISALLOW_ARENA_ALLOC=1"
+        ],
+        "cpus": "0,1",
+        "n": 2,
+        "thp": "[always] madvise never",
+        "results": {
+          "burst_peak_rss_kib": 31484.0,
+          "burst_hwm_kib": 38198.0,
+          "burst_after_drop": {
+            "Rss": 7478.0,
+            "Pss": 7474.0,
+            "Pss_Anon": 4430.0,
+            "Pss_File": 0.0,
+            "Private_Dirty": 7474.0,
+            "Anonymous": 4430.0,
+            "AnonHugePages": 1024.0,
+            "VmRSS": 7478.0,
+            "Threads": 1.0
+          },
+          "burst_after_idle": {
+            "Rss": 7478.0,
+            "Pss": 7474.0,
+            "Pss_Anon": 4430.0,
+            "Pss_File": 0.0,
+            "Private_Dirty": 7474.0,
+            "Anonymous": 4430.0,
+            "AnonHugePages": 1024.0,
+            "VmRSS": 7478.0,
+            "Threads": 1.0
+          },
+          "burst_baseline": {
+            "Rss": 3260.0,
+            "Pss": 3256.0,
+            "Pss_Anon": 340.0,
+            "Pss_File": 0.0,
+            "Private_Dirty": 3256.0,
+            "Anonymous": 340.0,
+            "AnonHugePages": 0.0,
+            "VmRSS": 3260.0,
+            "Threads": 1.0
+          }
+        }
+      }
+    },
+    "jobs_on_disk": {
+      "ring-in-memory": {
+        "bin": "/home/jared/execd-mem-bins/execd-musl-malloc",
+        "env": [
+          "EXECD_WORKER_THREADS=1"
+        ],
+        "cpus": "",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 2852,
+            "Pss": 2848,
+            "Pss_Anon": 160,
+            "Pss_File": 2688,
+            "Private_Dirty": 160,
+            "Anonymous": 160,
+            "AnonHugePages": 0,
+            "VmRSS": 2852,
+            "Threads": 1
+          },
+          "streams100": {
+            "Rss": 8552,
+            "Pss": 8548,
+            "Pss_Anon": 5668,
+            "Pss_File": 2880,
+            "Private_Dirty": 5664,
+            "Anonymous": 5668,
+            "AnonHugePages": 0,
+            "VmRSS": 8552,
+            "Threads": 1
+          },
+          "per_stream_pss_kib": 57.0,
+          "per_stream_rss_kib": 57.0,
+          "jobs20_9MiB": {
+            "Rss": 192096,
+            "Pss": 192092,
+            "Pss_Anon": 189148,
+            "Pss_File": 2944,
+            "Private_Dirty": 187156,
+            "Anonymous": 189148,
+            "AnonHugePages": 0,
+            "VmRSS": 192096,
+            "Threads": 1
+          },
+          "jobs20_spool_files_kib": 0,
+          "per_job_pss_kib": 9462.2,
+          "per_job_rss_kib": 9462.2
+        },
+        "thp_disabled_for_server": true
+      },
+      "spool-disk": {
+        "bin": "/home/jared/execd-mem-bins/execd-musl-spool",
+        "env": [
+          "EXECD_JOBS_DIR=/home/jared/execd-jobs-test"
+        ],
+        "cpus": "",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 2896,
+            "Pss": 2892,
+            "Pss_Anon": 172,
+            "Pss_File": 2720,
+            "Private_Dirty": 172,
+            "Anonymous": 172,
+            "AnonHugePages": 0,
+            "VmRSS": 2896,
+            "Threads": 1
+          },
+          "streams100": {
+            "Rss": 8508,
+            "Pss": 8504,
+            "Pss_Anon": 5656,
+            "Pss_File": 2848,
+            "Private_Dirty": 5656,
+            "Anonymous": 5656,
+            "AnonHugePages": 0,
+            "VmRSS": 8508,
+            "Threads": 1
+          },
+          "per_stream_pss_kib": 56.12,
+          "per_stream_rss_kib": 56.12,
+          "jobs20_9MiB": {
+            "Rss": 5488,
+            "Pss": 5484,
+            "Pss_Anon": 2636,
+            "Pss_File": 2848,
+            "Private_Dirty": 2636,
+            "Anonymous": 2636,
+            "AnonHugePages": 0,
+            "VmRSS": 5488,
+            "Threads": 1
+          },
+          "jobs20_spool_files_kib": 163840,
+          "per_job_pss_kib": 129.6,
+          "per_job_rss_kib": 129.6
+        },
+        "thp_disabled_for_server": true
+      },
+      "spool-tmpfs": {
+        "bin": "/home/jared/execd-mem-bins/execd-musl-spool",
+        "env": [],
+        "cpus": "",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 2884,
+            "Pss": 2880,
+            "Pss_Anon": 160,
+            "Pss_File": 2720,
+            "Private_Dirty": 160,
+            "Anonymous": 160,
+            "AnonHugePages": 0,
+            "VmRSS": 2884,
+            "Threads": 1
+          },
+          "streams100": {
+            "Rss": 8500,
+            "Pss": 8496,
+            "Pss_Anon": 5648,
+            "Pss_File": 2848,
+            "Private_Dirty": 5648,
+            "Anonymous": 5648,
+            "AnonHugePages": 0,
+            "VmRSS": 8500,
+            "Threads": 1
+          },
+          "per_stream_pss_kib": 56.16,
+          "per_stream_rss_kib": 56.16,
+          "jobs20_9MiB": {
+            "Rss": 5608,
+            "Pss": 5604,
+            "Pss_Anon": 2756,
+            "Pss_File": 2848,
+            "Private_Dirty": 2756,
+            "Anonymous": 2756,
+            "AnonHugePages": 0,
+            "VmRSS": 5608,
+            "Threads": 1
+          },
+          "jobs20_spool_files_kib": 0,
+          "per_job_pss_kib": 136.0,
+          "per_job_rss_kib": 136.0
+        },
+        "thp_disabled_for_server": true
+      }
+    }
+  },
+  "throughput": {
+    "malloc1t-vs-mimalloc1t": {
+      "rounds": 3,
+      "stream_mib": 1024,
+      "a": {
+        "bin": "/tmp/claude-1000/-home-jared-ai/6c27c043-1605-40a4-b767-f2549cdc9782/scratchpad/execd-musl-malloc",
+        "rev": ""
+      },
+      "b": {
+        "bin": "/tmp/claude-1000/-home-jared-ai/6c27c043-1605-40a4-b767-f2549cdc9782/scratchpad/execd-musl-mimalloc"
+      },
+      "env_a": "see name",
+      "results": {
+        "A": {
+          "kill_on_disconnect": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "leftover_stream_server_cpu_s": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "cpu-s"
+          },
+          "rss_100_streams": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "rss_idle": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "rss_slow_16x256MiB_hwm": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "rss_slow_16x256MiB_peak_sampled": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "stream16_256MiB_cpu_s_per_gb": {
+            "max": 1.501757651567459,
+            "median": 1.4971010386943815,
+            "min": 1.4901161193847652,
+            "n": 3,
+            "samples": [
+              1.4971010386943815,
+              1.501757651567459,
+              1.4901161193847652
+            ],
+            "unit": "cpu-s/GB"
+          },
+          "stream16_256MiB_mb_s": {
+            "max": 650.793360862081,
+            "median": 649.5740848603153,
+            "min": 640.2863134846269,
+            "n": 3,
+            "samples": [
+              650.793360862081,
+              640.2863134846269,
+              649.5740848603153
+            ],
+            "unit": "MB/s aggregate"
+          },
+          "stream_random_cpu_s_per_gb": {
+            "max": 1.415610313415527,
+            "median": 1.3876706361770632,
+            "min": 1.3317912817001338,
+            "n": 3,
+            "samples": [
+              1.3876706361770632,
+              1.415610313415527,
+              1.3317912817001338
+            ],
+            "unit": "cpu-s/GB"
+          },
+          "stream_random_mb_s": {
+            "max": 730.2855139252265,
+            "median": 695.1862507623629,
+            "min": 690.2159665531735,
+            "n": 3,
+            "samples": [
+              695.1862507623629,
+              690.2159665531735,
+              730.2855139252265
+            ],
+            "unit": "MB/s"
+          },
+          "stream_zeros_cpu_s_per_gb": {
+            "max": 1.369044184684754,
+            "median": 1.3597309589385993,
+            "min": 1.3411045074462888,
+            "n": 3,
+            "samples": [
+              1.3411045074462888,
+              1.369044184684754,
+              1.3597309589385993
+            ],
+            "unit": "cpu-s/GB"
+          },
+          "stream_zeros_mb_s": {
+            "max": 708.3932576466909,
+            "median": 706.1164731021338,
+            "min": 704.3557448213485,
+            "n": 3,
+            "samples": [
+              704.3557448213485,
+              706.1164731021338,
+              708.3932576466909
+            ],
+            "unit": "MB/s"
+          },
+          "ttff": {
+            "max": 3.668053,
+            "mean": 0.5847942666666667,
+            "n": 120,
+            "p50": 0.5213690000000001,
+            "p90": 0.674948,
+            "p99": 1.480601,
+            "round_p50_min_max": [
+              0.504976,
+              0.568901
+            ],
+            "round_p99_min_max": [
+              0.745135,
+              3.668053
+            ],
+            "rounds": [
+              {
+                "max": 0.745135,
+                "mean": 0.520581475,
+                "n": 40,
+                "p50": 0.5190140000000001,
+                "p90": 0.553902,
+                "p99": 0.745135
+              },
+              {
+                "max": 1.117122,
+                "mean": 0.5284367249999999,
+                "n": 40,
+                "p50": 0.504976,
+                "p90": 0.597096,
+                "p99": 1.117122
+              },
+              {
+                "max": 3.668053,
+                "mean": 0.7053646000000001,
+                "n": 40,
+                "p50": 0.568901,
+                "p90": 0.910609,
+                "p99": 3.668053
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_cat4k_conc16": {
+            "max": 17.484296,
+            "mean": 5.598336835937517,
+            "n": 1920,
+            "p50": 5.403623,
+            "p90": 6.663524,
+            "p99": 11.022145,
+            "round_p50_min_max": [
+              5.302516,
+              5.513888
+            ],
+            "round_p99_min_max": [
+              7.455871,
+              16.917779
+            ],
+            "rounds": [
+              {
+                "max": 9.666649,
+                "mean": 5.388791731250003,
+                "n": 640,
+                "p50": 5.311132,
+                "p90": 6.254755,
+                "p99": 7.455871
+              },
+              {
+                "max": 17.484296,
+                "mean": 5.927407464062496,
+                "n": 640,
+                "p50": 5.513888,
+                "p90": 7.126219,
+                "p99": 16.917779
+              },
+              {
+                "max": 11.385826,
+                "mean": 5.478811312500001,
+                "n": 640,
+                "p50": 5.302516,
+                "p90": 6.4629520000000005,
+                "p99": 8.161719
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_cat4k_seq": {
+            "max": 5.183764,
+            "mean": 0.5114596558333339,
+            "n": 1200,
+            "p50": 0.462523,
+            "p90": 0.6102609999999999,
+            "p99": 0.966146,
+            "round_p50_min_max": [
+              0.459818,
+              0.469808
+            ],
+            "round_p99_min_max": [
+              0.846413,
+              2.469382
+            ],
+            "rounds": [
+              {
+                "max": 1.138964,
+                "mean": 0.48789828250000006,
+                "n": 400,
+                "p50": 0.462503,
+                "p90": 0.53207,
+                "p99": 0.938302
+              },
+              {
+                "max": 5.183764,
+                "mean": 0.5667358649999997,
+                "n": 400,
+                "p50": 0.469808,
+                "p90": 0.656061,
+                "p99": 2.469382
+              },
+              {
+                "max": 1.26506,
+                "mean": 0.4797448199999996,
+                "n": 400,
+                "p50": 0.459818,
+                "p90": 0.5133530000000001,
+                "p99": 0.846413
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_true_conc16": {
+            "max": 10.346548,
+            "mean": 4.8744969499999975,
+            "n": 1920,
+            "p50": 4.795616,
+            "p90": 5.970921,
+            "p99": 8.706864,
+            "round_p50_min_max": [
+              4.612798000000001,
+              5.009343
+            ],
+            "round_p99_min_max": [
+              6.938521,
+              8.955641
+            ],
+            "rounds": [
+              {
+                "max": 9.701707,
+                "mean": 5.063657232812502,
+                "n": 640,
+                "p50": 5.009343,
+                "p90": 6.049945,
+                "p99": 7.755416
+              },
+              {
+                "max": 10.346548,
+                "mean": 4.8128270953125,
+                "n": 640,
+                "p50": 4.612798000000001,
+                "p90": 5.875645,
+                "p99": 8.955641
+              },
+              {
+                "max": 9.149639,
+                "mean": 4.747006521875,
+                "n": 640,
+                "p50": 4.688095,
+                "p90": 5.912468,
+                "p99": 6.938521
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_true_new_conn_each": {
+            "max": 7.029649,
+            "mean": 0.5506770591666671,
+            "n": 1200,
+            "p50": 0.5010789999999999,
+            "p90": 0.633578,
+            "p99": 1.171798,
+            "round_p50_min_max": [
+              0.487933,
+              0.513413
+            ],
+            "round_p99_min_max": [
+              1.007568,
+              2.803365
+            ],
+            "rounds": [
+              {
+                "max": 1.85888,
+                "mean": 0.5428267349999999,
+                "n": 400,
+                "p50": 0.513413,
+                "p90": 0.6207320000000001,
+                "p99": 1.231866
+              },
+              {
+                "max": 7.029649,
+                "mean": 0.5926951925000005,
+                "n": 400,
+                "p50": 0.504025,
+                "p90": 0.685299,
+                "p99": 2.803365
+              },
+              {
+                "max": 2.740091,
+                "mean": 0.5165092499999995,
+                "n": 400,
+                "p50": 0.487933,
+                "p90": 0.5786399999999999,
+                "p99": 1.007568
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_true_plus_0_idle_procs": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "v11_true_plus_1000_idle_procs": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "v11_true_plus_100_idle_procs": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "v11_true_seq": {
+            "max": 5.063308,
+            "mean": 0.4351986225000002,
+            "n": 1200,
+            "p50": 0.395523,
+            "p90": 0.464397,
+            "p99": 0.894567,
+            "round_p50_min_max": [
+              0.383569,
+              0.421474
+            ],
+            "round_p99_min_max": [
+              0.7142449999999999,
+              3.542319
+            ],
+            "rounds": [
+              {
+                "max": 0.894567,
+                "mean": 0.4001751925,
+                "n": 400,
+                "p50": 0.388028,
+                "p90": 0.420481,
+                "p99": 0.7331920000000001
+              },
+              {
+                "max": 4.3999429999999995,
+                "mean": 0.4908844875,
+                "n": 400,
+                "p50": 0.421474,
+                "p90": 0.507672,
+                "p99": 3.542319
+              },
+              {
+                "max": 5.063308,
+                "mean": 0.4145361875000001,
+                "n": 400,
+                "p50": 0.383569,
+                "p90": 0.441442,
+                "p99": 0.7142449999999999
+              }
+            ],
+            "unit": "ms"
+          }
+        },
+        "B": {
+          "kill_on_disconnect": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "leftover_stream_server_cpu_s": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "cpu-s"
+          },
+          "rss_100_streams": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "rss_idle": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "rss_slow_16x256MiB_hwm": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "rss_slow_16x256MiB_peak_sampled": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "stream16_256MiB_cpu_s_per_gb": {
+            "max": 0.9103678166866302,
+            "median": 0.9010545909404756,
+            "min": 0.8847564458847043,
+            "n": 3,
+            "samples": [
+              0.9010545909404756,
+              0.9103678166866302,
+              0.8847564458847043
+            ],
+            "unit": "cpu-s/GB"
+          },
+          "stream16_256MiB_mb_s": {
+            "max": 1117.7911895229013,
+            "median": 1083.7447479247903,
+            "min": 1057.7117846365345,
+            "n": 3,
+            "samples": [
+              1083.7447479247903,
+              1057.7117846365345,
+              1117.7911895229013
+            ],
+            "unit": "MB/s aggregate"
+          },
+          "stream_random_cpu_s_per_gb": {
+            "max": 0.8288770914077758,
+            "median": 0.8195638656616201,
+            "min": 0.8102506399154655,
+            "n": 3,
+            "samples": [
+              0.8288770914077758,
+              0.8195638656616201,
+              0.8102506399154655
+            ],
+            "unit": "cpu-s/GB"
+          },
+          "stream_random_mb_s": {
+            "max": 1221.8711278481096,
+            "median": 1181.8821796057266,
+            "min": 1174.6598545335669,
+            "n": 3,
+            "samples": [
+              1174.6598545335669,
+              1181.8821796057266,
+              1221.8711278481096
+            ],
+            "unit": "MB/s"
+          },
+          "stream_zeros_cpu_s_per_gb": {
+            "max": 0.8475035429000853,
+            "median": 0.8288770914077763,
+            "min": 0.8195638656616218,
+            "n": 3,
+            "samples": [
+              0.8475035429000853,
+              0.8288770914077763,
+              0.8195638656616218
+            ],
+            "unit": "cpu-s/GB"
+          },
+          "stream_zeros_mb_s": {
+            "max": 1220.3955516965718,
+            "median": 1140.3715534793905,
+            "min": 1133.4948578180097,
+            "n": 3,
+            "samples": [
+              1133.4948578180097,
+              1140.3715534793905,
+              1220.3955516965718
+            ],
+            "unit": "MB/s"
+          },
+          "ttff": {
+            "max": 1.0142110000000002,
+            "mean": 0.43705026666666674,
+            "n": 120,
+            "p50": 0.423196,
+            "p90": 0.50202,
+            "p99": 0.88588,
+            "round_p50_min_max": [
+              0.387056,
+              0.441782
+            ],
+            "round_p99_min_max": [
+              0.435971,
+              1.0142110000000002
+            ],
+            "rounds": [
+              {
+                "max": 0.527721,
+                "mean": 0.44934874999999985,
+                "n": 40,
+                "p50": 0.441782,
+                "p90": 0.500818,
+                "p99": 0.527721
+              },
+              {
+                "max": 1.0142110000000002,
+                "mean": 0.4740302749999999,
+                "n": 40,
+                "p50": 0.437885,
+                "p90": 0.535535,
+                "p99": 1.0142110000000002
+              },
+              {
+                "max": 0.435971,
+                "mean": 0.387771775,
+                "n": 40,
+                "p50": 0.387056,
+                "p90": 0.418767,
+                "p99": 0.435971
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_cat4k_conc16": {
+            "max": 23.046187999999997,
+            "mean": 5.399526192187506,
+            "n": 1920,
+            "p50": 5.062186,
+            "p90": 6.68728,
+            "p99": 11.966741,
+            "round_p50_min_max": [
+              4.951811,
+              5.20229
+            ],
+            "round_p99_min_max": [
+              8.183302,
+              17.403328
+            ],
+            "rounds": [
+              {
+                "max": 9.235186,
+                "mean": 5.279027990625002,
+                "n": 640,
+                "p50": 5.20229,
+                "p90": 6.253072,
+                "p99": 8.183302
+              },
+              {
+                "max": 23.046187999999997,
+                "mean": 5.867090964062501,
+                "n": 640,
+                "p50": 5.093447,
+                "p90": 8.547632,
+                "p99": 17.403328
+              },
+              {
+                "max": 9.559288,
+                "mean": 5.052459621874997,
+                "n": 640,
+                "p50": 4.951811,
+                "p90": 5.915592,
+                "p99": 8.320108
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_cat4k_seq": {
+            "max": 4.591527,
+            "mean": 0.48545383666666625,
+            "n": 1200,
+            "p50": 0.442274,
+            "p90": 0.525997,
+            "p99": 0.996887,
+            "round_p50_min_max": [
+              0.433336,
+              0.451452
+            ],
+            "round_p99_min_max": [
+              0.965005,
+              2.078619
+            ],
+            "rounds": [
+              {
+                "max": 4.591527,
+                "mean": 0.4974785874999996,
+                "n": 400,
+                "p50": 0.446242,
+                "p90": 0.521067,
+                "p99": 2.078619
+              },
+              {
+                "max": 3.776335,
+                "mean": 0.49067135000000023,
+                "n": 400,
+                "p50": 0.451452,
+                "p90": 0.552379,
+                "p99": 0.996887
+              },
+              {
+                "max": 4.037635000000001,
+                "mean": 0.46821157250000006,
+                "n": 400,
+                "p50": 0.433336,
+                "p90": 0.495648,
+                "p99": 0.965005
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_true_conc16": {
+            "max": 20.06601,
+            "mean": 5.094003482812506,
+            "n": 1920,
+            "p50": 4.529826,
+            "p90": 6.860177999999999,
+            "p99": 12.918611,
+            "round_p50_min_max": [
+              4.300949,
+              5.106845
+            ],
+            "round_p99_min_max": [
+              7.63941,
+              13.610683
+            ],
+            "rounds": [
+              {
+                "max": 8.322473,
+                "mean": 4.646631604687501,
+                "n": 640,
+                "p50": 4.40917,
+                "p90": 6.00628,
+                "p99": 7.63941
+              },
+              {
+                "max": 15.716243,
+                "mean": 5.718855801562495,
+                "n": 640,
+                "p50": 5.106845,
+                "p90": 8.943665999999999,
+                "p99": 12.556873
+              },
+              {
+                "max": 20.06601,
+                "mean": 4.9165230421875,
+                "n": 640,
+                "p50": 4.300949,
+                "p90": 6.732338,
+                "p99": 13.610683
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_true_new_conn_each": {
+            "max": 6.441,
+            "mean": 0.5004231049999983,
+            "n": 1200,
+            "p50": 0.443416,
+            "p90": 0.5546639999999999,
+            "p99": 1.92509,
+            "round_p50_min_max": [
+              0.4283360000000001,
+              0.4644970000000001
+            ],
+            "round_p99_min_max": [
+              0.7414379999999999,
+              3.567296
+            ],
+            "rounds": [
+              {
+                "max": 4.838329,
+                "mean": 0.5084226800000001,
+                "n": 400,
+                "p50": 0.4644970000000001,
+                "p90": 0.581996,
+                "p99": 1.051654
+              },
+              {
+                "max": 6.441,
+                "mean": 0.5488734150000003,
+                "n": 400,
+                "p50": 0.444047,
+                "p90": 0.561337,
+                "p99": 3.567296
+              },
+              {
+                "max": 1.145146,
+                "mean": 0.4439732200000004,
+                "n": 400,
+                "p50": 0.4283360000000001,
+                "p90": 0.499255,
+                "p99": 0.7414379999999999
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_true_plus_0_idle_procs": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "v11_true_plus_1000_idle_procs": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "v11_true_plus_100_idle_procs": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "v11_true_seq": {
+            "max": 5.51938,
+            "mean": 0.4362314799999999,
+            "n": 1200,
+            "p50": 0.380684,
+            "p90": 0.466822,
+            "p99": 1.1324219999999998,
+            "round_p50_min_max": [
+              0.360835,
+              0.408959
+            ],
+            "round_p99_min_max": [
+              0.851332,
+              3.878103
+            ],
+            "rounds": [
+              {
+                "max": 5.51938,
+                "mean": 0.5038005300000001,
+                "n": 400,
+                "p50": 0.408959,
+                "p90": 0.480358,
+                "p99": 3.878103
+              },
+              {
+                "max": 4.364814,
+                "mean": 0.4140155725,
+                "n": 400,
+                "p50": 0.373239,
+                "p90": 0.46093,
+                "p99": 0.954684
+              },
+              {
+                "max": 1.1324219999999998,
+                "mean": 0.3908783374999999,
+                "n": 400,
+                "p50": 0.360835,
+                "p90": 0.4468629999999999,
+                "p99": 0.851332
+              }
+            ],
+            "unit": "ms"
+          }
+        }
+      }
+    },
+    "mt-vs-1t-2cpu": {
+      "rounds": 3,
+      "stream_mib": 1024,
+      "a": {
+        "bin": "/tmp/claude-1000/-home-jared-ai/6c27c043-1605-40a4-b767-f2549cdc9782/scratchpad/execd-musl-malloc",
+        "rev": ""
+      },
+      "b": {
+        "bin": "/tmp/claude-1000/-home-jared-ai/6c27c043-1605-40a4-b767-f2549cdc9782/scratchpad/execd-musl-malloc"
+      },
+      "env_a": "see name",
+      "results": {
+        "A": {
+          "kill_on_disconnect": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "leftover_stream_server_cpu_s": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "cpu-s"
+          },
+          "rss_100_streams": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "rss_idle": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "rss_slow_16x256MiB_hwm": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "rss_slow_16x256MiB_peak_sampled": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "stream16_256MiB_cpu_s_per_gb": {
+            "max": 1.5995465219020846,
+            "median": 1.5832483768463137,
+            "min": 1.5343539416790006,
+            "n": 3,
+            "samples": [
+              1.5343539416790006,
+              1.5832483768463137,
+              1.5995465219020846
+            ],
+            "unit": "cpu-s/GB"
+          },
+          "stream16_256MiB_mb_s": {
+            "max": 1080.199943840996,
+            "median": 1047.4878049163212,
+            "min": 1035.851497529613,
+            "n": 3,
+            "samples": [
+              1080.199943840996,
+              1047.4878049163212,
+              1035.851497529613
+            ],
+            "unit": "MB/s aggregate"
+          },
+          "stream_random_cpu_s_per_gb": {
+            "max": 1.6205012798309326,
+            "median": 1.6018748283386228,
+            "min": 1.5832483768463128,
+            "n": 3,
+            "samples": [
+              1.6018748283386228,
+              1.6205012798309326,
+              1.5832483768463128
+            ],
+            "unit": "cpu-s/GB"
+          },
+          "stream_random_mb_s": {
+            "max": 755.3981454470246,
+            "median": 741.9215520110725,
+            "min": 737.8291434918266,
+            "n": 3,
+            "samples": [
+              741.9215520110725,
+              755.3981454470246,
+              737.8291434918266
+            ],
+            "unit": "MB/s"
+          },
+          "stream_zeros_cpu_s_per_gb": {
+            "max": 1.5366822481155398,
+            "median": 1.5366822481155382,
+            "min": 1.5087425708770752,
+            "n": 3,
+            "samples": [
+              1.5087425708770752,
+              1.5366822481155398,
+              1.5366822481155382
+            ],
+            "unit": "cpu-s/GB"
+          },
+          "stream_zeros_mb_s": {
+            "max": 798.7620496218419,
+            "median": 790.35141770688,
+            "min": 765.7094259679997,
+            "n": 3,
+            "samples": [
+              790.35141770688,
+              798.7620496218419,
+              765.7094259679997
+            ],
+            "unit": "MB/s"
+          },
+          "ttff": {
+            "max": 1.273698,
+            "mean": 0.5464868833333334,
+            "n": 120,
+            "p50": 0.502151,
+            "p90": 0.729375,
+            "p99": 1.021485,
+            "round_p50_min_max": [
+              0.446832,
+              0.5645020000000001
+            ],
+            "round_p99_min_max": [
+              0.873195,
+              1.273698
+            ],
+            "rounds": [
+              {
+                "max": 1.273698,
+                "mean": 0.6269133250000001,
+                "n": 40,
+                "p50": 0.5645020000000001,
+                "p90": 0.92146,
+                "p99": 1.273698
+              },
+              {
+                "max": 0.873195,
+                "mean": 0.48419665000000006,
+                "n": 40,
+                "p50": 0.446832,
+                "p90": 0.571156,
+                "p99": 0.873195
+              },
+              {
+                "max": 0.8816320000000001,
+                "mean": 0.5283506750000001,
+                "n": 40,
+                "p50": 0.499406,
+                "p90": 0.7119500000000001,
+                "p99": 0.8816320000000001
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_cat4k_conc16": {
+            "max": 13.282409,
+            "mean": 5.897577406249999,
+            "n": 1920,
+            "p50": 5.730762,
+            "p90": 7.835855,
+            "p99": 10.873124,
+            "round_p50_min_max": [
+              5.644944,
+              5.886175
+            ],
+            "round_p99_min_max": [
+              8.803863,
+              11.935118
+            ],
+            "rounds": [
+              {
+                "max": 13.282409,
+                "mean": 6.173177335937501,
+                "n": 640,
+                "p50": 5.886175,
+                "p90": 8.507136000000001,
+                "p99": 11.935118
+              },
+              {
+                "max": 10.873124,
+                "mean": 5.758582085937503,
+                "n": 640,
+                "p50": 5.693339000000001,
+                "p90": 7.352288000000001,
+                "p99": 8.803863
+              },
+              {
+                "max": 11.437877,
+                "mean": 5.760972796875002,
+                "n": 640,
+                "p50": 5.644944,
+                "p90": 7.477061999999999,
+                "p99": 10.420953
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_cat4k_seq": {
+            "max": 5.249982999999999,
+            "mean": 0.558758921666667,
+            "n": 1200,
+            "p50": 0.5260170000000001,
+            "p90": 0.6294690000000001,
+            "p99": 1.1525610000000002,
+            "round_p50_min_max": [
+              0.5118199999999999,
+              0.544033
+            ],
+            "round_p99_min_max": [
+              0.992368,
+              1.337402
+            ],
+            "rounds": [
+              {
+                "max": 5.249982999999999,
+                "mean": 0.5811043299999998,
+                "n": 400,
+                "p50": 0.544033,
+                "p90": 0.6448699999999999,
+                "p99": 1.052065
+              },
+              {
+                "max": 4.220463,
+                "mean": 0.5688780075000001,
+                "n": 400,
+                "p50": 0.523873,
+                "p90": 0.653997,
+                "p99": 1.337402
+              },
+              {
+                "max": 1.233759,
+                "mean": 0.5262944274999998,
+                "n": 400,
+                "p50": 0.5118199999999999,
+                "p90": 0.565033,
+                "p99": 0.992368
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_true_conc16": {
+            "max": 9.922718,
+            "mean": 4.7581035145833335,
+            "n": 1920,
+            "p50": 4.734325999999999,
+            "p90": 6.050747,
+            "p99": 7.595874,
+            "round_p50_min_max": [
+              4.697103,
+              4.768413
+            ],
+            "round_p99_min_max": [
+              7.219018,
+              8.094739
+            ],
+            "rounds": [
+              {
+                "max": 7.954454,
+                "mean": 4.649712731250003,
+                "n": 640,
+                "p50": 4.697103,
+                "p90": 6.0941220000000005,
+                "p99": 7.219018
+              },
+              {
+                "max": 9.922718,
+                "mean": 4.808202848437502,
+                "n": 640,
+                "p50": 4.768413,
+                "p90": 6.008724,
+                "p99": 8.094739
+              },
+              {
+                "max": 8.782531,
+                "mean": 4.8163949640625,
+                "n": 640,
+                "p50": 4.718886,
+                "p90": 6.076377,
+                "p99": 7.535288
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_true_new_conn_each": {
+            "max": 1.706843,
+            "mean": 0.5293987416666671,
+            "n": 1200,
+            "p50": 0.504966,
+            "p90": 0.602907,
+            "p99": 0.94733,
+            "round_p50_min_max": [
+              0.489496,
+              0.538782
+            ],
+            "round_p99_min_max": [
+              0.883105,
+              1.007498
+            ],
+            "rounds": [
+              {
+                "max": 1.706843,
+                "mean": 0.5677825050000003,
+                "n": 400,
+                "p50": 0.538782,
+                "p90": 0.6510119999999999,
+                "p99": 1.007498
+              },
+              {
+                "max": 1.2451910000000002,
+                "mean": 0.5077919475000007,
+                "n": 400,
+                "p50": 0.49156000000000005,
+                "p90": 0.553662,
+                "p99": 0.883105
+              },
+              {
+                "max": 1.076442,
+                "mean": 0.5126217725000001,
+                "n": 400,
+                "p50": 0.489496,
+                "p90": 0.565404,
+                "p99": 0.924065
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_true_plus_0_idle_procs": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "v11_true_plus_1000_idle_procs": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "v11_true_plus_100_idle_procs": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "v11_true_seq": {
+            "max": 5.6601539999999995,
+            "mean": 0.482911009166667,
+            "n": 1200,
+            "p50": 0.424298,
+            "p90": 0.531948,
+            "p99": 1.221265,
+            "round_p50_min_max": [
+              0.407817,
+              0.463305
+            ],
+            "round_p99_min_max": [
+              0.852655,
+              1.911554
+            ],
+            "rounds": [
+              {
+                "max": 5.6601539999999995,
+                "mean": 0.5227209274999999,
+                "n": 400,
+                "p50": 0.463305,
+                "p90": 0.560835,
+                "p99": 1.440243
+              },
+              {
+                "max": 4.6992270000000005,
+                "mean": 0.44806095500000026,
+                "n": 400,
+                "p50": 0.407817,
+                "p90": 0.480288,
+                "p99": 0.852655
+              },
+              {
+                "max": 4.777731999999999,
+                "mean": 0.4779511449999997,
+                "n": 400,
+                "p50": 0.411915,
+                "p90": 0.53746,
+                "p99": 1.911554
+              }
+            ],
+            "unit": "ms"
+          }
+        },
+        "B": {
+          "kill_on_disconnect": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "leftover_stream_server_cpu_s": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "cpu-s"
+          },
+          "rss_100_streams": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "rss_idle": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "rss_slow_16x256MiB_hwm": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "rss_slow_16x256MiB_peak_sampled": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "stream16_256MiB_cpu_s_per_gb": {
+            "max": 1.5622936189174652,
+            "median": 1.5459954738616943,
+            "min": 1.515727490186691,
+            "n": 3,
+            "samples": [
+              1.5459954738616943,
+              1.515727490186691,
+              1.5622936189174652
+            ],
+            "unit": "cpu-s/GB"
+          },
+          "stream16_256MiB_mb_s": {
+            "max": 643.2553985292772,
+            "median": 627.5840951424991,
+            "min": 610.292996549554,
+            "n": 3,
+            "samples": [
+              627.5840951424991,
+              643.2553985292772,
+              610.292996549554
+            ],
+            "unit": "MB/s aggregate"
+          },
+          "stream_random_cpu_s_per_gb": {
+            "max": 1.415610313415527,
+            "median": 1.4062970876693723,
+            "min": 1.3876706361770632,
+            "n": 3,
+            "samples": [
+              1.3876706361770632,
+              1.4062970876693723,
+              1.415610313415527
+            ],
+            "unit": "cpu-s/GB"
+          },
+          "stream_random_mb_s": {
+            "max": 707.8092867932886,
+            "median": 699.1947699804317,
+            "min": 685.0688961984005,
+            "n": 3,
+            "samples": [
+              707.8092867932886,
+              699.1947699804317,
+              685.0688961984005
+            ],
+            "unit": "MB/s"
+          },
+          "stream_zeros_cpu_s_per_gb": {
+            "max": 1.387670636177063,
+            "median": 1.3690441846847523,
+            "min": 1.3504177331924447,
+            "n": 3,
+            "samples": [
+              1.387670636177063,
+              1.3504177331924447,
+              1.3690441846847523
+            ],
+            "unit": "cpu-s/GB"
+          },
+          "stream_zeros_mb_s": {
+            "max": 727.2038352632883,
+            "median": 708.5767021926886,
+            "min": 694.7047309114475,
+            "n": 3,
+            "samples": [
+              708.5767021926886,
+              727.2038352632883,
+              694.7047309114475
+            ],
+            "unit": "MB/s"
+          },
+          "ttff": {
+            "max": 1.885622,
+            "mean": 0.5574642583333334,
+            "n": 120,
+            "p50": 0.5263979999999999,
+            "p90": 0.621303,
+            "p99": 1.33621,
+            "round_p50_min_max": [
+              0.48156,
+              0.574582
+            ],
+            "round_p99_min_max": [
+              0.5622280000000001,
+              1.885622
+            ],
+            "rounds": [
+              {
+                "max": 1.33621,
+                "mean": 0.611257575,
+                "n": 40,
+                "p50": 0.574582,
+                "p90": 0.668927,
+                "p99": 1.33621
+              },
+              {
+                "max": 0.5622280000000001,
+                "mean": 0.4741474,
+                "n": 40,
+                "p50": 0.48156,
+                "p90": 0.5070199999999999,
+                "p99": 0.5622280000000001
+              },
+              {
+                "max": 1.885622,
+                "mean": 0.5869878,
+                "n": 40,
+                "p50": 0.548201,
+                "p90": 0.617796,
+                "p99": 1.885622
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_cat4k_conc16": {
+            "max": 17.514706,
+            "mean": 5.769193620312481,
+            "n": 1920,
+            "p50": 5.614034,
+            "p90": 6.893282,
+            "p99": 10.488894,
+            "round_p50_min_max": [
+              5.432579,
+              5.813684
+            ],
+            "round_p99_min_max": [
+              8.094688,
+              15.315853
+            ],
+            "rounds": [
+              {
+                "max": 9.318218,
+                "mean": 5.503579457812498,
+                "n": 640,
+                "p50": 5.432579,
+                "p90": 6.488694,
+                "p99": 8.094688
+              },
+              {
+                "max": 17.514706,
+                "mean": 5.928167931250001,
+                "n": 640,
+                "p50": 5.607241,
+                "p90": 7.221222999999999,
+                "p99": 15.315853
+              },
+              {
+                "max": 11.538844,
+                "mean": 5.875833471874997,
+                "n": 640,
+                "p50": 5.813684,
+                "p90": 7.006423000000001,
+                "p99": 9.061827
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_cat4k_seq": {
+            "max": 2.937116,
+            "mean": 0.5219756166666669,
+            "n": 1200,
+            "p50": 0.492592,
+            "p90": 0.590232,
+            "p99": 0.978351,
+            "round_p50_min_max": [
+              0.474226,
+              0.5080129999999999
+            ],
+            "round_p99_min_max": [
+              0.933793,
+              1.0513530000000002
+            ],
+            "rounds": [
+              {
+                "max": 1.247196,
+                "mean": 0.5275084025000001,
+                "n": 400,
+                "p50": 0.5080129999999999,
+                "p90": 0.589121,
+                "p99": 0.933793
+              },
+              {
+                "max": 2.120962,
+                "mean": 0.5004620125000002,
+                "n": 400,
+                "p50": 0.474226,
+                "p90": 0.5266080000000001,
+                "p99": 1.0513530000000002
+              },
+              {
+                "max": 2.937116,
+                "mean": 0.5379564349999995,
+                "n": 400,
+                "p50": 0.50137,
+                "p90": 0.6132270000000001,
+                "p99": 1.006716
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_true_conc16": {
+            "max": 11.303124,
+            "mean": 4.810059731770836,
+            "n": 1920,
+            "p50": 4.708697000000001,
+            "p90": 5.814316,
+            "p99": 9.407013,
+            "round_p50_min_max": [
+              4.497262999999999,
+              4.809382
+            ],
+            "round_p99_min_max": [
+              7.133501000000001,
+              9.659885
+            ],
+            "rounds": [
+              {
+                "max": 11.303124,
+                "mean": 4.919001262499996,
+                "n": 640,
+                "p50": 4.7675909999999995,
+                "p90": 5.918058,
+                "p99": 9.659885
+              },
+              {
+                "max": 8.408541,
+                "mean": 4.532123646874997,
+                "n": 640,
+                "p50": 4.497262999999999,
+                "p90": 5.525793,
+                "p99": 7.133501000000001
+              },
+              {
+                "max": 9.858605,
+                "mean": 4.979054285937503,
+                "n": 640,
+                "p50": 4.809382,
+                "p90": 6.061147,
+                "p99": 9.442362
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_true_new_conn_each": {
+            "max": 4.9283850000000005,
+            "mean": 0.5311477883333331,
+            "n": 1200,
+            "p50": 0.49664900000000006,
+            "p90": 0.59903,
+            "p99": 0.999001,
+            "round_p50_min_max": [
+              0.484155,
+              0.5077010000000001
+            ],
+            "round_p99_min_max": [
+              0.846774,
+              1.09094
+            ],
+            "rounds": [
+              {
+                "max": 4.9283850000000005,
+                "mean": 0.5548657424999999,
+                "n": 400,
+                "p50": 0.503213,
+                "p90": 0.617436,
+                "p99": 1.09094
+              },
+              {
+                "max": 1.207528,
+                "mean": 0.5033403374999995,
+                "n": 400,
+                "p50": 0.484155,
+                "p90": 0.5472790000000001,
+                "p99": 0.846774
+              },
+              {
+                "max": 1.847418,
+                "mean": 0.5352372850000002,
+                "n": 400,
+                "p50": 0.5077010000000001,
+                "p90": 0.607316,
+                "p99": 1.0361840000000002
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_true_plus_0_idle_procs": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "v11_true_plus_1000_idle_procs": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "v11_true_plus_100_idle_procs": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "v11_true_seq": {
+            "max": 4.478416,
+            "mean": 0.4513912316666669,
+            "n": 1200,
+            "p50": 0.416213,
+            "p90": 0.50694,
+            "p99": 0.909666,
+            "round_p50_min_max": [
+              0.405872,
+              0.430341
+            ],
+            "round_p99_min_max": [
+              0.867123,
+              0.984914
+            ],
+            "rounds": [
+              {
+                "max": 3.394239,
+                "mean": 0.4724553725,
+                "n": 400,
+                "p50": 0.430341,
+                "p90": 0.513843,
+                "p99": 0.984914
+              },
+              {
+                "max": 0.960817,
+                "mean": 0.4369856025,
+                "n": 400,
+                "p50": 0.420701,
+                "p90": 0.479046,
+                "p99": 0.867123
+              },
+              {
+                "max": 4.478416,
+                "mean": 0.4447327200000003,
+                "n": 400,
+                "p50": 0.405872,
+                "p90": 0.507471,
+                "p99": 0.884918
+              }
+            ],
+            "unit": "ms"
+          }
+        }
+      }
+    },
+    "mt-vs-1t-all": {
+      "rounds": 3,
+      "stream_mib": 1024,
+      "a": {
+        "bin": "/tmp/claude-1000/-home-jared-ai/6c27c043-1605-40a4-b767-f2549cdc9782/scratchpad/execd-musl-malloc",
+        "rev": ""
+      },
+      "b": {
+        "bin": "/tmp/claude-1000/-home-jared-ai/6c27c043-1605-40a4-b767-f2549cdc9782/scratchpad/execd-musl-malloc"
+      },
+      "env_a": "see name",
+      "results": {
+        "A": {
+          "kill_on_disconnect": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "leftover_stream_server_cpu_s": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "cpu-s"
+          },
+          "rss_100_streams": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "rss_idle": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "rss_slow_16x256MiB_hwm": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "rss_slow_16x256MiB_peak_sampled": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "stream16_256MiB_cpu_s_per_gb": {
+            "max": 1.988373696804048,
+            "median": 1.9790604710578916,
+            "min": 1.9557774066925044,
+            "n": 3,
+            "samples": [
+              1.9790604710578916,
+              1.9557774066925044,
+              1.988373696804048
+            ],
+            "unit": "cpu-s/GB"
+          },
+          "stream16_256MiB_mb_s": {
+            "max": 3539.3992917425976,
+            "median": 3236.653695521845,
+            "min": 3022.841145898198,
+            "n": 3,
+            "samples": [
+              3236.653695521845,
+              3539.3992917425976,
+              3022.841145898198
+            ],
+            "unit": "MB/s aggregate"
+          },
+          "stream_random_cpu_s_per_gb": {
+            "max": 1.806765794754026,
+            "median": 1.7136335372924802,
+            "min": 1.7043203115463272,
+            "n": 3,
+            "samples": [
+              1.7136335372924802,
+              1.7043203115463272,
+              1.806765794754026
+            ],
+            "unit": "cpu-s/GB"
+          },
+          "stream_random_mb_s": {
+            "max": 947.5496958830324,
+            "median": 941.01267583567,
+            "min": 871.3069778272842,
+            "n": 3,
+            "samples": [
+              941.01267583567,
+              947.5496958830324,
+              871.3069778272842
+            ],
+            "unit": "MB/s"
+          },
+          "stream_zeros_cpu_s_per_gb": {
+            "max": 1.9371509552001935,
+            "median": 1.8719583749771116,
+            "min": 1.8626451492309553,
+            "n": 3,
+            "samples": [
+              1.8719583749771116,
+              1.8626451492309553,
+              1.9371509552001935
+            ],
+            "unit": "cpu-s/GB"
+          },
+          "stream_zeros_mb_s": {
+            "max": 947.5938403236172,
+            "median": 936.1770616096552,
+            "min": 892.2326167284913,
+            "n": 3,
+            "samples": [
+              947.5938403236172,
+              936.1770616096552,
+              892.2326167284913
+            ],
+            "unit": "MB/s"
+          },
+          "ttff": {
+            "max": 0.950727,
+            "mean": 0.5324266166666667,
+            "n": 120,
+            "p50": 0.50692,
+            "p90": 0.623899,
+            "p99": 0.908264,
+            "round_p50_min_max": [
+              0.469266,
+              0.5447839999999999
+            ],
+            "round_p99_min_max": [
+              0.817707,
+              0.950727
+            ],
+            "rounds": [
+              {
+                "max": 0.817707,
+                "mean": 0.5671041749999999,
+                "n": 40,
+                "p50": 0.5447839999999999,
+                "p90": 0.623899,
+                "p99": 0.817707
+              },
+              {
+                "max": 0.950727,
+                "mean": 0.5389818749999999,
+                "n": 40,
+                "p50": 0.504726,
+                "p90": 0.6881940000000001,
+                "p99": 0.950727
+              },
+              {
+                "max": 0.908264,
+                "mean": 0.4911937999999999,
+                "n": 40,
+                "p50": 0.469266,
+                "p90": 0.527621,
+                "p99": 0.908264
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_cat4k_conc16": {
+            "max": 5.005776,
+            "mean": 2.3323288598958323,
+            "n": 1920,
+            "p50": 2.24805,
+            "p90": 3.228315,
+            "p99": 4.307303,
+            "round_p50_min_max": [
+              2.15043,
+              2.375649
+            ],
+            "round_p99_min_max": [
+              3.896941,
+              4.615985
+            ],
+            "rounds": [
+              {
+                "max": 4.5505770000000005,
+                "mean": 2.218970618750002,
+                "n": 640,
+                "p50": 2.15043,
+                "p90": 3.094793,
+                "p99": 3.896941
+              },
+              {
+                "max": 4.3266800000000005,
+                "mean": 2.322119535937497,
+                "n": 640,
+                "p50": 2.228322,
+                "p90": 3.198766,
+                "p99": 4.097251
+              },
+              {
+                "max": 5.005776,
+                "mean": 2.455896425,
+                "n": 640,
+                "p50": 2.375649,
+                "p90": 3.404088,
+                "p99": 4.615985
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_cat4k_seq": {
+            "max": 1.566008,
+            "mean": 0.7862266100000003,
+            "n": 1200,
+            "p50": 0.6913400000000001,
+            "p90": 1.122873,
+            "p99": 1.362892,
+            "round_p50_min_max": [
+              0.667744,
+              0.708774
+            ],
+            "round_p99_min_max": [
+              1.335108,
+              1.376177
+            ],
+            "rounds": [
+              {
+                "max": 1.486072,
+                "mean": 0.7520904449999998,
+                "n": 400,
+                "p50": 0.6883940000000001,
+                "p90": 1.089207,
+                "p99": 1.335108
+              },
+              {
+                "max": 1.566008,
+                "mean": 0.81944952,
+                "n": 400,
+                "p50": 0.708774,
+                "p90": 1.141088,
+                "p99": 1.362111
+              },
+              {
+                "max": 1.463057,
+                "mean": 0.787139864999999,
+                "n": 400,
+                "p50": 0.667744,
+                "p90": 1.117613,
+                "p99": 1.376177
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_true_conc16": {
+            "max": 47.462784,
+            "mean": 2.3169990604166606,
+            "n": 1920,
+            "p50": 2.223623,
+            "p90": 3.188316,
+            "p99": 4.104726,
+            "round_p50_min_max": [
+              2.1687149999999997,
+              2.3003519999999997
+            ],
+            "round_p99_min_max": [
+              3.970825,
+              4.254728999999999
+            ],
+            "rounds": [
+              {
+                "max": 47.462784,
+                "mean": 2.3854876906249993,
+                "n": 640,
+                "p50": 2.209535,
+                "p90": 3.235018,
+                "p99": 4.156688000000001
+              },
+              {
+                "max": 4.1646529999999995,
+                "mean": 2.196419964062499,
+                "n": 640,
+                "p50": 2.1687149999999997,
+                "p90": 2.9975639999999997,
+                "p99": 3.970825
+              },
+              {
+                "max": 4.5449779999999995,
+                "mean": 2.3690895265625045,
+                "n": 640,
+                "p50": 2.3003519999999997,
+                "p90": 3.267972,
+                "p99": 4.254728999999999
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_true_new_conn_each": {
+            "max": 1.575457,
+            "mean": 0.6598719975000014,
+            "n": 1200,
+            "p50": 0.588449,
+            "p90": 0.953773,
+            "p99": 1.126861,
+            "round_p50_min_max": [
+              0.566136,
+              0.612225
+            ],
+            "round_p99_min_max": [
+              1.10563,
+              1.137833
+            ],
+            "rounds": [
+              {
+                "max": 1.286532,
+                "mean": 0.62148001,
+                "n": 400,
+                "p50": 0.566136,
+                "p90": 0.894557,
+                "p99": 1.10563
+              },
+              {
+                "max": 1.1886519999999998,
+                "mean": 0.6972886774999999,
+                "n": 400,
+                "p50": 0.612225,
+                "p90": 0.995915,
+                "p99": 1.137833
+              },
+              {
+                "max": 1.575457,
+                "mean": 0.6608473049999994,
+                "n": 400,
+                "p50": 0.592016,
+                "p90": 0.944625,
+                "p99": 1.119828
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_true_plus_0_idle_procs": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "v11_true_plus_1000_idle_procs": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "v11_true_plus_100_idle_procs": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "v11_true_seq": {
+            "max": 1.1733710000000002,
+            "mean": 0.5618797791666671,
+            "n": 1200,
+            "p50": 0.5054770000000001,
+            "p90": 0.8435969999999999,
+            "p99": 1.0032,
+            "round_p50_min_max": [
+              0.484406,
+              0.517019
+            ],
+            "round_p99_min_max": [
+              0.952781,
+              1.091382
+            ],
+            "rounds": [
+              {
+                "max": 1.059739,
+                "mean": 0.5764719100000003,
+                "n": 400,
+                "p50": 0.517019,
+                "p90": 0.8435969999999999,
+                "p99": 0.982108
+              },
+              {
+                "max": 1.1733710000000002,
+                "mean": 0.5857439649999997,
+                "n": 400,
+                "p50": 0.515417,
+                "p90": 0.889817,
+                "p99": 1.091382
+              },
+              {
+                "max": 1.0288389999999998,
+                "mean": 0.5234234624999997,
+                "n": 400,
+                "p50": 0.484406,
+                "p90": 0.730216,
+                "p99": 0.952781
+              }
+            ],
+            "unit": "ms"
+          }
+        },
+        "B": {
+          "kill_on_disconnect": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "leftover_stream_server_cpu_s": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "cpu-s"
+          },
+          "rss_100_streams": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "rss_idle": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "rss_slow_16x256MiB_hwm": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "rss_slow_16x256MiB_peak_sampled": {
+            "max": null,
+            "median": null,
+            "min": null,
+            "n": 0,
+            "samples": [],
+            "unit": "MiB"
+          },
+          "stream16_256MiB_cpu_s_per_gb": {
+            "max": 1.5133991837501526,
+            "median": 1.5087425708770752,
+            "min": 1.483131200075149,
+            "n": 3,
+            "samples": [
+              1.483131200075149,
+              1.5087425708770752,
+              1.5133991837501526
+            ],
+            "unit": "cpu-s/GB"
+          },
+          "stream16_256MiB_mb_s": {
+            "max": 668.6592027128216,
+            "median": 656.7167436639683,
+            "min": 655.0380928956607,
+            "n": 3,
+            "samples": [
+              668.6592027128216,
+              656.7167436639683,
+              655.0380928956607
+            ],
+            "unit": "MB/s aggregate"
+          },
+          "stream_random_cpu_s_per_gb": {
+            "max": 1.3969838619232178,
+            "median": 1.3783574104309084,
+            "min": 1.3783574104309069,
+            "n": 3,
+            "samples": [
+              1.3969838619232178,
+              1.3783574104309069,
+              1.3783574104309084
+            ],
+            "unit": "cpu-s/GB"
+          },
+          "stream_random_mb_s": {
+            "max": 719.9053835648549,
+            "median": 719.690522153066,
+            "min": 712.5834470024022,
+            "n": 3,
+            "samples": [
+              712.5834470024022,
+              719.690522153066,
+              719.9053835648549
+            ],
+            "unit": "MB/s"
+          },
+          "stream_zeros_cpu_s_per_gb": {
+            "max": 1.3597309589385993,
+            "median": 1.3597309589385984,
+            "min": 1.3317912817001338,
+            "n": 3,
+            "samples": [
+              1.3597309589385984,
+              1.3597309589385993,
+              1.3317912817001338
+            ],
+            "unit": "cpu-s/GB"
+          },
+          "stream_zeros_mb_s": {
+            "max": 742.3874011970862,
+            "median": 731.866450501491,
+            "min": 731.1215380780048,
+            "n": 3,
+            "samples": [
+              731.866450501491,
+              731.1215380780048,
+              742.3874011970862
+            ],
+            "unit": "MB/s"
+          },
+          "ttff": {
+            "max": 1.311932,
+            "mean": 0.5863322000000003,
+            "n": 120,
+            "p50": 0.5087740000000001,
+            "p90": 0.880279,
+            "p99": 0.99338,
+            "round_p50_min_max": [
+              0.49668,
+              0.518824
+            ],
+            "round_p99_min_max": [
+              0.973011,
+              1.311932
+            ],
+            "rounds": [
+              {
+                "max": 0.99338,
+                "mean": 0.5752093000000003,
+                "n": 40,
+                "p50": 0.498383,
+                "p90": 0.869568,
+                "p99": 0.99338
+              },
+              {
+                "max": 1.311932,
+                "mean": 0.6313555750000001,
+                "n": 40,
+                "p50": 0.49668,
+                "p90": 0.905688,
+                "p99": 1.311932
+              },
+              {
+                "max": 0.973011,
+                "mean": 0.552431725,
+                "n": 40,
+                "p50": 0.518824,
+                "p90": 0.603789,
+                "p99": 0.973011
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_cat4k_conc16": {
+            "max": 8.237347000000002,
+            "mean": 4.823108924479156,
+            "n": 1920,
+            "p50": 4.844641,
+            "p90": 5.6667369999999995,
+            "p99": 6.539111,
+            "round_p50_min_max": [
+              4.744485,
+              4.934086
+            ],
+            "round_p99_min_max": [
+              6.510505,
+              6.552937
+            ],
+            "rounds": [
+              {
+                "max": 7.434489,
+                "mean": 4.819954621874997,
+                "n": 640,
+                "p50": 4.887986000000001,
+                "p90": 5.574577,
+                "p99": 6.530093
+              },
+              {
+                "max": 7.227785,
+                "mean": 4.762115464062498,
+                "n": 640,
+                "p50": 4.744485,
+                "p90": 5.553586,
+                "p99": 6.510505
+              },
+              {
+                "max": 8.237347000000002,
+                "mean": 4.8872566875,
+                "n": 640,
+                "p50": 4.934086,
+                "p90": 5.795167,
+                "p99": 6.552937
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_cat4k_seq": {
+            "max": 1.220945,
+            "mean": 0.6564924366666668,
+            "n": 1200,
+            "p50": 0.545145,
+            "p90": 1.000815,
+            "p99": 1.1417199999999998,
+            "round_p50_min_max": [
+              0.527239,
+              0.571096
+            ],
+            "round_p99_min_max": [
+              1.097484,
+              1.156509
+            ],
+            "rounds": [
+              {
+                "max": 1.215714,
+                "mean": 0.6731855174999999,
+                "n": 400,
+                "p50": 0.5563570000000001,
+                "p90": 1.001776,
+                "p99": 1.097484
+              },
+              {
+                "max": 1.197198,
+                "mean": 0.6901027900000004,
+                "n": 400,
+                "p50": 0.571096,
+                "p90": 1.012076,
+                "p99": 1.098074
+              },
+              {
+                "max": 1.220945,
+                "mean": 0.6061890025,
+                "n": 400,
+                "p50": 0.527239,
+                "p90": 0.959614,
+                "p99": 1.156509
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_true_conc16": {
+            "max": 8.269171,
+            "mean": 4.528663200000003,
+            "n": 1920,
+            "p50": 4.515659,
+            "p90": 5.487477,
+            "p99": 6.626481,
+            "round_p50_min_max": [
+              4.393891,
+              4.674489
+            ],
+            "round_p99_min_max": [
+              6.260296,
+              6.811863
+            ],
+            "rounds": [
+              {
+                "max": 6.95336,
+                "mean": 4.433243634375003,
+                "n": 640,
+                "p50": 4.480068999999999,
+                "p90": 5.167021,
+                "p99": 6.260296
+              },
+              {
+                "max": 8.269171,
+                "mean": 4.428447915624997,
+                "n": 640,
+                "p50": 4.393891,
+                "p90": 5.319198,
+                "p99": 6.630059
+              },
+              {
+                "max": 7.790767,
+                "mean": 4.724298050000003,
+                "n": 640,
+                "p50": 4.674489,
+                "p90": 5.822932000000001,
+                "p99": 6.811863
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_true_new_conn_each": {
+            "max": 1.377831,
+            "mean": 0.6263552450000011,
+            "n": 1200,
+            "p50": 0.551246,
+            "p90": 0.909046,
+            "p99": 1.060501,
+            "round_p50_min_max": [
+              0.538331,
+              0.5616669999999999
+            ],
+            "round_p99_min_max": [
+              1.044159,
+              1.083075
+            ],
+            "rounds": [
+              {
+                "max": 1.108966,
+                "mean": 0.6392640200000003,
+                "n": 400,
+                "p50": 0.5462359999999999,
+                "p90": 0.920828,
+                "p99": 1.044159
+              },
+              {
+                "max": 1.201336,
+                "mean": 0.6289061725,
+                "n": 400,
+                "p50": 0.538331,
+                "p90": 0.915017,
+                "p99": 1.061343
+              },
+              {
+                "max": 1.377831,
+                "mean": 0.6108955425000003,
+                "n": 400,
+                "p50": 0.5616669999999999,
+                "p90": 0.86545,
+                "p99": 1.083075
+              }
+            ],
+            "unit": "ms"
+          },
+          "v11_true_plus_0_idle_procs": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "v11_true_plus_1000_idle_procs": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "v11_true_plus_100_idle_procs": {
+            "max": null,
+            "mean": -0.0,
+            "n": 0,
+            "p50": null,
+            "p90": null,
+            "p99": null,
+            "round_p50_min_max": [
+              null,
+              null
+            ],
+            "round_p99_min_max": [
+              null,
+              null
+            ],
+            "rounds": [],
+            "unit": "ms"
+          },
+          "v11_true_seq": {
+            "max": 1.330519,
+            "mean": 0.5157648624999996,
+            "n": 1200,
+            "p50": 0.433186,
+            "p90": 0.8179069999999999,
+            "p99": 0.971768,
+            "round_p50_min_max": [
+              0.424749,
+              0.439809
+            ],
+            "round_p99_min_max": [
+              0.935797,
+              0.992739
+            ],
+            "rounds": [
+              {
+                "max": 1.112332,
+                "mean": 0.5176898874999999,
+                "n": 400,
+                "p50": 0.433727,
+                "p90": 0.822627,
+                "p99": 0.992739
+              },
+              {
+                "max": 1.330519,
+                "mean": 0.5267283899999999,
+                "n": 400,
+                "p50": 0.424749,
+                "p90": 0.8274859999999999,
+                "p99": 0.969173
+              },
+              {
+                "max": 1.029531,
+                "mean": 0.50287631,
+                "n": 400,
+                "p50": 0.439809,
+                "p90": 0.795033,
+                "p99": 0.935797
+              }
+            ],
+            "unit": "ms"
+          }
+        }
+      }
+    }
+  },
+  "jobs_io_taskset_2cpus": {
+    "ring-1": {
+      "bin": "/home/jared/execd-mem-bins/execd-musl-malloc",
+      "env": [
+        "EXECD_WORKER_THREADS=1"
+      ],
+      "cpus": "0,1",
+      "read_8MiB_from_oldest_MB_s_median": 166.6052924882188,
+      "read_bytes": 8388608,
+      "attach_from_oldest_MB_s_median(approx, wire bytes*3/4)": 829.5696099290058,
+      "true_idle": {
+        "p50_ms": 0.4525184631347656,
+        "p99_ms": 0.8256435394287109,
+        "max_ms": 0.9067058563232422,
+        "n": 300
+      },
+      "true_while_16_jobs_write_flat_out": {
+        "p50_ms": 9.91368293762207,
+        "p99_ms": 126.33156776428223,
+        "max_ms": 138.66853713989258,
+        "n": 300
+      }
+    },
+    "ring-2": {
+      "bin": "/home/jared/execd-mem-bins/execd-musl-malloc",
+      "env": [
+        "EXECD_WORKER_THREADS=1"
+      ],
+      "cpus": "0,1",
+      "read_8MiB_from_oldest_MB_s_median": 180.91883877101543,
+      "read_bytes": 8388608,
+      "attach_from_oldest_MB_s_median(approx, wire bytes*3/4)": 1301.2171055474712,
+      "true_idle": {
+        "p50_ms": 0.4630088806152344,
+        "p99_ms": 0.8873939514160156,
+        "max_ms": 1.2009143829345703,
+        "n": 300
+      },
+      "true_while_16_jobs_write_flat_out": {
+        "p50_ms": 7.462024688720703,
+        "p99_ms": 121.3984489440918,
+        "max_ms": 138.8859748840332,
+        "n": 300
+      }
+    },
+    "ring-3": {
+      "bin": "/home/jared/execd-mem-bins/execd-musl-malloc",
+      "env": [
+        "EXECD_WORKER_THREADS=1"
+      ],
+      "cpus": "0,1",
+      "read_8MiB_from_oldest_MB_s_median": 187.28241152741285,
+      "read_bytes": 8388608,
+      "attach_from_oldest_MB_s_median(approx, wire bytes*3/4)": 830.2741276444444,
+      "true_idle": {
+        "p50_ms": 0.44417381286621094,
+        "p99_ms": 1.0197162628173828,
+        "max_ms": 1.184701919555664,
+        "n": 300
+      },
+      "true_while_16_jobs_write_flat_out": {
+        "p50_ms": 27.44317054748535,
+        "p99_ms": 119.26674842834473,
+        "max_ms": 126.7848014831543,
+        "n": 300
+      }
+    },
+    "spool-1": {
+      "bin": "/home/jared/execd-mem-bins/execd-musl-spool",
+      "env": [
+        "EXECD_JOBS_DIR=/home/jared/execd-jobs-test"
+      ],
+      "cpus": "0,1",
+      "read_8MiB_from_oldest_MB_s_median": 169.1011649556729,
+      "read_bytes": 8388608,
+      "attach_from_oldest_MB_s_median(approx, wire bytes*3/4)": 566.1051015883289,
+      "true_idle": {
+        "p50_ms": 0.4620552062988281,
+        "p99_ms": 0.8714199066162109,
+        "max_ms": 0.9641647338867188,
+        "n": 300
+      },
+      "true_while_16_jobs_write_flat_out": {
+        "p50_ms": 0.48041343688964844,
+        "p99_ms": 234.24053192138672,
+        "max_ms": 244.44961547851562,
+        "n": 300
+      }
+    },
+    "spool-2": {
+      "bin": "/home/jared/execd-mem-bins/execd-musl-spool",
+      "env": [
+        "EXECD_JOBS_DIR=/home/jared/execd-jobs-test"
+      ],
+      "cpus": "0,1",
+      "read_8MiB_from_oldest_MB_s_median": 186.80314355631535,
+      "read_bytes": 8388608,
+      "attach_from_oldest_MB_s_median(approx, wire bytes*3/4)": 547.8979446556968,
+      "true_idle": {
+        "p50_ms": 0.461578369140625,
+        "p99_ms": 0.9882450103759766,
+        "max_ms": 1.1379718780517578,
+        "n": 300
+      },
+      "true_while_16_jobs_write_flat_out": {
+        "p50_ms": 0.4756450653076172,
+        "p99_ms": 223.85716438293457,
+        "max_ms": 232.00631141662598,
+        "n": 300
+      }
+    },
+    "spool-3": {
+      "bin": "/home/jared/execd-mem-bins/execd-musl-spool",
+      "env": [
+        "EXECD_JOBS_DIR=/home/jared/execd-jobs-test"
+      ],
+      "cpus": "0,1",
+      "read_8MiB_from_oldest_MB_s_median": 166.4736485222781,
+      "read_bytes": 8388608,
+      "attach_from_oldest_MB_s_median(approx, wire bytes*3/4)": 579.5853482231041,
+      "true_idle": {
+        "p50_ms": 0.47087669372558594,
+        "p99_ms": 0.9434223175048828,
+        "max_ms": 1.2848377227783203,
+        "n": 300
+      },
+      "true_while_16_jobs_write_flat_out": {
+        "p50_ms": 0.514984130859375,
+        "p99_ms": 229.74443435668945,
+        "max_ms": 240.30375480651855,
+        "n": 300
+      }
+    }
+  }
+}

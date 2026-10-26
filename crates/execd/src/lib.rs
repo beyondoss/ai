@@ -34,6 +34,7 @@ mod jobs;
 mod notify;
 mod proc;
 mod runas;
+mod spool;
 
 pub use notify::{
     ATTEMPT_TIMEOUT, CallbackAttempt, CallbackKind, NOTIFY_VERSION, NotifyTarget, parse_notify,
@@ -55,6 +56,7 @@ pub mod __fuzz {
 
 pub use proc::{become_subreaper, reap_once, reap_orphans};
 pub use runas::{HELPER_FLAG, Resolved, RunAs, helper_main};
+pub use spool::remove_stale_jobs_dirs;
 
 /// The spec's heartbeat: a stream silent for this long gets `{}` (v1.2).
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -106,6 +108,10 @@ pub struct Options {
     pub run_as: Option<RunAs>,
     /// How much of each job's output is kept; see [`JOB_OUTPUT_RETENTION`].
     pub job_output_retention: usize,
+    /// Where the retained output of kept jobs is spooled, as chunk files under a directory of
+    /// execd's own (mode 0700); `None` is `$TMPDIR`, else `/tmp`. Use a disk-backed directory:
+    /// on tmpfs the output is RAM.
+    pub jobs_dir: Option<PathBuf>,
     /// The most output a v1.1 answer carries; see [`MAX_RESPONSE_BYTES`].
     pub max_response_bytes: usize,
     /// The most a request may carry; see [`MAX_REQUEST_BYTES`].
@@ -126,6 +132,7 @@ impl Options {
             run_as: None,
             kept_jobs_survive_idle: false,
             job_output_retention: JOB_OUTPUT_RETENTION,
+            jobs_dir: None,
             max_response_bytes: MAX_RESPONSE_BYTES,
             max_request_bytes: MAX_REQUEST_BYTES,
             observer: None,
@@ -151,6 +158,7 @@ impl std::fmt::Debug for Options {
             .field("run_as", &self.run_as)
             .field("kept_jobs_survive_idle", &self.kept_jobs_survive_idle)
             .field("job_output_retention", &self.job_output_retention)
+            .field("jobs_dir", &self.jobs_dir)
             .field("max_response_bytes", &self.max_response_bytes)
             .field("max_request_bytes", &self.max_request_bytes)
             .field("observer", &self.observer.is_some())
@@ -203,6 +211,8 @@ pub(crate) struct Ctx {
     /// The environment variables no command may inherit: every `EXECD_*` execd was started with.
     pub scrub: Vec<std::ffi::OsString>,
     pub jobs: jobs::Jobs,
+    /// Where kept jobs' output is held.
+    pub spool: spool::JobsDir,
     pub groups: proc::Groups,
     /// The callback client, built on the first attempt: a deployment that never keeps a job with
     /// `notify` never pays for it.
@@ -230,7 +240,9 @@ impl Handle {
     pub async fn shutdown(self) -> usize {
         self.stop.cancel();
         let _ = self.accept.await;
-        self.ctx.groups.kill_all()
+        let killed = self.ctx.groups.kill_all();
+        self.ctx.spool.clean();
+        killed
     }
 }
 
@@ -238,6 +250,7 @@ impl Handle {
 /// tokio runtime.
 pub fn serve(listener: tokio::net::TcpListener, opts: Options) -> std::io::Result<Handle> {
     let addr = listener.local_addr()?;
+    let spool = spool::JobsDir::open(opts.jobs_dir.as_deref())?;
     // Fail closed: no bearer is only for a listener that only this host can reach.
     if opts.bearer.is_none() && !opts.insecure_no_auth && !addr.ip().to_canonical().is_loopback() {
         return Err(std::io::Error::new(
@@ -256,6 +269,7 @@ pub fn serve(listener: tokio::net::TcpListener, opts: Options) -> std::io::Resul
         opts,
         scrub,
         jobs: jobs::Jobs::default(),
+        spool,
         groups: proc::Groups::default(),
         client: tokio::sync::OnceCell::new(),
         epoch: Instant::now(),
