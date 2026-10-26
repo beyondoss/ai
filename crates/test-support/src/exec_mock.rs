@@ -144,6 +144,10 @@ pub struct MockOptions {
     /// Answer 400 to a request carrying `stream` or `job`: a front that validates strictly and
     /// refuses the protocol's extensions instead of ignoring them as the spec says to.
     pub refuses_extensions: bool,
+    /// Enforce `timeout_ms` over v1.1: at the deadline kill the command's whole process group and
+    /// answer 200 with `exit_code` 124. `false` is the endpoint that ignores it (a hung command
+    /// runs until the client leaves), which the conformance verifier has to catch.
+    pub v11_timeout: bool,
 }
 
 /// One way per v1.4 conformance check for an endpoint to get the spec wrong. Each is a change to
@@ -214,6 +218,7 @@ impl Default for MockOptions {
             faults: NotifyFaults::default(),
             require_bearer: None,
             refuses_extensions: false,
+            v11_timeout: true,
         }
     }
 }
@@ -236,6 +241,7 @@ impl MockOptions {
             && self.keep_delay.is_zero()
             && self.faults == NotifyFaults::default()
             && !self.refuses_extensions
+            && self.v11_timeout
     }
 
     /// A conforming v1.4 endpoint: v1.3 jobs, and notify advertised (its deployment says kept jobs
@@ -696,22 +702,46 @@ async fn serve_envelope(mut sock: tokio::net::TcpStream, req: Value, shared: Sha
         std::process::Stdio::piped()
     } else {
         std::process::Stdio::null()
-    });
+    })
+    .process_group(0);
+    let deadline = req["timeout_ms"]
+        .as_u64()
+        .filter(|_| shared.opts.v11_timeout)
+        .map(Duration::from_millis);
     let payload = match cmd.spawn() {
         Ok(mut child) => {
+            let pgid = child.id();
             let pipe = child.stdin.take();
             let feed = async move {
                 if let (Some(mut pipe), Some(bytes)) = (pipe, stdin) {
                     let _ = pipe.write_all(&bytes).await;
                 }
             };
-            let (out, ()) = tokio::join!(child.wait_with_output(), feed);
-            let o = out.unwrap();
-            json!({
-                "exit_code": o.status.code().unwrap_or(-1),
-                "stdout": String::from_utf8_lossy(&o.stdout),
-                "stderr": String::from_utf8_lossy(&o.stderr),
-            })
+            let run = async { tokio::join!(child.wait_with_output(), feed) };
+            let finished = match deadline {
+                Some(limit) => tokio::time::timeout(limit, run).await.ok(),
+                None => Some(run.await),
+            };
+            match finished {
+                Some((out, ())) => {
+                    let o = out.unwrap();
+                    json!({
+                        "exit_code": o.status.code().unwrap_or(-1),
+                        "stdout": String::from_utf8_lossy(&o.stdout),
+                        "stderr": String::from_utf8_lossy(&o.stderr),
+                    })
+                }
+                None => {
+                    if let Some(pgid) = pgid {
+                        let _ = std::process::Command::new("kill")
+                            .args(["-KILL", "--", &format!("-{pgid}")])
+                            .stderr(std::process::Stdio::null())
+                            .status();
+                    }
+                    json!({ "exit_code": 124, "stdout": "",
+                            "stderr": "command exceeded its timeout" })
+                }
+            }
         }
         // `Argument list too long` lands here — the defect v1.1 exists to fix.
         Err(e) => json!({ "exit_code": 127, "stdout": "", "stderr": e.to_string() }),

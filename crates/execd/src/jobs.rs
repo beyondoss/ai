@@ -185,20 +185,51 @@ pub(crate) struct Job {
 pub(crate) struct Jobs {
     map: Mutex<HashMap<Key, JobCell>>,
     changed: watch::Sender<u64>,
-}
-
-impl Default for Jobs {
-    fn default() -> Self {
-        Self {
-            map: Mutex::default(),
-            changed: watch::Sender::new(0),
-        }
-    }
+    /// [`crate::Handle::activity_changed`]'s counter.
+    activity: Arc<watch::Sender<u64>>,
 }
 
 impl Jobs {
+    pub fn new(activity: Arc<watch::Sender<u64>>) -> Self {
+        Self {
+            map: Mutex::default(),
+            changed: watch::Sender::new(0),
+            activity,
+        }
+    }
+
     fn bump(&self) {
         self.changed.send_modify(|v| *v = v.wrapping_add(1));
+        self.bump_activity();
+    }
+
+    fn bump_activity(&self) {
+        self.activity.send_modify(|v| *v = v.wrapping_add(1));
+    }
+
+    /// Every job in the table that has not ended (held or kept, any scope), and the kept ones of them.
+    pub fn alive(&self) -> (usize, Vec<crate::KeptJob>) {
+        let cells: Vec<(Key, JobCell)> = locked(&self.map)
+            .iter()
+            .map(|(k, c)| (k.clone(), c.clone()))
+            .collect();
+        let mut alive = 0;
+        let mut kept = Vec::new();
+        for ((scope, id), cell) in cells {
+            let j = locked(&cell);
+            if j.end.is_some() || j.removed || j.pgid == 0 {
+                continue;
+            }
+            alive += 1;
+            if j.kept {
+                kept.push(crate::KeptJob {
+                    pgid: j.pgid,
+                    scope,
+                    id,
+                });
+            }
+        }
+        (alive, kept)
     }
 
     fn get(&self, key: &Key) -> Option<JobCell> {
@@ -504,7 +535,19 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
                 .collect();
             http::json_response(200, &json!({ "jobs": list }))
         }
-        other => http::error_response(400, &format!("unknown job op {other:?}")),
+        other => {
+            // An op this server does not implement: the embedder's, if it has a hook.
+            let hooked = ctx
+                .opts
+                .job_op_hook
+                .as_ref()
+                .zip(req.job.as_ref())
+                .and_then(|(hook, whole)| hook(other, whole));
+            match hooked {
+                Some((status, body)) => http::json_response(status, &body),
+                None => http::error_response(400, &format!("unknown job op {other:?}")),
+            }
+        }
     }
 }
 
@@ -544,6 +587,9 @@ fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq) -> Resp {
         j.seen = job.offset;
     }
     drop(j);
+    if keep {
+        ctx.jobs.bump_activity();
+    }
     http::json_response(200, &json!({}))
 }
 
@@ -589,6 +635,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     let pgid = proc.pgid;
     locked(&cell).pgid = pgid;
     ctx.groups.insert(pgid);
+    ctx.jobs.bump_activity();
 
     // Both pipes into one ring, in arrival order. `progress` counts what the pumps have read, so
     // the supervisor can tell when they have gone quiet.

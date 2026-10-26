@@ -30,7 +30,7 @@ variables alone ([Configuration](#configuration)).
 execd has no command-line flags. It is configured by `EXECD_*` environment variables, each read once at startup in
 `src/config.rs` and nowhere else: `EXECD_LISTEN`, `EXECD_ROOT`, `EXECD_HOME`, `EXECD_BEARER_FILE`, `EXECD_BEARER`,
 `EXECD_INSECURE_NO_AUTH`, `EXECD_RUN_AS`, `EXECD_KEPT_JOBS_SURVIVE_IDLE`, `EXECD_MAX_RESPONSE_BYTES`, `EXECD_JOBS_DIR`,
-`EXECD_LOG` and `EXECD_WORKER_THREADS` (the table is in the README). A value that does not parse is an error
+`EXECD_LOG`, `EXECD_WORKER_THREADS` and `EXECD_IDLE_TIMEOUT_MS` (the table is in the README). A value that does not parse is an error
 naming the variable and the value, with exit status 2; a boolean is `1`, `true`, `0` or `false`; an empty variable is unset.
 Any argument other than the internal `--execd-run-as-helper` re-exec marker (handled before anything else) prints the variable
 list to stderr and exits 2. There is no `--help` or `--version`: the startup line carries the version.
@@ -45,11 +45,11 @@ variable reaches a command's environment.
 ```text
 accept ──► hyper (HTTP/1.1, or prior-knowledge HTTP/2 on the same port)
               │
-   /livez ◄───┤ GET or HEAD only: 200, no auth
+   /livez ◄───┤ GET or HEAD only (also /healthz): 200, no auth
               ▼
    not POST ──► 405
               ▼
-   POST ──► bearer check (one header, constant time) ──► 401
+   POST ──► bearer check (one header, constant time), or `Options::authorizer` ──► 401
               ▼
    read the body, at most `max_request_bytes` ──► 413
               ▼
@@ -70,7 +70,9 @@ A request that is none of those fails before a process exists. A command that ca
 
 ### v1.1: `exec::envelope`
 
-The command runs as the leader of a new process group. Its stdout and stderr are read into buffers capped at 16 MiB across both
+The command runs as the leader of a new process group. `timeout_ms` is enforced here too (the spec's "Timeouts"): at the
+deadline the whole group is killed and the answer is `200` with `exit_code` 124 (`timeout(1)`'s status), the output read so far, and
+stderr ending in `command exceeded its timeout`. A request without `timeout_ms` has no deadline but the connection. Its stdout and stderr are read into buffers capped at 16 MiB across both
 (`EXECD_MAX_RESPONSE_BYTES`; see the bounds table). If output went past the cap it was drained and dropped, and the answer is a `422` (the agent treats 400 and 422 as a refusal of this request, not a dead sandbox) whose message says the command ran and its output exceeded the cap, so the model narrows it instead of rerunning. The answer is sent when the command exits and the pipes have been read, with a 100 ms grace for pipes
 that a descendant holds open. The group is then killed (the spec's SHOULD for v1.1), and it is killed if the client leaves
 first.
@@ -615,3 +617,108 @@ change, on a host with about 2,500 processes (static musl, one thread):
 Server CPU drops 22 times under the build-like load and 5 times per request; the round trips are the same, because the scan ran
 on the blocking pool beside the request, not in front of it. The wakeups were already zero, because they are driven by the signal
 and a 5 s tick, not by a scan. `benches/build_load.py` and `benches/per_request.py` rerun these.
+
+## Embedding
+
+The `execd` crate is the library the binary wraps, so another program can link it and serve the exec protocol itself. What the
+binary does beyond `serve()` is process setup, and each piece is public:
+
+| the binary does                                       | an embedder calls                                         | if it does not                                                      |
+| ----------------------------------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------- |
+| `helper_main()` first thing, before parsing anything  | `execd::helper_main()`; required with `run_as`            | `run_as` commands cannot start (the re-exec has no switch helper)   |
+| `log::set_level` from `EXECD_LOG`                     | `execd::log::set_level(Level)`                            | the library logs nothing                                            |
+| `become_subreaper()`, a warning when it fails         | `execd::become_subreaper()`                               | orphans go to the host's init; a waiter polls its group every 50 ms |
+| `remove_stale_jobs_dirs` on a thread, after listening | `execd::remove_stale_jobs_dirs(jobs_dir)`                 | job output directories of a crashed predecessor stay on disk        |
+| moves `EXECD_BEARER` out of `/proc/<pid>/environ`     | nothing: the binary alone has a bearer in its environment | n/a                                                                 |
+| `serve(listener, opts)`, `shutdown()` on a signal     | `execd::serve`, `Handle::shutdown`                        |                                                                     |
+
+A host that calls none of the setup is still correct: it only loses what the right-hand column says. `EXECD_*` variables in the
+host's environment are scrubbed from commands, but the rest of the host's environment is inherited, so keep secrets out of it.
+
+```rust
+use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
+
+fn main() -> ExitCode {
+    // First, before anything else, if commands run as another user (`Options::run_as`): as the
+    // switch helper this process becomes a command and never returns here.
+    if let Some(code) = execd::helper_main() {
+        return code;
+    }
+    // The library logs nothing until told a level.
+    execd::log::set_level(execd::log::Level::Info);
+    let key = std::env::var("EMBED_KEY").expect("EMBED_KEY");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let result: std::io::Result<()> = runtime.block_on(async move {
+        // Orphans reparent to this process and are collected at once. Without it execd still
+        // works, polling a command's group every 50 ms until it is empty.
+        if let Err(e) = execd::become_subreaper() {
+            execd::log_warn!("cannot become a subreaper: {e}");
+        }
+        let mut opts = execd::Options::new("/tmp");
+        opts.authorizer = Some(Arc::new(move |headers: &execd::HeaderMap| {
+            headers
+                .get("x-host-key")
+                .is_some_and(|v| v.as_bytes() == key.as_bytes())
+        }));
+        opts.idle_timeout = Some(Duration::from_secs(30));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
+        let server = execd::serve(listener, opts)?;
+        tokio::signal::ctrl_c().await?;
+        server.shutdown().await;
+        Ok(())
+    });
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            execd::log_error!("embedded execd failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+```
+
+(`examples/embed.rs` is this program; clippy builds it.)
+
+**Authentication.** `Options::authorizer` is `Arc<dyn Fn(&HeaderMap) -> bool + Send + Sync>`. With it set, every request except
+`/livez` and `/healthz` runs if and only if it returns `true`, and gets `401` (as for a bad bearer) otherwise. It is called once
+per request, before the body is read, inline on the connection's task, so it must be quick. Setting it together with `bearer` makes
+`serve()` return `InvalidInput`. It counts as authentication for the fail-closed rule, so a non-loopback listener needs no bearer
+with it. The binary cannot supply a closure and is unchanged.
+
+**Idle connections.** `Options::idle_timeout` (`EXECD_IDLE_TIMEOUT_MS` for the binary; unset or 0 is off) closes a connection with
+no request in flight for that long: HTTP/1.1 is closed, h2 gets a GOAWAY. A request is in flight from the moment hyper hands it to
+execd until its response body is dropped, so a stream, a held job start or an `attach` counts for as long as it lasts, even while it
+sends only heartbeats. Each connection has one counter and, only when the timeout is set, one timer armed for the remaining idle
+time; unset, no timer exists and the connection loop is exactly what it was (an idle execd holding one idle connection made 0 context switches in 20 s unset, and 0 with a 100 s timeout set). This is for a VM that sleeps when it has no network
+traffic, behind a proxy that pools connections with TCP keepalives.
+
+**Activity.** `Handle::activity()` answers what the server is doing now, and `Handle::activity_changed()` is a `watch::Receiver<u64>`
+that moves whenever that may have changed (a request starts or ends, a job starts, is kept, ends or is removed):
+
+- `in_flight`: requests from handler start to the end of their response body. `/livez` and `/healthz` never count. It is the same
+  guard the idle timeout counts with, summed over connections, so the two cannot disagree.
+- `running_kept`: every job that was kept and has not ended, with its process group.
+- `jobs_alive`: every job in the table that has not ended, in any scope, held or kept.
+
+A host that pauses an idle machine subscribes and re-reads:
+
+```rust
+let mut changed = server.activity_changed();
+loop {
+    changed.changed().await.ok();
+    let a = server.activity();
+    if a.in_flight == 0 && a.jobs_alive == 0 {
+        // nothing is running: safe to let the machine sleep
+    }
+}
+```
+
+**Unknown job ops.** `Options::job_op_hook` is `Arc<dyn Fn(&str, &serde_json::Value) -> Option<(u16, serde_json::Value)>>`. It
+receives the op name and the whole `job` object for an op execd does not implement, after authentication and parsing, never for a known
+op, and its `Some((status, body))` is sent as a JSON response; `None` is the usual `400`. It is synchronous and runs on the server's
+thread, so it must be quick.

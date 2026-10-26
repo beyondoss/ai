@@ -6,6 +6,7 @@
 //! about 284 KiB of the resident memory of a process whose floor is under a megabyte.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use execd::log::Level;
 
@@ -23,6 +24,7 @@ pub struct Config {
     pub jobs_dir: Option<PathBuf>,
     pub log_level: Level,
     pub worker_threads: usize,
+    pub idle_timeout: Option<Duration>,
 }
 
 /// The variables, printed when execd is given an argument. `EXECD_BEARER_FD` is internal.
@@ -41,6 +43,7 @@ execd takes no arguments; it is configured by environment variables:
   EXECD_JOBS_DIR                  where a kept job's last 8 MiB of output is spooled (default $TMPDIR, else /tmp)
   EXECD_LOG                       off, error, warn, info, debug or trace (default info)
   EXECD_WORKER_THREADS            1 (default) one thread, 0 a worker per CPU, N workers
+  EXECD_IDLE_TIMEOUT_MS           close a connection with no request in flight for this long; 0 (default) never
 ";
 
 fn number<T: std::str::FromStr>(name: &str, v: Option<String>) -> Result<Option<T>, String> {
@@ -84,6 +87,9 @@ pub fn parse<E: Fn(&str) -> Option<String>>(env: E) -> Result<Config, String> {
             })?,
         },
         worker_threads: number("EXECD_WORKER_THREADS", get("EXECD_WORKER_THREADS"))?.unwrap_or(1),
+        idle_timeout: number::<u64>("EXECD_IDLE_TIMEOUT_MS", get("EXECD_IDLE_TIMEOUT_MS"))?
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis),
     })
 }
 
@@ -110,6 +116,7 @@ mod tests {
         assert_eq!(c.max_response_bytes, execd::MAX_RESPONSE_BYTES);
         assert_eq!(c.log_level, Level::Info);
         assert_eq!(c.worker_threads, 1);
+        assert_eq!(c.idle_timeout, None);
     }
 
     #[test]
@@ -126,6 +133,7 @@ mod tests {
             ("EXECD_JOBS_DIR", "/var/jobs"),
             ("EXECD_LOG", "debug"),
             ("EXECD_WORKER_THREADS", "0"),
+            ("EXECD_IDLE_TIMEOUT_MS", "1500"),
         ])
         .unwrap();
         assert_eq!(c.listen, "0.0.0.0:9");
@@ -138,6 +146,9 @@ mod tests {
         assert_eq!(c.jobs_dir, Some("/var/jobs".into()));
         assert_eq!(c.log_level, Level::Debug);
         assert_eq!(c.worker_threads, 0);
+        assert_eq!(c.idle_timeout, Some(Duration::from_millis(1500)));
+        let zero = cfg(&[("EXECD_IDLE_TIMEOUT_MS", "0")]).unwrap();
+        assert_eq!(zero.idle_timeout, None);
     }
 
     #[test]
@@ -173,6 +184,7 @@ mod tests {
         for (k, v) in [
             ("EXECD_MAX_RESPONSE_BYTES", "lots"),
             ("EXECD_WORKER_THREADS", "-1"),
+            ("EXECD_IDLE_TIMEOUT_MS", "soon"),
             ("EXECD_LOG", "info,foo=debug"),
             ("EXECD_INSECURE_NO_AUTH", "maybe"),
         ] {

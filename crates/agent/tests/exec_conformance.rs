@@ -77,7 +77,7 @@ async fn a_conforming_endpoint_passes_every_check() {
         .map(|c| c.name)
         .collect();
     assert_eq!(skipped, conformance::notify::CHECKS, "{}", report.render());
-    assert_eq!(report.checks.len(), 17 + conformance::notify::CHECKS.len());
+    assert_eq!(report.checks.len(), 18 + conformance::notify::CHECKS.len());
 }
 
 /// The reference v1.4 endpoint passes every check, the v1.4 ones included.
@@ -98,7 +98,7 @@ async fn a_conforming_v14_endpoint_passes_every_check() {
         "{}",
         report.render()
     );
-    assert_eq!(report.checks.len(), 17 + conformance::notify::CHECKS.len());
+    assert_eq!(report.checks.len(), 18 + conformance::notify::CHECKS.len());
     assert!(report.render().contains("v1.4"), "{}", report.render());
 }
 
@@ -417,6 +417,42 @@ async fn an_endpoint_that_survives_a_disconnect_fails_the_kill_check() {
     assert_eq!(
         failed,
         vec![conformance::DISCONNECT, conformance::LEFTOVERS],
+        "{}",
+        report.render()
+    );
+}
+
+/// An endpoint that ignores `timeout_ms` over v1.1 runs a hung command until the client leaves; the
+/// verifier must catch it, and only it.
+#[tokio::test]
+async fn an_endpoint_that_ignores_the_v11_timeout_fails_that_check_alone() {
+    let (opts, expect) = quick();
+    let report = verify_mock(
+        MockOptions {
+            v11_timeout: false,
+            ..opts
+        },
+        &expect,
+    )
+    .await;
+    let failed: Vec<&str> = report
+        .checks
+        .iter()
+        .filter(|c| c.verdict == Verdict::Fail)
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(
+        failed,
+        vec![conformance::ENVELOPE_TIMEOUT],
+        "{}",
+        report.render()
+    );
+    assert!(
+        report
+            .check(conformance::ENVELOPE_TIMEOUT)
+            .unwrap()
+            .detail
+            .contains("ignores the deadline"),
         "{}",
         report.render()
     );

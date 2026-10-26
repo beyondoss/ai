@@ -155,8 +155,20 @@ async fn ran_within(marker: &Path, ms: u64) -> bool {
     false
 }
 
+/// Which way the server under test authenticates.
+#[derive(Clone, Copy)]
+enum Auth {
+    /// The real binary with `EXECD_BEARER`.
+    Bearer,
+    /// The library, embedded, with an `Options::authorizer` that accepts exactly the one
+    /// `Authorization: Bearer <token>` header and nothing else.
+    Authorizer,
+}
+
 struct Matrix {
-    execd: Execd,
+    dir: std::path::PathBuf,
+    /// Keeps the server (and its directory) alive until the matrix ends.
+    _server: Box<dyn std::any::Any>,
     addr: SocketAddr,
     failures: Vec<String>,
     cases: usize,
@@ -164,11 +176,34 @@ struct Matrix {
 }
 
 impl Matrix {
-    fn new() -> Self {
-        let execd = Execd::start(&[], &[("EXECD_BEARER", TOKEN)]);
-        let addr = SocketAddr::V4(execd.addr);
+    async fn new(auth: Auth) -> Self {
+        let (addr, dir, server): (SocketAddr, std::path::PathBuf, Box<dyn std::any::Any>) =
+            match auth {
+                Auth::Bearer => {
+                    let execd = Execd::start(&[], &[("EXECD_BEARER", TOKEN)]);
+                    let dir = execd.dir.path().to_path_buf();
+                    (SocketAddr::V4(execd.addr), dir, Box::new(execd))
+                }
+                Auth::Authorizer => {
+                    let dir = tempfile::tempdir().unwrap();
+                    let mut o = execd::Options::new(dir.path());
+                    let want = format!("Bearer {TOKEN}");
+                    o.authorizer = Some(std::sync::Arc::new(move |h: &execd::HeaderMap| {
+                        let mut all = h.get_all("authorization").iter();
+                        matches!((all.next(), all.next()), (Some(v), None) if v.as_bytes() == want.as_bytes())
+                    }));
+                    let listener = beyond_ai_test_support::ports::tokio_listener().await;
+                    let server = execd::serve(listener, o).unwrap();
+                    (
+                        server.local_addr(),
+                        dir.path().to_path_buf(),
+                        Box::new((server, dir)),
+                    )
+                }
+            };
         Self {
-            execd,
+            dir,
+            _server: server,
             addr,
             failures: Vec::new(),
             cases: 0,
@@ -177,7 +212,7 @@ impl Matrix {
     }
 
     fn marker(&self, n: usize) -> std::path::PathBuf {
-        self.execd.dir.path().join(format!("marker-{n}"))
+        self.dir.join(format!("marker-{n}"))
     }
 
     /// Send `build(marker)` over `proto`. `runs`: the case is one HTTP itself says is authorized, and
@@ -261,13 +296,22 @@ impl Matrix {
     fn finish(self) {
         println!("{} cases, {} ran by design", self.cases, self.ran_by_design);
         assert!(self.failures.is_empty(), "\n{}\n", self.failures.join("\n"));
-        drop(self.execd);
+        drop(self._server);
     }
 }
 
 #[tokio::test]
 async fn nothing_runs_without_the_bearer_over_http1_and_h2c() {
-    let mut m = Matrix::new();
+    paths_methods_and_headers(Auth::Bearer).await;
+}
+
+#[tokio::test]
+async fn nothing_runs_without_the_authorizer_saying_so_over_http1_and_h2c() {
+    paths_methods_and_headers(Auth::Authorizer).await;
+}
+
+async fn paths_methods_and_headers(auth: Auth) {
+    let mut m = Matrix::new(auth).await;
 
     // Controls: the vehicle works. A valid bearer on the exec path runs the command.
     m.both("control: valid bearer", true, |p| Req::post(p).auth())
@@ -286,6 +330,17 @@ async fn nothing_runs_without_the_bearer_over_http1_and_h2c() {
         "/livez%00",
         "/livez;x",
         "/exec/../livez",
+        "/healthz",
+        "/healthz/",
+        "//healthz",
+        "/healthz/..",
+        "/./healthz",
+        "/%68ealthz",
+        "/healthz?x",
+        "/HEALTHZ",
+        "/healthz%00",
+        "/healthz;x",
+        "/exec/../healthz",
         "/",
         "",
     ] {
@@ -298,6 +353,10 @@ async fn nothing_runs_without_the_bearer_over_http1_and_h2c() {
     // The fragment is not sent by any client; a raw one is part of the path and is just another path.
     m.case("path /livez#", Proto::H1, false, |p| {
         Req::post(p).at("/livez#")
+    })
+    .await;
+    m.case("path /healthz#", Proto::H1, false, |p| {
+        Req::post(p).at("/healthz#")
     })
     .await;
     // Absolute-form request target.
@@ -313,9 +372,21 @@ async fn nothing_runs_without_the_bearer_over_http1_and_h2c() {
         Req::post(p).at("/livez")
     })
     .await;
+    m.case("absolute-form http://host/healthz", Proto::H1, false, |p| {
+        Req::post(p).at("http://execd/healthz")
+    })
+    .await;
+    m.case("absolute-form over h2 /healthz", Proto::H2, false, |p| {
+        Req::post(p).at("/healthz")
+    })
+    .await;
     // A valid bearer on `/livez` is an exec request like any other (the path never mattered).
     m.both("POST /livez with the bearer", true, |p| {
         Req::post(p).auth().at("/livez")
+    })
+    .await;
+    m.both("POST /healthz with the bearer", true, |p| {
+        Req::post(p).auth().at("/healthz")
     })
     .await;
 
@@ -336,10 +407,18 @@ async fn nothing_runs_without_the_bearer_over_http1_and_h2c() {
                 Req::post(p).method(method).at("/livez")
             })
             .await;
+            m.both(&format!("{method} /healthz with a body"), false, move |p| {
+                Req::post(p).method(method).at("/healthz")
+            })
+            .await;
         }
     }
     m.both("POST /livez carrying an exec body", false, |p| {
         Req::post(p).at("/livez")
+    })
+    .await;
+    m.both("POST /healthz carrying an exec body", false, |p| {
+        Req::post(p).at("/healthz")
     })
     .await;
 
@@ -533,7 +612,16 @@ async fn nothing_runs_without_the_bearer_over_http1_and_h2c() {
 /// Bodies and framing, over HTTP/1.1 where the framing is the client's to get wrong.
 #[tokio::test]
 async fn framing_cannot_get_a_command_past_the_bearer_or_smuggle_one() {
-    let mut m = Matrix::new();
+    framing(Auth::Bearer).await;
+}
+
+#[tokio::test]
+async fn framing_cannot_get_a_command_past_the_authorizer_or_smuggle_one() {
+    framing(Auth::Authorizer).await;
+}
+
+async fn framing(mode: Auth) {
+    let mut m = Matrix::new(mode).await;
     let good = |n: usize, m: &Matrix| (m.marker(n), m.marker(n + 1));
     let auth = format!("Bearer {TOKEN}");
 
@@ -831,26 +919,28 @@ async fn framing_cannot_get_a_command_past_the_bearer_or_smuggle_one() {
 async fn livez_answers_a_read_and_reveals_nothing() {
     let execd = Execd::start(&[], &[("EXECD_BEARER", TOKEN)]);
     let addr = SocketAddr::V4(execd.addr);
-    let get = support::http::send(addr, "GET", "/livez", &[], b"").await;
-    assert_eq!(get.status, 200);
-    assert_eq!(get.body, br#"{"ok":true}"#);
-    let names: Vec<String> = get.headers.iter().map(|(n, _)| n.to_lowercase()).collect();
-    for n in &names {
-        assert!(
-            ["content-type", "content-length", "date", "connection"].contains(&n.as_str()),
-            "unexpected header {n}: {names:?}"
+    for health in ["/livez", "/healthz"] {
+        let get = support::http::send(addr, "GET", health, &[], b"").await;
+        assert_eq!(get.status, 200);
+        assert_eq!(get.body, br#"{"ok":true}"#);
+        let names: Vec<String> = get.headers.iter().map(|(n, _)| n.to_lowercase()).collect();
+        for n in &names {
+            assert!(
+                ["content-type", "content-length", "date", "connection"].contains(&n.as_str()),
+                "unexpected header {n}: {names:?}"
+            );
+        }
+        let head = support::http::send(addr, "HEAD", health, &[], b"").await;
+        assert_eq!(head.status, 200);
+        // A read of `/livez` that carries an exec body is still only a read: the body is never looked at.
+        let marker = execd.dir.path().join("health-marker");
+        let with_body = support::http::send(addr, "GET", health, &[], &exec_body(&marker)).await;
+        assert_eq!(
+            (with_body.status, &with_body.body[..]),
+            (200, &br#"{"ok":true}"#[..])
         );
+        assert!(!ran(&marker).await);
     }
-    let head = support::http::send(addr, "HEAD", "/livez", &[], b"").await;
-    assert_eq!(head.status, 200);
-    // A read of `/livez` that carries an exec body is still only a read: the body is never looked at.
-    let marker = execd.dir.path().join("livez-marker");
-    let with_body = support::http::send(addr, "GET", "/livez", &[], &exec_body(&marker)).await;
-    assert_eq!(
-        (with_body.status, &with_body.body[..]),
-        (200, &br#"{"ok":true}"#[..])
-    );
-    assert!(!ran(&marker).await);
     // Nothing else is open: a read of any other path is refused, with or without the bearer.
     for path in [
         "/", "/exec", "/metrics", "/debug", "/status", "/version", "/health", "/jobs",

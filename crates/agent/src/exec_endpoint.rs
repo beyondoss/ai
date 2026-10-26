@@ -29,6 +29,11 @@
 //! { "exit_code": 0, "stdout": "…", "stderr": "…" }
 //! ```
 //!
+//! **Timeouts over v1.1.** `timeout_ms` is the endpoint's to enforce over v1.1 too: at the deadline it
+//! MUST kill the command's whole process group and SHOULD answer 200 with `exit_code` 124 and stderr
+//! ending in `command exceeded its timeout`. A request without `timeout_ms` has no deadline but the
+//! connection. (The agent sends [`UNTRACKED_DEADLINE`] over v1.1 for exactly this reason.)
+//!
 //! Deliberately the smallest thing that can carry a command and its result. Putting an adapter in
 //! front of a vendor's SDK is a few dozen lines on their side, and that seam is where vendor
 //! specifics belong — not in here.
@@ -103,7 +108,7 @@
 //!   frames only — and this client treats 30 s with no frame at all as a dead connection.
 //! - **Unknown fields are ignored**, and a frame with no known field is a heartbeat, so a later
 //!   version can add fields (a sequence number, timings) without breaking this client.
-//! - **Timeouts.** `timeout_ms` is the endpoint's to enforce: at the deadline it MUST kill the
+//! - **Timeouts.** (Over v1.1 see "Timeouts over v1.1" above.) `timeout_ms` is the endpoint's to enforce: at the deadline it MUST kill the
 //!   command's whole process group and send `{"timed_out": true}`. The client's own deadline is
 //!   `timeout_ms` + 30 s for the whole exchange, so the endpoint's verdict normally wins. `bash`
 //!   jobs have no deadline — they end with the turn, the run or the session, or a `bash_job` kill,
