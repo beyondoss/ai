@@ -109,6 +109,12 @@ no answer, no argument and no environment; `Debug` for it prints `<redacted>`.
   `OWNED`. A child is therefore either already registered when the reaper looks (and skipped, so a command execd awaits is never
   reaped out from under its owner) or not yet created; there is no moment at which a forked child is visible to the reaper and
   unregistered. The reaper holds nothing while it looks for zombies.
+- **Runtime.** One thread: a tokio `current_thread` runtime. execd moves bytes between sockets and pipes and waits on timers and
+  child exits; the little CPU work it has (copying, base64) is about 1 GB/s on one core, more than a sandbox's commands write.
+  `EXECD_WORKER_THREADS` sets it: unset or `1` is one thread, `0` one worker per CPU, `N` N workers. The reads of the process
+  tree that the reaper and the liveness check make run inline, since they take microseconds; only a fallback scan of `/proc`
+  goes to the blocking pool. The spawn and reap locks are still needed (a host can embed `execd::serve` in a multi-thread
+  runtime, as the test mock does) and cost two uncontended atomics per spawn.
 - **Shutdown.** `SIGTERM` or `SIGINT` stops the accept loop, drops every open connection (which drops every in-flight handler, and
   with it the guard that kills that handler's group), then kills every group still registered, commands and jobs alike, and
   exits.
@@ -274,3 +280,80 @@ Before, that was more than half a core spent for as long as the dev server lived
 zero, and the reference mock spends five times as much. The `children` files need `CONFIG_PROC_CHILDREN` in the kernel (it
 exists on this 6.12 kernel); where they are missing, `/proc` is read as before, correct but at the old cost. This was not
 checked on the Fargate or E2B kernels.
+
+### Memory
+
+execd runs in every sandbox, so its resident memory is a per-VM cost. Everything here is the shipped artifact: a static musl,
+non-PIE (`-C relocation-model=static`), release build, for both the reference mock (A) and execd (B), measured by
+`benches/memory.py` (smaps_rollup PSS in KiB, medians of 3 fresh servers, `PR_SET_THP_DISABLE` on the server, so the host's
+THP=always does not enter) and `benches/exec_compare.rs`. Raw summaries: `benches/results/2026-10-25-memory.json`. The 16-thread
+host differs from a VM; "2 CPUs" rows pin the server with `taskset -c 0,1`.
+
+**Idle, and what each cut is worth** (PSS KiB; each row is one change from the row above unless it says otherwise):
+
+| build                                              | idle PSS | threads | change                                 |
+| -------------------------------------------------- | -------- | ------- | -------------------------------------- |
+| Rust floor: `current_thread` + hyper, `ok` reply   | 972      | 1       | `examples/floor.rs`, built as execd is |
+| C reference: busybox `httpd` (dynamic glibc, host) | 492      | 1       | RSS is 2144; shared libc counts part   |
+| reference mock (A)                                 | 3548     | 17      |                                        |
+| execd before this change (multi-thread)            | 3104     | 17      |                                        |
+| (a) `current_thread`                               | 2844     | 1       | -260                                   |
+| (b) lazy notify client                             | 2844     | 1       | 0: already lazy (`OnceCell`)           |
+| (c) no log subscriber at all                       | 2352     | 1       | -492, an upper bound; not shipped      |
+| (d) (c) and no clap                                | 2068     | 1       | -284 more; not shipped                 |
+| (f) PGO, on top of (a)                             | 2544     | 1       | -300 (not combined with (c) and (d))   |
+| (e) mimalloc, arena alloc disabled, on top of (a)  | 3252     | 1       | +408; default arena multi-thread: 4044 |
+
+(a) ships. (b) was already true: the callback client is built on the first v1.4 attempt, so nothing of reqwest, rustls or ring
+runs at startup. (c) and (d) are bounds, measured by removing the code, not by a replacement: an `EnvFilter` pulls in a regex
+engine, and clap's parser accounts for the 284 KiB of (d). Replacing them changes behaviour (a filter language, `--help`
+and error text), so they wait for a decision. PGO follows `release-agent.yml` and `.github/pgo-train-execd.py` trains it; it
+belongs in the distribution build (`Dockerfile.execd`, `release-execd.yml`, on #536), not in a cargo profile. On 2 CPUs the
+multi-thread build idles at 2960 and `current_thread` at 2852 (-108), because tokio then starts 2 workers, not 16.
+
+**Marginal cost** (medians of 3, in the JSON):
+
+| what                                            | reference (A) | execd, musl malloc | execd, mimalloc (no arena) |
+| ----------------------------------------------- | ------------- | ------------------ | -------------------------- |
+| one idle stream (`sleep 30`), PSS KiB, over 100 | 105.7         | 57.0               | 37.4                       |
+| one kept job that wrote 9 MiB, PSS KiB, over 20 | 8304          | 9501               | 8535                       |
+
+A stream's 57 KiB is far below the nominal sizes in the Bounds table (a 400 KiB hyper write buffer, 64 KiB read buffers): an
+idle command has written nothing, so those pages are not resident. I did not itemize the 57 KiB by buffer. A kept job's output
+ring is anonymous memory: 20 jobs that each wrote more than 8 MiB hold about 190 MB (PSS) in execd, 9.3 MiB each, the ring plus
+chunk and allocator overhead; the reference mock holds 8.1 MiB each, as it keeps its output in a `Vec`. This is the one large
+cost in the process, and it scales with the number of kept jobs, not with anything a sandbox does at idle. A job's output
+spilled to a file under the job directory would take it out of anonymous memory (page cache, reclaimable) and leave a few KiB
+per job; that is a redesign, so it is reported here and not built.
+
+**Burst** (16 slow readers of 256 MiB streams, 8 s, then dropped; 2 CPUs; n=2): the reference mock peaks at 4.4 GiB and settles
+at 3.7 MiB. execd with musl malloc peaks at 20 MiB, and after the clients leave sits at 3.0 MiB (2.8 MiB before), unchanged 30 s
+later: the memory returns. With mimalloc it peaks at 31 MiB and stays at 7.3 MiB (4.3 MiB of anonymous memory it does not give
+back).
+
+**Runtime and allocator, on throughput** (static musl, 3 rounds interleaved, a fast client, 1 GiB streams and 16 concurrent 256
+MiB streams; decoded MB/s, medians; `true` at concurrency 16 is p50 ms):
+
+| server                                | single stream | 16 streams, aggregate | server CPU-s/GB | `true` x16 p50 | first frame p50 |
+| ------------------------------------- | ------------- | --------------------- | --------------- | -------------- | --------------- |
+| multi-thread, unpinned (16 CPUs)      | 936           | 3237                  | 1.87            | 2.2 ms         | 0.51 ms         |
+| `current_thread`, unpinned            | 732           | 657                   | 1.36            | 4.5 ms         | 0.51 ms         |
+| multi-thread, 2 CPUs                  | 790           | 1047                  | 1.54            | 4.7 ms         | 0.50 ms         |
+| `current_thread`, 2 CPUs              | 709           | 628                   | 1.37            | 4.7 ms         | 0.53 ms         |
+| `current_thread`, musl malloc, 2 CPUs | 706           | 650                   | 1.36            | 4.8 ms         | 0.52 ms         |
+| `current_thread`, mimalloc, 2 CPUs    | 1140          | 1084                  | 0.83            | 4.5 ms         | 0.42 ms         |
+
+Verdict. `current_thread` saves 260 KiB at idle on this 16-thread host and 108 KiB on a 2-CPU VM (the 17 thread stacks are
+mostly untouched, so the saving is small), costs 10 to 22% of single-stream rate (709 to 732 MB/s, far above what the commands of a sandbox write) and, on a many-CPU host, the 16-stream aggregate (657 against 3237 MB/s, still far
+above a sandbox's output) and the concurrent-`true` latency (4.5 ms against 2.2 ms for 16 at once, spawn-bound on one thread).
+On 2 CPUs the aggregate is 628 against 1047 and the latency is a tie. It uses less server CPU per GB in both. That is a small
+memory win for a rate loss nothing in a sandbox reaches, so it ships as the default; `EXECD_WORKER_THREADS=0` restores a worker
+per CPU. mimalloc is a large throughput win on one thread (+60%, -40% CPU per GB), because musl's malloc is the cost of the
+64 KiB frame buffers, but it costs 408 KiB at idle and keeps 4 MiB after a burst, so it is not enabled; the `mimalloc` cargo
+feature builds it. Reusing the frame buffer would take the allocator out of the stream path without either cost; that is a
+change to the stream code and is not made here. PGO and the replacements for (c) and (d) are the remaining levers, worth about
+0.3 MiB each of a 2.8 MiB process.
+
+What would remove the rest of the reaper's work: a pidfd per spawned child would let each command's exit be awaited without the
+`SIGCHLD` path, but the orphan pass still needs the signal, since orphans are not children execd spawned and so have no pidfd
+until found. It would save the per-exit wake-up, not the pass.

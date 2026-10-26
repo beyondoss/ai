@@ -48,6 +48,8 @@ struct Side {
     name: &'static str,
     bin: PathBuf,
     stub: bool,
+    /// Extra environment for the server, from `EXEC_BENCH_<side>_ENV=K=V,K=V`.
+    env: Vec<(String, String)>,
 }
 
 struct Server {
@@ -65,7 +67,16 @@ impl Server {
         std::fs::create_dir_all(&root)?;
         std::fs::create_dir_all(&home)?;
         std::fs::write(root.join("f4k"), vec![b'x'; 4096])?;
-        let mut cmd = Command::new(&side.bin);
+        // `EXEC_BENCH_CPUS=0,1` pins the servers (not the client) as a small VM would be.
+        let mut cmd = match std::env::var("EXEC_BENCH_CPUS") {
+            Ok(cpus) => {
+                let mut c = Command::new("taskset");
+                c.args(["-c", &cpus]).arg(&side.bin);
+                c
+            }
+            Err(_) => Command::new(&side.bin),
+        };
+        cmd.envs(side.env.iter().map(|(k, v)| (k, v)));
         if side.stub {
             cmd.arg("exec-stub");
         }
@@ -456,6 +467,35 @@ async fn throughput(s: &Server, body: Value, mib: u64) -> Res<(f64, f64)> {
     Ok((n as f64 / 1e6 / secs, cpu / gb))
 }
 
+/// 16 concurrent streams of `mib` each, read as fast as the client can: (aggregate MB/s of decoded
+/// payload, server CPU-seconds per GB).
+async fn throughput16(s: &Server, mib: u64) -> Res<(f64, f64)> {
+    let body = req(
+        "head",
+        &["-c", &(mib << 20).to_string(), "/dev/zero"],
+        &s.root,
+    );
+    let cpu0 = s.cpu();
+    let t = Instant::now();
+    let mut hs = Vec::new();
+    for _ in 0..16 {
+        let (addr, body) = (s.addr, body.clone());
+        hs.push(tokio::spawn(async move {
+            let mut c = Conn::open(addr).await?;
+            c.stream(body).await?;
+            c.drain().await
+        }));
+    }
+    let mut total = 0u64;
+    for h in hs {
+        total += h.await??;
+    }
+    let secs = t.elapsed().as_secs_f64();
+    let cpu = s.cpu() - cpu0;
+    let gb = total as f64 / 1e9;
+    Ok((gb * 1e3 / secs, cpu / gb))
+}
+
 /// Request to first output frame; the connection is dropped there, which kills the `sleep`.
 async fn ttff(s: &Server, n: usize) -> Res<Vec<f64>> {
     let body = req("sh", &["-c", "printf a; sleep 1"], &s.root);
@@ -647,10 +687,21 @@ struct Samples {
     rss_slow_peak: Vec<u64>,
     rss_slow_hwm: Vec<u64>,
     leftover_cpu: Vec<f64>,
+    stream16_mbs: Vec<f64>,
+    stream16_cpu: Vec<f64>,
 }
 
 /// Idle processes added to the host for the crowded round trips.
 const SLEEPERS: [usize; 3] = [0, 100, 1000];
+
+fn side_env(var: &str) -> Vec<(String, String)> {
+    std::env::var(var)
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
 
 fn count_procs() -> usize {
     std::fs::read_dir("/proc")
@@ -764,6 +815,8 @@ fn side_json(s: &Samples) -> Value {
         "rss_slow_16x256MiB_peak_sampled": mib(&s.rss_slow_peak),
         "rss_slow_16x256MiB_hwm": mib(&s.rss_slow_hwm),
         "leftover_stream_server_cpu_s": scalar_json(&s.leftover_cpu, "cpu-s"),
+        "stream16_256MiB_mb_s": scalar_json(&s.stream16_mbs, "MB/s aggregate"),
+        "stream16_256MiB_cpu_s_per_gb": scalar_json(&s.stream16_cpu, "cpu-s/GB"),
     })
 }
 
@@ -805,12 +858,15 @@ async fn main() -> Res<()> {
         Side {
             name: "A",
             bin: a_bin.into(),
-            stub: true,
+            // `EXEC_BENCH_A_PLAIN=1`: A is an execd binary too (comparing two builds of it).
+            stub: std::env::var_os("EXEC_BENCH_A_PLAIN").is_none(),
+            env: side_env("EXEC_BENCH_A_ENV"),
         },
         Side {
             name: "B",
             bin: b_bin.into(),
             stub: false,
+            env: side_env("EXEC_BENCH_B_ENV"),
         },
     ];
     let rounds = env_num("EXEC_BENCH_ROUNDS", 5) as usize;
@@ -818,6 +874,10 @@ async fn main() -> Res<()> {
     let stream_mib = env_num("EXEC_BENCH_STREAM_MIB", 1024);
     let (n_seq, n_conc, n_ttff, n_kill) = (400 * scale, 40 * scale, 40 * scale, 10 * scale);
     let mem_rounds = 2.min(rounds);
+    // Which parts to run (default all): v11, sleepers, stream, stream16, ttff, kill, mem.
+    let parts = std::env::var("EXEC_BENCH_PARTS")
+        .unwrap_or_else(|_| "v11,sleepers,stream,ttff,kill,mem".to_string());
+    let on = |p: &str| parts.split(',').any(|x| x == p);
 
     // Incompressible payload, generated once.
     let random = tempfile::NamedTempFile::new()?;
@@ -843,13 +903,17 @@ async fn main() -> Res<()> {
             let t = Instant::now();
             let tr = req("true", &[], &s.root);
             let cat = req("cat", &["f4k"], &s.root);
-            r.seq_true.push(v11_seq(s, tr.clone(), n_seq, false).await?);
-            r.seq_cat.push(v11_seq(s, cat.clone(), n_seq, false).await?);
-            r.fresh_true
-                .push(v11_seq(s, tr.clone(), n_seq, true).await?);
+            if on("v11") {
+                r.seq_true.push(v11_seq(s, tr.clone(), n_seq, false).await?);
+                r.seq_cat.push(v11_seq(s, cat.clone(), n_seq, false).await?);
+                r.fresh_true
+                    .push(v11_seq(s, tr.clone(), n_seq, true).await?);
+                r.conc_true.push(v11_conc(s, tr.clone(), n_conc).await?);
+                r.conc_cat.push(v11_conc(s, cat.clone(), n_conc).await?);
+            }
             // The same round trip with the host holding more processes: what a scan of `/proc`
             // costs, if the endpoint does one per command.
-            for (k, extra) in SLEEPERS.iter().enumerate() {
+            for (k, extra) in SLEEPERS.iter().enumerate().filter(|_| on("sleepers")) {
                 let mut idle: Vec<Child> = (0..*extra)
                     .map(|_| {
                         Command::new("sleep")
@@ -865,23 +929,32 @@ async fn main() -> Res<()> {
                 }
                 r.crowded[k].push(lat?);
             }
-            r.conc_true.push(v11_conc(s, tr, n_conc).await?);
-            r.conc_cat.push(v11_conc(s, cat, n_conc).await?);
-            let zeros = req("head", &["-c", &size, "/dev/zero"], &s.root);
-            let (m, c) = throughput(s, zeros, stream_mib).await?;
-            r.zeros_mbs.push(m);
-            r.zeros_cpu.push(c);
-            let rand = req("cat", &[&random_path], &s.root);
-            let (m, c) = throughput(s, rand, stream_mib).await?;
-            r.rand_mbs.push(m);
-            r.rand_cpu.push(c);
-            r.ttff.push(ttff(s, n_ttff).await?);
-            let mut k = Vec::new();
-            for _ in 0..n_kill {
-                k.push(kill_latency(s).await?);
+            if on("stream") {
+                let zeros = req("head", &["-c", &size, "/dev/zero"], &s.root);
+                let (m, c) = throughput(s, zeros, stream_mib).await?;
+                r.zeros_mbs.push(m);
+                r.zeros_cpu.push(c);
+                let rand = req("cat", &[&random_path], &s.root);
+                let (m, c) = throughput(s, rand, stream_mib).await?;
+                r.rand_mbs.push(m);
+                r.rand_cpu.push(c);
             }
-            r.kill.push(k);
-            if round < mem_rounds {
+            if on("stream16") {
+                let (m, c) = throughput16(s, 256).await?;
+                r.stream16_mbs.push(m);
+                r.stream16_cpu.push(c);
+            }
+            if on("ttff") {
+                r.ttff.push(ttff(s, n_ttff).await?);
+            }
+            if on("kill") {
+                let mut k = Vec::new();
+                for _ in 0..n_kill {
+                    k.push(kill_latency(s).await?);
+                }
+                r.kill.push(k);
+            }
+            if on("mem") && round < mem_rounds {
                 r.rss_idle.push(mem_idle(&sides[i]).await?);
                 r.rss_100.push(mem_streams(&sides[i]).await?);
                 // Once: a baseline that buffers a slow reader's output holds gigabytes here.
@@ -960,6 +1033,8 @@ async fn main() -> Res<()> {
         "stream_zeros_cpu_s_per_gb",
         "stream_random_mb_s",
         "stream_random_cpu_s_per_gb",
+        "stream16_256MiB_mb_s",
+        "stream16_256MiB_cpu_s_per_gb",
         "rss_idle",
         "rss_100_streams",
         "rss_slow_16x256MiB_peak_sampled",

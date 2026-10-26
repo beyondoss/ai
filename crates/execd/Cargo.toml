@@ -18,6 +18,11 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# The global allocator under test in the Memory measurements; off in the shipped build unless the
+# numbers say otherwise.
+mimalloc = ["dep:mimalloc"]
+
 [dependencies]
 base64.workspace = true
 # The v1.4 timing kernel: when a callback is owed, retried or given up. Every endpoint drives the
@@ -33,6 +38,7 @@ hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 # Process groups, subreaper, the pipe-size query and the socket's user timeout, as safe wrappers:
 # the workspace forbids `unsafe_code`.
+mimalloc = { version = "0.1.52", default-features = false, optional = true }
 nix = { version = "0.31", default-features = false, features = ["fs", "net", "process", "signal", "socket"] }
 # Job-end callbacks over HTTPS that verify the server and never follow a redirect: rustls with
 # `ring` and the OS trust store, as the agent's own client. The provider is installed before the

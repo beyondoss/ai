@@ -53,8 +53,43 @@ fn bearer(cli: &Cli) -> std::io::Result<Option<String>> {
         .filter(|s| !s.is_empty()))
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// `mimalloc` is a build option for measuring against the platform's malloc (a static musl
+/// binary's is slow under threads); see ARCHITECTURE.md "Memory".
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// `EXECD_WORKER_THREADS`: unset or `1` is the single-threaded scheduler, `0` is one worker per
+/// CPU, `N` is N workers. execd only moves bytes between sockets and pipes, so one thread carries
+/// more than any sandbox asks of it, and a thread per CPU costs a stack and a heap each (see
+/// ARCHITECTURE.md "Memory").
+fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    let mut b = match std::env::var("EXECD_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        None | Some(1) => tokio::runtime::Builder::new_current_thread(),
+        Some(0) => tokio::runtime::Builder::new_multi_thread(),
+        Some(n) => {
+            let mut b = tokio::runtime::Builder::new_multi_thread();
+            b.worker_threads(n);
+            b
+        }
+    };
+    b.enable_all().build()
+}
+
+fn main() -> ExitCode {
+    match runtime() {
+        Ok(rt) => rt.block_on(real_main()),
+        Err(e) => {
+            eprintln!("execd: cannot start the runtime: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn real_main() -> ExitCode {
     let cli = Cli::parse();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(&cli.log_level))

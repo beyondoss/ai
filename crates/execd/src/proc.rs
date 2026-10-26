@@ -184,10 +184,26 @@ pub(crate) fn group_empty(pgid: i32) -> bool {
     live_members(pgid).is_empty()
 }
 
-/// [`live_members`] without holding up the runtime for the `/proc` scan.
+/// Whether the kernel lists a process's children (`CONFIG_PROC_CHILDREN`), probed once. The reads
+/// that use them take microseconds, so they run on the calling thread; a full scan of `/proc`
+/// does not, and goes to the blocking pool.
+fn has_children_files() -> bool {
+    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| children_of("self").is_some())
+}
+
+/// [`live_members`] without holding up the runtime: the walk of execd's own tree runs inline, and
+/// only a scan of `/proc` is sent to the blocking pool.
 pub(crate) async fn live_members_async(pgid: i32) -> Vec<u32> {
     if !group_exists(pgid) {
         return Vec::new();
+    }
+    if SUBREAPER.load(Ordering::Relaxed)
+        && has_children_files()
+        && let Some(found) = live_members_in_tree(pgid)
+        && !found.is_empty()
+    {
+        return found;
     }
     tokio::task::spawn_blocking(move || live_members(pgid))
         .await
@@ -277,7 +293,11 @@ pub async fn reap_orphans(stop: tokio_util::sync::CancellationToken) {
         return;
     };
     loop {
-        let _ = tokio::task::spawn_blocking(reap_once).await;
+        if has_children_files() {
+            reap_once();
+        } else {
+            let _ = tokio::task::spawn_blocking(reap_once).await;
+        }
         tokio::select! {
             _ = sigchld.recv() => {}
             () = stop.cancelled() => return,
