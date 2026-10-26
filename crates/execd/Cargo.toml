@@ -52,4 +52,10 @@ tracing-subscriber.workspace = true
 beyond-ai-agent = { path = "../agent" }
 beyond-ai-test-support = { path = "../test-support" }
 hyper = { version = "1", features = ["client", "http2"] }
+memchr = "2"
 tempfile = "3"
+
+# A/B comparison of execd against the reference endpoint, over HTTP on loopback.
+[[bench]]
+name = "exec_compare"
+harness = false
