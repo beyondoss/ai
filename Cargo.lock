@@ -545,6 +545,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "beyond-ai-execd"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "beyond-ai-agent",
+ "beyond-ai-exec-notify",
+ "beyond-ai-test-support",
+ "bytes",
+ "clap",
+ "getrandom 0.3.4",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "nix",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "beyond-ai-fleet-sim"
 version = "0.1.0"
 dependencies = [
@@ -581,6 +607,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "beyond-ai-exec-notify",
+ "beyond-ai-execd",
  "chacha20poly1305",
  "ed25519-dalek",
  "getrandom 0.3.4",
