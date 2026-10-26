@@ -44,11 +44,13 @@ stdin and is never written anywhere). Each VM
 
 - carries the metadata `beyond-ai-demo=<name>` and a 30 minute timeout (`E2B_TIMEOUT`), so `down.sh`
   can find it and it ends by itself if nothing does;
-- gets the same static `exec-stub` binary, uploaded through E2B's envd file API and started with
-  envd's process API, listening on 8081, which E2B exposes at `https://8081-<sandbox id>.e2b.app`;
+- gets the same static `execd` binary, uploaded through E2B's envd file API and started with
+  envd's process API (`--kept-jobs-survive-idle`, so it advertises job-end notify), listening on 8081,
+  which E2B exposes at `https://8081-<sandbox id>.e2b.app`;
 - is the exec endpoint of its session only: the session's grant carries that URL and a bearer token
-  (an exec header, sealed in the grant), and the stub answers 401 to anything without it, since the
-  endpoint is on the public internet.
+  (an exec header, sealed in the grant), and `execd` answers 401 to anything without it, since the
+  endpoint is on the public internet. The bearer is uploaded as a file (`--bearer-file`) and deleted once
+  `execd` has read it, so it is on no command line and in no command's environment.
 
 Job-end notify across the internet: the agent task announces `https://<its-public-ip-dashed>.sslip.io:8443`
 as its `--notify-origin` (computed at every start, so a replacement task announces its new address),
@@ -274,9 +276,10 @@ gateway, no load balancer), plus the model: a full `demo.sh all` spends about on
 - **agent** task: `serve --service`, `--notify-origin https://agent.<name>.local:8443`. It is not pid 1
   (a shell is, and ignores SIGTERM), so a stopped task is SIGKILLed with no chance to seal or unlock: a
   hard kill with nothing but `aws ecs stop-task`.
-- **sandbox** task: `beyond-ai-demo exec-stub`, the repo's reference exec endpoint
-  (`crates/test-support`), which passes the exec conformance suite, notify included
-  (`crates/demo/tests/stub_conformance.rs`). It runs agent-controlled code, so it has its own security
+- **sandbox** task: `execd`, the repo's production exec endpoint (`crates/execd`), which passes the
+  exec conformance suite, notify included (`crates/execd/tests/conformance.rs`). It listens beyond loopback, so it requires a bearer: `up.sh` stores a random `sandbox-bearer` in SSM, the task gets it as `EXECD_BEARER` (execd moves it out of its environment at start), and `demo.sh` seals it into every grant as the exec `Authorization` header. It logs JSON; `execd.jq`
+  turns each line into the `exec_request`, `exec_start`, `exec_end`, `job_ended_callback` and
+  `listening` events the checks and the report read. It runs agent-controlled code, so it has its own security
   group and no EFS mount: nothing admits it to the session store (see "The session store" below).
 - **the session store**: the EFS file system admits one identity, the agent task's role, through the
   agent's access point, over TLS. Three layers say so: the mount target's security group admits NFS (2049)

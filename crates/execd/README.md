@@ -84,6 +84,7 @@ Run execd as PID 1 in a container, or under any init: it makes itself the subrea
 | `--max-response-bytes`     | `EXECD_MAX_RESPONSE_BYTES`     | most output one v1.1 answer carries (default 16 MiB); match the agent's `--exec-max-response-bytes`              |
 | `--jobs-dir`               | `EXECD_JOBS_DIR`               | where a kept job's last 8 MiB of output is spooled (default `$TMPDIR`, else `/tmp`); use a disk-backed directory |
 | `--log-level`              | `EXECD_LOG`                    | `error`, `warn`, `info`, `debug` or `trace`                                                                      |
+| `--log-format`             | `EXECD_LOG_FORMAT`             | `text` (default) or `json`: one object per line, the event's fields beside `timestamp`                           |
 
 `GET /livez` answers 200 without authentication, and nothing else is open. `SIGTERM` and `SIGINT` kill every running process
 group and exit.

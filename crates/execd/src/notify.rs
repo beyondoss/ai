@@ -182,6 +182,15 @@ async fn run_attempt(
                 Ok(s) => (Some(s), None),
                 Err(e) => (None, Some(e)),
             };
+            tracing::info!(
+                kind = "callback",
+                job = ?key.1,
+                attempt = n,
+                status,
+                error = error.as_deref(),
+                ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "request"
+            );
             if let Some(o) = &ctx.opts.observer {
                 o.callback(&CallbackAttempt {
                     scope: key.0.clone(),
@@ -195,7 +204,6 @@ async fn run_attempt(
                     error,
                 });
             }
-            tracing::info!(kind = "callback", job = ?key.1, attempt = n, status, "request");
             status.map_or(exec_notify::Outcome::Failed, exec_notify::Outcome::Status)
         }
         None => exec_notify::Outcome::Failed,
@@ -246,6 +254,8 @@ async fn attempt(ctx: &Ctx, target: &NotifyTarget, key: &Key) -> Result<u16, Str
         .await
         .map(|r| r.status().as_u16())
         .map_err(|e| {
+            // The url carries the receiver's signature: it must not reach the log or an observer.
+            let e = e.without_url();
             let mut msg = e.to_string();
             let mut cause = std::error::Error::source(&e);
             while let Some(c) = cause {

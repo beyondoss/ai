@@ -6,7 +6,7 @@ v1.3 sandbox jobs and v1.4 job-end notify. The normative spec is the module doc 
 file says how execd meets it and what bounds every resource it holds.
 
 It is one crate: a library (`execd`) that embeds in a test or a larger host, and a thin `execd` binary (`--listen`, `--root`,
-`--home`, `--bearer-file`, `--insecure-no-auth`, `--run-as`, `--kept-jobs-survive-idle`, `--log-level`).
+`--home`, `--bearer-file`, `--insecure-no-auth`, `--run-as`, `--kept-jobs-survive-idle`, `--log-level`, `--log-format`).
 
 ## Modules
 

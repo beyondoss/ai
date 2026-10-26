@@ -4,7 +4,7 @@
 A grant's `exec_url` has to be a stable address, but an E2B microVM costs something from the moment it
 exists. This front is the stable address: `http://<front>:8084/exec/<session>?bundle=<tar url>`. It
 answers nothing itself. On the FIRST request for a session it creates that session's microVM (the same
-`vm_for` the rest of the demo uses: a private E2B sandbox running the exec stub, requiring a bearer),
+`vm_for` the rest of the demo uses: a private E2B sandbox running execd, requiring a bearer),
 seeds the agent folder into it from the bundle, and from then on forwards every request to the VM,
 streaming the answer back as it arrives. A session that never calls a sandbox tool never costs a VM.
 
@@ -34,7 +34,7 @@ PORT = int(os.environ.get("FRONT_PORT", "8084"))
 # Where things are in the image; a test run elsewhere points these at its own copies.
 VMDIR = os.environ.get("FRONT_VMDIR", "/tmp/vm")
 E2B_SH = os.environ.get("FRONT_E2B_SH", "/opt/demo/e2b.sh")
-STUB = os.environ.get("FRONT_STUB", "/usr/local/bin/beyond-ai-demo")
+EXECD = os.environ.get("FRONT_EXECD", "/usr/local/bin/execd")
 CA_FILE = os.environ.get("FRONT_CA_FILE", "/tmp/ca.pem")
 # A VM dies on its own after E2B_TIMEOUT (e2b.sh); an entry older than that points at nothing.
 VM_TTL = int(os.environ.get("E2B_TIMEOUT", "1800"))
@@ -87,7 +87,7 @@ fi
 
 
 def make_vm(session, bundle, browser="", site=""):
-    env = dict(os.environ, VMDIR=VMDIR, STUB=STUB, CA_FILE=CA_FILE, E2B_SH=E2B_SH,
+    env = dict(os.environ, VMDIR=VMDIR, EXECD=EXECD, CA_FILE=CA_FILE, E2B_SH=E2B_SH,
                VM_PRIVATE="1", TAG_KEY="beyond-ai-demo", SANDBOX_PORT="8081")
     env.setdefault("NAME", os.environ.get("DEMO_NAME", "demo"))
     if browser and os.environ.get("E2B_BROWSER_TEMPLATE"):
@@ -212,7 +212,7 @@ class Front(BaseHTTPRequestHandler):
                 return self.reply(502, {"error": str(e)})
             log("mcp_request" if kind == "mcp" else "exec_request", session=session)
             # An MCP request goes to the bridge's port on the same VM, which takes no bearer; an exec
-            # request goes to the exec stub, which does.
+            # request goes to execd, which does.
             up = urlsplit(f"https://{BRIDGE_PORT}-{vm['id']}.e2b.app/mcp" if kind == "mcp" else vm["url"])
             headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP | {"authorization"}}
             if kind == "exec":

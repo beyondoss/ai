@@ -1,11 +1,10 @@
 //! `beyond-ai-demo`: the pieces of `deploy/demo` that are code rather than AWS calls.
 //!
-//! - `exec-stub`: the sandbox, a service-mode agent's exec endpoint (v1.1 to v1.4).
 //! - `keys`: generate the demo's keys (once; `up.sh` stores them in SSM).
 //! - `mint-grant`: mint one `bsg_v1` session grant from those keys.
 //! - `chat`: one conversation step over the agent's WebSocket.
 
-use beyond_ai_demo::{chat, keys, load, load_host, stub};
+use beyond_ai_demo::{chat, keys, load, load_host};
 
 use std::path::PathBuf;
 
@@ -20,16 +19,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run the sandbox exec endpoint.
-    ExecStub {
-        #[arg(long, default_value = "0.0.0.0:8081")]
-        listen: String,
-        /// The tenant's workspace: where commands start.
-        #[arg(long, default_value = "/workspace")]
-        root: PathBuf,
-        #[arg(long, default_value = "/home/sandbox")]
-        home: PathBuf,
-    },
     /// Print the demo's keys as JSON.
     #[cfg(feature = "gateway-key")]
     Keys,
@@ -226,7 +215,6 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
-        Cmd::ExecStub { listen, root, home } => stub::run(stub::Args { listen, root, home }).await,
         #[cfg(feature = "gateway-key")]
         Cmd::Keys => {
             println!("{}", keys::generate()?);

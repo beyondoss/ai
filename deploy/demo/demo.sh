@@ -91,7 +91,7 @@ VMDIR=$WORK/vm                      # one file per session's E2B sandbox (e2b mo
 mkdir -p "$VMDIR"
 if [ "$USE_E2B" = 1 ]; then
   e2b_need_key || exit 2
-  STUB=$(stub_bin) || { echo "demo: could not build the static exec-stub" >&2; exit 1; }
+  EXECD=$(execd_bin) || { echo "demo: could not build the static execd" >&2; exit 1; }
   CA_FILE=$WORK/ca.pem
 fi
 
@@ -132,6 +132,8 @@ DEMO_FLEET_SECRET=$(ssm_get fleet-secret)
 DEMO_DEK=$(ssm_get dek)
 DEMO_GATEWAY_KEY=$(ssm_get gateway-key)
 export DEMO_GRANT_SEED DEMO_FLEET_SECRET DEMO_DEK DEMO_GATEWAY_KEY
+SANDBOX_BEARER=
+[ "$USE_FARGATE" = 0 ] || SANDBOX_BEARER=$(ssm_get sandbox-bearer)
 [ "$USE_E2B" = 0 ] || ssm_get public | jq -r .ca_pem > "$CA_FILE"
 
 grant() { # session [tamper]
@@ -141,8 +143,9 @@ grant() { # session [tamper]
     DEMO_EXEC_BEARER=$(vm_field "$1" bearer) "$DEMO" mint-grant --tenant "$TENANT" --session "$1" --shard demo \
       --workspace "$VM_HOME/workspace" --exec-url "$(vm_field "$1" url)" --exec-bearer ${2:+--tamper}
   else
-    "$DEMO" mint-grant --tenant "$TENANT" --session "$1" --shard demo --workspace /workspace \
-      --exec-url "http://sandbox.$DNS:$SANDBOX_PORT/exec" ${2:+--tamper}
+    # The Fargate sandbox requires its stack's bearer; the grant carries it sealed, as an exec header.
+    DEMO_EXEC_BEARER=$SANDBOX_BEARER "$DEMO" mint-grant --tenant "$TENANT" --session "$1" --shard demo --workspace /workspace \
+      --exec-url "http://sandbox.$DNS:$SANDBOX_PORT/exec" --exec-bearer ${2:+--tamper}
   fi
 }
 # One conversation step; the JSON summary on stdout, the live view on stderr. A use case sets GRANT_FN
@@ -185,16 +188,21 @@ run_check() {
 
 # CloudWatch, filtered: [{t, m}] for a stream prefix since a time.
 cw() { # stream-prefix since-ms [filter-pattern]
+  local a b
+  case "${1:-}" in
+    sandbox/*)
+      # The sandbox's lines are execd's, turned into events by cw_aws and vm_logs (execd.jq). The pattern
+      # is applied to those events, not to the raw lines, so it is not sent to CloudWatch. An E2B sandbox's
+      # own log is in its VM; a Fargate one (the use cases' workspace host) is in CloudWatch. Both, merged
+      # by time.
+      a=$(cw_aws "$1" "$2")
+      b='[]'
+      [ "$USE_E2B" != 1 ] || b=$(vm_logs "" "$2")
+      jq -nc --argjson a "$a" --argjson b "$b" --arg sub "${3//\"/}" '($a + $b)|map(select(.m|contains($sub)))|sort_by(.t)'
+      return ;;
+  esac
   if [ "$USE_E2B" = 1 ]; then
-    # An E2B sandbox's own log is in its VM, not CloudWatch; a Fargate one (the use cases' workspace
-    # host) is in CloudWatch. Both, merged by time.
-    local a b
     case "${1:-}" in
-      sandbox/*)
-        a=$(cw_aws "$@")
-        b=$(vm_logs "${3//\"/}" "$2")
-        jq -nc --argjson a "$a" --argjson b "$b" '($a + $b)|sort_by(.t)'
-        return ;;
       "")
         a=$(cw_aws "$@")
         b=$(vm_logs "" "$2")
@@ -204,10 +212,13 @@ cw() { # stream-prefix since-ms [filter-pattern]
   fi
   cw_aws "$@"
 }
+# A line execd wrote becomes the events it stands for (execd.jq); every other line is kept as it is.
 cw_aws() {
-  command aws --region "$REGION" --output json logs filter-log-events --log-group-name "$LOG_GROUP" \
+  local out
+  out=$(command aws --region "$REGION" --output json logs filter-log-events --log-group-name "$LOG_GROUP" \
     ${1:+--log-stream-name-prefix "$1"} --start-time "$2" ${3:+--filter-pattern "$3"} \
-    --query 'events[].{t:timestamp,m:message}' 2>/dev/null || echo '[]'
+    --query 'events[].{t:timestamp,m:message}' 2>/dev/null) || out='[]'
+  jq -L "$HERE" -c 'include "execd"; [.[] | . as $e | [$e.m | execd_events | {t: .ts_ms, m: tojson}] as $x | if ($x | length) > 0 then $x[] else $e end]' <<<"$out"
 }
 
 # ---- the checks --------------------------------------------------------------------------------------
@@ -252,7 +263,7 @@ check_sandbox_exec() {
   output=$(jq -r '.output // ""' <<<"$tool")
   # Only the sandbox has /workspace (Fargate) or the host name e2b (E2B); the agent's own
   # container has neither.
-  if [[ $output == *Linux* && ( ( $SANDBOX == fargate && $output == *workspace* && $output == *mnt* ) || ( $SANDBOX == e2b && $output == *e2b* ) ) ]]; then
+  if [[ $output == *Linux* && ( ( ( $SANDBOX == fargate || $SANDBOX == both ) && $output == *workspace* && $output == *mnt* ) || ( $SANDBOX == e2b && $output == *e2b* ) ) ]]; then
     result 1 "ran in the sandbox ($SANDBOX), not on the agent" \
       "$(jq -c --argjson t "$tool" '{tool_ms: (($t.end_ms // 0) - $t.t_ms), total_ms, first_token_ms}' <<<"$out")" \
       "$(jq -c --argjson t "$tool" '{label:"tool round trip",value:(($t.end_ms // 0) - $t.t_ms),unit:"ms"}' <<<"$out")"

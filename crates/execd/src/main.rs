@@ -62,6 +62,17 @@ struct Cli {
     /// Log level: error, warn, info, debug or trace (or a tracing filter).
     #[arg(long, env = "EXECD_LOG", default_value = "info")]
     log_level: String,
+
+    /// Log format: `text` (for a person) or `json` (one object per line, the event's fields beside
+    /// `timestamp`, `level` and `message`, for a log pipeline).
+    #[arg(long, env = "EXECD_LOG_FORMAT", default_value = "text")]
+    log_format: LogFormat,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum LogFormat {
+    Text,
+    Json,
 }
 
 /// The variable that carries the bearer across the re-exec that scrubs it from the environment: the
@@ -176,12 +187,15 @@ fn main() -> ExitCode {
     move_bearer_out_of_environ();
     let inherited = take_inherited_bearer();
     let cli = Cli::parse();
-    tracing_subscriber::fmt()
+    let fmt = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(&cli.log_level))
         .with_target(false)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
-        .with_writer(std::io::stderr)
-        .init();
+        .with_writer(std::io::stderr);
+    match cli.log_format {
+        LogFormat::Text => fmt.init(),
+        LogFormat::Json => fmt.json().flatten_event(true).init(),
+    }
     let runtime = match runtime() {
         Ok(r) => r,
         Err(e) => {
