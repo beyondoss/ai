@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 publish = false
 rust-version.workspace = true
-description = "Tools for deploy/demo: the sandbox exec endpoint, the key and grant minters, and the chat client — not published"
+description = "Tools for deploy/demo: the key and grant minters, and the chat client — not published"
 
 [lib]
 name = "beyond_ai_demo"
@@ -20,7 +20,7 @@ workspace = true
 
 [features]
 # `keys` mints the gateway's `bai_v1` virtual key, which pulls in the gateway crate (pingora and its
-# cmake-built zlib-ng). The sandbox image builds with `--no-default-features` and so never compiles it.
+# cmake-built zlib-ng). Build with `--no-default-features` to leave it out.
 default = ["gateway-key", "agent-lib"]
 gateway-key = ["dep:beyond-ai", "dep:ed25519-dalek"]
 # `notify-token` mints a callback token with the agent's own `NotifyKey`, so a forged one is forged
@@ -37,7 +37,7 @@ agent-lib = [
 base64.workspace = true
 beyond-ai = { path = "../gateway", features = ["mint"], optional = true }
 beyond-ai-agent = { path = "../agent", optional = true }
-# The exec endpoint is the repo's reference one, the same code the conformance suite grades.
+# The grant minter and the test servers the load proof uses are the repo's own.
 beyond-ai-test-support = { path = "../test-support" }
 # The broker seals refresh tokens (XChaCha20-Poly1305) under a per-tenant key derived (HKDF) from one master.
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"], optional = true }

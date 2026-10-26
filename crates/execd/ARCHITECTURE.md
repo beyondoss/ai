@@ -6,7 +6,7 @@ v1.3 sandbox jobs and v1.4 job-end notify. The normative spec is the module doc 
 file says how execd meets it and what bounds every resource it holds.
 
 It is one crate: a library (`execd`) that embeds in a test or a larger host, and a thin `execd` binary (`--listen`, `--root`,
-`--home`, `--bearer-file`, `--insecure-no-auth`, `--run-as`, `--kept-jobs-survive-idle`, `--log-level`).
+`--home`, `--bearer-file`, `--insecure-no-auth`, `--run-as`, `--kept-jobs-survive-idle`, `--log-level`, `--log-format`).
 
 ## Modules
 
@@ -184,7 +184,7 @@ What the spec and the conformance verifier assume, and what holds:
 | `tests/parsers.rs`, `fuzz/` (`request`, `ring`) | no body panics the parsers, every refused body is a `4xx`, and the output ring agrees with a plain buffer for every offset and size                                                                                                                                                                                                                                                |
 | `tests/conformance.rs`                          | the full verifier, also at `trace` level (then its log is searched for the bearer) and under `--run-as`                                                                                                                                                                                                                                                                            |
 
-The tests that need root run execd through `sudo -n` (or as root) and print `SKIPPED` where a host gives them neither. The long
+Every test that starts the binary owns it from the moment it exists, and a detached watchdog shell kills execd and everything under it if the test process dies without running destructors (`tests/guard.rs` SIGKILLs a test mid-run, as user and as root, and looks for survivors). The tests that need root run execd through `sudo -n` (or as root) and print `SKIPPED` where a host gives them neither. The long
 runs (ten minutes of job-table seeds, two of parser seeds, four of each fuzz target) are in `.github/workflows/deep.yml`.
 
 ## Process model

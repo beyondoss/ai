@@ -1,14 +1,12 @@
 # syntax=docker/dockerfile:1.7-labs
 #
-# The demo's sandbox: `beyond-ai-demo exec-stub`, the repo's reference exec endpoint (v1.1 to v1.4,
-# job-end notify included) as a static musl binary on a bare Alpine. Commands run in this container
-# through busybox, which is what the conformance suite's own commands need.
+# The demo's sandbox: `execd`, the repo's production exec endpoint (v1.1 to v1.4, job-end notify
+# included) as a static musl binary on a bare Alpine. Commands run in this container through busybox,
+# which is what the conformance suite's own commands need.
 #
 #     docker build -f deploy/demo/Dockerfile.sandbox -t beyond-ai-demo-sandbox .
 #     docker build -f deploy/demo/Dockerfile.sandbox --target front -t beyond-ai-demo-front .
 #
-# `--no-default-features` leaves out the gateway-key minter, so the gateway (pingora, cmake) is
-# never compiled into this image.
 ARG RUST_VERSION=1.92
 ARG ALPINE_VERSION=3.22
 
@@ -24,18 +22,24 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
     CC_x86_64_unknown_linux_musl=musl-gcc CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
-    cargo build --release --locked --target x86_64-unknown-linux-musl -p beyond-ai-demo --no-default-features \
-    && cp target/x86_64-unknown-linux-musl/release/beyond-ai-demo /usr/local/bin/beyond-ai-demo
+    cargo build --release --locked --target x86_64-unknown-linux-musl -p beyond-ai-execd \
+    && cp target/x86_64-unknown-linux-musl/release/execd /usr/local/bin/execd
 
 # `--target front`: the exec front (front.py), which makes a session's E2B microVM on its first request.
-# It runs the demo's own e2b.sh helpers, and uploads this same static binary into the VM as its stub.
+# It runs the demo's own e2b.sh helpers, and uploads this same static binary into the VM.
 # Before `runtime`, so a plain build is still the sandbox.
 FROM alpine:${ALPINE_VERSION} AS front
 RUN apk add --no-cache python3 bash curl jq openssl ca-certificates
-COPY --from=build /usr/local/bin/beyond-ai-demo /usr/local/bin/beyond-ai-demo
+COPY --from=build /usr/local/bin/execd /usr/local/bin/execd
 COPY deploy/demo/e2b.sh deploy/demo/front.py /opt/demo/
 ENTRYPOINT ["python3", "/opt/demo/front.py"]
 
 FROM alpine:${ALPINE_VERSION} AS runtime
-COPY --from=build /usr/local/bin/beyond-ai-demo /usr/local/bin/beyond-ai-demo
-ENTRYPOINT ["/usr/local/bin/beyond-ai-demo", "exec-stub"]
+COPY --from=build /usr/local/bin/execd /usr/local/bin/execd
+# Where commands start and their HOME: execd does not create them.
+RUN mkdir -p /workspace /home/sandbox
+# The defaults a bare `docker run` gets: a v1.4 endpoint (kept jobs survive idling, which is what lets it
+# advertise notify) logging JSON. It listens beyond loopback, so it needs EXECD_BEARER (or a bearer
+# file): `docker run -e EXECD_BEARER=... `. up.sh starts it with the demo's CA and a per-stack bearer.
+ENTRYPOINT ["/usr/local/bin/execd"]
+CMD ["--listen", "0.0.0.0:8081", "--root", "/workspace", "--home", "/home/sandbox", "--kept-jobs-survive-idle", "--log-format", "json"]

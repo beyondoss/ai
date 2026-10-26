@@ -6511,10 +6511,8 @@ touches a Dockerfile or the workflow runs the same four builds without pushing.
 
 `deploy/demo/` (`up.sh`, `demo.sh`, `down.sh`, README) stands up a replica end to end on ECS for anyone
 with AWS credentials and a model key: the real gateway (managed key, so every call is an `ai.usage`
-row), the agent as above on EFS, and a sandbox. The sandbox is `ExecMock` from `crates/test-support`, the
-reference exec endpoint the conformance suite grades, served by `crates/demo` (`beyond-ai-demo
-exec-stub`); `crates/demo/tests/stub_conformance.rs` runs the suite against exactly the options it
-serves. The same crate holds the grant minter `demo.sh` uses (the test-side `Minter`, tested against
+row), the agent as above on EFS, and a sandbox. The sandbox is `execd` (`crates/execd`), the production
+exec endpoint the conformance suite grades (`crates/execd/tests/conformance.rs`). `crates/demo` holds the grant minter `demo.sh` uses (the test-side `Minter`, tested against
 `GrantVerifier`), a forged-callback token maker (the right `bjn_v1` kid, a wrong tag) and the WebSocket
 client. Job-end callbacks must be `https` off loopback, so `up.sh` issues a throwaway CA and a
 certificate for the agent's Cloud Map name. Each `demo.sh` run writes a `run.json` and a replayable
@@ -6528,9 +6526,9 @@ connection without TLS. `demo.sh` shows a TCP connect from the sandbox to port 2
 sealed session bytes from a one-off task with the agent's definition rather than from the sandbox.
 
 `SANDBOX=e2b` runs the sandbox as one E2B microVM per session instead of the shared Fargate service:
-`demo.sh` creates each VM through E2B's REST API and envd, uploads the same static `exec-stub`, and
-mints the session's grant with that VM's public port URL and a bearer in its exec headers. The stub
-then runs with `MockOptions::require_bearer` and answers 401 to any other caller. The agent announces
+`demo.sh` creates each VM through E2B's REST API and envd, uploads the same static `execd`, and
+mints the session's grant with that VM's public port URL and a bearer in its exec headers. `execd`
+then runs with a `--bearer-file` and answers 401 to any other caller. The agent announces
 its own public address (as a `<ip>.sslip.io` name, which the throwaway CA certifies) as the callback
 origin, recomputed at every start, so job-end notify reaches a replacement agent too. `down.sh` kills
 every sandbox carrying the demo's metadata and verifies through E2B's list API that none remain.

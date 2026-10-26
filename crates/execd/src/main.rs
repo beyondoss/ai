@@ -212,6 +212,9 @@ async fn run(cli: Cli, inherited: Option<String>) -> Result<(), Box<dyn std::err
     let switched = run_as.is_some();
     opts.run_as = run_as;
 
+    // Before the listener is bound: it reads the whole of /tmp, and a client that finds the port
+    // open expects the server to be ready.
+    execd::remove_stale_jobs_dirs(cli.jobs_dir.as_deref());
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     let server = execd::serve(listener, opts)?;
     execd::log_info!(

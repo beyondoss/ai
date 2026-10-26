@@ -5,7 +5,7 @@
 #
 # A VM is created for each session the first time that session needs one, carries the metadata
 # `beyond-ai-demo=<name>` (that is how `down.sh` finds it) and a timeout, runs the same static
-# `exec-stub` as the Fargate sandbox, and requires the bearer its session's grant carries. Its public
+# `execd` as the Fargate sandbox, and requires the bearer its session's grant carries. Its public
 # port URL (https://<port>-<id>.e2b.app) is the session's exec URL.
 
 E2B_API=https://api.e2b.dev
@@ -36,17 +36,17 @@ e2b_kill() { # id
   e2b_curl -o /dev/null -w '%{http_code}' -X DELETE "$E2B_API/sandboxes/$1"
 }
 
-# --- the static exec-stub that runs in each VM ------------------------------------------------------
-stub_bin() { # builds it once per run; prints the path
+# --- the static execd that runs in each VM ---------------------------------------------------------
+execd_bin() { # builds it once per run; prints the path
   local dir bin
   dir=$(cd "$ROOT" && cargo metadata --format-version 1 --no-deps 2>/dev/null | jq -r .target_directory)
-  bin=$dir/e2b-stub/x86_64-unknown-linux-musl/release/beyond-ai-demo
+  bin=$dir/e2b-execd/x86_64-unknown-linux-musl/release/execd
   # A static musl binary: the VM's libc is not ours. The same flag the sandbox image's build uses,
   # because a static-pie musl binary segfaults at startup here.
   (cd "$ROOT" && RUSTFLAGS="-C relocation-model=static" CC_x86_64_unknown_linux_musl=musl-gcc \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
-    cargo build -q --release --target x86_64-unknown-linux-musl -p beyond-ai-demo --no-default-features \
-    --target-dir "$dir/e2b-stub") >&2 || return 1
+    cargo build -q --release --locked --target x86_64-unknown-linux-musl -p beyond-ai-execd \
+    --target-dir "$dir/e2b-execd") >&2 || return 1
   echo "$bin"
 }
 
@@ -106,35 +106,44 @@ vm_for() { # session
       '{session:$s, id:$id, envd_token:$tok, bearer:$b, traffic_token:$tr, url:("https://'"$VM_PORT"'-"+$id+".e2b.app/exec"), created_ms:$created}' > "$f.part"
     local i
     for i in $(seq 1 30); do
-      vm_put "$id" "$tok" "$STUB" "$VM_HOME/exec-stub" 2>/dev/null && break
+      vm_put "$id" "$tok" "$EXECD" "$VM_HOME/execd" 2>/dev/null && break
       sleep 1
     done
     vm_put "$id" "$tok" "$CA_FILE" "$VM_HOME/ca.pem" || { echo "E2B: could not upload to $id" >&2; exit 1; }
-    vm_run "$id" "$tok" "chmod +x $VM_HOME/exec-stub; mkdir -p $VM_HOME/workspace
-setsid nohup $VM_HOME/exec-stub exec-stub --listen 0.0.0.0:$VM_PORT --root $VM_HOME/workspace --home $VM_HOME >/tmp/stub.log 2>&1 < /dev/null &
-sleep 1" "$(jq -nc --arg b "$bearer" '{DEMO_EXEC_BEARER:$b, SSL_CERT_FILE:"'"$VM_HOME"'/ca.pem"}')" >/dev/null
+    # The bearer goes up as a file, never on a command line, and is deleted once execd has read it: after
+    # that neither the disk nor the environment of the commands it runs holds it.
+    (umask 077; printf '%s' "$bearer" > "$f.bearer")
+    vm_put "$id" "$tok" "$f.bearer" "$VM_HOME/bearer" || { rm -f "$f.bearer"; echo "E2B: could not upload to $id" >&2; exit 1; }
+    rm -f "$f.bearer"
+    # --kept-jobs-survive-idle: this VM is not stopped while a kept job runs, so it advertises v1.4 notify.
+    # SSL_CERT_FILE is the demo CA that signed the agent's https callback listener; execd's callback client
+    # takes its roots from the OS trust store, which honors it.
+    vm_run "$id" "$tok" "chmod +x $VM_HOME/execd; chmod 600 $VM_HOME/bearer; mkdir -p $VM_HOME/workspace
+setsid nohup $VM_HOME/execd --listen 0.0.0.0:$VM_PORT --root $VM_HOME/workspace --home $VM_HOME --bearer-file $VM_HOME/bearer --kept-jobs-survive-idle --log-format json >/tmp/execd.log 2>&1 < /dev/null &
+sleep 1; rm -f $VM_HOME/bearer" "$(jq -nc '{SSL_CERT_FILE:"'"$VM_HOME"'/ca.pem"}')" >/dev/null
     # Up when the public URL answers, and answers 401 to a caller without the bearer.
     for i in $(seq 1 40); do
       [ "$(curl -s -m 5 -o /dev/null -w '%{http_code}' -X POST "${hdr[@]}" "https://$VM_PORT-$id.e2b.app/exec" -d '{}')" = 401 ] && break
       sleep 1
     done
-    [ "$i" -lt 40 ] || { echo "E2B: the stub in $id never answered" >&2; exit 1; }
+    [ "$i" -lt 40 ] || { echo "E2B: execd in $id never answered" >&2; exit 1; }
     mv "$f.part" "$f"
     trap - EXIT
   ) 9> "$VMDIR/lock" || return 1
 }
 vm_field() { jq -r ".$2" "$VMDIR/$1.json"; }
 
-# The stubs' own log lines, in CloudWatch's shape ([{t, m}]) so the callers need not care where the
-# sandbox ran. Optional $1 filters on a substring, $2 on a minimum time.
+# The sandboxes' own log lines (execd's, turned by execd.jq into the events the checks and the report
+# read), in CloudWatch's shape ([{t, m}]) so the callers need not care where the sandbox ran. Optional $1
+# filters on a substring, $2 on a minimum time.
 vm_logs() { # [substring] [since-ms]
   local f id tok
   for f in "$VMDIR"/*.json; do
     [ -e "$f" ] || continue
     id=$(jq -r .id "$f")
     tok=$(jq -r .envd_token "$f")
-    vm_get "$id" "$tok" /tmp/stub.log | jq -Rc --arg vm "$id" --arg sub "${1:-}" --argjson since "${2:-0}" \
-      'select(startswith("{") and contains($sub)) | fromjson? | select(.ts_ms >= $since) | .vm = $vm | {t:.ts_ms, m:tojson}'
+    vm_get "$id" "$tok" /tmp/execd.log | jq -L "$HERE" -Rc --arg vm "$id" --arg sub "${1:-}" --argjson since "${2:-0}" \
+      'include "execd"; execd_events | select(.ts_ms >= $since) | .vm = $vm | select(tojson | contains($sub)) | {t:.ts_ms, m:tojson}'
   done | jq -sc 'sort_by(.t)'
 }
 
@@ -150,7 +159,7 @@ vm_upload_dir() { # id token local-dir remote-dir
 }
 
 # rustwright-mcp, built as a static musl binary from the repo's `mcp/` workspace root. The same flag as
-# the stub's: a static-pie musl binary segfaults at startup here.
+# execd's: a static-pie musl binary segfaults at startup here.
 RUSTWRIGHT_REPO=${RUSTWRIGHT_REPO:-https://github.com/beyondoss/rustwright}
 RUSTWRIGHT_REV=${RUSTWRIGHT_REV:-main}
 rustwright_bin() { # builds it once; prints the path
