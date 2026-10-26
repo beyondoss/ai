@@ -1,13 +1,13 @@
-//! The `execd` binary: `execd --listen 0.0.0.0:8080`.
+//! The `execd` binary: `EXECD_LISTEN=0.0.0.0:8080 execd`. It takes no arguments.
 
 use std::os::fd::IntoRawFd as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::process::ExitCode;
 
-mod cli;
+mod config;
 
-use cli::{Cli, Parsed};
+use config::Config;
 
 /// The variable that carries the bearer across the re-exec that scrubs it from the environment: the
 /// number of an inherited descriptor holding it.
@@ -58,18 +58,15 @@ fn move_bearer_out_of_environ() {
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// `EXECD_WORKER_THREADS`: unset or `1` is the single-threaded scheduler, `0` is one worker per
-/// CPU, `N` is N workers. execd only moves bytes between sockets and pipes, so one thread carries
-/// more than any sandbox asks of it, and a thread per CPU costs a stack and a heap each (see
-/// ARCHITECTURE.md "Memory").
-fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    let mut b = match std::env::var("EXECD_WORKER_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-    {
-        None | Some(1) => tokio::runtime::Builder::new_current_thread(),
-        Some(0) => tokio::runtime::Builder::new_multi_thread(),
-        Some(n) => {
+/// `EXECD_WORKER_THREADS`: `1` (the default) is the single-threaded scheduler, `0` is one worker
+/// per CPU, `N` is N workers. execd only moves bytes between sockets and pipes, so one thread
+/// carries more than any sandbox asks of it, and a thread per CPU costs a stack and a heap each
+/// (see ARCHITECTURE.md "Memory").
+fn runtime(worker_threads: usize) -> std::io::Result<tokio::runtime::Runtime> {
+    let mut b = match worker_threads {
+        1 => tokio::runtime::Builder::new_current_thread(),
+        0 => tokio::runtime::Builder::new_multi_thread(),
+        n => {
             let mut b = tokio::runtime::Builder::new_multi_thread();
             b.worker_threads(n);
             b
@@ -86,9 +83,9 @@ fn take_inherited_bearer() -> Option<String> {
     token
 }
 
-/// What `--bearer-file` / the environment hold, with trailing newlines trimmed. `Err` for a file
+/// What `EXECD_BEARER_FILE` / `EXECD_BEARER` hold, with trailing newlines trimmed. `Err` for a file
 /// that is named but unreadable or empty: a bearer that was asked for must not silently vanish.
-fn bearer(cli: &Cli, inherited: Option<String>) -> Result<Option<String>, String> {
+fn bearer(cli: &Config, inherited: Option<String>) -> Result<Option<String>, String> {
     let trim = |s: String| s.trim_end_matches(['\n', '\r']).to_string();
     if let Some(path) = &cli.bearer_file {
         let text = std::fs::read_to_string(path)
@@ -118,25 +115,23 @@ fn main() -> ExitCode {
     if let Some(code) = execd::helper_main() {
         return code;
     }
-    move_bearer_out_of_environ();
-    let inherited = take_inherited_bearer();
-    let cli = match cli::parse(std::env::args_os().skip(1), |k| std::env::var(k).ok()) {
-        Ok(Parsed::Run(cli)) => cli,
-        Ok(Parsed::Help(text)) => {
-            print!("{text}");
-            return ExitCode::SUCCESS;
-        }
-        Ok(Parsed::Version(line)) => {
-            println!("{line}");
-            return ExitCode::SUCCESS;
-        }
+    // Configuration is the environment alone: any argument is a mistake, and the usage says so.
+    if std::env::args_os().nth(1).is_some() {
+        eprint!("{}", config::USAGE);
+        return ExitCode::from(2);
+    }
+    let cli = match config::parse(|k| std::env::var(k).ok()) {
+        Ok(cli) => cli,
         Err(e) => {
             eprintln!("execd: {e}");
             return ExitCode::from(2);
         }
     };
+    move_bearer_out_of_environ();
+    let inherited = take_inherited_bearer();
     execd::log::set_level(cli.log_level);
-    let runtime = match runtime() {
+    execd::log::set_format(cli.log_format);
+    let runtime = match runtime(cli.worker_threads) {
         Ok(r) => r,
         Err(e) => {
             execd::log_error!("execd failed: {e}");
@@ -164,7 +159,7 @@ async fn listens_on_loopback(listen: &str) -> std::io::Result<bool> {
     Ok(any)
 }
 
-async fn run(cli: Cli, inherited: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(cli: Config, inherited: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let bearer = bearer(&cli, inherited)?;
     let root = match &cli.root {
         Some(r) => r.clone(),
@@ -176,7 +171,7 @@ async fn run(cli: Cli, inherited: Option<String>) -> Result<(), Box<dyn std::err
         return Err(format!(
             "refusing to start: no bearer is configured and {} is not a loopback address, so \
              anyone who can reach it could run commands. Set EXECD_BEARER_FILE (or EXECD_BEARER), \
-             listen on 127.0.0.1, or pass --insecure-no-auth to run open on purpose",
+             listen on 127.0.0.1, or set EXECD_INSECURE_NO_AUTH=1 to run open on purpose",
             cli.listen
         )
         .into());
@@ -212,13 +207,11 @@ async fn run(cli: Cli, inherited: Option<String>) -> Result<(), Box<dyn std::err
     let switched = run_as.is_some();
     opts.run_as = run_as;
 
-    // Before the listener is bound: it reads the whole of /tmp, and a client that finds the port
-    // open expects the server to be ready.
-    execd::remove_stale_jobs_dirs(cli.jobs_dir.as_deref());
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     let server = execd::serve(listener, opts)?;
     execd::log_info!(
-        "execd listening listen={} bearer={secured} run_as={switched} notify={}",
+        "execd {} listening listen={} bearer={secured} run_as={switched} notify={}",
+        env!("CARGO_PKG_VERSION"),
         server.local_addr(),
         cli.kept_jobs_survive_idle
     );

@@ -3,7 +3,7 @@
 //! `YYYY-MM-DDTHH:MM:SS.mmmZ LEVEL message key=value ...`, UTC, written with one `write` so lines
 //! from different threads do not interleave. A disabled level costs one atomic load and builds
 //! nothing. The library logs nothing until the host calls [`set_level`]; the binary sets it from
-//! `--log-level`. Values that come from outside are written with `{:?}`, which escapes a newline,
+//! `EXECD_LOG`. Values that come from outside are written with `{:?}`, which escapes a newline,
 //! so a request cannot forge a line.
 //!
 //! This replaces a general tracing subscriber and its per-target filter language: execd has one
@@ -52,7 +52,23 @@ impl Level {
     }
 }
 
+/// How a line is written.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum Format {
+    /// `timestamp LEVEL message`, for a person.
+    Text = 0,
+    /// One JSON object per line: `timestamp`, `level` and `message`, for a log pipeline.
+    Json = 1,
+}
+
 static LEVEL: AtomicU8 = AtomicU8::new(Level::Off as u8);
+static FORMAT: AtomicU8 = AtomicU8::new(Format::Text as u8);
+
+/// How lines are written.
+pub fn set_format(format: Format) {
+    FORMAT.store(format as u8, Ordering::Relaxed);
+}
 
 /// The most verbose level that is written.
 pub fn set_level(level: Level) {
@@ -66,10 +82,27 @@ pub fn enabled(level: Level) -> bool {
 
 #[doc(hidden)]
 pub fn emit(level: Level, args: Arguments<'_>) {
-    let mut line = String::with_capacity(128);
-    timestamp(&mut line);
-    let _ = writeln!(line, " {:<5} {args}", level.name());
+    let json = FORMAT.load(Ordering::Relaxed) == Format::Json as u8;
+    let line = render(level, args, json);
     let _ = std::io::stderr().lock().write_all(line.as_bytes());
+}
+
+fn render(level: Level, args: Arguments<'_>, json: bool) -> String {
+    let mut line = String::with_capacity(128);
+    if json {
+        line.push_str("{\"timestamp\":\"");
+        timestamp(&mut line);
+        let message = serde_json::to_string(&args.to_string()).unwrap_or_default();
+        let _ = writeln!(
+            line,
+            "\",\"level\":\"{}\",\"message\":{message}}}",
+            level.name().to_ascii_lowercase()
+        );
+    } else {
+        timestamp(&mut line);
+        let _ = writeln!(line, " {:<5} {args}", level.name());
+    }
+    line
 }
 
 /// `2026-10-25T22:22:09.385Z`, from the wall clock.
@@ -127,6 +160,7 @@ macro_rules! log_info { ($($arg:tt)*) => { $crate::log_at!($crate::log::Level::I
 macro_rules! log_debug { ($($arg:tt)*) => { $crate::log_at!($crate::log::Level::Debug, $($arg)*) }; }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -136,6 +170,17 @@ mod tests {
         assert_eq!(Level::parse("WARN"), None);
         assert_eq!(Level::parse("info,foo=debug"), None);
         assert!(Level::Error < Level::Info && Level::Info < Level::Trace);
+    }
+
+    #[test]
+    fn json_lines_are_one_object() {
+        let line = render(Level::Warn, format_args!("a\nb \"q\" k={}", 1), true);
+        assert_eq!(line.matches('\n').count(), 1, "{line}");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["level"], "warn");
+        assert_eq!(v["message"], "a\nb \"q\" k=1");
+        assert!(v["timestamp"].as_str().unwrap().ends_with('Z'));
+        assert!(render(Level::Info, format_args!("x"), false).contains(" INFO  x\n"));
     }
 
     #[test]

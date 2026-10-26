@@ -182,14 +182,11 @@ async fn run_attempt(
                 Ok(s) => (Some(s), None),
                 Err(e) => (None, Some(e)),
             };
-            tracing::info!(
-                kind = "callback",
-                job = ?key.1,
-                attempt = n,
-                status,
-                error = error.as_deref(),
-                ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                "request"
+            crate::log_info!(
+                "request kind=callback job={:?} attempt={n} status={status:?} error={:?} ms={}",
+                key.1,
+                error.as_deref(),
+                started.elapsed().as_millis()
             );
             if let Some(o) = &ctx.opts.observer {
                 o.callback(&CallbackAttempt {

@@ -29,7 +29,7 @@ async fn the_bearer_comes_from_a_file_and_is_never_logged() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("bearer");
     std::fs::write(&file, "from-a-file\n").unwrap();
-    let execd = Execd::start(&["--bearer-file", file.to_str().unwrap()], &[]);
+    let execd = Execd::start(&[("EXECD_BEARER_FILE", file.to_str().unwrap())], &[]);
     let addr = std::net::SocketAddr::V4(execd.addr);
     let req = json!({ "command": "true", "args": [], "timeout_ms": 5_000 });
     assert_eq!(post(addr, &[], &req).await.status, 401);
