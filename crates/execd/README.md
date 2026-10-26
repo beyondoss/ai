@@ -72,18 +72,18 @@ Run execd as PID 1 in a container, or under any init: it makes itself the subrea
 
 ## Options
 
-| flag                       | environment                    | meaning                                                                                                  |
-| -------------------------- | ------------------------------ | -------------------------------------------------------------------------------------------------------- |
-| `--listen`                 | `EXECD_LISTEN`                 | address to listen on (default `127.0.0.1:8080`)                                                          |
-| `--root`                   | `EXECD_ROOT`                   | where a command runs when its request names no directory (default: the current directory)                |
-| `--home`                   | `EXECD_HOME`                   | `HOME` for every command                                                                                 |
-| `--bearer-file`            | `EXECD_BEARER_FILE`            | a file holding the bearer token (mode 0600); `EXECD_BEARER` holds the token itself, a weaker way         |
-| `--insecure-no-auth`       | `EXECD_INSECURE_NO_AUTH`       | serve with no bearer on a non-loopback address; without it execd refuses to start                        |
-| `--run-as`                 | `EXECD_RUN_AS`                 | run every command as `user`, `uid`, `user:group` or `uid:gid` with the user's groups; execd must be root |
-| `--kept-jobs-survive-idle` | `EXECD_KEPT_JOBS_SURVIVE_IDLE` | advertise v1.4 job-end notify; say so only if this sandbox is not stopped when idle                      |
-| `--max-response-bytes`     | `EXECD_MAX_RESPONSE_BYTES`     | most output one v1.1 answer carries (default 16 MiB); match the agent's `--exec-max-response-bytes`      |
+| flag                       | environment                    | meaning                                                                                                          |
+| -------------------------- | ------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `--listen`                 | `EXECD_LISTEN`                 | address to listen on (default `127.0.0.1:8080`)                                                                  |
+| `--root`                   | `EXECD_ROOT`                   | where a command runs when its request names no directory (default: the current directory)                        |
+| `--home`                   | `EXECD_HOME`                   | `HOME` for every command                                                                                         |
+| `--bearer-file`            | `EXECD_BEARER_FILE`            | a file holding the bearer token (mode 0600); `EXECD_BEARER` holds the token itself, a weaker way                 |
+| `--insecure-no-auth`       | `EXECD_INSECURE_NO_AUTH`       | serve with no bearer on a non-loopback address; without it execd refuses to start                                |
+| `--run-as`                 | `EXECD_RUN_AS`                 | run every command as `user`, `uid`, `user:group` or `uid:gid` with the user's groups; execd must be root         |
+| `--kept-jobs-survive-idle` | `EXECD_KEPT_JOBS_SURVIVE_IDLE` | advertise v1.4 job-end notify; say so only if this sandbox is not stopped when idle                              |
+| `--max-response-bytes`     | `EXECD_MAX_RESPONSE_BYTES`     | most output one v1.1 answer carries (default 16 MiB); match the agent's `--exec-max-response-bytes`              |
 | `--jobs-dir`               | `EXECD_JOBS_DIR`               | where a kept job's last 8 MiB of output is spooled (default `$TMPDIR`, else `/tmp`); use a disk-backed directory |
-| `--log-level`              | `EXECD_LOG`                    | `error`, `warn`, `info`, `debug` or `trace`                                                              |
+| `--log-level`              | `EXECD_LOG`                    | `error`, `warn`, `info`, `debug` or `trace`                                                                      |
 
 `GET /livez` answers 200 without authentication, and nothing else is open. `SIGTERM` and `SIGINT` kill every running process
 group and exit.
