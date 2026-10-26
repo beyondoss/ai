@@ -79,7 +79,7 @@ run = "cargo audit"
 run = "dprint fmt && cargo fmt"
 
 [tasks."fuzz"]
-description = "Coverage-guided fuzzing of the gateway's byte parsers: `mise run fuzz -- <lex|peek|usage|translate|key|signed_id> [secs]` (default 60s). Crashes land in crates/gateway/fuzz/artifacts/<target>/."
+description = "Coverage-guided fuzzing of the gateway's byte parsers (`lex|peek|usage|translate|key|signed_id`) and execd's (`request|ring`): `mise run fuzz -- <target> [secs]` (default 60s). Crashes land in crates/{gateway,execd}/fuzz/artifacts/<target>/."
 run = """
 set -eu
 target="${1:?usage: mise run fuzz -- <target> [secs]}"
@@ -87,7 +87,10 @@ secs="${2:-60}"
 # The dated nightly libFuzzer needs; deep.yml pins the same one.
 tc="${FUZZ_NIGHTLY:-nightly-2026-04-01}"
 rustup toolchain list | grep -q "^$tc" || rustup toolchain install "$tc" --profile minimal
-cd crates/gateway/fuzz
+case "$target" in
+  request|ring) cd crates/execd/fuzz ;;
+  *) cd crates/gateway/fuzz ;;
+esac
 cargo "+$tc" fuzz run "$target" -- -max_total_time="$secs" -timeout=10 -rss_limit_mb=2048
 """
 

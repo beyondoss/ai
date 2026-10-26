@@ -33,7 +33,7 @@ use tokio::time::{Instant, Sleep};
 
 use crate::frame::{self, FRAME_MAX};
 use crate::http::{self, Line, Request, Resp};
-use crate::proc::{self, Proc};
+use crate::proc::{self, Proc, locked};
 use crate::{Ctx, StreamEnd, StreamStart};
 
 /// How long, after a command's process exits, to keep reading pipes a descendant may be holding
@@ -41,18 +41,30 @@ use crate::{Ctx, StreamEnd, StreamStart};
 pub(crate) const PIPE_GRACE: Duration = Duration::from_millis(100);
 
 /// The command a request describes, ready to spawn: its `cwd` (default: the root), `HOME`, and
-/// piped output.
+/// piped output. Nothing of execd's own secrets reaches it: every `EXECD_*` variable is removed
+/// (the bearer must not be in a command's environment). Under `--run-as` the switch helper becomes
+/// the command, as the target user.
 pub(crate) fn command_for(ctx: &Ctx, req: &Request) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(&req.command);
-    cmd.args(&req.args)
-        .current_dir(
-            req.cwd
-                .as_deref()
-                .map_or_else(|| ctx.opts.root.clone(), Into::into),
-        )
-        .stdout(Stdio::piped())
+    let cwd = req
+        .cwd
+        .as_deref()
+        .map_or_else(|| ctx.opts.root.clone(), Into::into);
+    let mut cmd = match &ctx.opts.run_as {
+        // The helper changes directory itself, after the switch, so the target's own permissions
+        // decide whether it may.
+        Some(who) => who.wrap(&req.command, &req.args, &cwd),
+        None => {
+            let mut cmd = tokio::process::Command::new(&req.command);
+            cmd.args(&req.args).current_dir(&cwd);
+            cmd
+        }
+    };
+    cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    for name in &ctx.scrub {
+        cmd.env_remove(name);
+    }
     if let Some(home) = &ctx.opts.home {
         cmd.env("HOME", home);
     }
@@ -114,9 +126,7 @@ async fn capture<R: tokio::io::AsyncRead + Unpin>(
         }
         if take > 0 {
             budget.fetch_sub(take, Ordering::Relaxed);
-            if let Ok(mut v) = into.lock() {
-                v.extend_from_slice(&buf[..take]);
-            }
+            locked(&into).extend_from_slice(&buf[..take]);
         }
     }
 }
@@ -185,11 +195,8 @@ pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
         a.abort();
     }
     feeder.abort();
-    let take = |m: &Arc<std::sync::Mutex<Vec<u8>>>| {
-        m.lock()
-            .map(|v| String::from_utf8_lossy(&v).into_owned())
-            .unwrap_or_default()
-    };
+    let take =
+        |m: &Arc<std::sync::Mutex<Vec<u8>>>| String::from_utf8_lossy(&locked(m)).into_owned();
     if dropped.load(Ordering::Relaxed) {
         // Output past the cap was thrown away, so there is no honest result to return: a prefix
         // presented as the output would be a confident wrong answer. 422, not 5xx or 413: the

@@ -33,12 +33,29 @@ mod http;
 mod jobs;
 mod notify;
 mod proc;
+mod runas;
 mod spool;
 
 pub use notify::{
     ATTEMPT_TIMEOUT, CallbackAttempt, CallbackKind, NOTIFY_VERSION, NotifyTarget, parse_notify,
 };
+/// Entry points for the fuzz targets and the parser tests; not part of the API.
+#[doc(hidden)]
+pub mod __fuzz {
+    /// Parse a request body as the server does after the bearer: `true` if it is accepted, `false`
+    /// if the server would answer `400`. Never panics.
+    pub fn request(bytes: &[u8]) -> bool {
+        crate::http::fuzz_request(bytes)
+    }
+
+    /// Hold the job output ring to a reference buffer over the operations `bytes` describe.
+    pub fn ring(bytes: &[u8]) {
+        crate::jobs::fuzz_ring(bytes);
+    }
+}
+
 pub use proc::{become_subreaper, reap_once, reap_orphans};
+pub use runas::{HELPER_FLAG, Resolved, RunAs, helper_main};
 pub use spool::remove_stale_jobs_dirs;
 
 /// The spec's heartbeat: a stream silent for this long gets `{}` (v1.2).
@@ -70,8 +87,12 @@ pub struct Options {
     /// `HOME` for every command; `None` inherits execd's own.
     pub home: Option<PathBuf>,
     /// Answer `401` to any request without `Authorization: Bearer <this>` (`/livez` excepted).
-    /// `None` accepts everything.
+    /// `None` accepts everything, which [`serve`] allows only on a loopback listener unless
+    /// [`Self::insecure_no_auth`] says otherwise.
     pub bearer: Option<String>,
+    /// Allow [`serve`] with no bearer on a listener that is not loopback: anyone who can reach it
+    /// runs commands. Off by default, so an embedding host cannot do it by forgetting the bearer.
+    pub insecure_no_auth: bool,
     /// A stream silent this long gets a heartbeat. The spec's is [`HEARTBEAT_INTERVAL`]; a test
     /// that wants to see one quickly shortens it.
     pub heartbeat: Duration,
@@ -81,6 +102,10 @@ pub struct Options {
     /// The deployment says a kept job survives its sandbox going idle. v1.4 notify is advertised
     /// only then (N1), and like the spec's setting it is off unless the operator turns it on.
     pub kept_jobs_survive_idle: bool,
+    /// Run every command as this uid, gid and groups instead of execd's own. The host must call
+    /// [`helper_main`] first thing, and should prove the switch works with [`RunAs::check`].
+    /// `None`: commands share execd's uid, and can read its memory and its environment.
+    pub run_as: Option<RunAs>,
     /// How much of each job's output is kept; see [`JOB_OUTPUT_RETENTION`].
     pub job_output_retention: usize,
     /// Where the retained output of kept jobs is spooled, as chunk files under a directory of
@@ -101,8 +126,10 @@ impl Options {
             root: root.into(),
             home: None,
             bearer: None,
+            insecure_no_auth: false,
             heartbeat: HEARTBEAT_INTERVAL,
             native_jobs: true,
+            run_as: None,
             kept_jobs_survive_idle: false,
             job_output_retention: JOB_OUTPUT_RETENTION,
             jobs_dir: None,
@@ -125,8 +152,10 @@ impl std::fmt::Debug for Options {
             .field("root", &self.root)
             .field("home", &self.home)
             .field("bearer", &self.bearer.as_ref().map(|_| "<redacted>"))
+            .field("insecure_no_auth", &self.insecure_no_auth)
             .field("heartbeat", &self.heartbeat)
             .field("native_jobs", &self.native_jobs)
+            .field("run_as", &self.run_as)
             .field("kept_jobs_survive_idle", &self.kept_jobs_survive_idle)
             .field("job_output_retention", &self.job_output_retention)
             .field("jobs_dir", &self.jobs_dir)
@@ -179,6 +208,8 @@ pub trait Observer: Send + Sync + 'static {
 /// Everything a request handler shares.
 pub(crate) struct Ctx {
     pub opts: Options,
+    /// The environment variables no command may inherit: every `EXECD_*` execd was started with.
+    pub scrub: Vec<std::ffi::OsString>,
     pub jobs: jobs::Jobs,
     /// Where kept jobs' output is held.
     pub spool: spool::JobsDir,
@@ -220,8 +251,23 @@ impl Handle {
 pub fn serve(listener: tokio::net::TcpListener, opts: Options) -> std::io::Result<Handle> {
     let addr = listener.local_addr()?;
     let spool = spool::JobsDir::open(opts.jobs_dir.as_deref())?;
+    // Fail closed: no bearer is only for a listener that only this host can reach.
+    if opts.bearer.is_none() && !opts.insecure_no_auth && !addr.ip().to_canonical().is_loopback() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to serve on {addr} with no bearer: anyone who can reach it could run \
+                 commands (set Options::bearer, listen on loopback, or set Options::insecure_no_auth)"
+            ),
+        ));
+    }
+    let scrub = std::env::vars_os()
+        .map(|(k, _)| k)
+        .filter(|k| k.as_encoded_bytes().starts_with(b"EXECD_"))
+        .collect();
     let ctx = Arc::new(Ctx {
         opts,
+        scrub,
         jobs: jobs::Jobs::default(),
         spool,
         groups: proc::Groups::default(),

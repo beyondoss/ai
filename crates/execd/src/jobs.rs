@@ -42,7 +42,7 @@ use crate::exec::{self, Cut, PIPE_GRACE, Sink};
 use crate::frame::{self, FRAME_MAX};
 use crate::http::{self, Line, Request, Resp};
 use crate::notify::{self, Notifier, NotifyTarget};
-use crate::proc;
+use crate::proc::{self, locked};
 use crate::spool;
 use crate::{Ctx, StreamEnd, StreamStart};
 
@@ -202,14 +202,12 @@ impl Jobs {
     }
 
     fn get(&self, key: &Key) -> Option<JobCell> {
-        self.map.lock().ok()?.get(key).cloned()
+        locked(&self.map).get(key).cloned()
     }
 
     /// The jobs of `scope` matching `pick`.
     fn in_scope(&self, scope: &str, pick: impl Fn(&str) -> bool) -> Vec<(Key, JobCell)> {
-        let Ok(map) = self.map.lock() else {
-            return Vec::new();
-        };
+        let map = locked(&self.map);
         map.iter()
             .filter(|((sc, id), _)| sc == scope && pick(id))
             .map(|(k, c)| (k.clone(), c.clone()))
@@ -218,15 +216,14 @@ impl Jobs {
 
     /// Take `keys` out of the table; their pumps and timers stop.
     fn remove(&self, keys: &[Key]) {
-        let cells: Vec<JobCell> = match self.map.lock() {
-            Ok(mut map) => keys.iter().filter_map(|k| map.remove(k)).collect(),
-            Err(_) => return,
+        let cells: Vec<JobCell> = {
+            let mut map = locked(&self.map);
+            keys.iter().filter_map(|k| map.remove(k)).collect()
         };
         for cell in cells {
-            if let Ok(mut j) = cell.lock() {
-                j.removed = true;
-                j.notifier = Notifier::default();
-            }
+            let mut j = locked(&cell);
+            j.removed = true;
+            j.notifier = Notifier::default();
         }
         self.bump();
     }
@@ -274,6 +271,88 @@ async fn stop_groups(pgids: &[i32], grace: Duration) {
     while any_live(pgids).await && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// Fuzz seam: whether `job` is a well-formed job operation (and its `notify`, if it has one, passes
+/// the grammar). Never panics.
+pub(crate) fn fuzz_job(job: &Value) -> bool {
+    match serde_json::from_value::<JobReq>(job.clone()) {
+        Ok(j) => {
+            j.op != "keep"
+                || j.notify
+                    .as_ref()
+                    .is_none_or(|n| notify::parse_notify(n).is_ok())
+        }
+        Err(_) => false,
+    }
+}
+
+/// Fuzz seam: drive a [`Ring`] with the pushes and reads `bytes` describe, and hold it to a plain
+/// `Vec` of everything pushed: every read returns the bytes at its offsets, from the oldest kept
+/// byte when the offset is older, and the ring keeps at least its retention.
+pub(crate) fn fuzz_ring(bytes: &[u8]) {
+    let mut it = bytes.iter().copied();
+    let retain = 1 + usize::from(it.next().unwrap_or(0)) * 1024;
+    // The ring spools to files: give this run a directory of its own, removed when it ends.
+    static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "execd-fuzz-ring-{}-{}",
+        std::process::id(),
+        RUNS.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _cleanup = scopeguard_remove(dir.clone());
+    let mut ring = Ring::new(retain, dir.join("ring"));
+    let mut all: Vec<u8> = Vec::new();
+    while let Some(op) = it.next() {
+        let a = u16::from_le_bytes([it.next().unwrap_or(0), it.next().unwrap_or(0)]);
+        if op % 2 == 0 {
+            let seed = op;
+            let data: Vec<u8> = (0..usize::from(a))
+                .map(|i| (i % 251) as u8 ^ seed)
+                .collect();
+            ring.push(&data);
+            all.extend_from_slice(&data);
+            continue;
+        }
+        let end = ring.end();
+        assert_eq!(end as usize, all.len());
+        // Offsets: near zero, around the end, and absurd. Sizes: small, huge and unbounded.
+        let offset = match op % 8 {
+            1 => u64::from(a),
+            3 => end.saturating_sub(u64::from(a)),
+            5 => end + u64::from(a),
+            _ => u64::MAX - u64::from(a),
+        };
+        let max = match (op / 8) % 4 {
+            0 => usize::from(a),
+            1 => usize::MAX,
+            2 => usize::MAX - usize::from(a),
+            _ => 1 << 20,
+        };
+        let (from, data) = ring.read(offset, max);
+        assert_eq!(from, offset.max(ring.base));
+        let avail = end.saturating_sub(from).min(max as u64);
+        assert_eq!(data.len() as u64, avail);
+        if avail > 0 {
+            assert_eq!(&data[..], &all[from as usize..from as usize + data.len()]);
+        }
+        let kept = end - ring.base;
+        assert!(kept >= (all.len().min(retain)) as u64);
+        assert!(kept < (retain + FRAME_MAX) as u64);
+    }
+}
+
+/// Removes a directory tree when dropped.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scopeguard_remove(p: PathBuf) -> RemoveOnDrop {
+    RemoveOnDrop(p)
 }
 
 /// A job operation: the request's `job` object.
@@ -333,9 +412,7 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
             let body = match jobs.get(&key(&job.id)) {
                 None => json!({ "state": "gone", "offset": 0, "end": 0, "data": "" }),
                 Some(cell) => {
-                    let Ok(j) = cell.lock() else {
-                        return http::error_response(500, "job state poisoned");
-                    };
+                    let j = locked(&cell);
                     let (state, code) = state_of(&j);
                     let (from, data) = j
                         .out
@@ -360,7 +437,10 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
                 .in_scope(&job.scope, |id| wipe || job.ids.iter().any(|i| i == id))
                 .into_iter()
                 .filter_map(|(k, c)| {
-                    let (running, pgid) = c.lock().ok().map(|j| (j.end.is_none(), j.pgid))?;
+                    let (running, pgid) = {
+                        let j = locked(&c);
+                        (j.end.is_none(), j.pgid)
+                    };
                     running.then_some((k, c, pgid))
                 })
                 .collect();
@@ -378,8 +458,9 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
                 let named = jobs.in_scope(&job.scope, |id| wipe || job.ids.iter().any(|i| i == id));
                 let mut gone = Vec::new();
                 for (k, c) in named {
-                    let pgid = c.lock().map(|j| j.pgid).unwrap_or(0);
-                    if proc::live_members_async(pgid).await.is_empty() {
+                    let pgid = locked(&c).pgid;
+                    // pgid 0: still being spawned, so not yet a job that can be taken out.
+                    if pgid != 0 && proc::live_members_async(pgid).await.is_empty() {
                         gone.push(k);
                     }
                 }
@@ -392,11 +473,11 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
             let named = jobs.in_scope(&job.scope, |id| job.ids.iter().any(|i| i == id));
             let mut gone = Vec::new();
             for (k, c) in named {
-                let (ended, pgid) = c
-                    .lock()
-                    .map(|j| (j.end.is_some(), j.pgid))
-                    .unwrap_or((false, 0));
-                if ended || proc::live_members_async(pgid).await.is_empty() {
+                let (ended, pgid) = {
+                    let j = locked(&c);
+                    (j.end.is_some(), j.pgid)
+                };
+                if ended || (pgid != 0 && proc::live_members_async(pgid).await.is_empty()) {
                     gone.push(k);
                 }
             }
@@ -407,10 +488,10 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
             let list: Vec<Value> = jobs
                 .in_scope(&job.scope, |_| true)
                 .into_iter()
-                .filter_map(|((_, id), c)| {
-                    let j = c.lock().ok()?;
+                .map(|((_, id), c)| {
+                    let j = locked(&c);
                     let (state, code) = state_of(&j);
-                    Some(json!({
+                    json!({
                         "id": id,
                         "state": state,
                         "code": code,
@@ -421,7 +502,7 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
                         "started": j.started,
                         "ended": j.ended,
                         "label": j.label,
-                    }))
+                    })
                 })
                 .collect();
             http::json_response(200, &json!({ "jobs": list }))
@@ -449,9 +530,7 @@ fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq) -> Resp {
     let Some(cell) = ctx.jobs.get(&key) else {
         return http::error_response(404, "no such job");
     };
-    let Ok(mut j) = cell.lock() else {
-        return http::error_response(500, "job state poisoned");
-    };
+    let mut j = locked(&cell);
     if keep {
         j.kept = true;
         j.num = job.num;
@@ -476,9 +555,7 @@ fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq) -> Resp {
 async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     let key = (job.scope.clone(), job.id.clone());
     let cell: JobCell = {
-        let Ok(mut map) = ctx.jobs.map.lock() else {
-            return http::error_response(500, "job table poisoned");
-        };
+        let mut map = locked(&ctx.jobs.map);
         if map.contains_key(&key) {
             return http::error_response(409, "the job exists");
         }
@@ -513,9 +590,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         }
     };
     let pgid = proc.pgid;
-    if let Ok(mut j) = cell.lock() {
-        j.pgid = pgid;
-    }
+    locked(&cell).pgid = pgid;
     ctx.groups.insert(pgid);
 
     // Both pipes into one ring, in arrival order. `progress` counts what the pumps have read, so
@@ -580,7 +655,7 @@ fn pump<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
                 break;
             }
             {
-                let Ok(mut j) = cell.lock() else { return };
+                let mut j = locked(&cell);
                 if j.removed {
                     return;
                 }
@@ -640,7 +715,8 @@ async fn supervise(
     let mut exits = proc::ChildEvents::new();
     if !proc::live_members_async(pgid).await.is_empty() {
         // The moment a held stream would send `shell_exit`: v1.4 calls back.
-        if let Ok(mut j) = cell.lock() {
+        {
+            let mut j = locked(&cell);
             j.shell_exit = Some(code);
             notify::change(&ctx, &cell, &key, &mut j);
         }
@@ -654,7 +730,8 @@ async fn supervise(
         p.abort();
     }
     // The end is observable from here on: v1.4 calls back.
-    if let Ok(mut j) = cell.lock() {
+    {
+        let mut j = locked(&cell);
         j.end = Some(code);
         j.ended = epoch();
         if !j.removed {
@@ -682,11 +759,10 @@ async fn stream_job(
     }
     // The connection is gone before the job's end: a held job nobody kept dies with it.
     if hold && let Some(cell) = ctx.jobs.get(&key) {
-        let pgid = cell
-            .lock()
-            .ok()
-            .filter(|j| !j.kept && j.end.is_none())
-            .map(|j| j.pgid);
+        let pgid = {
+            let j = locked(&cell);
+            (!j.kept && j.end.is_none()).then_some(j.pgid)
+        };
         if let Some(g) = pgid {
             proc::kill_group(g);
             return StreamEnd::Disconnected { killed: true };
@@ -720,9 +796,7 @@ async fn follow(
         let next = match ctx.jobs.get(key) {
             None => Next::Missing,
             Some(cell) => {
-                let Ok(j) = cell.lock() else {
-                    return Err(Cut::Gone);
-                };
+                let j = locked(&cell);
                 let total = j.out.end();
                 if sent < j.out.base {
                     let n = j.out.base - sent;
@@ -826,6 +900,23 @@ mod tests {
         let expect: Vec<u8> = (70_000..270_000usize).map(|i| (i % 251) as u8).collect();
         assert_eq!(data, expect);
         assert!(ring.read(300_000, 10).1.is_empty());
+    }
+
+    /// A `max` the client chose (`u64::MAX` is a valid JSON number) must not overflow the arithmetic
+    /// of a read from inside a chunk: it panicked while holding the job's lock.
+    #[test]
+    fn a_read_of_any_size_from_any_offset_does_not_overflow() {
+        let (mut ring, _d) = ring(10_000_000);
+        fill(&mut ring, 1000);
+        for offset in [0, 1, 500, 999, 1000, 5000, u64::MAX] {
+            let (from, data) = ring.read(offset, usize::MAX);
+            assert_eq!(from, offset, "{offset}");
+            assert_eq!(
+                data.len() as u64,
+                1000u64.saturating_sub(offset),
+                "{offset}"
+            );
+        }
     }
 
     #[test]
