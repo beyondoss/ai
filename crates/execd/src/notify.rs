@@ -195,7 +195,10 @@ async fn run_attempt(
                     error,
                 });
             }
-            tracing::info!(kind = "callback", job = ?key.1, attempt = n, status, "request");
+            crate::log_info!(
+                "request kind=callback job={:?} attempt={n} status={status:?}",
+                key.1
+            );
             status.map_or(exec_notify::Outcome::Failed, exec_notify::Outcome::Status)
         }
         None => exec_notify::Outcome::Failed,

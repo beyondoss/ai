@@ -141,13 +141,11 @@ impl Line {
     }
 
     pub fn done(self, status: u16, outcome: &str) {
-        tracing::info!(
-            kind = self.kind,
-            command = ?self.command,
-            status,
-            outcome,
-            ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            "request"
+        crate::log_info!(
+            "request kind={} command={:?} status={status} outcome={outcome:?} ms={}",
+            self.kind,
+            self.command,
+            u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
         );
     }
 }
@@ -201,7 +199,7 @@ pub(crate) async fn accept_loop(
                 Err(e) => {
                     // Out of descriptors, mostly. Retrying at once would spin; the pause is not a
                     // limit, only the time for one open connection to close.
-                    tracing::warn!(error = %e, "accept failed");
+                    crate::log_warn!("accept failed error={e}");
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
@@ -213,6 +211,10 @@ pub(crate) async fn accept_loop(
 /// keep-alive). The agent's pool drops an idle connection after 30 s (`pool_idle_timeout`, and
 /// N40), so closing at twice that never beats the client to it.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// hyper's write-buffer cap: with 16 KiB frames anything past one frame only holds memory for a
+/// client that is not reading (see [`crate::frame::READ_BUF`]); 16 KiB is no slower than 400 KiB.
+const HTTP_BUF: usize = 16 * 1024;
 
 async fn connection(sock: tokio::net::TcpStream, ctx: Arc<Ctx>, stop: CancellationToken) {
     let _ = sock.set_nodelay(true);
@@ -230,12 +232,13 @@ async fn connection(sock: tokio::net::TcpStream, ctx: Arc<Ctx>, stop: Cancellati
     builder
         .http1()
         .timer(TokioTimer::new())
+        .max_buf_size(HTTP_BUF)
         .header_read_timeout(HEAD_TIMEOUT);
     let conn = builder.serve_connection(TokioIo::new(sock), svc);
     tokio::select! {
         r = conn => {
             if let Err(e) = r {
-                tracing::debug!(error = %e, "connection ended");
+                crate::log_debug!("connection ended error={e}");
             }
         }
         // Dropping the connection drops its in-flight handlers, whose guards kill their groups.
@@ -258,7 +261,7 @@ async fn route(ctx: Arc<Ctx>, req: HttpRequest<Incoming>) -> Resp {
         return error_response(405, "POST an exec request");
     }
     if !authorized(&ctx, &parts.headers) {
-        tracing::info!(kind = "auth", status = 401, "request");
+        crate::log_info!("request kind=auth status=401");
         return error_response(401, "unauthorized");
     }
     let max = ctx.opts.max_request_bytes;
@@ -268,7 +271,7 @@ async fn route(ctx: Arc<Ctx>, req: HttpRequest<Incoming>) -> Resp {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<usize>().ok());
     if declared.is_some_and(|n| n > max) {
-        tracing::info!(kind = "body", status = 413, "request");
+        crate::log_info!("request kind=body status=413");
         return error_response(413, "request too large");
     }
     // Read at most `max` bytes, declared or not (chunked bodies declare nothing).
@@ -278,7 +281,7 @@ async fn route(ctx: Arc<Ctx>, req: HttpRequest<Incoming>) -> Resp {
             if e.downcast_ref::<http_body_util::LengthLimitError>()
                 .is_some() =>
         {
-            tracing::info!(kind = "body", status = 413, "request");
+            crate::log_info!("request kind=body status=413");
             return error_response(413, "request too large");
         }
         Err(_) => return error_response(400, "request body not readable"),
@@ -286,7 +289,7 @@ async fn route(ctx: Arc<Ctx>, req: HttpRequest<Incoming>) -> Resp {
     let req: Request = match serde_json::from_slice(&bytes) {
         Ok(r) => r,
         Err(e) => {
-            tracing::info!(kind = "body", status = 400, "request");
+            crate::log_info!("request kind=body status=400");
             return error_response(400, &format!("bad request: {e}"));
         }
     };

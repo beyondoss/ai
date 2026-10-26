@@ -553,7 +553,6 @@ dependencies = [
  "beyond-ai-exec-notify",
  "beyond-ai-test-support",
  "bytes",
- "clap",
  "getrandom 0.3.4",
  "http-body-util",
  "hyper",
@@ -568,8 +567,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

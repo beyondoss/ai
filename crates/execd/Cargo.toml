@@ -29,7 +29,6 @@ base64.workspace = true
 # same pure function.
 beyond-ai-exec-notify = { path = "../exec-notify", version = "0.1.0" }
 bytes.workspace = true
-clap.workspace = true
 # The jitter draw for a retry's wait (one u32 per failed attempt).
 getrandom = { version = "0.3", features = ["std"] }
 http-body-util = "0.1"
@@ -49,8 +48,6 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
 
 [dev-dependencies]
 # The conformance verifier lives in the agent, the only client of the protocol; the test runs it

@@ -302,7 +302,7 @@ pub fn become_subreaper() -> io::Result<()> {
 pub async fn reap_orphans(stop: tokio_util::sync::CancellationToken) {
     use tokio::signal::unix::{SignalKind, signal};
     let Ok(mut sigchld) = signal(SignalKind::child()) else {
-        tracing::warn!("cannot listen for SIGCHLD; orphans will not be reaped");
+        crate::log_warn!("cannot listen for SIGCHLD; orphans will not be reaped");
         return;
     };
     loop {

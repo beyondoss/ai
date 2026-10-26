@@ -26,7 +26,7 @@ use std::process::{ExitCode, Stdio};
 use nix::unistd::{Gid, Group, Uid, User};
 
 /// The argument that makes `execd` act as the switch helper instead of a server. It is the first
-/// argument, ahead of anything clap would parse.
+/// argument, ahead of any argument parsing.
 pub const HELPER_FLAG: &str = "--execd-run-as-helper";
 
 /// The identity commands run as.
