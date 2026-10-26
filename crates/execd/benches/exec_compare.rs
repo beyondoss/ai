@@ -78,14 +78,15 @@ impl Server {
         };
         cmd.envs(side.env.iter().map(|(k, v)| (k, v)));
         // port-0: the server binds it and keeps it; the port is read back from its own sockets.
+        let listen = "127.0.0.1:0";
         if side.stub {
             // The baseline stub predates execd's environment-only configuration: it takes flags.
-            cmd.args(["exec-stub", "--listen", "127.0.0.1:0", "--root"])
+            cmd.args(["exec-stub", "--listen", listen, "--root"])
                 .arg(&root)
                 .arg("--home")
                 .arg(&home);
         } else {
-            cmd.env("EXECD_LISTEN", "127.0.0.1:0")
+            cmd.env("EXECD_LISTEN", listen)
                 .env("EXECD_ROOT", &root)
                 .env("EXECD_HOME", &home);
         }
