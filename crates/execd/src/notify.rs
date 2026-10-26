@@ -108,6 +108,15 @@ pub(crate) struct Notifier {
     seq: u64,
 }
 
+impl Notifier {
+    /// A callback is owed and not settled: in flight, waiting on its backoff, or about to begin.
+    /// Settled, abandoned at the attempt limit, or removed, it is not.
+    pub fn owes(&self) -> bool {
+        let k = &self.kernel;
+        !k.removed && k.notify && k.owed > k.settled
+    }
+}
+
 /// Feed `event` to job `j`'s kernel (the caller holds the job's lock) and carry out what it says.
 pub(crate) fn feed(
     ctx: &Arc<Ctx>,
@@ -126,6 +135,8 @@ pub(crate) fn feed(
     let now = u64::try_from(ctx.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
     let (next, actions) = exec_notify::step(j.notifier.kernel, event, now);
     j.notifier.kernel = next;
+    // The host's activity view includes the callbacks owed.
+    ctx.activity_changed();
     for action in actions {
         match action {
             exec_notify::Action::Abandon => j.notifier.attempt = None,
@@ -381,5 +392,54 @@ mod trust_tests {
         let not_der = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
         assert_eq!(count_pem(not_der), (0, 1));
         assert_eq!(count_pem("-----BEGIN CERTIFICATE-----\nMAMC"), (0, 1));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod owed_tests {
+    use super::Notifier;
+    use exec_notify::{Event, Outcome, step};
+
+    fn owes(kernel: exec_notify::Job) -> bool {
+        Notifier {
+            kernel,
+            ..Notifier::default()
+        }
+        .owes()
+    }
+
+    fn kept() -> exec_notify::Job {
+        step(exec_notify::Job::default(), Event::Keep { notify: true }, 0).0
+    }
+
+    /// Owed from the keep, through every failed attempt and its backoff, until the twelfth failure
+    /// abandons the count; a settling answer and removal also end it.
+    #[test]
+    fn a_callback_is_owed_until_settled_abandoned_or_removed() {
+        let mut k = kept();
+        let mut now = 0;
+        for attempt in 1..=exec_notify::MAX_ATTEMPTS {
+            assert!(owes(k), "in flight, attempt {attempt}");
+            let failed = Event::AttemptEnded {
+                outcome: Outcome::Status(500),
+                draw: 0,
+            };
+            let (next, actions) = step(k, failed, now);
+            k = next;
+            if let Some(exec_notify::Action::WakeAt(at)) = actions.first() {
+                assert!(owes(k), "backing off after attempt {attempt}");
+                now = *at;
+                k = step(k, Event::Wake, now).0;
+            }
+        }
+        assert!(!owes(k), "abandoned at the attempt limit");
+        assert!(!owes(step(kept(), Event::Removed, 0).0));
+        let ok = Event::AttemptEnded {
+            outcome: Outcome::Status(200),
+            draw: 0,
+        };
+        assert!(!owes(step(kept(), ok, 0).0));
+        assert!(!owes(exec_notify::Job::default()));
     }
 }

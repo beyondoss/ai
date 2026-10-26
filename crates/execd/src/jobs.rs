@@ -208,15 +208,21 @@ impl Jobs {
     }
 
     /// Every job in the table that has not ended (held or kept, any scope), and the kept ones of them.
-    pub fn alive(&self) -> (usize, Vec<crate::KeptJob>) {
+    /// And how many jobs are owed a v1.4 callback that is neither settled nor abandoned.
+    pub fn alive(&self) -> (usize, Vec<crate::KeptJob>, usize) {
         let cells: Vec<(Key, JobCell)> = locked(&self.map)
             .iter()
             .map(|(k, c)| (k.clone(), c.clone()))
             .collect();
         let mut alive = 0;
+        let mut owed = 0;
         let mut kept = Vec::new();
         for ((scope, id), cell) in cells {
             let j = locked(&cell);
+            // An attempt in flight, a retry waiting out its backoff: owed and not yet settled.
+            if !j.removed && j.notifier.owes() {
+                owed += 1;
+            }
             if j.end.is_some() || j.removed || j.pgid == 0 {
                 continue;
             }
@@ -229,7 +235,7 @@ impl Jobs {
                 });
             }
         }
-        (alive, kept)
+        (alive, kept, owed)
     }
 
     fn get(&self, key: &Key) -> Option<JobCell> {
