@@ -637,6 +637,7 @@ async fn supervise(
         s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
     });
     drain_pumps(&mut pipes, &progress, cap).await;
+    let mut exits = proc::ChildEvents::new();
     if !proc::live_members_async(pgid).await.is_empty() {
         // The moment a held stream would send `shell_exit`: v1.4 calls back.
         if let Ok(mut j) = cell.lock() {
@@ -645,7 +646,7 @@ async fn supervise(
         }
         ctx.jobs.bump();
         while !proc::live_members_async(pgid).await.is_empty() {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            exits.next().await;
         }
         drain_pumps(&mut pipes, &progress, cap).await;
     }
