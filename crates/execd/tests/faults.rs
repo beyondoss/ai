@@ -329,7 +329,7 @@ const WRITER: &str = "while :; do yes | head -c 65536; sleep 0.1; done";
 
 fn assert_parity(from: u64, data: &[u8]) {
     for (i, b) in data.iter().enumerate() {
-        let want = if (from + i as u64) % 2 == 0 {
+        let want = if (from + i as u64).is_multiple_of(2) {
             b'y'
         } else {
             b'\n'
@@ -364,9 +364,10 @@ async fn a_full_jobs_disk_costs_the_output_and_nothing_else() {
     // The disk fills (and stays full). The writer keeps running, and what it wrote reads back
     // honestly: a gap at the front, offsets that never move backwards, bytes that are the bytes.
     disk.fill();
-    let (mut last_from, mut last_end) = (r.from, r.end);
-    let started = last_end;
+    let last = std::cell::Cell::new((r.from, r.end));
+    let started = r.end;
     until("600 KiB written while full", || async {
+        let (last_from, last_end) = last.get();
         let r = read(&e, "w", 0).await;
         assert_eq!(r.state, "running", "the writer must outlive a full disk");
         assert!(
@@ -377,12 +378,12 @@ async fn a_full_jobs_disk_costs_the_output_and_nothing_else() {
         assert!(r.end >= last_end, "end moved back: {} < {last_end}", r.end);
         assert!(r.end >= r.from + r.data.len() as u64);
         assert_parity(r.from, &r.data);
-        (last_from, last_end) = (r.from, r.end);
+        last.set((r.from, r.end));
         r.end >= started + (600 << 10)
     })
     .await;
     assert!(
-        last_from > 0,
+        last.get().0 > 0,
         "a full disk must read back as a gap, not as the old bytes"
     );
     // Asking for the lost bytes is answered from what is held, never with an error.
@@ -568,7 +569,7 @@ async fn a_failing_fork_fails_spawns_cleanly_and_recovers() {
 
     set_prlimit(pid, "--nproc", &original);
     assert_spawns_work(&e, "forks back").await;
-    assert_eq!(read(&e, "after-forks-back", 0).await.state != "gone", true);
+    assert_ne!(read(&e, "after-forks-back", 0).await.state, "gone");
     wipe(&e).await;
     assert_no_panic(&e);
 }

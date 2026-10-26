@@ -252,11 +252,7 @@ async fn stop_groups(pgids: &[i32], grace: Duration) {
     }
     let any_live = |pgids: &[i32]| {
         let pgids = pgids.to_vec();
-        async move {
-            tokio::task::spawn_blocking(move || pgids.iter().any(|&g| !proc::group_empty(g)))
-                .await
-                .unwrap_or(false)
-        }
+        async move { proc::off_runtime(move || pgids.iter().any(|&g| !proc::group_empty(g))).await }
     };
     let deadline = tokio::time::Instant::now() + grace;
     while any_live(pgids).await && tokio::time::Instant::now() < deadline {

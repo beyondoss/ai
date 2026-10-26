@@ -207,9 +207,7 @@ pub(crate) async fn group_gone(pgid: i32, precise: bool) -> bool {
     if SUBREAPER.load(Ordering::Relaxed) && !precise {
         return false;
     }
-    tokio::task::spawn_blocking(move || live_members_scan(pgid).is_empty())
-        .await
-        .unwrap_or(false)
+    off_runtime(move || live_members_scan(pgid).is_empty()).await
 }
 
 /// [`live_members`] without holding up the runtime for the `/proc` scan.
@@ -217,9 +215,33 @@ pub(crate) async fn live_members_async(pgid: i32) -> Vec<u32> {
     if !group_exists(pgid) {
         return Vec::new();
     }
-    tokio::task::spawn_blocking(move || live_members(pgid))
-        .await
-        .unwrap_or_default()
+    off_runtime(move || live_members(pgid)).await
+}
+
+/// Run `f`, a blocking `/proc` scan, on a thread of its own so the runtime is not held up. Where
+/// the process cannot make a thread (its process limit is reached), `f` runs here instead: a few
+/// milliseconds of stalled runtime, where `tokio::task::spawn_blocking` would panic the request.
+/// `T::default()` if the scan itself panics.
+pub(crate) async fn off_runtime<T: Default + Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let slot = std::sync::Arc::new(Mutex::new(Some(f)));
+    let (tx, rx) = oneshot::channel();
+    let theirs = slot.clone();
+    let spawned = std::thread::Builder::new()
+        .name("execd-scan".into())
+        .stack_size(256 << 10)
+        .spawn(move || {
+            let f = locked(&theirs).take();
+            if let Some(f) = f {
+                let _ = tx.send(f());
+            }
+        });
+    if spawned.is_ok() {
+        return rx.await.unwrap_or_default();
+    }
+    let f = locked(&slot).take();
+    f.map_or_else(T::default, |f| f())
 }
 
 /// Whether group `pgid` has no live member, for a caller that is already off the runtime.

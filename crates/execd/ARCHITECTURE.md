@@ -267,6 +267,20 @@ v1.1 and v1.2. Stdout, stderr, exit code and signal must agree per stream; the s
 for a signal in v1.1, a late background write possibly lost in v1.1) are encoded in the comparison. A failure prints its seed
 (`EXECD_DIFF_SEED`, `EXECD_DIFF_CASES`) and a shrunk program.
 
+### What the machine failing costs
+
+`tests/faults.rs` runs the real binary and applies each fault to it: a full tmpfs under the jobs directory (mounted with
+`sudo -n`; `SKIPPED` without it), `RLIMIT_NOFILE` and `RLIMIT_NPROC` lowered on the live process with `prlimit`.
+
+- **Disk full.** A kept job keeps running. Output that cannot be written reads back as a gap (`offset` moves forward, never back,
+  and the bytes at it are the bytes written), a refused chunk leaves no file behind, and other jobs, v1.1 and v1.2 are unaffected.
+  Output written after space returns is retained again.
+- **No descriptors, no processes.** A command that cannot be spawned is an ordinary result on v1.1 (`exit_code` 127 with the
+  reason) and v1.2 (a `stderr` frame, then 127); a job that cannot start is `500` and leaves no job behind. `/livez` and the jobs
+  already running are unaffected, and everything works again, with no descriptor leaked, once the limit clears. With no descriptor
+  left to accept with, a request waits in the kernel's queue rather than failing. The `/proc` scans that run off the runtime
+  (`proc::off_runtime`) fall back to running in place when no thread can be created, since `tokio::task::spawn_blocking` panics there.
+
 ## Deviations from the reference mock
 
 The reference mock in `crates/test-support` (`exec_mock`) now runs this code for its conforming configuration. It was a test
