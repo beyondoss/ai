@@ -124,7 +124,7 @@ vm_for() { # session
     # takes its roots from the OS trust store, which honors it.
     vm_run "$id" "$tok" "chmod +x $VM_HOME/execd; mkdir -p $VM_HOME/workspace
 sudo chown root:root $VM_HOME/execd $VM_HOME/bearer && sudo chmod 600 $VM_HOME/bearer || exit 1
-sudo env EXECD_LISTEN=0.0.0.0:$VM_PORT EXECD_ROOT=$VM_HOME/workspace EXECD_HOME=$VM_HOME EXECD_RUN_AS=user EXECD_BEARER_FILE=$VM_HOME/bearer EXECD_KEPT_JOBS_SURVIVE_IDLE=1 EXECD_LOG_FORMAT=json SSL_CERT_FILE=$VM_HOME/ca.pem setsid nohup $VM_HOME/execd >/tmp/execd.log 2>&1 < /dev/null &
+sudo env -u SUDO_COMMAND -u SUDO_USER -u SUDO_UID -u SUDO_GID EXECD_LISTEN=0.0.0.0:$VM_PORT EXECD_ROOT=$VM_HOME/workspace EXECD_HOME=$VM_HOME EXECD_RUN_AS=user EXECD_BEARER_FILE=$VM_HOME/bearer EXECD_KEPT_JOBS_SURVIVE_IDLE=1 EXECD_LOG_FORMAT=json SSL_CERT_FILE=$VM_HOME/ca.pem setsid nohup $VM_HOME/execd >/tmp/execd.log 2>&1 < /dev/null &
 sleep 1" >/dev/null
     # Up when the public URL answers, and answers 401 to a caller without the bearer.
     for i in $(seq 1 40); do

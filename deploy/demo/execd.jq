@@ -1,10 +1,11 @@
 # The sandbox's log lines, in the shape the demo's checks and report read.
 #
-# execd (run with `EXECD_LOG_FORMAT=json`) writes one object per request, when the request finishes:
-#   {"timestamp":"…Z","level":"INFO","message":"request","kind":"exec|job|stream|callback",
-#    "command":"bash","status":200,"outcome":"exit","ms":12}
-# and `{"message":"execd listening",…}` once at startup. A callback line also carries `job`,
-# `attempt` and, when the attempt failed, `error` (and no `status`).
+# execd (run with `EXECD_LOG_FORMAT=json`) writes one object per line, `{"timestamp":"…Z","level":"info",
+# "message":"…"}`, and the message carries `key=value` fields. One per request, when the request finishes:
+#   request kind=exec|job|stream|callback command="bash" status=200 outcome="exit" ms=12
+# and `execd <version> listening listen=… bearer=true run_as=true notify=true` once at startup. A callback
+# line carries `job="…" attempt=1 status=Some(204)|None error=None|Some("…") ms=…` instead of a command
+# (a second callback line without `ms` follows each attempt; only the one with `ms` is read).
 #
 # `execd_events` takes one raw log line (a string) and yields the events it stands for, each
 # `{ts_ms, src:"sandbox", event, detail}`; for any line that is not an execd request or startup line it
@@ -20,28 +21,41 @@ def ts_ms:
   capture("^(?<s>[^.Z]+)(\\.(?<f>[0-9]+))?Z$")
   | (((.s + "Z") | fromdateiso8601) * 1000) + (((.f // "0") + "000")[0:3] | tonumber);
 
-# execd logs a command name and a job id with `?`, so in JSON each is a string holding a quoted string.
-def unq: if type == "string" and startswith("\"") then (fromjson? // .) else . end;
+# One field value of a message: a quoted string, Some(x), None, a number, a boolean, or a bare word.
+def val:
+  if startswith("\"") then fromjson
+  elif . == "None" then null
+  elif startswith("Some(") then (.[5:-1] | val)
+  elif test("^[0-9]+$") then tonumber
+  elif . == "true" then true
+  elif . == "false" then false
+  else . end;
+def fields:
+  reduce (scan("(\\w+)=(Some\\(\"(?:[^\"\\\\]|\\\\.)*\"\\)|\"(?:[^\"\\\\]|\\\\.)*\"|\\S+)")) as $m ({}; .[$m[0]] = ($m[1] | val));
 
 def sandbox($ts; $event; $detail): {ts_ms: $ts, src: "sandbox", event: $event, detail: $detail};
 
 def execd_events:
   (fromjson? // null) as $l
-  | if ($l | type) != "object" or ($l.timestamp | type) != "string" then empty
-    elif $l.message == "execd listening" then
-      sandbox($l.timestamp | ts_ms; "listening"; {listen: $l.listen, bearer_required: $l.bearer})
-    elif $l.message != "request" then empty
+  | if ($l | type) != "object" or ($l.timestamp | type) != "string" or ($l.message | type) != "string" then empty
+    elif ($l.message | test("^execd [^ ]+ listening ")) then
+      ($l.message | fields) as $f
+      | sandbox($l.timestamp | ts_ms; "listening"; {listen: $f.listen, bearer_required: $f.bearer, run_as: $f.run_as, notify: $f.notify})
+    elif ($l.message | startswith("request ")) | not then empty
     else
-      ($l.timestamp | ts_ms) as $end
-      | ($end - ($l.ms // 0)) as $start
-      | if $l.kind == "callback" then
-          sandbox($end; "job_ended_callback";
-            {job: ($l.job | unq), attempt: $l.attempt, status: ($l.status // null), error: ($l.error // null), took_ms: $l.ms})
-        elif $l.kind == "exec" or $l.kind == "job" or $l.kind == "stream" then
-          sandbox($start; "exec_request"; {command: ($l.command | unq)}),
-          (if $l.kind == "stream" then
-             sandbox($start; "exec_start"; {command: ($l.command | unq)}),
-             sandbox($end; "exec_end"; {command: ($l.command | unq)})
+      ($l.message | fields) as $f
+      | ($l.timestamp | ts_ms) as $end
+      | ($end - ($f.ms // 0)) as $start
+      | if $f.kind == "callback" then
+          if $f.ms == null then empty
+          else sandbox($end; "job_ended_callback";
+            {job: $f.job, attempt: $f.attempt, status: $f.status, error: $f.error, took_ms: $f.ms})
+          end
+        elif $f.kind == "exec" or $f.kind == "job" or $f.kind == "stream" then
+          sandbox($start; "exec_request"; {command: $f.command}),
+          (if $f.kind == "stream" then
+             sandbox($start; "exec_start"; {command: $f.command}),
+             sandbox($end; "exec_end"; {command: $f.command})
            else empty end)
         else empty end
     end;
