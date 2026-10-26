@@ -71,10 +71,8 @@ impl Execd {
         let log = dir.path().join("execd.log");
         let mut cmd = if as_root {
             let mut c = Command::new("sudo");
-            c.args(["-n", "env"]);
-            for (k, v) in env {
-                c.arg(format!("{k}={v}"));
-            }
+            c.arg("-n");
+            preserve(&mut c, env);
             c.arg(BIN);
             c
         } else {
@@ -86,10 +84,8 @@ impl Execd {
             .stderr(std::fs::File::create(&log).unwrap())
             .env_remove("EXECD_BEARER")
             .env_remove("EXECD_BEARER_FILE");
-        if !as_root {
-            for (k, v) in env {
-                cmd.env(k, v);
-            }
+        for (k, v) in env {
+            cmd.env(k, v);
         }
         let mut child = cmd.spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -142,19 +138,20 @@ impl Execd {
         .unwrap();
         let pidfile = dir.path().join("execd.pid");
         let mut cmd = Command::new("sudo");
-        cmd.args(["-n", "sh", "-c", "echo $$ > \"$0\"; exec \"$@\""])
+        cmd.arg("-n");
+        preserve(&mut cmd, env);
+        cmd.args(["sh", "-c", "echo $$ > \"$0\"; exec \"$@\""])
             .arg(&pidfile)
-            .arg("env");
-        for (k, v) in env {
-            cmd.arg(format!("{k}={v}"));
-        }
-        cmd.arg(BIN)
+            .arg(BIN)
             .args(["--listen", ports::CHILD_LISTEN, "--root"])
             .arg(root.unwrap_or(dir.path()))
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(dir.path().join("execd.log")).unwrap());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         let mut child = cmd.spawn().unwrap();
         let log = dir.path().join("execd.log");
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -199,6 +196,16 @@ impl Execd {
     /// Everything execd has logged so far.
     pub fn log(&self) -> String {
         std::fs::read_to_string(self.dir.path().join("execd.log")).unwrap_or_default()
+    }
+}
+
+/// Pass `env` through `sudo` in its environment, not on a command line: `sudo` puts the command it
+/// runs in `SUDO_COMMAND`, which every process below it inherits, so a token given as an argument
+/// would sit in the environment of every command the server runs.
+fn preserve(sudo: &mut Command, env: &[(&str, &str)]) {
+    if !env.is_empty() {
+        let names: Vec<&str> = env.iter().map(|(k, _)| *k).collect();
+        sudo.arg(format!("--preserve-env={}", names.join(",")));
     }
 }
 

@@ -11,6 +11,7 @@ mod support;
 use std::os::unix::fs::MetadataExt as _;
 use std::process::{Command, Stdio};
 
+use beyond_ai_test_support::ports;
 use serde_json::{Value, json};
 use support::{Execd, http::post};
 
@@ -199,13 +200,16 @@ async fn a_streamed_command_and_a_job_do_not_see_the_bearer_either() {
 
 #[test]
 fn it_refuses_to_start_open_on_a_network() {
-    let (status, log) = Execd::run_to_exit(&["--listen", "0.0.0.0:0"], &[], false);
+    let (status, log) = Execd::run_to_exit(&["--listen", ports::CHILD_LISTEN_ALL], &[], false);
     assert!(!status.success(), "it started: {log}");
     assert!(log.contains("refusing to start"), "{log}");
     assert!(log.contains("--insecure-no-auth"), "{log}");
     // An empty bearer is no bearer.
-    let (status, log) =
-        Execd::run_to_exit(&["--listen", "0.0.0.0:0"], &[("EXECD_BEARER", "")], false);
+    let (status, log) = Execd::run_to_exit(
+        &["--listen", ports::CHILD_LISTEN_ALL],
+        &[("EXECD_BEARER", "")],
+        false,
+    );
     assert!(
         !status.success() && log.contains("refusing to start"),
         "{log}"
@@ -217,7 +221,7 @@ fn it_refuses_to_start_open_on_a_network() {
     let (status, log) = Execd::run_to_exit(
         &[
             "--listen",
-            "127.0.0.1:0",
+            ports::CHILD_LISTEN,
             "--bearer-file",
             empty.to_str().unwrap(),
         ],
@@ -231,15 +235,15 @@ fn it_refuses_to_start_open_on_a_network() {
 async fn it_starts_open_on_loopback_and_on_a_network_only_when_told_or_secured() {
     let bearer = token("it_starts_op");
     // Loopback, no bearer: allowed, and loud.
-    let open = Execd::start_on("127.0.0.1:0", &[], &[]);
+    let open = Execd::start_on(ports::CHILD_LISTEN, &[], &[]);
     assert!(open.log().contains("NO BEARER CONFIGURED"));
     // All interfaces with a bearer: allowed, and it answers 401 without it.
-    let secured = Execd::start_on("0.0.0.0:0", &[], &[("EXECD_BEARER", &bearer)]);
+    let secured = Execd::start_on(ports::CHILD_LISTEN_ALL, &[], &[("EXECD_BEARER", &bearer)]);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], secured.addr.port()));
     let req = json!({ "command": "true" });
     assert_eq!(post(addr, &[], &req).await.status, 401);
     // All interfaces with nothing, on purpose: allowed, and louder.
-    let deliberate = Execd::start_on("0.0.0.0:0", &["--insecure-no-auth"], &[]);
+    let deliberate = Execd::start_on(ports::CHILD_LISTEN_ALL, &["--insecure-no-auth"], &[]);
     assert!(deliberate.log().contains("NO BEARER CONFIGURED"));
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], deliberate.addr.port()));
     assert_eq!(post(addr, &[], &req).await.status, 200);
@@ -296,8 +300,11 @@ async fn run_as_refuses_root_when_execd_is_root() {
         eprintln!("SKIPPED: needs root");
         return;
     }
-    let (status, log) =
-        Execd::run_to_exit(&["--listen", "127.0.0.1:0", "--run-as", "root"], &[], true);
+    let (status, log) = Execd::run_to_exit(
+        &["--listen", ports::CHILD_LISTEN, "--run-as", "root"],
+        &[],
+        true,
+    );
     assert!(
         !status.success() && log.contains("execd's own uid"),
         "{log}"
@@ -371,17 +378,11 @@ async fn under_run_as_a_command_cannot_reach_execd() {
             .lines()
             .nth(1)
             .unwrap_or("");
-        assert!(
-            body.contains("Permission denied"),
-            "{section}: {body:?}\n{text}"
-        );
+        assert!(body.contains("Permission denied"), "{section}: {body:?}");
     }
-    // The walk saw the decoy (same uid as the test, readable by `nobody`? no: not readable either,
-    // so only the nobody-owned and world-readable environments are there), and nothing of execd.
-    assert!(
-        !text.contains("EXECD_"),
-        "execd's environ was readable:\n{text}"
-    );
+    // The walk reads what `nobody` may, which includes the commands of other tests (also `nobody`),
+    // so it is not searched for execd's variables: execd's own environ is shown unreadable above,
+    // and this test's bearer (unique) is checked absent from all of it.
     // The command ran in the root directory, as a user who could write there.
     let root = execd.dir.path().display().to_string();
     assert!(

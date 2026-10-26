@@ -164,6 +164,9 @@ What the spec and the conformance verifier assume, and what holds:
 ### What is deliberately not done
 
 - No rate limiting, lockout or TLS: put execd behind the network boundary that has them.
+- Only `EXECD_*` is scrubbed from a command's environment; the rest is inherited, as a sandbox expects. A launcher that puts the
+  bearer on a command line leaks it that way: `sudo` records the command it runs in `SUDO_COMMAND`, which every command below
+  it inherits. Hand the token over in a file, or in the environment, never as an argument.
 - No `no_new_privs`: it would break `sudo` in a sandbox image that wants it.
 - A kill is of a process group. A command that daemonizes out of its group (`setsid`) survives the kill of its job, a timeout and
   the shutdown sweep, with or without `--run-as`; a cgroup per job would close that, and execd does not own one.

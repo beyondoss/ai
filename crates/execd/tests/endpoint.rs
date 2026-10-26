@@ -35,13 +35,13 @@ async fn serve_refuses_no_bearer_on_a_network_listener() {
         o.insecure_no_auth = insecure;
         o
     };
-    let all = || tokio::net::TcpListener::bind("0.0.0.0:0");
-    let refused = execd::serve(all().await.unwrap(), open(None, false))
+    let all = ports::tokio_listener_all;
+    let refused = execd::serve(all().await, open(None, false))
         .err()
         .expect("served open on all interfaces");
     assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
     for (bearer, insecure) in [(Some("tok"), false), (None, true)] {
-        execd::serve(all().await.unwrap(), open(bearer, insecure))
+        execd::serve(all().await, open(bearer, insecure))
             .unwrap()
             .shutdown()
             .await;
