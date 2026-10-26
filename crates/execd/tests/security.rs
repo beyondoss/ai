@@ -636,3 +636,89 @@ async fn notify_tokens_and_callback_urls_never_reach_the_log() {
         assert!(!log.contains(secret.as_str()), "a secret is in the log");
     }
 }
+
+/// Under `--run-as`, the jobs directory is execd's: a command (another user) can neither list it
+/// nor read a chunk file of a job's retained output, while execd itself still reads the output back.
+#[tokio::test]
+async fn under_run_as_a_command_cannot_list_or_read_the_jobs_dir() {
+    let base = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        base.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let Some(execd) = Execd::start_as_root(
+        &[
+            "--run-as",
+            "nobody",
+            "--jobs-dir",
+            base.path().to_str().unwrap(),
+        ],
+        &[],
+    ) else {
+        return;
+    };
+    let addr = std::net::SocketAddr::V4(execd.addr);
+    // A job that writes three chunks.
+    let started = post(
+        addr,
+        &[],
+        &json!({ "command": "head", "args": ["-c", "200000", "/dev/zero"],
+                 "job": { "op": "start", "scope": "s", "id": "j", "hold": false } }),
+    )
+    .await;
+    assert_eq!(started.status, 200);
+    let mut ended = json!(null);
+    for _ in 0..200 {
+        let r = post(
+            addr,
+            &[],
+            &json!({ "command": "true",
+                     "job": { "op": "read", "scope": "s", "id": "j", "offset": 0, "max": 10 } }),
+        )
+        .await
+        .json();
+        if r["state"] == "ended" {
+            ended = r;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(ended["end"], 200_000, "the job did not finish: {ended}");
+    // Chunk files exist (root sees them) ...
+    let listing = String::from_utf8(
+        Command::new("sudo")
+            .args(["-n", "find", base.path().to_str().unwrap(), "-type", "f"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(listing.lines().count() >= 3, "no chunk files:\n{listing}");
+    // ... and the command, as nobody, can reach none of it.
+    let script = format!(
+        "for d in {b}/execd-jobs-*; do echo \"dir $d\"; ls -A $d 2>&1; \
+         for f in $d/*/*; do cat $f 2>&1 | head -c 20; done; done; \
+         ls -A {b}/execd-jobs-*/0 2>&1; cat {b}/execd-jobs-*/0/0000000000 2>&1 | head -c 20",
+        b = base.path().display()
+    );
+    let answer = sh(&execd, None, &script).await;
+    let text = out(&answer);
+    println!("{text}");
+    assert!(text.contains("Permission denied"), "{text}");
+    assert!(
+        !text.contains("0000000000\n") && !text.contains('\0'),
+        "a chunk name or its bytes were visible:\n{text}"
+    );
+    // execd itself still reads the output back.
+    let read = post(
+        addr,
+        &[],
+        &json!({ "command": "true",
+                 "job": { "op": "read", "scope": "s", "id": "j", "offset": 70_000, "max": 100 } }),
+    )
+    .await
+    .json();
+    assert_eq!(read["offset"], 70_000);
+    assert!(!read["data"].as_str().unwrap().is_empty(), "{read}");
+}
