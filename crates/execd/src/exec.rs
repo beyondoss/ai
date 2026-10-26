@@ -44,7 +44,7 @@ pub(crate) const PIPE_GRACE: Duration = Duration::from_millis(100);
 /// piped output. Nothing of execd's own secrets reaches it: every `EXECD_*` variable is removed
 /// (the bearer must not be in a command's environment). Under `EXECD_RUN_AS` the switch helper becomes
 /// the command, as the target user.
-pub(crate) fn command_for(ctx: &Ctx, req: &Request) -> tokio::process::Command {
+pub(crate) fn command_for(ctx: &Ctx, req: &Request) -> std::process::Command {
     let cwd = req
         .cwd
         .as_deref()
@@ -54,14 +54,12 @@ pub(crate) fn command_for(ctx: &Ctx, req: &Request) -> tokio::process::Command {
         // decide whether it may.
         Some(who) => who.wrap(&req.command, &req.args, &cwd),
         None => {
-            let mut cmd = tokio::process::Command::new(&req.command);
+            let mut cmd = std::process::Command::new(&req.command);
             cmd.args(&req.args).current_dir(&cwd);
             cmd
         }
     };
-    cmd.stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     for name in &ctx.scrub {
         cmd.env_remove(name);
     }
@@ -164,7 +162,7 @@ pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
     // Killed on every way out, including this future being dropped when the client leaves (v1.1: a
     // SHOULD once it has answered; a MUST that nothing is left behind an abandoned request).
     let _slot = GroupSlot::new(ctx, proc.pgid);
-    let feed = proc.child.stdin.take().zip(stdin);
+    let feed = proc.stdin.take().zip(stdin);
     let feeder = tokio::spawn(async move {
         if let Some((mut pipe, bytes)) = feed {
             let _ = pipe.write_all(&bytes).await;
@@ -175,16 +173,14 @@ pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
     let out = Arc::new(std::sync::Mutex::new(Vec::new()));
     let err = Arc::new(std::sync::Mutex::new(Vec::new()));
     let readers = [
-        proc.child
-            .stdout
+        proc.stdout
             .take()
             .map(|p| tokio::spawn(capture(p, out.clone(), budget.clone(), dropped.clone()))),
-        proc.child
-            .stderr
+        proc.stderr
             .take()
             .map(|p| tokio::spawn(capture(p, err.clone(), budget.clone(), dropped.clone()))),
     ];
-    let status = proc.child.wait().await;
+    let status = proc.wait().await;
     // The command is done. Pipes a descendant holds open are given the grace, then let go.
     let mut abort = Vec::new();
     for r in readers.into_iter().flatten() {
@@ -393,11 +389,11 @@ async fn run_stream(ctx: Arc<Ctx>, req: Request, out: mpsc::Sender<Bytes>) {
     let (tx, mut rx) = mpsc::channel::<Bytes>(1);
     let mut cap = 0;
     let mut readers = Vec::new();
-    if let Some(p) = proc.child.stdout.take() {
+    if let Some(p) = proc.stdout.take() {
         cap += proc::pipe_capacity(&p);
         readers.push(pump(p, "stdout", tx.clone()));
     }
-    if let Some(p) = proc.child.stderr.take() {
+    if let Some(p) = proc.stderr.take() {
         cap += proc::pipe_capacity(&p);
         readers.push(pump(p, "stderr", tx.clone()));
     }
@@ -440,7 +436,7 @@ async fn run_stream(ctx: Arc<Ctx>, req: Request, out: mpsc::Sender<Bytes>) {
     // empty already, and a dropped slot kills only a group that still exists.
     if !matches!(end, StreamEnd::Finished) {
         proc::kill_group(pgid);
-        let _ = proc.child.wait().await;
+        let _ = proc.wait().await;
     }
     drop(slot);
     if let Some(o) = &ctx.opts.observer {
@@ -463,7 +459,7 @@ async fn timed_out(
     readers: &mut [tokio::task::JoinHandle<()>],
 ) -> StreamEnd {
     proc::kill_group(proc.pgid);
-    let _ = proc.child.wait().await;
+    let _ = proc.wait().await;
     for r in readers.iter() {
         r.abort();
     }
@@ -494,7 +490,7 @@ async fn drive(
                 Some(f) => sink.put(f).await?,
                 None => readers_done = true,
             },
-            st = proc.child.wait() => match st {
+            st = proc.wait() => match st {
                 Ok(s) => break s,
                 // The child cannot be waited for: nothing more can be said about it.
                 Err(_) => return Err(Cut::Gone),
@@ -503,7 +499,7 @@ async fn drive(
     };
     let pgid = proc.pgid;
     let mut exits = proc::ChildEvents::new();
-    if proc::live_members_async(pgid).await.is_empty() {
+    if proc::group_gone(pgid, false).await {
         return Ok(status);
     }
     // The shell exited and its group lives on. What it printed goes first (the pipes are read
@@ -522,8 +518,8 @@ async fn drive(
                 Some(f) => sink.put(f).await?,
                 None => readers_done = true,
             },
-            () = exits.next() => {
-                if proc::live_members_async(pgid).await.is_empty() {
+            wake = exits.next() => {
+                if proc::group_gone(pgid, wake == proc::Wake::Tick).await {
                     return Ok(status);
                 }
             }

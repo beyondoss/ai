@@ -193,8 +193,6 @@ async fn run(cli: Config, inherited: Option<String>) -> Result<(), Box<dyn std::
     if let Err(e) = execd::become_subreaper() {
         execd::log_warn!("cannot become a subreaper; orphans go to the host's init: {e}");
     }
-    let reaper_stop = tokio_util::sync::CancellationToken::new();
-    tokio::spawn(execd::reap_orphans(reaper_stop.clone()));
 
     let mut opts = execd::Options::new(root);
     opts.home = home;
@@ -236,7 +234,6 @@ async fn run(cli: Config, inherited: Option<String>) -> Result<(), Box<dyn std::
 
     wait_for_signal().await;
     let killed = server.shutdown().await;
-    reaper_stop.cancel();
     execd::log_info!("execd stopped killed_groups={killed}");
     Ok(())
 }

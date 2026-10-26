@@ -39,6 +39,8 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 # the workspace forbids `unsafe_code`.
 mimalloc = { version = "0.1.52", default-features = false, optional = true }
 nix = { version = "0.31", default-features = false, features = ["fs", "net", "process", "signal", "socket", "user"] }
+# Where the OS trust store lives (honours SSL_CERT_FILE and SSL_CERT_DIR), to say when it is empty.
+openssl-probe = "0.1"
 # Job-end callbacks over HTTPS that verify the server and never follow a redirect: rustls with
 # `ring` and the OS trust store, as the agent's own client. The provider is installed before the
 # client is built (`rustls-no-provider` has no default).

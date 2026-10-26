@@ -227,12 +227,111 @@ async fn run_attempt(
     }
 }
 
+/// PEM certificates in `text`: (well formed, malformed). A certificate is well formed when its
+/// body is base64 that decodes to a DER sequence.
+fn count_pem(text: &str) -> (usize, usize) {
+    use base64::Engine as _;
+    let (mut good, mut bad) = (0, 0);
+    let mut rest = text;
+    while let Some(start) = rest.find("-----BEGIN CERTIFICATE-----") {
+        let body = &rest[start + 27..];
+        let Some(end) = body.find("-----END CERTIFICATE-----") else {
+            bad += 1;
+            break;
+        };
+        let b64: String = body[..end].split_whitespace().collect();
+        match base64::engine::general_purpose::STANDARD.decode(b64) {
+            Ok(der) if der.first() == Some(&0x30) => good += 1,
+            _ => bad += 1,
+        }
+        rest = &body[end + 25..];
+    }
+    (good, bad)
+}
+
+/// What is wrong with the trust store that https callbacks verify against, if anything. Where
+/// `SSL_CERT_FILE` or `SSL_CERT_DIR` is set it is the only source, as it is for the verifier;
+/// otherwise the system's bundle and directory. `None` when at least one certificate loads, none
+/// is malformed and nothing named is unreadable. Read once, when the callback client is first
+/// built, so a sandbox that never sends a callback never pays for it.
+fn trust_store_problem() -> Option<String> {
+    use std::path::PathBuf;
+    let env = |k: &str| {
+        std::env::var_os(k)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    let (file, dir, names) = match (env("SSL_CERT_FILE"), env("SSL_CERT_DIR")) {
+        (None, None) => {
+            let p = openssl_probe::probe();
+            (
+                p.cert_file,
+                p.cert_dir,
+                ["the system bundle", "the system directory"],
+            )
+        }
+        (f, d) => (f, d, ["SSL_CERT_FILE", "SSL_CERT_DIR"]),
+    };
+    let (mut good, mut bad) = (0, 0);
+    let mut notes = Vec::new();
+    let mut sources = Vec::new();
+    let mut tally = |text: &str| {
+        let (g, b) = count_pem(text);
+        good += g;
+        bad += b;
+    };
+    if let Some(f) = &file {
+        sources.push(format!("{}={}", names[0], f.display()));
+        match std::fs::read_to_string(f) {
+            Ok(t) => tally(&t),
+            Err(e) => notes.push(format!("{}: {e}", f.display())),
+        }
+    }
+    if let Some(d) = &dir {
+        sources.push(format!("{}={}", names[1], d.display()));
+        match std::fs::read_dir(d) {
+            Ok(entries) => {
+                for e in entries.flatten().take(5000) {
+                    if let Ok(t) = std::fs::read_to_string(e.path()) {
+                        tally(&t);
+                    }
+                }
+            }
+            Err(e) => notes.push(format!("{}: {e}", d.display())),
+        }
+    }
+    if good > 0 && bad == 0 && notes.is_empty() {
+        return None;
+    }
+    let mut why = Vec::new();
+    if good == 0 {
+        why.push("no certificates load".to_string());
+    }
+    if bad > 0 {
+        why.push(format!("{bad} certificate(s) do not parse"));
+    }
+    why.extend(notes);
+    let from = if sources.is_empty() {
+        "no trust store found".to_string()
+    } else {
+        sources.join(", ")
+    };
+    Some(format!("{} (from {from})", why.join("; ")))
+}
+
 /// One attempt: one `POST`, no redirects, the server verified, 30 s at most. Its status, or why not.
 async fn attempt(ctx: &Ctx, target: &NotifyTarget, key: &Key) -> Result<u16, String> {
     let client = ctx
         .client
         .get_or_init(|| async {
             let _ = rustls::crypto::ring::default_provider().install_default();
+            if let Some(problem) = trust_store_problem() {
+                tracing::warn!(
+                    %problem,
+                    "https callbacks may fail to verify their server: the trust store has a \
+                     problem; set SSL_CERT_FILE or SSL_CERT_DIR to a valid bundle"
+                );
+            }
             reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(ATTEMPT_TIMEOUT)
@@ -266,4 +365,26 @@ async fn attempt(ctx: &Ctx, target: &NotifyTarget, key: &Key) -> Result<u16, Str
             }
             msg
         })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod trust_tests {
+    use super::count_pem;
+
+    const GOOD: &str = "-----BEGIN CERTIFICATE-----\nMAMCAQA=\n-----END CERTIFICATE-----\n";
+
+    #[test]
+    fn certificates_are_counted_and_malformed_ones_are_told_apart() {
+        assert_eq!(count_pem(""), (0, 0));
+        assert_eq!(count_pem("not a pem"), (0, 0));
+        assert_eq!(count_pem(GOOD), (1, 0));
+        assert_eq!(count_pem(&GOOD.repeat(3)), (3, 0));
+        let bad_b64 = "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n";
+        assert_eq!(count_pem(&format!("{GOOD}{bad_b64}")), (1, 1));
+        // Valid base64 that is not a DER sequence, and a block that never ends.
+        let not_der = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        assert_eq!(count_pem(not_der), (0, 1));
+        assert_eq!(count_pem("-----BEGIN CERTIFICATE-----\nMAMC"), (0, 1));
+    }
 }

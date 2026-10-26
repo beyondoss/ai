@@ -736,3 +736,58 @@ async fn under_run_as_a_command_cannot_list_or_read_the_jobs_dir() {
     assert_eq!(read["offset"], 70_000);
     assert!(!read["data"].as_str().unwrap().is_empty(), "{read}");
 }
+
+/// An invalid `SSL_CERT_FILE` used to make every https callback fail with nothing in execd's log. The
+/// first callback now logs a warning that names where the trust store came from.
+#[tokio::test]
+async fn a_broken_trust_store_is_warned_about_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let junk = dir.path().join("ca.pem");
+    std::fs::write(
+        &junk,
+        "-----BEGIN CERTIFICATE-----\n!!!not base64!!!\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+    for (case, file) in [
+        ("malformed", junk.to_str().unwrap().to_string()),
+        ("missing", "/nonexistent/ca.pem".to_string()),
+    ] {
+        let bearer = token(&format!("trust_{case}"));
+        let execd = Execd::start(
+            &["--kept-jobs-survive-idle"],
+            &[("EXECD_BEARER", &bearer), ("SSL_CERT_FILE", &file)],
+        );
+        let addr = std::net::SocketAddr::V4(execd.addr);
+        let auth = format!("Bearer {bearer}");
+        let h = [("Authorization", auth.as_str())];
+        let started = post(
+            addr,
+            &h,
+            &json!({ "command": "sh", "args": ["-c", "sleep 0.1"],
+                     "job": { "op": "start", "scope": "sc", "id": "j", "hold": false } }),
+        )
+        .await;
+        assert_eq!(started.status, 200);
+        let kept = post(
+            addr,
+            &h,
+            &json!({ "command": "true",
+                     "job": { "op": "keep", "scope": "sc", "id": "j", "num": 1, "kind": "background",
+                              "notify": { "url": "https://127.0.0.1:1/hook", "token": "t" } } }),
+        )
+        .await;
+        assert_eq!(kept.status, 200);
+        let mut log = String::new();
+        for _ in 0..100 {
+            log = execd.log();
+            if log.contains("trust store") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            log.contains("trust store") && log.contains("SSL_CERT_FILE"),
+            "{case}: no warning naming SSL_CERT_FILE:\n{log}"
+        );
+    }
+}

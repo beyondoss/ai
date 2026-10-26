@@ -32,7 +32,9 @@ def main():
     ap.add_argument("--run-as", default="")
     ap.add_argument("--stream", action="store_true")
     ap.add_argument("--log-level", default="off")
+    ap.add_argument("--sleepers", type=int, default=0, help="idle processes to add to /proc")
     a = ap.parse_args()
+    idle = [subprocess.Popen(["sleep", "3600"]) for _ in range(a.sleepers)]
     port = free_port()
     root = tempfile.mkdtemp()
     os.chmod(root, 0o777)
@@ -104,6 +106,9 @@ def main():
     finally:
         subprocess.run(["sudo", "-n", "kill", str(p.pid)] if a.run_as else ["kill", str(p.pid)])
         p.wait()
+        for c in idle:
+            c.kill()
+            c.wait()
 
 
 if __name__ == "__main__":

@@ -1,76 +1,146 @@
-//! Processes: spawning into their own group, group liveness and kills by syscall, and reaping the
-//! orphans a PID 1 inherits.
+//! Processes: spawning into their own group, reaping every child ourselves, group liveness and kills
+//! by syscall.
 //!
-//! Everything here is a syscall or a read of `/proc`; nothing spawns `kill`.
+//! Everything here is a syscall; nothing spawns `kill`, and nothing reads `/proc` except the one
+//! scan that decides a group's emptiness on the slow tick (see [`group_gone`]).
 //!
-//! **Bounds.** [`OWNED`] holds one pid per child execd spawned and has not yet finished with: freed
-//! when its [`Proc`] drops. N concurrent cold callers means N entries, 4 bytes each, plus the
-//! children themselves, which the OS bounds (`pids.max`, `RLIMIT_NPROC`). [`Groups`] is the same
-//! idea per server, for the shutdown sweep.
+//! **Reaping.** execd reaps its children itself, like an init: on each `SIGCHLD` the reaper task
+//! ([`start_reaper`]) calls `waitpid` until nothing is left to collect. tokio's own child
+//! handling is never used, so nothing else reaps behind it: a command is spawned with std's
+//! `Command` (std never waits for a child, not even on drop), its pipes are handed to tokio as
+//! plain async descriptors, and its exit status reaches the one waiting for it through a oneshot
+//! channel the reaper fills. Where execd is the subreaper (the binary) the reaper takes
+//! `waitpid(-1)`, so an orphaned grandchild is collected the moment it exits and no zombie
+//! outlives the instant between its death and the next pass; elsewhere (a host that embeds
+//! `execd::serve` and owns other children) it collects only the pids execd spawned, so it never
+//! steals another's exit status. Either way the cost is a few `waitpid` calls per pass, whatever
+//! the host's process count, and no pass reads `/proc`.
+//!
+//! **Bounds.** [`CHILDREN`] holds one entry per child execd spawned and has not yet seen exit:
+//! freed by the reaper when the child is collected. N concurrent cold callers means N entries,
+//! plus the children themselves, which the OS bounds (`pids.max`, `RLIMIT_NPROC`). [`Groups`] is
+//! the same idea per server, for the shutdown sweep.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::os::fd::AsFd;
+use std::os::unix::process::ExitStatusExt as _;
+use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
+use tokio::sync::{oneshot, watch};
 
-/// The pids of children execd spawned and still awaits. The orphan reaper must leave these alone:
-/// reaping one would steal the exit status its owner is about to ask for.
-static OWNED: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
+/// The children execd spawned and has not yet collected, each with the channel its exit status
+/// goes down.
+static CHILDREN: Mutex<Option<HashMap<u32, oneshot::Sender<ExitStatus>>>> = Mutex::new(None);
 
-/// Held shared across every spawn, from before the child exists until it is in [`OWNED`]; held
-/// exclusively by the reaper around the check and reap of one zombie. Spawns do not exclude each
-/// other; the reaper excludes them all, and only for as long as one `waitpid`.
+/// Held shared across every spawn, from before the child exists until it is in [`CHILDREN`]; held
+/// exclusively by the reaper for the whole of one pass. Spawns do not exclude each other; the pass
+/// excludes them all, and lasts only as long as its `waitpid` calls.
 ///
-/// **Why a child is never reaped between its creation and its registration.** The reaper takes
-/// this lock exclusively before it asks whether a pid is owned, and a spawn holds it shared from
-/// before it creates the child to after the insert. So when the reaper holds it, every spawn is
-/// either entirely before it (its child is in `OWNED`, and is skipped) or entirely after it (no
-/// such child exists yet). There is no moment at which a new child is both visible to the reaper
-/// and unregistered.
+/// **Why a child's status is never lost.** The reaper collects a pid only while it holds this lock
+/// exclusively, and looks the pid up in [`CHILDREN`] before it lets go. A spawn holds the lock
+/// shared from before it creates the child to after the insert. So at any pass, every spawn is
+/// entirely before it (its child is in `CHILDREN`, and its status goes to its waiter) or entirely
+/// after it (no such child exists yet, so the pass cannot collect it). The lookup also happens
+/// inside the pass because a pid is reused as soon as it is collected: a later spawn may register
+/// the same number, and must not be handed this status.
 static SPAWNING: RwLock<()> = RwLock::new(());
 
-/// Whether this process is its descendants' subreaper, so every orphaned group member is one of its
-/// own descendants (see [`live_members`]). Set by [`become_subreaper`].
+/// Whether this process is its descendants' subreaper, so every orphaned group member becomes its
+/// own child (see [`group_gone`]). Set by [`become_subreaper`].
 static SUBREAPER: AtomicBool = AtomicBool::new(false);
+
+fn children() -> std::sync::MutexGuard<'static, Option<HashMap<u32, oneshot::Sender<ExitStatus>>>> {
+    let mut g = locked(&CHILDREN);
+    g.get_or_insert_with(HashMap::new);
+    g
+}
 
 /// A spawned command, leading a process group of its own.
 pub(crate) struct Proc {
-    pub child: tokio::process::Child,
+    pub stdin: Option<tokio::process::ChildStdin>,
+    pub stdout: Option<tokio::process::ChildStdout>,
+    pub stderr: Option<tokio::process::ChildStderr>,
     /// The group's id, which is also the leader's pid.
     pub pgid: i32,
-    pid: u32,
+    exit: oneshot::Receiver<ExitStatus>,
+    /// What `wait` answered, kept so that it can answer again: a oneshot receiver must not be
+    /// polled after it completes.
+    done: Option<Result<ExitStatus, ()>>,
 }
 
-impl Drop for Proc {
-    fn drop(&mut self) {
-        locked(&OWNED).remove(&self.pid);
+impl Proc {
+    /// The command's exit status, once the reaper has collected it. Cancel-safe, and callable again
+    /// after it has answered.
+    pub async fn wait(&mut self) -> io::Result<ExitStatus> {
+        let answer = match self.done {
+            Some(a) => a,
+            None => {
+                let a = (&mut self.exit).await.map_err(|_| ());
+                self.done = Some(a);
+                a
+            }
+        };
+        answer.map_err(|()| io::Error::other("the command's exit status was lost"))
     }
 }
 
 /// Spawn `cmd` as the leader of a new process group.
 ///
-/// [`SPAWNING`] is held shared across the spawn, so the reaper can never see the child as an
-/// unowned zombie before it is registered, and concurrent spawns do not wait for each other.
-pub(crate) fn spawn(cmd: &mut tokio::process::Command) -> io::Result<Proc> {
+/// [`SPAWNING`] is held shared across the spawn, so the reaper cannot collect the child before it
+/// is registered, and concurrent spawns do not wait for each other.
+pub(crate) fn spawn(cmd: &mut std::process::Command) -> io::Result<Proc> {
+    use std::os::unix::process::CommandExt as _;
     cmd.process_group(0);
     // Poison is recovered, as for every lock here: a panic elsewhere must not stop a spawn.
     let _spawning = SPAWNING
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let child = cmd.spawn()?;
-    let pid = child.id().unwrap_or(0);
-    locked(&OWNED).insert(pid);
-    Ok(Proc {
-        child,
-        pgid: i32::try_from(pid).unwrap_or(0),
-        pid,
-    })
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    let (tx, exit) = oneshot::channel();
+    children().as_mut().map(|m| m.insert(pid, tx));
+    let pipes = (|| -> io::Result<_> {
+        Ok((
+            child
+                .stdin
+                .take()
+                .map(tokio::process::ChildStdin::from_std)
+                .transpose()?,
+            child
+                .stdout
+                .take()
+                .map(tokio::process::ChildStdout::from_std)
+                .transpose()?,
+            child
+                .stderr
+                .take()
+                .map(tokio::process::ChildStderr::from_std)
+                .transpose()?,
+        ))
+    })();
+    match pipes {
+        Ok((stdin, stdout, stderr)) => Ok(Proc {
+            stdin,
+            stdout,
+            stderr,
+            pgid: i32::try_from(pid).unwrap_or(0),
+            exit,
+            done: None,
+        }),
+        Err(e) => {
+            // Registered, so the reaper collects it once it is dead.
+            let _ = child.kill();
+            Err(e)
+        }
+    }
 }
 
 /// SIGKILL every member of group `pgid`. A group that is already gone is not an error.
@@ -89,71 +159,17 @@ pub(crate) fn group_exists(pgid: i32) -> bool {
     pgid > 1 && !matches!(killpg(Pid::from_raw(pgid), None), Err(Errno::ESRCH))
 }
 
-/// The live (non-zombie) members of group `pgid`. A zombie never counts: a sandbox whose pid 1 is
-/// not an init never reaps what it inherits, and the spec says such a group is empty.
-///
-/// The syscall answers the common case, an empty group, without touching `/proc`. For a group that
-/// exists, the members are found in execd's own process tree: as the subreaper, every orphan of a
-/// command is a descendant of execd, and the kernel lists a process's children
-/// (`/proc/<pid>/task/*/children`), so the cost follows the size of that tree and not the number of
-/// processes on the host. Without a subreaper, or on a kernel that does not list children, the
-/// whole of `/proc` is scanned. So is it when the tree shows no live member of a group that still
-/// exists: a member whose parent exited during the walk moves to execd unseen, and "empty" ends a
-/// stream, so that answer is confirmed. It is reached only while a zombie holds the group.
+/// The live (non-zombie) members of group `pgid`, by reading `/proc`: the pids, for an operation
+/// that reports them. A zombie never counts: the spec says a group of zombies is empty.
 pub(crate) fn live_members(pgid: i32) -> Vec<u32> {
     if !group_exists(pgid) {
         return Vec::new();
-    }
-    if SUBREAPER.load(Ordering::Relaxed)
-        && let Some(found) = live_members_in_tree(pgid)
-        && !found.is_empty()
-    {
-        return found;
     }
     live_members_scan(pgid)
 }
 
 fn is_live(state: char) -> bool {
     state != 'Z' && state != 'X'
-}
-
-/// The children of `pid` (`"self"` for this process), from every thread's `children` file; `None`
-/// if the kernel has no such file.
-fn children_of(pid: &str) -> Option<Vec<u32>> {
-    let mut out = Vec::new();
-    for t in std::fs::read_dir(format!("/proc/{pid}/task"))
-        .ok()?
-        .flatten()
-    {
-        match std::fs::read_to_string(t.path().join("children")) {
-            Ok(text) => out.extend(
-                text.split_whitespace()
-                    .filter_map(|p| p.parse::<u32>().ok()),
-            ),
-            // The file is missing from a kernel without it, and so is a thread that just exited.
-            Err(e) if e.kind() == io::ErrorKind::NotFound && t.path().exists() => return None,
-            Err(_) => {}
-        }
-    }
-    Some(out)
-}
-
-fn live_members_in_tree(pgid: i32) -> Option<Vec<u32>> {
-    let mut out = Vec::new();
-    let mut todo = children_of("self")?;
-    while let Some(pid) = todo.pop() {
-        if let Some((state, _, pg)) = stat(pid)
-            && is_live(state)
-            && pg == pgid
-        {
-            out.push(pid);
-        }
-        // A process that is gone has no children to find.
-        if let Some(kids) = children_of(&pid.to_string()) {
-            todo.extend(kids);
-        }
-    }
-    Some(out)
 }
 
 /// [`live_members`] by reading every process in `/proc`.
@@ -176,35 +192,42 @@ fn live_members_scan(pgid: i32) -> Vec<u32> {
     out
 }
 
-/// Whether group `pgid` has no live member.
-pub(crate) fn group_empty(pgid: i32) -> bool {
-    live_members(pgid).is_empty()
+/// Whether group `pgid` has no live member, as cheaply as is right.
+///
+/// `kill(-pgid, 0)` answers a gone group at once. A group that exists is alive, unless every
+/// member is a zombie. Where execd is the subreaper it collects every zombie at once, so a zombie
+/// can outlast an instant only while its parent is alive; if that parent is in the group the
+/// group is alive, and the rare case left is a parent outside it. That case, and any host without
+/// the subreaper (whose orphans go to init, and may sit as zombies there for good), is decided by
+/// reading `/proc`, which `precise` asks for: it is asked on the slow tick, never per `SIGCHLD`.
+pub(crate) async fn group_gone(pgid: i32, precise: bool) -> bool {
+    if !group_exists(pgid) {
+        return true;
+    }
+    if SUBREAPER.load(Ordering::Relaxed) && !precise {
+        return false;
+    }
+    tokio::task::spawn_blocking(move || live_members_scan(pgid).is_empty())
+        .await
+        .unwrap_or(false)
 }
 
-/// Whether the kernel lists a process's children (`CONFIG_PROC_CHILDREN`), probed once. The reads
-/// that use them take microseconds, so they run on the calling thread; a full scan of `/proc`
-/// does not, and goes to the blocking pool.
-fn has_children_files() -> bool {
-    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PROBE.get_or_init(|| children_of("self").is_some())
-}
-
-/// [`live_members`] without holding up the runtime: the walk of execd's own tree runs inline, and
-/// only a scan of `/proc` is sent to the blocking pool.
+/// [`live_members`] without holding up the runtime for the `/proc` scan.
 pub(crate) async fn live_members_async(pgid: i32) -> Vec<u32> {
     if !group_exists(pgid) {
         return Vec::new();
     }
-    if SUBREAPER.load(Ordering::Relaxed)
-        && has_children_files()
-        && let Some(found) = live_members_in_tree(pgid)
-        && !found.is_empty()
-    {
-        return found;
-    }
     tokio::task::spawn_blocking(move || live_members(pgid))
         .await
         .unwrap_or_default()
+}
+
+/// Whether group `pgid` has no live member, for a caller that is already off the runtime.
+pub(crate) fn group_empty(pgid: i32) -> bool {
+    if !group_exists(pgid) {
+        return true;
+    }
+    !SUBREAPER.load(Ordering::Relaxed) && live_members_scan(pgid).is_empty()
 }
 
 /// `(state, ppid, pgrp)` of `pid`, from `/proc/<pid>/stat`.
@@ -282,111 +305,142 @@ impl Groups {
 }
 
 /// Make this process the subreaper of its descendants: a process that loses its parent is adopted
-/// by execd rather than by the host's init, so [`reap_orphans`] can reap it. Meant for the binary;
-/// an embedding test harness has no business changing its process's reaping.
+/// by execd rather than by the host's init, and the reaper collects it. Meant for the binary; an
+/// embedding test harness has no business changing its process's reaping.
 pub fn become_subreaper() -> io::Result<()> {
     nix::sys::prctl::set_child_subreaper(true).map_err(io::Error::from)?;
     SUBREAPER.store(true, Ordering::Relaxed);
     Ok(())
 }
 
-/// Reap every zombie child of this process that execd did not spawn itself, on each `SIGCHLD`.
-///
-/// A PID 1 (a container's, E2B's) inherits every orphan of every command, and unless it reaps them
-/// they sit as zombies for the life of the sandbox. This waits on exactly those pids: the ones
-/// execd spawned are skipped (their owner is about to collect the exit status, and a bulk
-/// `waitpid(-1)` here would steal it), and a zombie is found by its parent being this process.
-///
-/// Bounded: one scan of `/proc` per wakeup, and `SIGCHLD`s that arrive during a scan coalesce into
-/// the next wakeup. Runs until `stop` is cancelled.
-pub async fn reap_orphans(stop: tokio_util::sync::CancellationToken) {
-    use tokio::signal::unix::{SignalKind, signal};
-    let Ok(mut sigchld) = signal(SignalKind::child()) else {
-        crate::log_warn!("cannot listen for SIGCHLD; orphans will not be reaped");
-        return;
-    };
-    loop {
-        if has_children_files() {
-            reap_once();
-        } else {
-            let _ = tokio::task::spawn_blocking(reap_once).await;
-        }
-        tokio::select! {
-            _ = sigchld.recv() => {}
-            () = stop.cancelled() => return,
-        }
-    }
+/// Tells waiters that a pass collected something. A counter, so a waiter that subscribed before the
+/// pass sees it whenever it next looks.
+fn reaped() -> &'static watch::Sender<u64> {
+    static TX: OnceLock<watch::Sender<u64>> = OnceLock::new();
+    TX.get_or_init(|| watch::channel(0).0)
 }
 
-/// Child exits, as a wake-up for a task that waits for a process group to empty.
-///
-/// When the last member of a group exits, its parent is nearly always execd (the subreaper adopts
-/// every orphan) or the member's own parent in the group, and execd gets `SIGCHLD` for the first
-/// and, a moment later, for the second. So a waiter sleeps until a `SIGCHLD` and re-checks, with no
-/// timer running. The one case no signal covers is a last member whose live parent is neither
-/// execd nor in the group (a process that left the group and still has a child in it); for that
-/// there is a slow fallback, [`GROUP_FALLBACK`], which only decides how late the end of such a
-/// group is noticed. Create one before the first check, so an exit that races the check is kept.
-pub(crate) struct ChildEvents(Option<tokio::signal::unix::Signal>);
+/// One pass of the reaper: collect what has exited and hand each status to its waiter. How many
+/// children it collected.
+fn sweep() -> usize {
+    let mut delivered = Vec::new();
+    let mut n = 0;
+    {
+        let _exclusive = SPAWNING
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut table = children();
+        let table = table.as_mut();
+        let Some(table) = table else { return 0 };
+        let owned: Vec<u32> = table.keys().copied().collect();
+        let mut take = |status: WaitStatus| {
+            let (pid, st) = match status {
+                WaitStatus::Exited(pid, code) => (pid, ExitStatus::from_raw((code & 0xff) << 8)),
+                WaitStatus::Signaled(pid, sig, core) => (
+                    pid,
+                    ExitStatus::from_raw(sig as i32 | if core { 0x80 } else { 0 }),
+                ),
+                _ => return false,
+            };
+            n += 1;
+            if let Some(tx) = u32::try_from(pid.as_raw())
+                .ok()
+                .and_then(|p| table.remove(&p))
+            {
+                delivered.push((tx, st));
+            }
+            true
+        };
+        if SUBREAPER.load(Ordering::Relaxed) {
+            // Every child, execd's commands and the orphans it adopted alike.
+            loop {
+                match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
+                    Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => break,
+                    Err(Errno::EINTR) => {}
+                    Ok(st) => {
+                        take(st);
+                    }
+                    Err(_) => break,
+                }
+            }
+        } else {
+            // Only what execd spawned: the host may own other children.
+            for pid in owned {
+                if let Ok(st) = waitpid(
+                    Pid::from_raw(i32::try_from(pid).unwrap_or(0)),
+                    Some(WaitPidFlag::WNOHANG),
+                ) {
+                    take(st);
+                }
+            }
+        }
+    }
+    for (tx, st) in delivered {
+        let _ = tx.send(st);
+    }
+    if n > 0 {
+        reaped().send_modify(|v| *v += 1);
+    }
+    n
+}
 
-/// How long a waiter sleeps without a `SIGCHLD` before it looks anyway: as long as a heartbeat, the
-/// delay the protocol already tolerates for a silent stream, and rare enough to cost nothing.
+/// Start the reaper: one pass now and one after every `SIGCHLD`, until `stop`. The signal is
+/// registered before this returns, so no exit that follows it is missed; signals that arrive during
+/// a pass coalesce into the next one.
+pub(crate) fn start_reaper(
+    stop: tokio_util::sync::CancellationToken,
+) -> io::Result<tokio::task::JoinHandle<()>> {
+    let mut sigchld = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?;
+    Ok(tokio::spawn(async move {
+        loop {
+            sweep();
+            tokio::select! {
+                _ = sigchld.recv() => {}
+                () = stop.cancelled() => return,
+            }
+        }
+    }))
+}
+
+/// Why a waiter woke.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Wake {
+    /// The reaper collected something.
+    Exit,
+    /// The slow tick: look even though nothing was collected.
+    Tick,
+}
+
+/// Wake-ups for a task that waits for a process group to empty.
+///
+/// When the last member of a group exits, execd collects it (it is its child, or its adopted
+/// orphan), and the reaper says so; a waiter sleeps until then and re-checks, with no timer running.
+/// The case no collection covers is a last member that is a zombie whose live parent is neither
+/// execd nor in the group; for that there is the slow tick, [`GROUP_FALLBACK`], at which the
+/// waiter reads `/proc`. A host without the subreaper gets the tick every 50 ms, because its
+/// orphans go to init and nothing tells execd that they exited. Create one before the first check,
+/// so an exit that races the check is kept.
+pub(crate) struct ChildEvents(watch::Receiver<u64>);
+
+/// How long a waiter sleeps without a collection before it looks anyway: as long as a heartbeat,
+/// the delay the protocol already tolerates for a silent stream, and rare enough to cost nothing.
 pub(crate) const GROUP_FALLBACK: Duration = Duration::from_secs(5);
 
 impl ChildEvents {
     pub fn new() -> Self {
-        Self(tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()).ok())
+        Self(reaped().subscribe())
     }
 
-    /// Wait for a child to exit, or for [`GROUP_FALLBACK`].
-    pub async fn next(&mut self) {
-        match &mut self.0 {
-            // Without the subreaper an orphan goes to the host's init, and no signal says that it
-            // exited: look often, as an embedding host that does not set one has to accept.
-            Some(sig) if SUBREAPER.load(Ordering::Relaxed) => {
-                tokio::select! {
-                    _ = sig.recv() => {}
-                    () = tokio::time::sleep(GROUP_FALLBACK) => {}
-                }
-            }
-            _ => tokio::time::sleep(Duration::from_millis(50)).await,
+    pub async fn next(&mut self) -> Wake {
+        if !SUBREAPER.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            return Wake::Tick;
+        }
+        tokio::select! {
+            r = self.0.changed() => if r.is_ok() { Wake::Exit } else { Wake::Tick },
+            () = tokio::time::sleep(GROUP_FALLBACK) => Wake::Tick,
         }
     }
-}
-
-/// One pass of [`reap_orphans`]; how many zombies it collected.
-///
-/// The candidates are this process's own children (listed by the kernel, so the pass costs the
-/// number of execd's threads and children, not of processes on the host; a full `/proc` scan is the
-/// fallback). Each zombie is checked and reaped under [`SPAWNING`] held exclusively, which is what
-/// keeps a child that is mid-spawn safe; nothing is held while looking.
-pub fn reap_once() -> usize {
-    let me = i32::try_from(std::process::id()).unwrap_or(0);
-    let candidates = match children_of("self") {
-        Some(c) => c,
-        None => match std::fs::read_dir("/proc") {
-            Ok(dir) => dir
-                .flatten()
-                .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()))
-                .collect(),
-            Err(_) => return 0,
-        },
-    };
-    candidates
-        .into_iter()
-        .filter(|&pid| matches!(stat(pid), Some(('Z', ppid, _)) if ppid == me))
-        .filter(|&pid| reap_unowned(pid))
-        .count()
-}
-
-/// Reap zombie `pid` unless execd spawned it.
-fn reap_unowned(pid: u32) -> bool {
-    use nix::sys::wait::{WaitPidFlag, waitpid};
-    let _exclusive = SPAWNING
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let owned = locked(&OWNED);
-    !owned.contains(&pid) && waitpid(Pid::from_raw(pid as i32), Some(WaitPidFlag::WNOHANG)).is_ok()
 }
 
 #[cfg(test)]

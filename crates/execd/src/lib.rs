@@ -55,7 +55,7 @@ pub mod __fuzz {
     }
 }
 
-pub use proc::{become_subreaper, reap_once, reap_orphans};
+pub use proc::become_subreaper;
 pub use runas::{HELPER_FLAG, Resolved, RunAs, helper_main};
 pub use spool::remove_stale_jobs_dirs;
 
@@ -228,6 +228,7 @@ pub struct Handle {
     addr: SocketAddr,
     stop: CancellationToken,
     accept: tokio::task::JoinHandle<()>,
+    reaper: CancellationToken,
     ctx: Arc<Ctx>,
 }
 
@@ -243,6 +244,7 @@ impl Handle {
         let _ = self.accept.await;
         let killed = self.ctx.groups.kill_all();
         self.ctx.spool.clean();
+        self.reaper.cancel();
         killed
     }
 }
@@ -276,12 +278,16 @@ pub fn serve(listener: tokio::net::TcpListener, opts: Options) -> std::io::Resul
         epoch: Instant::now(),
         next_seq: AtomicU64::new(0),
     });
+    // The reaper collects every command's exit (see `proc`); it runs before the first can start.
+    let reaper = CancellationToken::new();
+    proc::start_reaper(reaper.clone())?;
     let stop = CancellationToken::new();
     let accept = tokio::spawn(http::accept_loop(listener, ctx.clone(), stop.clone()));
     Ok(Handle {
         addr,
         stop,
         accept,
+        reaper,
         ctx,
     })
 }
