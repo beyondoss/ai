@@ -1551,7 +1551,10 @@ impl World {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let log = self.execd.log();
-        ensure!(!log.contains("panicked"), "execd panicked during shutdown:\n{log}");
+        ensure!(
+            !log.contains("panicked"),
+            "execd panicked during shutdown:\n{log}"
+        );
         Ok(())
     }
 }
