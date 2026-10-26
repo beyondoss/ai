@@ -63,12 +63,12 @@ done
 # --- installer, per distro ------------------------------------------------------------------------
 # Host networking so the container reaches the server on the host's loopback.
 run_in() { # image, then a sh script on stdin
-  docker run --rm -i --network host -v "$here/install-execd.sh:/install-execd.sh:ro" \
+  docker run --rm -i --network host -v "$here/install-execd.sh:/install-execd.sh:ro" -v "$here/probe.sh:/probe.sh:ro" \
     -e EXECD_BASE_URL="http://127.0.0.1:$port" "$1" sh -eu
 }
 
-check() { # label, image, prelude
-  local label="$1" image="$2" prelude="$3"
+check() { # label, image, prelude, serve (1 = also run the installed execd and probe it)
+  local label="$1" image="$2" prelude="$3" serve="${4:-0}"
   echo "== $label ($image)"
   run_in "$image" <<EOF
 $prelude
@@ -105,13 +105,20 @@ if PATH=/fake:\$PATH sh /install-execd.sh 2>/tmp/err; then echo "riscv accepted"
 grep -q 'unsupported architecture' /tmp/err
 echo "ok unsupported arch refused"
 
+if [ "$serve" = 1 ]; then
+  # The installed binary actually serves, with a bearer file.
+  printf 's3cret-token\n' >/tmp/token
+  /opt/bin/execd --listen 127.0.0.1:8099 --bearer-file /tmp/token >/tmp/execd.log 2>&1 &
+  for i in \$(seq 40); do curl -fs http://127.0.0.1:8099/livez >/dev/null && break; sleep 0.25; done
+  BASE=http://127.0.0.1:8099 TOKEN=s3cret-token sh /probe.sh
+fi
 EOF
   pass "$label"
 }
 
 check alpine alpine:3.22 "mkdir -p /opt/bin /opt/fresh; command -v wget; ! command -v curl"
 check debian debian:bookworm-slim \
-  "apt-get update -qq >/dev/null && apt-get install -y -qq --no-install-recommends curl ca-certificates >/dev/null; mkdir -p /opt/bin /opt/fresh; command -v curl"
+  "apt-get update -qq >/dev/null && apt-get install -y -qq --no-install-recommends curl ca-certificates >/dev/null; mkdir -p /opt/bin /opt/fresh; command -v curl" 1
 
 # --- carrier image --------------------------------------------------------------------------------
 if [ -z "${SKIP_IMAGE:-}" ]; then
@@ -124,14 +131,16 @@ EOF
   cport="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
   # shellcheck disable=SC2206
   execd_args=(${EXECD_ARGS:-})
-  docker run -d --name "$uniq-run" -p "127.0.0.1:$cport:8080" "$uniq-consumer" \
-    execd --listen 0.0.0.0:8080 "${execd_args[@]}" >/dev/null
+  printf 's3cret-token\n' >"$work/token"
+  docker run -d --name "$uniq-run" -v "$work/token:/token:ro" -p "127.0.0.1:$cport:8080" "$uniq-consumer" \
+    execd --listen 0.0.0.0:8080 --bearer-file /token "${execd_args[@]}" >/dev/null
   ok=""
   for _ in $(seq 50); do
     if curl -fs "http://127.0.0.1:$cport/livez" >/dev/null; then ok=1; break; fi
     sleep 0.2
   done
   [ -n "$ok" ] || { docker logs "$uniq-run" >&2; fail "execd in the consumer image never answered /livez"; }
-  pass "COPY --from carrier works; /livez answered: $(curl -s "http://127.0.0.1:$cport/livez")"
+  BASE="http://127.0.0.1:$cport" TOKEN=s3cret-token sh "$here/probe.sh"
+  pass "COPY --from carrier works and serves"
 fi
 echo "all checks passed"

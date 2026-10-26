@@ -2,7 +2,7 @@
 
 `execd` is the in-sandbox exec endpoint the agent talks to (`--exec-url`). It ships as a single fully static musl binary (linux amd64 and arm64), so it runs in any sandbox image: Alpine, Debian, busybox, E2B templates.
 
-Start it with `execd --listen 0.0.0.0:8080 --bearer-file /path/to/token`.
+Start it with `execd --listen 0.0.0.0:8080 --bearer-file /path/to/token`. `--listen` defaults to `127.0.0.1:8080`. Without a bearer token (`--bearer-file`, or `EXECD_BEARER`) execd accepts anyone who can reach it. Other flags: `--root`, `--home`, `--kept-jobs-survive-idle`, `--max-response-bytes`, `--log-level`; each also reads an `EXECD_*` environment variable (see `crates/execd/README.md`).
 
 ## Install
 
@@ -51,16 +51,19 @@ file /usr/local/bin/execd # ... statically linked
 ldd /usr/local/bin/execd  # not a dynamic executable (glibc); musl's ldd may print a loader line
 ```
 
-Then start it and probe `/livez`:
+Then start it, check that `/livez` answers without a token, and run a command with one:
 
 ```sh
 execd --listen 127.0.0.1:8080 --bearer-file /path/to/token &
 curl -fs http://127.0.0.1:8080/livez
+curl -s -X POST -H "authorization: Bearer $(cat /path/to/token)" \
+  -d '{"command":"sh","args":["-c","echo hi"]}' http://127.0.0.1:8080/
+# {"exit_code":0,"stderr":"","stdout":"hi\n"}
 ```
 
 ## Tests
 
-`test-install.sh` runs the installer in `alpine` (busybox `wget`) and `debian:bookworm-slim` (`curl`) against a local fake release served with `python3 -m http.server`: success, rerun, checksum mismatch (refused, no file left), mismatch over an existing install, unsupported architecture. It then builds `Dockerfile.execd`, copies it into a throwaway `FROM alpine` image and curls `/livez` from the host. It needs docker, python3 and a static musl build:
+`test-install.sh` runs the installer in `alpine` (busybox `wget`) and `debian:bookworm-slim` (`curl`) against a local fake release served with `python3 -m http.server`: success, rerun, checksum mismatch (refused, no file left), mismatch over an existing install, unsupported architecture. In debian it also runs the installed `execd` with a bearer file. It then builds `Dockerfile.execd`, copies it into a throwaway `FROM alpine` image and runs `execd` there. Both runs use `probe.sh`: `/livez` answers 200 without auth, an unauthenticated exec gets 401, and an authenticated `sh -c 'echo hi'` returns `exit_code` 0 and stdout `hi\n`. It needs docker, python3 and a static musl build:
 
 ```sh
 RUSTFLAGS="-C relocation-model=static" \
