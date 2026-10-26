@@ -129,6 +129,11 @@ async fn capture<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
+/// What a v1.1 command killed at its deadline is answered with: `timeout(1)`'s status, and a note
+/// ending its stderr (the agent's own words for a v1.2 `timed_out`).
+const TIMEOUT_EXIT: i32 = 124;
+const TIMEOUT_NOTE: &str = "command exceeded its timeout";
+
 /// v1.1: run to completion, answer with one object.
 pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
     let line = Line::new("exec", &req.command);
@@ -180,7 +185,21 @@ pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
             .take()
             .map(|p| tokio::spawn(capture(p, err.clone(), budget.clone(), dropped.clone()))),
     ];
-    let status = proc.wait().await;
+    // `timeout_ms` is the endpoint's to enforce here too: at the deadline the whole group is killed
+    // (the spec, "Timeouts"). Absent, the connection is the only bound.
+    let deadline = req.timeout_ms.map(Duration::from_millis);
+    let mut timed_out = false;
+    let status = match deadline {
+        None => proc.wait().await,
+        Some(limit) => match tokio::time::timeout(limit, proc.wait()).await {
+            Ok(status) => status,
+            Err(_) => {
+                timed_out = true;
+                proc::kill_group(proc.pgid);
+                proc.wait().await
+            }
+        },
+    };
     // The command is done. Pipes a descendant holds open are given the grace, then let go.
     let mut abort = Vec::new();
     for r in readers.into_iter().flatten() {
@@ -210,6 +229,15 @@ pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
         );
     }
     let payload = match status {
+        Ok(_) if timed_out => {
+            line.done(200, "timed out");
+            let mut stderr = take(&err);
+            if !stderr.is_empty() && !stderr.ends_with('\n') {
+                stderr.push('\n');
+            }
+            stderr.push_str(TIMEOUT_NOTE);
+            json!({ "exit_code": TIMEOUT_EXIT, "stdout": take(&out), "stderr": stderr })
+        }
         Ok(s) => {
             line.done(200, "exit");
             json!({ "exit_code": exit_code(s), "stdout": take(&out), "stderr": take(&err) })

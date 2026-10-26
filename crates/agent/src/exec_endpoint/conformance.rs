@@ -146,6 +146,7 @@ impl Report {
 }
 
 pub const ENVELOPE: &str = "v1.1 envelope";
+pub const ENVELOPE_TIMEOUT: &str = "v1.1 timeout kills the process group";
 pub const CONTENT_TYPE: &str = "stream content type";
 pub const INCREMENTAL: &str = "incremental delivery (the probe)";
 pub const BYTES: &str = "bytes and streams survive exactly";
@@ -195,7 +196,7 @@ pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectatio
         ),
     };
 
-    let mut checks = vec![v.envelope().await];
+    let mut checks = vec![v.envelope().await, v.envelope_timeout().await];
     let streams = match v.run("printf a", Duration::from_secs(10)).await {
         Ok(Exchange::Stream { .. }) => {
             checks.push(pass(CONTENT_TYPE, format!("`{}`", stream::NDJSON)));
@@ -431,6 +432,68 @@ impl Verifier {
             ),
             Err(e) => fail(ENVELOPE, e),
         }
+    }
+
+    /// `timeout_ms` is the endpoint's to enforce over v1.1 too: a command that hangs is killed, whole
+    /// group, and the request answered, within a bound. The MUST is the kill and the prompt answer;
+    /// the status 124 and the stderr note are a SHOULD, reported in the detail.
+    async fn envelope_timeout(&self) -> Check {
+        let marker = self.marker("v11-timeout");
+        let grandchild = Duration::from_secs(2);
+        let script = format!(
+            "(sleep {}; touch {marker}) & sleep 60",
+            grandchild.as_secs()
+        );
+        let limit = Duration::from_secs(1);
+        let bound = limit + self.expect.kill_within;
+        let started = Instant::now();
+        let args = Self::args(&script);
+        let sent = self.runner.post("sh", &args, None, limit, None);
+        let check = match tokio::time::timeout(bound, sent).await {
+            Err(_) => fail(
+                ENVELOPE_TIMEOUT,
+                format!(
+                    "no answer {} ms after a 1 s `timeout_ms`: the endpoint ignores the deadline over v1.1, so a hung command runs until the client gives up",
+                    bound.as_millis()
+                ),
+            ),
+            Ok(Err(e)) => fail(ENVELOPE_TIMEOUT, e.to_string()),
+            Ok(Ok(r)) => {
+                let at = started.elapsed();
+                tokio::time::sleep(grandchild.saturating_sub(at) + Duration::from_secs(1)).await;
+                match self.sh(&format!("test -e {marker}")).await {
+                    Ok(t) if t.exit_code != 0 => {
+                        let shape = if r.exit_code == 124
+                            && r.stderr
+                                .trim_end()
+                                .ends_with("command exceeded its timeout")
+                        {
+                            "answered 124 with the timeout note".to_string()
+                        } else {
+                            format!(
+                                "note: it SHOULD answer exit_code 124 with stderr ending in                                  `command exceeded its timeout`; got exit {}, stderr {:?}",
+                                r.exit_code, r.stderr
+                            )
+                        };
+                        pass(
+                            ENVELOPE_TIMEOUT,
+                            format!(
+                                "answered {} ms after a 1 s timeout and the backgrounded grandchild died with its group; {shape}",
+                                at.as_millis()
+                            ),
+                        )
+                    }
+                    Ok(_) => fail(
+                        ENVELOPE_TIMEOUT,
+                        "a backgrounded grandchild survived the v1.1 timeout: the endpoint killed \
+                         the command, not its process group",
+                    ),
+                    Err(e) => fail(ENVELOPE_TIMEOUT, e),
+                }
+            }
+        };
+        let _ = self.sh(&format!("rm -f {marker}")).await;
+        check
     }
 
     async fn incremental(&self) -> Check {
