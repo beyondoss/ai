@@ -562,6 +562,21 @@ async fn kill_latency(s: &Server) -> Res<f64> {
     }
 }
 
+/// Server CPU seconds spent over `secs` while one stream holds a command whose shell has exited
+/// and left a process running (a kept dev server): what the leftover bookkeeping costs.
+async fn leftover_cpu(s: &Server, secs: u64) -> Res<f64> {
+    let mut c = Conn::open(s.addr).await?;
+    c.stream(req("sh", &["-c", "sleep 3600 &"], &s.root))
+        .await?;
+    // The shell is gone and the stream stays open: wait for `shell_exit`, and a moment more.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let cpu0 = s.cpu();
+    tokio::time::sleep(Duration::from_secs(secs)).await;
+    let used = s.cpu() - cpu0;
+    drop(c);
+    Ok(used)
+}
+
 async fn mem_idle(side: &Side) -> Res<u64> {
     let s = Server::start(side)?;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -631,6 +646,7 @@ struct Samples {
     rss_100: Vec<u64>,
     rss_slow_peak: Vec<u64>,
     rss_slow_hwm: Vec<u64>,
+    leftover_cpu: Vec<f64>,
 }
 
 /// Idle processes added to the host for the crowded round trips.
@@ -747,6 +763,7 @@ fn side_json(s: &Samples) -> Value {
         "rss_idle": mib(&s.rss_idle), "rss_100_streams": mib(&s.rss_100),
         "rss_slow_16x256MiB_peak_sampled": mib(&s.rss_slow_peak),
         "rss_slow_16x256MiB_hwm": mib(&s.rss_slow_hwm),
+        "leftover_stream_server_cpu_s": scalar_json(&s.leftover_cpu, "cpu-s"),
     })
 }
 
@@ -872,6 +889,8 @@ async fn main() -> Res<()> {
                     let (p, h) = mem_slow(&sides[i], 8).await?;
                     r.rss_slow_peak.push(p);
                     r.rss_slow_hwm.push(h);
+                    let secs = env_num("EXEC_BENCH_LEFTOVER_SECS", 30);
+                    r.leftover_cpu.push(leftover_cpu(s, secs).await?);
                 }
             }
             eprintln!(
@@ -945,6 +964,7 @@ async fn main() -> Res<()> {
         "rss_100_streams",
         "rss_slow_16x256MiB_peak_sampled",
         "rss_slow_16x256MiB_hwm",
+        "leftover_stream_server_cpu_s",
     ] {
         print_rows(
             k,
