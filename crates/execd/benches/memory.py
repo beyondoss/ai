@@ -166,7 +166,12 @@ def scen_jobs(a, srv, root):
     time.sleep(3.0)
     time.sleep(1.0)
     m = srv.measure()
-    return {"jobs20_9MiB": m, "per_job_pss_kib": (m["Pss"] - base["Pss"]) / n,
+    spool = 0
+    for kv in a.env:
+        if kv.startswith("EXECD_JOBS_DIR="):
+            for dp, _, fs in os.walk(kv.split("=", 1)[1]):
+                spool += sum(os.path.getsize(os.path.join(dp, f)) for f in fs)
+    return {"jobs20_9MiB": m, "jobs20_spool_files_kib": spool // 1024, "per_job_pss_kib": (m["Pss"] - base["Pss"]) / n,
             "per_job_rss_kib": (m["Rss"] - base["Rss"]) / n}
 
 

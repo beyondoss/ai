@@ -61,12 +61,13 @@ impl JobsDir {
     }
 
     /// Say what the directory is on, and warn where retained output would be RAM.
+    #[allow(clippy::unnecessary_cast)] // `f_type` is signed on glibc and unsigned on musl
     fn log_filesystem(&self) {
         use nix::sys::statfs::{TMPFS_MAGIC, statfs};
-        const RAMFS_MAGIC: i64 = 0x8584_58f6;
+        const RAMFS_MAGIC: u64 = 0x8584_58f6;
         let Ok(st) = statfs(&self.path) else { return };
         let kind = st.filesystem_type();
-        if kind == TMPFS_MAGIC || kind.0 & 0xffff_ffff == RAMFS_MAGIC {
+        if kind == TMPFS_MAGIC || (kind.0 as u64) & 0xffff_ffff == RAMFS_MAGIC {
             tracing::warn!(
                 dir = %self.path.display(),
                 "the jobs directory is on tmpfs, so retained job output (up to 8 MiB per job) \
@@ -172,4 +173,61 @@ pub(crate) fn read_chunk(path: &Path, pos: u64, buf: &mut [u8]) -> io::Result<us
         .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
         .open(path)?;
     f.read_at(buf, pos)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn dead_pid() -> u32 {
+        let mut c = std::process::Command::new("true").spawn().unwrap();
+        let pid = c.id();
+        c.wait().unwrap();
+        pid
+    }
+
+    #[test]
+    fn stale_removal_takes_only_its_own_dead_directories() {
+        let base = tempfile::tempdir().unwrap();
+        let uid = fs::metadata("/proc/self").unwrap().uid();
+        let me = std::process::id();
+        let dead = dead_pid();
+        let mk = |name: String| {
+            let p = base.path().join(name);
+            fs::create_dir(&p).unwrap();
+            fs::write(p.join("f"), b"x").unwrap();
+            p
+        };
+        let stale = mk(format!("{PREFIX}{uid}-{dead}-aa"));
+        let alive = mk(format!("{PREFIX}{uid}-{me}-bb"));
+        let other_uid = mk(format!("{PREFIX}{}-{dead}-cc", uid + 1));
+        let other_name = mk(format!("not-{PREFIX}{uid}-{dead}-dd"));
+        let malformed = mk(format!("{PREFIX}x-y"));
+        // A link with the right name is not a directory of ours, and its target is never followed.
+        let target = mk("target".into());
+        let link = base.path().join(format!("{PREFIX}{uid}-{dead}-ee"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        remove_stale(base.path(), uid, me);
+        assert!(!stale.exists());
+        for kept in [&alive, &other_uid, &other_name, &malformed, &target] {
+            assert!(kept.join("f").exists(), "{kept:?} was removed");
+        }
+        assert!(link.symlink_metadata().is_ok());
+    }
+
+    #[test]
+    fn a_jobs_directory_is_private_and_goes_away_with_its_server() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = tempfile::tempdir().unwrap();
+        let dir = JobsDir::open(Some(base.path())).unwrap();
+        let path = dir.path.clone();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        fs::write(path.join("x"), b"y").unwrap();
+        drop(dir);
+        assert!(!path.exists());
+    }
 }

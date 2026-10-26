@@ -6,8 +6,9 @@
 //! **Bounds.**
 //!
 //! - *Output*: the last [`crate::Options::job_output_retention`] bytes per job (8 MiB, the spec's
-//!   floor), in whole chunks of at most 64 KiB, so a job holds between that and that plus one
-//!   chunk. Older bytes are dropped and read back as a gap. A job's two pumps write into it
+//!   floor), as whole chunk files of 64 KiB under execd's jobs directory (see [`crate::spool`]),
+//!   so a job holds between that and that plus one chunk on disk, and in memory only its
+//!   unfinished chunk. Older bytes are dropped and read back as a gap. A job's two pumps write into it
 //!   directly; there is no channel to fill, and a slow `attach` never slows the job (it reads a gap
 //!   instead).
 //! - *The table*: one entry per job the agent has started and not removed. The agent keeps at most

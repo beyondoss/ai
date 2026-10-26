@@ -956,6 +956,156 @@
           }
         }
       }
+    },
+    "jobs_on_disk": {
+      "ring-in-memory": {
+        "bin": "/home/jared/execd-mem-bins/execd-musl-malloc",
+        "env": [
+          "EXECD_WORKER_THREADS=1"
+        ],
+        "cpus": "",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 2852,
+            "Pss": 2848,
+            "Pss_Anon": 160,
+            "Pss_File": 2688,
+            "Private_Dirty": 160,
+            "Anonymous": 160,
+            "AnonHugePages": 0,
+            "VmRSS": 2852,
+            "Threads": 1
+          },
+          "streams100": {
+            "Rss": 8552,
+            "Pss": 8548,
+            "Pss_Anon": 5668,
+            "Pss_File": 2880,
+            "Private_Dirty": 5664,
+            "Anonymous": 5668,
+            "AnonHugePages": 0,
+            "VmRSS": 8552,
+            "Threads": 1
+          },
+          "per_stream_pss_kib": 57.0,
+          "per_stream_rss_kib": 57.0,
+          "jobs20_9MiB": {
+            "Rss": 192096,
+            "Pss": 192092,
+            "Pss_Anon": 189148,
+            "Pss_File": 2944,
+            "Private_Dirty": 187156,
+            "Anonymous": 189148,
+            "AnonHugePages": 0,
+            "VmRSS": 192096,
+            "Threads": 1
+          },
+          "jobs20_spool_files_kib": 0,
+          "per_job_pss_kib": 9462.2,
+          "per_job_rss_kib": 9462.2
+        },
+        "thp_disabled_for_server": true
+      },
+      "spool-disk": {
+        "bin": "/home/jared/execd-mem-bins/execd-musl-spool",
+        "env": [
+          "EXECD_JOBS_DIR=/home/jared/execd-jobs-test"
+        ],
+        "cpus": "",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 2896,
+            "Pss": 2892,
+            "Pss_Anon": 172,
+            "Pss_File": 2720,
+            "Private_Dirty": 172,
+            "Anonymous": 172,
+            "AnonHugePages": 0,
+            "VmRSS": 2896,
+            "Threads": 1
+          },
+          "streams100": {
+            "Rss": 8508,
+            "Pss": 8504,
+            "Pss_Anon": 5656,
+            "Pss_File": 2848,
+            "Private_Dirty": 5656,
+            "Anonymous": 5656,
+            "AnonHugePages": 0,
+            "VmRSS": 8508,
+            "Threads": 1
+          },
+          "per_stream_pss_kib": 56.12,
+          "per_stream_rss_kib": 56.12,
+          "jobs20_9MiB": {
+            "Rss": 5488,
+            "Pss": 5484,
+            "Pss_Anon": 2636,
+            "Pss_File": 2848,
+            "Private_Dirty": 2636,
+            "Anonymous": 2636,
+            "AnonHugePages": 0,
+            "VmRSS": 5488,
+            "Threads": 1
+          },
+          "jobs20_spool_files_kib": 163840,
+          "per_job_pss_kib": 129.6,
+          "per_job_rss_kib": 129.6
+        },
+        "thp_disabled_for_server": true
+      },
+      "spool-tmpfs": {
+        "bin": "/home/jared/execd-mem-bins/execd-musl-spool",
+        "env": [],
+        "cpus": "",
+        "n": 3,
+        "thp": "[always] madvise never",
+        "results": {
+          "idle": {
+            "Rss": 2884,
+            "Pss": 2880,
+            "Pss_Anon": 160,
+            "Pss_File": 2720,
+            "Private_Dirty": 160,
+            "Anonymous": 160,
+            "AnonHugePages": 0,
+            "VmRSS": 2884,
+            "Threads": 1
+          },
+          "streams100": {
+            "Rss": 8500,
+            "Pss": 8496,
+            "Pss_Anon": 5648,
+            "Pss_File": 2848,
+            "Private_Dirty": 5648,
+            "Anonymous": 5648,
+            "AnonHugePages": 0,
+            "VmRSS": 8500,
+            "Threads": 1
+          },
+          "per_stream_pss_kib": 56.16,
+          "per_stream_rss_kib": 56.16,
+          "jobs20_9MiB": {
+            "Rss": 5608,
+            "Pss": 5604,
+            "Pss_Anon": 2756,
+            "Pss_File": 2848,
+            "Private_Dirty": 2756,
+            "Anonymous": 2756,
+            "AnonHugePages": 0,
+            "VmRSS": 5608,
+            "Threads": 1
+          },
+          "jobs20_spool_files_kib": 0,
+          "per_job_pss_kib": 136.0,
+          "per_job_rss_kib": 136.0
+        },
+        "thp_disabled_for_server": true
+      }
     }
   },
   "throughput": {
@@ -3663,6 +3813,140 @@
             "unit": "ms"
           }
         }
+      }
+    }
+  },
+  "jobs_io_taskset_2cpus": {
+    "ring-1": {
+      "bin": "/home/jared/execd-mem-bins/execd-musl-malloc",
+      "env": [
+        "EXECD_WORKER_THREADS=1"
+      ],
+      "cpus": "0,1",
+      "read_8MiB_from_oldest_MB_s_median": 166.6052924882188,
+      "read_bytes": 8388608,
+      "attach_from_oldest_MB_s_median(approx, wire bytes*3/4)": 829.5696099290058,
+      "true_idle": {
+        "p50_ms": 0.4525184631347656,
+        "p99_ms": 0.8256435394287109,
+        "max_ms": 0.9067058563232422,
+        "n": 300
+      },
+      "true_while_16_jobs_write_flat_out": {
+        "p50_ms": 9.91368293762207,
+        "p99_ms": 126.33156776428223,
+        "max_ms": 138.66853713989258,
+        "n": 300
+      }
+    },
+    "ring-2": {
+      "bin": "/home/jared/execd-mem-bins/execd-musl-malloc",
+      "env": [
+        "EXECD_WORKER_THREADS=1"
+      ],
+      "cpus": "0,1",
+      "read_8MiB_from_oldest_MB_s_median": 180.91883877101543,
+      "read_bytes": 8388608,
+      "attach_from_oldest_MB_s_median(approx, wire bytes*3/4)": 1301.2171055474712,
+      "true_idle": {
+        "p50_ms": 0.4630088806152344,
+        "p99_ms": 0.8873939514160156,
+        "max_ms": 1.2009143829345703,
+        "n": 300
+      },
+      "true_while_16_jobs_write_flat_out": {
+        "p50_ms": 7.462024688720703,
+        "p99_ms": 121.3984489440918,
+        "max_ms": 138.8859748840332,
+        "n": 300
+      }
+    },
+    "ring-3": {
+      "bin": "/home/jared/execd-mem-bins/execd-musl-malloc",
+      "env": [
+        "EXECD_WORKER_THREADS=1"
+      ],
+      "cpus": "0,1",
+      "read_8MiB_from_oldest_MB_s_median": 187.28241152741285,
+      "read_bytes": 8388608,
+      "attach_from_oldest_MB_s_median(approx, wire bytes*3/4)": 830.2741276444444,
+      "true_idle": {
+        "p50_ms": 0.44417381286621094,
+        "p99_ms": 1.0197162628173828,
+        "max_ms": 1.184701919555664,
+        "n": 300
+      },
+      "true_while_16_jobs_write_flat_out": {
+        "p50_ms": 27.44317054748535,
+        "p99_ms": 119.26674842834473,
+        "max_ms": 126.7848014831543,
+        "n": 300
+      }
+    },
+    "spool-1": {
+      "bin": "/home/jared/execd-mem-bins/execd-musl-spool",
+      "env": [
+        "EXECD_JOBS_DIR=/home/jared/execd-jobs-test"
+      ],
+      "cpus": "0,1",
+      "read_8MiB_from_oldest_MB_s_median": 169.1011649556729,
+      "read_bytes": 8388608,
+      "attach_from_oldest_MB_s_median(approx, wire bytes*3/4)": 566.1051015883289,
+      "true_idle": {
+        "p50_ms": 0.4620552062988281,
+        "p99_ms": 0.8714199066162109,
+        "max_ms": 0.9641647338867188,
+        "n": 300
+      },
+      "true_while_16_jobs_write_flat_out": {
+        "p50_ms": 0.48041343688964844,
+        "p99_ms": 234.24053192138672,
+        "max_ms": 244.44961547851562,
+        "n": 300
+      }
+    },
+    "spool-2": {
+      "bin": "/home/jared/execd-mem-bins/execd-musl-spool",
+      "env": [
+        "EXECD_JOBS_DIR=/home/jared/execd-jobs-test"
+      ],
+      "cpus": "0,1",
+      "read_8MiB_from_oldest_MB_s_median": 186.80314355631535,
+      "read_bytes": 8388608,
+      "attach_from_oldest_MB_s_median(approx, wire bytes*3/4)": 547.8979446556968,
+      "true_idle": {
+        "p50_ms": 0.461578369140625,
+        "p99_ms": 0.9882450103759766,
+        "max_ms": 1.1379718780517578,
+        "n": 300
+      },
+      "true_while_16_jobs_write_flat_out": {
+        "p50_ms": 0.4756450653076172,
+        "p99_ms": 223.85716438293457,
+        "max_ms": 232.00631141662598,
+        "n": 300
+      }
+    },
+    "spool-3": {
+      "bin": "/home/jared/execd-mem-bins/execd-musl-spool",
+      "env": [
+        "EXECD_JOBS_DIR=/home/jared/execd-jobs-test"
+      ],
+      "cpus": "0,1",
+      "read_8MiB_from_oldest_MB_s_median": 166.4736485222781,
+      "read_bytes": 8388608,
+      "attach_from_oldest_MB_s_median(approx, wire bytes*3/4)": 579.5853482231041,
+      "true_idle": {
+        "p50_ms": 0.47087669372558594,
+        "p99_ms": 0.9434223175048828,
+        "max_ms": 1.2848377227783203,
+        "n": 300
+      },
+      "true_while_16_jobs_write_flat_out": {
+        "p50_ms": 0.514984130859375,
+        "p99_ms": 229.74443435668945,
+        "max_ms": 240.30375480651855,
+        "n": 300
       }
     }
   }
