@@ -25,6 +25,33 @@ fn run(cmd: &str, args: &[&str]) -> Value {
     json!({ "command": cmd, "args": args, "timeout_ms": 30_000 })
 }
 
+/// The library fails closed as the binary does: no bearer is served only on loopback.
+#[tokio::test]
+async fn serve_refuses_no_bearer_on_a_network_listener() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = |bearer: Option<&str>, insecure: bool| {
+        let mut o = execd::Options::new(dir.path());
+        o.bearer = bearer.map(String::from);
+        o.insecure_no_auth = insecure;
+        o
+    };
+    let all = || tokio::net::TcpListener::bind("0.0.0.0:0");
+    let refused = execd::serve(all().await.unwrap(), open(None, false))
+        .err()
+        .expect("served open on all interfaces");
+    assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+    for (bearer, insecure) in [(Some("tok"), false), (None, true)] {
+        execd::serve(all().await.unwrap(), open(bearer, insecure))
+            .unwrap()
+            .shutdown()
+            .await;
+    }
+    execd::serve(ports::tokio_listener().await, open(None, false))
+        .unwrap()
+        .shutdown()
+        .await;
+}
+
 #[tokio::test]
 async fn livez_answers_without_auth_and_everything_else_wants_the_bearer() {
     let (server, _dir) = start(|o| o.bearer = Some("open-sesame".into())).await;

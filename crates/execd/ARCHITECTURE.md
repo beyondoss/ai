@@ -6,29 +6,32 @@ v1.3 sandbox jobs and v1.4 job-end notify. The normative spec is the module doc 
 file says how execd meets it and what bounds every resource it holds.
 
 It is one crate: a library (`execd`) that embeds in a test or a larger host, and a thin `execd` binary (`--listen`, `--root`,
-`--home`, `--bearer-file`, `--kept-jobs-survive-idle`, `--log-level`).
+`--home`, `--bearer-file`, `--insecure-no-auth`, `--run-as`, `--kept-jobs-survive-idle`, `--log-level`).
 
 ## Modules
 
-| file            | role                                                                                           |
-| --------------- | ---------------------------------------------------------------------------------------------- |
-| `src/lib.rs`    | `Options`, the `Observer` trait, `serve` and `Handle`, and the derived limits                  |
-| `src/main.rs`   | the CLI: flags, bearer sources, subreaper and reaper, signals                                  |
-| `src/http.rs`   | hyper (HTTP/1.1 and h2c), routing, `/livez`, the bearer check, the request limit, the log line |
-| `src/exec.rs`   | v1.1 envelope and v1.2 stream: pumps, the sink, heartbeat, leftovers, timeout, disconnect      |
-| `src/jobs.rs`   | v1.3 jobs: the table, the output ring, the supervisor, job streams                             |
-| `src/notify.rs` | v1.4: the sender that drives the `exec-notify` kernel                                          |
-| `src/proc.rs`   | process groups by syscall, the spawn registry, the subreaper and orphan reaper                 |
-| `src/frame.rs`  | v1.2 frame encoding                                                                            |
+| file            | role                                                                                            |
+| --------------- | ----------------------------------------------------------------------------------------------- |
+| `src/lib.rs`    | `Options`, the `Observer` trait, `serve` and `Handle`, and the derived limits                   |
+| `src/main.rs`   | the CLI: flags, bearer sources and the environment scrub, fail-closed start, subreaper, signals |
+| `src/runas.rs`  | `--run-as`: resolving the user, proving execd can switch, the switch helper                     |
+| `src/http.rs`   | hyper (HTTP/1.1 and h2c), routing, `/livez`, the bearer check, the request limit, the log line  |
+| `src/exec.rs`   | v1.1 envelope and v1.2 stream: pumps, the sink, heartbeat, leftovers, timeout, disconnect       |
+| `src/jobs.rs`   | v1.3 jobs: the table, the output ring, the supervisor, job streams                              |
+| `src/notify.rs` | v1.4: the sender that drives the `exec-notify` kernel                                           |
+| `src/proc.rs`   | process groups by syscall, the spawn registry, the subreaper and orphan reaper                  |
+| `src/frame.rs`  | v1.2 frame encoding                                                                             |
 
 ## Request flow
 
 ```text
 accept ──► hyper (HTTP/1.1, or prior-knowledge HTTP/2 on the same port)
               │
-   /livez ◄───┤ 200, no auth
+   /livez ◄───┤ GET or HEAD only: 200, no auth
               ▼
-   POST ──► bearer check (constant time) ──► 401
+   not POST ──► 405
+              ▼
+   POST ──► bearer check (one header, constant time) ──► 401
               ▼
    read the body, at most `max_request_bytes` ──► 413
               ▼
@@ -91,6 +94,94 @@ attempt begins, when to wait, and when to stop; `notify` makes the request (one 
 verified, 30 s at most) and feeds back what happened. A job's latest `keep` governs, a `keep` abandons the attempt in flight,
 and a removed job's timers are dropped with it. The token is held in the job and in the request header, and appears in no log,
 no answer, no argument and no environment; `Debug` for it prints `<redacted>`.
+
+## Security
+
+execd is remote code execution by design: whoever holds its bearer can run any command in the sandbox. Security here means
+three things, in this order, and nothing else:
+
+1. **No request without the bearer runs anything.**
+2. **The bearer cannot leak**, including to the commands execd itself runs, because those may be prompt-injected or malicious
+   repository code.
+3. **One job scope can never see or affect another's jobs.**
+
+Out of scope: denial of service (the bounds above are for memory, not for an adversary), except where a panic or a poisoned
+lock would break 1 to 3 or the kill guarantees; the network (the bearer crosses it in the clear unless the listener is behind
+TLS or a private network); and a holder of the bearer doing what the bearer allows.
+
+### Controls
+
+| control                | guarantees                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | does not guarantee                                                                                                                                                                                                                                                | tested by                                                                                                         |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| The bearer check       | Every request but `GET`/`HEAD /livez` is refused (`401`, or `405` for a method that cannot exec) before its body is read, unless it carries exactly one `Authorization` header whose value is `Bearer`, one space, and the token (compared in constant time). The path does not matter: `//livez`, `/livez/`, `/%6civez` are paths like any other, and a `POST` to `/livez` is an exec request that needs the bearer. Two `Authorization` headers are refused in either order. The scheme is case-sensitive (`bearer <token>` is refused, as is `Bearer  <token>`). `Proxy-Authorization`, cookies, query strings and forwarding headers are never read. | HTTP/1.1 strips optional whitespace around a header value before execd sees it, so `Bearer <token>` followed by a space or tab on the wire is the same credential and runs; over HTTP/2 nothing is stripped and it is refused. There is no rate limit and no TLS. | `tests/auth_matrix.rs`: about 180 requests over HTTP/1.1 and h2c, each answered and each proven to run nothing    |
+| Fail-closed start      | With no bearer, execd refuses to start (non-zero exit, a message) unless every address in `--listen` is loopback, or `--insecure-no-auth` is passed. An empty `EXECD_BEARER` is no bearer; a named bearer file that is empty or unreadable is an error. With `--insecure-no-auth` or on loopback it starts and logs `NO BEARER CONFIGURED`. The library does the same: `serve` returns `PermissionDenied` for a non-loopback listener with no bearer unless `Options::insecure_no_auth` is set.                                                                                                                                                          | Loopback is not private on a multi-tenant host: any local user can connect.                                                                                                                                                                                       | `tests/security.rs`; the loopback decision is a unit test in `src/main.rs`                                        |
+| The token stays secret | The bearer is never an argument. Every `EXECD_*` variable is removed from every command's environment (v1.1, v1.2, jobs). A bearer handed over in `EXECD_BEARER` is moved out of execd's own environment by re-executing it (see below). No log line, `Debug` output or error carries the bearer, a notify token or a callback URL.                                                                                                                                                                                                                                                                                                                      | A process that runs as execd's uid can still read execd's memory and a bearer file execd owns. The observer an embedding host sets sees every request's headers, `Authorization` included; the host is trusted.                                                   | `tests/security.rs`, `tests/conformance.rs` (the whole verifier at `trace` level, then a search of its log)       |
+| `--run-as`             | Commands run as another uid, gid and groups, so they cannot read execd's memory, `/proc/<execd>/environ`, or a 0600 bearer file owned by execd's uid, and cannot signal or trace execd.                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | A setuid program the user can run (`sudo`, `su`) can still become root, and then reads everything. A process that leaves its process group (`setsid`) outlives a kill of the group, as it does without `--run-as`.                                                | `tests/security.rs` (as root), `tests/conformance.rs` (the whole verifier under `--run-as`)                       |
+| Job scopes             | A job is addressed by the exact pair `(scope, id)`. Every operation filters by its own scope before it looks at an id, so another scope's id reads as `gone`/`404` and an answer, a listing or an error never names, orders or times anything of another scope. `kill` and `wipe` only signal groups of their own scope's jobs that have not ended.                                                                                                                                                                                                                                                                                                      | A scope is a name, not a secret: a client with the bearer can ask for any scope it can name. The agent sends a digest of tenant and session, which is the capability; there is no operation that lists scopes.                                                    | `tests/jobtable.rs`: random operations across scopes with colliding ids, a model, every invariant after each step |
+| No panic, no poison    | Every lock is taken with `locked`, which recovers a poisoned mutex (the data under each is a map or a plain record), so one panicking handler cannot stop a kill, a list or the shutdown sweep. After the sweep the group set is closed: a group registered by a spawn that raced the shutdown is killed at once.                                                                                                                                                                                                                                                                                                                                        | A panic still ends that one request.                                                                                                                                                                                                                              | `tests/jobtable.rs` (the log never says `panicked`, every later request works), `tests/parsers.rs`, `fuzz/`       |
+
+### The bearer and the environment
+
+`/proc/<pid>/environ` shows the environment a process was **started** with; removing a variable from a running process does not
+change it. So a bearer delivered in `EXECD_BEARER` would sit in execd's `environ` for any command that runs as execd's uid to
+read, however carefully execd keeps it from the commands' own environment. execd therefore starts by writing the token to a
+memfd and re-executing itself without the variable (`EXECD_BEARER_FD` names the descriptor, which the new image reads and closes
+before it parses a flag or spawns anything). The new image's `environ` never held the token. Delivery by environment is still
+the weaker choice: the launcher's own environment, `docker inspect`, a process supervisor's unit file and the first instants
+before the re-execution all hold it. **Prefer `--bearer-file`** (mode 0600; execd warns when others can read it), and **use
+`--run-as`** when the commands are not trusted: without it a command is the same uid as execd and can read the token from execd's
+memory (`/proc/<execd>/mem` is refused only where the kernel's Yama `ptrace_scope` is 1 or more) and from a bearer file execd
+owns.
+
+### `--run-as`
+
+`--run-as <user|uid[:gid]>` (or `user:group`) makes every command run as that identity, with the user's groups from the group
+database (`setgroups`, then `setresgid`, then `setresuid`, all three ids of each). execd keeps its own uid, which must be root or
+hold `CAP_SETUID`, `CAP_SETGID` and `CAP_KILL` (it signals processes it does not own). It refuses to start unless it has proved
+it can: a helper switches to the target and execd signals it, and the target must not be execd's uid. The workspace forbids
+`unsafe`, which rules out `pre_exec`, and `std`'s supplementary-group setter is unstable, so the switch is made by `execd`
+itself: a command is spawned as `/proc/self/exe --execd-run-as-helper run <uid> <gid> <groups> <cwd> <command> <args>...`, which
+switches, proves the switch cannot be undone (`setresuid(0)` must fail), changes into the request's directory **as the target**
+(so the target's permissions decide whether it may enter it) and `exec`s the command. The helper is the command's own process:
+the pid, the process group and the pipes are the ones execd spawned, so every kill, timeout and disconnect path is unchanged. Any
+failure in the switch exits 126 before the command is reached.
+
+What the spec and the conformance verifier assume, and what holds:
+
+- **uid.** Neither says anything about the command's uid; the verifier passes unchanged under `--run-as`
+  (`the_binary_passes_every_check_under_run_as`).
+- **`HOME`.** `--home` if given, otherwise the user's own home from the passwd database (execd's would be root's).
+- **`cwd` and `--root`.** A command with no `cwd` runs in `--root`, which must be writable by the target. execd says at startup
+  when it is not (`--root ... is not writable by uid ...`), and a command whose directory the target cannot enter exits 127 with
+  `Permission denied`, as it would for any user.
+- **Jobs.** The supervisor stays execd (root) and signals the user's groups; `kill`, `wipe`, a dropped hold and the shutdown
+  sweep all work (`tests/security.rs` kills a user's job by `SIGTERM` to execd).
+- **A missing program** is exit 127 with `No such file or directory`, as without `--run-as`. A job whose program is missing is
+  a started job that ends 127, not a `500` at `start`.
+- **argv.** For the instant between the spawn and the `exec`, a command's `/proc/<pid>/cmdline` is the helper's: the uid, gid,
+  groups, directory, command and arguments. The bearer is never among them.
+
+### What is deliberately not done
+
+- No rate limiting, lockout or TLS: put execd behind the network boundary that has them.
+- No `no_new_privs`: it would break `sudo` in a sandbox image that wants it.
+- A kill is of a process group. A command that daemonizes out of its group (`setsid`) survives the kill of its job, a timeout and
+  the shutdown sweep, with or without `--run-as`; a cgroup per job would close that, and execd does not own one.
+- A capability held by execd as an _ambient_ capability would reach the commands (`--run-as` from a non-root execd with ambient
+  `CAP_SETUID`): run execd as root, or with those capabilities permitted and effective only.
+
+### How it is tested
+
+| test                                            | proves                                                                                                                                                                                                                                                                                                                                                                             |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tests/security.rs`                             | the bearer is in none of a command's `env`, its parent's environ, or any readable `/proc/*/environ` (by environment, by file, for streams and jobs); fail-closed start in all its cases; `--run-as` refusals; as root, a user who cannot read execd's memory, environ or a root-owned bearer file, gets the right uid, groups, `HOME` and directory, and is killed by the shutdown |
+| `tests/auth_matrix.rs`                          | path, method, `Authorization`, body-framing and smuggling cases over HTTP/1.1 and h2c, each refused and each proven to have run nothing by a command that would create a marker file; a control per family proves the vehicle runs                                                                                                                                                 |
+| `tests/jobtable.rs`                             | the job table against a model, over random operations (`EXECD_JOBS_SEED`, `EXECD_JOBS_CASES`, `EXECD_JOBS_SECS`, `EXECD_JOBS_OPS`; a failure prints its seed and a shrunk list)                                                                                                                                                                                                    |
+| `tests/parsers.rs`, `fuzz/` (`request`, `ring`) | no body panics the parsers, every refused body is a `4xx`, and the output ring agrees with a plain buffer for every offset and size                                                                                                                                                                                                                                                |
+| `tests/conformance.rs`                          | the full verifier, also at `trace` level (then its log is searched for the bearer) and under `--run-as`                                                                                                                                                                                                                                                                            |
+
+The tests that need root run execd through `sudo -n` (or as root) and print `SKIPPED` where a host gives them neither. The long
+runs (ten minutes of job-table seeds, two of parser seeds, four of each fuzz target) are in `.github/workflows/deep.yml`.
 
 ## Process model
 
