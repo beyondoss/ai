@@ -33,6 +33,70 @@ ignore = [
   "RUSTSEC-2026-0099",
   "RUSTSEC-2026-0049",
 
+  # zstd 0.13.3 / zstd-safe 7.2.4: RUSTSEC-2026-0391 and 0395..0406. Pulled ONLY by pingora 0.9
+  # (pingora-core, pingora-header-serde; pingora-cache and pingora-proxy through them), which pins
+  # `zstd ^0.13` and `zstd-safe ^7.1`; the patched lines are zstd >= 0.14.3 and zstd-safe >= 8.2.0.
+  # beyond-ai-agent-core is already on zstd 0.14.3, and zstd-sys is at 2.1.2 (RUSTSEC-2026-0410
+  # fixed, no ignore). Upstream: https://github.com/cloudflare/pingora/issues/1072 and
+  # https://github.com/cloudflare/pingora/pull/1073 (open, unreleased). REMOVE every entry in this
+  # block when pingora releases with zstd >= 0.14.3 / zstd-safe >= 8.2.0, and bump pingora.
+  #
+  # Exposure, checked in the pingora 0.9.0 sources. pingora's only zstd call sites are
+  #   pingora-core  protocols/http/compression/zstd.rs:41,61,66,92  zstd::stream::write::Encoder
+  #                 ::new / ::with_dictionary, write_all, do_finish   (downstream response compression)
+  #   pingora-header-serde  thread_zstd.rs:106-113,138,148,159,170  CCtx::create / ::compress /
+  #                 ::compress_using_cdict, DCtx::create / ::decompress / ::decompress_using_ddict,
+  #                 CDict::create, DDict::create (one-shot calls on thread-local contexts)
+  #                 dict.rs:25  zstd::dict::from_files (dictionary training, `dict::train`)
+  # and neither is reached by the gateway:
+  #  - Response compression: the gateway does not override `init_downstream_modules`, so pingora's
+  #    default installs `ResponseCompressionBuilder::enable(0)`, which is disabled (level 0:
+  #    `Algorithm::compressor` returns None, compression/mod.rs:471). Nothing in crates/gateway
+  #    names a compression module or `adjust_level`.
+  #  - Header serialization: only `CacheMeta::serialize/deserialize` (pingora-cache meta.rs:890-900)
+  #    reach pingora-header-serde, and their only in-tree callers are the `MemCache` storage
+  #    (memory.rs:301-445). The gateway never uses `MemCache`; its one pingora cache storage is
+  #    `NoStore` (crates/gateway/src/drain.rs:85-130, enabled at :140), which stores nothing.
+  #    `set_compression_dict_*` and `dict::train` are never called.
+  #  - Cargo features: zstd-safe 7.2.4 is built with arrays, legacy, std, zdict_builder only. The
+  #    `experimental`, `seekable` and `zstdmt` features are off.
+  #
+  # Per advisory (API: pingora call site: verdict, all unreachable):
+  #  0391 zstd::stream::raw::{Encoder,Decoder}::with_context: none; pingora uses Encoder::new /
+  #       ::with_dictionary, which build their own context (zstd-0.13.3 stream/write/mod.rs:174-190).
+  #  0395 CCtx::set_parameter with CParameter::StableInBuffer: none; the parameter is
+  #       `experimental`-gated (zstd-safe lib.rs:651) and off.
+  #  0396, 0398, 0405 zstd_safe::seekable::*: none; module is `seekable`-gated (lib.rs:30) and off.
+  #  0397 OutBuffer::around_pos: none (pingora and zstd 0.13.3 never call it).
+  #  0399 CCtx::init_using_cdict, DCtx::init_using_ddict: none; `experimental`-gated and off.
+  #  0400 DCtx::decompress / decompress_using_ddict: CALLED (header-serde thread_zstd.rs:138-170),
+  #       but the trigger is a one-shot call on a context that has an unfinished stream. Those
+  #       contexts are private thread-locals used only for one-shot calls; pingora never calls
+  #       decompress_stream or compress_stream, so no stream can be open on them.
+  #  0401 zstd_safe::train_from_buffer: only through dict::train (dict.rs:25), never called outside
+  #       pingora's own tests, and the sample sizes would be file lengths, not attacker input.
+  #  0402, 0404 CCtx::try_clone, DCtx::try_clone: none; `experimental`-gated and off.
+  #  0403 DCtx::decompress_stream: none; pingora uses no zstd decoder outside its tests.
+  #  0406 CCtx::load_dictionary / ref_cdict / ref_prefix / set_parameter etc. while a multithreaded
+  #       frame is unfinished: needs CParameter::NbWorkers > 0, which requires the `zstdmt`
+  #       feature (lib.rs:2233); off. Encoder::with_dictionary loads the dictionary into a fresh
+  #       context.
+  # If the gateway ever enables response compression, a cache storage that serializes metadata, or
+  # a zstd feature above, re-check this block.
+  "RUSTSEC-2026-0391",
+  "RUSTSEC-2026-0395",
+  "RUSTSEC-2026-0396",
+  "RUSTSEC-2026-0397",
+  "RUSTSEC-2026-0398",
+  "RUSTSEC-2026-0399",
+  "RUSTSEC-2026-0400",
+  "RUSTSEC-2026-0401",
+  "RUSTSEC-2026-0402",
+  "RUSTSEC-2026-0403",
+  "RUSTSEC-2026-0404",
+  "RUSTSEC-2026-0405",
+  "RUSTSEC-2026-0406",
+
   # protobuf 2.28.0: DoS via uncontrolled recursion when PARSING protobuf. Pulled by prometheus
   # 0.13 (both our direct dep — kept at 0.13 to share pingora-core's default registry — and
   # pingora-core 0.9 itself). We never parse untrusted protobuf: metrics are exposed in the text
