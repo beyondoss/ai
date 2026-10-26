@@ -39,6 +39,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
+use support::baseline::Baseline;
 use support::{Execd, http::post};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -321,7 +322,7 @@ impl Job {
                 Phase::Running => format!("start-{l}\n"),
                 _ => format!("start-{l}\ndone-{l}\n"),
             },
-            Kind::Quick => format!("q-{l}\n"),
+            Kind::Quick => format!("q-{l}\n{}", "p".repeat(QUICK_PAD)),
         }
     }
 
@@ -533,6 +534,9 @@ struct World {
     /// How many operations had something to act on, by kind: a run whose kills all hit nothing
     /// proves nothing.
     stats: std::collections::BTreeMap<&'static str, usize>,
+    /// Where execd spools job output, and what `/proc` showed of it when it was idle and new.
+    jobs_base: tempfile::TempDir,
+    baseline: Baseline,
 }
 
 impl World {
@@ -628,7 +632,15 @@ impl World {
 
     fn new(seed: u64) -> Self {
         let bearer = format!("jobs-{seed}-{}", std::process::id());
-        let execd = Execd::start(&[], &[("EXECD_BEARER", &bearer)]);
+        let jobs_base = tempfile::tempdir().unwrap();
+        let execd = Execd::start(
+            &[],
+            &[
+                ("EXECD_BEARER", &bearer),
+                ("EXECD_JOBS_DIR", jobs_base.path().to_str().unwrap()),
+            ],
+        );
+        let baseline = Baseline::take(&execd);
         let addr = SocketAddr::V4(execd.addr);
         let (recv_addr, callbacks) = receiver_blocking();
         Self {
@@ -643,6 +655,8 @@ impl World {
             recv_addr,
             notified: HashSet::new(),
             stats: std::collections::BTreeMap::new(),
+            jobs_base,
+            baseline,
         }
     }
 
@@ -893,7 +907,7 @@ impl World {
                 );
                 let want = match job.kind {
                     Kind::Gate => format!("start-{0}\ndone-{0}\n", job.label),
-                    _ => format!("q-{}\n", job.label),
+                    _ => job.full_output(),
                 };
                 ensure!(
                     String::from_utf8_lossy(&out) == want,
@@ -1489,6 +1503,22 @@ impl World {
         Ok(())
     }
 
+    /// Every scope wiped and every connection closed: execd is back at what it showed when new
+    /// (same descriptors and threads, no zombie child, an empty jobs directory).
+    async fn baseline_check(&self) -> Result<(), String> {
+        for s in 0..SCOPES.len() {
+            let a = self.op(s, json!({ "op": "wipe", "grace_ms": 200 })).await;
+            ensure!(a.status == 200, "wipe: {} {}", a.status, a.json());
+            ensure!(a.json()["survivors"] == json!([]), "wipe left survivors");
+        }
+        let base = self.jobs_base.path().to_owned();
+        let before = &self.baseline;
+        let settle = Duration::from_secs(15);
+        // The check sleeps; keep it off the runtime's threads.
+        tokio::task::block_in_place(|| before.restored(&base, settle))
+            .map_err(|e| format!("execd is not back at its starting state: {e}"))
+    }
+
     /// `SIGTERM`: every process of every job ever started must be gone, however it ended.
     async fn shutdown_check(&mut self) -> Result<(), String> {
         let pid = nix::unistd::Pid::from_raw(i32::try_from(self.execd.pid()).unwrap());
@@ -1521,7 +1551,10 @@ impl World {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let log = self.execd.log();
-        ensure!(!log.contains("panicked"), "execd panicked during shutdown");
+        ensure!(
+            !log.contains("panicked"),
+            "execd panicked during shutdown:\n{log}"
+        );
         Ok(())
     }
 }
@@ -1549,6 +1582,10 @@ fn not_found(a: &support::http::Answer) -> bool {
     a.status == 404 && a.json() == json!({ "error": "no such job" })
 }
 
+/// What a quick job writes after its label: more than one 64 KiB chunk, so its output reaches the
+/// jobs directory and the end-of-run check of that directory has something to find.
+const QUICK_PAD: usize = 70_000;
+
 fn script(kind: Kind, pids: &Path, gate: &Path, l: &str) -> String {
     let (p, g) = (pids.display(), gate.display());
     match kind {
@@ -1564,7 +1601,9 @@ fn script(kind: Kind, pids: &Path, gate: &Path, l: &str) -> String {
         Kind::GateLeft => format!(
             "echo $$ >> '{p}'; sleep 600 & echo $! >> '{p}'; echo start-{l}; while [ ! -e '{g}' ]; do sleep 0.05; done; echo done-{l}; exit 6"
         ),
-        Kind::Quick => format!("echo $$ >> '{p}'; echo q-{l}; exit 7"),
+        Kind::Quick => format!(
+            "echo $$ >> '{p}'; echo q-{l}; head -c {QUICK_PAD} /dev/zero | tr '\\0' p; exit 7"
+        ),
     }
 }
 
@@ -1603,6 +1642,11 @@ async fn run_case(seed: u64, ops: &[Op]) -> Result<(), String> {
     if std::env::var_os("EXECD_JOBS_STATS").is_some() {
         println!("seed {seed}: {:?}", w.stats);
     }
+    let returned = if broke.is_none() {
+        w.baseline_check().await
+    } else {
+        Ok(())
+    };
     // However the run ended, execd is stopped the polite way, so a failed case leaves no job behind.
     let down = w
         .shutdown_check()
@@ -1610,7 +1654,7 @@ async fn run_case(seed: u64, ops: &[Op]) -> Result<(), String> {
         .map_err(|e| format!("at shutdown: {e}"));
     match broke {
         Some(e) => Err(e),
-        None => down,
+        None => returned.and(down),
     }
 }
 

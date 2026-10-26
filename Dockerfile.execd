@@ -15,12 +15,13 @@ ARG RUST_VERSION=1.92
 FROM rust:${RUST_VERSION}-bookworm AS build
 # `musl-tools` installs a native `musl-gcc`, so each arch builds natively on its own runner (see
 # publish.yml) with no cross-linker.
-RUN apt-get update && apt-get install -y --no-install-recommends musl-tools \
+RUN apt-get update && apt-get install -y --no-install-recommends musl-tools python3 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-# The agent image's flag, for the same musl reason: a static-pie musl binary segfaults at startup in
-# some environments.
-ENV RUSTFLAGS="-C relocation-model=static"
+# Profile-guided, as release-execd.yml (which has the reasoning): instrument, train, merge, rebuild.
+# `RUSTFLAGS` replaces cargo-config rustflags, so `-C relocation-model=static` (a static-pie musl
+# binary segfaults at startup in some environments) is repeated in each stage. The base image's
+# rustup has no `llvm-tools`, so it is added for `llvm-profdata`.
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -28,9 +29,18 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     set -eu; \
     target="$(uname -m)-unknown-linux-musl"; \
     rustup target add "$target"; \
+    rustup component add llvm-tools-preview; \
     export "CC_$(echo "$target" | tr '-' '_')=musl-gcc"; \
     export "CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')_LINKER=musl-gcc"; \
-    cargo build --release --locked --target "$target" -p beyond-ai-execd; \
+    prof=/tmp/pgo; rm -rf "$prof"; mkdir -p "$prof/raw"; \
+    profdata="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/^host: /{print $2}')/bin/llvm-profdata"; \
+    RUSTFLAGS="-Cprofile-generate=$prof/raw -C relocation-model=static" \
+        cargo build --release --locked --target "$target" -p beyond-ai-execd; \
+    python3 .github/pgo-train-execd.py "target/$target/release/execd" "$prof/raw"; \
+    "$profdata" merge -o "$prof/merged.profdata" "$prof"/raw/*.profraw; \
+    rm -rf "target/$target/release"; \
+    RUSTFLAGS="-Cprofile-use=$prof/merged.profdata -C relocation-model=static" \
+        cargo build --release --locked --target "$target" -p beyond-ai-execd; \
     cp "target/$target/release/execd" /execd
 
 FROM scratch

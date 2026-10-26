@@ -50,7 +50,7 @@ async fn victim() {
     )
     .await;
     assert_eq!(started.status, 200);
-    // Its own file: the job's (root's, under `--run-as`-less root execd) cannot be rewritten by us.
+    // Its own file: the job's (root's, under `EXECD_RUN_AS`-less root execd) cannot be rewritten by us.
     std::fs::write(format!("{file}.execd"), execd.pid().to_string()).unwrap();
     std::thread::sleep(Duration::from_secs(120));
 }

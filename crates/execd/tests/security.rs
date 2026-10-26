@@ -1,5 +1,5 @@
 //! What the bearer and the sandbox are protected from, against the real binary: the token never
-//! reaches a command, execd refuses to start open on a network, and `--run-as` puts execd's memory,
+//! reaches a command, execd refuses to start open on a network, and `EXECD_RUN_AS` puts execd's memory,
 //! environment and files out of a command's reach.
 //!
 //! The root-only tests run execd through `sudo -n` (or as root) and say `SKIPPED` on a host that
@@ -259,7 +259,7 @@ async fn it_starts_open_on_loopback_and_on_a_network_only_when_told_or_secured()
     assert_eq!(post(addr, &[], &req).await.status, 200);
 }
 
-// --- --run-as, without root -------------------------------------------------------------------
+// --- EXECD_RUN_AS, without root -------------------------------------------------------------------
 
 fn my_uid() -> u32 {
     std::fs::metadata("/proc/self").unwrap().uid()
@@ -292,7 +292,7 @@ fn run_as_refuses_when_execd_cannot_switch() {
     assert!(!status.success() && log.contains("name its gid"), "{log}");
 }
 
-// --- --run-as, as root ------------------------------------------------------------------------
+// --- EXECD_RUN_AS, as root ------------------------------------------------------------------------
 
 fn sudo(args: &[&str]) {
     let ok = Command::new("sudo")
@@ -324,7 +324,7 @@ async fn run_as_refuses_root_when_execd_is_root() {
     );
 }
 
-/// Under `--run-as`, a command is another user and cannot read execd's memory, its environment or a
+/// Under `EXECD_RUN_AS`, a command is another user and cannot read execd's memory, its environment or a
 /// 0600 bearer file execd owns; a request still works end to end, from the right directory and home.
 #[tokio::test]
 async fn under_run_as_a_command_cannot_reach_execd() {
@@ -421,7 +421,7 @@ async fn under_run_as_a_command_cannot_reach_execd() {
     drop(decoy);
 }
 
-/// `--home` still wins over the user's own home, and a `SIGTERM` to execd (root) kills the jobs and
+/// `EXECD_HOME` still wins over the user's own home, and a `SIGTERM` to execd (root) kills the jobs and
 /// commands of the user it switched to.
 #[tokio::test]
 async fn under_run_as_home_is_configurable_and_shutdown_kills_the_users_jobs() {
@@ -484,7 +484,7 @@ async fn under_run_as_home_is_configurable_and_shutdown_kills_the_users_jobs() {
     }
 }
 
-/// Everything the spec lets a command depend on holds under `--run-as`: stdin, a `cwd` the user
+/// Everything the spec lets a command depend on holds under `EXECD_RUN_AS`: stdin, a `cwd` the user
 /// can enter, an exit status, a missing program, a directory the user may not enter.
 #[tokio::test]
 async fn under_run_as_the_envelope_behaves() {
@@ -532,7 +532,7 @@ async fn under_run_as_the_envelope_behaves() {
     assert_eq!(frames.last().unwrap()["exit_code"], 3, "{frames:?}");
 }
 
-/// A `--root` the user cannot use is said so at startup, and a command then fails as the user.
+/// An `EXECD_ROOT` the user cannot use is said so at startup, and a command then fails as the user.
 #[tokio::test]
 async fn under_run_as_an_unusable_root_is_reported_at_startup() {
     let Some(execd) = Execd::start_as_root_in(
@@ -653,7 +653,7 @@ async fn notify_tokens_and_callback_urls_never_reach_the_log() {
     }
 }
 
-/// Under `--run-as`, the jobs directory is execd's: a command (another user) can neither list it
+/// Under `EXECD_RUN_AS`, the jobs directory is execd's: a command (another user) can neither list it
 /// nor read a chunk file of a job's retained output, while execd itself still reads the output back.
 #[tokio::test]
 async fn under_run_as_a_command_cannot_list_or_read_the_jobs_dir() {

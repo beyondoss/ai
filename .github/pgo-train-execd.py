@@ -67,11 +67,11 @@ def main():
     port = free_port()
     with tempfile.TemporaryDirectory() as root:
         open(os.path.join(root, "f"), "wb").write(b"x" * 4096)
+        # Configured by environment, which every execd build reads (flags are going away).
         env = dict(os.environ, LLVM_PROFILE_FILE=os.path.join(profdir, "execd-%p.profraw"),
                    EXECD_LISTEN=f"127.0.0.1:{port}", EXECD_ROOT=root, EXECD_HOME=root,
-                   EXECD_KEPT_JOBS_SURVIVE_IDLE="1")
-        p = subprocess.Popen([exe],
-                             env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                   EXECD_KEPT_JOBS_SURVIVE_IDLE="true")
+        p = subprocess.Popen([exe], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
         try:
             for _ in range(200):

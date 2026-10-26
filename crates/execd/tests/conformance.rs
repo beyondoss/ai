@@ -58,7 +58,7 @@ async fn the_binary_passes_every_check_v11_to_v14() {
 }
 
 /// The verifier cannot tell it is talking to an endpoint whose commands run as another user: every
-/// check passes under `--run-as`, with the bearer in the environment. Needs root (or `sudo -n`).
+/// check passes under `EXECD_RUN_AS`, with the bearer in the environment. Needs root (or `sudo -n`).
 #[tokio::test]
 async fn the_binary_passes_every_check_under_run_as() {
     let Some(execd) = Execd::start_as_root(

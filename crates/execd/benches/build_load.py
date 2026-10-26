@@ -44,7 +44,8 @@ def main():
     a = ap.parse_args()
     port = free_port()
     root = tempfile.mkdtemp()
-    p = subprocess.Popen([a.bin, "--listen", f"127.0.0.1:{port}", "--root", root, "--home", root, "--log-level", "off"],
+    env = dict(os.environ, EXECD_LISTEN=f"127.0.0.1:{port}", EXECD_ROOT=root, EXECD_HOME=root, EXECD_LOG="off")
+    p = subprocess.Popen([a.bin], env=env,
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         for _ in range(500):

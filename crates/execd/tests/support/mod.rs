@@ -4,6 +4,7 @@
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+pub mod baseline;
 pub mod http;
 
 use beyond_ai_test_support::ports;

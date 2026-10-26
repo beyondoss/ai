@@ -197,7 +197,8 @@ What the spec and the conformance verifier assume, and what holds:
 | ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `tests/security.rs`                             | the bearer is in none of a command's `env`, its parent's environ, or any readable `/proc/*/environ` (by environment, by file, for streams and jobs); fail-closed start in all its cases; `EXECD_RUN_AS` refusals; as root, a user who cannot read execd's memory, environ or a root-owned bearer file, gets the right uid, groups, `HOME` and directory, and is killed by the shutdown |
 | `tests/auth_matrix.rs`                          | path, method, `Authorization`, body-framing and smuggling cases over HTTP/1.1 and h2c, each refused and each proven to have run nothing by a command that would create a marker file; a control per family proves the vehicle runs                                                                                                                                                     |
-| `tests/jobtable.rs`                             | the job table against a model, over random operations (`EXECD_JOBS_SEED`, `EXECD_JOBS_CASES`, `EXECD_JOBS_SECS`, `EXECD_JOBS_OPS`; a failure prints its seed and a shrunk list)                                                                                                                                                                                                        |
+| `tests/jobtable.rs`                             | the job table against a model, over random operations (`EXECD_JOBS_SEED`, `EXECD_JOBS_CASES`, `EXECD_JOBS_SECS`, `EXECD_JOBS_OPS`; a failure prints its seed and a shrunk list); at the end of every case, once every scope is wiped, execd is back at its starting state (see `tests/baseline.rs`)                                                                                    |
+| `tests/baseline.rs`                             | after a mixed workload (v1.1, streams finished and dropped, jobs past the 8 MiB spool, kills, removes, a wipe), `/proc` shows the starting open fds and threads, no zombie child, and an empty jobs directory                                                                                                                                                                          |
 | `tests/parsers.rs`, `fuzz/` (`request`, `ring`) | no body panics the parsers, every refused body is a `4xx`, and the output ring agrees with a plain buffer for every offset and size                                                                                                                                                                                                                                                    |
 | `tests/conformance.rs`                          | the full verifier, also at `debug` level (then its log is searched for the bearer) and under `EXECD_RUN_AS`                                                                                                                                                                                                                                                                            |
 
@@ -434,8 +435,9 @@ host differs from a VM; "2 CPUs" rows pin the server with `taskset -c 0,1`.
 (a) ships. (b) was already true: the callback client is built on the first v1.4 attempt, so nothing of reqwest, rustls or ring
 runs at startup. (c) and (d) are bounds, measured by removing the code, not by a replacement: an `EnvFilter` pulls in a regex
 engine, and clap's parser accounts for the 284 KiB of (d). Both are now replaced: `src/log.rs` is a one-knob logger and
-`src/config.rs` reads environment variables, with no flags at all (see "Footprint of the replacements" below). PGO follows `release-agent.yml` and `.github/pgo-train-execd.py` trains it; it
-belongs in the distribution build (`Dockerfile.execd`, `release-execd.yml`, on #536), not in a cargo profile. On 2 CPUs the
+`src/config.rs` reads environment variables, with no flags at all (see "Footprint of the replacements" below). (f) ships in the
+distribution build: `release-execd.yml` and `Dockerfile.execd` follow `release-agent.yml`, and `.github/pgo-train-execd.py` trains it
+(re-measured on the shipped musl binary, n=3: 2728 to 2544 KiB, -185). It belongs there, not in a cargo profile. On 2 CPUs the
 multi-thread build idles at 2960 and `current_thread` at 2852 (-108), because tokio then starts 2 workers, not 16.
 
 **Footprint of the replacements** (no clap, no tracing-subscriber, 16 KiB frames, the stale-directory scan off the serving path;
@@ -533,7 +535,7 @@ memory win for a rate loss nothing in a sandbox reaches, so it ships as the defa
 per CPU. mimalloc is a large throughput win on one thread (+60%, -40% CPU per GB), because musl's malloc is the cost of the
 64 KiB frame buffers, but it costs 408 KiB at idle and keeps 4 MiB after a burst, so it is not enabled; the `mimalloc` cargo
 feature builds it. Reusing the frame buffer would take the allocator out of the stream path without either cost; that is a
-change to the stream code and is not made here. PGO is the remaining lever, worth about 0.3 MiB of a 2.4 MiB process.
+change to the stream code and is not made here. With (c) and (d) done, nothing else in the process is as large.
 
 **Wakeups** (context switches per second over a window, all threads, static musl build; `benches/wakeups.py`,
 `benches/results/2026-10-25-wakeups.json`):
