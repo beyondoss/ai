@@ -6,3 +6,5 @@ dist
 .env.*
 .claude
 .github
+# execd's PGO training script (Dockerfile.execd).
+!.github/pgo-train-execd.py
