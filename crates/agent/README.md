@@ -176,18 +176,70 @@ and frame reference is the module doc of `src/serve/mod.rs` and
 
 ## Run the tools somewhere else
 
-`--exec-url <URL>` sends every tool call, `bash` included, to a remote
-endpoint instead of running it on the host. The model sees the same tools. The
-agent knows one protocol; it does not create or destroy sandboxes.
+`--exec-url <URL>` sends every tool call, `bash` included, to a remote endpoint instead of running it on the host. The model
+sees the same tools, with the same schemas and descriptions, so the prompt cache stays warm. The agent knows one protocol; it
+does not create or destroy sandboxes.
+
+**Put [`execd`](../execd/README.md) in the sandbox image and you are done.** It is the endpoint, already written:
+
+- **Conformant.** Exec protocol v1.1 to v1.4 (streaming, kill on disconnect, sandbox-native jobs, job-end notify): 32/32
+  conformance checks live on AWS Fargate and on E2B.
+- **Small.** One 5 MB static binary (linux amd64 and arm64), about 2,372 KiB idle PSS, zero idle wakeups.
+- **Isolated.** Under `EXECD_RUN_AS` the commands run as another user and cannot read execd's token or memory.
+- **Fails closed.** Without a bearer token it refuses to start on any address but loopback.
+
+Every recipe below is proven. Pick the one that matches how you build the sandbox.
+
+**Dockerfile.** The image is `FROM scratch` with the binary at `/execd`:
+
+```dockerfile
+COPY --from=ghcr.io/beyondoss/execd:v0.1.11 /execd /usr/local/bin/execd
+ENV EXECD_LISTEN=0.0.0.0:8080 EXECD_BEARER_FILE=/run/execd-bearer EXECD_RUN_AS=sandbox
+CMD ["/usr/local/bin/execd"]
+```
+
+Write the token to `/run/execd-bearer` (root-owned, mode 0600) at start, and create the `sandbox` user the commands run as.
+
+**Any image with a shell.** The installer checks the SHA-256 and is verified in Alpine and Debian:
+
+```sh
+curl -fsSL https://github.com/beyondoss/ai/releases/latest/download/install-execd.sh | sh
+```
+
+**E2B.** Upload the binary and a bearer file, then start execd as root with `EXECD_RUN_AS=user`. E2B's VM has passwordless
+`sudo` and terminates TLS on `https://<port>-<sandbox id>.e2b.app`, so there is nothing else to run
+([`deploy/demo/e2b.sh`](../../deploy/demo/e2b.sh) is the working script):
+
+```sh
+sudo chown root:root ~/execd ~/bearer && sudo chmod 600 ~/bearer
+sudo env EXECD_LISTEN=0.0.0.0:8081 EXECD_ROOT=~/workspace EXECD_HOME=/home/user \
+  EXECD_RUN_AS=user EXECD_BEARER_FILE=~/bearer setsid nohup ~/execd >/tmp/execd.log 2>&1 &
+```
+
+**Point the agent at it:**
 
 ```sh
 beyond-ai-agent run \
-  --exec-url https://exec.internal/run \
-  --exec-header 'Authorization: Bearer ...' \
+  --exec-url https://8081-<sandbox id>.e2b.app/ \
+  --exec-header "Authorization: Bearer $TOKEN" \
   "fix the failing test under /srv/app"
 ```
 
-The base protocol (v1.1) is one `POST`:
+`--exec-url` and `--exec-header` also work with `serve`. The agent probes the endpoint at attach and uses the highest version
+it finds. An endpoint's response is capped at 16 MiB (`--exec-max-response-bytes`; keep `EXECD_MAX_RESPONSE_BYTES` equal to
+it); a larger one is an error, not a truncation.
+
+**Security, in three lines.** Run execd as root with `EXECD_RUN_AS`. Give it a bearer file. Put TLS in front of it, or use the
+provider's (E2B does). What each control guarantees is in
+[execd's ARCHITECTURE.md](../execd/ARCHITECTURE.md#security).
+
+**Configuration** is `EXECD_*` environment variables only. [The table is in execd's README](../execd/README.md#configuration).
+
+### Implementing your own endpoint
+
+The spec is the module doc of `src/exec_endpoint.rs`; the prose is
+[Running the tools against a remote exec endpoint](ARCHITECTURE.md#running-the-tools-against-a-remote-exec-endpoint). The base
+protocol (v1.1) is one `POST`:
 
 ```jsonc
 // request; cwd and stdin_base64 (standard base64, written to stdin) are optional
@@ -196,18 +248,13 @@ The base protocol (v1.1) is one `POST`:
 { "exit_code": 0, "stdout": "...", "stderr": "..." }
 ```
 
-Later versions are opt-in per endpoint, probed at attach: v1.2 streams
-output as NDJSON frames and treats a closed connection as the kill signal;
-v1.3 lets the endpoint own background jobs so they outlive an agent replica;
-v1.4 has the sandbox call back when a kept job ends
-([`exec-notify`](../exec-notify/README.md)). The spec is the module doc of
-`src/exec_endpoint.rs`; the prose is
-[Running the tools against a remote exec endpoint](ARCHITECTURE.md#running-the-tools-against-a-remote-exec-endpoint).
-An endpoint's response is capped at 16 MiB (`--exec-max-response-bytes`); a
-larger one is an error, not a truncation.
+v1.2 streams output as NDJSON frames and treats a closed connection as the kill signal; v1.3 lets the endpoint own background
+jobs so they outlive an agent replica; v1.4 has the sandbox call back when a kept job ends
+([`exec-notify`](../exec-notify/README.md)). They are opt-in per endpoint and probed at attach. A v1.1-only endpoint works, but
+`bash` cannot stream, cannot tell a silent command from a hung one, and cannot kill. The conformance suite below grades any
+endpoint.
 
-Try it with the `execd` endpoint, no model needed. In one
-terminal:
+Try it locally with execd, no model needed. In one terminal:
 
 ```sh
 mkdir -p /tmp/ws /tmp/ws-home
@@ -215,8 +262,7 @@ EXECD_LISTEN=127.0.0.1:8081 EXECD_ROOT=/tmp/ws EXECD_HOME=/tmp/ws-home \
   cargo run -p beyond-ai-execd
 ```
 
-In another, run `bash` through it with a `serve` command (the dummy key only
-satisfies startup):
+In another, run `bash` through it with a `serve` command (the dummy key only satisfies startup):
 
 ```sh
 (echo '{"id":"1","type":"bash","command":"pwd"}'; sleep 3) \
