@@ -7,12 +7,12 @@ same schemas, same descriptions, so the prompt cache stays warm.
 A hand-written endpoint usually stops at v1.1 (one POST, one answer), where `bash` cannot stream, cannot tell a silent command
 from a hung one, and cannot kill. execd also speaks:
 
-| version | what the agent gets                                                                                                        |
-| ------- | -------------------------------------------------------------------------------------------------------------------------- |
-| v1.1    | one request, one answer, with stdin                                                                                        |
-| v1.2    | streaming: the connection is the command's lifetime. `bash` shows progress, and closing the stream kills the process group |
-| v1.3    | sandbox-native jobs: a silent command becomes a job that survives the agent replica moving                                 |
-| v1.4    | job-end notify: the sandbox calls back when a kept job ends                                                                |
+| version | what the agent gets                                                                                                                                                                                          |
+| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| v1.1    | one request, one answer, with stdin                                                                                                                                                                          |
+| v1.2    | streaming: the connection is the command's lifetime. `bash` shows progress, a silent command is handed back as a background job instead of blocking the turn, and closing the stream kills the process group |
+| v1.3    | sandbox-native jobs: jobs live in the endpoint, survive the agent replica moving, and their output is readable from an offset                                                                                |
+| v1.4    | job-end notify: the sandbox calls back when a kept job ends                                                                                                                                                  |
 
 Lifecycle stays yours. execd never creates or destroys a sandbox, so it has nothing vendor-specific in it: E2B, Modal,
 Daytona, Fargate, docker, Kubernetes or your own.
