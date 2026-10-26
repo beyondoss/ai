@@ -18,6 +18,48 @@ pub struct Execd {
     pub dir: tempfile::TempDir,
     /// Started through `sudo`: the real execd's pid (the child is `sudo`).
     root_pid: Option<u32>,
+    /// Kills execd and everything under it if the test process dies without running `Drop`.
+    _watchdog: Watchdog,
+}
+
+/// What survives a test process that dies by `SIGKILL` (or any way that skips destructors): nothing.
+/// A detached shell watches the owning test process; when it is gone it kills the target and every
+/// descendant (leaves first, so nothing is orphaned before it is listed), as root through `sudo`
+/// when the target is root's. `PR_SET_PDEATHSIG` would not do: it cannot be set without `unsafe`,
+/// it does not reach what execd's own children left behind, and `sudo` clears it. Dropping the
+/// watchdog (the normal end of a test) kills the shell.
+pub struct Watchdog(Child);
+
+const WATCH: &str = r#"
+owner=$0; target=$1; as_root=$2
+while kill -0 "$owner" 2>/dev/null; do sleep 0.2; done
+S=; if [ "$as_root" = 1 ]; then S="sudo -n"; target=$(cat "$target" 2>/dev/null); fi
+[ -n "$target" ] || exit 0
+kt() { for c in $(pgrep -P "$1"); do kt "$c"; done; $S kill -9 "$1" 2>/dev/null; }
+kt "$target"
+"#;
+
+impl Watchdog {
+    /// Watch the current process on behalf of `target`: a pid, or with `as_root` the path of a file
+    /// holding one (the pid is only known once the server has written it).
+    pub fn new(target: &str, as_root: bool) -> Self {
+        let child = Command::new("sh")
+            .args(["-c", WATCH, &std::process::id().to_string(), target])
+            .arg(if as_root { "1" } else { "0" })
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        Self(child)
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 impl Execd {
@@ -43,20 +85,23 @@ impl Execd {
             cmd.env(k, v);
         }
         let child = cmd.spawn().unwrap();
+        // Owned from the moment it exists, so a panic while waiting for it still stops it.
+        let mut me = Self {
+            _watchdog: Watchdog::new(&child.id().to_string(), false),
+            child,
+            addr: std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
+            dir,
+            root_pid: None,
+        };
         let deadline = Instant::now() + Duration::from_secs(20);
-        let addr = loop {
-            if let Some(a) = ports::listening_on(child.id()).first() {
+        me.addr = loop {
+            if let Some(a) = ports::listening_on(me.child.id()).first() {
                 break *a;
             }
             assert!(Instant::now() < deadline, "execd never listened");
             std::thread::sleep(Duration::from_millis(20));
         };
-        Self {
-            child,
-            addr,
-            dir,
-            root_pid: None,
-        }
+        me
     }
 
     /// Run `execd` with these arguments (no `--listen` or `--root` added) until it exits on its own,
@@ -88,6 +133,7 @@ impl Execd {
             cmd.env(k, v);
         }
         let mut child = cmd.spawn().unwrap();
+        let _watchdog = Watchdog::new(&child.id().to_string(), false);
         let deadline = Instant::now() + Duration::from_secs(20);
         let status = loop {
             if let Some(s) = child.try_wait().unwrap() {
@@ -152,10 +198,17 @@ impl Execd {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let mut child = cmd.spawn().unwrap();
+        let child = cmd.spawn().unwrap();
         let log = dir.path().join("execd.log");
+        let mut me = Self {
+            _watchdog: Watchdog::new(pidfile.to_str().unwrap(), true),
+            child,
+            addr: std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
+            dir,
+            root_pid: None,
+        };
         let deadline = Instant::now() + Duration::from_secs(20);
-        let addr = loop {
+        me.addr = loop {
             let text = std::fs::read_to_string(&log).unwrap_or_default();
             if let Some(a) = text
                 .split("listen=")
@@ -166,7 +219,7 @@ impl Execd {
                 break a;
             }
             assert!(
-                child.try_wait().unwrap().is_none(),
+                me.child.try_wait().unwrap().is_none(),
                 "execd exited before listening:\n{text}"
             );
             assert!(Instant::now() < deadline, "execd never listened:\n{text}");
@@ -177,12 +230,8 @@ impl Execd {
             .trim()
             .parse()
             .unwrap();
-        Some(Self {
-            child,
-            addr,
-            dir,
-            root_pid: Some(root_pid),
-        })
+        me.root_pid = Some(root_pid);
+        Some(me)
     }
 
     pub fn url(&self) -> String {
@@ -216,20 +265,33 @@ fn nix_is_root() -> bool {
 
 impl Drop for Execd {
     fn drop(&mut self) {
-        if let Some(pid) = self.root_pid {
-            let _ = Command::new("sudo")
-                .args(["-n", "kill", "-TERM", &pid.to_string()])
-                .stderr(Stdio::null())
-                .status();
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(20));
+        let root_pid = self.root_pid.or_else(|| {
+            std::fs::read_to_string(self.dir.path().join("execd.pid"))
+                .ok()
+                .and_then(|t| t.trim().parse().ok())
+        });
+        let signal = |sig: &str| {
+            if let Some(pid) = root_pid {
+                let _ = Command::new("sudo")
+                    .args(["-n", "kill", sig, &pid.to_string()])
+                    .stderr(Stdio::null())
+                    .status();
             }
-            let _ = Command::new("sudo")
-                .args(["-n", "kill", "-KILL", &pid.to_string()])
-                .stderr(Stdio::null())
-                .status();
+        };
+        if root_pid.is_some() {
+            signal("-TERM");
+        } else if let Ok(pid) = i32::try_from(self.child.id()) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGTERM,
+            );
         }
+        // execd's own SIGTERM sweep kills its commands and jobs; give it the time to.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        signal("-KILL");
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

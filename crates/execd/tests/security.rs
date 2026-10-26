@@ -66,7 +66,7 @@ impl Decoy {
     fn start(bearer: &str) -> Self {
         Self(
             Command::new("sleep")
-                .arg("300")
+                .arg("60")
                 .env("DECOY_BEARER", bearer)
                 .stdin(Stdio::null())
                 .spawn()
