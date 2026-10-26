@@ -33,11 +33,13 @@ mod http;
 mod jobs;
 mod notify;
 mod proc;
+mod spool;
 
 pub use notify::{
     ATTEMPT_TIMEOUT, CallbackAttempt, CallbackKind, NOTIFY_VERSION, NotifyTarget, parse_notify,
 };
 pub use proc::{become_subreaper, reap_once, reap_orphans};
+pub use spool::remove_stale_jobs_dirs;
 
 /// The spec's heartbeat: a stream silent for this long gets `{}` (v1.2).
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -81,6 +83,10 @@ pub struct Options {
     pub kept_jobs_survive_idle: bool,
     /// How much of each job's output is kept; see [`JOB_OUTPUT_RETENTION`].
     pub job_output_retention: usize,
+    /// Where the retained output of kept jobs is spooled, as chunk files under a directory of
+    /// execd's own (mode 0700); `None` is `$TMPDIR`, else `/tmp`. Use a disk-backed directory:
+    /// on tmpfs the output is RAM.
+    pub jobs_dir: Option<PathBuf>,
     /// The most output a v1.1 answer carries; see [`MAX_RESPONSE_BYTES`].
     pub max_response_bytes: usize,
     /// The most a request may carry; see [`MAX_REQUEST_BYTES`].
@@ -99,6 +105,7 @@ impl Options {
             native_jobs: true,
             kept_jobs_survive_idle: false,
             job_output_retention: JOB_OUTPUT_RETENTION,
+            jobs_dir: None,
             max_response_bytes: MAX_RESPONSE_BYTES,
             max_request_bytes: MAX_REQUEST_BYTES,
             observer: None,
@@ -122,6 +129,7 @@ impl std::fmt::Debug for Options {
             .field("native_jobs", &self.native_jobs)
             .field("kept_jobs_survive_idle", &self.kept_jobs_survive_idle)
             .field("job_output_retention", &self.job_output_retention)
+            .field("jobs_dir", &self.jobs_dir)
             .field("max_response_bytes", &self.max_response_bytes)
             .field("max_request_bytes", &self.max_request_bytes)
             .field("observer", &self.observer.is_some())
@@ -172,6 +180,8 @@ pub trait Observer: Send + Sync + 'static {
 pub(crate) struct Ctx {
     pub opts: Options,
     pub jobs: jobs::Jobs,
+    /// Where kept jobs' output is held.
+    pub spool: spool::JobsDir,
     pub groups: proc::Groups,
     /// The callback client, built on the first attempt: a deployment that never keeps a job with
     /// `notify` never pays for it.
@@ -199,7 +209,9 @@ impl Handle {
     pub async fn shutdown(self) -> usize {
         self.stop.cancel();
         let _ = self.accept.await;
-        self.ctx.groups.kill_all()
+        let killed = self.ctx.groups.kill_all();
+        self.ctx.spool.clean();
+        killed
     }
 }
 
@@ -207,9 +219,11 @@ impl Handle {
 /// tokio runtime.
 pub fn serve(listener: tokio::net::TcpListener, opts: Options) -> std::io::Result<Handle> {
     let addr = listener.local_addr()?;
+    let spool = spool::JobsDir::open(opts.jobs_dir.as_deref())?;
     let ctx = Arc::new(Ctx {
         opts,
         jobs: jobs::Jobs::default(),
+        spool,
         groups: proc::Groups::default(),
         client: tokio::sync::OnceCell::new(),
         epoch: Instant::now(),

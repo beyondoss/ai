@@ -37,6 +37,12 @@ struct Cli {
     #[arg(long, env = "EXECD_MAX_RESPONSE_BYTES", default_value_t = execd::MAX_RESPONSE_BYTES)]
     max_response_bytes: usize,
 
+    /// Where kept jobs' retained output (the last 8 MiB of each) is spooled, in a directory of
+    /// execd's own. Default: `$TMPDIR`, else `/tmp`. Use a disk-backed directory: on tmpfs the
+    /// output is RAM.
+    #[arg(long, env = "EXECD_JOBS_DIR")]
+    jobs_dir: Option<PathBuf>,
+
     /// Log level: error, warn, info, debug or trace (or a tracing filter).
     #[arg(long, env = "EXECD_LOG", default_value = "info")]
     log_level: String,
@@ -124,9 +130,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     opts.home = cli.home;
     opts.max_response_bytes = cli.max_response_bytes;
     opts.kept_jobs_survive_idle = cli.kept_jobs_survive_idle;
+    opts.jobs_dir = cli.jobs_dir.clone();
     let secured = bearer.is_some();
     opts.bearer = bearer;
 
+    // Before the listener is bound: it reads the whole of /tmp, and a client that finds the port
+    // open expects the server to be ready.
+    execd::remove_stale_jobs_dirs(cli.jobs_dir.as_deref());
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     let server = execd::serve(listener, opts)?;
     tracing::info!(
