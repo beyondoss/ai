@@ -13,8 +13,10 @@
 //!
 //! Metrics: v1.1 round trip (sequential and at concurrency 16), v1.2 throughput and server CPU per
 //! GB, time to first frame, server RSS (idle, 100 idle streams, 16 slow readers) and the latency of
-//! kill-on-disconnect. Every sample goes to the JSON file (`EXEC_BENCH_OUT`, default
-//! `crates/execd/benches/results/<date>.json`), and a summary is printed.
+//! kill-on-disconnect. A summary (per metric, side and round: n, p50, p90, p99, max, mean) goes to
+//! the JSON file `EXEC_BENCH_OUT` (default `crates/execd/benches/results/<date>.json`) and a table
+//! is printed. `EXEC_BENCH_RAW=1` also writes every sample to `EXEC_BENCH_RAW_OUT` (default under
+//! `/tmp`); `EXEC_BENCH_SUMMARIZE=<raw file>` turns such a file into the summary.
 //!
 //! Environment: `EXEC_BENCH_A` (baseline binary), `EXEC_BENCH_B` (default: this build's execd),
 //! `EXEC_BENCH_ROUNDS` (default 5), `EXEC_BENCH_SCALE` (multiplies request counts, default 1),
@@ -698,6 +700,42 @@ fn lat_json(rounds: &[Vec<f64>]) -> Value {
     })
 }
 
+/// n, p50, p90, p99, max and mean of one batch of samples.
+fn stats(v: &[f64]) -> Value {
+    let mean = v.iter().sum::<f64>() / v.len().max(1) as f64;
+    json!({
+        "n": v.len(), "p50": pct(v, 0.5), "p90": pct(v, 0.9), "p99": pct(v, 0.99),
+        "max": pct(v, 1.0), "mean": mean,
+    })
+}
+
+/// The committed form of a result: every latency metric keeps its pooled statistics and one row of
+/// statistics per round (the per-round medians behind the spreads quoted in ARCHITECTURE.md), and
+/// drops the samples. Throughput, CPU and memory metrics are a handful of numbers per side and stay
+/// whole. Set `EXEC_BENCH_RAW` to keep the samples as well, in a file outside the repository.
+fn summarize(v: &Value) -> Value {
+    match v {
+        Value::Object(o) if o.contains_key("samples_by_round") => {
+            let rounds: Vec<Vec<f64>> =
+                serde_json::from_value(o["samples_by_round"].clone()).unwrap_or_default();
+            let all: Vec<f64> = rounds.iter().flatten().copied().collect();
+            let mut out = o.clone();
+            out.remove("samples_by_round");
+            let pooled = stats(&all);
+            for k in ["p90", "mean"] {
+                out.insert(k.into(), pooled[k].clone());
+            }
+            let rows: Vec<Value> = rounds.iter().map(|r| stats(r)).collect();
+            out.insert("rounds".into(), Value::Array(rows));
+            Value::Object(out)
+        }
+        Value::Object(o) => {
+            Value::Object(o.iter().map(|(k, x)| (k.clone(), summarize(x))).collect())
+        }
+        other => other.clone(),
+    }
+}
+
 fn scalar_json(v: &[f64], unit: &str) -> Value {
     let (min, max) = min_max(v);
     json!({"n": v.len(), "unit": unit, "median": pct(v, 0.5), "min": min, "max": max, "samples": v})
@@ -741,6 +779,13 @@ fn print_rows(name: &str, a: &Value, b: &Value, keys: &[(&str, &str)]) {
 
 #[tokio::main]
 async fn main() -> Res<()> {
+    // Turn a raw results file into the committed summary and stop.
+    if let Ok(raw) = std::env::var("EXEC_BENCH_SUMMARIZE") {
+        let out = std::env::var("EXEC_BENCH_OUT").map_err(|_| "set EXEC_BENCH_OUT")?;
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(raw)?)?;
+        std::fs::write(&out, serde_json::to_string_pretty(&summarize(&v))? + "\n")?;
+        return Ok(());
+    }
     let started = Instant::now();
     let procs_visible = std::fs::read_dir("/proc")?
         .flatten()
@@ -878,7 +923,16 @@ async fn main() -> Res<()> {
             env!("CARGO_MANIFEST_DIR")
         )
     });
-    std::fs::write(&path, serde_json::to_string_pretty(&out)? + "\n")?;
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&summarize(&out))? + "\n",
+    )?;
+    if std::env::var_os("EXEC_BENCH_RAW").is_some() {
+        let raw = std::env::var("EXEC_BENCH_RAW_OUT")
+            .unwrap_or_else(|_| format!("/tmp/exec_bench_raw-{date}{tag}.json"));
+        std::fs::write(&raw, serde_json::to_string_pretty(&out)? + "\n")?;
+        println!("raw samples: {raw}");
+    }
     println!("\nwrote {path}  (wall {wall:.0}s)\n");
     let (ra, rb) = (&out["results"]["A"], &out["results"]["B"]);
     for k in [
