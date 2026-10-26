@@ -43,5 +43,5 @@ RUN adduser -D -h /home/sandbox sandbox && mkdir -p /workspace && chown sandbox:
 # The defaults a bare `docker run` gets: a v1.4 endpoint (kept jobs survive idling, which is what lets it
 # advertise notify) logging JSON. It listens beyond loopback, so it needs EXECD_BEARER (or a bearer
 # file): `docker run -e EXECD_BEARER=... `. up.sh starts it with the demo's CA and a per-stack bearer.
-ENV EXECD_LISTEN=0.0.0.0:8081 EXECD_ROOT=/workspace EXECD_HOME=/home/sandbox EXECD_RUN_AS=sandbox EXECD_KEPT_JOBS_SURVIVE_IDLE=1 EXECD_LOG_FORMAT=json
+ENV EXECD_LISTEN=0.0.0.0:8081 EXECD_ROOT=/workspace EXECD_HOME=/home/sandbox EXECD_RUN_AS=sandbox EXECD_KEPT_JOBS_SURVIVE_IDLE=1
 ENTRYPOINT ["/usr/local/bin/execd"]

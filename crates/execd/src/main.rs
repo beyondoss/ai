@@ -130,7 +130,6 @@ fn main() -> ExitCode {
     move_bearer_out_of_environ();
     let inherited = take_inherited_bearer();
     execd::log::set_level(cli.log_level);
-    execd::log::set_format(cli.log_format);
     let runtime = match runtime(cli.worker_threads) {
         Ok(r) => r,
         Err(e) => {

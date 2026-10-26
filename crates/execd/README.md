@@ -89,7 +89,6 @@ error that names the variable and the value (exit 2), and so is any argument: ex
 | `EXECD_MAX_RESPONSE_BYTES`     | most output one v1.1 answer carries (default 16 MiB); match the agent's `--exec-max-response-bytes`              |
 | `EXECD_JOBS_DIR`               | where a kept job's last 8 MiB of output is spooled (default `$TMPDIR`, else `/tmp`); use a disk-backed directory |
 | `EXECD_LOG`                    | `off`, `error`, `warn`, `info` (default), `debug` or `trace`                                                     |
-| `EXECD_LOG_FORMAT`             | `text` (default) or `json`: one object per line with `timestamp`, `level` and `message`                          |
 | `EXECD_WORKER_THREADS`         | `1` (default) one thread; `0` a worker per CPU; `N` workers                                                      |
 
 No `EXECD_*` variable reaches the commands execd runs. The startup line logs execd's version.
