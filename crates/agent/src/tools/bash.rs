@@ -965,12 +965,12 @@ impl Bash {
             // A non-streaming runner (a test double, a remote endpoint) delivered nothing through the
             // sink; its captured output is the whole story.
             if !out.streamed {
-                out.acc.append(result.stdout.as_bytes());
+                out.acc.append(&result.stdout);
                 if !result.stderr.is_empty() {
                     if !result.stdout.is_empty() {
                         out.acc.append(b"\n");
                     }
-                    out.acc.append(result.stderr.as_bytes());
+                    out.acc.append(&result.stderr);
                 }
             }
             out.acc.finish();
@@ -2058,7 +2058,7 @@ mod tests {
             .join("\n");
         let runner = recording(ExecResult {
             code: Some(0),
-            stdout: body,
+            stdout: body.into(),
             ..Default::default()
         });
         let out = Bash::with_runner(runner)
@@ -2107,7 +2107,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let runner = recording(ExecResult {
-            stdout: body.clone(),
+            stdout: body.clone().into(),
             timed_out: true,
             ..Default::default()
         });
@@ -2439,8 +2439,8 @@ mod tests {
         // interrupted one.
         let runner = recording(ExecResult {
             timed_out: true,
-            stdout: String::new(),
-            stderr: String::new(),
+            stdout: String::new().into(),
+            stderr: String::new().into(),
             ..Default::default()
         });
         let err = Bash::with_runner(runner)
@@ -2476,8 +2476,8 @@ mod tests {
             Ok(ExecResult {
                 code: Some(0),
                 signal: None,
-                stdout: String::new(),
-                stderr: String::new(),
+                stdout: String::new().into(),
+                stderr: String::new().into(),
                 timed_out: false,
                 truncated: false,
             })

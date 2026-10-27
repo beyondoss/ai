@@ -849,7 +849,7 @@ mod notify_tests {
             dir.path(),
             MockOptions {
                 lose_callbacks: LoseCallbacks::All,
-                ..MockOptions::notifying()
+                ..MockOptions::default()
             },
         )
         .await;

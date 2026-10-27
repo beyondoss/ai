@@ -1,4 +1,4 @@
-//! The v1.3 sandbox-job decoding vectors (`tests/fixtures/exec/v1.3-jobs.json`): job stream frames
+//! The v1.3 sandbox-job decoding vectors (`tests/fixtures/exec/jobs.json`): job stream frames
 //! and the answers to non-streamed job operations, read the way the agent reads them. An endpoint
 //! implementer can check their encoder against the same file.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -11,7 +11,7 @@ use beyond_sandbox::exec_endpoint::jobs_native::{
 use serde_json::Value;
 
 fn vectors() -> Value {
-    serde_json::from_str(include_str!("fixtures/exec/v1.3-jobs.json")).unwrap()
+    serde_json::from_str(include_str!("fixtures/exec/jobs.json")).unwrap()
 }
 
 fn b64(s: &str) -> Vec<u8> {

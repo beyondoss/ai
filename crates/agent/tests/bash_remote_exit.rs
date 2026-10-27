@@ -23,7 +23,7 @@ use serde_json::json;
 #[tokio::test]
 async fn the_exit_path_reaches_a_parked_remote_job() {
     let dir = tempfile::tempdir().unwrap();
-    let mock = ExecMock::start(dir.path(), true).await;
+    let mock = ExecMock::start(dir.path()).await;
     let runner = Arc::new(HttpExecRunner::new(&mock.url).unwrap());
     let (bash, _jobs) = remote_bash(runner, Duration::from_millis(500));
     let out = call(
@@ -63,7 +63,6 @@ fn sigterm_to_run_kills_the_remote_command_group() {
     let mock = rt.block_on(ExecMock::start_with(
         dir.path(),
         MockOptions {
-            jobs: false,
             ..MockOptions::default()
         },
     ));

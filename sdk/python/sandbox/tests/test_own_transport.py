@@ -1,7 +1,7 @@
 """Layers 2 and 3 over a transport that is not HTTP: the helpers need only ``run``.
 
 ``LocalTransport`` is the "bring your own transport" example of the README: commands run in a local
-subprocess. Files, search and the baseline jobs all work on it unchanged.
+subprocess. Files and search work on it unchanged.
 """
 
 from __future__ import annotations
@@ -10,26 +10,29 @@ import asyncio
 import subprocess
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from beyond_sandbox import (
     AsyncFiles,
     AsyncFrameStream,
-    AsyncJobs,
     Conflict,
     ExecResult,
     Files,
     FrameStream,
-    Jobs,
     NotFound,
-    NotOffered,
     Sandbox,
 )
+from beyond_sandbox.atransport import AsyncJobFrameStream
+from beyond_sandbox.transport import JobFrameStream
 
 
 class LocalTransport:
-    """Layer 1 in a dozen lines."""
+    """Layer 1 in a dozen lines. ``calls`` records (command, stdin size) per request."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int | None]] = []
 
     def run(
         self,
@@ -40,6 +43,7 @@ class LocalTransport:
         timeout_ms: int = 120_000,
         stdin: bytes | None = None,
     ) -> ExecResult:
+        self.calls.append((command, None if stdin is None else len(stdin)))
         try:
             p = subprocess.run(
                 [command, *args], cwd=cwd, input=stdin or b"", capture_output=True,
@@ -59,7 +63,19 @@ class LocalTransport:
         cwd: str | None = None,
         timeout_ms: int | None = None,
     ) -> FrameStream:
-        raise NotOffered("this transport does not stream")
+        raise NotImplementedError("this transport only runs commands")
+
+    def job_call(
+        self,
+        job: dict[str, Any],
+        command: str = "true",
+        args: Sequence[str] = (),
+        cwd: str | None = None,
+    ) -> Any:
+        raise NotImplementedError("this transport only runs commands")
+
+    def job_stream(self, job: dict[str, Any]) -> JobFrameStream:
+        raise NotImplementedError("this transport only runs commands")
 
 
 class AsyncLocalTransport:
@@ -88,13 +104,24 @@ class AsyncLocalTransport:
         cwd: str | None = None,
         timeout_ms: int | None = None,
     ) -> AsyncFrameStream:
-        raise NotOffered("this transport does not stream")
+        raise NotImplementedError("this transport only runs commands")
+
+    async def job_call(
+        self,
+        job: dict[str, Any],
+        command: str = "true",
+        args: Sequence[str] = (),
+        cwd: str | None = None,
+    ) -> Any:
+        raise NotImplementedError("this transport only runs commands")
+
+    async def job_stream(self, job: dict[str, Any]) -> AsyncJobFrameStream:
+        raise NotImplementedError("this transport only runs commands")
 
 
 def test_files_over_a_subprocess(tmp_path: Path) -> None:
     f = Files(LocalTransport())
-    caps = f.capabilities()
-    assert caps.stdin and caps.read_window
+    assert f.capabilities().read_window
     p = str(tmp_path / "a.txt")
     f.write(p, b"hello\nworld\n")
     assert f.read(p) == b"hello\nworld\n"
@@ -115,31 +142,27 @@ def test_files_over_a_subprocess(tmp_path: Path) -> None:
     assert sorted(x.name for x in tmp_path.iterdir()) == ["a.txt", "d"]
 
 
-def test_a_large_write_without_stdin_goes_in_48k_chunks(tmp_path: Path) -> None:
-    f = Files(LocalTransport(), override={"stdin": False})
-    data = bytes(range(256)) * 600  # 150 KiB: four chunks
+def test_a_large_write_is_one_request_with_stdin(tmp_path: Path) -> None:
+    t = LocalTransport()
+    f = Files(t)
+    data = bytes(range(256)) * 600  # 150 KiB
     p = str(tmp_path / "big")
     f.write(p, data)
     assert f.read(p) == data
     assert [e.name for e in f.list(str(tmp_path))] == ["big"]
+    writes = [c for c in t.calls if c[1] is not None]
+    assert len(writes) == 1 and writes[0][1] == len(data)
 
 
-def test_baseline_jobs_over_a_subprocess(tmp_path: Path) -> None:
-    jobs = Jobs(LocalTransport(), root=str(tmp_path / "jobs"))
-    assert jobs.kind() == "baseline"
-    pgid = jobs.start("scope1", "j1", "sh", ["-c", "echo hi; echo err >&2; exit 3"], label="demo")
-    assert pgid > 0
-    a = jobs.attach("scope1", "j1")
-    assert (a.exit_code, a.output, a.gap) == (3, b"hi\nerr\n", 0)
-    [info] = jobs.list("scope1")
-    assert (info.id, info.state, info.code, info.label) == ("j1", "ended", 3, "demo")
-    assert jobs.read("scope1", "j1").data == b"hi\nerr\n"
-    assert jobs.read("scope1", "nope").state == "gone"
-    jobs.remove("scope1", ["j1"])
-    assert jobs.list("scope1") == []
-    jobs.start("scope1", "j2", "sleep", ["30"])
-    assert jobs.kill("scope1", ["j2"]) == []
-    assert jobs.wipe("scope1") == []
+def test_the_first_file_op_is_one_probe_and_one_command(tmp_path: Path) -> None:
+    p = tmp_path / "f"
+    p.write_bytes(b"hi")
+    t = LocalTransport()
+    assert Files(t).read(str(p)) == b"hi"
+    assert len(t.calls) == 2  # the environment probe, then the read
+    t = LocalTransport()
+    Files(t).write(str(tmp_path / "g"), b"x")
+    assert len(t.calls) == 1  # a write needs no probe
 
 
 def test_the_sandbox_surface_keeps_raw_exec_in_reach(tmp_path: Path) -> None:
@@ -147,9 +170,7 @@ def test_the_sandbox_surface_keeps_raw_exec_in_reach(tmp_path: Path) -> None:
     assert sb.exec("echo", ["x"]).stdout == b"x\n"
     assert sb.transport.run("true").exit_code == 0
     sb.files.write(str(tmp_path / "f"), b"1")
-    assert sb.capabilities().stream is False
-    with pytest.raises(NotOffered):
-        sb.stream("true")
+    assert sb.capabilities().read_window
 
 
 def test_a_user_helper_on_raw_exec_alone(tmp_path: Path) -> None:
@@ -172,7 +193,7 @@ def test_a_user_helper_on_raw_exec_alone(tmp_path: Path) -> None:
     ]
 
 
-def test_async_files_and_jobs_over_an_async_subprocess(tmp_path: Path) -> None:
+def test_async_files_over_an_async_subprocess(tmp_path: Path) -> None:
     async def main() -> None:
         t = AsyncLocalTransport()
         f = AsyncFiles(t)
@@ -180,13 +201,5 @@ def test_async_files_and_jobs_over_an_async_subprocess(tmp_path: Path) -> None:
         await f.write(p, b"abc")
         assert await f.read(p) == b"abc"
         assert [h.text for h in (await f.search("b", str(tmp_path))).hits] == ["abc"]
-        jobs = AsyncJobs(t, root=str(tmp_path / "jobs"))
-        assert await jobs.kind() == "baseline"
-        await jobs.start("s", "j", "sh", ["-c", "echo out; exit 2"])
-        events = [e async for e in jobs.follow("s", "j")]
-        assert [type(e).__name__ for e in events] == ["JobOutput", "JobEnd"]
-        a = await jobs.attach("s", "j")
-        assert (a.exit_code, a.output) == (2, b"out\n")
-        assert await jobs.wipe("s") == []
 
     asyncio.run(main())

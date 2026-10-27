@@ -22,22 +22,19 @@ from .errors import (
     InvalidQuery,
     IoError,
     NotFound,
-    NotOffered,
     SandboxError,
     Timeout,
-    TooLarge,
     classify_stderr,
 )
 from .models import Capabilities, Entry, ExecResult, Hit, Kind, SearchResult, Stat
 
 PROBE_TIMEOUT_MS = 10_000
-STDIN_PROBE = b"stdin-probe"
-READ_WINDOW_PROBE = (
-    "printf abc | dd iflag=skip_bytes,count_bytes skip=1 count=1 status=none 2>/dev/null"
-    " | base64 -w0 2>/dev/null"
-)
-#: Raw bytes per write command without stdin: 48 KiB, which is 64 KiB of base64.
-WRITE_CHUNK = 48 * 1024
+#: The whole environment probe: one ``sh -c`` round trip, one line per capability the sandbox has.
+PROBE_SCRIPT = r"""rg --version >/dev/null 2>&1 && echo rg
+grep -rnZ -e __cap_probe__ -- /dev/null >/dev/null 2>&1; [ $? -le 1 ] && echo grep_null
+[ "$(find /dev/null -maxdepth 0 -printf %y 2>/dev/null)" = c ] && echo find_printf
+[ "$(printf abc | dd iflag=skip_bytes,count_bytes skip=1 count=1 status=none 2>/dev/null | base64 -w0 2>/dev/null)" = Yg== ] && echo read_window
+true"""
 #: Raw bytes per read command: 96 KiB, which is 128 KiB of base64.
 READ_CHUNK = 96 * 1024
 #: Context lines asked of the engine are clamped to this.
@@ -52,7 +49,7 @@ DEFAULT_SEARCH_LIMIT = 100
 
 @dataclass(slots=True)
 class FsState:
-    """What a :class:`~beyond_sandbox.Files` learns about its sandbox: probes and git roots."""
+    """What a :class:`~beyond_sandbox.Files` learns about its sandbox: the probe and git roots."""
 
     caps: Capabilities | None = None
     git_roots: dict[str, bool] = field(default_factory=dict)
@@ -63,18 +60,14 @@ def sh(script: str, *args: str) -> list[str]:
     return ["-c", script, "sh", *args]
 
 
-def text(b: bytes) -> str:
-    return b.decode("utf-8", "replace")
-
-
-def first_line(stderr: bytes, fallback: str = "command failed") -> str:
-    lines = text(stderr).strip().splitlines()
+def first_line(stderr: str, fallback: str = "command failed") -> str:
+    lines = stderr.strip().splitlines()
     return lines[0] if lines else fallback
 
 
-def fail(prefix: str, stderr: bytes) -> SandboxError:
+def fail(prefix: str, r: ExecResult) -> SandboxError:
     """A command that ran and failed (3.3): ``prefix: first line``, classified by that line."""
-    line = first_line(stderr)
+    line = first_line(r.stderr_text)
     err = classify_stderr(line)
     return type(err)(f"{prefix}: {line}")
 
@@ -83,40 +76,18 @@ def fail(prefix: str, stderr: bytes) -> SandboxError:
 
 
 def probe() -> Op[Capabilities]:
-    """FILES-OVER-EXEC.md 4. A probe that fails at the transport level raises; only one that ran
-    and answered "absent" means absent."""
-
-    def attempt(run: Run) -> Op[ExecResult | None]:
-        try:
-            r: ExecResult = yield run
-            return r
-        except (NotFound, NotOffered, TooLarge):
-            return None  # the command could not run on the target at all: that is the answer
-
-    r = yield from attempt(Run("rg", ["--version"], timeout_ms=PROBE_TIMEOUT_MS))
-    rg = r is not None and r.exit_code == 0
-    r = yield from attempt(
-        Run("grep", ["-rnZ", "-e", "__cap_probe__", "--", "/dev/null"], timeout_ms=PROBE_TIMEOUT_MS)
+    """FILES-OVER-EXEC.md 4: every environment check in one round trip. A request that fails
+    raises; only a script that ran and answered "absent" means absent."""
+    r: ExecResult = yield Run("sh", ["-c", PROBE_SCRIPT], timeout_ms=PROBE_TIMEOUT_MS)
+    found = {line.strip() for line in r.stdout_text.splitlines()}
+    return capabilities(
+        "rg" in found, "grep_null" in found, "find_printf" in found, "read_window" in found
     )
-    grep_null = r is not None and r.exit_code in (0, 1)
-    r = yield from attempt(
-        Run("find", ["/dev/null", "-maxdepth", "0", "-printf", "%y"], timeout_ms=PROBE_TIMEOUT_MS)
-    )
-    # busybox find has no -printf, prints its usage and exits 1, the code of "found nothing":
-    # only GNU's answer (the type of /dev/null, a character device) proves the flag
-    find_printf = r is not None and r.exit_code in (0, 1) and r.stdout == b"c"
-    r = yield from attempt(Run("cat", [], stdin=STDIN_PROBE, timeout_ms=PROBE_TIMEOUT_MS))
-    stdin = r is not None and r.exit_code == 0 and r.stdout == STDIN_PROBE
-    r = yield from attempt(Run("sh", ["-c", READ_WINDOW_PROBE], timeout_ms=PROBE_TIMEOUT_MS))
-    read_window = r is not None and r.exit_code == 0 and r.stdout.strip() == b"Yg=="
-    return capabilities(rg, grep_null, find_printf, stdin, read_window)
 
 
-def capabilities(
-    rg: bool, grep_null: bool, find_printf: bool, stdin: bool, read_window: bool
-) -> Capabilities:
+def capabilities(rg: bool, grep_null: bool, find_printf: bool, read_window: bool) -> Capabilities:
     engine = "rg" if rg else "grep" if grep_null else "busybox-grep"
-    return Capabilities(stdin, find_printf, engine, read_window, rg, grep_null)
+    return Capabilities(find_printf, engine, read_window, rg, grep_null)
 
 
 def with_engine(caps: Capabilities, engine: str) -> Capabilities:
@@ -124,7 +95,7 @@ def with_engine(caps: Capabilities, engine: str) -> Capabilities:
     rg, grep_null = {"rg": (True, True), "grep": (False, True), "busybox-grep": (False, False)}[
         engine
     ]
-    return capabilities(rg, grep_null, caps.find_printf, caps.stdin, caps.read_window)
+    return capabilities(rg, grep_null, caps.find_printf, caps.read_window)
 
 
 # ---- stat ------------------------------------------------------------------------------------------
@@ -153,7 +124,7 @@ def _uint(s: str) -> int | None:
 
 def stat(path: str) -> Op[Stat | None]:
     r = yield Run("sh", sh(_scripts.STAT, path))
-    out = text(r.stdout)
+    out = r.stdout_text
     if r.exit_code != 0 or not out.strip():
         return None
     return parse_stat(out)
@@ -185,7 +156,7 @@ def read(path: str, offset: int, max_bytes: int | None, caps: Capabilities) -> O
         want = min(limit - len(out), READ_CHUNK)
         r = yield Run("sh", sh(_scripts.READ_WINDOW, path, str(offset + len(out)), str(want)))
         if r.exit_code != 0:
-            raise fail(f"read {path}", r.stderr)
+            raise fail(f"read {path}", r)
         try:
             chunk = decode_base64(r.stdout.strip())
         except ValueError as e:
@@ -206,43 +177,16 @@ def new_suffix() -> str:
     return secrets.token_hex(8)
 
 
-def write(path: str, data: bytes, caps: Capabilities, suffix: str | None = None) -> Op[None]:
+def write(path: str, data: bytes, suffix: str | None = None) -> Op[None]:
     suffix = suffix or new_suffix()
     try:
-        if caps.stdin:
-            r = yield Run("sh", sh(_scripts.WRITE_STDIN, path, suffix, str(len(data))), stdin=data)
-        else:
-            r = yield from _write_chunks(path, suffix, data)
+        r = yield Run("sh", sh(_scripts.WRITE_STDIN, path, suffix, str(len(data))), stdin=data)
     except SandboxError:
         yield from _cleanup(path, suffix)
         raise
     if r.exit_code != 0:
         yield from _cleanup(path, suffix)
-        raise fail(f"write {path}", r.stderr)
-
-
-def _write_chunks(path: str, suffix: str, data: bytes) -> Op[ExecResult]:
-    """One command per 48 KiB; the first creates the temp, the last commits. An empty file is one
-    empty chunk. Returns the first failed command's result, or the committing one's."""
-    size = str(len(data))
-    pieces = [data[i : i + WRITE_CHUNK] for i in range(0, len(data), WRITE_CHUNK)] or [b""]
-    for n, piece in enumerate(pieces):
-        last = n == len(pieces) - 1
-        r: ExecResult = yield Run(
-            "sh",
-            sh(
-                _scripts.WRITE_CHUNK,
-                path,
-                suffix,
-                base64.b64encode(piece).decode("ascii"),
-                "new" if n == 0 else "append",
-                "commit" if last else "",
-                size,
-            ),
-        )
-        if r.exit_code != 0 or last:
-            return r
-    raise AssertionError("unreachable")
+        raise fail(f"write {path}", r)
 
 
 def _cleanup(path: str, suffix: str) -> Op[None]:
@@ -251,14 +195,12 @@ def _cleanup(path: str, suffix: str) -> Op[None]:
         yield Run("sh", sh(_scripts.REMOVE_TEMP, path, suffix))
 
 
-def write_if_unchanged(
-    path: str, data: bytes, expected_mtime: int | None, caps: Capabilities
-) -> Op[None]:
+def write_if_unchanged(path: str, data: bytes, expected_mtime: int | None) -> Op[None]:
     """Compare whole epoch seconds, then write. Two round trips; the guard is not a lock."""
     current = yield from stat(path)
     if (current.mtime if current else None) != expected_mtime:
         raise Conflict("the file changed since it was read")
-    yield from write(path, data, caps)
+    yield from write(path, data)
 
 
 # ---- mkdir -----------------------------------------------------------------------------------------
@@ -267,7 +209,7 @@ def write_if_unchanged(
 def mkdir(path: str) -> Op[None]:
     r = yield Run("mkdir", ["-p", "--", path])
     if r.exit_code != 0:
-        raise fail(f"create {path}", r.stderr)
+        raise fail(f"create {path}", r)
 
 
 # ---- list ------------------------------------------------------------------------------------------
@@ -302,16 +244,16 @@ def list_dir(path: str, limit: int, include_hidden: bool, caps: Capabilities) ->
     if caps.find_printf:
         r = yield _find_children(path, "-printf", "%Y\\t%s\\t%f\\0")
         if r.exit_code != 0 and not r.stdout:
-            raise fail(f"ls {path}", r.stderr)
-        return parse_dir_entries(text(r.stdout), limit, include_hidden)
+            raise fail(f"ls {path}", r)
+        return parse_dir_entries(r.stdout_text, limit, include_hidden)
     # busybox: no -printf, so the type comes from a second pass restricted to directories
     listing = yield _find_children(path, "-print0")
     if listing.exit_code != 0 and not listing.stdout:
-        raise fail(f"ls {path}", listing.stderr)
+        raise fail(f"ls {path}", listing)
     dirs = yield _find_children(path, "-type", "d", "-print0")
-    dir_set = {r for r in text(dirs.stdout).split("\0") if r}
+    dir_set = {r for r in dirs.stdout_text.split("\0") if r}
     entries: list[Entry] = []
-    for raw in text(listing.stdout).split("\0"):
+    for raw in listing.stdout_text.split("\0"):
         if not raw or len(entries) >= limit:
             continue
         name = raw.rstrip("/").rsplit("/", 1)[-1] if raw.rstrip("/") else ""
@@ -730,7 +672,7 @@ def search(q: Query, state: FsState, caps: Capabilities) -> Op[SearchResult]:
     else:
         args, program = posix_grep_args(q, engine == "grep"), "grep"
     r = yield Run(program, args)
-    stderr = text(r.stderr)
+    stderr = r.stderr_text
     note: str | None = None
     if r.exit_code in (0, 1):
         pass
@@ -744,7 +686,7 @@ def search(q: Query, state: FsState, caps: Capabilities) -> Op[SearchResult]:
         if failure.kind == "missing_root":
             raise NotFound(failure.note)
         note = failure.note
-    stdout = text(r.stdout)
+    stdout = r.stdout_text
     hits = parse_colon_records(stdout, q) if engine == "busybox-grep" else parse_records(stdout)
     hits = [h for h in hits if not is_under_git_dir(q.root, h.path)]
     hits = [

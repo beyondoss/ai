@@ -334,7 +334,10 @@ impl Git {
                     )
                     .await
                     .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
-                Ok((res.code == Some(0), res.stdout.into_bytes(), res.stderr))
+                {
+                    let stderr = res.stderr_text().into_owned();
+                    Ok((res.code == Some(0), res.stdout, stderr))
+                }
             }
         }
     }
@@ -379,7 +382,10 @@ impl Git {
                     )
                     .await
                     .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
-                Ok((res.code == Some(0), res.stdout.into_bytes(), res.stderr))
+                {
+                    let stderr = res.stderr_text().into_owned();
+                    Ok((res.code == Some(0), res.stdout, stderr))
+                }
             }
         }
     }
@@ -412,7 +418,7 @@ impl Git {
                     )
                     .await
                     .map_err(|e| format!("sh: {e}"))?;
-                Ok(res.stdout)
+                Ok(res.stdout_text().into_owned())
             }
         }
     }
@@ -540,7 +546,7 @@ impl Git {
                         return Err(format!(
                             "copy into {} failed: {}",
                             dst.display(),
-                            res.stderr.trim()
+                            res.stderr_text().trim()
                         ));
                     }
                 }
@@ -574,10 +580,10 @@ impl Git {
                     return Err(format!(
                         "git {} failed: {}",
                         args.join(" "),
-                        res.stderr.trim()
+                        res.stderr_text().trim()
                     ));
                 }
-                Ok(res.stdout)
+                Ok(res.stdout_text().into_owned())
             }
         }
     }
@@ -615,12 +621,12 @@ impl Git {
                     return Err(format!(
                         "git {} failed: {}",
                         args.join(" "),
-                        res.stderr.trim()
+                        res.stderr_text().trim()
                     ));
                 }
                 use base64::Engine as _;
                 base64::engine::general_purpose::STANDARD
-                    .decode(res.stdout.trim())
+                    .decode(res.stdout_text().trim())
                     .map_err(|e| format!("git {}: undecodable output: {e}", args.join(" ")))
             }
         }
@@ -650,7 +656,7 @@ impl Git {
                     return Err(format!(
                         "git {} failed: {}",
                         args.join(" "),
-                        res.stderr.trim()
+                        res.stderr_text().trim()
                     ));
                 }
                 Ok(())

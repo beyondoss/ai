@@ -1,15 +1,9 @@
-//! The end-to-end fleet for exec v1.4's proof suites: real `serve --service` replicas, a fleet
+//! The end-to-end fleet for the job notify proof suites: real `serve --service` replicas, a fleet
 //! front that routes by session id over a hash ring (retrying and walking on `503`, attaching
 //! nothing), the reference endpoint behind a proxy that counts every byte crossing a
 //! replica-to-endpoint connection, and a model that answers by each request's last message.
 //!
-//! Every suite runs in three endpoint modes:
-//!
-//! - [`Mode::Native`]: the endpoint keeps jobs itself (v1.3) and calls back natively (v1.4);
-//! - [`Mode::Baseline`]: the endpoint has no native jobs, so the agent runs its baseline
-//!   (`ShellJobs`), whose `setsid` supervisor calls back with `curl`;
-//! - [`Mode::NoEgress`]: the sandbox cannot reach the network, so the endpoint does not offer
-//!   notify, and every job is held as before v1.4.
+//! Every suite runs against the endpoint in [`Mode::Native`]: it keeps jobs itself and calls back.
 
 #![allow(dead_code)]
 
@@ -30,49 +24,32 @@ use super::{TestWs, turn_text, turn_tool_use, ws_connect_with_headers, ws_send};
 
 pub const TENANT: &str = "00tenant1";
 
-/// How the sandbox's endpoint offers jobs and notify.
+/// How the sandbox's endpoint is set up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Native,
-    Baseline,
-    NoEgress,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 3] = [Mode::Native, Mode::Baseline, Mode::NoEgress];
+    pub const ALL: [Mode; 1] = [Mode::Native];
 
-    /// The endpoint for this mode; `notify` off is the same endpoint whose deployment does not
-    /// say kept jobs survive idling, so it never offers notify: today's behaviour, to compare with.
-    pub fn mock(self, notify: bool) -> MockOptions {
-        let base = MockOptions {
-            kept_jobs_survive_idle: notify,
+    /// The endpoint for this mode.
+    pub fn mock(self, _notify: bool) -> MockOptions {
+        MockOptions {
             // A heartbeat often enough that a held stream is plainly not silent.
             heartbeat: Duration::from_secs(1),
             ..MockOptions::default()
-        };
-        match self {
-            Mode::Native => base,
-            Mode::Baseline => MockOptions {
-                jobs: false,
-                ..base
-            },
-            Mode::NoEgress => MockOptions {
-                egress: false,
-                ..base
-            },
         }
     }
 
     /// Whether a kept job is let go of (`false`: held to its end, as today).
     pub fn releases(self) -> bool {
-        self != Mode::NoEgress
+        true
     }
 
     pub fn name(self) -> &'static str {
         match self {
             Mode::Native => "native",
-            Mode::Baseline => "baseline",
-            Mode::NoEgress => "no-egress",
         }
     }
 }
@@ -994,8 +971,7 @@ pub async fn wait_reaped(svc: &Service, ports: &[u16], session: &str) {
     }
 }
 
-/// One test per endpoint mode, `case::native`, `case::baseline`, `case::no_egress`, each running
-/// `case(Mode)`; the modes run in parallel.
+/// One test per endpoint mode, `case::native`, each running `case(Mode)`.
 #[allow(unused_macros)]
 macro_rules! in_every_mode {
     ($($case:ident),* $(,)?) => {$(
@@ -1005,21 +981,14 @@ macro_rules! in_every_mode {
             async fn native() {
                 super::$case(Mode::Native).await;
             }
-            #[tokio::test(flavor = "multi_thread")]
-            async fn baseline() {
-                super::$case(Mode::Baseline).await;
-            }
-            #[tokio::test(flavor = "multi_thread")]
-            async fn no_egress() {
-                super::$case(Mode::NoEgress).await;
-            }
+
         }
     )*};
 }
 #[allow(unused_imports)]
 pub(crate) use in_every_mode;
 
-/// As [`in_every_mode`], for a case that needs a callback path: native and baseline only.
+/// As [`in_every_mode`], for a case that needs a callback path.
 #[allow(unused_macros)]
 macro_rules! in_notify_modes {
     ($($case:ident),* $(,)?) => {$(
@@ -1029,10 +998,7 @@ macro_rules! in_notify_modes {
             async fn native() {
                 super::$case(Mode::Native).await;
             }
-            #[tokio::test(flavor = "multi_thread")]
-            async fn baseline() {
-                super::$case(Mode::Baseline).await;
-            }
+
         }
     )*};
 }

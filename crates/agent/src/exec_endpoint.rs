@@ -77,7 +77,12 @@ impl ExecTarget {
             Some(home) => backend.with_home(home),
             None => backend,
         };
-        let caps = backend.capabilities();
+        // The one probe of the sandbox's tools, here so an unreachable or refused endpoint fails the
+        // attach with its own error rather than the first tool call.
+        let caps = backend
+            .capabilities()
+            .await
+            .map_err(|e| format!("the sandbox did not answer: {e}"))?;
         Ok(Self {
             runner,
             backend: std::sync::Arc::new(backend),
@@ -368,30 +373,6 @@ impl CommandRunner for CellRunner {
             None => {
                 crate::tools::exec::RealRunner
                     .run(program, args, cwd, timeout)
-                    .await
-            }
-        }
-    }
-
-    /// Forwarded, so a cell over an endpoint that honours `output_base64` returns bytes, not the
-    /// default's text.
-    async fn run_exact(
-        &self,
-        program: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        timeout: Duration,
-        stdin: Option<&[u8]>,
-    ) -> std::io::Result<beyond_sandbox::exec::ExecOutput> {
-        match self.target().await? {
-            Some(t) => {
-                t.runner()
-                    .run_exact(program, args, cwd, timeout, stdin)
-                    .await
-            }
-            None => {
-                crate::tools::exec::RealRunner
-                    .run_exact(program, args, cwd, timeout, stdin)
                     .await
             }
         }

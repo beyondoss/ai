@@ -113,22 +113,16 @@ pub(crate) struct Request {
     pub cwd: Option<String>,
     /// Absent: no deadline, the connection is the command's lifetime.
     pub timeout_ms: Option<u64>,
-    pub stdin_base64: Option<String>,
+    /// Standard base64, fed to the command's stdin and then closed.
+    pub stdin: Option<String>,
     /// Kept as a value: only `true` streams, and any other type is an unknown shape to ignore.
     pub stream: Option<Value>,
     pub job: Option<Value>,
-    /// v1.1: answer with `stdout_base64`/`stderr_base64`. Kept as a value, like `stream`: only
-    /// `true` asks, and any other type is an unknown shape to ignore.
-    pub output_base64: Option<Value>,
 }
 
 impl Request {
     pub fn wants_stream(&self) -> bool {
         self.stream == Some(Value::Bool(true))
-    }
-
-    pub fn wants_exact_output(&self) -> bool {
-        self.output_base64 == Some(Value::Bool(true))
     }
 }
 
@@ -441,16 +435,8 @@ async fn route(ctx: Arc<Ctx>, req: HttpRequest<Incoming>) -> Resp {
     }
     drop(bytes);
 
-    let job = req.job.as_ref().and_then(Value::as_object);
-    if let Some(job) = job {
-        if ctx.opts.native_jobs {
-            return crate::jobs::serve(&ctx, &req).await;
-        }
-        // Without native jobs the field is unknown and the command runs, except that an endpoint
-        // offering notify for the baseline answers the probe (v1.4, N1).
-        if job.get("op").and_then(Value::as_str) == Some("probe") && ctx.opts.advertises_notify() {
-            return json_response(200, &json!({ "notify": crate::NOTIFY_VERSION }));
-        }
+    if req.job.as_ref().is_some_and(Value::is_object) {
+        return crate::jobs::serve(&ctx, &req).await;
     }
     if req.wants_stream() {
         crate::exec::stream(&ctx, req)
@@ -460,7 +446,7 @@ async fn route(ctx: Arc<Ctx>, req: HttpRequest<Incoming>) -> Resp {
 }
 
 /// The parsing a request body goes through once the bearer is accepted, for the fuzz targets and
-/// the parser test: the envelope, a `job` object's operation and `notify`, and `stdin_base64`.
+/// the parser test: the envelope, a `job` object's operation and `notify`, and `stdin`.
 /// Whether the body was accepted (the server answers `400` for one that is not). Never panics.
 pub(crate) fn fuzz_request(bytes: &[u8]) -> bool {
     use base64::Engine as _;
@@ -472,7 +458,7 @@ pub(crate) fn fuzz_request(bytes: &[u8]) -> bool {
     {
         return false;
     }
-    if let Some(b) = &req.stdin_base64 {
+    if let Some(b) = &req.stdin {
         match base64::engine::general_purpose::STANDARD.decode(b) {
             Ok(data) => crate::frame::fuzz(&data),
             Err(_) => return false,

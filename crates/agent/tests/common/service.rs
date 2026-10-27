@@ -93,7 +93,7 @@ impl Service {
                 mock.home = Some(sandbox_home.clone());
                 ExecMock::start_with(&workspace, mock).await
             }
-            None => ExecMock::start_with_home(&workspace, Some(&sandbox_home), true).await,
+            None => ExecMock::start_with_home(&workspace, Some(&sandbox_home)).await,
         };
 
         let shards: Vec<(String, PathBuf)> = shard_names

@@ -20,10 +20,7 @@ use support::Execd;
 async fn the_binary_passes_every_check_v11_to_v14() {
     // At the most verbose level, so the log holds everything execd would say.
     let execd = Execd::start(
-        &[
-            ("EXECD_KEPT_JOBS_SURVIVE_IDLE", "1"),
-            ("EXECD_LOG", "debug"),
-        ],
+        &[("EXECD_LOG", "debug")],
         &[("EXECD_BEARER", "s3cret-bearer")],
     );
     let headers = [(
@@ -32,9 +29,6 @@ async fn the_binary_passes_every_check_v11_to_v14() {
     )];
     let report = verify(&execd.url(), &headers, &Expectations::default()).await;
     println!("{}", report.render());
-    assert!(report.streams, "{}", report.render());
-    assert!(report.jobs, "{}", report.render());
-    assert!(report.notify, "{}", report.render());
     let not_passed: Vec<_> = report
         .checks
         .iter()
@@ -42,7 +36,7 @@ async fn the_binary_passes_every_check_v11_to_v14() {
         .map(|c| (c.name, c.verdict))
         .collect();
     assert!(not_passed.is_empty(), "{not_passed:?}\n{}", report.render());
-    assert_eq!(report.checks.len(), 20 + conformance::notify::CHECKS.len());
+    assert_eq!(report.checks.len(), 18 + conformance::notify::CHECKS.len());
     // The whole run's log, at its most verbose, never held the bearer; and it is a real log, not an empty one.
     let log = execd.log();
     assert!(
@@ -62,10 +56,7 @@ async fn the_binary_passes_every_check_v11_to_v14() {
 #[tokio::test]
 async fn the_binary_passes_every_check_under_run_as() {
     let Some(execd) = Execd::start_as_root(
-        &[
-            ("EXECD_KEPT_JOBS_SURVIVE_IDLE", "1"),
-            ("EXECD_RUN_AS", "nobody"),
-        ],
+        &[("EXECD_RUN_AS", "nobody")],
         &[("EXECD_BEARER", "s3cret-run-as-bearer")],
     ) else {
         return;
@@ -76,11 +67,6 @@ async fn the_binary_passes_every_check_under_run_as() {
     )];
     let report = verify(&execd.url(), &headers, &Expectations::default()).await;
     println!("{}", report.render());
-    assert!(
-        report.streams && report.jobs && report.notify,
-        "{}",
-        report.render()
-    );
     let not_passed: Vec<_> = report
         .checks
         .iter()
@@ -88,17 +74,6 @@ async fn the_binary_passes_every_check_under_run_as() {
         .map(|c| (c.name, c.verdict))
         .collect();
     assert!(not_passed.is_empty(), "{not_passed:?}\n{}", report.render());
-    assert_eq!(report.checks.len(), 20 + conformance::notify::CHECKS.len());
+    assert_eq!(report.checks.len(), 18 + conformance::notify::CHECKS.len());
     assert!(!execd.log().contains("s3cret-run-as-bearer"));
-}
-
-/// With the deployment setting off (the default) notify is not advertised, and everything else
-/// still passes; the v1.4 checks are skipped, not failed.
-#[tokio::test]
-async fn without_the_idle_setting_it_is_a_conforming_v13_endpoint() {
-    let execd = Execd::start(&[], &[]);
-    let report = verify(&execd.url(), &[], &Expectations::default()).await;
-    println!("{}", report.render());
-    assert!(report.streams && report.jobs && !report.notify);
-    assert!(report.passed(), "{}", report.render());
 }

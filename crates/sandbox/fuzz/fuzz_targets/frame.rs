@@ -1,6 +1,6 @@
 //! Exec protocol v1.2 stream frames (`stream::decode_line`).
 //!
-//! * The golden vectors (`tests/fixtures/exec/v1.2-frames.json`) still decode as specified.
+//! * The golden vectors (`tests/fixtures/exec/frames.json`) still decode as specified.
 //! * Round trip: a frame built from the spec's table decodes to exactly its parts, output first, then
 //!   `shell_exit`, then the one final frame; unknown fields change nothing.
 //! * Raw: never panics; an accepted line is blank or a JSON *object* (not an array a struct happens
@@ -22,7 +22,7 @@ const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STA
 
 fn vectors() {
     let doc: Value =
-        serde_json::from_str(include_str!("../../tests/fixtures/exec/v1.2-frames.json"))
+        serde_json::from_str(include_str!("../../tests/fixtures/exec/frames.json"))
             .expect("fixture is JSON");
     let b64 = |v: &Value| {
         B64.decode(v.as_str().unwrap_or(""))

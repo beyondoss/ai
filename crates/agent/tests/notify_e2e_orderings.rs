@@ -163,15 +163,14 @@ impl Plan {
         // A refused proof leaves the job held, unless a duplicate (a real callback) arrives
         // inside the proof window and proves the path itself.
         let duplicated = self.acts.iter().any(|(_, a)| *a == Act::Duplicate);
-        let end_safe = self.mode == Mode::NoEgress
-            || (self.proof == Fate::Refuse && !duplicated)
-            || !matches!(self.end, Fate::Refuse);
+        let end_safe =
+            (self.proof == Fate::Refuse && !duplicated) || !matches!(self.end, Fate::Refuse);
         !moved && end_safe
     }
 }
 
 fn mode_of(seed: u64) -> Mode {
-    Mode::ALL[(seed % 3) as usize]
+    Mode::ALL[(seed as usize) % Mode::ALL.len()]
 }
 
 // ---- one run
@@ -380,16 +379,6 @@ impl Run<'_> {
     /// Whether the job has ended in the sandbox: its held stream finished or its process group is
     /// gone (native), or its supervisor wrote its `end` (baseline).
     fn job_ended(&self) -> bool {
-        if self.plan.mode == Mode::Baseline {
-            let Some(id) = self.job_id() else {
-                return false;
-            };
-            return std::path::Path::new("/tmp/beyond-jobs")
-                .join(scope(&self.session))
-                .join(id)
-                .join("end")
-                .exists();
-        }
         let tag = &self.marker["fin-".len()..];
         self.f
             .svc
@@ -807,12 +796,6 @@ shards! {
     orderings_native_0: Mode::Native, 0;
     orderings_native_1: Mode::Native, 1;
     orderings_native_2: Mode::Native, 2;
-    orderings_baseline_0: Mode::Baseline, 0;
-    orderings_baseline_1: Mode::Baseline, 1;
-    orderings_baseline_2: Mode::Baseline, 2;
-    orderings_no_egress_0: Mode::NoEgress, 0;
-    orderings_no_egress_1: Mode::NoEgress, 1;
-    orderings_no_egress_2: Mode::NoEgress, 2;
 }
 
 /// Replay one seed alone (`NOTIFY_E2E_SEED`), printing its plan; without the variable, nothing.

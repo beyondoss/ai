@@ -134,28 +134,23 @@ async fn capture<R: tokio::io::AsyncRead + Unpin>(
 const TIMEOUT_EXIT: i32 = 124;
 const TIMEOUT_NOTE: &str = "command exceeded its timeout";
 
-/// A v1.1 answer. `exact` (the request's `output_base64`) sends the bytes as `stdout_base64` and
-/// `stderr_base64`, both always present, instead of text: no lossy conversion, ever.
-fn answer(exact: bool, code: i32, stdout: &[u8], stderr: &[u8]) -> Value {
-    if exact {
-        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
-        json!({ "exit_code": code, "stdout_base64": b64(stdout), "stderr_base64": b64(stderr) })
-    } else {
-        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
-        json!({ "exit_code": code, "stdout": text(stdout), "stderr": text(stderr) })
-    }
+/// An answer: `stdout` and `stderr` are the command's bytes, standard base64, the empty string for
+/// none. No lossy conversion, ever.
+fn answer(code: i32, stdout: &[u8], stderr: &[u8]) -> Value {
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    json!({ "exit_code": code, "stdout": b64(stdout), "stderr": b64(stderr) })
 }
 
 /// v1.1: run to completion, answer with one object.
 pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
     let line = Line::new("exec", &req.command);
-    let stdin = match req.stdin_base64.as_deref() {
+    let stdin = match req.stdin.as_deref() {
         None => None,
         Some(b) => match base64::engine::general_purpose::STANDARD.decode(b) {
             Ok(bytes) => Some(bytes),
             Err(_) => {
-                line.done(400, "bad stdin_base64");
-                return http::error_response(400, "stdin_base64 is not base64");
+                line.done(400, "bad stdin");
+                return http::error_response(400, "stdin is not base64");
             }
         },
     };
@@ -170,10 +165,7 @@ pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
         // `Argument list too long` lands here: an ordinary result, as a shell reports it.
         Err(e) => {
             line.done(200, "spawn failed");
-            return http::json_response(
-                200,
-                &answer(req.wants_exact_output(), 127, b"", e.to_string().as_bytes()),
-            );
+            return http::json_response(200, &answer(127, b"", e.to_string().as_bytes()));
         }
     };
     // Killed on every way out, including this future being dropped when the client leaves (v1.1: a
@@ -239,7 +231,6 @@ pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
             ),
         );
     }
-    let exact = req.wants_exact_output();
     let payload = match status {
         Ok(_) if timed_out => {
             line.done(200, "timed out");
@@ -248,15 +239,15 @@ pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
                 stderr.push(b'\n');
             }
             stderr.extend_from_slice(TIMEOUT_NOTE.as_bytes());
-            answer(exact, TIMEOUT_EXIT, &take(&out), &stderr)
+            answer(TIMEOUT_EXIT, &take(&out), &stderr)
         }
         Ok(s) => {
             line.done(200, "exit");
-            answer(exact, exit_code(s), &take(&out), &take(&err))
+            answer(exit_code(s), &take(&out), &take(&err))
         }
         Err(e) => {
             line.done(200, "wait failed");
-            answer(exact, 127, &take(&out), e.to_string().as_bytes())
+            answer(127, &take(&out), e.to_string().as_bytes())
         }
     };
     http::json_response(200, &payload)

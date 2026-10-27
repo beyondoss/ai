@@ -169,54 +169,20 @@ async fn every_final_frame_maps_onto_the_result() {
 }
 
 #[tokio::test]
-async fn the_probe_runs_once_and_plain_runs_stay_v11() {
+async fn a_stream_asks_for_the_stream_and_a_plain_run_does_not() {
     let (mock, _dir) = mock(Protocol::Streaming).await;
     let runner = HttpExecRunner::new(&mock.url).unwrap();
-    for _ in 0..3 {
-        stream(&runner, "true", Duration::from_secs(10)).await;
-    }
+    stream(&runner, "true", Duration::from_secs(10)).await;
+    assert_eq!(mock.bodies().pop().unwrap()["stream"], true);
     runner
         .run("true", &[], None, Duration::from_secs(10))
         .await
         .unwrap();
-    let bodies = mock.bodies();
-    let probes = bodies
-        .iter()
-        .filter(|b| b["args"][1].as_str().unwrap_or("").starts_with("printf a;"))
-        .count();
-    assert_eq!(probes, 1, "probed once and cached: {bodies:#?}");
-    let last = bodies.last().unwrap();
+    let last = mock.bodies().pop().unwrap();
     assert!(
         last.get("stream").is_none(),
         "`run` (the filesystem backend's path) must not ask to stream: {last}"
     );
-    assert_eq!(bodies.len(), 5);
-}
-
-/// The two ways an endpoint fails the probe, and what `bash` gets instead: v1.1, unchanged — the
-/// sink is never called, and stdout *and* stderr come back in the result.
-#[tokio::test]
-async fn an_endpoint_that_has_not_proved_it_streams_is_driven_as_v11() {
-    for protocol in [Protocol::V11, Protocol::Buffered] {
-        let (mock, _dir) = mock(protocol).await;
-        let runner = HttpExecRunner::new(&mock.url).unwrap();
-        assert!(!runner.streams().await, "{protocol:?} must fail the probe");
-        let (res, sink) = stream(
-            &runner,
-            "printf out; printf err >&2; exit 2",
-            Duration::from_secs(10),
-        )
-        .await;
-        assert!(sink.calls().is_empty(), "{protocol:?}: the sink was called");
-        assert_eq!(
-            (res.code, res.stdout.as_str(), res.stderr.as_str()),
-            (Some(2), "out", "err"),
-            "{protocol:?}"
-        );
-        let last = mock.bodies().pop().unwrap();
-        assert!(
-            last.get("stream").is_none(),
-            "{protocol:?}: after a failed probe, requests are exactly v1.1: {last}"
-        );
-    }
+    // No request but the two: nothing is probed first.
+    assert_eq!(mock.bodies().len(), 2);
 }

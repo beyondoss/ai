@@ -5,11 +5,11 @@ from __future__ import annotations
 import ssl
 from typing import Sequence
 
-from .atransport import AsyncFrameStream, AsyncHttpTransport, AsyncToken, AsyncTransport
+from .atransport import AsyncFrameStream, AsyncHttpTransport, AsyncJobTransport, AsyncToken
 from .files import AsyncFiles, CapsOverride, Files
 from .jobs import AsyncJobs, Jobs
-from .models import ExecResult, Frame, SandboxCapabilities
-from .transport import DEFAULT_TIMEOUT_MS, FrameStream, HttpTransport, Token, Transport
+from .models import Capabilities, ExecResult, Frame
+from .transport import DEFAULT_TIMEOUT_MS, FrameStream, HttpTransport, JobTransport, Token
 
 
 class Frames:
@@ -65,14 +65,13 @@ class Sandbox:
 
     def __init__(
         self,
-        transport: Transport,
+        transport: JobTransport,
         *,
-        jobs_root: str | None = None,
         override: CapsOverride | None = None,
     ) -> None:
         self.transport = transport
         self.files = Files(transport, override=override)
-        self.jobs = Jobs(transport, **({"root": jobs_root} if jobs_root else {}))
+        self.jobs = Jobs(transport)
 
     @classmethod
     def connect(
@@ -82,12 +81,11 @@ class Sandbox:
         *,
         headers: dict[str, str] | None = None,
         ssl_context: ssl.SSLContext | None = None,
-        jobs_root: str | None = None,
         override: CapsOverride | None = None,
     ) -> Sandbox:
         """A sandbox behind an exec endpoint. Nothing is sent until the first call."""
         http = HttpTransport(url, token, headers=headers, ssl_context=ssl_context)
-        return cls(http, jobs_root=jobs_root, override=override)
+        return cls(http, override=override)
 
     def exec(
         self,
@@ -109,18 +107,12 @@ class Sandbox:
         cwd: str | None = None,
         timeout_ms: int | None = None,
     ) -> Frames:
-        """Run a command and iterate its frames as they arrive (v1.2). ``close()`` kills it."""
+        """Run a command and iterate its frames as they arrive. ``close()`` kills it."""
         return Frames(self.transport.stream(command, args, cwd=cwd, timeout_ms=timeout_ms))
 
-    def capabilities(self) -> SandboxCapabilities:
-        caps = self.files.capabilities()
-        probe = getattr(self.transport, "streams", None)
-        outputs = getattr(self.transport, "outputs_base64", None)
-        return SandboxCapabilities(
-            caps.stdin, bool(probe()) if probe else False, self.jobs.kind(),
-            caps.search_engine, caps.find_printf, caps.read_window,
-            bool(outputs()) if outputs else False,
-        )  # fmt: skip
+    def capabilities(self) -> Capabilities:
+        """What the sandbox's environment offers (probed once, cached)."""
+        return self.files.capabilities()
 
     def close(self) -> None:
         close = getattr(self.transport, "close", None)
@@ -139,14 +131,13 @@ class AsyncSandbox:
 
     def __init__(
         self,
-        transport: AsyncTransport,
+        transport: AsyncJobTransport,
         *,
-        jobs_root: str | None = None,
         override: CapsOverride | None = None,
     ) -> None:
         self.transport = transport
         self.files = AsyncFiles(transport, override=override)
-        self.jobs = AsyncJobs(transport, **({"root": jobs_root} if jobs_root else {}))
+        self.jobs = AsyncJobs(transport)
 
     @classmethod
     def connect(
@@ -156,11 +147,10 @@ class AsyncSandbox:
         *,
         headers: dict[str, str] | None = None,
         ssl_context: ssl.SSLContext | None = None,
-        jobs_root: str | None = None,
         override: CapsOverride | None = None,
     ) -> AsyncSandbox:
         http = AsyncHttpTransport(url, token, headers=headers, ssl_context=ssl_context)
-        return cls(http, jobs_root=jobs_root, override=override)
+        return cls(http, override=override)
 
     async def exec(
         self,
@@ -185,15 +175,8 @@ class AsyncSandbox:
             await self.transport.stream(command, args, cwd=cwd, timeout_ms=timeout_ms)
         )
 
-    async def capabilities(self) -> SandboxCapabilities:
-        caps = await self.files.capabilities()
-        probe = getattr(self.transport, "streams", None)
-        outputs = getattr(self.transport, "outputs_base64", None)
-        return SandboxCapabilities(
-            caps.stdin, bool(await probe()) if probe else False, await self.jobs.kind(),
-            caps.search_engine, caps.find_printf, caps.read_window,
-            bool(await outputs()) if outputs else False,
-        )  # fmt: skip
+    async def capabilities(self) -> Capabilities:
+        return await self.files.capabilities()
 
     async def aclose(self) -> None:
         close = getattr(self.transport, "aclose", None)

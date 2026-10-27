@@ -23,7 +23,7 @@ from beyond_sandbox._fs import (
     split_colon_record,
 )
 from beyond_sandbox.errors import classify_stderr
-from beyond_sandbox.models import Hit
+from beyond_sandbox.models import ExecResult, Hit
 
 
 def q(pattern: str = "x", root: str = ".", **kw: object) -> Query:
@@ -368,6 +368,8 @@ def test_stderr_classification(stderr: str, kind: str) -> None:
 
 
 def test_the_classifier_reads_the_stderr_line_not_the_path() -> None:
-    err = _fs.fail("read /tmp/is a directory/x", b"Permission denied (os error 13)\n")
+    err = _fs.fail(
+        "read /tmp/is a directory/x", ExecResult(1, b"", b"Permission denied (os error 13)\n")
+    )
     assert err.kind == "permission_denied"
     assert str(err.detail) == "read /tmp/is a directory/x: Permission denied (os error 13)"

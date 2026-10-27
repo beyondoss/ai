@@ -1,8 +1,8 @@
 //! execd: an exec endpoint that runs inside a sandbox and speaks the agent's exec protocol.
 //!
 //! The normative spec is the module doc of `crates/sandbox/src/exec_endpoint.rs`. execd implements
-//! all of it: v1.1 (one request, one JSON answer, stdin, exact output), v1.2 streaming (frames, heartbeats,
-//! disconnect kills, leftover processes), v1.3 sandbox jobs and v1.4 job-end notify. See this
+//! all of it: one request and one JSON answer (stdin in, base64 bytes out), streaming (frames, heartbeats,
+//! disconnect kills, leftover processes), sandbox jobs and job-end notify. See this
 //! crate's `ARCHITECTURE.md` for the request flow, the process model and every bound.
 //!
 //! This is the library the `execd` binary is a thin wrapper around, so a test harness can embed the
@@ -73,7 +73,7 @@ pub const JOB_OUTPUT_RETENTION: usize = 8 * 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// The largest request the agent sends, in bytes. Derived, not chosen: the biggest thing the agent
-/// ever puts in a request is a file's content as `stdin_base64` (`ShellFs::write_slice`), and the
+/// ever puts in a request is a file's content as `stdin` (`ShellFs::write_slice`), and the
 /// biggest file it writes is an edit's, capped at `MAX_EDIT_BYTES` = 64 MiB. Base64 turns 64 MiB
 /// into `ceil(64 MiB / 3) * 4` = 89,478,488 bytes. The rest of the envelope is the command and its
 /// arguments, which the kernel itself refuses past `ARG_MAX` (2 MiB on a default 8 MiB stack), so
@@ -113,12 +113,6 @@ pub struct Options {
     /// A stream silent this long gets a heartbeat. The spec's is [`HEARTBEAT_INTERVAL`]; a test
     /// that wants to see one quickly shortens it.
     pub heartbeat: Duration,
-    /// Offer sandbox jobs natively (v1.3). Off, the `job` field is an unknown field and the agent
-    /// runs jobs from plain exec commands (the baseline).
-    pub native_jobs: bool,
-    /// The deployment says a kept job survives its sandbox going idle. v1.4 notify is advertised
-    /// only then (N1), and like the spec's setting it is off unless the operator turns it on.
-    pub kept_jobs_survive_idle: bool,
     /// Run every command as this uid, gid and groups instead of execd's own. The host must call
     /// [`helper_main`] first thing, and should prove the switch works with [`RunAs::check`].
     /// `None`: commands share execd's uid, and can read its memory and its environment.
@@ -157,9 +151,7 @@ impl Options {
             authorizer: None,
             insecure_no_auth: false,
             heartbeat: HEARTBEAT_INTERVAL,
-            native_jobs: true,
             run_as: None,
-            kept_jobs_survive_idle: false,
             job_output_retention: JOB_OUTPUT_RETENTION,
             jobs_dir: None,
             max_response_bytes: MAX_RESPONSE_BYTES,
@@ -168,11 +160,6 @@ impl Options {
             idle_timeout: None,
             job_op_hook: None,
         }
-    }
-
-    /// Whether the job probe offers notify (natively, or for the baseline).
-    pub fn advertises_notify(&self) -> bool {
-        self.kept_jobs_survive_idle
     }
 }
 
@@ -186,9 +173,7 @@ impl std::fmt::Debug for Options {
             .field("authorizer", &self.authorizer.is_some())
             .field("insecure_no_auth", &self.insecure_no_auth)
             .field("heartbeat", &self.heartbeat)
-            .field("native_jobs", &self.native_jobs)
             .field("run_as", &self.run_as)
-            .field("kept_jobs_survive_idle", &self.kept_jobs_survive_idle)
             .field("job_output_retention", &self.job_output_retention)
             .field("jobs_dir", &self.jobs_dir)
             .field("max_response_bytes", &self.max_response_bytes)

@@ -1,5 +1,5 @@
 {
-  "spec": "exec protocol v1.4 sandbox job notify (crates/sandbox/src/exec_endpoint.rs, \"Sandbox job notify (v1.4)\"), \"keep with notify\"",
+  "spec": "exec protocol sandbox job notify (crates/sandbox/src/exec_endpoint.rs, \"Sandbox job notify\"), \"keep with notify\"",
   "notes": [
     "cases: the notify member of one keep request (the rest of the request is template), and whether a conforming endpoint accepts it. Refused: the answer is 400 and nothing is recorded, so a list afterwards reports the job exactly as before (not kept, no notify). refusal names the rule broken, for a human reading a failure.",
     "The url's query is the replica's business: the endpoint checks only N4's grammar. The first case is the url the replica sends, naming the session and the tenant."

@@ -123,7 +123,7 @@ async fn adopted_then_stopped(runner: Arc<dyn CommandRunner>, cmd: &'static str)
 #[tokio::test]
 async fn a_v12_leftover_is_adopted_and_stopped_with_the_session() {
     let dir = tempfile::tempdir().unwrap();
-    let mock = ExecMock::start(dir.path(), true).await;
+    let mock = ExecMock::start(dir.path()).await;
     let runner = Arc::new(HttpExecRunner::new(&mock.url).unwrap());
     adopted_then_stopped(runner, "sleep 63.11").await;
     let s = mock.streams().into_iter().last().unwrap();
@@ -149,7 +149,7 @@ async fn a_leftover_holding_stdout_is_adopted_not_yielded() {
         (
             Arc::new(
                 HttpExecRunner::new(
-                    &ExecMock::start(tempfile::tempdir().unwrap().path(), true)
+                    &ExecMock::start(tempfile::tempdir().unwrap().path())
                         .await
                         .url,
                 )
@@ -184,7 +184,7 @@ async fn a_leftover_holding_stdout_is_adopted_not_yielded() {
 #[tokio::test]
 async fn a_leftover_that_exits_ends_its_job() {
     let dir = tempfile::tempdir().unwrap();
-    let mock = ExecMock::start(dir.path(), true).await;
+    let mock = ExecMock::start(dir.path()).await;
     for runner in [
         detaching_transport(),
         Arc::new(HttpExecRunner::new(&mock.url).unwrap()) as Arc<dyn CommandRunner>,

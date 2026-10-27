@@ -11,7 +11,7 @@ import pytest
 
 from beyond_sandbox import _wire
 from beyond_sandbox._http import Malformed, ResponseReader, Truncated, build_request, parse_url
-from beyond_sandbox.errors import InvalidRequest, ProtocolError, TransportError
+from beyond_sandbox.errors import InvalidRequest, ProtocolError, TooLarge, TransportError
 from beyond_sandbox.models import (
     Exit,
     JobEnd,
@@ -45,7 +45,7 @@ def b64(s: str) -> bytes:
     return base64.b64decode(s)
 
 
-# ---- v1.2 frames: the reference vectors ------------------------------------------------------------
+# ---- stream frames: the reference vectors ------------------------------------------------------------
 
 
 def run_frames(lines: list[str]) -> tuple[bytes, bytes, list[int], Any, str | None]:
@@ -68,7 +68,7 @@ def run_frames(lines: list[str]) -> tuple[bytes, bytes, list[int], Any, str | No
 
 
 def test_the_v12_frame_vectors() -> None:
-    for case in fixture("v1.2-frames.json")["cases"]:
+    for case in fixture("frames.json")["cases"]:
         name, want = case["name"], case["expect"]
         out, err, shell, end, error = run_frames(case["lines"])
         if want.get("invalid"):
@@ -117,11 +117,11 @@ def test_an_overlong_line_is_refused() -> None:
         _wire.LineSplitter().feed(b"x" * (_wire.MAX_FRAME_LINE + 1))
 
 
-# ---- v1.3 jobs: the reference vectors --------------------------------------------------------------
+# ---- jobs: the reference vectors --------------------------------------------------------------
 
 
 def test_the_v13_job_stream_vectors() -> None:
-    for case in fixture("v1.3-jobs.json")["streams"]:
+    for case in fixture("jobs.json")["streams"]:
         name, want = case["name"], case["expect"]
         started, out, gap, shell, end, error = None, bytearray(), 0, [], None, None
         dec = _wire.job_decoder()
@@ -159,7 +159,7 @@ def test_the_v13_job_stream_vectors() -> None:
 
 
 def test_the_v13_answer_vectors() -> None:
-    for case in fixture("v1.3-jobs.json")["answers"]:
+    for case in fixture("jobs.json")["answers"]:
         want, answer = case["expect"], case["answer"]
         if case["op"] == "read":
             r = _wire.parse_read(answer)
@@ -181,27 +181,37 @@ def test_the_v13_answer_vectors() -> None:
             ]
 
 
-def test_the_probe_answers_offer_only_what_the_spec_names() -> None:
-    for case in fixture("v1.4-probe.json")["answers"]:
-        offer = _wire.parse_offer(case["answer"])
-        assert offer.native is case["expect"]["native_jobs"], case["name"]
-        assert offer.notify is case["expect"]["notify"], case["name"]
+# ---- the one-shot envelope, errors ---------------------------------------------------------------------
 
 
-# ---- the v1.1 envelope, errors ---------------------------------------------------------------------
+def test_envelope_streams_are_base64_bytes() -> None:
+    body = json.dumps({"exit_code": 2, "stdout": "/wA=", "stderr": ""}).encode()
+    r = _wire.parse_envelope("u", body, 100)
+    assert (r.exit_code, r.stdout, r.stderr) == (2, b"\xff\x00", b"")
 
 
-def test_envelope_text_becomes_utf8_bytes() -> None:
-    r = _wire.parse_envelope(
-        "u", json.dumps({"exit_code": 2, "stdout": "é�", "stderr": ""}).encode()
-    )
-    assert (r.exit_code, r.stdout, r.stderr) == (2, "é�".encode(), b"")
+def test_the_cap_is_on_the_decoded_bytes_of_both_streams() -> None:
+    body = json.dumps({"exit_code": 0, "stdout": "YWJj", "stderr": "ZGU="}).encode()  # 3 + 2
+    assert _wire.parse_envelope("u", body, 5).stdout == b"abc"
+    with pytest.raises(TooLarge):
+        _wire.parse_envelope("u", body, 4)
 
 
-@pytest.mark.parametrize("body", [b"nope", b"[]", b'{"stdout":""}', b'{"exit_code":"0"}'])
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"nope",
+        b"[]",
+        b'{"stdout":"","stderr":""}',
+        b'{"exit_code":"0","stdout":"","stderr":""}',
+        b'{"exit_code":0,"stdout":"","stderr":"!!"}',
+        b'{"exit_code":0,"stdout":""}',
+        b'{"exit_code":0,"stdout":"hi there","stderr":""}',
+    ],
+)
 def test_a_200_that_is_not_the_envelope_is_a_protocol_error(body: bytes) -> None:
     with pytest.raises(ProtocolError):
-        _wire.parse_envelope("u", body)
+        _wire.parse_envelope("u", body, 100)
 
 
 def test_status_codes_map_to_kinds() -> None:
@@ -221,7 +231,7 @@ def test_the_request_body_omits_what_is_absent() -> None:
             "cat", [], cwd="/w", timeout_ms=1, stdin=b"hi", stream=True, job={"op": "x"}
         )
     )
-    assert body["stdin_base64"] == "aGk=" and body["stream"] is True and body["cwd"] == "/w"
+    assert body["stdin"] == "aGk=" and body["stream"] is True and body["cwd"] == "/w"
     assert body["job"] == {"op": "x"}
 
 

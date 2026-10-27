@@ -36,9 +36,8 @@ skipped.
 
 `cargo nextest run -p beyond-sandbox -E 'binary(sdk_conformance)'`
 replays every scenario through the agent's own `ShellFs` and `HttpExecRunner`
-against a loopback `execd`, in several backend profiles (plain, bearer, a v1
-endpoint without stdin, a v1.1-only endpoint, forced no-stdin, forced `grep` and
-busybox-grep rungs, baseline jobs). It proves the scenarios say what the
+against a loopback `execd`, in several backend profiles (plain, bearer, forced `grep` and
+busybox-grep rungs, and a transport that is only `sh`). It proves the scenarios say what the
 implementation the spec was read from does today. Known defects of that
 implementation are marked `xfail` and listed in FILES-OVER-EXEC.md; they must
 fail there and pass everywhere else.
@@ -47,8 +46,8 @@ fail there and pass everywhere else.
 
 `mise run test:clients` builds every driver in [drivers.toml](drivers.toml) and runs it against every backend with
 `sandbox-matrix` ([crates/sandbox-conformance](../../crates/sandbox-conformance/ARCHITECTURE.md)): `local` (execd on loopback,
-with the forced no-stdin, `grep` and busybox rungs), `alpine` (real busybox), `debian-runas` (`EXECD_RUN_AS`), `readonly`,
-`tinydisk` and `fault` (an endpoint that is wrong on purpose). The container backends need docker. It prints a table
+with the forced `grep` and busybox rungs), `alpine` (real busybox), `debian-runas` (`EXECD_RUN_AS`), `readonly`
+and `tinydisk`. The container backends need docker. It prints a table
 (pass / fail / known defect / unsupported / skipped per `driver__backend`) and writes `target/sandbox-matrix/report.json`;
 a `fail`, including an `xfail` that passes, exits non-zero. `BACKENDS="local alpine" mise run test:clients` picks backends;
 extra arguments reach `sandbox-matrix` (`--filter 'files.*'`, `--verbose` to list every skip with its reason).
@@ -69,7 +68,7 @@ says so.
 
 A backend is a URL (and a bearer, if it has one) of an exec endpoint, and a
 directory in the sandbox the harness may use. Start `execd` anywhere (see
-`crates/execd/README.md`) or point at any v1.1 to v1.3 endpoint. Scenarios that
+`crates/execd/README.md`) or point at any endpoint that speaks the protocol. Scenarios that
 need a capability the backend lacks are skipped, visibly. To add one to the
 matrix, add a name to `backends::start` in `crates/sandbox-conformance` that
 returns the URL, the bearer and the directory, and a guard that stops it; a live

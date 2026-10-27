@@ -425,13 +425,6 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
     let jobs = &ctx.jobs;
     let key = |id: &str| (job.scope.clone(), id.to_string());
     match job.op.as_str() {
-        "probe" => {
-            let mut answer = json!({ "jobs": "v1.3" });
-            if ctx.opts.advertises_notify() {
-                answer["notify"] = json!(crate::NOTIFY_VERSION);
-            }
-            http::json_response(200, &answer)
-        }
         "start" => start_job(ctx, req, &job).await,
         "attach" => {
             let k = key(&job.id);

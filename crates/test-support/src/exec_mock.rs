@@ -1,36 +1,27 @@
-//! A stand-in exec endpoint: the other side of the exec protocol (v1.1, and v1.2 streaming),
-//! running each command as a real process on this host.
+//! A stand-in exec endpoint: the other side of the exec protocol, running each command as a real
+//! process on this host.
 //!
 //! Shared rather than per-test because several suites need the same thing for different reasons.
-//! `exec_endpoint_writes` needs a **v1** endpoint (`honors_stdin: false`) that ignores `stdin_base64`
-//! like any unknown field, so the 128 KiB argv cap bites for real. `serve_service_mode` needs a
-//! **sandbox**: a directory that stands in for the tenant's box, with its own `HOME`, so a test can
-//! tell "the tool ran in the sandbox" from "the tool ran on the replica" by which marker file it
-//! finds — and can assert, from [`ExecMock::requests`], exactly which headers the grant sent. The
-//! streaming suites need a **v1.2** endpoint whose process groups they can watch die
-//! ([`ExecMock::streams`]), and the endpoints that get v1.2 wrong in each way the probe and the
-//! conformance verifier must catch ([`Protocol`], [`MockOptions::kills_on_disconnect`]).
+//! `serve_service_mode` needs a **sandbox**: a directory that stands in for the tenant's box, with its
+//! own `HOME`, so a test can tell "the tool ran in the sandbox" from "the tool ran on the replica" by
+//! which marker file it finds — and can assert, from [`ExecMock::requests`], exactly which headers the
+//! grant sent. The streaming suites need an endpoint whose process groups they can watch die
+//! ([`ExecMock::streams`]), and the endpoints that get the protocol wrong in each way the conformance
+//! verifier must catch ([`Protocol`], [`MockOptions::kills_on_disconnect`]).
 //!
 //! **A conforming configuration runs execd**, the production endpoint (`crates/execd`): the same code
 //! the shipping binary runs, with an observer filling [`ExecMock::requests`], [`ExecMock::streams`]
-//! and [`ExecMock::callbacks`]. Only the configurations that get the protocol wrong on purpose (the
-//! v1 endpoint that ignores stdin, [`Protocol::V11`] and [`Protocol::Buffered`], the non-killing and
-//! non-tracking variants, [`MockOptions::idle_kill`], lost callbacks, a slow `keep`, no egress, the
-//! [`NotifyFaults`], a front that refuses the extensions) keep this module's own server below, which
-//! exists to be wrong in those ways. [`MockOptions::is_conforming`] says which is which.
+//! and [`ExecMock::callbacks`]. Only the configurations that get the protocol wrong on purpose
+//! ([`Protocol::Buffered`], the non-killing and non-tracking variants, [`MockOptions::idle_kill`],
+//! lost callbacks, a slow `keep`, no egress, the [`NotifyFaults`], corrupted base64) keep this
+//! module's own server below, which exists to be wrong in those ways. [`MockOptions::is_conforming`]
+//! says which is which.
 //!
-//! The default is a conforming v1.3 endpoint — v1.2 streaming plus native sandbox jobs
-//! ([`MockOptions::jobs`]): what a real sandbox should be, so every suite that does not ask for
-//! something else exercises the newest path. `jobs: false` is a v1.2-only endpoint, on which the
-//! agent falls back to running jobs with plain exec commands (the baseline).
-//!
-//! It is also the reference **v1.4** endpoint (job notify): `keep` takes `notify`, and its own sender
-//! calls back at `keep` and at each state change, with the spec's retry schedule, status table, no
-//! redirects and a verified server. Like the spec's deployment setting, it advertises notify only
-//! when told its kept jobs survive idling ([`MockOptions::notifying`]); with `jobs: false` the
-//! advertisement is for the baseline. The proof matrix's failure modes are options too: lost
-//! callbacks, a slow `keep`, no egress, and a sandbox that kills idle jobs. [`CallbackReceiver`] is
-//! the fleet's side of a callback, for the suites that watch one arrive.
+//! It is the reference endpoint for job notify too: `keep` takes `notify`, and its own sender calls
+//! back at `keep` and at each state change, with the spec's retry schedule, status table, no
+//! redirects and a verified server. The proof matrix's failure modes are options: lost callbacks, a
+//! slow `keep`, no egress, and a sandbox that kills idle jobs. [`CallbackReceiver`] is the fleet's
+//! side of a callback, for the suites that watch one arrive.
 
 #![allow(dead_code)]
 
@@ -76,30 +67,23 @@ impl ExecRequest {
     }
 }
 
-/// Which protocol the endpoint speaks when asked to stream.
+/// How the endpoint streams when asked to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Protocol {
-    /// v1.2, conforming: `"stream": true` gets frames as the command produces them.
+    /// Conforming: `"stream": true` gets frames as the command produces them.
     Streaming,
-    /// v1.1: `stream` is an unknown field and ignored; the answer is always one JSON object.
-    V11,
     /// Answers with `application/x-ndjson` but holds everything until the command exits, then sends
     /// one frame per stream and the final frame — a lazy implementation, or a buffering proxy in
-    /// front of a good one. Looks like v1.2 on the wire; the probe must refuse it.
+    /// front of a good one. The conformance verifier must refuse it.
     Buffered,
 }
 
-/// How the endpoint behaves. [`Default`] is a conforming v1.2 sandbox with stdin support.
+/// How the endpoint behaves. [`Default`] is a conforming sandbox.
 #[derive(Clone, Debug)]
 pub struct MockOptions {
-    pub honors_stdin: bool,
-    /// Honour `output_base64` (v1.1 "Exact output"): answer `stdout_base64`/`stderr_base64`. `false`
-    /// is an endpoint that predates it, which ignores the field and answers text with invalid UTF-8
-    /// replaced by U+FFFD, as every endpoint did before.
-    pub honors_output_base64: bool,
-    /// Honours `output_base64` in form only: the answer has the base64 fields, but the bytes went
-    /// through a lossy UTF-8 conversion first. The non-conforming endpoint the verifier has to catch.
-    pub lossy_output_base64: bool,
+    /// Answer every one-shot request with corrupted base64 in `stdout` and `stderr`: the
+    /// non-conforming endpoint the verifier has to catch.
+    pub corrupts_base64: bool,
     pub protocol: Protocol,
     /// The silence after which a stream gets a heartbeat frame. The spec's is 5 s; a suite that
     /// wants to prove heartbeats are not output makes it much shorter than its idle window.
@@ -114,21 +98,11 @@ pub struct MockOptions {
     pub tracks_leftovers: bool,
     /// `HOME` for every command; `None` inherits this process's.
     pub home: Option<PathBuf>,
-    /// Offer sandbox jobs natively (v1.3): answer requests carrying `"job"`. `false` is a v1.2-only
-    /// endpoint, which ignores the field and runs the command.
-    pub jobs: bool,
     /// Kill a held job whose stream closes before it was kept — the v1.3 MUST. `false` is the
     /// non-conforming endpoint the conformance verifier has to catch.
     pub jobs_hold_kills: bool,
     /// How much of a job's output is kept; older bytes are dropped and read back as a gap.
     pub job_output_cap: usize,
-    /// The endpoint implements v1.4: `keep` takes `notify`, and its own sender (in this process)
-    /// calls back. `false` is a v1.3 endpoint, to which `notify` is an unknown field.
-    pub notify: bool,
-    /// The deployment's setting that a kept job survives its sandbox going idle. Notify is
-    /// advertised only when it is on (and there is egress), and like the spec's setting it is off
-    /// unless turned on. With [`Self::jobs`] off the advertisement is for the baseline.
-    pub kept_jobs_survive_idle: bool,
     /// The sandbox kills every job once no request has been open for this long (a vendor's
     /// auto-stop). An honest deployment of it leaves [`Self::kept_jobs_survive_idle`] off, and so
     /// does not advertise notify; turning both on is the misconfigured endpoint a verifier must
@@ -148,10 +122,7 @@ pub struct MockOptions {
     /// Answer 401 to any request that does not carry `Authorization: Bearer <this>`: an endpoint on
     /// the public internet, reached with the bearer its grant's exec headers carry. `None` accepts all.
     pub require_bearer: Option<String>,
-    /// Answer 400 to a request carrying `stream`, `output_base64` or `job`: a front that validates strictly and
-    /// refuses the protocol's extensions instead of ignoring them as the spec says to.
-    pub refuses_extensions: bool,
-    /// Enforce `timeout_ms` over v1.1: at the deadline kill the command's whole process group and
+    /// Enforce `timeout_ms` on a one-shot request: at the deadline kill the command's whole process group and
     /// answer 200 with `exit_code` 124. `false` is the endpoint that ignores it (a hung command
     /// runs until the client leaves), which the conformance verifier has to catch.
     pub v11_timeout: bool,
@@ -161,8 +132,6 @@ pub struct MockOptions {
 /// what the mock feeds the kernel, or to the request it makes, never to the kernel.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct NotifyFaults {
-    /// Advertise `notify` as this value instead of `"v1.4"`.
-    pub probe_notify: Option<Value>,
     /// Accept any `notify`, valid or not.
     pub accepts_any_notify: bool,
     /// A `keep` with `notify` leaves a notify already recorded in place.
@@ -207,26 +176,20 @@ pub enum LoseCallbacks {
 impl Default for MockOptions {
     fn default() -> Self {
         Self {
-            honors_stdin: true,
-            honors_output_base64: true,
-            lossy_output_base64: false,
+            corrupts_base64: false,
             protocol: Protocol::Streaming,
             heartbeat: Duration::from_secs(5),
             kills_on_disconnect: true,
             tracks_leftovers: true,
             home: None,
-            jobs: true,
             jobs_hold_kills: true,
             job_output_cap: 8 * 1024 * 1024,
-            notify: true,
-            kept_jobs_survive_idle: false,
             idle_kill: None,
             egress: true,
             lose_callbacks: LoseCallbacks::None,
             keep_delay: Duration::ZERO,
             faults: NotifyFaults::default(),
             require_bearer: None,
-            refuses_extensions: false,
             v11_timeout: true,
         }
     }
@@ -238,43 +201,17 @@ impl MockOptions {
     /// offering (a sandbox that kills idle jobs, a callback path that loses its callbacks, a front
     /// that refuses the extensions, a v1 endpoint that ignores stdin), keeps the mock's own server.
     pub fn is_conforming(&self) -> bool {
-        self.honors_stdin
-            && self.honors_output_base64
-            && !self.lossy_output_base64
+        !self.corrupts_base64
             && self.protocol == Protocol::Streaming
             && self.kills_on_disconnect
             && self.tracks_leftovers
             && self.jobs_hold_kills
-            && self.notify
             && self.idle_kill.is_none()
             && self.egress
             && self.lose_callbacks == LoseCallbacks::None
             && self.keep_delay.is_zero()
             && self.faults == NotifyFaults::default()
-            && !self.refuses_extensions
             && self.v11_timeout
-    }
-
-    /// A conforming v1.4 endpoint: v1.3 jobs, and notify advertised (its deployment says kept jobs
-    /// survive idling).
-    pub fn notifying() -> Self {
-        Self {
-            kept_jobs_survive_idle: true,
-            ..Self::default()
-        }
-    }
-
-    /// Whether the job probe's answer offers notify (natively, or for the baseline).
-    pub fn advertises_notify(&self) -> bool {
-        self.notify && self.kept_jobs_survive_idle && self.egress
-    }
-
-    /// The probe answer's `notify` value, when it advertises.
-    fn notify_answer(&self) -> Value {
-        self.faults
-            .probe_notify
-            .clone()
-            .unwrap_or_else(|| json!(NOTIFY_VERSION))
     }
 }
 
@@ -319,17 +256,16 @@ struct Shared {
 
 impl ExecMock {
     /// An endpoint rooted at `root`, with no `HOME` of its own.
-    pub async fn start(root: &Path, honors_stdin: bool) -> Self {
-        Self::start_with_home(root, None, honors_stdin).await
+    pub async fn start(root: &Path) -> Self {
+        Self::start_with_home(root, None).await
     }
 
     /// A sandbox: commands run with `cwd` defaulting to `root` and `HOME` set to `home`, so `$HOME`
     /// (what `serve --service`'s startup probe asks for) is the sandbox's, never the replica's.
-    pub async fn start_with_home(root: &Path, home: Option<&Path>, honors_stdin: bool) -> Self {
+    pub async fn start_with_home(root: &Path, home: Option<&Path>) -> Self {
         Self::start_with(
             root,
             MockOptions {
-                honors_stdin,
                 home: home.map(Path::to_path_buf),
                 ..MockOptions::default()
             },
@@ -348,18 +284,12 @@ impl ExecMock {
     /// opposite: replicas carry the exec URL in their grant and are started before the driver, so
     /// the address has to be predictable and reachable from another host — which `127.0.0.1:0` is
     /// neither of.
-    pub async fn start_on(
-        bind: &str,
-        root: &Path,
-        home: Option<&Path>,
-        honors_stdin: bool,
-    ) -> Self {
+    pub async fn start_on(bind: &str, root: &Path, home: Option<&Path>) -> Self {
         let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
         Self::serve(
             listener,
             root,
             MockOptions {
-                honors_stdin,
                 home: home.map(Path::to_path_buf),
                 ..MockOptions::default()
             },
@@ -433,8 +363,6 @@ impl ExecMock {
         o.home = opts.home.clone();
         o.bearer = opts.require_bearer.clone();
         o.heartbeat = opts.heartbeat;
-        o.native_jobs = opts.jobs;
-        o.kept_jobs_survive_idle = opts.kept_jobs_survive_idle;
         o.job_output_retention = opts.job_output_cap;
         o.observer = Some(Arc::new(Recorder {
             requests: mock.requests.clone(),
@@ -650,26 +578,12 @@ async fn serve_one(mut sock: tokio::net::TcpStream, shared: Shared) {
         headers,
         body: req.clone(),
     });
-    if shared.opts.refuses_extensions
-        && (req["stream"].as_bool() == Some(true)
-            || req["output_base64"].as_bool() == Some(true)
-            || req.get("job").is_some_and(Value::is_object))
-    {
-        respond_json(sock, 400, &json!({ "error": "unknown field" })).await;
-        return;
-    }
-    if shared.opts.jobs && req.get("job").is_some_and(Value::is_object) {
+    if req.get("job").is_some_and(Value::is_object) {
         serve_job(sock, req, shared).await;
         return;
     }
-    // Without native jobs the field is unknown and the command runs, except that an endpoint
-    // offering notify for the baseline answers the probe (v1.4).
-    if req["job"]["op"] == "probe" && shared.opts.advertises_notify() {
-        respond_json(sock, 200, &json!({ "notify": shared.opts.notify_answer() })).await;
-        return;
-    }
     let wants_stream = req["stream"].as_bool() == Some(true);
-    if wants_stream && shared.opts.protocol != Protocol::V11 {
+    if wants_stream {
         serve_stream(sock, req, shared).await;
     } else {
         serve_envelope(sock, req, shared).await;
@@ -706,10 +620,8 @@ fn command_for(req: &Value, shared: &Shared) -> tokio::process::Command {
 
 /// v1.1: run to completion, answer with one object.
 async fn serve_envelope(mut sock: tokio::net::TcpStream, req: Value, shared: Shared) {
-    let exact = shared.opts.honors_output_base64 && req["output_base64"] == Value::Bool(true);
-    let stdin = req["stdin_base64"]
+    let stdin = req["stdin"]
         .as_str()
-        .filter(|_| shared.opts.honors_stdin)
         .map(|b| base64::engine::general_purpose::STANDARD.decode(b).unwrap());
     let mut cmd = command_for(&req, &shared);
     cmd.stdin(if stdin.is_some() {
@@ -746,26 +658,7 @@ async fn serve_envelope(mut sock: tokio::net::TcpStream, req: Value, shared: Sha
                         .code()
                         .or_else(|| o.status.signal().map(|n| 128 + n))
                         .unwrap_or(-1);
-                    if exact {
-                        let lossy = |b: &[u8]| {
-                            if shared.opts.lossy_output_base64 {
-                                String::from_utf8_lossy(b).into_owned().into_bytes()
-                            } else {
-                                b.to_vec()
-                            }
-                        };
-                        json!({
-                            "exit_code": code,
-                            "stdout_base64": b64(&lossy(&o.stdout)),
-                            "stderr_base64": b64(&lossy(&o.stderr)),
-                        })
-                    } else {
-                        json!({
-                            "exit_code": code,
-                            "stdout": String::from_utf8_lossy(&o.stdout),
-                            "stderr": String::from_utf8_lossy(&o.stderr),
-                        })
-                    }
+                    answer(&shared, code, &o.stdout, &o.stderr)
                 }
                 None => {
                     if let Some(pgid) = pgid {
@@ -774,21 +667,12 @@ async fn serve_envelope(mut sock: tokio::net::TcpStream, req: Value, shared: Sha
                             .stderr(std::process::Stdio::null())
                             .status();
                     }
-                    if exact {
-                        json!({ "exit_code": 124, "stdout_base64": "",
-                                "stderr_base64": b64(b"command exceeded its timeout") })
-                    } else {
-                        json!({ "exit_code": 124, "stdout": "",
-                                "stderr": "command exceeded its timeout" })
-                    }
+                    answer(&shared, 124, b"", b"command exceeded its timeout")
                 }
             }
         }
-        // `Argument list too long` lands here — the defect v1.1 exists to fix.
-        Err(e) if exact => json!({
-            "exit_code": 127, "stdout_base64": "", "stderr_base64": b64(e.to_string().as_bytes())
-        }),
-        Err(e) => json!({ "exit_code": 127, "stdout": "", "stderr": e.to_string() }),
+        // `Argument list too long` lands here.
+        Err(e) => answer(&shared, 127, b"", e.to_string().as_bytes()),
     };
     let body = payload.to_string();
     let resp = format!(
@@ -806,6 +690,18 @@ fn chunk(frame: &Value) -> Vec<u8> {
     out.extend_from_slice(line.as_bytes());
     out.extend_from_slice(b"\r\n");
     out
+}
+
+/// A one-shot answer: `stdout` and `stderr` are base64, corrupted when the endpoint is told to.
+fn answer(shared: &Shared, code: i32, stdout: &[u8], stderr: &[u8]) -> Value {
+    let enc = |b: &[u8]| {
+        let mut s = b64(b);
+        if shared.opts.corrupts_base64 {
+            s.insert(0, '!');
+        }
+        s
+    };
+    json!({ "exit_code": code, "stdout": enc(stdout), "stderr": enc(stderr) })
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -1145,13 +1041,6 @@ async fn serve_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
         .unwrap_or_default();
     let jobs = shared.jobs.clone();
     match op {
-        "probe" => {
-            let mut answer = json!({ "jobs": "v1.3" });
-            if shared.opts.advertises_notify() {
-                answer["notify"] = shared.opts.notify_answer();
-            }
-            respond_json(sock, 200, &answer).await
-        }
         "start" => start_job(sock, req.clone(), shared).await,
         "attach" => {
             let id = job["id"].as_str().unwrap_or("").to_string();
@@ -1193,7 +1082,7 @@ async fn serve_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
             // v1.4: a `notify` that fails the grammar refuses the whole `keep`, before anything is
             // recorded. The reason never quotes the token.
             let notify = match job.get("notify") {
-                Some(n) if op == "keep" && shared.opts.notify => match parse_notify(n) {
+                Some(n) if op == "keep" => match parse_notify(n) {
                     Ok(t) => Some(t),
                     Err(_) if shared.opts.faults.accepts_any_notify => Some(NotifyTarget {
                         url: n["url"].as_str().unwrap_or("").to_string(),

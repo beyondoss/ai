@@ -56,8 +56,15 @@ export const json = (res: ServerResponse, status: number, v: unknown): void => {
   res.end(JSON.stringify(v));
 };
 
-export const ok = (stdout = "", exit_code = 0, stderr = ""): unknown => ({
+const b64 = (s: string | Uint8Array) => Buffer.from(s).toString("base64");
+
+/** A one-shot answer: the text given is what the command wrote; the envelope carries it as base64. */
+export const ok = (
+  stdout: string | Uint8Array = "",
+  exit_code = 0,
+  stderr: string | Uint8Array = "",
+): unknown => ({
   exit_code,
-  stdout,
-  stderr,
+  stdout: b64(stdout),
+  stderr: b64(stderr),
 });

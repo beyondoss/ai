@@ -1,11 +1,10 @@
-//! The reference v1.4 endpoint (`exec_mock`, native mode) against the spec's endpoint-side
-//! requirements and vectors, driven through the agent's own client (`jobs_native`): the probe's
-//! answer, `keep`'s `notify` and its grammar (`v1.4-keep.json`), the callback's exact bytes
-//! (`v1.4-callback.json`), when it calls back, the retry schedule and the status table over the
+//! The reference endpoint (`exec_mock`) against the spec's endpoint-side
+//! requirements and vectors, driven through the agent's own client (`jobs_native`): `keep`'s `notify` and its grammar (`notify-keep.json`), the callback's exact bytes
+//! (`notify-callback.json`), when it calls back, the retry schedule and the status table over the
 //! wire, no redirects, a verified server, and what the mock can be told to get wrong for the proof
 //! matrix (lost callbacks, a slow `keep`, no egress, an idle-killing sandbox). When to call back is
 //! the shared kernel's (`exec_notify`, re-exported as `exec_endpoint::notify_kernel`), whose own
-//! tests run every `v1.4-retry.json` timeline through it.
+//! tests run every `notify-retry.json` timeline through it.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
@@ -15,15 +14,15 @@ use beyond_sandbox::exec_endpoint::HttpExecRunner;
 use beyond_sandbox::exec_endpoint::jobs::{
     JobId, JobNotify, JobScope, JobSpec, JobStatus, SandboxJobs,
 };
-use beyond_sandbox::exec_endpoint::jobs_native::{JobOffer, NativeJobs};
+use beyond_sandbox::exec_endpoint::jobs_native::NativeJobs;
 use beyond_test_support::exec_mock::{
     Answer, CallbackReceiver, ExecMock, LoseCallbacks, MockOptions,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const KEEP: &str = include_str!("fixtures/exec/v1.4-keep.json");
-const CALLBACK: &str = include_str!("fixtures/exec/v1.4-callback.json");
+const KEEP: &str = include_str!("fixtures/exec/notify-keep.json");
+const CALLBACK: &str = include_str!("fixtures/exec/notify-callback.json");
 
 struct Endpoint {
     mock: ExecMock,
@@ -131,87 +130,7 @@ async fn post(url: &str, body: &Value) -> u16 {
         .unwrap()
 }
 
-#[tokio::test]
-async fn the_mock_advertises_notify_as_its_deployment_says() {
-    let cases = [
-        (
-            "the setting is off by default",
-            MockOptions::default(),
-            JobOffer {
-                native_jobs: true,
-                ..JobOffer::default()
-            },
-        ),
-        (
-            "kept jobs survive idling",
-            MockOptions::notifying(),
-            JobOffer {
-                native_jobs: true,
-                notify: true,
-                baseline_notify: false,
-            },
-        ),
-        (
-            "no egress: it knows, and does not advertise",
-            MockOptions {
-                egress: false,
-                ..MockOptions::notifying()
-            },
-            JobOffer {
-                native_jobs: true,
-                ..JobOffer::default()
-            },
-        ),
-        (
-            "a v1.3 endpoint",
-            MockOptions {
-                notify: false,
-                ..MockOptions::notifying()
-            },
-            JobOffer {
-                native_jobs: true,
-                ..JobOffer::default()
-            },
-        ),
-        (
-            "an idle-killing sandbox, deployed honestly",
-            MockOptions {
-                idle_kill: Some(Duration::from_secs(60)),
-                ..MockOptions::default()
-            },
-            JobOffer {
-                native_jobs: true,
-                ..JobOffer::default()
-            },
-        ),
-        (
-            "no native jobs: notify for the baseline",
-            MockOptions {
-                jobs: false,
-                ..MockOptions::notifying()
-            },
-            JobOffer {
-                baseline_notify: true,
-                ..JobOffer::default()
-            },
-        ),
-        (
-            "no native jobs, the setting off",
-            MockOptions {
-                jobs: false,
-                ..MockOptions::default()
-            },
-            JobOffer::default(),
-        ),
-    ];
-    for (name, opts, want) in cases {
-        let e = Endpoint::start(opts).await;
-        assert_eq!(e.runner.job_offer().await, want, "{name}");
-        assert_eq!(e.jobs().offers_notify().await, want.notify, "{name}");
-    }
-}
-
-/// Every case of `v1.4-keep.json`, sent as written to a held job: accepted cases are recorded with
+/// Every case of `notify-keep.json`, sent as written to a held job: accepted cases are recorded with
 /// their `notify` (the proof is attempted at once), refused ones are a `400` that records nothing.
 #[tokio::test]
 async fn keep_takes_notify_as_the_vectors_say() {
@@ -219,7 +138,7 @@ async fn keep_takes_notify_as_the_vectors_say() {
     // network still shows which URL the recorded `notify` holds.
     let e = Endpoint::start(MockOptions {
         egress: false,
-        ..MockOptions::notifying()
+        ..MockOptions::default()
     })
     .await;
     let file: Value = serde_json::from_str(KEEP).unwrap();
@@ -268,7 +187,7 @@ async fn keep_takes_notify_as_the_vectors_say() {
     }
 }
 
-/// The first case of `v1.4-callback.json`: one `POST` to the URL exactly as `keep` gave it, its
+/// The first case of `notify-callback.json`: one `POST` to the URL exactly as `keep` gave it, its
 /// headers and body byte for byte, nothing forbidden, and the token only in `Authorization`.
 #[tokio::test]
 async fn the_callback_is_the_vector_byte_for_byte() {
@@ -276,7 +195,7 @@ async fn the_callback_is_the_vector_byte_for_byte() {
     let vector = &file["requests"][0];
     let keep = &file["keep"];
     let rx = CallbackReceiver::start().await;
-    let e = Endpoint::start(MockOptions::notifying()).await;
+    let e = Endpoint::start(MockOptions::default()).await;
     let sc = scope(keep["scope"].as_str().unwrap());
     let id = JobId::parse(keep["id"].as_str().unwrap()).unwrap();
     let token = keep["token"].as_str().unwrap();
@@ -348,7 +267,7 @@ async fn the_callback_is_the_vector_byte_for_byte() {
 async fn keep_answers_without_waiting_and_the_proof_can_overtake_it() {
     let rx = CallbackReceiver::start().await;
     rx.script([Answer::Hang]);
-    let e = Endpoint::start(MockOptions::notifying()).await;
+    let e = Endpoint::start(MockOptions::default()).await;
     let (sc, id) = (scope("hang"), JobId::fresh());
     let _hold = e.held(&sc, &id, "sleep 120").await;
     let t = Instant::now();
@@ -362,7 +281,7 @@ async fn keep_answers_without_waiting_and_the_proof_can_overtake_it() {
     let rx = CallbackReceiver::start().await;
     let e = Endpoint::start(MockOptions {
         keep_delay: Duration::from_millis(800),
-        ..MockOptions::notifying()
+        ..MockOptions::default()
     })
     .await;
     let (sc, id) = (scope("slow"), JobId::fresh());
@@ -381,7 +300,7 @@ async fn keep_answers_without_waiting_and_the_proof_can_overtake_it() {
 #[tokio::test]
 async fn the_shell_exit_and_the_end_are_called_back() {
     let rx = CallbackReceiver::start().await;
-    let e = Endpoint::start(MockOptions::notifying()).await;
+    let e = Endpoint::start(MockOptions::default()).await;
     let (sc, id) = (scope("end"), JobId::fresh());
     let _hold = e
         .held(&sc, &id, "sleep 1; sleep 1 & echo bye; exit 3")
@@ -411,7 +330,7 @@ async fn the_shell_exit_and_the_end_are_called_back() {
 async fn a_change_during_an_attempt_gets_an_attempt_of_its_own() {
     let rx = CallbackReceiver::start().await;
     rx.script([Answer::Slow(Duration::from_millis(1500), 200)]);
-    let e = Endpoint::start(MockOptions::notifying()).await;
+    let e = Endpoint::start(MockOptions::default()).await;
     let (sc, id) = (scope("overlap"), JobId::fresh());
     let _hold = e.held(&sc, &id, "sleep 0.5").await;
     e.jobs()
@@ -447,7 +366,7 @@ async fn the_mock_retries_on_the_schedule_and_stops() {
         Answer::Status(429),
         Answer::Status(204),
     ]);
-    let e = Endpoint::start(MockOptions::notifying()).await;
+    let e = Endpoint::start(MockOptions::default()).await;
     let (sc, id) = (scope("retry"), JobId::fresh());
     let _hold = e.held(&sc, &id, "sleep 120").await;
     e.jobs()
@@ -511,7 +430,7 @@ async fn a_redirect_is_never_followed() {
         CallbackReceiver::start().await,
     );
     a.script([Answer::Redirect(b.url.clone())]);
-    let e = Endpoint::start(MockOptions::notifying()).await;
+    let e = Endpoint::start(MockOptions::default()).await;
     let (sc, id) = (scope("redirect"), JobId::fresh());
     let _hold = e.held(&sc, &id, "sleep 120").await;
     e.jobs()
@@ -555,7 +474,7 @@ async fn the_server_is_verified_over_tls() {
             }
         });
     }
-    let e = Endpoint::start(MockOptions::notifying()).await;
+    let e = Endpoint::start(MockOptions::default()).await;
     let (sc, id) = (scope("tls"), JobId::fresh());
     let _hold = e.held(&sc, &id, "sleep 120").await;
     e.jobs()
@@ -586,7 +505,7 @@ async fn the_server_is_verified_over_tls() {
 /// `notify` is never called back.
 #[tokio::test]
 async fn callbacks_follow_the_latest_keep_and_stop_at_removal() {
-    let e = Endpoint::start(MockOptions::notifying()).await;
+    let e = Endpoint::start(MockOptions::default()).await;
     let (sc, id) = (scope("latest"), JobId::fresh());
     let _hold = e.held(&sc, &id, "sleep 120").await;
     let (a, b) = (
@@ -664,7 +583,7 @@ async fn lost_callbacks_are_never_sent() {
         let rx = CallbackReceiver::start().await;
         let e = Endpoint::start(MockOptions {
             lose_callbacks: lose,
-            ..MockOptions::notifying()
+            ..MockOptions::default()
         })
         .await;
         let (sc, id) = (scope("lose"), JobId::fresh());
@@ -688,16 +607,15 @@ async fn lost_callbacks_are_never_sent() {
     }
 }
 
-/// Without egress every attempt is a connection error, and the endpoint does not advertise.
+/// Without egress every attempt is a connection error.
 #[tokio::test]
 async fn without_egress_no_callback_leaves_the_sandbox() {
     let rx = CallbackReceiver::start().await;
     let e = Endpoint::start(MockOptions {
         egress: false,
-        ..MockOptions::notifying()
+        ..MockOptions::default()
     })
     .await;
-    assert!(!e.runner.job_offer().await.notify);
     let (sc, id) = (scope("dark"), JobId::fresh());
     let _hold = e.held(&sc, &id, "sleep 120").await;
     e.jobs()
@@ -710,8 +628,7 @@ async fn without_egress_no_callback_leaves_the_sandbox() {
     assert!(attempts.len() >= 2 && attempts.iter().all(|a| a.status.is_none()));
 }
 
-/// An idle-killing sandbox kills a kept job once no request is open, and (deployed honestly) does
-/// not advertise notify.
+/// An idle-killing sandbox kills a kept job once no request is open.
 #[tokio::test]
 async fn an_idle_killing_sandbox_kills_kept_jobs() {
     let e = Endpoint::start(MockOptions {
@@ -719,7 +636,6 @@ async fn an_idle_killing_sandbox_kills_kept_jobs() {
         ..MockOptions::default()
     })
     .await;
-    assert!(!e.runner.job_offer().await.notify);
     let (sc, id) = (scope("idle"), JobId::fresh());
     e.jobs()
         .start_kept(&sc, &id, &spec("sleep 120"))
@@ -733,7 +649,7 @@ async fn an_idle_killing_sandbox_kills_kept_jobs() {
 /// The client: a refused `notify` is `InvalidInput`, so the caller can keep without it.
 #[tokio::test]
 async fn a_refused_notify_is_invalid_input_to_the_client() {
-    let e = Endpoint::start(MockOptions::notifying()).await;
+    let e = Endpoint::start(MockOptions::default()).await;
     let (sc, id) = (scope("refused"), JobId::fresh());
     let _hold = e.held(&sc, &id, "sleep 120").await;
     let err = e

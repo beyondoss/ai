@@ -1,7 +1,7 @@
 //! Sandbox-owned jobs over plain exec commands (`exec_endpoint::jobs::ShellJobs`): start held or
 //! kept, stream or poll the output, keep, kill, list, remove, wipe — over every transport the
 //! baseline has to work on. Each runs the real scripts against real processes on this host: this
-//! host's `sh` directly, the v1.2 mock, the v1.1 mock (no hold: jobs start kept and are polled), and a
+//! host's `sh` directly, a
 //! template transport whose far side, like `docker exec`'s, lives in its own session. The live suite
 //! (`exec_endpoint_live`) repeats the essentials inside CI's busybox container.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -16,35 +16,20 @@ use beyond_agent::exec_endpoint::jobs::{
 };
 use beyond_agent::exec_endpoint::{HttpExecRunner, TemplateRunner};
 use beyond_agent::tools::exec::{CommandRunner, RealRunner};
-use common::exec_mock::{ExecMock, MockOptions, Protocol, group_alive, wait_group_gone};
+use common::exec_mock::{ExecMock, MockOptions, group_alive, wait_group_gone};
 
 #[derive(Clone, Copy, Debug)]
 enum Transport {
     /// This host's `sh`, no transport at all.
     Local,
-    /// The conforming v1.2 mock.
-    Stream,
-    /// A v1.1 endpoint: nothing streams, so nothing can be held.
-    V11,
     /// A template whose far side runs in its own session (`docker exec`'s shape).
     Template,
-    /// The v1.3 mock: the endpoint runs the jobs itself, and the agent uses its native operations.
+    /// The mock: the endpoint runs the jobs itself, and the agent uses its native operations.
     Native,
 }
 
-const HOLDING: [Transport; 4] = [
-    Transport::Local,
-    Transport::Stream,
-    Transport::Template,
-    Transport::Native,
-];
-const ALL: [Transport; 5] = [
-    Transport::Local,
-    Transport::Stream,
-    Transport::V11,
-    Transport::Template,
-    Transport::Native,
-];
+const HOLDING: [Transport; 3] = [Transport::Local, Transport::Template, Transport::Native];
+const ALL: [Transport; 3] = [Transport::Local, Transport::Template, Transport::Native];
 
 /// A sandbox over `t`, its jobs rooted in a fresh directory.
 struct Sandbox {
@@ -63,18 +48,11 @@ impl Sandbox {
         let dir = tempfile::tempdir().unwrap();
         let (runner, mock): (Arc<dyn CommandRunner>, _) = match t {
             Transport::Local => (Arc::new(RealRunner), None),
-            Transport::Stream | Transport::V11 | Transport::Native => {
+            Transport::Native => {
                 let mock = ExecMock::start_with(
                     dir.path(),
                     MockOptions {
-                        protocol: if matches!(t, Transport::V11) {
-                            Protocol::V11
-                        } else {
-                            Protocol::Streaming
-                        },
                         heartbeat: Duration::from_millis(500),
-                        // Only the v1.3 mock runs jobs itself; the others take the baseline.
-                        jobs: matches!(t, Transport::Native),
                         job_output_cap: cap.map_or(8 * 1024 * 1024, |c| c as usize),
                         ..MockOptions::default()
                     },
@@ -196,7 +174,7 @@ async fn every_transport_can_run_jobs_and_says_whether_it_can_hold_them() {
     for t in ALL {
         let sb = Sandbox::new(t).await;
         assert!(sb.jobs.available().await, "{t:?}");
-        assert_eq!(sb.jobs.holds().await, !matches!(t, Transport::V11), "{t:?}");
+        assert!(sb.jobs.holds().await, "{t:?}");
     }
 }
 
@@ -359,7 +337,7 @@ async fn a_job_started_kept_is_followed_by_polling() {
 
 #[tokio::test]
 async fn polling_reports_leftovers_and_follows_them_to_the_end() {
-    let sb = Sandbox::new(Transport::V11).await;
+    let sb = Sandbox::new(Transport::Local).await;
     let id = JobId::fresh();
     sb.jobs
         .start_kept(&sb.scope, &id, &sh("(sleep 1.5; echo late) & echo early"))

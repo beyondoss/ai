@@ -5,7 +5,7 @@
 //! Two layers. The end-to-end tests drive a real replica over raw TCP (the head classification,
 //! the refusals, the front door's refusal of `job_ended`, a run in flight, an idle reap). The rest
 //! drive the receiver ([`job_ended::serve`]) and the session driver over an in-memory stream with
-//! a scripted job table, which is how every case of `v1.4-callback.json` is reached, released jobs
+//! a scripted job table, which is how every case of `notify-callback.json` is reached, released jobs
 //! included.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -600,7 +600,7 @@ impl JobTracker for Table {
 
 fn fixture_key() -> NotifyKey {
     let fx: Value = serde_json::from_str(include_str!(
-        "../../sandbox/tests/fixtures/exec/v1.4-token.json"
+        "../../sandbox/tests/fixtures/exec/notify-token.json"
     ))
     .unwrap();
     let bytes: [u8; 32] = base64::engine::general_purpose::STANDARD
@@ -727,11 +727,11 @@ async fn prepare(s: &Arc<SessionNotify>, state: &Value) {
     }
 }
 
-/// Every receiver case of `v1.4-callback.json`, through the real receiver, driver and kernel.
+/// Every receiver case of `notify-callback.json`, through the real receiver, driver and kernel.
 #[tokio::test]
 async fn every_receiver_case_of_the_fixture() {
     let fx: Value = serde_json::from_str(include_str!(
-        "../../sandbox/tests/fixtures/exec/v1.4-callback.json"
+        "../../sandbox/tests/fixtures/exec/notify-callback.json"
     ))
     .unwrap();
     let cases = fx["receiver"].as_array().unwrap().clone();
@@ -852,7 +852,7 @@ async fn run_case(case: &Value) {
 
 fn fx_url_session() -> (String, String) {
     let fx: Value = serde_json::from_str(include_str!(
-        "../../sandbox/tests/fixtures/exec/v1.4-callback.json"
+        "../../sandbox/tests/fixtures/exec/notify-callback.json"
     ))
     .unwrap();
     (
@@ -1018,7 +1018,7 @@ async fn one_report_per_end() {
         turn_text("started"),
     ];
     turns.extend((0..8).map(|i| turn_text(&format!("noted {i}"))));
-    let f = fleet_with(MockOptions::notifying(), turns, None).await;
+    let f = fleet_with(MockOptions::default(), turns, None).await;
     let _ws = f.start_job().await;
     let pgid = f.stream("fin-%s").await;
     let end = f.svc.exec.wait_for_end(pgid, Duration::from_secs(8)).await;

@@ -43,8 +43,6 @@ use truth::{Kind, Node, Plan, Snap, classify, secs, snapshot, temps};
 pub struct Config {
     /// The runner's response cap. `None` is the default 16 MiB, which no generated file reaches.
     pub cap: Option<usize>,
-    /// Whether writes use stdin (one command) or 48 KiB argv chunks (the rung for a v1 endpoint).
-    pub stdin: bool,
     /// Percent of requests a fault hits. 0 is a clean transport.
     pub fault_pct: u64,
     /// Start with a read-only directory and read-only files in the tree.
@@ -58,7 +56,6 @@ pub struct Config {
 
 pub const PLAIN: Config = Config {
     cap: None,
-    stdin: true,
     fault_pct: 0,
     readonly_start: false,
     tiny_kib: None,
@@ -131,24 +128,8 @@ pub fn http_runner(cap: Option<usize>) -> Arc<HttpExecRunner> {
         .clone()
 }
 
-/// `ShellFs::connect` returns the backend on `main` and a `Result` once a failed probe fails connect
-/// (D3). This test compiles against both.
-pub trait IntoFs {
-    fn into_fs(self) -> Option<ShellFs>;
-}
-impl IntoFs for ShellFs {
-    fn into_fs(self) -> Option<ShellFs> {
-        Some(self)
-    }
-}
-impl<E> IntoFs for Result<ShellFs, E> {
-    fn into_fs(self) -> Option<ShellFs> {
-        self.ok()
-    }
-}
-
 pub async fn connect(r: Arc<dyn CommandRunner>) -> Option<ShellFs> {
-    ShellFs::connect(r).await.into_fs()
+    ShellFs::connect(r).await.ok()
 }
 
 fn capabilities(cap: Option<usize>) -> Capabilities {
@@ -160,7 +141,7 @@ fn capabilities(cap: Option<usize>) -> Capabilities {
     let fs = rt()
         .block_on(connect(http_runner(cap)))
         .expect("the loopback execd answers the probe");
-    let caps = fs.capabilities();
+    let caps = rt().block_on(fs.capabilities()).unwrap();
     C.get().unwrap().lock().unwrap().insert(key, caps);
     caps
 }
@@ -329,8 +310,8 @@ impl NsRunner {
         let out = out?;
         Ok(beyond_agent::tools::exec::ExecResult {
             code: out.status.code(),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned().into(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned().into(),
             ..Default::default()
         })
     }
@@ -350,8 +331,7 @@ pub fn machine(tc: &TestCase, cfg: Config) -> Machine {
         None => (host_root.clone(), None),
     };
     let seed = tc.draw_silent(gs::integers::<u64>());
-    let mut caps = capabilities(cfg.cap);
-    caps.stdin &= cfg.stdin;
+    let caps = capabilities(cfg.cap);
     let http: Arc<dyn CommandRunner> = match &tiny {
         Some(t) => Arc::new(NsRunner { pid: t.pid }),
         None => http_runner(cfg.cap),

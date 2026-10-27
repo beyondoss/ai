@@ -9,10 +9,9 @@ export type {
   JobChunk,
   JobFrame,
   JobInfo,
+  JobOps,
   JobSpec,
   JobState,
-  NativeJobs,
-  Offers,
   RunOptions,
   RunResult,
   Survivor,
@@ -31,13 +30,7 @@ export type {
 } from "./files.js";
 
 export { Jobs } from "./jobs.js";
-export type {
-  JobOutput,
-  JobReadOptions,
-  JobsMode,
-  JobsOptions,
-  KillOptions,
-} from "./jobs.js";
+export type { JobOutput, JobReadOptions, KillOptions } from "./jobs.js";
 
 export type {
   SearchEngine,

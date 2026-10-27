@@ -49,18 +49,12 @@ fn stream(cmd: &str, args: &[&str]) -> Value {
 async fn an_authorizer_passes_the_full_conformance_verifier() {
     let (server, _dir) = start(|o| {
         o.authorizer = Some(accept_header("let-me-in"));
-        o.kept_jobs_survive_idle = true;
     })
     .await;
     let url = format!("http://{}/exec", server.local_addr());
     let headers = [("x-embed-key".to_string(), "let-me-in".to_string())];
     let report = verify(&url, &headers, &Expectations::default()).await;
     println!("{}", report.render());
-    assert!(
-        report.streams && report.jobs && report.notify,
-        "{}",
-        report.render()
-    );
     let not_passed: Vec<_> = report
         .checks
         .iter()

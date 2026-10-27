@@ -1807,10 +1807,10 @@ async fn open_exec_backend(
         Some(runner) => {
             let backend = tools::fs::shell::ShellFs::connect(runner.clone()).await?;
             // Report the rung, because the alternative is discovering it from a search that walked
-            // `target/` — see `SearchEngine::PosixGrep`.
+            // `target/` — see `SearchEngine::PosixGrep`. This is the one probe of the target's tools.
             eprintln!(
                 "tools run on the remote exec endpoint, `bash` included (search engine: {:?})",
-                backend.capabilities().search_engine()
+                backend.capabilities().await?.search_engine()
             );
             Some(std::sync::Arc::new(backend))
         }

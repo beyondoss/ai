@@ -77,7 +77,6 @@ fn a_transcript_switch_stops_remote_jobs_promptly_and_says_so() {
     let mock = rt.block_on(ExecMock::start_with(
         dir.path(),
         MockOptions {
-            jobs: false,
             ..MockOptions::default()
         },
     ));
@@ -153,7 +152,6 @@ fn the_end_of_a_run_stops_remote_jobs_without_waiting_out_each_kill() {
     let mock = rt.block_on(ExecMock::start_with(
         dir.path(),
         MockOptions {
-            jobs: false,
             ..MockOptions::default()
         },
     ));

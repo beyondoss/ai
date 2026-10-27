@@ -49,7 +49,7 @@ async fn endpoint(accepts: Option<&'static str>) -> Endpoint {
                     log.lock().unwrap().push(auth.clone());
                     let ok = accepts.is_some_and(|t| auth == format!("Bearer {t}"));
                     let (status, payload) = if ok {
-                        ("200 OK", r#"{"exit_code":0,"stdout":"hi","stderr":""}"#)
+                        ("200 OK", r#"{"exit_code":0,"stdout":"aGk=","stderr":""}"#)
                     } else {
                         ("401 Unauthorized", r#"{"error":"token expired"}"#)
                     };
@@ -81,7 +81,7 @@ fn counting() -> (TokenSource, Arc<AtomicUsize>) {
 async fn run(exec: &HttpExec) -> std::io::Result<String> {
     exec.run("true", &[], None, Duration::from_secs(10))
         .await
-        .map(|r| r.stdout)
+        .map(|r| r.stdout_text().into_owned())
 }
 
 #[tokio::test]

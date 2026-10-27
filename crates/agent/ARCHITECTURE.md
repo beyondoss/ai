@@ -2532,7 +2532,7 @@ leftover is adopted, not yielded; a leftover that exits ends its job; an endpoin
 container. `exec_conformance.rs` runs `exec_endpoint::conformance::verify`
 against the mocks (it must pass the conforming one and fail a buffering one, one that survives a
 disconnect, and one that ends the stream with the shell) and against `AGENT_CONFORMANCE_EXEC_URL` for endpoint implementers; the decoding vectors
-are `crates/sandbox/tests/fixtures/exec/v1.2-frames.json`.
+are `crates/sandbox/tests/fixtures/exec/frames.json`.
 
 `exec_endpoint::conformance::front` is the kit for the other side of the exec path, Beyond's exec front / edge
 (`BEYOND.md`, "Conformance"): it checks the front's behavior, not the protocol, and can run `verify` through
@@ -2613,7 +2613,7 @@ checks when the probe says yes: the capability, a held job's live output and end
 killing an unkept job (measured on the far side), a kept job surviving its hold and reading back by
 `read` and `attach` from an offset (closing the attach must not kill), `kill` reaching a
 `SIGTERM`-ignoring job and removing it, and `list`/`wipe` staying in their scope. The decoding
-vectors are `crates/sandbox/tests/fixtures/exec/v1.3-jobs.json` (`crates/sandbox/tests/exec_jobs_vectors.rs`).
+vectors are `crates/sandbox/tests/fixtures/exec/jobs.json` (`crates/sandbox/tests/exec_jobs_vectors.rs`).
 A number that does not fit its field (a status or code beyond `i32`, a start beyond `u32`, a `128 + signal` past `i32::MAX`) is a protocol error in both decoders, never a panic or a truncated value.
 
 **Job-end notify (v1.4).** A replica holds a v1.2 stream to every kept
@@ -2642,7 +2642,7 @@ crate, so an endpoint outside this repo and a model checker can call exactly wha
 calls): one attempt per job at a time, what is owed and an answer settling only what was owed when
 its attempt began (a change during an attempt gets an attempt of its own once that one ends), the
 status table, the schedule, a new `keep` abandoning what is in flight, nothing without `notify` or
-after removal. Time and the random draw are inputs; its tests run every `v1.4-retry.json` timeline
+after removal. Time and the random draw are inputs; its tests run every `notify-retry.json` timeline
 through it and walk every short event sequence for its invariants. `exec_mock` is the reference
 endpoint: it validates `notify`, drives the kernel per job, and makes the requests (no redirects, a
 verified server, 30 s at most). It advertises notify only when told its kept jobs survive idling, and it can lose callbacks, answer
@@ -2661,7 +2661,7 @@ runs the same event sequences through `step` and through `SH` under dash and bus
 (in CI's `exec-live` shard) in an Alpine container. The vectors
 are `crates/sandbox/tests/fixtures/exec/v1.4-*.json`, and `tests/exec_notify_vectors.rs` loads each into a strict
 schema, recomputes what follows from its inputs (the token vectors under a reference verifier, the
-retry timelines), and fails when a tagged requirement names no check (`v1.4-checks.json` lists
+retry timelines), and fails when a tagged requirement names no check (`notify-checks.json` lists
 each one).
 
 The token is built: [`notify_token`](src/notify_token.rs) is the only code that makes or checks a
@@ -2672,7 +2672,7 @@ mints; `mint` takes the tenant, session and job and
 computes the session's own scope itself, so a replica cannot mint for another session; `verify`
 builds the MAC input from the request's tenant, session, scope and job id, takes only the kid and
 tag from the token, and compares the tag with `verify_slice`. `tests/notify_token.rs` holds it to
-every vector in `v1.4-token.json` and changes every byte of the token and of each field.
+every vector in `notify-token.json` and changes every byte of the token and of each field.
 
 The receiver is built. A request is classified by its `Authorization` header alone, before its
 `Content-Length` is read ([`serve_ws::job_ended`](src/serve_ws/job_ended.rs)): a look-alike is
@@ -2688,7 +2688,7 @@ waits for a live reconcile, at most one per session at a time, spaced a second a
 16 callbacks waiting and each answered `503` 20 s after it arrived. The callback is answered through
 its own path, never pins the session, and never touches its idle clock. `job_ended` sent any other
 way is refused (`403` over HTTP, a failed `response` otherwise). `tests/serve_job_ended.rs` drives a
-real replica over raw TCP, and every receiver case of `v1.4-callback.json` through the receiver, the
+real replica over raw TCP, and every receiver case of `notify-callback.json` through the receiver, the
 driver and the kernel.
 
 Across real replicas, `crates/fleet-sim` grades the whole path on the local-directory and NFS
@@ -2780,7 +2780,7 @@ kill, the cap's gap, `wipe` scoped to one session, `remove` refusing a running j
 `exec_endpoint_live.rs` repeats the lifecycle inside CI's busybox container; `exec_conformance.rs`
 passes the v1.3 mock with every check, the v1.2-only mock with the job checks skipped, and fails a
 mock whose dropped hold leaves the job running on exactly the hold check. Its v1.4 half
-(`conformance/notify.rs`, one check per conformance check `v1.4-checks.json` names) runs its own
+(`conformance/notify.rs`, one check per conformance check `notify-checks.json` names) runs its own
 callback receiver and an untrusted-certificate TLS listener. It passes the reference v1.4 mock,
 passes the modes that do not offer notify natively with those checks skipped (no egress, an honest
 idle-killing sandbox, notify for the baseline), and fails a mock with one fault per check

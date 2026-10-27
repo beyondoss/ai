@@ -354,8 +354,7 @@ impl Fleet {
                 std::fs::create_dir_all(&sandbox_home).map_err(|e| format!("sandbox home: {e}"))?;
                 let model_at = format!("{}:{}", spec_bind.host, spec_bind.port);
                 let exec_at = format!("{}:{}", spec_bind.host, spec_bind.port + 1);
-                let exec =
-                    ExecMock::start_on(&exec_at, sandbox.path(), Some(&sandbox_home), true).await;
+                let exec = ExecMock::start_on(&exec_at, sandbox.path(), Some(&sandbox_home)).await;
                 let url = beyond_test_support::spawn_model_server_routed_unrecorded_on(
                     &model_at,
                     Vec::new(),
@@ -619,7 +618,7 @@ impl Fleet {
         // tenant's box. Service mode probes it at session start, so a session whose endpoint does not
         // work never comes up at all — which is the correct behaviour, and makes a broken double look
         // exactly like a broken sandbox.
-        let exec = ExecMock::start_with_home(sandbox.path(), Some(&sandbox_home), true).await;
+        let exec = ExecMock::start_with_home(sandbox.path(), Some(&sandbox_home)).await;
 
         let mut edge = Edge::new(keys.path(), Vec::new());
         let agent = agent_binary()?;
@@ -1398,7 +1397,7 @@ pub async fn unmounted_shard_is_misdirected(
         Ok(d) => d,
         Err(e) => return Outcome::failed_with(format!("sandbox: {e}")),
     };
-    let exec = ExecMock::start_with_home(sandbox.path(), Some(sandbox.path()), true).await;
+    let exec = ExecMock::start_with_home(sandbox.path(), Some(sandbox.path())).await;
     let (gateway_url, _bodies) = spawn_model_server(vec![turn_text("unused")]);
 
     let mut edge = Edge::new(keys.path(), Vec::new());
@@ -2173,8 +2172,7 @@ fn sandbox_job_routes() -> Vec<(String, String)> {
 }
 
 /// A two-replica fleet whose model follows [`sandbox_job_routes`], and the requests it was sent.
-/// Two sandboxes beside the fleet's own: the default (v1.3, which runs jobs itself) and a v1.2-only
-/// one, on which the agent runs jobs with plain exec commands — the baseline every endpoint gets.
+/// A sandbox beside the fleet's own, which runs jobs itself.
 async fn sandbox_job_fleet(
     kind: Kind,
     history_path: &std::path::Path,
@@ -2196,14 +2194,11 @@ async fn sandbox_job_fleet(
         beyond_test_support::spawn_model_server_routed(sandbox_job_routes(), turn_text("ok"));
     let fleet = Fleet::start_against(kind, 2, 1, history_path, None, false, gateway_url).await?;
     let mut sandboxes = Vec::new();
-    for (name, jobs) in [("native (v1.3)", true), ("baseline (v1.2)", false)] {
+    for name in ["execd"] {
         let dir = tempfile::tempdir().map_err(|e| format!("sandbox: {e}"))?;
         let mock = ExecMock::start_with(
             dir.path(),
-            beyond_test_support::exec_mock::MockOptions {
-                jobs,
-                ..Default::default()
-            },
+            beyond_test_support::exec_mock::MockOptions::default(),
         )
         .await;
         sandboxes.push((name, mock, dir));

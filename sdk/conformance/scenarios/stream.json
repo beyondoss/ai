@@ -1,14 +1,11 @@
 {
   "suite": "stream",
   "version": 1,
-  "description": "Layer 1: the streaming exec call, v1.2.",
+  "description": "Layer 1: the streaming exec call.",
   "scenarios": [
     {
       "id": "stream.basic.streams-and-exit",
       "description": "A streamed command reports stdout and stderr separately, then its exit code.",
-      "requires": {
-        "stream": true
-      },
       "steps": [
         {
           "id": "a",
@@ -31,9 +28,6 @@
     {
       "id": "stream.bytes.all-256-exact",
       "description": "Output is base64 on the wire: every byte value, NUL and invalid UTF-8 included, arrives exactly.",
-      "requires": {
-        "stream": true
-      },
       "steps": [
         {
           "id": "a",
@@ -56,9 +50,6 @@
     {
       "id": "stream.frames.larger-than-a-frame",
       "description": "Output beyond one 64 KiB frame is split by the endpoint and reassembled by the client without loss.",
-      "requires": {
-        "stream": true
-      },
       "steps": [
         {
           "id": "a",
@@ -81,9 +72,6 @@
     {
       "id": "stream.output.beyond-the-v11-cap",
       "description": "A stream is never buffered whole: 20 MB of output, more than the 16 MiB one-shot cap, streams through.",
-      "requires": {
-        "stream": true
-      },
       "steps": [
         {
           "id": "a",
@@ -105,9 +93,6 @@
     {
       "id": "stream.exit.signal",
       "description": "A command killed by signal S ends the stream with signal S, not an exit code.",
-      "requires": {
-        "stream": true
-      },
       "steps": [
         {
           "id": "a",
@@ -131,9 +116,6 @@
     {
       "id": "stream.exit.command-not-found",
       "description": "A command that cannot be started is an ordinary result: stderr, then exit 127.",
-      "requires": {
-        "stream": true
-      },
       "steps": [
         {
           "id": "a",
@@ -153,9 +135,6 @@
     {
       "id": "stream.timeout.timed-out",
       "description": "At timeout_ms the endpoint kills the group and the stream ends with timed_out; output before the deadline is kept.",
-      "requires": {
-        "stream": true
-      },
       "steps": [
         {
           "id": "a",
@@ -181,9 +160,6 @@
     {
       "id": "stream.leftovers.stream-waits-for-the-group",
       "description": "When the shell exits leaving a background child, the stream stays open until the group is empty and carries the child's output; the final status is the shell's.",
-      "requires": {
-        "stream": true
-      },
       "steps": [
         {
           "id": "a",
@@ -205,9 +181,6 @@
     {
       "id": "stream.leftovers.none-no-wait",
       "description": "A command that leaves nothing behind ends the stream at once.",
-      "requires": {
-        "stream": true
-      },
       "steps": [
         {
           "id": "a",
@@ -229,9 +202,6 @@
     {
       "id": "stream.cwd",
       "description": "cwd applies to a streamed command as to a one-shot one.",
-      "requires": {
-        "stream": true
-      },
       "steps": [
         {
           "id": "a",
@@ -250,9 +220,6 @@
     {
       "id": "stream.heartbeat.silent-command",
       "description": "A command silent for longer than the client's patience still completes: heartbeats are not output and not an end.",
-      "requires": {
-        "stream": true
-      },
       "steps": [
         {
           "id": "a",

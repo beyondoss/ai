@@ -165,7 +165,7 @@ open learns of its jobs' ends when it next opens, as it does today, so a callbac
 the replica that has the session open now. That replica verifies the token and reconciles; any other
 verifies the token and answers `503`, as it answers any request for a session it does not hold, so
 the edge's usual retry and ring walk find the replica that has it. Each requirement is tagged (E1,
-E2, …) and names the check that tests it; `tests/fixtures/exec/v1.4-checks.json` lists them all.
+E2, …) and names the check that tests it; `tests/fixtures/exec/notify-checks.json` lists them all.
 
 - **E1** The edge MUST classify a request with exactly the two rules of exec v1.4's N21: a request
   is a callback when it has exactly one `Authorization` header and its value is `Bearer` (any case),
@@ -179,7 +179,7 @@ E2, …) and names the check that tests it; `tests/fixtures/exec/v1.4-checks.jso
   answer `400` itself a callback whose query names `session_id` more than once, keys decoded as
   `application/x-www-form-urlencoded` as the replica decodes them, so it never routes by a
   different value than the replica reads. (check: fleet-sim `job-ended-classified-exactly`;
-  fixture `v1.4-callback.json`)
+  fixture `notify-callback.json`)
 - **E2** The edge MUST forward a callback unchanged, its `Content-Length` and any
   `Transfer-Encoding` included, and MUST NOT attach, mint or check anything for it: no session
   grant, no tenant lookup, no token check. The token is opaque to it. (check: fleet-sim

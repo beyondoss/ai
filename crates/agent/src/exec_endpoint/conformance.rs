@@ -21,7 +21,7 @@
 //! the disconnect check watches a backgrounded grandchild that would write a marker file if its
 //! process group outlived the connection.
 //!
-//! An endpoint that advertises job notify (v1.4) is held to [`notify`]'s checks too, against a
+//! Every endpoint is held to [`notify`]'s checks too, against a
 //! callback receiver the verifier runs ([`Expectations::callback_listen`]): the proof's timing and
 //! exact shape, a callback at each state change and for a change during an attempt, one url and
 //! one sender, `keep` not waiting, the grammar, the latest keep governing, nothing without notify or
@@ -36,8 +36,9 @@ use super::HttpExecRunner;
 use super::jobs::{JobEvent, JobId, JobScope, JobSpec, JobStatus, SandboxJobs as _};
 use super::jobs_native::NativeJobs;
 use super::stream::{self, Frame, FrameReader, HEARTBEAT_INTERVAL};
+use beyond_sandbox::Exec as _;
 
-/// The v1.4 (job notify) checks; their names are this module's constants.
+/// The job notify checks; their names are this module's constants.
 pub mod notify;
 
 /// The exec front / edge kit: the front's behavior in front of the endpoints (single-flight create,
@@ -54,14 +55,14 @@ pub struct Expectations {
     /// intervals, the bound an endpoint that only notices a disconnect when a heartbeat write fails
     /// still meets.
     pub kill_within: Duration,
-    /// Where the v1.4 checks' callback receiver listens. The default, an ephemeral loopback port,
+    /// Where the notify checks' callback receiver listens. The default, an ephemeral loopback port,
     /// serves an endpoint whose sandbox shares this host's loopback (the in-repo mock, a container
     /// on the host network): `keep` takes plain `http` only to loopback.
     pub callback_listen: String,
     /// The origin the sandbox reaches the receiver at, when it is not the listen address: an
     /// `https` origin that forwards to [`Self::callback_listen`]. The TLS check is then skipped.
     pub callback_origin: Option<String>,
-    /// How long a kept job must survive with nothing sent to the sandbox (v1.4 "a kept job
+    /// How long a kept job must survive with nothing sent to the sandbox ("a kept job
     /// survives idling"). An auto-stop slower than this goes unseen.
     pub notify_idle: Duration,
 }
@@ -84,7 +85,7 @@ impl Default for Expectations {
 pub enum Verdict {
     Pass,
     Fail,
-    /// Not applicable: a v1.1 endpoint is not held to the streaming checks.
+    /// Not applicable here.
     Skip,
 }
 
@@ -98,18 +99,11 @@ pub struct Check {
 /// The whole run.
 #[derive(Debug, Clone)]
 pub struct Report {
-    /// The endpoint answered `"stream": true` with a v1.2 stream.
-    pub streams: bool,
-    /// The endpoint offers sandbox jobs natively (v1.3).
-    pub jobs: bool,
-    /// The endpoint offers job notify (v1.4), natively or for the baseline.
-    pub notify: bool,
     pub checks: Vec<Check>,
 }
 
 impl Report {
-    /// No check failed. A v1.1 endpoint passes with its streaming checks skipped — see
-    /// [`Self::streams`] for whether it is v1.2.
+    /// No check failed.
     pub fn passed(&self) -> bool {
         self.checks.iter().all(|c| c.verdict != Verdict::Fail)
     }
@@ -120,19 +114,7 @@ impl Report {
 
     /// One line per check, for a terminal.
     pub fn render(&self) -> String {
-        let mut out = format!(
-            "exec endpoint: {}\n",
-            if self.jobs && self.notify {
-                "v1.4 (streams, runs sandbox jobs itself, and calls back when a kept job changes)"
-            } else if self.jobs {
-                "v1.3 (streams, and runs sandbox jobs itself)"
-            } else if self.streams {
-                "v1.2 (streams; sandbox jobs run on plain exec commands)"
-            } else {
-                "v1.1 (no streaming: `bash` waits for every command to exit, cannot yield a silent \
-                 one, and cannot kill one)"
-            }
-        );
+        let mut out = String::from("exec endpoint:\n");
         for c in &self.checks {
             let mark = match c.verdict {
                 Verdict::Pass => "PASS",
@@ -145,10 +127,9 @@ impl Report {
     }
 }
 
-pub const ENVELOPE: &str = "v1.1 envelope";
-pub const ENVELOPE_TIMEOUT: &str = "v1.1 timeout kills the process group";
-pub const OUTPUT_BASE64: &str = "exact output offered (v1.1 output_base64)";
-pub const OUTPUT_BYTES: &str = "output_base64 returns every byte value intact";
+pub const ENVELOPE: &str = "one-shot envelope";
+pub const ENVELOPE_TIMEOUT: &str = "one-shot timeout kills the process group";
+pub const OUTPUT_BYTES: &str = "every byte value round-trips on stdout and stderr";
 pub const CONTENT_TYPE: &str = "stream content type";
 pub const INCREMENTAL: &str = "incremental delivery (the probe)";
 pub const BYTES: &str = "bytes and streams survive exactly";
@@ -159,15 +140,11 @@ pub const TIMEOUT: &str = "timeout kills the process group";
 pub const HEARTBEAT: &str = "heartbeat during silence";
 pub const DISCONNECT: &str = "disconnect kills the process group";
 pub const LEFTOVERS: &str = "leftover processes keep the stream open";
-pub const JOBS: &str = "sandbox jobs offered (v1.3)";
 pub const JOBS_HELD: &str = "a held job streams its output and ends";
 pub const JOBS_HOLD: &str = "a dropped hold kills a job nobody kept";
 pub const JOBS_KEEP: &str = "a kept job outlives its hold and reads back from an offset";
 pub const JOBS_KILL: &str = "kill stops a job's group and removes it";
 pub const JOBS_SCOPE: &str = "list and wipe stay inside their scope";
-
-/// Every v1.3 check after the capability itself.
-const JOB_CHECKS: [&str; 5] = [JOBS_HELD, JOBS_HOLD, JOBS_KEEP, JOBS_KILL, JOBS_SCOPE];
 
 /// Run every check against the endpoint at `url`.
 pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectations) -> Report {
@@ -175,9 +152,6 @@ pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectatio
         Ok(r) => r,
         Err(e) => {
             return Report {
-                streams: false,
-                jobs: false,
-                notify: false,
                 checks: vec![fail(ENVELOPE, e)],
             };
         }
@@ -198,51 +172,26 @@ pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectatio
         ),
     };
 
-    let mut checks = vec![v.envelope().await, v.envelope_timeout().await];
-    checks.extend(v.exact_output().await);
-    let streams = match v.run("printf a", Duration::from_secs(10)).await {
+    let mut checks = vec![
+        v.envelope().await,
+        v.envelope_timeout().await,
+        v.output_bytes().await,
+    ];
+    match v.run("printf a", Duration::from_secs(10)).await {
         Ok(Exchange::Stream { .. }) => {
             checks.push(pass(CONTENT_TYPE, format!("`{}`", stream::NDJSON)));
-            true
         }
         Ok(Exchange::Envelope) => {
-            checks.push(skip(
+            checks.push(fail(
                 CONTENT_TYPE,
-                "answered `\"stream\": true` with one JSON object: a v1.1 endpoint",
+                "answered `\"stream\": true` with one JSON object",
             ));
-            false
+            return Report { checks };
         }
         Err(e) => {
             checks.push(fail(CONTENT_TYPE, e));
-            false
+            return Report { checks };
         }
-    };
-    if !streams {
-        for name in [
-            INCREMENTAL,
-            BYTES,
-            FRAME_SIZE,
-            EXIT,
-            SIGNAL,
-            TIMEOUT,
-            HEARTBEAT,
-            DISCONNECT,
-            LEFTOVERS,
-        ] {
-            checks.push(skip(name, "not a v1.2 endpoint"));
-        }
-        for name in std::iter::once(JOBS)
-            .chain(JOB_CHECKS)
-            .chain(notify::CHECKS)
-        {
-            checks.push(skip(name, "not a v1.2 endpoint"));
-        }
-        return Report {
-            streams,
-            jobs: false,
-            notify: false,
-            checks,
-        };
     }
     checks.push(v.incremental().await);
     checks.push(v.bytes().await);
@@ -252,33 +201,16 @@ pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectatio
     // The slow checks wait on timers, not on each other.
     let (t, h, d, l) = tokio::join!(v.timeout(), v.heartbeat(), v.disconnect(), v.leftovers());
     checks.extend([t, h, d, l]);
-    let jobs = v.runner.offers_jobs().await;
-    if jobs {
-        checks.push(pass(JOBS, "answered the probe with `{\"jobs\": \"v1.3\"}`"));
-        let (held, hold, keep, kill, scope) = tokio::join!(
-            v.jobs_held(),
-            v.jobs_hold(),
-            v.jobs_keep(),
-            v.jobs_kill(),
-            v.jobs_scope()
-        );
-        checks.extend([held, hold, keep, kill, scope]);
-    } else {
-        checks.push(skip(
-            JOBS,
-            "not offered: the agent runs sandbox jobs with plain exec commands instead",
-        ));
-        for name in JOB_CHECKS {
-            checks.push(skip(name, "sandbox jobs are not offered"));
-        }
-    }
-    let notify = notify::checks(&v, &mut checks).await;
-    Report {
-        streams,
-        jobs,
-        notify,
-        checks,
-    }
+    let (held, hold, keep, kill, scope) = tokio::join!(
+        v.jobs_held(),
+        v.jobs_hold(),
+        v.jobs_keep(),
+        v.jobs_kill(),
+        v.jobs_scope()
+    );
+    checks.extend([held, hold, keep, kill, scope]);
+    notify::checks(&v, &mut checks).await;
+    Report { checks }
 }
 
 /// Where two byte strings first differ, for a failure message.
@@ -306,6 +238,14 @@ fn pass(name: &'static str, detail: impl Into<String>) -> Check {
     }
 }
 
+fn skip(name: &'static str, detail: impl Into<String>) -> Check {
+    Check {
+        name,
+        verdict: Verdict::Skip,
+        detail: detail.into(),
+    }
+}
+
 fn fail(name: &'static str, detail: impl Into<String>) -> Check {
     Check {
         name,
@@ -314,12 +254,86 @@ fn fail(name: &'static str, detail: impl Into<String>) -> Check {
     }
 }
 
-fn skip(name: &'static str, detail: impl Into<String>) -> Check {
-    Check {
-        name,
-        verdict: Verdict::Skip,
-        detail: detail.into(),
+/// The incremental-delivery script: output, a pause, more output. Only a stream that delivers the
+/// first part a clear interval before the end is incremental; a buffering endpoint or proxy delivers
+/// everything at once. `sleep 0.3` is not POSIX (busybox has it, some minimal `sleep`s do not), so
+/// it falls back to a whole second rather than failing.
+const PROBE_SCRIPT: &str = "printf a; sleep 0.3 2>/dev/null || sleep 1; printf b";
+
+/// The least gap between the first output frame and the final frame that counts as incremental
+/// delivery. A third of the script's pause: wide enough to absorb scheduling noise on a loaded host,
+/// far above the ~0 a buffered body shows.
+const PROBE_MIN_GAP: Duration = Duration::from_millis(100);
+
+/// What the incremental-delivery check saw.
+#[derive(Debug, Default)]
+struct ProbeSeen {
+    output_frames: usize,
+    stdout: Vec<u8>,
+    end: Option<Frame>,
+    /// From the first output frame to the final frame.
+    gap: Option<Duration>,
+}
+
+impl ProbeSeen {
+    fn streams(&self) -> bool {
+        self.output_frames >= 2
+            && self.stdout == b"ab"
+            && self.end == Some(Frame::Exit(0))
+            && self.gap.is_some_and(|g| g >= PROBE_MIN_GAP)
     }
+
+    fn explain(&self) -> String {
+        if self.end != Some(Frame::Exit(0)) || self.stdout != b"ab" {
+            return format!(
+                "did not complete as `ab` + exit 0 (stdout {:?}, end {:?})",
+                String::from_utf8_lossy(&self.stdout),
+                self.end
+            );
+        }
+        if self.output_frames < 2 {
+            return "sent the output as one frame: it buffered the output until exit".into();
+        }
+        match self.gap {
+            Some(g) if g >= PROBE_MIN_GAP => format!(
+                "streamed incrementally ({} output frames, first {} ms before the end)",
+                self.output_frames,
+                g.as_millis()
+            ),
+            g => format!(
+                "delivered every frame at once ({} ms apart): something buffers the stream",
+                g.unwrap_or_default().as_millis()
+            ),
+        }
+    }
+}
+
+/// Read a stream to its end, timing it.
+async fn observe_probe(resp: reqwest::Response) -> Result<ProbeSeen, String> {
+    let mut seen = ProbeSeen::default();
+    let mut reader = FrameReader::new(resp);
+    let mut first_output: Option<Instant> = None;
+    while let Some(frame) = reader.next(stream::FRAME_SILENCE_LIMIT).await? {
+        match frame {
+            Frame::Stdout(b) => {
+                first_output.get_or_insert_with(Instant::now);
+                seen.output_frames += 1;
+                seen.stdout.extend_from_slice(&b);
+            }
+            Frame::Stderr(_) => {
+                first_output.get_or_insert_with(Instant::now);
+                seen.output_frames += 1;
+            }
+            Frame::Heartbeat => {}
+            end => {
+                seen.gap = first_output.map(|t| t.elapsed());
+                seen.end = Some(end);
+                reader.finish().await;
+                return Ok(seen);
+            }
+        }
+    }
+    Ok(seen)
 }
 
 /// What one streamed request produced.
@@ -381,16 +395,10 @@ impl Verifier {
         format!("/tmp/exec-conformance-{}-{which}", self.nonce)
     }
 
-    /// A v1.1 request, for setup and for observing the far side between streamed requests.
-    async fn sh(&self, script: &str) -> Result<super::ExecResponse, String> {
+    /// A one-shot request, for setup and for observing the far side between streamed requests.
+    async fn sh(&self, script: &str) -> Result<beyond_sandbox::exec::ExecResult, String> {
         self.runner
-            .post(
-                "sh",
-                &Self::args(script),
-                None,
-                Duration::from_secs(10),
-                None,
-            )
+            .run("sh", &Self::args(script), None, Duration::from_secs(10))
             .await
             .map_err(|e| e.to_string())
     }
@@ -438,16 +446,17 @@ impl Verifier {
 
     async fn envelope(&self) -> Check {
         match self.sh("printf out; printf err >&2; exit 3").await {
-            Ok(r) if r.exit_code == 3 && r.stdout == "out" && r.stderr == "err" => pass(
-                ENVELOPE,
-                "a request without `stream` gets one JSON object, as in v1.1",
-            ),
+            Ok(r) if r.code == Some(3) && r.stdout == b"out" && r.stderr == b"err" => {
+                pass(ENVELOPE, "a request without `stream` gets one JSON object")
+            }
             Ok(r) => fail(
                 ENVELOPE,
                 format!(
-                    "expected exit 3, stdout \"out\", stderr \"err\"; got exit {}, stdout {:?}, \
+                    "expected exit 3, stdout \"out\", stderr \"err\"; got exit {:?}, stdout {:?}, \
                      stderr {:?}",
-                    r.exit_code, r.stdout, r.stderr
+                    r.code,
+                    r.stdout_text(),
+                    r.stderr_text()
                 ),
             ),
             Err(e) => fail(ENVELOPE, e),
@@ -468,7 +477,7 @@ impl Verifier {
         let bound = limit + self.expect.kill_within;
         let started = Instant::now();
         let args = Self::args(&script);
-        let sent = self.runner.post("sh", &args, None, limit, None);
+        let sent = self.runner.run("sh", &args, None, limit);
         let check = match tokio::time::timeout(bound, sent).await {
             Err(_) => fail(
                 ENVELOPE_TIMEOUT,
@@ -482,17 +491,18 @@ impl Verifier {
                 let at = started.elapsed();
                 tokio::time::sleep(grandchild.saturating_sub(at) + Duration::from_secs(1)).await;
                 match self.sh(&format!("test -e {marker}")).await {
-                    Ok(t) if t.exit_code != 0 => {
-                        let shape = if r.exit_code == 124
-                            && r.stderr
+                    Ok(t) if t.code != Some(0) => {
+                        let shape = if r.code == Some(124)
+                            && r.stderr_text()
                                 .trim_end()
                                 .ends_with("command exceeded its timeout")
                         {
                             "answered 124 with the timeout note".to_string()
                         } else {
                             format!(
-                                "note: it SHOULD answer exit_code 124 with stderr ending in                                  `command exceeded its timeout`; got exit {}, stderr {:?}",
-                                r.exit_code, r.stderr
+                                "note: it SHOULD answer exit_code 124 with stderr ending in                                  `command exceeded its timeout`; got exit {:?}, stderr {:?}",
+                                r.code,
+                                r.stderr_text()
                             )
                         };
                         pass(
@@ -516,93 +526,10 @@ impl Verifier {
         check
     }
 
-    /// One v1.1 request carrying `output_base64`, its answer as JSON.
-    async fn exact_answer(&self, script: &str) -> Result<serde_json::Value, String> {
-        let resp = self
-            .runner
-            .send_exact(
-                "sh",
-                &Self::args(script),
-                None,
-                Duration::from_secs(10),
-                None,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        let (body, over) = self
-            .runner
-            .read_capped(resp)
-            .await
-            .map_err(|e| e.to_string())?;
-        if over {
-            return Err("the answer exceeded the response cap".to_string());
-        }
-        serde_json::from_slice(&body).map_err(|e| format!("unparseable JSON ({e})"))
-    }
-
-    /// An `output_base64` answer taken apart: the exit code and the decoded streams. Everything the
-    /// spec says an honouring endpoint MUST do is checked here: both fields present, standard
-    /// base64, and no text fields beside them.
-    fn exact_parts(v: &serde_json::Value) -> Result<(i64, Vec<u8>, Vec<u8>), String> {
-        use base64::Engine as _;
-        let field = |key: &str| -> Result<Vec<u8>, String> {
-            let s = v[key]
-                .as_str()
-                .ok_or_else(|| format!("`{key}` is missing or not a string"))?;
-            base64::engine::general_purpose::STANDARD
-                .decode(s)
-                .map_err(|e| format!("`{key}` is not standard base64 with padding ({e})"))
-        };
-        if v.get("stdout").is_some() || v.get("stderr").is_some() {
-            return Err(
-                "the answer carries `stdout`/`stderr` text beside the base64 fields".into(),
-            );
-        }
-        let code = v["exit_code"]
-            .as_i64()
-            .ok_or_else(|| "no integer `exit_code`".to_string())?;
-        Ok((code, field("stdout_base64")?, field("stderr_base64")?))
-    }
-
-    /// Exact output (v1.1 `output_base64`): optional, probed the way a client probes it, and an
-    /// endpoint that answers with either base64 field is held to all of it.
-    async fn exact_output(&self) -> [Check; 2] {
-        let probe = match self.exact_answer(r"printf '\377\000\n'").await {
-            Ok(v) => v,
-            Err(e) => {
-                return [
-                    fail(OUTPUT_BASE64, e),
-                    skip(OUTPUT_BYTES, "the probe request failed"),
-                ];
-            }
-        };
-        if probe.get("stdout_base64").is_none() && probe.get("stderr_base64").is_none() {
-            return [
-                skip(
-                    OUTPUT_BASE64,
-                    "answers text: a plain v1.1 endpoint (raw exec output through it is inexact; clients \
-                     say so, or use a v1.2 stream)",
-                ),
-                skip(OUTPUT_BYTES, "output_base64 is not offered"),
-            ];
-        }
-        let offered = match Self::exact_parts(&probe) {
-            Ok((0, out, err)) if out == [0xff, 0x00, 0x0a] && err.is_empty() => pass(
-                OUTPUT_BASE64,
-                "`ff 00 0a` came back as `stdout_base64`, `stderr_base64` empty",
-            ),
-            Ok((code, out, err)) => fail(
-                OUTPUT_BASE64,
-                format!(
-                    "expected exit 0, stdout ff 00 0a, empty stderr; got exit {code}, stdout {out:?}, stderr {err:?}"
-                ),
-            ),
-            Err(e) => fail(OUTPUT_BASE64, e),
-        };
-        [offered, self.exact_bytes().await]
-    }
-
-    async fn exact_bytes(&self) -> Check {
+    /// Every byte value comes back intact on stdout and on stderr, and both streams with an exit
+    /// code. An answer whose `stdout` or `stderr` is not standard base64 is an error of the client,
+    /// reported as the check's failure.
+    async fn output_bytes(&self) -> Check {
         // Every byte value, as a shell writes them: 0x00 and 0x80 to 0xFF are what text cannot hold.
         let gen_ =
             r#"i=0; while [ $i -lt 256 ]; do printf "\\$(printf %03o $i)"; i=$((i+1)); done"#;
@@ -619,23 +546,20 @@ impl Verifier {
             ),
         ];
         for (what, script, code, want_out, want_err) in cases {
-            let got = match self.exact_answer(&script).await {
-                Ok(v) => Self::exact_parts(&v),
-                Err(e) => Err(e),
-            };
-            match got {
-                Ok((c, out, err)) if c == code && out == want_out && err == want_err => {}
-                Ok((c, out, err)) => {
+            match self.sh(&script).await {
+                Ok(r) if r.code == Some(code) && r.stdout == want_out && r.stderr == want_err => {}
+                Ok(r) => {
                     return fail(
                         OUTPUT_BYTES,
                         format!(
-                            "{what}: expected exit {code}, {} stdout bytes, {} stderr bytes; got exit {c}, {} and {} bytes (first difference: {})",
+                            "{what}: expected exit {code}, {} stdout bytes, {} stderr bytes; got exit {:?}, {} and {} bytes (first difference: {})",
                             want_out.len(),
                             want_err.len(),
-                            out.len(),
-                            err.len(),
-                            first_difference(&out, &want_out)
-                                .or_else(|| first_difference(&err, &want_err))
+                            r.code,
+                            r.stdout.len(),
+                            r.stderr.len(),
+                            first_difference(&r.stdout, &want_out)
+                                .or_else(|| first_difference(&r.stderr, &want_err))
                                 .unwrap_or_else(|| "none in the bytes: the exit code".into()),
                         ),
                     );
@@ -654,7 +578,7 @@ impl Verifier {
             .runner
             .send(
                 "sh",
-                &Self::args(stream::PROBE_SCRIPT),
+                &Self::args(PROBE_SCRIPT),
                 None,
                 Duration::from_secs(10),
                 None,
@@ -665,7 +589,7 @@ impl Verifier {
             Ok(r) => r,
             Err(e) => return fail(INCREMENTAL, e.to_string()),
         };
-        match stream::observe_probe(resp).await {
+        match observe_probe(resp).await {
             Ok(seen) if seen.streams() => pass(INCREMENTAL, seen.explain()),
             Ok(seen) => fail(INCREMENTAL, seen.explain()),
             Err(e) => fail(INCREMENTAL, e),
@@ -790,7 +714,7 @@ impl Verifier {
                     tokio::time::sleep(grandchild.saturating_sub(at) + Duration::from_secs(1))
                         .await;
                     match self.sh(&format!("test -e {marker}")).await {
-                        Ok(r) if r.exit_code != 0 => pass(
+                        Ok(r) if r.code != Some(0) => pass(
                             TIMEOUT,
                             format!(
                                 "`{{\"timed_out\":true}}` after {} ms; the backgrounded grandchild \
@@ -932,7 +856,7 @@ impl Verifier {
         );
         let gone_after = loop {
             match self.sh(&alive).await {
-                Ok(r) if r.exit_code != 0 => break Some(hung_up.elapsed()),
+                Ok(r) if r.code != Some(0) => break Some(hung_up.elapsed()),
                 Ok(_) if hung_up.elapsed() > self.expect.kill_within => break None,
                 Ok(_) => tokio::time::sleep(Duration::from_millis(100)).await,
                 Err(e) => return fail(DISCONNECT, e),
@@ -954,7 +878,7 @@ impl Verifier {
         tokio::time::sleep((grandchild + Duration::from_secs(1)).saturating_sub(started.elapsed()))
             .await;
         match self.sh(&format!("test -e {marker}")).await {
-            Ok(r) if r.exit_code != 0 => pass(
+            Ok(r) if r.code != Some(0) => pass(
                 DISCONNECT,
                 format!(
                     "the process group was gone {} ms after the disconnect",
@@ -1064,7 +988,7 @@ impl Verifier {
         tokio::time::sleep((grandchild + Duration::from_secs(1)).saturating_sub(started.elapsed()))
             .await;
         match self.sh(&format!("test -e {marker}")).await {
-            Ok(r) if r.exit_code != 0 => pass(
+            Ok(r) if r.code != Some(0) => pass(
                 LEFTOVERS,
                 "`shell_exit` sent, the stream held until the leftover exited, and a disconnect \
                  killed it",
@@ -1105,7 +1029,7 @@ impl Verifier {
              for f in /proc/[0-9]*/stat; do read -r t <\"$f\" 2>/dev/null || continue; \
              t=${{t##*) }}; set -- $t; [ \"$3\" = {pgid} ] && [ \"$1\" != Z ] && exit 0; done; exit 1"
         );
-        Ok(self.sh(&script).await?.exit_code == 0)
+        Ok(self.sh(&script).await?.code == Some(0))
     }
 
     /// Wait (bounded) for group `pgid` to be gone; how long it took.
@@ -1140,7 +1064,7 @@ impl Verifier {
             }
         };
         let r = jobs
-            .run_held(&scope, &id, &Self::spec(stream::PROBE_SCRIPT), &events)
+            .run_held(&scope, &id, &Self::spec(PROBE_SCRIPT), &events)
             .await;
         let _ = jobs.wipe(&scope).await;
         let (pgid, out, first) = heard.into_inner().unwrap_or_else(|e| e.into_inner());
@@ -1149,7 +1073,7 @@ impl Verifier {
                 let lead =
                     first.map(|f| started.elapsed().saturating_sub(f.duration_since(started)));
                 match lead {
-                    Some(l) if l >= stream::PROBE_MIN_GAP => pass(
+                    Some(l) if l >= PROBE_MIN_GAP => pass(
                         JOBS_HELD,
                         format!(
                             "`started`, then `ab` live ({} ms before the end), then exit 0",

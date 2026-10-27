@@ -179,12 +179,8 @@ fn routes(flags: &Flags) -> Vec<(String, String)> {
     out
 }
 
-/// The two v1.4 sandboxes: one that keeps jobs natively and calls back itself, and one without
-/// native jobs whose notify is the baseline's (`curl` from the job's supervisor).
-const SANDBOXES: [(&str, bool); 2] = [
-    ("native (v1.3 + notify)", true),
-    ("baseline (v1.2 + notify)", false),
-];
+/// The sandbox: it keeps jobs natively and calls back itself.
+const SANDBOXES: [&str; 1] = ["execd"];
 
 type Sandboxes = Vec<(&'static str, ExecMock, tempfile::TempDir)>;
 
@@ -223,16 +219,9 @@ pub(super) async fn notify_fleet(
     )
     .await?;
     let mut sandboxes = Vec::new();
-    for (name, jobs) in SANDBOXES {
+    for name in SANDBOXES {
         let dir = tempfile::tempdir().map_err(|e| format!("sandbox: {e}"))?;
-        let mock = ExecMock::start_with(
-            dir.path(),
-            MockOptions {
-                jobs,
-                ..MockOptions::notifying()
-            },
-        )
-        .await;
+        let mock = ExecMock::start_with(dir.path(), MockOptions::default()).await;
         sandboxes.push((name, mock, dir));
     }
     Ok((fleet, sandboxes, flags))

@@ -16,7 +16,7 @@ use hegel::TestCase;
 use hegel::generators as gs;
 
 #[hegel::test(env::settings(100, 0x5e11_f511))]
-fn a_faulty_transport_with_stdin_writes(tc: TestCase) {
+fn a_faulty_transport(tc: TestCase) {
     run_machine(
         tc,
         Config {
@@ -26,48 +26,46 @@ fn a_faulty_transport_with_stdin_writes(tc: TestCase) {
     );
 }
 
-#[hegel::test(env::settings(80, 0x5e11_f512))]
-fn a_faulty_transport_with_chunked_writes(tc: TestCase) {
-    run_machine(
-        tc,
-        Config {
-            fault_pct: 25,
-            stdin: false,
-            ..PLAIN
-        },
-    );
-}
-
-/// What `connect` may do over a transport that fails: fail, or learn exactly what a healthy one shows.
-/// Never cache a degraded answer (no stdin, no `dd`, no `rg`) learned from failed probes: FILES-OVER-EXEC
-/// section 4.2 (D3).
+/// What the first operation's probe may do over a transport that fails: fail, or learn exactly what a
+/// healthy one shows. Never cache a degraded answer (no `dd`, no `rg`) learned from a failed probe:
+/// FILES-OVER-EXEC section 4.2 (D3).
 #[hegel::test(env::settings(40, 0x5e11_f513))]
-fn connect_never_caches_what_failed_probes_say(tc: TestCase) {
+fn the_probe_never_caches_what_a_failed_request_says(tc: TestCase) {
     let seed = tc.draw(gs::integers::<u64>());
     let pct = tc.draw(gs::sampled_from(vec![20u64, 60, 100]));
     let clean = env::rt()
-        .block_on(env::connect(env::http_runner(None)))
-        .expect("a healthy loopback execd answers the probe")
-        .capabilities();
+        .block_on(async {
+            env::connect(env::http_runner(None))
+                .await
+                .expect("connect sends nothing")
+                .capabilities()
+                .await
+        })
+        .expect("a healthy loopback execd answers the probe");
     let faults = FaultRunner::new(env::http_runner(None), seed, pct);
     faults.enable(true);
     let runner: Arc<dyn CommandRunner> = faults.clone();
-    let got = env::rt().block_on(env::connect(runner));
+    let got = env::rt().block_on(async {
+        env::connect(runner)
+            .await
+            .expect("connect sends nothing")
+            .capabilities()
+            .await
+    });
     let report = faults.take();
     tc.note(&format!(
         "pct={pct} seed={seed}: probe requests {}, failed by a fault: {}",
         report.requests, report.errored
     ));
     match got {
-        Some(fs) => assert_eq!(
-            fs.capabilities(),
-            clean,
-            "connect succeeded with capabilities learned from failed probes (errored={})",
+        Ok(caps) => assert_eq!(
+            caps, clean,
+            "the probe succeeded with capabilities learned from failed requests (errored={})",
             report.errored
         ),
-        None => assert!(
+        Err(_) => assert!(
             report.errored,
-            "connect failed over a transport no fault touched"
+            "the probe failed over a transport no fault touched"
         ),
     }
 }

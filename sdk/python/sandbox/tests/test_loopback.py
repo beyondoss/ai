@@ -17,8 +17,8 @@ def test_exec_and_stream(execd_url: str) -> None:
     sb = Sandbox.connect(execd_url)
     r = sb.exec("sh", ["-c", "echo out; echo err >&2; exit 7"])
     assert (r.exit_code, r.stdout, r.stderr) == (7, b"out\n", b"err\n")
-    exact = sb.exec("cat", stdin=b"\x00\xff bytes")  # bytes, exactly: invalid UTF-8 and NUL survive
-    assert (exact.stdout, exact.exact) == (b"\x00\xff bytes", True)
+    raw = sb.exec("cat", stdin=b"\x00\xff bytes")  # bytes, exactly: invalid UTF-8 and NUL survive
+    assert raw.stdout == b"\x00\xff bytes"
 
     t0 = time.monotonic()
     seen: list[tuple[float, object]] = []
@@ -50,15 +50,14 @@ def test_a_signal_is_a_final_frame(execd_url: str) -> None:
 
 def test_files(execd_url: str, tmp_path: Path) -> None:
     sb = Sandbox.connect(execd_url)
-    caps = sb.capabilities()
-    assert caps.stream and caps.stdin and caps.jobs == "native"
+    assert sb.capabilities().read_window
     p = str(tmp_path / "f.txt")
     sb.files.write(p, bytes(range(256)))
     assert sb.files.read(p) == bytes(range(256))
     assert [e.name for e in sb.files.list(str(tmp_path))] == ["f.txt"]
 
 
-def test_native_jobs(execd_url: str) -> None:
+def test_jobs(execd_url: str) -> None:
     sb = Sandbox.connect(execd_url)
     scope = f"pytest{time.monotonic_ns()}"
     try:
@@ -84,8 +83,6 @@ def test_async_sandbox(execd_url: str, tmp_path: Path) -> None:
             p = str(tmp_path / "x")
             await sb.files.write(p, b"async")
             assert await sb.files.read(p) == b"async"
-            caps = await sb.capabilities()
-            assert caps.stream and caps.jobs == "native"
             scope = f"pyasync{time.monotonic_ns()}"
             await sb.jobs.start(scope, "b1", "sh", ["-c", "echo hey; exit 1"])
             a = await sb.jobs.attach(scope, "b1")

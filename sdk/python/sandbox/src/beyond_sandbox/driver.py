@@ -23,7 +23,6 @@ from typing import Any, Callable, cast
 from . import AsyncSandbox, Exit, Sandbox, SandboxError, Signal, Stderr, Stdout, TimedOut
 from .errors import InvalidRequest
 from .files import CapsOverride
-from .jobs import JOBS_ROOT
 from .models import Stat
 
 Result = dict[str, Any]
@@ -142,7 +141,6 @@ def plan(op: str, req: dict[str, Any]) -> Plan:
                 "exit_code": r.exit_code,
                 "stdout_b64": _b64(r.stdout),
                 "stderr_b64": _b64(r.stderr),
-                "exact": r.exact,
             },
         )
     if op == "exec_stream":
@@ -315,7 +313,7 @@ def _override() -> CapsOverride | None:
         return None
     caps = json.loads(raw)
     out: dict[str, Any] = {}
-    for key in ("stdin", "find_printf", "search_engine"):
+    for key in ("find_printf", "search_engine"):
         if key in caps and caps[key] is not None:
             out[key] = caps[key]
     return cast(CapsOverride, out)
@@ -334,12 +332,11 @@ class Driver:
         self.name = "python-async" if use_async else "python"
         url = os.environ.get("CONFORMANCE_URL", "")
         token = os.environ.get("CONFORMANCE_BEARER") or None
-        root = os.environ.get("CONFORMANCE_JOBS_ROOT") or JOBS_ROOT
         override = _override()
         if use_async:
-            self.sb: Any = AsyncSandbox.connect(url, token, jobs_root=root, override=override)
+            self.sb: Any = AsyncSandbox.connect(url, token, override=override)
         else:
-            self.sb = Sandbox.connect(url, token, jobs_root=root, override=override)
+            self.sb = Sandbox.connect(url, token, override=override)
 
     def parse(self, line: str) -> tuple[Any, str, dict[str, Any]]:
         try:
@@ -359,12 +356,10 @@ class Driver:
     @staticmethod
     def caps_result(c: Any) -> Result:
         return {
-            "stdin": c.stdin, "stream": c.stream, "jobs": c.jobs, "search_engine": c.search_engine,
-            "find_printf": c.find_printf, "read_window": c.read_window,
-            "output_base64": c.output_base64,
-            # Raw exec returns the command's bytes: over `output_base64`, else over a v1.2 stream.
-            "exact_exec": c.output_base64 or c.stream,
-        }  # fmt: skip
+            "search_engine": c.search_engine,
+            "find_printf": c.find_printf,
+            "read_window": c.read_window,
+        }
 
     def handle(self, line: str) -> Result:
         id_: Any = None

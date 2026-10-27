@@ -11,19 +11,8 @@ pub fn run_machine(tc: TestCase, cfg: Config) {
 }
 
 #[hegel::test(env::settings(120, 0x5e11_f501))]
-fn plain_stdin_writes(tc: TestCase) {
+fn plain_writes(tc: TestCase) {
     run_machine(tc, PLAIN);
-}
-
-#[hegel::test(env::settings(80, 0x5e11_f502))]
-fn chunked_writes_without_stdin(tc: TestCase) {
-    run_machine(
-        tc,
-        Config {
-            stdin: false,
-            ..PLAIN
-        },
-    );
 }
 
 #[hegel::test(env::settings(80, 0x5e11_f503))]

@@ -154,7 +154,6 @@ mod run_subagent_worktree_note;
 mod run_todo;
 mod run_wrap_up_and_export;
 mod sandbox_jobs;
-mod sandbox_jobs_notify;
 mod serve_accept_error;
 mod serve_agent_frontmatter;
 mod serve_approval;

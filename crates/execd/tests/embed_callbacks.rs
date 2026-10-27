@@ -88,8 +88,7 @@ async fn until(what: &str, mut cond: impl FnMut() -> bool) {
 
 async fn start() -> (execd::Handle, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let mut o = execd::Options::new(dir.path());
-    o.kept_jobs_survive_idle = true;
+    let o = execd::Options::new(dir.path());
     let server = execd::serve(ports::tokio_listener().await, o).unwrap();
     (server, dir)
 }
