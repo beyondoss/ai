@@ -6,11 +6,11 @@
 //! layers compose.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::io::{Read, Write};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use beyond_sandbox::procgroup::{GroupId, GroupKillGuard, kill_process_group};
 use beyond_sandbox::{Exec, ExecResult};
 
 pub struct LocalSh;
@@ -29,14 +29,18 @@ async fn pump<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-/// One blocking `Command`, on a blocking thread. Output is captured whole.
-fn spawn(
+/// One command in its own process group, under the caller's deadline. The group is killed when the
+/// deadline passes and when the call is dropped, so no test leaves a process behind. A command that
+/// finishes is left alone: the job baseline's supervisor keeps jobs running past their start.
+async fn spawn(
     program: &str,
     args: &[String],
     cwd: Option<&str>,
     stdin: Option<&[u8]>,
+    timeout: Duration,
 ) -> std::io::Result<ExecResult> {
-    let mut cmd = Command::new(program);
+    use tokio::io::AsyncWriteExt as _;
+    let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
         .stdin(if stdin.is_some() {
             Stdio::piped()
@@ -44,38 +48,49 @@ fn spawn(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true);
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
     let mut child = cmd.spawn()?;
-    let feeder = stdin.map(|bytes| {
-        let mut pipe = child.stdin.take().unwrap();
-        let bytes = bytes.to_vec();
-        std::thread::spawn(move || {
-            let _ = pipe.write_all(&bytes);
-        })
-    });
-    let mut out = child.stdout.take().unwrap();
-    let mut err = child.stderr.take().unwrap();
-    let err_reader = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = err.read_to_end(&mut v);
-        v
-    });
-    let mut stdout = Vec::new();
-    out.read_to_end(&mut stdout)?;
-    let status = child.wait()?;
-    if let Some(f) = feeder {
-        let _ = f.join();
-    }
-    let stderr = err_reader.join().unwrap();
-    Ok(ExecResult {
-        code: status.code(),
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        ..Default::default()
+    let mut guard = GroupKillGuard {
+        group: child.id().map(GroupId::leader),
+    };
+    let mut pipe = child.stdin.take();
+    let bytes = stdin.map(<[u8]>::to_vec);
+    let feed = async move {
+        if let (Some(p), Some(b)) = (pipe.as_mut(), bytes) {
+            let _ = p.write_all(&b).await;
+        }
+        drop(pipe);
+    };
+    match tokio::time::timeout(timeout, async {
+        tokio::join!(child.wait_with_output(), feed)
     })
+    .await
+    {
+        Ok((out, ())) => {
+            guard.disarm();
+            let out = out?;
+            Ok(ExecResult {
+                code: out.status.code(),
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                ..Default::default()
+            })
+        }
+        Err(_) => {
+            if let Some(group) = guard.group.take() {
+                let _ = tokio::task::spawn_blocking(move || kill_process_group(group)).await;
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out",
+            ))
+        }
+    }
 }
 
 #[async_trait]
@@ -85,12 +100,9 @@ impl Exec for LocalSh {
         program: &str,
         args: &[String],
         cwd: Option<&str>,
-        _timeout: Duration,
+        timeout: Duration,
     ) -> std::io::Result<ExecResult> {
-        let (p, a, c) = (program.to_string(), args.to_vec(), cwd.map(str::to_string));
-        tokio::task::spawn_blocking(move || spawn(&p, &a, c.as_deref(), None))
-            .await
-            .unwrap()
+        spawn(program, args, cwd, None, timeout).await
     }
 
     async fn run_with_stdin(
@@ -98,18 +110,10 @@ impl Exec for LocalSh {
         program: &str,
         args: &[String],
         cwd: Option<&str>,
-        _timeout: Duration,
+        timeout: Duration,
         stdin: &[u8],
     ) -> std::io::Result<ExecResult> {
-        let (p, a, c, i) = (
-            program.to_string(),
-            args.to_vec(),
-            cwd.map(str::to_string),
-            stdin.to_vec(),
-        );
-        tokio::task::spawn_blocking(move || spawn(&p, &a, c.as_deref(), Some(&i)))
-            .await
-            .unwrap()
+        spawn(program, args, cwd, Some(stdin), timeout).await
     }
 
     /// Output as it is produced; dropping the call kills the command (`kill_on_drop`).
@@ -126,11 +130,16 @@ impl Exec for LocalSh {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .process_group(0)
             .kill_on_drop(true);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
         let mut child = cmd.spawn()?;
+        // Dropping this call kills the whole group, not just the shell.
+        let _guard = GroupKillGuard {
+            group: child.id().map(GroupId::leader),
+        };
         let (mut out, mut err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
         let (_, _, status) = tokio::join!(
             pump(&mut out, on_stdout),

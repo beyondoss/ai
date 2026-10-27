@@ -149,3 +149,52 @@ async fn connect_reaches_an_endpoint_with_a_bearer_and_streams() {
         .unwrap();
     assert_eq!(sandbox.files().stat(&file).await.unwrap().unwrap().len, 1);
 }
+
+/// The test transport itself must not leak: a command past its deadline is killed with every process
+/// it started, and so is one whose call is dropped.
+#[tokio::test]
+async fn the_test_transport_leaves_no_process_behind() {
+    fn gone(pid: i32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat.contains(") Z"),
+        }
+    }
+    async fn wait_gone(pidfile: &std::path::Path) {
+        let pid: i32 = std::fs::read_to_string(pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        for _ in 0..100 {
+            if gone(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("process {pid} outlived its command");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let exec = local_sh::LocalSh;
+    let script = |name: &str| {
+        let pidfile = dir.path().join(name);
+        let args = sh(&format!(
+            "sleep 300 & echo $! > {}; wait",
+            pidfile.display()
+        ));
+        (pidfile, args)
+    };
+
+    let (pidfile, args) = script("timeout.pid");
+    let err = exec
+        .run("sh", &args, None, Duration::from_millis(500))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    wait_gone(&pidfile).await;
+
+    let (pidfile, args) = script("dropped.pid");
+    let call = exec.run_attached("sh", &args, None, &|_| {}, &|_| {});
+    let _ = tokio::time::timeout(Duration::from_millis(500), call).await;
+    wait_gone(&pidfile).await;
+}
