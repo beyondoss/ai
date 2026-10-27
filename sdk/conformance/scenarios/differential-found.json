@@ -25,13 +25,6 @@
           "op": "write",
           "path": "${ROOT}/f/cr\rname",
           "data_b64": "",
-          "xfail": {
-            "drivers": [
-              "python",
-              "python-async"
-            ],
-            "reason": "the Python client reads the first stderr line with str.splitlines(), which also splits at this character; FILES-OVER-EXEC 3.3 reads up to LF, so the OS error is missed and the kind falls back to io"
-          },
           "expect": {
             "error": {
               "kind": {
@@ -48,13 +41,6 @@
           "op": "write",
           "path": "${ROOT}/f/ls name",
           "data_b64": "",
-          "xfail": {
-            "drivers": [
-              "python",
-              "python-async"
-            ],
-            "reason": "the Python client reads the first stderr line with str.splitlines(), which also splits at this character; FILES-OVER-EXEC 3.3 reads up to LF, so the OS error is missed and the kind falls back to io"
-          },
           "expect": {
             "error": {
               "kind": {
@@ -71,13 +57,6 @@
           "op": "write",
           "path": "${ROOT}/f/ff\fname",
           "data_b64": "",
-          "xfail": {
-            "drivers": [
-              "python",
-              "python-async"
-            ],
-            "reason": "the Python client reads the first stderr line with str.splitlines(), which also splits at this character; FILES-OVER-EXEC 3.3 reads up to LF, so the OS error is missed and the kind falls back to io"
-          },
           "expect": {
             "error": {
               "kind": {
