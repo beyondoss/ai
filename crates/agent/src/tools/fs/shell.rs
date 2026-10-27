@@ -297,28 +297,33 @@ impl FsBackend for ShellFs {
             .map_err(|e| FsError::Backend(format!("{program}: {e}")))?;
 
         // Both `rg` and `grep` use exit 1 for "no matches" — a perfectly ordinary outcome, not a
-        // failure. Anything above that is a real error, and the overwhelmingly common cause is a
-        // pattern the target's regex dialect rejected, so it maps to the caller's mistake rather than
-        // the backend's.
+        // failure. Exit 2 is shared by three different situations that must not be conflated: a
+        // pattern the target's regex dialect rejected (the caller's mistake), a missing root, and
+        // per-path read errors (the matches found elsewhere are still good).
+        let mut skipped_note = None;
         match result.code {
             Some(0) | Some(1) => {}
-            _ if result.timed_out => {
+            _ if result.timed_out || result.code == Some(124) => {
                 return Err(FsError::Backend(format!(
                     "{program} timed out after {}s",
                     self.timeout.as_secs()
                 )));
             }
-            _ => {
-                let detail = result.stderr.trim();
-                return Err(FsError::InvalidQuery(format!(
-                    "bad regex: {}",
-                    if detail.is_empty() {
-                        format!("{program} rejected the pattern")
-                    } else {
-                        detail.to_string()
-                    }
-                )));
-            }
+            _ => match classify_search_failure(&result.stderr, &q.root.to_string_lossy()) {
+                SearchFailure::BadRegex => {
+                    let detail = result.stderr.trim();
+                    return Err(FsError::InvalidQuery(format!(
+                        "bad regex: {}",
+                        if detail.is_empty() {
+                            format!("{program} rejected the pattern")
+                        } else {
+                            detail.to_string()
+                        }
+                    )));
+                }
+                SearchFailure::MissingRoot(line) => return Err(FsError::Backend(line)),
+                SearchFailure::Skipped(note) => skipped_note = Some(note),
+            },
         }
 
         let mut hits = if engine == SearchEngine::BusyboxGrep {
@@ -347,7 +352,7 @@ impl FsBackend for ShellFs {
             // unreadable subdirectory shows up only as noise on stderr, in a format that varies by
             // implementation. Reported when the command still succeeded but said something — enough
             // for the "search was incomplete" notice to fire, without pretending to name the path.
-            first_error: incomplete_note(&result),
+            first_error: skipped_note.or_else(|| incomplete_note(&result)),
         })
     }
 
@@ -1285,6 +1290,55 @@ exit 1"#
 /// transport error, a timeout between chunks): remove the temp, found the way the write named it.
 const REMOVE_TEMP_SCRIPT: &str = concat!(resolve_target!(), r#"rm -f "$tmp""#);
 
+/// What a search exit above 1 means, from stderr alone (the three causes share the exit code).
+enum SearchFailure {
+    /// The engine rejected the pattern.
+    BadRegex,
+    /// The search root itself does not exist; carries the engine's message.
+    MissingRoot(String),
+    /// Only per-path read errors: the hits on stdout are still valid. Carries the note.
+    Skipped(String),
+}
+
+/// Per-path read errors name the path and end in the OS message (`rg` appends ` (os error N)`).
+/// Anything else on stderr is the engine complaining about the pattern.
+fn classify_search_failure(stderr: &str, root: &str) -> SearchFailure {
+    const OS_ERRORS: [&str; 5] = [
+        "No such file or directory",
+        "Permission denied",
+        "Is a directory",
+        "Too many levels of symbolic links",
+        "Input/output error",
+    ];
+    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    let path_error = |l: &str| {
+        let l = l.trim_end();
+        let l = l
+            .strip_suffix(')')
+            .and_then(|x| x.rsplit_once(" (os error ").map(|p| p.0))
+            .unwrap_or(l);
+        OS_ERRORS.iter().any(|e| l.ends_with(e))
+    };
+    if lines.is_empty() || !lines.iter().all(|l| path_error(l)) {
+        return SearchFailure::BadRegex;
+    }
+    // The root's own error is `PROGRAM: ROOT: [IO error for operation on ROOT: ]No such file or
+    // directory`; a path under the root carries more path after ROOT, so matching the exact
+    // `: ROOT: ` form tells them apart.
+    let root_prefix = format!(": {root}: ");
+    if let Some(l) = lines
+        .iter()
+        .find(|l| l.contains(&root_prefix) && l.contains("No such file or directory"))
+    {
+        return SearchFailure::MissingRoot(l.trim().to_string());
+    }
+    let first = lines[0].trim();
+    SearchFailure::Skipped(format!(
+        "{} path(s) could not be searched; first: {first}",
+        lines.len()
+    ))
+}
+
 /// stderr from a *successful* search — an unreadable path, typically. Empty stderr means nothing to
 /// report, which is the common case.
 fn incomplete_note(result: &ExecResult) -> Option<String> {
@@ -1565,6 +1619,46 @@ pub fn query(pattern: &str, root: PathBuf, limit: usize) -> SearchQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_exit_two_is_told_apart_by_stderr() {
+        let root = "/work/proj";
+        for bad in [
+            "regex parse error:\n    (\n    ^\nerror: unclosed group",
+            "grep: Unmatched ( or \\(",
+            "grep: bad regex '(': Unmatched ( or \\(",
+            "",
+        ] {
+            assert!(
+                matches!(classify_search_failure(bad, root), SearchFailure::BadRegex),
+                "{bad:?}"
+            );
+        }
+        for missing in [
+            "rg: /work/proj: No such file or directory (os error 2)",
+            "rg: /work/proj: IO error for operation on /work/proj: No such file or directory (os error 2)",
+            "grep: /work/proj: No such file or directory",
+        ] {
+            assert!(
+                matches!(
+                    classify_search_failure(missing, root),
+                    SearchFailure::MissingRoot(_)
+                ),
+                "{missing:?}"
+            );
+        }
+        let SearchFailure::Skipped(note) = classify_search_failure(
+            "rg: /work/proj/a: Permission denied (os error 13)\nrg: /work/proj/b: Permission denied (os error 13)\n",
+            root,
+        ) else {
+            panic!("per-file errors must keep the matches");
+        };
+        assert!(note.starts_with("2 path(s)"), "{note}");
+        assert!(matches!(
+            classify_search_failure("grep: /work/proj/x: No such file or directory", root),
+            SearchFailure::Skipped(_)
+        ));
+    }
 
     /// This host's `sh`, with a prelude run before every script. A `PATH` shim, not a shell function,
     /// because the read script `exec`s `dd`, which skips functions.
