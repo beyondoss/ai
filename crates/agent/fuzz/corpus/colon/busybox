@@ -1,0 +1,10 @@
+./crlf.txt:1:foo
+./.hidden:1:foo
+./--:1:foo
+./odd:12:name.txt:1:foo
+./we
+ird.txt:1:foo in odd
+./a.txt:2:foo two
+./a.txt:6:foo six
+./sub/b.rs:1:foo
+./sub/b.rs:5:foo

@@ -2347,6 +2347,16 @@ prefix runs through a symlink (`/tmp/...` on macOS) also gets a host-resolved tw
 remote world; the typed spelling is matched as well (fail-safe). Project trust keys go through the
 same resolver (`path_utils::resolved_path`), so `trust /tmp/newproj/` before `mkdir` takes effect.
 
+**Parsers of command output are fuzzed.** `fuzz/` (`beyond-agent-fuzz`, its own workspace, run by
+`mise run fuzz -- <target>` and the `fuzz-agent` job of `deep.yml`) has one coverage-guided target
+per parser: `records` (`rg --null`/`grep -Z` search output), `colon` (busybox `grep -rn`), `stat`,
+`listing` (`find -printf` and the directory listing), `base64`, `frame` (v1.2 stream frames, plus the
+golden vectors) and `jobs` (v1.3 job frames and answers). Each prints structured input exactly as
+the real tool does and requires the original back, and holds raw bytes to no-panic, bounded-output
+and "every returned path occurs in the input". The parsers stay private; `fs::shell::__fuzz` is the
+`#[doc(hidden)]` seam, the same shape as `execd::__fuzz`. A bug the fuzzer found and the fix has not
+landed yet is named `known-*` in the corpus and excluded by a marked `KNOWN` guard in its target.
+
 Because `ShellFs` is generic over the _runner_ rather than over a transport, it runs over
 `RealRunner` on this host, against the same files `LocalFs` sees. `tests/fs_backend_parity.rs` uses
 that to diff the two backends' full model-visible output across a fixture tree of the cases that

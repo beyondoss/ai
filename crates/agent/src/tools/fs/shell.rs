@@ -1562,6 +1562,49 @@ pub fn query(pattern: &str, root: PathBuf, limit: usize) -> SearchQuery {
     super::local::query(pattern, root, limit)
 }
 
+/// Entry points for the fuzz targets (`crates/agent/fuzz`); not part of the API. The parsers stay
+/// private to this module, as the fuzz crate lives outside the workspace and can reach only `pub`
+/// items. Same shape as `execd::__fuzz`: thin wrappers, no logic of their own.
+#[doc(hidden)]
+pub mod __fuzz {
+    use std::path::PathBuf;
+
+    use super::super::{DirEntry, Hit, Meta};
+
+    /// `rg --null` / `grep -Z` records.
+    pub fn records(stdout: &str) -> Vec<Hit> {
+        super::parse_records(stdout)
+    }
+
+    /// busybox `grep -rn` records (no glob).
+    pub fn colon_records(stdout: &str) -> Vec<Hit> {
+        super::parse_colon_records(stdout, &super::query("x", PathBuf::from("."), 1))
+    }
+
+    /// The one-shot stat line.
+    pub fn stat(stdout: &str) -> Option<Meta> {
+        super::parse_stat(stdout)
+    }
+
+    /// `find -printf '%y\t%p\0'`.
+    pub fn typed_paths(stdout: &str) -> Vec<(PathBuf, bool)> {
+        super::parse_typed_paths(stdout)
+    }
+
+    /// `<type>\t<size>\t<name>\0` directory listing.
+    pub fn dir_entries(stdout: &str, cap: usize, include_hidden: bool) -> Vec<DirEntry> {
+        super::parse_dir_entries(stdout, cap, include_hidden)
+    }
+
+    pub fn encode_base64(bytes: &[u8]) -> String {
+        super::encode_base64(bytes)
+    }
+
+    pub fn decode_base64(s: &str) -> Result<Vec<u8>, String> {
+        super::decode_base64(s)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
