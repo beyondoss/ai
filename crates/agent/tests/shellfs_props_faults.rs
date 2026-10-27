@@ -15,7 +15,7 @@ use beyond_agent::tools::exec::CommandRunner;
 use hegel::TestCase;
 use hegel::generators as gs;
 
-#[hegel::test(env::settings(40, 0x5e11_f511))]
+#[hegel::test(env::settings(100, 0x5e11_f511))]
 fn a_faulty_transport_with_stdin_writes(tc: TestCase) {
     run_machine(
         tc,
@@ -26,7 +26,7 @@ fn a_faulty_transport_with_stdin_writes(tc: TestCase) {
     );
 }
 
-#[hegel::test(env::settings(30, 0x5e11_f512))]
+#[hegel::test(env::settings(80, 0x5e11_f512))]
 fn a_faulty_transport_with_chunked_writes(tc: TestCase) {
     run_machine(
         tc,

@@ -10,12 +10,12 @@ pub fn run_machine(tc: TestCase, cfg: Config) {
     hegel::stateful::machine(m).steps(cfg.steps).run(tc);
 }
 
-#[hegel::test(env::settings(40, 0x5e11_f501))]
+#[hegel::test(env::settings(120, 0x5e11_f501))]
 fn plain_stdin_writes(tc: TestCase) {
     run_machine(tc, PLAIN);
 }
 
-#[hegel::test(env::settings(30, 0x5e11_f502))]
+#[hegel::test(env::settings(80, 0x5e11_f502))]
 fn chunked_writes_without_stdin(tc: TestCase) {
     run_machine(
         tc,
@@ -26,7 +26,7 @@ fn chunked_writes_without_stdin(tc: TestCase) {
     );
 }
 
-#[hegel::test(env::settings(30, 0x5e11_f503))]
+#[hegel::test(env::settings(80, 0x5e11_f503))]
 fn small_response_cap(tc: TestCase) {
     run_machine(
         tc,

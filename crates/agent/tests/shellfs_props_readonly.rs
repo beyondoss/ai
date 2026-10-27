@@ -10,7 +10,7 @@ use crate::shellfs_props::run_machine;
 use crate::shellfs_props_env::{self as env, Config, PLAIN};
 use hegel::TestCase;
 
-#[hegel::test(env::settings(40, 0x5e11_f521))]
+#[hegel::test(env::settings(100, 0x5e11_f521))]
 fn read_only_directory_and_file(tc: TestCase) {
     if env::truth_is_root() {
         eprintln!("skipping: running as root, where permission bits do not bind");
