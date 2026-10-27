@@ -402,6 +402,7 @@ The command is `rg` or `grep`, with **no shell**, each item one argument.
 [--glob G | --glob !G]        the caller's glob; the second form when excluding
 --glob !.git
 [-B before] [-A after]        each only when greater than 0
+--no-context-separator        always
 -e PATTERN -- ROOT
 ```
 
@@ -414,12 +415,14 @@ The command is `rg` or `grep`, with **no shell**, each item one argument.
 [--include=G | --exclude=G]
 --exclude-dir=.git            unless the root's last path component is .git
 [-B before] [-A after]
+--no-group-separator          always
 -e PATTERN -- ROOT
 ```
 
 where for a non-literal pattern `PATTERN` is rewritten for CRLF files (below).
 
-`busybox-grep` engine: `-r -n -H`, then `-F` or `-E`, `-i`, context flags,
+`busybox-grep` engine: `-r -n -H`, then `-F` or `-E`, `-i`, context flags (no
+`--no-group-separator`: busybox rejects it),
 `-e PATTERN -- ROOT`. It has no `-Z`, `-I`, `--color`, `--include`,
 `--exclude-dir`; the glob is applied by the client.
 
@@ -456,14 +459,17 @@ share exit 2:
 #### Parsing
 
 `rg` and `grep -Z` emit records `PATH<NUL>LINE<SEP>TEXT<LF>`, where `SEP` is `:`
-for a match and `-` for a context line. Parse by scanning for the **NUL**, not
-for newlines: a path may contain a newline. At each position, first check for
-a group separator: the bytes `--` + LF (or `--` at the very end) are skipped.
-(ripgrep with `--crlf` writes `--` + CR + LF; a client MUST skip that too.
-A file actually named `--` is not mistaken for a separator: its record is
-`--` NUL ..., so the byte after `--` (or `--` CR) is NUL, not LF.) Otherwise the path runs to the next NUL, the rest of the record to the
-next LF; `LINE` is one or more digits followed by `:` or `-`; a record that
-does not fit is dropped.
+for a match and `-` for a context line. The command MUST turn off the group
+separator: `rg --no-context-separator` (ripgrep 0.10 and later), GNU
+`grep --no-group-separator` (2.5.4 and later). The separator is the only record
+without a NUL, and a path may begin with `--` + LF (or `--` + CR LF under
+`rg --crlf`), so it cannot be told from the start of such a path; with it off,
+the output is path records only. A client MUST NOT skip any `--` bytes. Parse by
+scanning for the **NUL**, not for newlines: a path may contain a newline. The
+path runs from the start of the record to the next NUL, the rest of the record
+to the next LF; `LINE` is one or more digits followed by `:` or `-`; a record
+that does not fit is dropped. A file named `--` or `--` LF `b` is an ordinary
+path.
 
 `busybox-grep` emits `PATH:LINE:TEXT` (match) or `PATH-LINE-TEXT` (context). A
 line equal to `--` is skipped. Otherwise split at the **first** position `i`
@@ -495,7 +501,7 @@ U+FFFD for the bad bytes (stdout is text).
    an error).
 5. `note` is the first line of the trimmed stderr of a successful run, or null.
 
-Context groups that overlap are merged by the engine; separators are not hits.
+Context groups that overlap are merged by the engine.
 
 #### Clipping
 

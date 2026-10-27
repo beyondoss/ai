@@ -4189,6 +4189,75 @@
       ]
     },
     {
+      "id": "files.search.context-path-starting-with-dashes-newline",
+      "description": "A file whose name begins with '--' and a newline is searched with context, next to a second file so the engine would print a group separator between them. Hits are attributed to the full name; no separator is mistaken for (or taken from) the start of a path.",
+      "requires": {
+        "search_engine": [
+          "rg",
+          "grep"
+        ]
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'p\\nHIT\\nq\\n' > \"$(printf -- '--\\nb')\"; printf 'HIT\\nr\\n' > z",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "ctx",
+          "op": "search",
+          "pattern": "HIT",
+          "before": 1,
+          "after": 1,
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/--\nb",
+                  "line": 1,
+                  "text": "p",
+                  "is_match": false
+                },
+                {
+                  "path": "${ROOT}/--\nb",
+                  "line": 2,
+                  "text": "HIT",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/--\nb",
+                  "line": 3,
+                  "text": "q",
+                  "is_match": false
+                },
+                {
+                  "path": "${ROOT}/z",
+                  "line": 1,
+                  "text": "HIT",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/z",
+                  "line": 2,
+                  "text": "r",
+                  "is_match": false
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
       "id": "files.search.context-is-clamped-to-100",
       "description": "A before/after larger than 100 is 100.",
       "setup": [

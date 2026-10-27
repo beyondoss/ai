@@ -1450,6 +1450,9 @@ fn rg_args(q: &SearchQuery, in_git_repo: bool) -> Vec<String> {
     args.push("--glob".to_string());
     args.push(format!("!{}", super::GIT_DIR));
     push_context(&mut args, q);
+    // No `--` line between context groups. It is the one record with no NUL, so it cannot be told
+    // from a path that starts with `--` + newline; without it the stream is only path records.
+    args.push("--no-context-separator".to_string());
     // `-e` and `--` so a pattern or path beginning with `-` is never read as a flag.
     args.push("-e".to_string());
     args.push(q.pattern.clone());
@@ -1502,6 +1505,11 @@ fn posix_grep_args(q: &SearchQuery, gnu: bool) -> Vec<String> {
         args.push(format!("--exclude-dir={}", super::GIT_DIR));
     }
     push_context(&mut args, q);
+    // GNU grep only (busybox rejects it, and prints its `--` where `parse_colon_records` skips it): drop
+    // the NUL-less `--` group line, which is indistinguishable from a path starting `--` + newline.
+    if gnu {
+        args.push("--no-group-separator".to_string());
+    }
     args.push("-e".to_string());
     args.push(if q.literal {
         q.pattern.clone()
@@ -1596,32 +1604,14 @@ fn push_context(args: &mut Vec<String>, q: &SearchQuery) {
 /// path, and everything from the NUL to the next newline is `line`+`sep`+`text` (which cannot contain
 /// a newline, because that is what ended the line).
 ///
-/// Records with no NUL before the next newline are group separators (`--`, emitted between context
-/// blocks) and are skipped.
+/// There is no group-separator line to skip: the engines are run with it turned off (see `rg_args` and
+/// `posix_grep_args`), because `--` + newline is also a legal start of a path. Every record is
+/// `PATH NUL ...`, so a path beginning with `--` + newline round-trips.
 fn parse_records(stdout: &str) -> Vec<Hit> {
     let bytes = stdout.as_bytes();
     let mut hits = Vec::new();
     let mut i = 0usize;
     while i < bytes.len() {
-        // The group separator is matched *first*, against the exact bytes `--\n`. It has to be,
-        // because it is the only NUL-less record and every other way of recognizing it (looking for
-        // the next newline before the next NUL) would misfire on a path that legally contains a
-        // newline. Matching `--\n` rather than a bare `--` keeps a file actually *named* `--` — whose
-        // record is `--\0…` — on the path branch where it belongs.
-        let rest_bytes = &bytes[i..];
-        if rest_bytes.starts_with(b"--\n") {
-            i += 3;
-            continue;
-        }
-        // `rg --crlf` (which ShellFs passes) writes the separator as `--\r\n`. A path named `--\r`
-        // is still told apart: its record continues `--\r\0`, never `--\r\n`.
-        if rest_bytes.starts_with(b"--\r\n") {
-            i += 4;
-            continue;
-        }
-        if rest_bytes == b"--" || rest_bytes == b"--\r" {
-            break; // a trailing separator with no final newline
-        }
         let Some(nul) = memchr_from(bytes, i, b'\0') else {
             break; // no NUL anywhere in the remainder — nothing parseable is left
         };
@@ -1965,26 +1955,39 @@ mod tests {
     }
 
     #[test]
-    fn skips_the_group_separator_between_context_blocks() {
-        // Both engines emit a bare `--` between non-adjacent context blocks. It has no NUL, so it must
-        // be skipped whole — not mistaken for a path that swallows the next record.
-        let hits = parse_records("a.rs\u{0}1:one\n--\nb.rs\u{0}9:two\n");
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[1].path.to_string_lossy(), "b.rs");
-        assert_eq!(hits[1].line, 9);
+    fn a_path_starting_with_dashes_and_a_newline_is_not_a_group_separator() {
+        // The engines are run without a group separator, so `--` + newline can only be a path.
+        let hits = parse_records("--\nb\u{0}2-y\n--\r\nc\u{0}3:z\r\n");
+        let got: Vec<_> = hits
+            .iter()
+            .map(|h| (h.path.to_string_lossy().into_owned(), h.line))
+            .collect();
+        assert_eq!(got, [("--\nb".into(), 2), ("--\r\nc".into(), 3)]);
     }
 
     #[test]
-    fn skips_the_crlf_group_separator_rg_writes_under_crlf() {
-        let hits = parse_records("a.rs\u{0}1:one\r\n--\r\nb.rs\u{0}9:two\r\n");
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[1].path.to_string_lossy(), "b.rs");
-        assert_eq!(hits[1].line, 9);
+    fn engines_are_told_not_to_print_group_separators() {
+        let q = query("x", PathBuf::from("."), 10);
+        assert!(
+            rg_args(&q, true)
+                .iter()
+                .any(|a| a == "--no-context-separator")
+        );
+        assert!(
+            posix_grep_args(&q, true)
+                .iter()
+                .any(|a| a == "--no-group-separator")
+        );
+        assert!(
+            !posix_grep_args(&q, false)
+                .iter()
+                .any(|a| a == "--no-group-separator")
+        );
     }
 
     #[test]
     fn files_named_like_a_separator_are_not_skipped() {
-        let hits = parse_records("--\u{0}1:x\n--\r\u{0}2:y\n--\n--\u{0}3:--\n");
+        let hits = parse_records("--\u{0}1:x\n--\r\u{0}2:y\n--\u{0}3:--\n");
         let got: Vec<_> = hits
             .iter()
             .map(|h| (h.path.to_string_lossy().into_owned(), h.line))
