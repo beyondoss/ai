@@ -7,17 +7,28 @@ dependencies: it is `fetch` and web streams, on Node 18+ and Bun.
 ```ts
 import { Sandbox } from "@beyond.dev/sandbox";
 
-const sb = await Sandbox.connect({ url: process.env.EXEC_URL!, token: process.env.EXEC_TOKEN });
+const sb = await Sandbox.connect({
+  url: process.env.EXEC_URL!,
+  token: process.env.EXEC_TOKEN,
+});
 
 const { exitCode, stdoutText } = await sb.exec("uname", ["-sr"]); // a non-zero exit is a result, not an error
 await sb.files.write("/work/hello.txt", "hello\n"); // atomic, keeps the file's mode
 console.log(await sb.files.readText("/work/hello.txt"));
 
-const { hits } = await sb.files.search({ pattern: "hel+o", root: "/work", before: 1, after: 1 });
+const { hits } = await sb.files.search({
+  pattern: "hel+o",
+  root: "/work",
+  before: 1,
+  after: 1,
+});
 for await (const frame of sb.stream("sh", ["-c", "make"])) {
   if (frame.type === "stdout") process.stdout.write(frame.data); // break out and the sandbox kills the command
 }
-await sb.jobs.start("my-session", "dev1", { command: "npm", args: ["run", "dev"] }); // survives this process
+await sb.jobs.start("my-session", "dev1", {
+  command: "npm",
+  args: ["run", "dev"],
+}); // survives this process
 ```
 
 **Proven, not claimed.** The package ships a conformance driver (`dist/driver.mjs`) that runs the shared scenarios of
@@ -47,13 +58,13 @@ Transport  run, stream, nativeJobs, offers             raw exec; replace it with
 
 ### Files
 
-| call                                                        | notes                                                                                                                   |
-| ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `stat(path)`                                                | `null` if absent; follows symlinks; `mtime` in whole epoch seconds                                                      |
-| `read(path, { offset, max })`                               | windows of 96 KiB; a missing file is `not_found`, never an empty file                                                   |
-| `write(path, bytes \| string)`                              | temp file beside the target, `mv -f`; keeps mode; writes through symlinks; refuses a directory                         |
-| `writeIfUnchanged(path, data, expectedMtime)`               | `null` means "must not exist"; `conflict` otherwise. Two round trips, not a lock                                        |
-| `mkdir(path)`, `list(path, { includeHidden, limit })`       | `mkdir -p`; entries `{ name, kind, size }`                                                                              |
+| call                                                        | notes                                                                                                                                                      |
+| ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `stat(path)`                                                | `null` if absent; follows symlinks; `mtime` in whole epoch seconds                                                                                         |
+| `read(path, { offset, max })`                               | windows of 96 KiB; a missing file is `not_found`, never an empty file                                                                                      |
+| `write(path, bytes \| string)`                              | temp file beside the target, `mv -f`; keeps mode; writes through symlinks; refuses a directory                                                             |
+| `writeIfUnchanged(path, data, expectedMtime)`               | `null` means "must not exist"; `conflict` otherwise. Two round trips, not a lock                                                                           |
+| `mkdir(path)`, `list(path, { includeHidden, limit })`       | `mkdir -p`; entries `{ name, kind, size }`                                                                                                                 |
 | `search({ pattern, root, literal, ignoreCase, glob, ... })` | context, limits, long-line windows; `capabilities().searchEngine` says which engine ran, and the engines differ in regex dialect and `.gitignore` handling |
 
 ### Jobs
@@ -78,7 +89,10 @@ import { Sandbox, type Transport } from "@beyond.dev/sandbox";
 
 const overSsh: Transport = {
   async run(command, args, { stdin, timeoutMs } = {}) {
-    const { code, out, err } = await mySshClient.exec([command, ...args], { stdin, timeoutMs });
+    const { code, out, err } = await mySshClient.exec([command, ...args], {
+      stdin,
+      timeoutMs,
+    });
     return { exitCode: code, stdout: out, stderr: err };
   },
 };

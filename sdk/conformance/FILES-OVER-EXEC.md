@@ -164,7 +164,7 @@ one `run` with a 10 s timeout.
 | ------------- | ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------- |
 | `rg`          | `rg --version`                                                                                                           | exit 0                                         |
 | `grep_null`   | `grep -rnZ -e __cap_probe__ -- /dev/null`                                                                                | exit 0 or 1                                    |
-| `find_printf` | `find /dev/null -maxdepth 0 -printf %y`                                                                                  | exit 0 or 1                                    |
+| `find_printf` | `find /dev/null -maxdepth 0 -printf %y`                                                                                  | exit 0 or 1 **and** stdout is `c`              |
 | `stdin`       | `cat` with stdin `stdin-probe`                                                                                           | exit 0 **and** stdout is exactly `stdin-probe` |
 | `read_window` | `sh -c 'printf abc \| dd iflag=skip_bytes,count_bytes skip=1 count=1 status=none 2>/dev/null \| base64 -w0 2>/dev/null'` | exit 0 and stdout trimmed is `Yg==`            |
 
@@ -272,9 +272,12 @@ preplanted name cannot redirect the write. The scripts (C and D below) do the
 resolution, in order:
 
 1. a path starting with `-` is prefixed with `./`;
-2. if it is a symlink, resolve it: `readlink -f`, and if that yields nothing
-   (a dangling link) one `readlink` hop, joined to the link's directory when
-   relative; the prefix rule of 1 is applied again;
+2. if it is a symlink, resolve it: `readlink -f` when the target exists; for
+   a dangling link (or if that yields nothing) follow the chain one `readlink`
+   hop at a time, each relative target joined to the directory of the link it
+   came from, for at most 40 hops. A dangling link is never given to
+   `readlink -f`: busybox resolves its relative target against the working
+   directory instead of the link's. The prefix rule of 1 is applied again;
 3. a target that is a directory is refused (`Is a directory (os error 21)`, exit
    1), before the temp exists, because `mv -f` would move the temp _into_ it
    and report success;
@@ -606,13 +609,18 @@ exec dd if="$1" iflag=skip_bytes,count_bytes skip="$2" count="$3" status=none | 
 t="$1"
 case "$t" in -*) t="./$t" ;; esac
 if [ -L "$t" ]; then
-  r=$(readlink -f "$t" 2>/dev/null) || r=
+  r=
+  [ -e "$t" ] && r=$(readlink -f "$t" 2>/dev/null)
   if [ -z "$r" ]; then
-    r=$(readlink "$t") || exit 1
-    case "$r" in
-      /*) ;;
-      *) case "$t" in */*) r="${t%/*}/$r" ;; esac ;;
-    esac
+    r="$t" n=0
+    while [ -L "$r" ] && [ $n -lt 40 ]; do
+      l=$(readlink "$r") || exit 1
+      case "$l" in
+        /*) r="$l" ;;
+        *) case "$r" in */*) r="${r%/*}/$l" ;; *) r="$l" ;; esac ;;
+      esac
+      n=$((n + 1))
+    done
   fi
   t="$r"
   case "$t" in -*) t="./$t" ;; esac
@@ -651,13 +659,18 @@ exit 1
 t="$1"
 case "$t" in -*) t="./$t" ;; esac
 if [ -L "$t" ]; then
-  r=$(readlink -f "$t" 2>/dev/null) || r=
+  r=
+  [ -e "$t" ] && r=$(readlink -f "$t" 2>/dev/null)
   if [ -z "$r" ]; then
-    r=$(readlink "$t") || exit 1
-    case "$r" in
-      /*) ;;
-      *) case "$t" in */*) r="${t%/*}/$r" ;; esac ;;
-    esac
+    r="$t" n=0
+    while [ -L "$r" ] && [ $n -lt 40 ]; do
+      l=$(readlink "$r") || exit 1
+      case "$l" in
+        /*) r="$l" ;;
+        *) case "$r" in */*) r="${r%/*}/$l" ;; *) r="$l" ;; esac ;;
+      esac
+      n=$((n + 1))
+    done
   fi
   t="$r"
   case "$t" in -*) t="./$t" ;; esac
@@ -698,13 +711,18 @@ exit 1
 t="$1"
 case "$t" in -*) t="./$t" ;; esac
 if [ -L "$t" ]; then
-  r=$(readlink -f "$t" 2>/dev/null) || r=
+  r=
+  [ -e "$t" ] && r=$(readlink -f "$t" 2>/dev/null)
   if [ -z "$r" ]; then
-    r=$(readlink "$t") || exit 1
-    case "$r" in
-      /*) ;;
-      *) case "$t" in */*) r="${t%/*}/$r" ;; esac ;;
-    esac
+    r="$t" n=0
+    while [ -L "$r" ] && [ $n -lt 40 ]; do
+      l=$(readlink "$r") || exit 1
+      case "$l" in
+        /*) r="$l" ;;
+        *) case "$r" in */*) r="${r%/*}/$l" ;; *) r="$l" ;; esac ;;
+      esac
+      n=$((n + 1))
+    done
   fi
   t="$r"
   case "$t" in -*) t="./$t" ;; esac

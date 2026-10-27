@@ -202,7 +202,9 @@ export class Files {
       stdin: o.stdin
         ?? (stdin !== null && stdin.exitCode === 0
           && text(stdin.stdout) === "stdin-probe"),
-      findPrintf: o.findPrintf ?? ranOk(find),
+      // busybox `find` has no -printf: it prints usage and exits 1, which "exit 0 or 1" accepts.
+      // GNU prints the type of /dev/null, a character device.
+      findPrintf: o.findPrintf ?? (ranOk(find) && text(find!.stdout) === "c"),
       readWindow: window !== null && window.exitCode === 0
         && text(window.stdout).trim() === "Yg==",
       rg: hasRg,
