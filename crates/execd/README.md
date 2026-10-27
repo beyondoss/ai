@@ -1,20 +1,20 @@
 # beyond-execd
 
 **Give the agent its full toolset in any sandbox.** `execd` is one static binary that speaks the whole of the agent's exec
-protocol, v1.1 through v1.4. Put it in the image and the agent works in your sandbox as it does on your laptop: same tools,
+protocol. Put it in the image and the agent works in your sandbox as it does on your laptop: same tools,
 same schemas, same descriptions, so the prompt cache stays warm.
 
-A hand-written endpoint usually stops at v1.1 (one POST, one answer), where `bash` cannot stream, cannot tell a silent command
-from a hung one, and cannot kill. execd also speaks:
+A hand-written endpoint usually stops at one POST and one answer, where `bash` cannot stream, cannot tell a silent command
+from a hung one, and cannot kill. execd implements all of it, and a client sends what it needs without asking first:
 
-| version | what the agent gets                                                                                                                                                                                          |
-| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| v1.1    | one request, one answer, with stdin and exact output (`output_base64`: the command's bytes, not text)                                                                                                        |
-| v1.2    | streaming: the connection is the command's lifetime. `bash` shows progress, a silent command is handed back as a background job instead of blocking the turn, and closing the stream kills the process group |
-| v1.3    | sandbox-native jobs: jobs live in the endpoint, survive the agent replica moving, and their output is readable from an offset                                                                                |
-| v1.4    | job-end notify: the sandbox calls back when a kept job ends                                                                                                                                                  |
+| what      | what the agent gets                                                                                                                                                                               |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| one-shot  | one request, one answer, with stdin in and the command's bytes out: `stdin`, `stdout` and `stderr` are standard base64, so nothing is lost to text                                                |
+| streaming | the connection is the command's lifetime. `bash` shows progress, a silent command is handed back as a background job instead of blocking the turn, and closing the stream kills the process group |
+| jobs      | sandbox-native jobs: jobs live in the endpoint, survive the agent replica moving, and their output is readable from an offset                                                                     |
+| notify    | job-end notify: the sandbox calls back when a kept job ends                                                                                                                                       |
 
-**Proven:** v1.1 to v1.4 conformance 32/32 live on AWS Fargate and E2B; a 5 MB static binary; 2,372 KiB idle PSS and zero
+**Proven:** exec conformance 32/32 live on AWS Fargate and E2B; a 5 MB static binary; 2,372 KiB idle PSS and zero
 idle wakeups ([measurements](ARCHITECTURE.md#performance)); commands isolated from execd's token and memory under `EXECD_RUN_AS`;
 it fails closed without a token.
 
@@ -23,7 +23,7 @@ Daytona, Fargate, docker, Kubernetes or your own.
 
 ## Why you can trust it
 
-- **The agent's own verifier passes it, v1.1 through v1.4.** The conformance kit that grades every endpoint runs against the
+- **The agent's own verifier passes it.** The conformance kit that grades every endpoint runs against the
   real binary as a separate process, behind a bearer, with the spec's own timings: framing, heartbeats, the 64 KiB frame cap,
   leftover processes, jobs, and the full notify retry rules
   ([`tests/conformance.rs`](tests/conformance.rs)).
@@ -74,21 +74,20 @@ execd takes no command-line arguments, only environment variables, read once at 
 error that names the variable and the value (exit 2), and so is any argument: execd prints this list and exits. A boolean is
 `1`, `true`, `0` or `false`; an empty variable is unset.
 
-| variable                       | default                                            | meaning                                                                                                  |
-| ------------------------------ | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `EXECD_LISTEN`                 | `127.0.0.1:8080`                                   | address to listen on                                                                                     |
-| `EXECD_ROOT`                   | the current directory                              | where a command runs when its request names no directory                                                 |
-| `EXECD_HOME`                   | execd's own `HOME`; the user's with `EXECD_RUN_AS` | `HOME` for every command                                                                                 |
-| `EXECD_BEARER_FILE`            | unset                                              | a file holding the bearer token (mode 0600)                                                              |
-| `EXECD_BEARER`                 | unset                                              | the bearer token itself, a weaker way: execd re-execs to move it out of its environment                  |
-| `EXECD_INSECURE_NO_AUTH`       | `false`                                            | serve with no bearer on a non-loopback address; without it execd refuses to start                        |
-| `EXECD_RUN_AS`                 | unset                                              | run every command as `user`, `uid`, `user:group` or `uid:gid` with the user's groups; execd must be root |
-| `EXECD_KEPT_JOBS_SURVIVE_IDLE` | `false`                                            | advertise v1.4 job-end notify; say so only if this sandbox is not stopped when idle                      |
-| `EXECD_MAX_RESPONSE_BYTES`     | 16 MiB                                             | most output one v1.1 answer carries; match the agent's `--exec-max-response-bytes`                       |
-| `EXECD_JOBS_DIR`               | `$TMPDIR`, else `/tmp`                             | where a kept job's last 8 MiB of output is spooled; use a disk-backed directory                          |
-| `EXECD_LOG`                    | `info`                                             | `off`, `error`, `warn`, `info`, `debug` or `trace`                                                       |
-| `EXECD_WORKER_THREADS`         | `1`                                                | `1` one thread; `0` a worker per CPU; `N` workers                                                        |
-| `EXECD_IDLE_TIMEOUT_MS`        | `0` (off)                                          | close a connection with no request in flight for this long (a stream in flight is never cut)             |
+| variable                   | default                                            | meaning                                                                                                  |
+| -------------------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `EXECD_LISTEN`             | `127.0.0.1:8080`                                   | address to listen on                                                                                     |
+| `EXECD_ROOT`               | the current directory                              | where a command runs when its request names no directory                                                 |
+| `EXECD_HOME`               | execd's own `HOME`; the user's with `EXECD_RUN_AS` | `HOME` for every command                                                                                 |
+| `EXECD_BEARER_FILE`        | unset                                              | a file holding the bearer token (mode 0600)                                                              |
+| `EXECD_BEARER`             | unset                                              | the bearer token itself, a weaker way: execd re-execs to move it out of its environment                  |
+| `EXECD_INSECURE_NO_AUTH`   | `false`                                            | serve with no bearer on a non-loopback address; without it execd refuses to start                        |
+| `EXECD_RUN_AS`             | unset                                              | run every command as `user`, `uid`, `user:group` or `uid:gid` with the user's groups; execd must be root |
+| `EXECD_MAX_RESPONSE_BYTES` | 16 MiB                                             | most output one one-shot answer carries; match the agent's `--exec-max-response-bytes`                   |
+| `EXECD_JOBS_DIR`           | `$TMPDIR`, else `/tmp`                             | where a kept job's last 8 MiB of output is spooled; use a disk-backed directory                          |
+| `EXECD_LOG`                | `info`                                             | `off`, `error`, `warn`, `info`, `debug` or `trace`                                                       |
+| `EXECD_WORKER_THREADS`     | `1`                                                | `1` one thread; `0` a worker per CPU; `N` workers                                                        |
+| `EXECD_IDLE_TIMEOUT_MS`    | `0` (off)                                          | close a connection with no request in flight for this long (a stream in flight is never cut)             |
 
 No `EXECD_*` variable reaches the commands execd runs. The startup line logs execd's version.
 

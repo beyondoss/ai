@@ -77,10 +77,6 @@ class EndpointError(SandboxError):
     kind = "endpoint"
 
 
-class NotOffered(SandboxError):
-    kind = "not_offered"
-
-
 _BY_KIND: dict[str, type[SandboxError]] = {
     cls.kind: cls
     for cls in (
@@ -98,7 +94,6 @@ _BY_KIND: dict[str, type[SandboxError]] = {
         TransportError,
         ProtocolError,
         EndpointError,
-        NotOffered,
     )
 }
 

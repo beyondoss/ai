@@ -120,12 +120,6 @@ fn local_plain() {
 
 #[test]
 #[ignore = "needs built drivers and execd; run by `mise run test:differential` (the clients job)"]
-fn local_without_stdin() {
-    drive("local-no-stdin", 60, 0xd1ff_0002);
-}
-
-#[test]
-#[ignore = "needs built drivers and execd; run by `mise run test:differential` (the clients job)"]
 fn local_posix_grep() {
     drive("local-grep", 60, 0xd1ff_0003);
 }

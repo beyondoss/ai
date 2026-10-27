@@ -1,4 +1,4 @@
-//! v1.4: job-end notify. When to call back is the kernel's to say ([`exec_notify::step`], the one
+//! notify: job-end notify. When to call back is the kernel's to say ([`exec_notify::step`], the one
 //! pure function every endpoint shares); this side makes the requests and keeps the timers.
 //!
 //! **Bounds.** At most one attempt per job in flight (N16) and one retry timer per job: two tasks
@@ -18,8 +18,8 @@ use crate::Ctx;
 use crate::jobs::{Job, JobCell, Key};
 use crate::proc::locked;
 
-/// What an endpoint that offers v1.4 adds to its probe answer.
-pub const NOTIFY_VERSION: &str = "v1.4";
+/// What an endpoint that offers notify adds to its probe answer.
+pub const NOTIFY_VERSION: &str = "notify";
 
 /// How long one attempt may take before it is abandoned as a connection error (N16).
 pub const ATTEMPT_TIMEOUT: Duration = Duration::from_millis(exec_notify::ATTEMPT_TIMEOUT_MS);

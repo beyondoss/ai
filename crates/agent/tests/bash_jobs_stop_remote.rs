@@ -73,11 +73,10 @@ fn stream_ended(end: Option<(StreamEnd, Instant)>) -> bool {
 fn a_transcript_switch_stops_remote_jobs_promptly_and_says_so() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    // A v1.2-only sandbox: the jobs run on plain exec commands, whose streams the mock records.
+    // A streaming sandbox: the jobs run on plain exec commands, whose streams the mock records.
     let mock = rt.block_on(ExecMock::start_with(
         dir.path(),
         MockOptions {
-            jobs: false,
             ..MockOptions::default()
         },
     ));
@@ -149,11 +148,10 @@ fn a_transcript_switch_stops_remote_jobs_promptly_and_says_so() {
 fn the_end_of_a_run_stops_remote_jobs_without_waiting_out_each_kill() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    // A v1.2-only sandbox: the jobs run on plain exec commands, whose streams the mock records.
+    // A streaming sandbox: the jobs run on plain exec commands, whose streams the mock records.
     let mock = rt.block_on(ExecMock::start_with(
         dir.path(),
         MockOptions {
-            jobs: false,
             ..MockOptions::default()
         },
     ));
@@ -214,7 +212,7 @@ fn the_end_of_a_run_stops_remote_jobs_without_waiting_out_each_kill() {
         assert!(Instant::now() < deadline, "the jobs are still running");
         std::thread::sleep(Duration::from_millis(20));
     }
-    // Inline, each v1.2 kill waited out its 2 s bound: two jobs took over 4 s.
+    // Inline, each streaming kill waited out its 2 s bound: two jobs took over 4 s.
     assert!(
         took < Duration::from_millis(2500),
         "stopping two remote jobs took {} ms",

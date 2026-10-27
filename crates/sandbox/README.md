@@ -1,6 +1,6 @@
 # beyond-sandbox
 
-**Run commands, edit files and keep jobs in any sandbox, from Rust.** One client for the exec protocol (v1.1 to v1.4),
+**Run commands, edit files and keep jobs in any sandbox, from Rust.** One client for the exec protocol,
 with the file and job helpers an agent needs built on top of it. It is the code the Beyond agent itself runs in a
 sandbox, extracted so anything else can use it.
 
@@ -16,8 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         TokenSource::command(["mint-exec-token"]),
     )
     .await?;
-    let uname = sb.exec("uname", ["-a"]).run().await?; // stdout and stderr are bytes
-    assert!(uname.exact); // ...and these are exactly what the command wrote
+    let uname = sb.exec("uname", ["-a"]).run().await?; // stdout and stderr are the bytes the command wrote
     println!("{}", uname.stdout_text());
     sb.files()
         .write_bytes("/work/hello.txt".as_ref(), b"hi\n".to_vec())
@@ -38,19 +37,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## What is proven
 
-- **One shared conformance matrix passes: 3,770 checks, 0 failures,** across ten backend profiles (a conforming `execd`
-  with and without bearer, no stdin, `rg` / GNU `grep` / busybox `grep`, an HTTP v1 and a v1.1 endpoint, native and
-  baseline jobs). The scenarios are the ones in [`sdk/conformance`](../../sdk/conformance), which the TypeScript and
-  Python clients are held to as well.
+- **One shared conformance matrix passes: 2,245 checks, 0 failures,** across four backend profiles (a conforming `execd` with
+  and without bearer, `rg` / GNU `grep` / busybox `grep`) plus a transport that is nothing but `sh`. The scenarios are the
+  ones in [`sdk/conformance`](../../sdk/conformance), which the TypeScript, Python and MCP clients are held to as well.
 - **The layers compose.** The same files, jobs, helpers and bulk scenarios run over a transport that is nothing but
-  `sh` on this host (written inside the test, no HTTP anywhere): 346 checks pass, 21 skipped, identical to the HTTP
-  client's counts on the same suites ([`tests/sdk_conformance.rs`](tests/sdk_conformance.rs)).
+  `sh` on this host (written inside the test, no HTTP anywhere): 374 checks pass, 15 skipped
+  ([`tests/sdk_conformance.rs`](tests/sdk_conformance.rs)).
 - **A user-written helper needs only `run`.** A `git status` helper written on raw `Exec` runs unchanged over any
   transport ([`tests/sandbox_surface.rs`](tests/sandbox_surface.rs)).
 - **Token renewal is exactly one retry:** a `401` asks the source once for a new token and repeats that request once;
   eight concurrent requests that all hit the `401` share one renewal; a second `401` is final
   ([`tests/token_refresh.rs`](tests/token_refresh.rs)).
-- **Parsers are fuzzed:** search records, `stat`, listings, base64, v1.2 frames and v1.3 job answers
+- **Parsers are fuzzed:** search records, `stat`, listings, base64, streaming frames and jobs job answers
   ([`fuzz/`](fuzz), four minutes per target in CI).
 
 ## Three layers, each usable alone
@@ -62,14 +60,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | 3. surface | one object that owns all three                | `Sandbox::connect(url, token)`, `.exec(..)`, `.files()`, `.jobs()`, `.raw()`         |
 
 Write a transport for anything that can run a command (a vendor SDK, a test double) by implementing `Exec::run`; every
-other method has a safe default (`Unsupported`, or a deadline), and the helpers probe what the transport can do.
+other method has a safe default (`Unsupported`, or a deadline).
 
-**Raw output is bytes.** `sb.exec(..).run()` returns stdout and stderr as `Vec<u8>` and an `exact` flag. Over an endpoint
-that honours `output_base64` (`execd` does) or streams (v1.2) the bytes are exactly what the command wrote; a `tar`, a
-`gzip` or a `cat` of a binary comes back intact. A plain v1.1 endpoint can only answer text (it already replaced invalid
-UTF-8 with U+FFFD), so the result carries that text as UTF-8 and `exact: false`: the client does not pass text off as
-bytes. A transport of your own returns its bytes by implementing `Exec::run_exact`; the default wraps `run` and is
-`exact: false`.
+**Raw output is bytes.** `sb.exec(..).run()` returns the exit code and stdout and stderr as `Vec<u8>`: exactly what the
+command wrote. The endpoint carries them as base64, so a `tar`, a `gzip` or a `cat` of a binary comes back intact, and
+there is no flag to ask for it. A transport of your own returns its bytes in `ExecResult`; `stdout_text()` is the one
+place they become text.
 
 ## Protocol and conformance
 

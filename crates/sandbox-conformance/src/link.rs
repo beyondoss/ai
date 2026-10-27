@@ -131,7 +131,6 @@ pub struct ProcessConnector {
     pub cmd: String,
     pub url: String,
     pub bearer: Option<String>,
-    pub jobs_root: String,
     pub caps: Option<Value>,
 }
 
@@ -146,10 +145,6 @@ impl Connector for ProcessConnector {
         env.insert(
             "CONFORMANCE_BEARER".to_string(),
             bearer.unwrap_or_else(|| self.bearer.clone()),
-        );
-        env.insert(
-            "CONFORMANCE_JOBS_ROOT".to_string(),
-            Some(self.jobs_root.clone()),
         );
         env.insert(
             "CONFORMANCE_CAPS".to_string(),

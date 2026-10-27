@@ -199,7 +199,7 @@ description = "Process-level Tokio runtime A/B: current_thread vs multi_thread u
 run = "cargo bench -p beyond-agent --bench serve_runtime"
 
 [tasks."bench:execd"]
-description = "execd vs the baseline exec endpoint, A/B over HTTP on loopback (v1.1 round trip, stream throughput, first frame, RSS, kill-on-disconnect). Set EXEC_BENCH_A to a baseline `beyond-ai-demo` binary built from the commit before execd."
+description = "execd vs the baseline exec endpoint, A/B over HTTP on loopback (one-shot round trip, stream throughput, first frame, RSS, kill-on-disconnect). Set EXEC_BENCH_A to a baseline `beyond-ai-demo` binary built from the commit before execd."
 run = "cargo bench -p beyond-execd --bench exec_compare"
 
 [tasks."bench:execd:sandbox"]
@@ -297,13 +297,13 @@ env "$cc=musl-gcc" "$ln=musl-gcc" cargo build -q -p beyond-execd --target "$t"
 """
 
 [tasks."test:clients"]
-description = "The client conformance matrix: every driver in sdk/conformance/drivers.toml against every backend (local, alpine, debian-runas, readonly, tinydisk, fault). Needs docker for the container backends. BACKENDS overrides the list; extra arguments go to sandbox-matrix (e.g. --filter 'files.*', --verbose)."
+description = "The client conformance matrix: every driver in sdk/conformance/drivers.toml against every backend (local, alpine, debian-runas, readonly, tinydisk). Needs docker for the container backends. BACKENDS overrides the list; extra arguments go to sandbox-matrix (e.g. --filter 'files.*', --verbose)."
 depends = ["build:execd-static"]
 run = """
 set -e
 cargo build -q -p beyond-execd -p beyond-sandbox-conformance
 backends=""
-for b in ${BACKENDS:-local alpine debian-runas readonly tinydisk fault}; do backends="$backends --backend $b"; done
+for b in ${BACKENDS:-local alpine debian-runas readonly tinydisk}; do backends="$backends --backend $b"; done
 mkdir -p target/sandbox-matrix
 target/debug/sandbox-matrix --registry sdk/conformance/drivers.toml $backends \
   --report target/sandbox-matrix/report.json "$@"

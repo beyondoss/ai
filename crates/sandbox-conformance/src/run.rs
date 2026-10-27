@@ -156,17 +156,6 @@ async fn unmet(req: &Value, be: &Backend) -> Option<String> {
                     return Some(format!("requires auth={want}"));
                 }
             }
-            "jobs" => {
-                let have = be.caps["jobs"].as_str().unwrap_or("none");
-                let ok = match want.as_str() {
-                    Some("any") => have != "none",
-                    Some(w) => w == have,
-                    None => false,
-                };
-                if !ok {
-                    return Some(format!("requires jobs={want}, backend has {have}"));
-                }
-            }
             "search_engine" => {
                 let have = be.caps["search_engine"].clone();
                 let ok = match want {

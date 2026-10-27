@@ -225,7 +225,7 @@ pub async fn job_ended_after_takeover(kind: Kind, history: &Path) -> Outcome {
                 return Err(format!("{session} opened on {a}, not its hashed target r1"));
             }
             let proof = nth_answer(fleet, &session, 200, 1, Duration::from_secs(20)).await?;
-            let native = SANDBOXES[i].1;
+            let native = true;
             let keeps_before = native.then(|| native_keep_bodies(exec, &session).len());
 
             // A dies outright; the session moves to B.

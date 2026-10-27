@@ -2,9 +2,9 @@
 
 A helper (``_fs``, ``_jobs``) is written once as a generator that yields :class:`Run` and receives
 the :class:`~beyond_sandbox.ExecResult` back. The sync driver answers with ``transport.run``, the
-async one awaits it. So the control flow of every fallback rung exists exactly once, and only the I/O
-differs. Jobs add :class:`Call`, :class:`Follow` and :class:`Offer` (native v1.3 operations),
-:class:`Sleep` (the baseline's poll) and :class:`Emit` (an event for the caller of ``follow``).
+async one awaits it. So the control flow of every helper exists exactly once, and only the I/O
+differs. Jobs add :class:`Call` and :class:`Follow` (job operations) and :class:`Emit` (an event for
+the caller of ``follow``).
 
 A transport error is thrown into the generator at the ``yield``, so cleanup (``except``/``finally``)
 works as it would in straight-line code.
@@ -14,10 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import time
 from dataclasses import dataclass
 from typing import (
-    TYPE_CHECKING,
     Any,
     AsyncGenerator,
     Awaitable,
@@ -29,13 +27,8 @@ from typing import (
     Union,
 )
 
-from ._wire import JobOffer
-from .errors import NotOffered, SandboxError
+from .errors import SandboxError
 from .models import ExecResult, JobEnd
-
-if TYPE_CHECKING:
-    from .atransport import AsyncTransport
-    from .transport import Transport
 
 T = TypeVar("T")
 
@@ -49,11 +42,6 @@ class Run:
 
 
 @dataclass(frozen=True, slots=True)
-class Sleep:
-    seconds: float
-
-
-@dataclass(frozen=True, slots=True)
 class Emit:
     """Something for the caller of a streaming helper (an event of a followed job)."""
 
@@ -62,7 +50,7 @@ class Emit:
 
 @dataclass(frozen=True, slots=True)
 class Call:
-    """A native job operation (v1.3); answered with its parsed JSON."""
+    """A job operation; answered with its parsed JSON."""
 
     job: dict[str, Any]
     command: str = "true"
@@ -77,53 +65,35 @@ class Follow:
     job: dict[str, Any]
 
 
-@dataclass(frozen=True, slots=True)
-class Offer:
-    """Ask the transport what it offers for jobs; answered with a :class:`~._wire.JobOffer`."""
-
-
-Effect = Union[Run, Sleep, Emit, Call, Follow, Offer]
+Effect = Union[Run, Emit, Call, Follow]
 Op = Generator[Effect, Any, T]
 
 #: Marks the end of a driven op's items; carries its result.
 _DONE = object()
-#: What a :class:`Sleep` or :class:`Emit` effect is answered with.
+#: What an :class:`Emit` effect is answered with.
 _NOTHING = ExecResult(0, b"", b"")
 
 
-def _no_native(what: str) -> NotOffered:
-    return NotOffered(f"this transport has no native {what}")
-
-
-def drive_iter(op: Op[T], transport: Transport) -> Iterator[Any]:
+def drive_iter(op: Op[T], transport: Any) -> Iterator[Any]:
     """Run ``op`` on a sync transport, yielding each emitted item; the last is ``(_DONE, result)``."""
     try:
         effect = next(op)
         while True:
             try:
                 if isinstance(effect, Run):
-                    answer: Any = getattr(transport, "run_text", transport.run)(
+                    answer: Any = transport.run(
                         effect.command,
                         effect.args,
                         timeout_ms=effect.timeout_ms,
                         stdin=effect.stdin,
                     )
-                elif isinstance(effect, Sleep):
-                    time.sleep(effect.seconds)
-                    answer = _NOTHING
                 elif isinstance(effect, Emit):
                     yield effect.item
                     answer = _NOTHING
                 elif isinstance(effect, Call):
-                    call = getattr(transport, "job_call", None)
-                    if call is None:
-                        raise _no_native("jobs")
-                    answer = call(effect.job, effect.command, effect.args, effect.cwd)
+                    answer = transport.job_call(effect.job, effect.command, effect.args, effect.cwd)
                 elif isinstance(effect, Follow):
-                    open_stream = getattr(transport, "job_stream", None)
-                    if open_stream is None:
-                        raise _no_native("jobs")
-                    stream = open_stream(effect.job)
+                    stream = transport.job_stream(effect.job)
                     try:
                         answer = None
                         for frame in stream:
@@ -134,8 +104,7 @@ def drive_iter(op: Op[T], transport: Transport) -> Iterator[Any]:
                     finally:
                         stream.close()
                 else:
-                    offer = getattr(transport, "job_offer", None)
-                    answer = offer() if offer is not None else JobOffer()
+                    raise AssertionError(f"unknown effect {effect!r}")
             except SandboxError as e:
                 effect = op.throw(e)
                 continue
@@ -146,7 +115,7 @@ def drive_iter(op: Op[T], transport: Transport) -> Iterator[Any]:
         op.close()
 
 
-def drive(op: Op[T], transport: Transport) -> T:
+def drive(op: Op[T], transport: Any) -> T:
     for item in drive_iter(op, transport):
         if isinstance(item, tuple) and item and item[0] is _DONE:
             return item[1]  # type: ignore[no-any-return]
@@ -154,7 +123,7 @@ def drive(op: Op[T], transport: Transport) -> T:
 
 
 async def adrive_emit(
-    op: Op[T], transport: AsyncTransport, emit: Callable[[Any], Awaitable[None]] | None = None
+    op: Op[T], transport: Any, emit: Callable[[Any], Awaitable[None]] | None = None
 ) -> T:
     """Run ``op`` on an async transport; each emitted item is awaited into ``emit``."""
     try:
@@ -162,29 +131,22 @@ async def adrive_emit(
         while True:
             try:
                 if isinstance(effect, Run):
-                    answer: Any = await getattr(transport, "run_text", transport.run)(
+                    answer: Any = await transport.run(
                         effect.command,
                         effect.args,
                         timeout_ms=effect.timeout_ms,
                         stdin=effect.stdin,
                     )
-                elif isinstance(effect, Sleep):
-                    await asyncio.sleep(effect.seconds)
-                    answer = _NOTHING
                 elif isinstance(effect, Emit):
                     if emit is not None:
                         await emit(effect.item)
                     answer = _NOTHING
                 elif isinstance(effect, Call):
-                    call = getattr(transport, "job_call", None)
-                    if call is None:
-                        raise _no_native("jobs")
-                    answer = await call(effect.job, effect.command, effect.args, effect.cwd)
+                    answer = await transport.job_call(
+                        effect.job, effect.command, effect.args, effect.cwd
+                    )
                 elif isinstance(effect, Follow):
-                    open_stream = getattr(transport, "job_stream", None)
-                    if open_stream is None:
-                        raise _no_native("jobs")
-                    stream = await open_stream(effect.job)
+                    stream = await transport.job_stream(effect.job)
                     try:
                         answer = None
                         async for frame in stream:
@@ -196,8 +158,7 @@ async def adrive_emit(
                     finally:
                         await stream.aclose()
                 else:
-                    offer = getattr(transport, "job_offer", None)
-                    answer = await offer() if offer is not None else JobOffer()
+                    raise AssertionError(f"unknown effect {effect!r}")
             except SandboxError as e:
                 effect = op.throw(e)
                 continue
@@ -208,7 +169,7 @@ async def adrive_emit(
         op.close()
 
 
-async def adrive(op: Op[T], transport: AsyncTransport) -> T:
+async def adrive(op: Op[T], transport: Any) -> T:
     return await adrive_emit(op, transport)
 
 
@@ -216,7 +177,7 @@ async def adrive(op: Op[T], transport: AsyncTransport) -> T:
 EVENT_QUEUE = 16
 
 
-async def aiter_events(op: Op[T], transport: AsyncTransport) -> AsyncGenerator[Any, None]:
+async def aiter_events(op: Op[T], transport: Any) -> AsyncGenerator[Any, None]:
     """Run ``op`` and yield its emitted items as they happen; the last is ``(_DONE, result)``."""
     queue: asyncio.Queue[Any] = asyncio.Queue(EVENT_QUEUE)
 

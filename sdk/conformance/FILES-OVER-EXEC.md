@@ -25,8 +25,7 @@ helpers    files, search, jobs, bulk copy      may use layer 1 only
 transport  exec: one-shot, stream, jobs        may use nothing of this spec
 ```
 
-1. **Transport.** A raw `exec` call: one-shot (v1.1), streaming (v1.2) and the
-   job calls (v1.3). It is a plain interface (command, args, cwd, timeout,
+1. **Transport.** A raw `exec` call: one-shot, streaming and the job calls. It is a plain interface (command, args, cwd, timeout,
    stdin in; exit status and bytes out) that a user MUST be able to replace
    with their own implementation (an SSH session, a vendor SDK, a test double).
    The HTTP implementation is the default, not the definition.
@@ -62,19 +61,19 @@ or fails with a transport-level error (section 3.2).
   inert argument.
 - Helpers send no `cwd`: relative paths are the endpoint's business, and
   helpers SHOULD be given absolute paths.
-- `stdin` is bytes. It is sent only by `write` and only after the stdin probe
-  proved the endpoint delivers it.
-- `stdout` and `stderr` are **text**. Over the one-shot envelope (v1.1) they are
-  JSON strings, so bytes that are not valid UTF-8 reach the client as U+FFFD,
-  decided by the endpoint. A helper that must move arbitrary bytes MUST encode
-  them (base64) inside the command.
-- `code` is the exit status. Over v1.1 a command killed by signal `S` has
+- `stdin` is bytes. It is sent by `write`, and the endpoint always delivers it.
+- `stdout` and `stderr` are **bytes**: exactly what the command wrote, carried
+  as standard base64 on the wire. A helper that wants text decodes the bytes in
+  one place (UTF-8, invalid sequences replaced by U+FFFD); a helper that must
+  move arbitrary bytes keeps them as bytes (the `read` script still encodes
+  its file in base64 inside the command, so its stdout is text by design).
+- `code` is the exit status. A command killed by signal `S` has
   `code` `128+S`, and a command that hit `timeout_ms` has `code` 124 with stderr
   ending `command exceeded its timeout`. A command that cannot be started (or
   whose `cwd` is missing) has `code` 127 and the reason on stderr. None of
   these is a transport error.
 - Timeouts: helpers use 120 s per command (`timeout_ms` 120000) and 10 s for
-  capability probes.
+  the environment probe.
 
 On the wire (the HTTP transport) a call is one `POST` of
 
@@ -83,15 +82,18 @@ On the wire (the HTTP transport) a call is one `POST` of
   "command": "sh",
   "args": ["-c", "...", "sh", "/a"],
   "timeout_ms": 120000,
-  "stdin_base64": "..."
+  "stdin": "..."
 }
 ```
 
-(`cwd` and `stdin_base64` only when present) with every configured header,
-among them `Authorization: Bearer <token>`, and the answer
-`{"exit_code": N, "stdout": "...", "stderr": "..."}`. The client reads the body
-incrementally and stops at a cap (default 16 MiB): over the cap the call fails
-with `too_large` and says the command ran. The request deadline is
+(`cwd` and `stdin` only when present; `stdin` is standard base64) with every
+configured header, among them `Authorization: Bearer <token>`, and the answer
+`{"exit_code": N, "stdout": "<base64>", "stderr": "<base64>"}` (standard base64
+with padding, the empty string for no output). The client reads the body
+incrementally and stops at a cap (default 16 MiB of decoded `stdout` plus
+`stderr`): over the cap the call fails with `too_large` and says the command ran.
+A `stdout` or `stderr` that is missing or not standard base64 is a `protocol`
+error, never empty output. The request deadline is
 `timeout_ms` plus 30 s of grace so that the endpoint's own timeout report wins.
 
 ## 3. Errors
@@ -117,24 +119,22 @@ situations.
 | `transport`         | the endpoint could not be reached, or a stream broke                        |
 | `protocol`          | the endpoint answered with something that is not the protocol               |
 | `endpoint`          | the endpoint refused the request with another status (`detail` names it)    |
-| `not_offered`       | the endpoint lacks the capability (it does not stream; it has no jobs)      |
 | `invalid_request`   | the caller's arguments cannot form a request; nothing was sent              |
 
 ### 3.2 From the transport
 
-| what happened                                                       | kind          |
-| ------------------------------------------------------------------- | ------------- |
-| connection refused, reset, DNS failure                              | `transport`   |
-| the request deadline passed                                         | `timeout`     |
-| HTTP 401 or 403                                                     | `auth`        |
-| HTTP 422 whose body says the output exceeded the cap, or client cap | `too_large`   |
-| any other non-2xx                                                   | `endpoint`    |
-| 200 whose body is not the expected JSON                             | `protocol`    |
-| a v1.2 stream ends without its final frame, or a `{"error"}` frame  | `transport`   |
-| a stream asked of an endpoint that did not prove v1.2               | `not_offered` |
+| what happened                                                       | kind        |
+| ------------------------------------------------------------------- | ----------- |
+| connection refused, reset, DNS failure                              | `transport` |
+| the request deadline passed                                         | `timeout`   |
+| HTTP 401 or 403                                                     | `auth`      |
+| HTTP 422 whose body says the output exceeded the cap, or client cap | `too_large` |
+| any other non-2xx                                                   | `endpoint`  |
+| 200 whose body is not the expected JSON                             | `protocol`  |
+| a stream ends without its final frame, or a `{"error"}` frame       | `transport` |
 
 A transport-level failure is never a capability: see
-[probe errors](#52-probe-errors).
+[probe errors](#42-probe-errors).
 
 ### 3.3 From a command that ran and failed
 
@@ -159,41 +159,36 @@ The patterns cover GNU coreutils, busybox, dash and bash. (The `read` script
 prints the three `(os error N)` wordings itself so the text does not depend on
 the sandbox's tools.)
 
-## 4. Capability probe
+## 4. Environment probe
 
-A helper client probes the sandbox once and records the results. Each probe is
-one `run` with a 10 s timeout.
+A helper client looks at the sandbox's tools once, in **one** round trip, the
+first time an operation needs to know (a write needs nothing and never probes).
+The result is cached per sandbox. The probe is a single `run` with a 10 s
+timeout of script F of the appendix, `sh -c PROBE_SCRIPT sh`, whose stdout has
+one line per capability the sandbox has:
 
-| capability    | command                                                                                                                  | present when                                   |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------- |
-| `rg`          | `rg --version`                                                                                                           | exit 0                                         |
-| `grep_null`   | `grep -rnZ -e __cap_probe__ -- /dev/null`                                                                                | exit 0 or 1                                    |
-| `find_printf` | `find /dev/null -maxdepth 0 -printf %y`                                                                                  | stdout is exactly `c`                          |
-| `stdin`       | `cat` with stdin `stdin-probe`                                                                                           | exit 0 **and** stdout is exactly `stdin-probe` |
-| `read_window` | `sh -c 'printf abc \| dd iflag=skip_bytes,count_bytes skip=1 count=1 status=none 2>/dev/null \| base64 -w0 2>/dev/null'` | exit 0 and stdout trimmed is `Yg==`            |
+| line          | capability                                         | present when the script finds                              |
+| ------------- | -------------------------------------------------- | ---------------------------------------------------------- |
+| `rg`          | ripgrep                                            | `rg --version` exits 0                                     |
+| `grep_null`   | `grep -Z`                                          | `grep -rnZ -e __cap_probe__ -- /dev/null` exits 0 or 1     |
+| `find_printf` | `find -printf`                                     | `find /dev/null -maxdepth 0 -printf %y` prints exactly `c` |
+| `read_window` | `dd iflag=skip_bytes,count_bytes` and `base64 -w0` | `printf abc \| dd ... \| base64 -w0` prints `Yg==`         |
 
-Derived: the **search engine** is `rg` if `rg`; otherwise `grep` (GNU grep:
-`grep_null`); otherwise `busybox-grep`.
-
-`stdin` is proven by an echo, never assumed. A v1 endpoint ignores
-`stdin_base64`, runs `cat` on empty input and answers with empty stdout, so the
-probe fails and writes fall back to chunks. Writing through such an endpoint as
-though stdin arrived would replace the file with an empty one.
+A capability whose line is absent is absent. Derived: the **search engine** is
+`rg` if `rg`; otherwise `grep` (GNU grep: `grep_null`); otherwise
+`busybox-grep`.
 
 ### 4.1 What a client reports
 
-`capabilities` (DRIVER.md) reports `stdin`, `stream`, `jobs`
-(`native`, `baseline` or `none`), `search_engine`, `find_printf` and
-`read_window`. `stream` is true only when the v1.2 probe of the exec spec
-succeeded.
+`capabilities` (DRIVER.md) reports `search_engine`, `find_printf` and
+`read_window`.
 
 ### 4.2 Probe errors
 
-If a probe request fails at the transport level (unreachable, `auth`,
+If the probe request fails at the transport level (unreachable, `auth`,
 `endpoint`, `timeout`), the client MUST report that error from the operation
-that needed the probe, and MUST NOT cache a capability set learned from failed
-probes. (The reference `ShellFs::connect` fails with the runner's error when a
-probe request fails; only a probe that ran and answered "absent" means absent.)
+that needed the probe, and MUST NOT cache a capability set learned from a failed
+request. Only a probe that ran and left a line out means absent.
 
 Probe overrides for testing are in DRIVER.md (`CONFORMANCE_CAPS`).
 
@@ -282,7 +277,7 @@ resolves to** (so the `mv` is a rename within one filesystem), named
 write. The name is therefore always 21 bytes, and a target whose own name is
 anything up to `NAME_MAX` (255 bytes) can be written; a name derived from the
 target's (`NAME.tmp.SUFFIX`) overflowed `NAME_MAX` for names over about 230
-bytes. The scripts (C and D below) do the
+bytes. The script (C below) does the
 resolution, in order:
 
 1. a path starting with `-` is prefixed with `./`;
@@ -323,30 +318,17 @@ through symlinks (the link stays a link; a dangling link's target is created),
 creates a new file with the default mode, and never leaves a temp behind on a
 failure the script sees.
 
-**With stdin** (the `stdin` probe passed): one command,
-`sh -c WRITE_STDIN_SCRIPT sh TARGET SUFFIX SIZE` with the whole content as
-stdin (script C). The size check is what turns a lost stdin into a failed
-write instead of an empty file: a probe is one sample, and an endpoint behind a
-load balancer mid-rollout can pass it on one replica and answer the write from
-another.
+One command, `sh -c WRITE_STDIN_SCRIPT sh TARGET SUFFIX SIZE` with the whole
+content as stdin (script C). The size check is what turns a lost stdin (a
+transport that closes the command's stdin, as `docker exec` does without `-i`)
+into a failed write instead of an empty file.
 
-**Without stdin**: one command per **48 KiB (49152 raw bytes)** chunk, each
-`sh -c WRITE_CHUNK_SCRIPT sh TARGET SUFFIX CHUNK_B64 MODE COMMIT SIZE` (script
-D) where `CHUNK_B64` is the chunk in standard base64 with padding (at most 64
-KiB of text, half of Linux's 128 KiB single-argument limit), `MODE` is `new`
-for the first chunk and `append` after, `COMMIT` is `commit` for the last chunk
-and the empty string otherwise, and `SIZE` the total byte count. The temp is
-created by the `new` command and the commit does the size check and the `mv`.
-An empty file is one empty chunk (so the temp is still created and committed).
-Chunks are sent sequentially.
-
-**On failure** (non-zero exit of any command, or a transport error part-way):
+**On failure** (a non-zero exit, or a transport error):
 the client sends one best-effort cleanup command,
-`sh -c REMOVE_TEMP_SCRIPT sh TARGET SUFFIX` (script E; its result is ignored),
+`sh -c REMOVE_TEMP_SCRIPT sh TARGET SUFFIX` (script D; its result is ignored),
 and then reports the failure: a transport error as it is, otherwise
-`write PATH: LINE` classified by section 3.3. Stdin and chunk scripts both
-remove the temp themselves on failures they see; the cleanup covers the ones
-they cannot (a timeout between chunks).
+`write PATH: LINE` classified by section 3.3. The script removes the temp itself on failures it sees; the cleanup covers the
+ones it cannot (a timeout).
 
 Further rules:
 
@@ -472,7 +454,7 @@ where for a non-literal pattern `PATTERN` is rewritten for CRLF files (below).
 
 **Git root probe** (`rg` only): `--no-require-git` is added unless the root or
 an ancestor holds a `.git` entry, decided **in the sandbox** (never from the
-client's filesystem): `sh -c GIT_SCRIPT sh ROOT` (script F), exit 0 meaning
+client's filesystem): `sh -c GIT_SCRIPT sh ROOT` (script E), exit 0 meaning
 inside a repository, cached per root. A failed probe counts as "not inside".
 It makes `.gitignore` honored in a plain directory too.
 
@@ -638,11 +620,13 @@ and may report binary files differently. A client MUST report the engine in use
 
 ## 6. Jobs
 
-Jobs are layer 1, specified by the exec protocol (v1.3 natively; the
-**baseline** over plain commands where the endpoint has no native jobs; the
-baseline's layout and supervisor are in `crates/sandbox/src/exec_endpoint/jobs.rs`).
-A client MUST support native jobs and SHOULD support the baseline; the driver
-ops are in DRIVER.md. Behaviours the scenarios pin, for both:
+Jobs are layer 1, specified by the exec protocol ("Sandbox jobs" in the module
+doc of `crates/sandbox/src/exec_endpoint.rs`): the endpoint runs them, and a
+client calls the job operations. (A transport that is not an exec endpoint, a
+template such as `ssh` or `docker exec`, has no jobs of its own; the Rust crate
+builds them there from plain commands, in
+`crates/sandbox/src/exec_endpoint/jobs.rs`. That is not part of this contract.)
+The driver ops are in DRIVER.md. Behaviours the scenarios pin:
 
 - a job id is 1 to 32 characters of `[0-9a-z]`, chosen by the caller, unique
   within its scope; a client rejects anything else before sending (`invalid_request`);
@@ -757,61 +741,7 @@ rm -f "$tmp"
 exit 1
 ```
 
-### D. WRITE_CHUNK_SCRIPT (`$1` target, `$2` suffix, `$3` chunk base64, `$4` new|append, `$5` commit or empty, `$6` size)
-
-```sh
-t="$1"
-case "$t" in -*) t="./$t" ;; esac
-n=0
-while [ -L "$t" ] && [ $n -lt 40 ]; do
-  l=$(readlink "$t") || exit 1
-  case "$l" in
-    /*) t="$l" ;;
-    *) case "$t" in */*) t="${t%/*}/$l" ;; *) t="$l" ;; esac ;;
-  esac
-  case "$t" in -*) t="./$t" ;; esac
-  n=$((n + 1))
-done
-if [ -L "$t" ]; then
-  echo "Too many levels of symbolic links (os error 40)" >&2
-  exit 1
-fi
-case "$t" in */*) tmp="${t%/*}/.tmp.$2" ;; *) tmp=".tmp.$2" ;; esac
-if [ "$4" = new ]; then
-if [ -d "$t" ]; then
-  echo "Is a directory (os error 21)" >&2
-  exit 1
-fi
-set -C
-if [ -e "$t" ]; then (umask 077; : > "$tmp") || exit 1; else : > "$tmp" || exit 1; fi
-set +C
-if [ -e "$t" ] && [ ! -w "$t" ]; then
-  echo "Permission denied (os error 13)" >&2
-  rm -f "$tmp"
-  exit 1
-fi
-fi
-printf %s "$3" | base64 -d >> "$tmp" || { rm -f "$tmp"; exit 1; }
-[ -z "$5" ] && exit 0
-n=$(wc -c < "$tmp")
-if [ $n -eq "$6" ]; then
-  if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
-if [ -e "$t" ]; then
-  chmod --reference="$t" "$tmp" 2>/dev/null || chmod "$(stat -L -c %a "$t")" "$tmp" || {
-    echo "cannot give the new file the mode of $t" >&2
-    rm -f "$tmp"
-    exit 1
-  }
-fi
-  mv -f "$tmp" "$t" && exit 0
-else
-  echo "short write: $n of $6 bytes assembled" >&2
-fi
-rm -f "$tmp"
-exit 1
-```
-
-### E. REMOVE_TEMP_SCRIPT (`$1` target, `$2` suffix)
+### D. REMOVE_TEMP_SCRIPT (`$1` target, `$2` suffix)
 
 ```sh
 t="$1"
@@ -834,7 +764,7 @@ case "$t" in */*) tmp="${t%/*}/.tmp.$2" ;; *) tmp=".tmp.$2" ;; esac
 rm -f "$tmp"
 ```
 
-### F. GIT_SCRIPT (`$1` root)
+### E. GIT_SCRIPT (`$1` root)
 
 ```sh
 d="$1"
@@ -846,6 +776,18 @@ while [ -n "$d" ]; do
   d="$n"
 done
 exit 1
+```
+
+### F. PROBE_SCRIPT (no arguments)
+
+Prints one line per capability the sandbox has (section 4).
+
+```sh
+rg --version >/dev/null 2>&1 && echo rg
+grep -rnZ -e __cap_probe__ -- /dev/null >/dev/null 2>&1; [ $? -le 1 ] && echo grep_null
+[ "$(find /dev/null -maxdepth 0 -printf %y 2>/dev/null)" = c ] && echo find_printf
+[ "$(printf abc | dd iflag=skip_bytes,count_bytes skip=1 count=1 status=none 2>/dev/null | base64 -w0 2>/dev/null)" = Yg== ] && echo read_window
+true
 ```
 
 ## Known deviations from the reference implementation

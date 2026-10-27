@@ -1,7 +1,7 @@
-//! The exec protocol v1.4 **notification kernel**: when a sandbox calls back about a kept job, as
+//! The exec protocol notify **notification kernel**: when a sandbox calls back about a kept job, as
 //! one pure function, [`step`].
 //!
-//! The normative spec is `crates/sandbox/src/exec_endpoint.rs` ("Sandbox job notify (v1.4)", "When
+//! The normative spec is `crates/sandbox/src/exec_endpoint.rs` ("Sandbox job notify", "When
 //! the endpoint calls back", "The answer, and retries"). Everything an endpoint must decide about
 //! *when* to call back is here, and nothing else: one notification per job at a time; what is owed,
 //! and an answer settling only what was owed when its attempt began; retry or stop by status; the

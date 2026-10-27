@@ -45,7 +45,6 @@ type Out = Result<Value, ToolError>;
 /// A connected sandbox, with what the capabilities resource needs from it.
 struct Target {
     sandbox: Sandbox,
-    http: Arc<HttpExec>,
     /// File helpers whose probe results were overridden (`SANDBOX_CAPS`); `None` otherwise.
     files: Option<ShellFs>,
 }
@@ -316,12 +315,8 @@ impl SandboxMcp {
         }
         let http = Arc::new(http);
         let sandbox = Sandbox::over(http.clone()).await?;
-        let files = override_caps(&sandbox, &c.caps);
-        let target = Arc::new(Target {
-            sandbox,
-            http,
-            files,
-        });
+        let files = override_caps(&sandbox, &c.caps).await?;
+        let target = Arc::new(Target { sandbox, files });
         *slot = Some(target.clone());
         Ok(target)
     }
@@ -339,30 +334,23 @@ impl SandboxMcp {
                 "bad scope {name:?}: 1 to 64 characters of [0-9a-z-]"
             )));
         }
-        Ok(JobScope::under(c.jobs_root.clone(), name))
+        Ok(JobScope::under(
+            beyond_sandbox::exec_endpoint::jobs::JOBS_ROOT,
+            name,
+        ))
     }
 
-    /// What the connected sandbox can do: the capabilities resource.
+    /// What the connected sandbox has: the capabilities resource. The first call looks at the
+    /// sandbox's tools, in one command.
     pub async fn capabilities(&self) -> Out {
         let t = self.target().await?;
-        let caps = t.files().capabilities();
+        let caps = t.files().capabilities().await?;
         let engine = match caps.search_engine() {
             SearchEngine::Ripgrep => "rg",
             SearchEngine::PosixGrep => "grep",
             SearchEngine::BusyboxGrep => "busybox-grep",
         };
-        let jobs = if t.http.offers_jobs().await {
-            "native"
-        } else if t.sandbox.jobs().available().await {
-            "baseline"
-        } else {
-            "none"
-        };
-        let stream = t.http.streams().await;
         Ok(json!({
-            "stdin": caps.stdin,
-            "stream": stream,
-            "jobs": jobs,
             "search_engine": engine,
             "find_printf": caps.find_printf,
             "read_window": !caps.no_read_window,
@@ -371,14 +359,11 @@ impl SandboxMcp {
 }
 
 /// The file helpers with their probe results replaced, or `None` when nothing is overridden.
-fn override_caps(sandbox: &Sandbox, o: &CapsOverride) -> Option<ShellFs> {
+async fn override_caps(sandbox: &Sandbox, o: &CapsOverride) -> Result<Option<ShellFs>, ToolError> {
     if *o == CapsOverride::default() {
-        return None;
+        return Ok(None);
     }
-    let mut caps: Capabilities = sandbox.files().capabilities();
-    if let Some(s) = o.stdin {
-        caps.stdin = s;
-    }
+    let mut caps: Capabilities = sandbox.files().capabilities().await?;
     if let Some(f) = o.find_printf {
         caps.find_printf = f;
     }
@@ -397,7 +382,10 @@ fn override_caps(sandbox: &Sandbox, o: &CapsOverride) -> Option<ShellFs> {
         }
         _ => {}
     }
-    Some(ShellFs::with_capabilities(sandbox.raw().clone(), caps))
+    Ok(Some(ShellFs::with_capabilities(
+        sandbox.raw().clone(),
+        caps,
+    )))
 }
 
 type ToolReply = Result<rmcp::model::CallToolResult, ErrorData>;
@@ -834,8 +822,7 @@ impl ServerHandler for SandboxMcp {
     ) -> Result<ListResourcesResult, ErrorData> {
         let resource = rmcp::model::Resource::new(CAPABILITIES_URI, "capabilities")
             .with_description(
-                "What the connected sandbox supports: stdin, stream, jobs (native, baseline or none), \
-                 search_engine, find_printf, read_window; or an error when it cannot be reached.",
+                "What the connected sandbox has: search_engine, find_printf, read_window; or an error when it cannot be reached.",
             )
             .with_mime_type("application/json");
         Ok(ListResourcesResult {

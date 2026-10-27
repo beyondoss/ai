@@ -159,7 +159,6 @@ impl Mcp {
             "SANDBOX_TOKEN",
             "SANDBOX_TOKEN_CMD",
             "SANDBOX_CAPS",
-            "SANDBOX_JOBS_ROOT",
             "SANDBOX_JOBS_SCOPE",
         ] {
             cmd.env_remove(k);
@@ -170,12 +169,6 @@ impl Mcp {
             .filter(|b| !b.is_empty())
         {
             cmd.env("SANDBOX_TOKEN", b);
-        }
-        if let Some(root) = std::env::var("CONFORMANCE_JOBS_ROOT")
-            .ok()
-            .filter(|r| !r.is_empty())
-        {
-            cmd.env("SANDBOX_JOBS_ROOT", root);
         }
         if let Some(c) = std::env::var("CONFORMANCE_CAPS")
             .ok()

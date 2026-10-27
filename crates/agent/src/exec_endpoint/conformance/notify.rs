@@ -1,5 +1,5 @@
-//! The v1.4 (job notify) checks of [`super::verify`]: the endpoint's half of "Sandbox job notify
-//! (v1.4)", measured from the outside. The verifier runs its own callback receiver (plain HTTP on
+//! The notify (job notify) checks of [`super::verify`]: the endpoint's half of "Sandbox job notify
+//! (notify)", measured from the outside. The verifier runs its own callback receiver (plain HTTP on
 //! loopback by default, and a TLS listener whose certificate nobody trusts), keeps jobs with
 //! `notify` pointing at it, and watches what arrives and when.
 //!
@@ -17,9 +17,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{Check, Verifier, fail, pass, skip};
 use crate::exec_endpoint::jobs::{JobId, JobNotify, JobScope, JobStatus, SandboxJobs as _};
-use crate::exec_endpoint::jobs_native::{JobOffer, NOTIFY_CAPABILITY, NativeJobs};
+use crate::exec_endpoint::jobs_native::NativeJobs;
 
-pub const NOTIFY: &str = "notify offered (v1.4)";
 pub const IDLE: &str = "a kept job survives idling";
 pub const KEEP_INVALID: &str = "keep refuses an invalid notify";
 pub const LATEST: &str = "notify follows the latest keep";
@@ -35,9 +34,8 @@ pub const TLS: &str = "callback verifies TLS";
 pub const RETRY: &str = "callback retry and stop";
 pub const TOKEN: &str = "the token never reaches argv, environment or answers";
 
-/// Every v1.4 check, in the order the report lists them.
-pub const CHECKS: [&str; 15] = [
-    NOTIFY,
+/// Every notify check, in the order the report lists them.
+pub const CHECKS: [&str; 14] = [
     KEEP_INVALID,
     LATEST,
     SHAPE,
@@ -67,7 +65,7 @@ const QUIET: Duration = Duration::from_secs(3);
 const PROOF_WAIT: Duration = Duration::from_secs(6);
 
 /// The `keep` vectors: the refused cases are sent as written.
-const KEEP_VECTORS: &str = include_str!("../../../../sandbox/tests/fixtures/exec/v1.4-keep.json");
+const KEEP_VECTORS: &str = include_str!("../../../../sandbox/tests/fixtures/exec/notify-keep.json");
 
 /// A throwaway self-signed certificate (and its key) for `localhost` and `127.0.0.1`: no trust
 /// store has it, so an endpoint that verifies the server must refuse the handshake.
@@ -339,92 +337,15 @@ impl TlsTrap {
 // The checks.
 // ---------------------------------------------------------------------------------------------
 
-/// What the v1.4 run needs beyond the verifier itself.
+/// What the notify run needs beyond the verifier itself.
 struct Run<'a> {
     v: &'a Verifier,
     rx: Receiver,
     token: String,
 }
 
-/// Run the v1.4 checks: the capability first, then (when it is offered natively) the rest side by
-/// side, and the idle check last, alone. Returns whether notify is offered.
-pub(super) async fn checks(v: &Verifier, out: &mut Vec<Check>) -> bool {
-    let answer = match probe_answer(v).await {
-        Ok(a) => a,
-        Err(e) => {
-            out.push(fail(NOTIFY, format!("the job probe failed: {e}")));
-            out.extend(
-                CHECKS[1..]
-                    .iter()
-                    .copied()
-                    .map(|n| skip(n, "the probe failed")),
-            );
-            return false;
-        }
-    };
-    let offer = JobOffer::from_answer(&answer);
-    match answer.get("notify") {
-        None => {
-            out.push(skip(
-                NOTIFY,
-                "not offered: kept jobs are held by their streams, as in v1.3",
-            ));
-            out.extend(
-                CHECKS[1..]
-                    .iter()
-                    .copied()
-                    .map(|n| skip(n, "notify is not offered")),
-            );
-            return false;
-        }
-        Some(n) if n.as_str() != Some(NOTIFY_CAPABILITY) => {
-            out.push(fail(
-                NOTIFY,
-                format!("the probe answered `notify` as {n}: it must be exactly \"v1.4\""),
-            ));
-            out.extend(
-                CHECKS[1..]
-                    .iter()
-                    .copied()
-                    .map(|n| skip(n, "notify is not offered")),
-            );
-            return false;
-        }
-        Some(_) if !offer.notify && !offer.baseline_notify => {
-            out.push(fail(
-                NOTIFY,
-                format!(
-                    "the probe answered {answer}: notify goes with `\"jobs\": \"v1.3\"` exactly, \
-                     or with no `jobs` for the baseline"
-                ),
-            ));
-            out.extend(
-                CHECKS[1..]
-                    .iter()
-                    .copied()
-                    .map(|n| skip(n, "notify is not offered")),
-            );
-            return false;
-        }
-        Some(_) => {}
-    }
-    if offer.baseline_notify {
-        out.push(pass(
-            NOTIFY,
-            "answered the probe with `{\"notify\": \"v1.4\"}`: offered for the baseline",
-        ));
-        out.extend(CHECKS[1..].iter().copied().map(|n| {
-            skip(
-                n,
-                "offered for the baseline, whose sender is the agent's own job supervisor",
-            )
-        }));
-        return true;
-    }
-    out.push(pass(
-        NOTIFY,
-        "answered the probe with `{\"jobs\": \"v1.3\", \"notify\": \"v1.4\"}`",
-    ));
+/// Run the notify checks side by side, and the idle check last, alone.
+pub(super) async fn checks(v: &Verifier, out: &mut Vec<Check>) {
     let rx = match Receiver::start(
         &v.expect.callback_listen,
         v.expect.callback_origin.as_deref(),
@@ -433,8 +354,8 @@ pub(super) async fn checks(v: &Verifier, out: &mut Vec<Check>) -> bool {
     {
         Ok(rx) => rx,
         Err(e) => {
-            out.extend(CHECKS[1..].iter().copied().map(|n| fail(n, e.clone())));
-            return true;
+            out.extend(CHECKS.iter().copied().map(|n| fail(n, e.clone())));
+            return;
         }
     };
     let run = Run {
@@ -472,30 +393,6 @@ pub(super) async fn checks(v: &Verifier, out: &mut Vec<Check>) -> bool {
         token,
     ]);
     out.push(run.idle().await);
-    true
-}
-
-/// The job probe's raw answer.
-async fn probe_answer(v: &Verifier) -> Result<Value, String> {
-    let resp = v
-        .runner
-        .send_job(
-            "sh",
-            &["-c".to_string(), "printf exec-v1.2".to_string()],
-            None,
-            Duration::from_secs(10),
-            None,
-            false,
-            Some(&json!({ "op": "probe" })),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    let (body, _) = v
-        .runner
-        .read_capped(resp)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(serde_json::from_slice(&body).unwrap_or(Value::Null))
 }
 
 /// A token for this run: `bjn_v1`-shaped, unique, and using every `token68` character class so a
@@ -1224,7 +1121,7 @@ impl Run<'_> {
                 )),
                 other => Err(format!(
                     "a kept job was {other:?} after {} s of idling: an endpoint whose sandbox ends \
-                     idle jobs must not advertise notify",
+                     idle jobs does not conform",
                     idle.as_secs_f64()
                 )),
             }

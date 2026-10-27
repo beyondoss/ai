@@ -1,14 +1,11 @@
 {
   "suite": "jobs",
   "version": 1,
-  "description": "Layer 1: sandbox jobs (v1.3 natively; plain exec commands otherwise).",
+  "description": "Layer 1: sandbox jobs.",
   "scenarios": [
     {
       "id": "jobs.start.runs-and-ends",
       "description": "A started job runs on its own: its combined output is readable from offset 0, and it ends with the shell's exit code.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -54,9 +51,6 @@
     {
       "id": "jobs.start.pgid-is-the-process-group",
       "description": "start answers with the job's process group, which leads a group of its own.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -95,9 +89,6 @@
     {
       "id": "jobs.read.window",
       "description": "read returns up to max bytes from offset, reports where the data starts (offset) and where the job's output ends so far (end, the same whatever max was), and an offset at the end is empty with the job's final state.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -213,9 +204,6 @@
     {
       "id": "jobs.read.sees-output-while-running",
       "description": "Output is readable while the job still runs, and state says running with no code.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -270,9 +258,6 @@
     {
       "id": "jobs.exit.code",
       "description": "The job's status is the shell's exit code.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -316,9 +301,6 @@
     {
       "id": "jobs.exit.signal-is-128-plus-n",
       "description": "A job killed by signal N has status 128+N.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -361,9 +343,6 @@
     {
       "id": "jobs.exit.shell-command-not-found",
       "description": "A job whose shell cannot find its command ends with 127. (Starting a program that does not exist at all is refused by a native endpoint with an error status and is an ended job with 127 on the baseline: callers wrap commands in sh -c to get one behaviour.)",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -406,9 +385,6 @@
     {
       "id": "jobs.output.stdout-and-stderr-are-one-stream",
       "description": "stdout and stderr are one combined output, in the order the bytes were written (best effort between the two).",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -458,9 +434,6 @@
     {
       "id": "jobs.output.binary-exact",
       "description": "Job output is bytes: all 256 values come back exactly.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -505,9 +478,6 @@
     {
       "id": "jobs.input.stdin-is-empty",
       "description": "A job's stdin is empty: cat ends at once.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -548,9 +518,6 @@
     {
       "id": "jobs.start.cwd-and-args",
       "description": "cwd and argv are as for exec: arguments arrive verbatim.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -630,9 +597,6 @@
     {
       "id": "jobs.list.fields",
       "description": "list shows the scope's jobs with id, state, code, kept, label and start time; a running job has no code.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -719,9 +683,6 @@
     {
       "id": "jobs.list.several",
       "description": "list returns every job of the scope, ended ones until removed.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "one",
@@ -827,9 +788,6 @@
     {
       "id": "jobs.kill.stops-the-group",
       "description": "kill signals the job's whole process group: a child it started dies too.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -907,9 +865,6 @@
     {
       "id": "jobs.kill.escalates-past-sigterm",
       "description": "A job that ignores SIGTERM is killed anyway after the grace: kill returns when the group is empty.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -981,9 +936,6 @@
     {
       "id": "jobs.kill.ended-job-is-a-noop",
       "description": "Killing a job that already ended signals nothing and succeeds.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -1052,9 +1004,6 @@
     {
       "id": "jobs.kill.with-remove",
       "description": "kill with remove deletes the job once its group is gone: it is then gone, and no longer listed.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -1116,9 +1065,6 @@
     {
       "id": "jobs.kill.unknown-job",
       "description": "Killing a job that does not exist is not an error.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "kill",
@@ -1138,9 +1084,6 @@
     {
       "id": "jobs.remove.ended-only",
       "description": "remove deletes ended jobs and never a running one.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "done",
@@ -1252,9 +1195,6 @@
     {
       "id": "jobs.remove.twice-is-fine",
       "description": "remove is idempotent.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -1318,9 +1258,6 @@
     {
       "id": "jobs.read.unknown-job-is-gone",
       "description": "Reading a job that never existed is state gone with no data, not an error.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "a",
@@ -1340,9 +1277,6 @@
     {
       "id": "jobs.scope.isolation",
       "description": "Scopes are separate namespaces: the same id in another scope is another job, and one scope cannot list, read, kill or remove another's.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "mine",
@@ -1500,9 +1434,6 @@
     {
       "id": "jobs.wipe.kills-and-deletes-the-scope",
       "description": "wipe kills every job of the scope and deletes them all.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "one",
@@ -1579,9 +1510,6 @@
     {
       "id": "jobs.attach.ended-job",
       "description": "attach streams a job's output from an offset to its end and reports its status; on an ended job that is what is left, at once.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -1650,9 +1578,6 @@
     {
       "id": "jobs.attach.live-job",
       "description": "attach on a running job follows its output until it ends.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -1691,9 +1616,6 @@
     {
       "id": "jobs.attach.signal",
       "description": "attach reports a signalled job as 128+N.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -1732,9 +1654,6 @@
     {
       "id": "jobs.attach.large-output",
       "description": "A quarter megabyte of output follows through whole.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -1774,9 +1693,6 @@
     {
       "id": "jobs.leftovers.shell-exit-then-end",
       "description": "When the shell exits leaving a background process in its group, the job is 'exited' (with the shell's code) until the group is empty, then 'ended' with the same code. The leftover lives until the scenario kills it, so 'exited' lasts as long as the poll needs.",
-      "requires": {
-        "jobs": "native"
-      },
       "steps": [
         {
           "id": "start",
@@ -1850,9 +1766,6 @@
     {
       "id": "jobs.leftovers.attach-waits-for-the-group",
       "description": "attach does not end at the shell's exit but when the group is empty; the status is the shell's.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -1891,9 +1804,6 @@
     {
       "id": "jobs.id.is-validated-by-the-client",
       "description": "A job id is 1 to 32 characters of [0-9a-z]; anything else is refused before any request is sent.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "upper",
@@ -1956,9 +1866,6 @@
     {
       "id": "jobs.start.same-id-twice",
       "description": "An id is unique within its scope: starting it again while it exists is an error and leaves the first job alone.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "first",
@@ -2031,9 +1938,6 @@
     {
       "id": "jobs.output.is-retained-past-eight-mib",
       "description": "At least the last 8 MiB of a job's output is kept; older output is dropped as a gap of known size, and offsets never move.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",

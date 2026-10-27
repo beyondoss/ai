@@ -5,23 +5,22 @@ depends on it; it depends on neither `beyond-agent` nor `beyond-agent-core`.
 
 ## Modules
 
-| file                               | what                                                                                                                |
-| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `src/lib.rs`                       | the public names: `Exec`, `HttpExec`, `Files`, `Jobs`, `Sandbox`, `TokenSource`                                     |
-| `src/exec.rs`                      | `CommandRunner` (`Exec`), `ExecResult`, `ExecOutput` (bytes), `Kill`/`LocalKill`/`kill_all`, bounded output capture |
-| `src/exec_endpoint.rs`             | the protocol spec (module doc), `HttpExecRunner`, `TemplateRunner`                                                  |
-| `src/exec_endpoint/stream.rs`      | v1.2 frames, the frame reader, the streaming probe                                                                  |
-| `src/exec_endpoint/exact.rs`       | `output_base64` (v1.1): its probe and `run_exact`, exact over the answer, a stream, or said not to be               |
-| `src/exec_endpoint/jobs.rs`        | `SandboxJobs`, `ShellJobs` (the baseline over plain exec), scopes, ids                                              |
-| `src/exec_endpoint/jobs_native.rs` | v1.3 native jobs and `HttpJobs`                                                                                     |
-| `src/exec_endpoint/far_kill.rs`    | killing a template transport's command on the far side                                                              |
-| `src/fs.rs`                        | `FsBackend`, its types, and the result policy every backend shares                                                  |
-| `src/fs/shell.rs`                  | `ShellFs` (`Files`): file operations as commands, capability probe, parsers, `__fuzz`                               |
-| `src/procgroup.rs`                 | process-group identity and kill guards for local children                                                           |
-| `src/sandbox.rs`                   | `Jobs`, `Sandbox`, the `Command` builder                                                                            |
-| `src/token.rs`                     | `TokenSource` and the one-renewal bearer                                                                            |
-| `src/tls.rs`                       | installs the `ring` rustls provider before a client is built                                                        |
-| `src/testing.rs`                   | a plain local runner for unit tests                                                                                 |
+| file                               | what                                                                                                                         |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `src/lib.rs`                       | the public names: `Exec`, `HttpExec`, `Files`, `Jobs`, `Sandbox`, `TokenSource`                                              |
+| `src/exec.rs`                      | `CommandRunner` (`Exec`), `ExecResult`, `ExecOutput` (code and bytes), `Kill`/`LocalKill`/`kill_all`, bounded output capture |
+| `src/exec_endpoint.rs`             | the protocol spec (module doc), `HttpExecRunner`, `TemplateRunner`                                                           |
+| `src/exec_endpoint/stream.rs`      | stream frames and the frame reader                                                                                           |
+| `src/exec_endpoint/jobs.rs`        | `SandboxJobs`, `ShellJobs` (jobs over plain exec, for a transport with none), scopes, ids                                    |
+| `src/exec_endpoint/jobs_native.rs` | the endpoint's jobs: `NativeJobs`, `HttpJobs`                                                                                |
+| `src/exec_endpoint/far_kill.rs`    | killing a template transport's command on the far side                                                                       |
+| `src/fs.rs`                        | `FsBackend`, its types, and the result policy every backend shares                                                           |
+| `src/fs/shell.rs`                  | `ShellFs` (`Files`): file operations as commands, the one lazy environment probe, parsers, `__fuzz`                          |
+| `src/procgroup.rs`                 | process-group identity and kill guards for local children                                                                    |
+| `src/sandbox.rs`                   | `Jobs`, `Sandbox`, the `Command` builder                                                                                     |
+| `src/token.rs`                     | `TokenSource` and the one-renewal bearer                                                                                     |
+| `src/tls.rs`                       | installs the `ring` rustls provider before a client is built                                                                 |
+| `src/testing.rs`                   | a plain local runner for unit tests                                                                                          |
 
 ## Layers
 
@@ -40,12 +39,11 @@ A runner that does more says so, and the callers ask before relying on it. Calli
 of both streams went through it.
 
 **Layer 2 never reaches below the trait.** `ShellFs` (`Files`) builds every file operation from `Exec::run` and
-`run_with_stdin`; `Jobs` is `Exec::sandbox_jobs()` when the runner has native jobs, else `ShellJobs` over plain `run` and
+`run_with_stdin`; `Jobs` is `Exec::sandbox_jobs()` when the runner has jobs of its own (the HTTP one), else `ShellJobs` over plain `run` and
 `run_attached`. Neither knows about HTTP. The proof is a test-written transport (`sh` through `std::process::Command`)
-that runs the shared scenarios with the same counts as the HTTP client (`tests/sdk_conformance.rs`, profile `local-sh`
-against `http-subset`).
+that runs the shared scenarios with the same counts as the HTTP client (`tests/sdk_conformance.rs`, profile `local-sh`).
 
-**Layer 3 is a holder.** `Sandbox` owns an `Arc<dyn Exec>`, the `ShellFs` probed over it and the `Jobs`, and hands the
+**Layer 3 is a holder.** `Sandbox` owns an `Arc<dyn Exec>`, the `ShellFs` over it and the `Jobs`, and hands the
 raw `Exec` back (`.raw()`), so nothing the helpers do is out of reach of a caller who needs something else.
 
 ## The HTTP client (`exec_endpoint.rs`)
@@ -53,16 +51,15 @@ raw `Exec` back (`.raw()`), so nothing the helpers do is out of reach of a calle
 `HttpExec` (`HttpExecRunner`) is a `reqwest::Client` and a URL: no session, no lifecycle. One request path,
 `send_job`, carries every call, which is why auth lives in one place.
 
-- **Capabilities are proved, not assumed.** Streaming (v1.2) is probed once on the first streaming call (a command that
-  prints, sleeps, prints: two `output` frames at least 100 ms apart, `application/x-ndjson`); native jobs (v1.3) and
-  notify (v1.4) by one `job` request. A probe that could not reach the endpoint is an outage and is retried; a probe
-  the endpoint answered is cached. A `400`/`422` is the endpoint declining one request, not a reason to distrust it.
+- **Nothing is negotiated or probed.** An endpoint speaks the whole protocol (one-shot with stdin, streaming, jobs,
+  notify), so a request is just sent. A `400`/`422` is the endpoint declining one request, not a sign the sandbox was
+  replaced.
 - **Auth** is `bearer(TokenSource)`. The source (`token.rs`) is a fixed token, a closure, or a command. The first request
   asks it; on a `401` the client asks again once and repeats that request once, and a source that returns the token it
   was already using, or a fixed source, ends it there. Concurrent requests compare the token they failed with against
   the current one, so a renewal is shared, not repeated. Error text never contains a token (`Debug` is redacted).
-- **Bounded.** A response is read incrementally up to `with_max_response_bytes` (16 MiB default) and an over-cap body is
-  an error; a stream frame is at most 64 KiB and a line at most 1 MiB; a silent stream is abandoned after 30 s
+- **Bounded.** A one-shot answer is read incrementally up to the base64 of `with_max_response_bytes` (16 MiB of decoded bytes by
+  default) and an over-cap answer is an error; a stream frame is at most 64 KiB and a line at most 1 MiB; a silent stream is abandoned after 30 s
   (heartbeats are every 5 s).
 - **Disconnect kills.** For a stream the connection is the command's lifetime: dropping the call, or the `Kill` a
   tracked run hands out, closes it, and the endpoint kills the process group.
@@ -74,8 +71,8 @@ in a new session and prints its pid first; `far_kill.rs` kills the group through
 ## Files (`fs.rs`, `fs/shell.rs`)
 
 `FsBackend` is the seam the agent's `read`/`write`/`edit`/`ls`/`grep`/`find` use; `ShellFs` is its implementation over
-`Exec`. It probes the target once (`Capabilities`: stdin delivery, `rg`, GNU or busybox `grep`, `find -printf`, read
-windows) and picks the best rung of the fallback ladder; the exact commands, parsing and error kinds are
+`Exec`. It looks at the target's tools once, in one `sh -c` the first operation that needs it sends (`Capabilities`: `rg`, GNU
+or busybox `grep`, `find -printf`, read windows; a write never probes) and picks the best rung of the search ladder; the exact commands, parsing and error kinds are
 `sdk/conformance/FILES-OVER-EXEC.md`, and `ShellFs` is its reference implementation. The impl-independent tail every
 backend shares (`clip`, `finalize`, `finalize_glob`) is in `fs.rs`, so a result's shape holds by construction. The
 agent's `LocalFs` implements the same trait on the host's disk.
@@ -85,10 +82,10 @@ Parsers of command output are private; `fs::shell::__fuzz` is the `#[doc(hidden)
 ## Jobs (`exec_endpoint/jobs.rs`, `jobs_native.rs`)
 
 `SandboxJobs` is the operation set (run held, start kept, follow, read from an offset, keep, kill, list, remove, wipe).
-`NativeJobs` speaks v1.3 to an endpoint that offers it. `ShellJobs` is the baseline for one that does not: a supervisor
-script run over plain exec, a job directory under `/tmp/beyond-jobs/<scope>/`, output read back with `dd`/`base64`. It
-is client logic that any user of the crate needs on endpoints without v1.3, so it lives here, not in the agent.
-`HttpJobs` picks native or shell per endpoint, once. The v1.4 notifier script comes from `beyond-exec-notify`.
+`NativeJobs` speaks the operations to an endpoint, and `HttpJobs` is the one an `HttpExec` hands out. `ShellJobs` is for a
+transport with no jobs of its own (a template, this host): a supervisor script run over plain exec, a job directory under
+`/tmp/beyond-jobs/<scope>/`, output read back with `dd`/`base64`. It offers no notify. It is client logic that any user
+of the crate needs on such transports, so it lives here, not in the agent.
 
 ## Process-group machinery (`procgroup.rs`)
 
@@ -101,23 +98,20 @@ number of them.
 
 ## Raw exec is bytes
 
-`CommandRunner::run` returns text (an `ExecResult` with `String` output), which is what the helpers parse and what the
-agent's `bash` tool shows. `CommandRunner::run_exact` returns `ExecOutput`: `stdout`/`stderr` as `Vec<u8>` and `exact`. The
-HTTP runner answers it over `output_base64` when its probe (`printf '\377\000\n'`, once per runner, a failed request
-is an error and not cached) shows the endpoint honours it; else over a v1.2 stream (the frames are base64 already, answered
-at the command's exit, `128 + N` for a signal and `124` plus the note for a deadline built to the v1.1 shape); else it returns the
-endpoint's text as UTF-8 with `exact: false`, as a call with stdin on an endpoint without `output_base64` does. The default
-`run_exact` wraps `run` and is `exact: false`. `Sandbox::exec().run()` is `run_exact`. The response cap is on the decoded bytes
-of both streams together.
+`CommandRunner::run` returns an `ExecResult` whose `stdout` and `stderr` are `Vec<u8>`: exactly what the command wrote.
+The one-shot answer carries them as standard base64, so there is no lossy path. Text is
+`ExecResult::stdout_text`/`stderr_text` (UTF-8, invalid sequences replaced), which is what the helpers parse and the
+agent's `bash` tool shows. `Sandbox::exec().run()` returns `ExecOutput`: the exit code (`128 + N` for a signal, `124`
+for a deadline) and the bytes. The response cap is on the decoded bytes of both streams together.
 
 ## What is not here
 
-The host command runner (`RealRunner`), `LocalFs`, the model-facing tools, the lazily attached `ExecCell`, the v1.4
+The host command runner (`RealRunner`), `LocalFs`, the model-facing tools, the lazily attached `ExecCell`, the notify
 callback receiver and the server-conformance verifier are agent policy and stay in `crates/agent`.
 
 ## Specification and tests
 
-The normative protocol spec is the module doc of `src/exec_endpoint.rs` (v1.1 to v1.4); the vectors are in
-`tests/fixtures/exec/`. Tests are small sibling files: `exec_stream_*` (frames, kill on disconnect), `exec_output_exact` (raw exec is bytes: all 256 values, each path, the probe rules, the cap), `exec_notify_*`
-(v1.4 against the mock), `exec_jobs_vectors`, `token_refresh`, `sandbox_surface`, and `sdk_conformance` (the shared
+The normative protocol spec is the module doc of `src/exec_endpoint.rs` (the whole protocol); the vectors are in
+`tests/fixtures/exec/`. Tests are small sibling files: `exec_stream_*` (frames, kill on disconnect), `exec_output` (raw exec is bytes: all 256 values on both streams, corrupt base64 is an error, the cap), `exec_notify_*`
+(notify against the mock), `exec_jobs_vectors`, `token_refresh`, `sandbox_surface`, and `sdk_conformance` (the shared
 matrix, with the reference driver in `tests/sdk_conformance/driver.rs`). Run them with `cargo nextest run -p beyond-sandbox`.

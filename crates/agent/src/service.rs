@@ -479,13 +479,13 @@ impl ServiceSession {
             )
             .await
             .map_err(|e| format!("the sandbox did not answer: {e}"))?;
-        if home.code != Some(0) || home.stdout.trim().is_empty() {
+        if home.code != Some(0) || home.stdout_text().trim().is_empty() {
             return Err(format!(
                 "the sandbox did not report a home directory (exit {:?})",
                 home.code
             ));
         }
-        let home = home.stdout.trim().to_string();
+        let home = home.stdout_text().trim().to_string();
         // The remote `bash` tool prefers a real bash and falls back to `sh`, which every sandbox has
         // by construction (the probe above just ran one).
         let shell = runner
@@ -496,7 +496,7 @@ impl ServiceSession {
                 PROBE_TIMEOUT,
             )
             .await
-            .is_ok_and(|r| r.code == Some(0) && !r.stdout.trim().is_empty());
+            .is_ok_and(|r| r.code == Some(0) && !r.stdout_text().trim().is_empty());
         *self.sandbox.write().unwrap_or_else(|e| e.into_inner()) = Some(Sandbox {
             home: home.clone(),
             shell: if shell { "bash" } else { "sh" },
@@ -1358,7 +1358,7 @@ mod tests {
             .success();
         assert!(has_bash, "the test host has no bash");
         let dir = tempfile::tempdir().unwrap();
-        let mock = beyond_test_support::exec_mock::ExecMock::start(dir.path(), true).await;
+        let mock = beyond_test_support::exec_mock::ExecMock::start(dir.path()).await;
         let mut s = session(&[("a", "/mnt/efs/a")], "a.x");
         Arc::get_mut(&mut s.grant).unwrap().exec_url = mock.url.clone();
         s.connect_exec(1 << 20).await.unwrap();

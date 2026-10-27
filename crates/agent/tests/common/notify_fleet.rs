@@ -1,4 +1,4 @@
-//! A fleet for exec v1.4's notify suites: a `serve --service` replica, the reference v1.4
+//! A fleet for exec notify's notify suites: a `serve --service` replica, the reference notify
 //! endpoint (`exec_mock`, which makes the callbacks), and a stand-in for the fleet's edge that
 //! forwards them to the replica (`--notify-origin` names it).
 

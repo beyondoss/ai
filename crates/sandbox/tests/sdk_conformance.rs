@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use beyond_test_support::exec_mock::{ExecMock, MockOptions, Protocol};
+use beyond_test_support::exec_mock::{ExecMock, MockOptions};
 use sandbox_conformance::{Backend, Connector, Link, Status, Tally, run_scenario};
 use serde_json::{Value, json};
 
@@ -31,15 +31,13 @@ fn scenario_dir() -> PathBuf {
 }
 
 /// A backend configuration: what the endpoint is, and which probe results the driver is told to
-/// believe instead (`CONFORMANCE_CAPS`), so one machine can walk every rung of the fallback ladder.
+/// believe instead (`CONFORMANCE_CAPS`), so one machine can walk every rung of the search ladder.
 struct Profile {
     name: &'static str,
     options: MockOptions,
     bearer: bool,
     caps: CapsOverride,
-    /// The suites this profile runs. The two profiles served by the mock's own (deliberately
-    /// imperfect) endpoint exist to prove the client's probes and fallbacks, so they run the
-    /// suites that go through those and leave the endpoint-behaviour suites to execd.
+    /// The suites this profile runs; empty is all of them.
     suites: &'static [&'static str],
     /// Run over a transport written in this test (`local_sh`), not the HTTP client.
     local: bool,
@@ -65,47 +63,6 @@ fn profiles() -> Vec<Profile> {
             ..base()
         },
         Profile {
-            // A v1 endpoint: ignores `stdin_base64`, so the probe finds no stdin by itself.
-            name: "v1-no-stdin",
-            options: MockOptions {
-                honors_stdin: false,
-                honors_output_base64: false,
-                ..MockOptions::default()
-            },
-            suites: &["files", "errors", "helpers", "exec-bytes"],
-            ..base()
-        },
-        Profile {
-            // An endpoint that never learned streaming: `stream` is an unknown field to it, and so
-            // is `output_base64`: raw exec output is text, and the client says so (`exact: false`).
-            name: "v11-endpoint",
-            options: MockOptions {
-                protocol: Protocol::V11,
-                honors_output_base64: false,
-                ..MockOptions::default()
-            },
-            suites: &["files", "errors", "helpers", "exec-bytes"],
-            ..base()
-        },
-        Profile {
-            // v1.2 without `output_base64`: raw exec is exact over a stream.
-            name: "v12-no-output-base64",
-            options: MockOptions {
-                honors_output_base64: false,
-                ..MockOptions::default()
-            },
-            suites: &["exec-bytes"],
-            ..base()
-        },
-        Profile {
-            name: "execd-no-stdin",
-            caps: CapsOverride {
-                stdin: Some(false),
-                ..CapsOverride::default()
-            },
-            ..base()
-        },
-        Profile {
             name: "execd-grep",
             caps: CapsOverride {
                 search_engine: Some("grep"),
@@ -118,30 +75,10 @@ fn profiles() -> Vec<Profile> {
             caps: CapsOverride {
                 search_engine: Some("busybox-grep"),
                 find_printf: Some(false),
-                ..CapsOverride::default()
             },
             ..base()
         },
-        Profile {
-            // Native jobs off: the endpoint offers plain exec only, so jobs are the baseline.
-            name: "execd-baseline-jobs",
-            options: MockOptions {
-                jobs: false,
-                ..MockOptions::default()
-            },
-            ..base()
-        },
-        // The same endpoint behaviour, twice: over the HTTP client, and over a transport that is
-        // only `sh` on this host. Same files, same jobs (the baseline), same results.
-        Profile {
-            name: "http-subset",
-            options: MockOptions {
-                jobs: false,
-                ..MockOptions::default()
-            },
-            suites: LAYER_SUITES,
-            ..base()
-        },
+        // The same layers, over a transport that is only `sh` on this host (the baseline jobs).
         Profile {
             name: "local-sh",
             suites: LAYER_SUITES,
@@ -232,7 +169,6 @@ async fn reference_agent_passes_every_scenario() {
     let files = load();
     let mut grand = Tally::default();
     let mut grand_failures: Vec<String> = Vec::new();
-    let mut outcomes = std::collections::BTreeMap::new();
     for profile in profiles() {
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().canonicalize().unwrap();
@@ -249,7 +185,7 @@ async fn reference_agent_passes_every_scenario() {
             url: mock.as_ref().map(|m| m.url.clone()).unwrap_or_default(),
             bearer: profile.bearer.then(|| BEARER.to_string()),
             caps: profile.caps,
-            jobs_root: work.join(".jobs"),
+            jobs_root: Some(work.join(".jobs")),
         };
         let mut be = Backend::open(
             profile.name,
@@ -292,15 +228,6 @@ async fn reference_agent_passes_every_scenario() {
             tally.unsupported,
             tally.skipped,
         );
-        outcomes.insert(
-            profile.name,
-            (
-                tally.passed,
-                tally.known_defect,
-                tally.unsupported,
-                tally.skipped,
-            ),
-        );
         grand.known_defect += tally.known_defect;
         grand.unsupported += tally.unsupported;
         grand.passed += tally.passed;
@@ -318,65 +245,37 @@ async fn reference_agent_passes_every_scenario() {
         grand_failures.join("\n")
     );
     assert!(grand.passed > 0);
-    // The layers compose: a transport that is only `sh` gets exactly the results the HTTP client does.
-    assert_eq!(
-        outcomes["local-sh"], outcomes["http-subset"],
-        "(passed, known defects, unsupported, skipped) over a test-written transport and over HTTP"
-    );
     assert_eq!(grand.unsupported, 0, "the reference driver has every op");
 }
 
-/// The wire shapes FILES-OVER-EXEC.md states as exact: what a write sends with stdin, and without.
+/// The wire shape FILES-OVER-EXEC.md states as exact: a write is one command with the content on stdin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn write_wire_shapes_match_the_spec() {
-    for stdin in [true, false] {
-        let dir = tempfile::tempdir().unwrap();
-        let work = dir.path().canonicalize().unwrap();
-        let mock = ExecMock::start(&work, stdin).await;
-        let cfg = Config {
-            url: mock.url.clone(),
-            jobs_root: work.join(".jobs"),
-            ..Config::default()
-        };
-        let d = Driver::connect(&cfg).await;
-        let n = 100_000usize;
-        let before = mock.bodies().len();
-        let r = d
-            .handle(
-                &json!({"id": 1, "op": "write", "path": work.join("f").to_string_lossy(),
-                "data_b64": B64.encode(vec![b'x'; n])}),
-            )
-            .await;
-        assert!(r.get("ok").is_some(), "{r}");
-        let sent = &mock.bodies()[before..];
-        for b in sent {
-            assert_eq!(b["command"], "sh");
-            assert_eq!(b["args"][0], "-c");
-            assert_eq!(b["args"][2], "sh");
-        }
-        if stdin {
-            assert_eq!(sent.len(), 1, "one command with the content on stdin");
-            assert_eq!(sent[0]["args"].as_array().unwrap().len(), 6);
-            assert_eq!(sent[0]["args"][5], n.to_string());
-            assert_eq!(
-                sent[0]["stdin_base64"].as_str().unwrap().len(),
-                n.div_ceil(3) * 4
-            );
-        } else {
-            assert_eq!(sent.len(), n.div_ceil(48 * 1024), "one command per 48 KiB");
-            for (i, b) in sent.iter().enumerate() {
-                let a = b["args"].as_array().unwrap();
-                assert_eq!(
-                    a.len(),
-                    9,
-                    "-c, script, sh, target, suffix, chunk, mode, commit, size"
-                );
-                assert!(a[5].as_str().unwrap().len() <= 65536);
-                assert_eq!(a[6], if i == 0 { "new" } else { "append" });
-                assert_eq!(a[7], if i + 1 == sent.len() { "commit" } else { "" });
-                assert_eq!(a[8], n.to_string());
-                assert!(b.get("stdin_base64").is_none());
-            }
-        }
+async fn write_wire_shape_matches_the_spec() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().canonicalize().unwrap();
+    let mock = ExecMock::start(&work).await;
+    let cfg = Config {
+        url: mock.url.clone(),
+        ..Config::default()
+    };
+    let d = Driver::connect(&cfg).await;
+    let n = 100_000usize;
+    let before = mock.bodies().len();
+    let r = d
+        .handle(
+            &json!({"id": 1, "op": "write", "path": work.join("f").to_string_lossy(),
+            "data_b64": B64.encode(vec![b'x'; n])}),
+        )
+        .await;
+    assert!(r.get("ok").is_some(), "{r}");
+    let sent = &mock.bodies()[before..];
+    for b in sent {
+        assert_eq!(b["command"], "sh");
+        assert_eq!(b["args"][0], "-c");
+        assert_eq!(b["args"][2], "sh");
     }
+    assert_eq!(sent.len(), 1, "one command with the content on stdin");
+    assert_eq!(sent[0]["args"].as_array().unwrap().len(), 6);
+    assert_eq!(sent[0]["args"][5], n.to_string());
+    assert_eq!(sent[0]["stdin"].as_str().unwrap().len(), n.div_ceil(3) * 4);
 }

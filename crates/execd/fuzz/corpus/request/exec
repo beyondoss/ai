@@ -1,1 +1,1 @@
-{"command":"sh","args":["-c","echo hi"],"cwd":"/tmp","timeout_ms":5000,"stdin_base64":"aGVsbG8=","stream":true}
+{"command":"sh","args":["-c","echo hi"],"cwd":"/tmp","timeout_ms":5000,"stdin":"aGVsbG8=","stream":true}

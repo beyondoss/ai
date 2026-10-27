@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, inject, it } from "vitest";
 import { Sandbox } from "../src/index.js";
-import type { Frame, Transport } from "../src/index.js";
+import type { Frame } from "../src/index.js";
 import { HttpTransport } from "../src/index.js";
 
 const execd = inject("execd");
@@ -21,60 +21,20 @@ async function connect(): Promise<Sandbox> {
   return Sandbox.connect({ url: execd!.url, token: execd!.token });
 }
 
-/** The same endpoint with v1.3 hidden: jobs fall back to the baseline built from plain exec. */
-async function connectBaseline(): Promise<Sandbox> {
-  const http = new HttpTransport({ url: execd!.url, token: execd!.token });
-  const t: Transport = {
-    run: (c, a, o) => http.run(c, a, o),
-    ...(http.stream
-      ? { stream: (c: string, a: string[], o = {}) => http.stream(c, a, o) }
-      : {}),
-    offers: async () => ({ ...(await http.offers()), nativeJobs: false }),
-  };
-  return Sandbox.connect({ transport: t });
-}
-
 d("against a loopback execd", () => {
-  it("raw exec returns every byte value exactly, on both streams, over output_base64", async () => {
+  it("raw exec returns every byte value exactly, on both streams", async () => {
     const sb = await connect();
     const r = await sb.exec("sh", [
       "-c",
       `${ALL_256}; ${ALL_256} >&2; exit 3`,
     ]);
     const all = Array.from({ length: 256 }, (_, i) => i);
-    expect(r.exact).toBe(true);
     expect(r.exitCode).toBe(3);
     expect(Array.from(r.stdout)).toEqual(all);
     expect(Array.from(r.stderr)).toEqual(all);
-    expect((await sb.transport.offers!()).outputBase64).toBe(true);
     // And with stdin: binary in, binary out.
-    const echoed = await sb.exec("cat", [], {
-      stdin: Uint8Array.from(all),
-    });
-    expect(echoed.exact).toBe(true);
+    const echoed = await sb.exec("cat", [], { stdin: Uint8Array.from(all) });
     expect(Array.from(echoed.stdout)).toEqual(all);
-  });
-
-  it("raw exec is exact over a stream when output_base64 is hidden", async () => {
-    const http = new HttpTransport({ url: execd!.url, token: execd!.token });
-    // An endpoint that predates output_base64: the field is dropped from the request.
-    const dropping = new HttpTransport({
-      url: execd!.url,
-      token: execd!.token,
-      fetch: (input, init) => {
-        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-        delete body.output_base64;
-        return fetch(input, { ...init, body: JSON.stringify(body) });
-      },
-    });
-    expect((await http.offers()).outputBase64).toBe(true);
-    expect((await dropping.offers()).outputBase64).toBe(false);
-    const r = await dropping.run("sh", ["-c", `${ALL_256}; kill -9 $$`]);
-    expect(r.exact).toBe(true);
-    expect(r.exitCode).toBe(137);
-    expect(Array.from(r.stdout)).toEqual(
-      Array.from({ length: 256 }, (_, i) => i),
-    );
   });
 
   it("runs a command, with stdin, and reports a non-zero exit as a result", async () => {
@@ -171,20 +131,6 @@ d("against a loopback execd", () => {
       expect(await sb.files.read(`${dir}/bin`, { max: 0 })).toHaveLength(0);
       const st = await sb.files.stat(`${dir}/bin`);
       expect(st).toMatchObject({ kind: "file", size: 300_000, writable: true });
-    });
-
-    it("writes through the chunked fallback (no stdin) just the same", async () => {
-      const t = new HttpTransport({ url: execd!.url, token: execd!.token });
-      const sb = new Sandbox(t, { files: { overrides: { stdin: false } } });
-      const dir = scratch();
-      await sb.files.mkdir(dir);
-      const data = randomBytes(120_000); // three 48 KiB chunks
-      await sb.files.write(`${dir}/c`, data);
-      expect(Buffer.from(await sb.files.read(`${dir}/c`)).equals(data)).toBe(
-        true,
-      );
-      await sb.files.write(`${dir}/empty`, new Uint8Array(0));
-      expect((await sb.files.stat(`${dir}/empty`))?.size).toBe(0);
     });
 
     it("reports the spec's error kinds", async () => {
@@ -291,17 +237,11 @@ d("against a loopback execd", () => {
     });
   });
 
-  for (
-    const [name, connectFn, mode] of [
-      ["native (v1.3)", connect, "native"],
-      ["baseline (plain exec)", connectBaseline, "baseline"],
-    ] as const
-  ) {
-    describe(`jobs, ${name}`, () => {
+  {
+    describe("jobs", () => {
       it("starts, reads from an offset, follows to the end, lists and removes", async () => {
-        const sb = await connectFn();
-        expect(await sb.jobs.capabilities()).toBe(mode);
-        const scope = `ts-${mode}-${process.pid}`;
+        const sb = await connect();
+        const scope = `ts-jobs-${process.pid}`;
         try {
           await sb.jobs.start(scope, "job1", {
             command: "sh",
@@ -335,8 +275,8 @@ d("against a loopback execd", () => {
       });
 
       it("kills the whole group, and refuses a bad id before sending anything", async () => {
-        const sb = await connectFn();
-        const scope = `ts-kill-${mode}-${process.pid}`;
+        const sb = await connect();
+        const scope = `ts-kill-${process.pid}`;
         try {
           await sb.jobs.start(scope, "sleeper", {
             command: "sh",

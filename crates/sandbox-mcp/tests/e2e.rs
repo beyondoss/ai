@@ -24,7 +24,6 @@ fn server_command(url: &str) -> tokio::process::Command {
         "SANDBOX_TOKEN",
         "SANDBOX_TOKEN_CMD",
         "SANDBOX_CAPS",
-        "SANDBOX_JOBS_ROOT",
         "SANDBOX_MCP_LISTEN",
     ] {
         cmd.env_remove(k);
@@ -72,7 +71,7 @@ fn error_kind(r: &CallToolResult) -> String {
 async fn sandbox() -> (tempfile::TempDir, ExecMock) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
-    let mock = ExecMock::start(&root, true).await;
+    let mock = ExecMock::start(&root).await;
     (dir, mock)
 }
 
@@ -401,9 +400,8 @@ async fn the_capabilities_resource_says_what_the_sandbox_supports() {
             panic!("not text")
         };
         let v: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(v["stdin"], true);
         assert!(["rg", "grep", "busybox-grep"].contains(&v["search_engine"].as_str().unwrap()));
-        assert!(["native", "baseline", "none"].contains(&v["jobs"].as_str().unwrap()));
+        assert!(v["find_printf"].is_boolean() && v["read_window"].is_boolean());
         client.cancel().await.unwrap();
     })
     .await

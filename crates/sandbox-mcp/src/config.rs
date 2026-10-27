@@ -18,10 +18,9 @@ pub enum Token {
 }
 
 /// Probe results the server is told to believe instead of what it finds (`SANDBOX_CAPS`), so one
-/// sandbox can walk every rung of the file helpers' fallback ladder. The conformance driver sets it.
+/// sandbox can walk every rung of the file helpers' search ladder. The conformance driver sets it.
 #[derive(Debug, Default, PartialEq)]
 pub struct CapsOverride {
-    pub stdin: Option<bool>,
     pub find_printf: Option<bool>,
     /// `rg`, `grep` or `busybox-grep`.
     pub search_engine: Option<String>,
@@ -32,7 +31,6 @@ pub struct CapsOverride {
 pub struct Config {
     pub url: String,
     pub token: Token,
-    pub jobs_root: String,
     pub jobs_scope: String,
     pub caps: CapsOverride,
     /// `SANDBOX_MCP_LISTEN`: serve streamable HTTP here instead of stdio.
@@ -48,12 +46,11 @@ sandbox-mcp takes no arguments; it is configured by environment variables:
   SANDBOX_TOKEN_CMD            a shell command whose stdout is a fresh token (run again after a 401);
                                not together with SANDBOX_TOKEN
   SANDBOX_JOBS_SCOPE           the name jobs are kept under in the sandbox (default mcp)
-  SANDBOX_JOBS_ROOT            where the sandbox keeps jobs (default /tmp/beyond-jobs)
   SANDBOX_MCP_LISTEN           host:port: serve streamable HTTP there instead of stdio
   SANDBOX_MCP_INSECURE_NO_AUTH 1|true|0|false: allow SANDBOX_MCP_LISTEN on a non-loopback address
                                (the server holds the sandbox token and checks nobody; default 0)
-  SANDBOX_CAPS                 JSON {\"stdin\":bool,\"find_printf\":bool,\"search_engine\":\"rg|grep|busybox-grep\"}:
-                               force a fallback rung of the file helpers (for testing)
+  SANDBOX_CAPS                 JSON {\"find_printf\":bool,\"search_engine\":\"rg|grep|busybox-grep\"}:
+                               force a search rung of the file helpers (for testing)
 ";
 
 fn boolean(name: &str, v: Option<String>) -> Result<bool, String> {
@@ -97,7 +94,6 @@ impl Config {
                 let v: Value = serde_json::from_str(&raw)
                     .map_err(|e| format!("SANDBOX_CAPS is not JSON: {e}"))?;
                 CapsOverride {
-                    stdin: v["stdin"].as_bool(),
                     find_printf: v["find_printf"].as_bool(),
                     search_engine: v["search_engine"].as_str().map(str::to_string),
                 }
@@ -106,8 +102,6 @@ impl Config {
         Ok(Self {
             url,
             token,
-            jobs_root: get("SANDBOX_JOBS_ROOT")
-                .unwrap_or_else(|| beyond_sandbox::exec_endpoint::jobs::JOBS_ROOT.to_string()),
             jobs_scope,
             caps,
             listen: get("SANDBOX_MCP_LISTEN"),
@@ -168,10 +162,13 @@ mod tests {
         assert!(Config::from_env(bad).unwrap_err().contains("SANDBOX_CAPS"));
         let ok = env(&[
             ("SANDBOX_URL", "u"),
-            ("SANDBOX_CAPS", r#"{"stdin":false,"search_engine":"grep"}"#),
+            (
+                "SANDBOX_CAPS",
+                r#"{"find_printf":false,"search_engine":"grep"}"#,
+            ),
         ]);
         let caps = Config::from_env(ok).unwrap().caps;
-        assert_eq!(caps.stdin, Some(false));
+        assert_eq!(caps.find_printf, Some(false));
         assert_eq!(caps.search_engine.as_deref(), Some("grep"));
     }
 }

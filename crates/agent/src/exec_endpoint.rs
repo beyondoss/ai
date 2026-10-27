@@ -2,7 +2,7 @@
 //!
 //! The client (`HttpExecRunner`, `TemplateRunner`, the stream and job clients) and the normative
 //! protocol spec live in the `beyond-sandbox` crate (`crates/sandbox/src/exec_endpoint.rs`). What
-//! stays here is agent policy: which target a session runs on, when it connects, the v1.4 job-end
+//! stays here is agent policy: which target a session runs on, when it connects, the notify job-end
 //! receiver (`tools::job_notify`) and the server-conformance verifier ([`conformance`]).
 
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use beyond_sandbox::exec::{ChunkSink, CommandRunner, ExecResult};
 pub use beyond_sandbox::exec_endpoint::*;
 
 pub mod conformance;
-/// When an endpoint calls back about a kept job (v1.4), as one pure function every endpoint shares.
+/// When an endpoint calls back about a kept job (notify), as one pure function every endpoint shares.
 pub use exec_notify as notify_kernel;
 
 // ---------------------------------------------------------------------------------------------
@@ -77,7 +77,12 @@ impl ExecTarget {
             Some(home) => backend.with_home(home),
             None => backend,
         };
-        let caps = backend.capabilities();
+        // The one probe of the sandbox's tools, here so an unreachable or refused endpoint fails the
+        // attach with its own error rather than the first tool call.
+        let caps = backend
+            .capabilities()
+            .await
+            .map_err(|e| format!("the sandbox did not answer: {e}"))?;
         Ok(Self {
             runner,
             backend: std::sync::Arc::new(backend),
@@ -159,7 +164,7 @@ struct CellRoute {
     strict: bool,
     /// Told of every real use of the sandbox: each command and filesystem call dispatched through
     /// the cell. Never told of a sandbox job operation, which goes to the job store directly (exec
-    /// v1.4's live reconcile starts on a use; its own `list` must not count as one).
+    /// notify's live reconcile starts on a use; its own `list` must not count as one).
     on_use: std::sync::Arc<std::sync::RwLock<Option<UseHook>>>,
 }
 
@@ -368,30 +373,6 @@ impl CommandRunner for CellRunner {
             None => {
                 crate::tools::exec::RealRunner
                     .run(program, args, cwd, timeout)
-                    .await
-            }
-        }
-    }
-
-    /// Forwarded, so a cell over an endpoint that honours `output_base64` returns bytes, not the
-    /// default's text.
-    async fn run_exact(
-        &self,
-        program: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        timeout: Duration,
-        stdin: Option<&[u8]>,
-    ) -> std::io::Result<beyond_sandbox::exec::ExecOutput> {
-        match self.target().await? {
-            Some(t) => {
-                t.runner()
-                    .run_exact(program, args, cwd, timeout, stdin)
-                    .await
-            }
-            None => {
-                crate::tools::exec::RealRunner
-                    .run_exact(program, args, cwd, timeout, stdin)
                     .await
             }
         }

@@ -76,7 +76,6 @@ impl World {
                 cmd: d.cmd.clone(),
                 url: started.url.clone(),
                 bearer: started.bearer.clone(),
-                jobs_root: started.jobs_root.clone(),
                 caps: started.caps.clone(),
             };
             let be = Backend::open(

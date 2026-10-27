@@ -1,23 +1,20 @@
 """Layer 2: sandbox jobs over any transport.
 
 A job is a command the *sandbox* keeps: it runs until it exits or is killed, whichever connection
-started it, and its output can be read from any offset. Natively (v1.3) when the transport offers
-it, otherwise on plain commands (the baseline).
+started it, and its output can be read from any offset.
 """
 
 from __future__ import annotations
 
-import asyncio
 import builtins
 from typing import Any, AsyncIterator, Iterator, Sequence
 
 from . import _jobs
 from ._drive import _DONE, adrive, adrive_emit, aiter_events, drive, drive_iter
-from .atransport import AsyncTransport
+from .atransport import AsyncJobTransport
 from .models import Attached, JobEnd, JobGap, JobInfo, JobOutput, JobRead, JobShellExit, Survivor
-from .transport import Transport
+from .transport import JobTransport
 
-JOBS_ROOT = _jobs.JOBS_ROOT
 READ_MAX = _jobs.READ_MAX
 
 
@@ -34,14 +31,8 @@ class Jobs:
     """Jobs, grouped in *scopes*: a scope is an opaque name (1 to 64 of ``[0-9a-z-]``) for one
     session's jobs. A job id is 1 to 32 characters of ``[0-9a-z]``, chosen by the caller."""
 
-    def __init__(self, transport: Transport, *, root: str = JOBS_ROOT) -> None:
+    def __init__(self, transport: JobTransport) -> None:
         self._t = transport
-        self._root = root
-        self._state = _jobs.JobsState()
-
-    def kind(self) -> str:
-        """``native``, ``baseline`` or ``none``."""
-        return drive(_jobs.resolve(self._state, self._root), self._t)
 
     def start(
         self,
@@ -54,21 +45,19 @@ class Jobs:
         label: str = "",
     ) -> int:
         """Start a job the sandbox keeps from the start; returns its process group."""
-        return drive(
-            _jobs.start(self._state, self._root, scope, job, command, args, cwd, label), self._t
-        )
+        return drive(_jobs.start(scope, job, command, args, cwd, label), self._t)
 
     def list(self, scope: str) -> builtins.list[JobInfo]:
-        return drive(_jobs.list_jobs(self._state, self._root, scope), self._t)
+        return drive(_jobs.list_jobs(scope), self._t)
 
     def read(self, scope: str, job: str, offset: int = 0, max: int = READ_MAX) -> JobRead:  # noqa: A002
         """Up to ``max`` bytes of output from ``offset``. An unknown job is ``gone``, not an error."""
-        return drive(_jobs.read(self._state, self._root, scope, job, offset, max), self._t)
+        return drive(_jobs.read(scope, job, offset, max), self._t)
 
     def follow(self, scope: str, job: str, offset: int = 0) -> Iterator[Any]:
         """Events (:class:`JobOutput`, :class:`JobGap`, :class:`JobShellExit`), ending with a
         :class:`JobEnd` once the job's group is empty. Stopping early leaves the job running."""
-        op = _jobs.follow(self._state, self._root, scope, job, offset)
+        op = _jobs.follow(scope, job, offset)
         for item in drive_iter(op, self._t):
             if isinstance(item, tuple) and item and item[0] is _DONE:
                 yield JobEnd(item[1])
@@ -89,29 +78,22 @@ class Jobs:
         self, scope: str, jobs: Sequence[str], *, remove: bool = False
     ) -> builtins.list[Survivor]:
         """SIGTERM, a grace, SIGKILL to each job's group; the groups that survived."""
-        return drive(_jobs.kill(self._state, self._root, scope, jobs, remove), self._t)
+        return drive(_jobs.kill(scope, jobs, remove), self._t)
 
     def remove(self, scope: str, jobs: Sequence[str]) -> None:
         """Delete ended jobs; never a running one."""
-        drive(_jobs.remove(self._state, self._root, scope, jobs), self._t)
+        drive(_jobs.remove(scope, jobs), self._t)
 
     def wipe(self, scope: str) -> builtins.list[str]:
         """Kill and delete every job of the scope."""
-        return drive(_jobs.wipe(self._state, self._root, scope), self._t)
+        return drive(_jobs.wipe(scope), self._t)
 
 
 class AsyncJobs:
-    """:class:`Jobs` for an :class:`~beyond_sandbox.AsyncTransport`."""
+    """:class:`Jobs` for an :class:`~beyond_sandbox.AsyncJobTransport`."""
 
-    def __init__(self, transport: AsyncTransport, *, root: str = JOBS_ROOT) -> None:
+    def __init__(self, transport: AsyncJobTransport) -> None:
         self._t = transport
-        self._root = root
-        self._state = _jobs.JobsState()
-        self._lock = asyncio.Lock()
-
-    async def kind(self) -> str:
-        async with self._lock:
-            return await adrive(_jobs.resolve(self._state, self._root), self._t)
 
     async def start(
         self,
@@ -123,18 +105,18 @@ class AsyncJobs:
         cwd: str | None = None,
         label: str = "",
     ) -> int:
-        op = _jobs.start(self._state, self._root, scope, job, command, args, cwd, label)
+        op = _jobs.start(scope, job, command, args, cwd, label)
         return await adrive(op, self._t)
 
     async def list(self, scope: str) -> builtins.list[JobInfo]:
-        return await adrive(_jobs.list_jobs(self._state, self._root, scope), self._t)
+        return await adrive(_jobs.list_jobs(scope), self._t)
 
     async def read(self, scope: str, job: str, offset: int = 0, max: int = READ_MAX) -> JobRead:  # noqa: A002
-        return await adrive(_jobs.read(self._state, self._root, scope, job, offset, max), self._t)
+        return await adrive(_jobs.read(scope, job, offset, max), self._t)
 
     async def follow(self, scope: str, job: str, offset: int = 0) -> AsyncIterator[Any]:
         """As :meth:`Jobs.follow`."""
-        op = _jobs.follow(self._state, self._root, scope, job, offset)
+        op = _jobs.follow(scope, job, offset)
         events = aiter_events(op, self._t)
         try:
             async for item in events:
@@ -147,7 +129,7 @@ class AsyncJobs:
 
     async def attach(self, scope: str, job: str, offset: int = 0) -> Attached:
         result = Attached(-1)
-        op = _jobs.follow(self._state, self._root, scope, job, offset)
+        op = _jobs.follow(scope, job, offset)
 
         async def collect(ev: Any) -> None:
             _collect(result, ev)
@@ -158,10 +140,10 @@ class AsyncJobs:
     async def kill(
         self, scope: str, jobs: Sequence[str], *, remove: bool = False
     ) -> builtins.list[Survivor]:
-        return await adrive(_jobs.kill(self._state, self._root, scope, jobs, remove), self._t)
+        return await adrive(_jobs.kill(scope, jobs, remove), self._t)
 
     async def remove(self, scope: str, jobs: Sequence[str]) -> None:
-        await adrive(_jobs.remove(self._state, self._root, scope, jobs), self._t)
+        await adrive(_jobs.remove(scope, jobs), self._t)
 
     async def wipe(self, scope: str) -> builtins.list[str]:
-        return await adrive(_jobs.wipe(self._state, self._root, scope), self._t)
+        return await adrive(_jobs.wipe(scope), self._t)

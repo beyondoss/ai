@@ -1,8 +1,6 @@
-//! Exec protocol **v1.3**: sandbox jobs as an endpoint capability, and **v1.4**'s `notify` on
-//! `keep`. The normative spec is the parent module's doc ("Sandbox jobs (v1.3)", "Sandbox job notify
-//! (v1.4)"); this is the client half — the probe that adopts them, and [`NativeJobs`], the
-//! [`SandboxJobs`] that speaks them — plus [`HttpJobs`], which picks it or the baseline
-//! ([`ShellJobs`]) per endpoint.
+//! Sandbox jobs and job notify over the exec protocol. The normative spec is the parent module's doc
+//! ("Sandbox jobs", "Sandbox job notify"); this is the client half: [`NativeJobs`], the
+//! [`SandboxJobs`] that speaks them, and [`HttpJobs`], the one an [`HttpExecRunner`] hands out.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,15 +13,9 @@ use serde_json::{Value, json};
 use super::HttpExecRunner;
 use super::jobs::{
     EventSink, JobEvent, JobId, JobInfo, JobNotify, JobScope, JobSpec, JobStatus, ReadChunk,
-    SandboxJobs, ShellJobs,
+    SandboxJobs,
 };
 use super::stream::{FRAME_SILENCE_LIMIT, FrameReader};
-
-/// What a v1.3 endpoint answers the probe with: `{"jobs": "v1.3"}`.
-pub const CAPABILITY: &str = "v1.3";
-
-/// What an endpoint that offers v1.4 adds to its probe answer: `"notify": "v1.4"`.
-pub const NOTIFY_CAPABILITY: &str = "v1.4";
 
 /// How long a job operation other than a stream may take.
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -35,67 +27,14 @@ const KILL_GRACE_MS: u64 = 300;
 /// `job` runs it.
 const INERT: &str = "true";
 
-/// What an endpoint's answer to the job probe offers.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct JobOffer {
-    /// Sandbox jobs natively (v1.3): `jobs` is exactly `"v1.3"`.
-    pub native_jobs: bool,
-    /// `notify` on a native `keep` (v1.4): `jobs` is exactly `"v1.3"` and `notify` exactly `"v1.4"`.
-    pub notify: bool,
-    /// `notify` for the baseline (v1.4): no `jobs`, and `notify` exactly `"v1.4"`. The baseline
-    /// further needs `curl` and `stdin_base64` in the sandbox.
-    pub baseline_notify: bool,
-}
-
-impl JobOffer {
-    /// Read an answer to the probe. Only the spec's exact answers offer anything: a later version,
-    /// a boolean, a `jobs` of another version, or a v1.1 envelope (the endpoint ran the command)
-    /// offers nothing it does not name exactly.
-    pub fn from_answer(answer: &Value) -> Self {
-        let jobs = answer.get("jobs");
-        let notify = answer.get("notify").and_then(Value::as_str) == Some(NOTIFY_CAPABILITY);
-        let native_jobs = jobs.and_then(Value::as_str) == Some(CAPABILITY);
-        Self {
-            native_jobs,
-            notify: native_jobs && notify,
-            baseline_notify: jobs.is_none() && notify,
-        }
-    }
-}
-
-/// What the endpoint offers for jobs. The probe is a valid v1.1 request (`printf exec-v1.2`)
-/// carrying `"job": {"op": "probe"}`: an endpoint without the capability ignores the unknown field
-/// and runs the command, one with it answers `{"jobs": "v1.3"}` (plus `"notify": "v1.4"` when it
-/// offers notify), and one that offers notify only for the baseline answers `{"notify": "v1.4"}`.
-pub(crate) async fn probe(runner: &HttpExecRunner) -> std::io::Result<JobOffer> {
-    let job = json!({ "op": "probe" });
-    let resp = runner
-        .send_job(
-            "sh",
-            &["-c".to_string(), "printf exec-v1.2".to_string()],
-            None,
-            Duration::from_secs(10),
-            None,
-            false,
-            Some(&job),
-        )
-        .await?;
-    let (body, _) = runner.read_capped(resp).await?;
-    Ok(serde_json::from_slice::<Value>(&body)
-        .map(|v| JobOffer::from_answer(&v))
-        .unwrap_or_default())
-}
-
-/// The endpoint's jobs: native when it offers v1.3, the baseline otherwise — decided once, on the
-/// first operation, and cached by the runner (a probe that could not reach it is retried).
+/// The endpoint's jobs: every operation is native (one request carrying `"job"`).
 pub struct HttpJobs {
     runner: Arc<HttpExecRunner>,
-    shell: ShellJobs,
 }
 
 impl HttpJobs {
-    pub(crate) fn new(runner: Arc<HttpExecRunner>, shell: ShellJobs) -> Self {
-        Self { runner, shell }
+    pub(crate) fn new(runner: Arc<HttpExecRunner>) -> Self {
+        Self { runner }
     }
 
     fn native(&self) -> NativeJobs<'_> {
@@ -103,35 +42,22 @@ impl HttpJobs {
             runner: &self.runner,
         }
     }
-
-    /// Whether this endpoint's jobs are native (v1.3).
-    pub async fn native_capability(&self) -> bool {
-        self.runner.offers_jobs().await
-    }
 }
 
 macro_rules! dispatch {
     ($self:ident, $method:ident ( $($arg:expr),* )) => {
-        if $self.runner.offers_jobs().await {
-            $self.native().$method($($arg),*).await
-        } else {
-            $self.shell.$method($($arg),*).await
-        }
+        $self.native().$method($($arg),*).await
     };
 }
 
 #[async_trait]
 impl SandboxJobs for HttpJobs {
     async fn available(&self) -> bool {
-        if self.runner.offers_jobs().await {
-            return true;
-        }
-        self.shell.available().await
+        true
     }
 
     async fn holds(&self) -> bool {
-        // Native holds need a stream like any other (a v1.3 endpoint is a v1.2 one).
-        self.runner.streams().await
+        true
     }
 
     async fn run_held(
@@ -185,7 +111,7 @@ impl SandboxJobs for HttpJobs {
     }
 
     async fn offers_notify(&self) -> bool {
-        dispatch!(self, offers_notify())
+        true
     }
 
     async fn keep_notify(
@@ -226,7 +152,7 @@ impl SandboxJobs for HttpJobs {
     }
 }
 
-/// The v1.3 client: every [`SandboxJobs`] operation is one request carrying `"job"`.
+/// The jobs client: every [`SandboxJobs`] operation is one request carrying `"job"`.
 pub struct NativeJobs<'a> {
     runner: &'a HttpExecRunner,
 }
@@ -322,7 +248,7 @@ impl SandboxJobs for NativeJobs<'_> {
     }
 
     async fn holds(&self) -> bool {
-        self.runner.streams().await
+        true
     }
 
     async fn run_held(
@@ -431,7 +357,7 @@ impl SandboxJobs for NativeJobs<'_> {
     }
 
     async fn offers_notify(&self) -> bool {
-        self.runner.job_offer().await.notify
+        true
     }
 
     async fn keep_notify(
@@ -549,7 +475,7 @@ struct WireJobFrame {
     error: Option<String>,
 }
 
-/// Decode one line of a v1.3 job stream. The frames are v1.2's (`stdout`, `stderr`, `{}`,
+/// Decode one line of a job stream. The frames are streaming's (`stdout`, `stderr`, `{}`,
 /// `shell_exit`, `exit_code`, `signal`, `error`) plus `started` and `gap`; both output streams are
 /// the job's combined output. Unknown fields are ignored, and a line with none known is a heartbeat.
 pub fn decode_job_frame(line: &[u8]) -> Result<JobFrame, String> {
@@ -726,30 +652,6 @@ pub fn parse_survivors(v: &Value) -> Vec<(Option<String>, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Every probe answer in `v1.4-probe.json` means to this client what the spec says it means.
-    #[test]
-    fn probe_answers_offer_what_the_vectors_say() {
-        let file: Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/exec/v1.4-probe.json"))
-                .unwrap();
-        let answers = file["answers"].as_array().unwrap();
-        assert!(!answers.is_empty());
-        for case in answers {
-            let want = &case["expect"];
-            let got = JobOffer::from_answer(&case["answer"]);
-            assert_eq!(
-                got,
-                JobOffer {
-                    native_jobs: want["native_jobs"].as_bool().unwrap(),
-                    notify: want["notify"].as_bool().unwrap(),
-                    baseline_notify: want["baseline_notify"].as_bool().unwrap(),
-                },
-                "{}",
-                case["name"]
-            );
-        }
-    }
 
     #[test]
     fn a_signal_past_the_i32_sum_is_an_error_not_a_panic() {

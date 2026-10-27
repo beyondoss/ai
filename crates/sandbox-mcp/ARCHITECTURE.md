@@ -51,9 +51,8 @@ reads in), `list_dir` 1000 entries, `search` 100 hits. Each is a default for the
 
 ## Capabilities
 
-`sandbox://capabilities` (JSON): `stdin`, `stream`, `jobs` (`native` / `baseline` / `none`), `search_engine`, `find_printf`,
-`read_window`: what the probes found, which tells an agent whether `search` honours `.gitignore` (`rg`) and whether jobs
-are the sandbox's own. A resource rather than a tool because it describes the connection, not an action. When the sandbox
+`sandbox://capabilities` (JSON): `search_engine`, `find_printf`,
+`read_window`: what the one probe found, which tells an agent whether `search` honours `.gitignore` (`rg`). A resource rather than a tool because it describes the connection, not an action. When the sandbox
 cannot be reached the content is `{"error": {...}}`.
 
 `SANDBOX_CAPS` overrides the probe results the same way the conformance harness's `CONFORMANCE_CAPS` does, so one sandbox

@@ -53,7 +53,7 @@ pub mod mcp_session_fixture;
 /// Real replicas behind a ring-routing front, a byte-metered endpoint, in three endpoint modes:
 /// the job notify end-to-end suites.
 pub mod notify_e2e;
-/// A replica, the reference v1.4 endpoint and a stand-in edge, for the job notify suites.
+/// A replica, the reference notify endpoint and a stand-in edge, for the job notify suites.
 pub mod notify_fleet;
 /// `bash` + `bash_job` over a remote runner, for the streaming exec suites.
 pub mod remote_bash;

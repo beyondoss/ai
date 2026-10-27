@@ -1,4 +1,4 @@
-//! exec v1.4 end to end, a session that moves or closes while its job runs. Two real `serve
+//! exec notify end to end, a session that moves or closes while its job runs. Two real `serve
 //! --service` replicas on a hash ring behind the fleet's front, which routes clients and callbacks
 //! alike by session id, retrying and walking the ring on `503`. A callback never opens a session:
 //! one that reaches a replica without the session is answered `503` and the front walks on; one

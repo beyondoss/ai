@@ -1,4 +1,4 @@
-import { concat, fromBase64, text, toBase64, utf8 } from "./bytes.js";
+import { concat, fromBase64, text, utf8 } from "./bytes.js";
 import {
   classifyFailure,
   ConflictError,
@@ -13,7 +13,6 @@ import {
   READ_SCRIPT,
   REMOVE_TEMP_SCRIPT,
   STAT_SCRIPT,
-  WRITE_CHUNK_SCRIPT,
   WRITE_STDIN_SCRIPT,
 } from "./scripts.js";
 import {
@@ -33,20 +32,25 @@ import type { RunResult, Transport } from "./transport.js";
 
 /** Bytes per `read` command: 96 KiB, which is exactly 128 KiB of base64. */
 export const READ_CHUNK = 96 * 1024;
-/** Raw bytes per chunked-write command: 48 KiB, exactly 64 KiB of base64. */
-export const WRITE_CHUNK = 48 * 1024;
 /** Per-command timeout of helpers. */
 export const COMMAND_TIMEOUT_MS = 120_000;
-/** Per-command timeout of capability probes. */
+/** Timeout of the environment probe. */
 export const PROBE_TIMEOUT_MS = 10_000;
 
-const READ_WINDOW_PROBE =
-  "printf abc | dd iflag=skip_bytes,count_bytes skip=1 count=1 status=none 2>/dev/null | base64 -w0 2>/dev/null";
+/**
+ * The environment probe: ONE `sh -c` that checks every tool the helpers choose between, printing
+ * `name=1` or `name=0` per line. Sent once per sandbox, on the first file operation.
+ */
+export const PROBE_SCRIPT = [
+  "rg --version >/dev/null 2>&1 && echo rg",
+  "grep -rnZ -e __cap_probe__ -- /dev/null >/dev/null 2>&1; [ $? -le 1 ] && echo grep_null",
+  "[ \"$(find /dev/null -maxdepth 0 -printf %y 2>/dev/null)\" = c ] && echo find_printf",
+  "[ \"$(printf abc | dd iflag=skip_bytes,count_bytes skip=1 count=1 status=none 2>/dev/null | base64 -w0 2>/dev/null)\" = Yg== ] && echo read_window",
+  "true",
+].join("\n");
 
 /** What the sandbox has, probed once (FILES-OVER-EXEC section 4). */
 export interface Capabilities {
-  /** `cat` echoed its stdin: writes send their content on stdin in one command. */
-  stdin: boolean;
   /** `find -printf` works: listings are one command. */
   findPrintf: boolean;
   /** `dd iflag=skip_bytes,count_bytes` and `base64 -w0` work: files can be read. */
@@ -60,7 +64,6 @@ export interface Capabilities {
 
 /** Probe results to force, so one sandbox can walk every rung of the fallback ladder. */
 export interface CapabilityOverrides {
-  stdin?: boolean | undefined;
   findPrintf?: boolean | undefined;
   searchEngine?: SearchEngine | undefined;
 }
@@ -121,15 +124,15 @@ async function randomHex64(): Promise<string> {
 
 /**
  * Layer 2: files and search over ANY {@link Transport}. Built on `transport.run` and nothing else,
- * following FILES-OVER-EXEC.md. The sandbox is probed once, on the first call.
+ * following FILES-OVER-EXEC.md. The sandbox is probed once (one round trip), on the first call.
  */
 export class Files {
-  readonly transport: Transport;
+  readonly transport: Pick<Transport, "run">;
   private readonly overrides: CapabilityOverrides;
   private caps: Promise<Capabilities> | undefined;
   private readonly gitRoots = new Map<string, boolean>();
 
-  constructor(transport: Transport, options: FilesOptions = {}) {
+  constructor(transport: Pick<Transport, "run">, options: FilesOptions = {}) {
     this.transport = transport;
     this.overrides = options.overrides ?? {};
   }
@@ -151,38 +154,14 @@ export class Files {
   }
 
   private async probe(): Promise<Capabilities> {
-    const t = this.transport;
-    // A probe that ran and answered "absent" (or could not be started at all) is a capability
-    // that is missing; any other failure is returned.
-    const settle = async (p: Promise<RunResult>): Promise<RunResult | null> => {
-      try {
-        return await p;
-      } catch (e) {
-        if (
-          e instanceof SandboxError
-          && ["not_found", "not_offered", "too_large"].includes(e.kind)
-        ) {
-          return null;
-        }
-        throw e;
-      }
-    };
-    const opts = { timeoutMs: PROBE_TIMEOUT_MS, text: true };
-    const [rg, grep, find, stdin, window] = await Promise.all([
-      settle(t.run("rg", ["--version"], opts)),
-      settle(
-        t.run("grep", ["-rnZ", "-e", "__cap_probe__", "--", "/dev/null"], opts),
-      ),
-      settle(
-        t.run("find", ["/dev/null", "-maxdepth", "0", "-printf", "%y"], opts),
-      ),
-      settle(t.run("cat", [], { ...opts, stdin: utf8("stdin-probe") })),
-      settle(t.run("sh", ["-c", READ_WINDOW_PROBE], opts)),
-    ]);
-    const ranOk = (r: RunResult | null) =>
-      r !== null && (r.exitCode === 0 || r.exitCode === 1);
-    let hasRg = rg !== null && rg.exitCode === 0;
-    let grepNull = ranOk(grep);
+    const r = await this.transport.run("sh", ["-c", PROBE_SCRIPT], {
+      timeoutMs: PROBE_TIMEOUT_MS,
+    });
+    const found = new Set(
+      text(r.stdout).split("\n").map((l) => l.trim()),
+    );
+    let hasRg = found.has("rg");
+    let grepNull = found.has("grep_null");
     const o = this.overrides;
     switch (o.searchEngine) {
       case "rg":
@@ -199,14 +178,8 @@ export class Files {
         break;
     }
     return {
-      stdin: o.stdin
-        ?? (stdin !== null && stdin.exitCode === 0
-          && text(stdin.stdout) === "stdin-probe"),
-      // busybox `find` has no -printf: it prints usage and exits 1, which "exit 0 or 1" accepts.
-      // GNU prints the type of /dev/null, a character device.
-      findPrintf: o.findPrintf ?? (ranOk(find) && text(find!.stdout) === "c"),
-      readWindow: window !== null && window.exitCode === 0
-        && text(window.stdout).trim() === "Yg==",
+      findPrintf: o.findPrintf ?? found.has("find_printf"),
+      readWindow: found.has("read_window"),
       rg: hasRg,
       grepNull,
       searchEngine: hasRg ? "rg" : grepNull ? "grep" : "busybox-grep",
@@ -220,7 +193,6 @@ export class Files {
   ): Promise<RunResult> {
     return this.transport.run(command, args, {
       timeoutMs: COMMAND_TIMEOUT_MS,
-      text: true,
       ...(stdin !== undefined ? { stdin } : {}),
     });
   }
@@ -293,17 +265,15 @@ export class Files {
    */
   async write(path: string, data: Uint8Array | string): Promise<void> {
     const bytes = typeof data === "string" ? utf8(data) : data;
-    const caps = await this.capabilities();
+    await this.capabilities();
     const suffix = await randomHex64();
     let failed: SandboxError | undefined;
     try {
-      const r = caps.stdin
-        ? await this.exec(
-          "sh",
-          sh(WRITE_STDIN_SCRIPT, [path, suffix, String(bytes.length)]),
-          bytes,
-        )
-        : await this.writeChunks(path, suffix, bytes);
+      const r = await this.exec(
+        "sh",
+        sh(WRITE_STDIN_SCRIPT, [path, suffix, String(bytes.length)]),
+        bytes,
+      );
       if (r.exitCode !== 0) {
         failed = classifyFailure(`write ${path}`, text(r.stderr));
       }
@@ -320,33 +290,6 @@ export class Files {
         () => {},
       );
       throw failed;
-    }
-  }
-
-  private async writeChunks(
-    path: string,
-    suffix: string,
-    bytes: Uint8Array,
-  ): Promise<RunResult> {
-    const size = String(bytes.length);
-    let first = true;
-    for (let at = 0;; at += WRITE_CHUNK) {
-      // An empty file is one empty chunk: the temp must still be created and committed.
-      const chunk = bytes.subarray(at, at + WRITE_CHUNK);
-      const last = at + WRITE_CHUNK >= bytes.length;
-      const r = await this.exec(
-        "sh",
-        sh(WRITE_CHUNK_SCRIPT, [
-          path,
-          suffix,
-          toBase64(chunk),
-          first ? "new" : "append",
-          last ? "commit" : "",
-          size,
-        ]),
-      );
-      if (r.exitCode !== 0 || last) return r;
-      first = false;
     }
   }
 

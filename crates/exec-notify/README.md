@@ -1,8 +1,8 @@
 # beyond-exec-notify
 
-The notification rules of exec protocol v1.4, as one pure function.
+The notification rules of exec protocol notify, as one pure function.
 
-In v1.4 a sandbox tells the agent that a kept job ended by calling back
+In notify a sandbox tells the agent that a kept job ended by calling back
 (`POST` of `{"type":"job_ended","scope":…,"id":…}`) instead of holding a stream
 open. This crate decides _when_ that callback is sent: when one is owed, when an
 attempt starts, how long to wait after a failure, and when to stop. It makes no
@@ -70,7 +70,7 @@ body; and `SH`, the same kernel in POSIX `sh` for endpoints that have no Rust.
 
 ## Reference
 
-The normative spec is the "Sandbox job notify (v1.4)" section of the module doc
+The normative spec is the "Sandbox job notify" section of the module doc
 in [`crates/sandbox/src/exec_endpoint.rs`](../sandbox/src/exec_endpoint.rs). Its
 requirements are tagged N1, N2, …; this crate implements N16 to N18 and the
 callback grammar and body (N4, N14). `cargo nextest run -p beyond-exec-notify`

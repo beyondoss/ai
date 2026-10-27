@@ -49,18 +49,12 @@ fn stream(cmd: &str, args: &[&str]) -> Value {
 async fn an_authorizer_passes_the_full_conformance_verifier() {
     let (server, _dir) = start(|o| {
         o.authorizer = Some(accept_header("let-me-in"));
-        o.kept_jobs_survive_idle = true;
     })
     .await;
     let url = format!("http://{}/exec", server.local_addr());
     let headers = [("x-embed-key".to_string(), "let-me-in".to_string())];
     let report = verify(&url, &headers, &Expectations::default()).await;
     println!("{}", report.render());
-    assert!(
-        report.streams && report.jobs && report.notify,
-        "{}",
-        report.render()
-    );
     let not_passed: Vec<_> = report
         .checks
         .iter()
@@ -349,7 +343,7 @@ async fn in_flight_counts_a_v11_call_a_stream_and_a_client_that_leaves() {
     let addr = server.local_addr();
     assert_eq!(server.activity(), execd::Activity::default());
 
-    // A v1.1 call.
+    // A one-shot call.
     let call = tokio::spawn(async move { post(addr, &[], &run("sleep", &["0.5"])).await });
     until("the call to count", || server.activity().in_flight == 1).await;
     assert_eq!(call.await.unwrap().status, 200);

@@ -77,7 +77,6 @@ async fn run_backend(plan: &Plan, name: &str) -> Vec<Cell> {
             cmd: d.cmd.clone(),
             url: started.url.clone(),
             bearer: started.bearer.clone(),
-            jobs_root: started.jobs_root.clone(),
             caps: started.caps.clone(),
         };
         let (cell_name, auth, work, vars) = (

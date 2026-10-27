@@ -156,14 +156,11 @@ impl RealRunner {
             (status, out, err, fed)
         };
         match tokio::time::timeout(timeout, collect).await {
-            // Lossy on purpose, not by oversight: `bash` (this crate's primary consumer) never
-            // reads these two fields for real output — its `run_streaming` sink appends every chunk
-            // to its `OutputAccumulator` as raw bytes as they arrive (see `bash.rs`'s `sink`
-            // closure), and only falls back to `stdout`/`stderr` here when nothing streamed (a test
-            // double, a remote runner). The live path this struct actually feeds for `bash` never
-            // goes through `from_utf8_lossy`. The non-streaming callers that *do* read these fields
-            // (`ShellFs`, worktree `git`) run commands whose output is text, or base64-encode bytes
-            // that may not be (a worktree patch; see `worktree.rs`).
+            // `bash` (this crate's primary consumer) never reads these two fields for real output —
+            // its `run_streaming` sink appends every chunk to its `OutputAccumulator` as raw bytes as
+            // they arrive (see `bash.rs`'s `sink` closure), and only falls back to `stdout`/`stderr`
+            // here when nothing streamed (a test double, a remote runner). Empty on the streaming
+            // path: `drain_capped` returned empty capture buffers there.
             Ok((status, (stdout, out_trunc), (stderr, err_trunc), fed)) => {
                 guard.disarm();
                 let status = status?;
@@ -173,16 +170,8 @@ impl RealRunner {
                     signal: exit_signal(&status),
                     // Empty on the streaming path: `drain_capped` returned empty capture buffers there
                     // (nothing to decode), and `bash` never reads these anyway.
-                    stdout: if streaming {
-                        String::new()
-                    } else {
-                        String::from_utf8_lossy(&stdout).into_owned()
-                    },
-                    stderr: if streaming {
-                        String::new()
-                    } else {
-                        String::from_utf8_lossy(&stderr).into_owned()
-                    },
+                    stdout: if streaming { Vec::new() } else { stdout },
+                    stderr: if streaming { Vec::new() } else { stderr },
                     timed_out: false,
                     truncated: out_trunc || err_trunc,
                 })
@@ -200,8 +189,8 @@ impl RealRunner {
                 drop(guard);
                 Ok(ExecResult {
                     code: None,
-                    stdout: String::new(),
-                    stderr: "command exceeded its timeout".into(),
+                    stdout: Vec::new(),
+                    stderr: b"command exceeded its timeout".to_vec(),
                     timed_out: true,
                     ..Default::default()
                 })
@@ -305,7 +294,7 @@ mod tests {
             .unwrap();
         assert_eq!(res.code, Some(0), "got: {res:?}");
         assert!(!res.timed_out, "cat blocked on stdin instead of seeing EOF");
-        assert_eq!(res.stdout, "");
+        assert_eq!(res.stdout_text(), "");
     }
 
     #[tokio::test]
@@ -316,7 +305,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.code, Some(0), "got: {res:?}");
-        assert_eq!(res.stdout, "stdin-probe");
+        assert_eq!(res.stdout_text(), "stdin-probe");
     }
 
     #[tokio::test]
@@ -337,7 +326,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            res.stdout.trim(),
+            res.stdout_text().trim(),
             input.len().to_string(),
             "every byte arrived"
         );
@@ -436,7 +425,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!res.timed_out);
-        assert_eq!(res.stdout, "DONE\n");
+        assert_eq!(res.stdout_text(), "DONE\n");
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "took {:?}; must release via the idle grace, not wait on the held-open pipe",
@@ -463,8 +452,16 @@ mod tests {
             .await
             .unwrap();
         assert!(!res.timed_out);
-        assert!(res.stdout.contains("HEAD"), "got: {:?}", res.stdout);
-        assert!(res.stdout.contains("TICK6"), "got: {:?}", res.stdout);
+        assert!(
+            res.stdout_text().contains("HEAD"),
+            "got: {:?}",
+            res.stdout_text()
+        );
+        assert!(
+            res.stdout_text().contains("TICK6"),
+            "got: {:?}",
+            res.stdout_text()
+        );
     }
 
     #[tokio::test]
@@ -488,7 +485,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            res.stdout, "",
+            res.stdout_text(),
+            "",
             "streaming skips the discarded capture; the sink is the source of truth"
         );
         let streamed = String::from_utf8(collected.lock().unwrap().clone()).unwrap();
@@ -564,11 +562,13 @@ mod tests {
             STREAM_HEAD + STREAM_TAIL
         );
         assert!(
-            res.stdout.starts_with("ABCDEFGHIJKLMNOPQRST"),
+            res.stdout.starts_with(b"ABCDEFGHIJKLMNOPQRST"),
             "head preserved"
         );
         assert!(
-            res.stdout.trim_end().ends_with("ABCDEFGHIJKLMNOPQRST"),
+            res.stdout_text()
+                .trim_end()
+                .ends_with("ABCDEFGHIJKLMNOPQRST"),
             "tail preserved"
         );
     }

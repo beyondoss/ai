@@ -1,4 +1,4 @@
-//! exec v1.4 end to end, callbacks that are not the sandbox's honest report: forged ones, repeats
+//! exec notify end to end, callbacks that are not the sandbox's honest report: forged ones, repeats
 //! and a loop. A callback is a hint: a forged one is refused before the replica looks for the
 //! session and changes nothing; a repeat costs at most one reconcile a second and starts no model
 //! turn; and however many arrive, the end is reported once. Every case runs in every endpoint mode,
@@ -11,7 +11,9 @@ use crate::common;
 use std::time::{Duration, Instant};
 
 use beyond_agent::exec_endpoint::jobs::JobId;
-use common::notify_e2e::{E2e, Mode, Setup, TENANT, in_every_mode, key, scope, unique};
+use common::notify_e2e::{
+    E2e, Mode, Setup, TENANT, in_every_mode, in_notify_modes, key, scope, unique,
+};
 
 fn job(secs: u32, marker: &str) -> String {
     format!("echo up; sleep {secs}; printf 'fin-%s\\n' {marker}")
@@ -156,12 +158,6 @@ async fn a_looped_callback_costs_one_reconcile_a_second(mode: Mode) {
         model_before,
         "{mode:?}: a turn of its own"
     );
-    if !mode.releases() {
-        assert_eq!(
-            reconciles, 0,
-            "a held job's callback never contacts the sandbox"
-        );
-    }
 
     f.wake_with(&format!("fin-{marker}"), Duration::from_secs(30))
         .await
@@ -169,7 +165,8 @@ async fn a_looped_callback_costs_one_reconcile_a_second(mode: Mode) {
     assert_eq!(f.reports(&mut ws, &format!("fin-{marker}")).await, 1);
 }
 
-in_every_mode!(
-    a_forged_callback_changes_nothing,
-    a_looped_callback_costs_one_reconcile_a_second
-);
+in_every_mode!(a_forged_callback_changes_nothing);
+// Not in the no-egress mode: there the loop's real-token callback is the only first notice the
+// sandbox ever sends, so it releases the job and its end (which no callback delivers) waits for the
+// next use: the spec's one accepted difference, covered by `notify_e2e_lost`.
+in_notify_modes!(a_looped_callback_costs_one_reconcile_a_second);

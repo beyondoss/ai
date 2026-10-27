@@ -1,4 +1,4 @@
-//! v1.1 enforces `timeout_ms`: at the deadline the whole group is killed and the request answered
+//! A one-shot request enforces `timeout_ms`: at the deadline the whole group is killed and the request answered
 //! `200` with `exit_code` 124 and stderr ending in `command exceeded its timeout`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -6,6 +6,7 @@ mod support;
 
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use beyond_test_support::ports;
 use serde_json::json;
 use support::http::post;
@@ -40,8 +41,16 @@ async fn a_hung_command_is_killed_with_its_group_and_answered_124() {
     assert!(took < Duration::from_secs(3), "{took:?}");
     let body = a.json();
     assert_eq!(body["exit_code"], 124);
-    assert_eq!(body["stdout"], "partial\n");
-    let stderr = body["stderr"].as_str().unwrap();
+    let b = |v: &serde_json::Value| {
+        String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(v.as_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    assert_eq!(b(&body["stdout"]), "partial\n");
+    let stderr = b(&body["stderr"]);
     assert!(
         stderr.starts_with("oops\n") && stderr.ends_with("command exceeded its timeout"),
         "{stderr:?}"
@@ -64,7 +73,7 @@ async fn a_command_that_finishes_in_time_is_unaffected_and_no_timeout_means_no_d
     .await;
     assert_eq!(
         a.json(),
-        json!({ "exit_code": 3, "stdout": "hi\n", "stderr": "" })
+        json!({ "exit_code": 3, "stdout": "aGkK", "stderr": "" })
     );
     // No `timeout_ms`: it runs as long as it takes.
     let a = post(
@@ -73,6 +82,6 @@ async fn a_command_that_finishes_in_time_is_unaffected_and_no_timeout_means_no_d
         &json!({ "command": "sh", "args": ["-c", "sleep 1; echo done"] }),
     )
     .await;
-    assert_eq!(a.json()["stdout"], "done\n");
+    assert_eq!(a.json()["stdout"], "ZG9uZQo=");
     server.shutdown().await;
 }

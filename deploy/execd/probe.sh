@@ -16,5 +16,5 @@ echo "ok unauthenticated exec 401"
 out="$(curl -s -X POST -H "authorization: Bearer $TOKEN" -d "$body" "$BASE/")"
 printf "response: %s\n" "$out"
 printf "%s" "$out" | grep -Eq '"exit_code": ?0' || { echo "exit_code is not 0" >&2; exit 1; }
-printf "%s" "$out" | grep -Fq '"stdout":"hi\n"' || { printf '%s\n' 'stdout is not "hi\n"' >&2; exit 1; }
+printf "%s" "$out" | grep -Fq '"stdout":"aGkK"' || { printf '%s\n' 'stdout is not "hi\n"' >&2; exit 1; }
 echo "ok authenticated exec: exit_code 0, stdout hi"

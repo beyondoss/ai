@@ -22,10 +22,10 @@ async fn git_status(exec: &dyn Exec, repo: &str) -> std::io::Result<Vec<(String,
         )
         .await?;
     if out.code != Some(0) {
-        return Err(std::io::Error::other(out.stderr));
+        return Err(std::io::Error::other(out.stderr_text().into_owned()));
     }
     Ok(out
-        .stdout
+        .stdout_text()
         .lines()
         .filter_map(|l| l.split_once(' '))
         .map(|(code, path)| (code.to_string(), path.trim().to_string()))
@@ -72,8 +72,6 @@ async fn a_sandbox_over_a_test_written_transport_has_all_three_layers() {
         .await
         .unwrap();
     assert_eq!(out.stdout_text(), format!("sh\n{}\n", root.display()));
-    // `LocalSh` implements `run` only: its text is not claimed to be the bytes.
-    assert!(!out.exact);
 
     let piped = sandbox
         .exec("cat", [] as [&str; 0])
@@ -119,8 +117,10 @@ async fn connect_reaches_an_endpoint_with_a_bearer_and_streams() {
     )
     .await;
 
-    let wrong = Sandbox::connect(mock.url.clone(), "nope").await;
-    assert!(wrong.is_err(), "the probe is refused");
+    // Connecting sends nothing; the first request is where a wrong bearer is refused.
+    let wrong = Sandbox::connect(mock.url.clone(), "nope").await.unwrap();
+    let refused = wrong.exec("true", [] as [&str; 0]).run().await;
+    assert!(refused.unwrap_err().to_string().contains("401"));
 
     let sandbox = Sandbox::connect(mock.url.clone(), TokenSource::fixed("secret"))
         .await

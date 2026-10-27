@@ -407,12 +407,12 @@ pub struct ServeConfig {
     /// consult it yet. `Arc` so every per-session copy of this config shares one keyring and one
     /// fleet secret rather than duplicating the secret per session.
     pub grant_verifier: Option<Arc<crate::grant::GrantVerifier>>,
-    /// exec v1.4's job-end callbacks: the replica's notify key and the sessions it holds, which a
+    /// exec notify's job-end callbacks: the replica's notify key and the sessions it holds, which a
     /// service session registers with ([`crate::tools::job_notify`]). Filled by the daemon in
     /// service mode from [`Self::grant_verifier`]'s seal secret; `None` everywhere else.
     pub job_notify: Option<Arc<crate::tools::job_notify::NotifyHub>>,
     /// `--notify-origin`: the origin the fleet's edge serves sessions at, which a `keep`'s
-    /// `notify.url` names. Service mode only; `None` keeps every job held, as before v1.4.
+    /// `notify.url` names. Service mode only; `None` keeps every job held, as before notify.
     pub notify_origin: Option<String>,
     /// When set (daemon mode only), the supervisor reaps a session that has had **no attached
     /// connection** for at least this long and isn't mid-run — dropping its retained `input_tx` so it

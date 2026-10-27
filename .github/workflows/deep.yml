@@ -203,7 +203,7 @@ jobs:
           path: crates/execd/fuzz/artifacts/${{ matrix.target }}/
           if-no-files-found: ignore
   # Coverage-guided fuzzing of the sandbox client's parsers of tool output: `rg`/`grep` search records, the
-  # stat and `find` listings, ShellFs's base64, and the exec protocol's v1.2 stream frames and v1.3
+  # stat and `find` listings, ShellFs's base64, and the exec protocol's streams frames and jobs
   # job answers. Round-trip and substring/bound properties, not just "does not panic"; four minutes
   # per target, same pinned nightly and crash handling as above.
   fuzz-sandbox:
@@ -236,7 +236,7 @@ jobs:
           name: fuzz-crash-agent-${{ matrix.target }}
           path: crates/sandbox/fuzz/artifacts/${{ matrix.target }}/
           if-no-files-found: ignore
-  # execd's stateful job-table test (random v1.3 operations across scopes with colliding and hostile
+  # execd's stateful job-table test (random jobs operations across scopes with colliding and hostile
   # ids against the real binary, a model beside it, every invariant checked after every step) for
   # ten minutes of fresh seeds, then the seeded parser test for two. A failure prints its seed and
   # the shrunk operation list; replay with EXECD_JOBS_SEED / EXECD_PARSE_SEED. The tests that need

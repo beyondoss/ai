@@ -270,7 +270,7 @@ fn attached_cannot(
     None
 }
 
-/// Whether a fleet offers exec v1.4 job notify, and the replica knob its scenarios need with it.
+/// Whether a fleet offers exec notify job notify, and the replica knob its scenarios need with it.
 #[derive(Clone, Copy, Default)]
 pub struct Notify {
     /// Start a callback front and give every replica its origin as `--notify-origin`.
@@ -296,7 +296,7 @@ pub struct Fleet {
     /// How this fleet's faults are performed. Local mechanisms for a fleet it spawned; a
     /// caller-supplied command for one it attached to — see [`crate::faults`].
     pub faults: Faults,
-    /// The edge's front for exec v1.4 job-end callbacks, when the fleet was started to offer
+    /// The edge's front for exec notify job-end callbacks, when the fleet was started to offer
     /// notify: every replica carries its origin as `--notify-origin`, and it routes over the same
     /// ring as [`Self::edge`].
     pub front: Option<crate::front::Front>,
@@ -354,8 +354,7 @@ impl Fleet {
                 std::fs::create_dir_all(&sandbox_home).map_err(|e| format!("sandbox home: {e}"))?;
                 let model_at = format!("{}:{}", spec_bind.host, spec_bind.port);
                 let exec_at = format!("{}:{}", spec_bind.host, spec_bind.port + 1);
-                let exec =
-                    ExecMock::start_on(&exec_at, sandbox.path(), Some(&sandbox_home), true).await;
+                let exec = ExecMock::start_on(&exec_at, sandbox.path(), Some(&sandbox_home)).await;
                 let url = beyond_test_support::spawn_model_server_routed_unrecorded_on(
                     &model_at,
                     Vec::new(),
@@ -552,7 +551,7 @@ impl Fleet {
         .await
     }
 
-    /// As [`start_against`](Self::start_against), with exec v1.4 notify as `notify` says.
+    /// As [`start_against`](Self::start_against), with exec job notify as `notify` says.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_against_with(
         kind: Kind,
@@ -615,11 +614,11 @@ impl Fleet {
         let sandbox = tempfile::tempdir().map_err(|e| format!("sandbox: {e}"))?;
         let sandbox_home = sandbox.path().join("home");
         std::fs::create_dir_all(&sandbox_home).map_err(|e| format!("sandbox home: {e}"))?;
-        // A real endpoint speaking the v1.1 exec protocol, rooted at a directory standing in for the
+        // A real endpoint speaking the one-shot exec protocol, rooted at a directory standing in for the
         // tenant's box. Service mode probes it at session start, so a session whose endpoint does not
         // work never comes up at all — which is the correct behaviour, and makes a broken double look
         // exactly like a broken sandbox.
-        let exec = ExecMock::start_with_home(sandbox.path(), Some(&sandbox_home), true).await;
+        let exec = ExecMock::start_with_home(sandbox.path(), Some(&sandbox_home)).await;
 
         let mut edge = Edge::new(keys.path(), Vec::new());
         let agent = agent_binary()?;
@@ -1398,7 +1397,7 @@ pub async fn unmounted_shard_is_misdirected(
         Ok(d) => d,
         Err(e) => return Outcome::failed_with(format!("sandbox: {e}")),
     };
-    let exec = ExecMock::start_with_home(sandbox.path(), Some(sandbox.path()), true).await;
+    let exec = ExecMock::start_with_home(sandbox.path(), Some(sandbox.path())).await;
     let (gateway_url, _bodies) = spawn_model_server(vec![turn_text("unused")]);
 
     let mut edge = Edge::new(keys.path(), Vec::new());
@@ -2173,8 +2172,7 @@ fn sandbox_job_routes() -> Vec<(String, String)> {
 }
 
 /// A two-replica fleet whose model follows [`sandbox_job_routes`], and the requests it was sent.
-/// Two sandboxes beside the fleet's own: the default (v1.3, which runs jobs itself) and a v1.2-only
-/// one, on which the agent runs jobs with plain exec commands — the baseline every endpoint gets.
+/// A sandbox beside the fleet's own, which runs jobs itself.
 async fn sandbox_job_fleet(
     kind: Kind,
     history_path: &std::path::Path,
@@ -2196,14 +2194,11 @@ async fn sandbox_job_fleet(
         beyond_test_support::spawn_model_server_routed(sandbox_job_routes(), turn_text("ok"));
     let fleet = Fleet::start_against(kind, 2, 1, history_path, None, false, gateway_url).await?;
     let mut sandboxes = Vec::new();
-    for (name, jobs) in [("native (v1.3)", true), ("baseline (v1.2)", false)] {
+    for name in ["execd"] {
         let dir = tempfile::tempdir().map_err(|e| format!("sandbox: {e}"))?;
         let mock = ExecMock::start_with(
             dir.path(),
-            beyond_test_support::exec_mock::MockOptions {
-                jobs,
-                ..Default::default()
-            },
+            beyond_test_support::exec_mock::MockOptions::default(),
         )
         .await;
         sandboxes.push((name, mock, dir));
@@ -2264,7 +2259,7 @@ fn replica_at(fleet: &Fleet, addr: &Addr) -> Option<usize> {
 /// session's sandbox; the owning replica is killed outright; the session reopens on the other
 /// replica, which lists the job under its number as **not yet checked** (it has not woken the
 /// sandbox to look), and, at the model's first look, finds it still running, shows its output from
-/// where the model left off, and kills it. On both kinds of sandbox: one that runs jobs itself (v1.3) and
+/// where the model left off, and kills it. On both kinds of sandbox: one that runs jobs itself (jobs) and
 /// one that only runs commands (the baseline). Before, the job lived in the dead replica's exec
 /// stream, and the endpoint killed it with the connection.
 pub async fn sandbox_job_survives_its_replica(

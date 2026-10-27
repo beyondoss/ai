@@ -54,8 +54,8 @@ impl Host {
                 let out = out?;
                 Ok(ExecResult {
                     code: out.status.code(),
-                    stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                    stdout: out.stdout,
+                    stderr: out.stderr,
                     ..Default::default()
                 })
             }

@@ -91,8 +91,8 @@ fn ok(stdout: &str) -> ExecResult {
     ExecResult {
         code: Some(0),
         signal: None,
-        stdout: stdout.to_string(),
-        stderr: String::new(),
+        stdout: stdout.to_string().into(),
+        stderr: String::new().into(),
         timed_out: false,
         truncated: false,
     }
@@ -112,7 +112,6 @@ fn full_caps() -> Capabilities {
         rg: true,
         grep_null: true,
         find_printf: true,
-        stdin: true,
         no_read_window: false,
     }
 }

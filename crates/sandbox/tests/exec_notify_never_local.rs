@@ -1,6 +1,5 @@
-//! With an exec endpoint configured, commands and jobs run on the endpoint, whatever it answers
-//! about v1.4 notify: no probe answer, notify setting, refused or failed `notify` makes anything run
-//! on this host, and an endpoint that cannot be reached fails closed (an error), never locally.
+//! With an exec endpoint configured, commands and jobs run on the endpoint: no egress setting, refused
+//! or failed `notify` makes anything run on this host, and an endpoint that cannot be reached fails closed (an error), never locally.
 //!
 //! The mock runs commands on this machine too, so "on the endpoint" is told by its own `HOME`: a
 //! directory only the mock hands its commands.
@@ -12,7 +11,7 @@ use std::time::{Duration, Instant};
 use beyond_sandbox::exec::CommandRunner;
 use beyond_sandbox::exec_endpoint::HttpExecRunner;
 use beyond_sandbox::exec_endpoint::jobs::{JobId, JobNotify, JobScope, JobSpec};
-use beyond_test_support::exec_mock::{ExecMock, MockOptions, NotifyFaults, Protocol};
+use beyond_test_support::exec_mock::{ExecMock, MockOptions, NotifyFaults};
 
 fn spec(script: &str) -> JobSpec {
     JobSpec {
@@ -23,63 +22,22 @@ fn spec(script: &str) -> JobSpec {
     }
 }
 
-/// Every way an endpoint can answer about notify, and some it should not.
+/// Every way an endpoint can be configured that touches notify.
 fn variants() -> Vec<(&'static str, MockOptions)> {
-    let notifying = MockOptions::notifying();
-    let probe = |v: serde_json::Value| MockOptions {
-        faults: NotifyFaults {
-            probe_notify: Some(v),
-            ..NotifyFaults::default()
-        },
-        ..MockOptions::notifying()
-    };
     vec![
-        ("v1.3, the setting off", MockOptions::default()),
-        ("v1.4 natively", notifying.clone()),
-        (
-            "notify for the baseline",
-            MockOptions {
-                jobs: false,
-                ..notifying.clone()
-            },
-        ),
-        (
-            "no native jobs, the setting off",
-            MockOptions {
-                jobs: false,
-                ..MockOptions::default()
-            },
-        ),
+        ("the defaults", MockOptions::default()),
         (
             "no egress",
             MockOptions {
                 egress: false,
-                ..notifying.clone()
-            },
-        ),
-        ("notify as a boolean", probe(serde_json::json!(true))),
-        ("a later notify version", probe(serde_json::json!("v9"))),
-        (
-            "notify for the baseline, without stdin",
-            MockOptions {
-                jobs: false,
-                honors_stdin: false,
-                ..notifying.clone()
+                ..MockOptions::default()
             },
         ),
         (
-            "notify for the baseline over v1.1",
-            MockOptions {
-                jobs: false,
-                protocol: Protocol::V11,
-                ..notifying.clone()
-            },
-        ),
-        (
-            "an idle-killing sandbox that advertises",
+            "an idle-killing sandbox",
             MockOptions {
                 idle_kill: Some(Duration::from_secs(60)),
-                ..notifying.clone()
+                ..MockOptions::default()
             },
         ),
         (
@@ -89,14 +47,14 @@ fn variants() -> Vec<(&'static str, MockOptions)> {
                     accepts_any_notify: true,
                     ..NotifyFaults::default()
                 },
-                ..notifying
+                ..MockOptions::default()
             },
         ),
     ]
 }
 
 #[tokio::test]
-async fn no_notify_answer_runs_anything_on_this_host() {
+async fn no_notify_setting_runs_anything_on_this_host() {
     for (name, opts) in variants() {
         let (root, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let home_path = home.path().to_string_lossy().into_owned();
@@ -121,12 +79,10 @@ async fn no_notify_answer_runs_anything_on_this_host() {
             .await
             .unwrap();
         assert_eq!(
-            r.stdout, home_path,
+            r.stdout_text(),
+            home_path,
             "{name}: a command ran off the endpoint"
         );
-        if !jobs.available().await {
-            continue;
-        }
         let scope = JobScope::under(root.path().to_string_lossy(), "s");
         let id = JobId::fresh();
         jobs.start_kept(&scope, &id, &spec("printf %s \"$HOME\"; sleep 3"))
@@ -184,7 +140,6 @@ async fn an_unreachable_endpoint_fails_closed() {
             .is_err()
     );
     let jobs = runner.clone().sandbox_jobs().unwrap();
-    assert!(!jobs.offers_notify().await);
     let scope = JobScope::under(marker.path().to_string_lossy(), "s");
     assert!(
         jobs.start_kept(&scope, &JobId::fresh(), &spec(&script))

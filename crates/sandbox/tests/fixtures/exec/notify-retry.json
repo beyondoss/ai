@@ -1,5 +1,5 @@
 {
-  "spec": "exec protocol v1.4 sandbox job notify (crates/sandbox/src/exec_endpoint.rs, \"Sandbox job notify (v1.4)\"), \"The answer, and retries\"",
+  "spec": "exec protocol sandbox job notify (crates/sandbox/src/exec_endpoint.rs, \"Sandbox job notify\"), \"The answer, and retries\"",
   "notes": [
     "statuses: the endpoint's action on each answer to an attempt: done and stop end the notification, retry waits per the schedule. connection_error, tls_error and timeout (no complete answer in 30 s) are attempts without a status.",
     "schedule: the wait after failed attempt n is d(n) * (1 - u/2) with d(n) = min(2^(n-1), 60) s and u uniform in [0, 1); waits_max is u = 0, waits_min the limit as u approaches 1.",

@@ -17,12 +17,8 @@ class ExecResult:
     exit_code: int
     stdout: bytes
     stderr: bytes
-    #: Whether ``stdout`` and ``stderr`` are exactly the bytes the command wrote. ``False`` only when
-    #: the transport could get nothing but text from the target (a plain v1.1 endpoint, which already
-    #: replaced invalid UTF-8 with U+FFFD before this client saw it): the bytes are then the UTF-8
-    #: of that text. A transport that has the bytes (ssh, a vendor SDK) leaves the default.
-    exact: bool = True
 
+    # The one place the client reads output as text: helpers parse ``stdout_text`` / ``stderr_text``.
     @property
     def stdout_text(self) -> str:
         return self.stdout.decode("utf-8", "replace")
@@ -32,7 +28,7 @@ class ExecResult:
         return self.stderr.decode("utf-8", "replace")
 
 
-# ---- v1.2 stream frames -----------------------------------------------------------------------
+# ---- stream frames -----------------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,28 +106,13 @@ class SearchResult:
 
 @dataclass(frozen=True, slots=True)
 class Capabilities:
-    """What the probes found. ``search_engine`` is ``rg``, ``grep`` or ``busybox-grep``."""
+    """What the environment probe found. ``search_engine`` is ``rg``, ``grep`` or ``busybox-grep``."""
 
-    stdin: bool
     find_printf: bool
     search_engine: str
     read_window: bool
     rg: bool = False
     grep_null: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class SandboxCapabilities:
-    """What a sandbox offers: the file probes plus ``stream`` and ``jobs`` (native/baseline/none), and
-    ``output_base64`` (a one-shot call returns the command's bytes)."""
-
-    stdin: bool
-    stream: bool
-    jobs: str
-    search_engine: str
-    find_printf: bool
-    read_window: bool
-    output_base64: bool = False
 
 
 # ---- jobs --------------------------------------------------------------------------------------

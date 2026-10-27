@@ -1,4 +1,4 @@
-//! v1.3: sandbox jobs, natively. A job is a command that outlives the request that started it: it
+//! jobs: sandbox jobs, natively. A job is a command that outlives the request that started it: it
 //! runs in a process group of its own, its output (stdout and stderr, combined) is kept by byte
 //! offset, and it ends when its group is empty. Every job belongs to a *scope*, an opaque name for
 //! one session's jobs, and an operation only ever sees the jobs of its own scope.
@@ -19,7 +19,7 @@
 //!   never sends them keeps its jobs until execd exits. N concurrent cold callers (N sessions)
 //!   hold N times that, as the sandbox's own memory allows.
 //! - *A read*: answers at most the output held, so `max` cannot ask for more than the retention.
-//! - *Streams* (`attach`, a held `start`): the same bounded channel as v1.2, one task each, freed
+//! - *Streams* (`attach`, a held `start`): the same bounded channel as streaming, one task each, freed
 //!   when the stream ends or its client leaves.
 //! - *Pumps*: two per job, freed when their pipes close, when the job is removed, or when the
 //!   supervisor lets go of a pipe a descendant holds open after the grace.
@@ -173,7 +173,7 @@ pub(crate) struct Job {
     num: Option<u64>,
     kind: Option<String>,
     seen: u64,
-    /// The latest `keep`'s `notify` (v1.4), if it carried one.
+    /// The latest `keep`'s `notify` (notify), if it carried one.
     pub notify: Option<NotifyTarget>,
     /// When it calls back.
     pub notifier: Notifier,
@@ -208,7 +208,7 @@ impl Jobs {
     }
 
     /// Every job in the table that has not ended (held or kept, any scope), and the kept ones of them.
-    /// And how many jobs are owed a v1.4 callback that is neither settled nor abandoned.
+    /// And how many jobs are owed a notify callback that is neither settled nor abandoned.
     pub fn alive(&self) -> (usize, Vec<crate::KeptJob>, usize) {
         let cells: Vec<(Key, JobCell)> = locked(&self.map)
             .iter()
@@ -282,7 +282,7 @@ fn state_of(j: &Job) -> (&'static str, Value) {
 }
 
 /// `SIGTERM` the groups, wait up to `grace` for them to empty, `SIGKILL` what is left, wait up to a
-/// second more (v1.3 `kill`).
+/// second more (jobs `kill`).
 async fn stop_groups(pgids: &[i32], grace: Duration) {
     for &g in pgids {
         proc::signal_group(g, Signal::SIGTERM);
@@ -425,13 +425,6 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
     let jobs = &ctx.jobs;
     let key = |id: &str| (job.scope.clone(), id.to_string());
     match job.op.as_str() {
-        "probe" => {
-            let mut answer = json!({ "jobs": "v1.3" });
-            if ctx.opts.advertises_notify() {
-                answer["notify"] = json!(crate::NOTIFY_VERSION);
-            }
-            http::json_response(200, &answer)
-        }
         "start" => start_job(ctx, req, &job).await,
         "attach" => {
             let k = key(&job.id);
@@ -561,7 +554,7 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
 /// has been shown).
 fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq) -> Resp {
     let keep = job.op == "keep";
-    // v1.4: a `notify` that fails the grammar refuses the whole `keep`, before anything is
+    // notify: a `notify` that fails the grammar refuses the whole `keep`, before anything is
     // recorded (N4, N5). The reason never quotes the token.
     let notify = match (&job.notify, keep) {
         (Some(n), true) => match notify::parse_notify(n) {
@@ -749,7 +742,7 @@ async fn drain_pumps(
 }
 
 /// The job's life: wait for the shell, report `shell_exit` if its group lives on, wait for the
-/// group to empty, record the end. Each is a state change v1.4 calls back about.
+/// group to empty, record the end. Each is a state change notify calls back about.
 async fn supervise(
     ctx: Arc<Ctx>,
     cell: JobCell,
@@ -768,7 +761,7 @@ async fn supervise(
     drain_pumps(&mut pipes, &progress, cap).await;
     let mut exits = proc::ChildEvents::new();
     if !proc::group_gone(pgid, false).await {
-        // The moment a held stream would send `shell_exit`: v1.4 calls back.
+        // The moment a held stream would send `shell_exit`: notify calls back.
         {
             let mut j = locked(&cell);
             j.shell_exit = Some(code);
@@ -786,7 +779,7 @@ async fn supervise(
     for p in &pipes {
         p.abort();
     }
-    // The end is observable from here on: v1.4 calls back.
+    // The end is observable from here on: notify calls back.
     {
         let mut j = locked(&cell);
         j.end = Some(code);

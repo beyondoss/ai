@@ -3,7 +3,7 @@
 # A scripted conversation with the agent running on AWS, as a list of named checks.
 #
 #     ./deploy/demo/demo.sh         the core checks: a real model turn, a command in the sandbox, a
-#                                   background job whose end is pushed to the agent (exec v1.4), a
+#                                   background job whose end is pushed to the agent (exec notify), a
 #                                   forged callback, sessions sealed on EFS, and one billing row per call
 #     ./deploy/demo/demo.sh kill    start a background job, SIGKILL the agent, watch ECS replace it, and
 #                                   see the same session, and the job's end, come back
@@ -44,7 +44,7 @@ declare -A CHECK_TITLE=(
   [sandbox-exec]="The model runs a command in the sandbox"
   [sandbox-per-session]="Each session has its own E2B microVM"
   [sandbox-auth-required]="The public sandbox refuses a caller without the grant's bearer"
-  [background-job-notify]="A background job ends and the agent is told (exec v1.4)"
+  [background-job-notify]="A background job ends and the agent is told (exec notify)"
   [notify-forged-refused]="A forged job_ended is refused and changes nothing"
   [kill-and-recover]="The agent is SIGKILLed mid-job; the session survives"
   [sandbox-cannot-reach-store]="The sandbox cannot connect to the session store"

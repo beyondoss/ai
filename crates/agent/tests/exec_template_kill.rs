@@ -193,8 +193,12 @@ async fn a_template_command_still_reports_its_exit_and_cwd() {
         .await
         .unwrap();
     assert_eq!(res.code, Some(5));
-    assert!(res.stdout.contains("here.txt"), "{res:?}");
-    assert_eq!(res.stderr, "oops\n", "marker stripped, the rest intact");
+    assert!(res.stdout_text().contains("here.txt"), "{res:?}");
+    assert_eq!(
+        res.stderr_text(),
+        "oops\n",
+        "marker stripped, the rest intact"
+    );
     let missing = detaching_transport()
         .run(
             "true",

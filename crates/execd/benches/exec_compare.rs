@@ -11,7 +11,7 @@
 //! whole battery, in alternating order (AB, BA, AB...), so drift in this machine's load lands on
 //! both.
 //!
-//! Metrics: v1.1 round trip (sequential and at concurrency 16), v1.2 throughput and server CPU per
+//! Metrics: one-shot round trip (sequential and at concurrency 16), streaming throughput and server CPU per
 //! GB, time to first frame, server RSS (idle, 100 idle streams, 16 slow readers) and the latency of
 //! kill-on-disconnect. A summary (per metric, side and round: n, p50, p90, p99, max, mean) goes to
 //! the JSON file `EXEC_BENCH_OUT` (default `crates/execd/benches/results/<date>.json`) and a table
@@ -334,7 +334,7 @@ impl Conn {
         }
     }
 
-    /// A v1.1 exchange, whole: the exit code must be 0.
+    /// A one-shot exchange, whole: the exit code must be 0.
     async fn exec(&mut self, body: &Value) -> Res<()> {
         let st = self.request(body).await?;
         while self.fill().await? {}
@@ -348,7 +348,7 @@ impl Conn {
         Ok(())
     }
 
-    /// Open a v1.2 stream.
+    /// Open a stream.
     async fn stream(&mut self, mut body: Value) -> Res<()> {
         body["stream"] = json!(true);
         let st = self.request(&body).await?;

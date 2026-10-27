@@ -1,4 +1,4 @@
-//! A stateful randomized test of the v1.3 job table, against the real binary.
+//! A stateful randomized test of the job table, against the real binary.
 //!
 //! Random sequences of job operations (start held or unheld, keep with and without `notify`, attach
 //! from offsets, read, kill with and without remove, list, remove, wipe, seen, and a few malformed

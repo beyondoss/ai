@@ -3,15 +3,39 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { Files, Jobs, Sandbox } from "../src/index.js";
-import type { RunOptions, RunResult, Transport } from "../src/index.js";
+import { Files, SandboxError } from "../src/index.js";
+import type {
+  Frame,
+  JobOps,
+  RunOptions,
+  RunResult,
+  Transport,
+} from "../src/index.js";
+
+const refuse = (what: string) => (): never => {
+  throw new SandboxError("not_offered", `this transport has no ${what}`);
+};
 
 /**
- * Bring your own transport: raw exec on this machine, no HTTP anywhere. Everything in layers 2
- * and 3 works over it because it is built on `run` alone.
+ * Bring your own transport: raw exec on this machine, no HTTP anywhere. The file helpers work over
+ * it because they are built on `run` alone. This one has no streaming and no jobs, so it throws
+ * `not_offered` from them: the transport's own business, not a capability the client probes.
  */
 class LocalTransport implements Transport {
   calls = 0;
+  readonly jobs: JobOps = {
+    start: refuse("jobs"),
+    list: refuse("jobs"),
+    read: refuse("jobs"),
+    attach: refuse("jobs"),
+    kill: refuse("jobs"),
+    remove: refuse("jobs"),
+    wipe: refuse("jobs"),
+  };
+
+  stream(): AsyncIterable<Frame> {
+    return refuse("stream")();
+  }
 
   run(
     command: string,
@@ -52,13 +76,12 @@ class LocalTransport implements Transport {
 
 const dir = mkdtempSync(join(tmpdir(), "sandbox-ts-local-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
-const dec = (b: Uint8Array) => new TextDecoder().decode(b);
 
 describe("a user's own transport", () => {
   it("runs the file helpers over it", async () => {
     const t = new LocalTransport();
     const files = new Files(t);
-    expect((await files.capabilities()).stdin).toBe(true);
+    expect((await files.capabilities()).readWindow).toBe(true);
     await files.write(`${dir}/a.txt`, "hello\nworld needle\n");
     expect(await files.readText(`${dir}/a.txt`)).toBe("hello\nworld needle\n");
     expect(await files.stat(`${dir}/a.txt`)).toMatchObject({
@@ -73,57 +96,36 @@ describe("a user's own transport", () => {
     });
   });
 
-  it("does not stream or keep jobs natively, and says so", async () => {
-    const sb = new Sandbox(new LocalTransport());
-    expect(() => sb.stream("true")).toThrowError(/does not stream/);
-    expect(await sb.jobs.capabilities()).toBe("baseline");
+  it("reaches the sandbox with one probe round trip, then one per operation", async () => {
+    const t = new LocalTransport();
+    const files = new Files(t);
+    await files.write(`${dir}/b.txt`, "x");
+    expect(t.calls).toBe(2); // the probe, the write
+    await files.readText(`${dir}/b.txt`);
+    expect(t.calls).toBe(3);
   });
 
-  it("runs the baseline jobs over it", async () => {
-    const jobs = new Jobs(new LocalTransport(), { root: `${dir}/jobs` });
-    const scope = "local-scope";
-    try {
-      await jobs.start(scope, "j1", {
-        command: "sh",
-        args: ["-c", "echo out; echo err >&2; exit 2"],
-      });
-      const done = await jobs.attach(scope, "j1");
-      expect(done.exitCode).toBe(2);
-      expect(dec(done.output).split("\n").sort()).toEqual(["", "err", "out"]);
-    } finally {
-      await jobs.wipe(scope);
-    }
-  });
-
-  it("falls back to chunked writes when stdin is not delivered, and refuses to write through a lie", async () => {
-    class NoStdin extends LocalTransport {
-      override run(c: string, a: string[], o: RunOptions = {}) {
-        const { stdin: _drop, ...rest } = o;
-        return super.run(c, a, rest);
-      }
-    }
-    const files = new Files(new NoStdin());
-    expect((await files.capabilities()).stdin).toBe(false);
+  it("writes content larger than one read window through stdin, in one command", async () => {
+    const t = new LocalTransport();
+    const files = new Files(t);
     const data = new Uint8Array(100_000).map((_, i) => i % 251);
-    await files.write(`${dir}/chunked`, data);
+    await files.write(`${dir}/big`, data);
+    expect(t.calls).toBe(2); // the probe, one write
     expect(
-      Buffer.from(await files.read(`${dir}/chunked`)).equals(Buffer.from(data)),
+      Buffer.from(await files.read(`${dir}/big`)).equals(Buffer.from(data)),
     ).toBe(true);
+  });
 
-    // A transport that passed the probe once and then drops stdin: the size check fails the write.
-    let probes = 0;
-    class Flaky extends LocalTransport {
+  it("refuses to write through a transport that drops stdin: the size check fails the write", async () => {
+    class DropsStdin extends LocalTransport {
       override run(c: string, a: string[], o: RunOptions = {}) {
-        if (c === "cat" && probes++ === 0) return super.run(c, a, o);
         const { stdin: _drop, ...rest } = o;
         return super.run(c, a, rest);
       }
     }
     await new Files(new LocalTransport()).write(`${dir}/precious`, "keep me");
-    const flaky = new Files(new Flaky());
-    expect((await flaky.capabilities()).stdin).toBe(true);
-    await expect(flaky.write(`${dir}/precious`, "new content")).rejects
-      .toMatchObject({
+    await expect(new Files(new DropsStdin()).write(`${dir}/precious`, "new"))
+      .rejects.toMatchObject({
         kind: "io",
         detail: expect.stringContaining("short write"),
       });
@@ -134,5 +136,18 @@ describe("a user's own transport", () => {
         n.startsWith("precious")
       ),
     ).toEqual(["precious"]);
+  });
+});
+
+describe("round trips of the first file operation on a fresh sandbox", () => {
+  it("issues one probe and one command, whatever the first operation is", async () => {
+    for (const op of ["read", "write"] as const) {
+      await new Files(new LocalTransport()).write(`${dir}/rt`, "x");
+      const t = new LocalTransport();
+      const files = new Files(t);
+      if (op === "write") await files.write(`${dir}/rt`, "y");
+      else await files.read(`${dir}/rt`);
+      expect(t.calls, op).toBe(2);
+    }
   });
 });

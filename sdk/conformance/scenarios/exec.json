@@ -1,7 +1,7 @@
 {
   "suite": "exec",
   "version": 1,
-  "description": "Layer 1: the one-shot exec call, v1.1.",
+  "description": "Layer 1: the one-shot exec call.",
   "scenarios": [
     {
       "id": "exec.basic.streams-and-exit",
@@ -233,9 +233,6 @@
     {
       "id": "exec.stdin.text",
       "description": "stdin_b64 is fed to the command and then closed.",
-      "requires": {
-        "stdin": true
-      },
       "steps": [
         {
           "id": "a",
@@ -254,9 +251,6 @@
     {
       "id": "exec.stdin.binary-exact",
       "description": "All 256 byte values survive stdin, NULs included.",
-      "requires": {
-        "stdin": true
-      },
       "steps": [
         {
           "id": "a",
@@ -279,9 +273,6 @@
     {
       "id": "exec.stdin.empty-and-absent",
       "description": "An empty stdin and no stdin are both end-of-file immediately.",
-      "requires": {
-        "stdin": true
-      },
       "steps": [
         {
           "id": "empty",
@@ -311,9 +302,6 @@
     {
       "id": "exec.stdin.large",
       "description": "A 1 MiB stdin arrives whole.",
-      "requires": {
-        "stdin": true
-      },
       "steps": [
         {
           "id": "a",
@@ -355,42 +343,11 @@
           "expect": {
             "ok": {
               "exit_code": 0,
-              "stdout_b64": "Yf9i",
-              "exact": true
+              "stdout_b64": "Yf9i"
             }
           }
         }
-      ],
-      "requires": {
-        "exact_exec": true
-      }
-    },
-    {
-      "id": "exec.stdout.non-utf8-is-lossy",
-      "description": "A text-only endpoint (no output_base64, no streaming) answers text: bytes that are not valid UTF-8 come back as U+FFFD, which is why file helpers base64 content. The client says so: exact is false.",
-      "steps": [
-        {
-          "id": "a",
-          "op": "exec",
-          "command": "sh",
-          "args": [
-            "-c",
-            "printf 'a\\377b'",
-            "sh"
-          ],
-          "expect": {
-            "ok": {
-              "exit_code": 0,
-              "stdout_utf8": "a�b",
-              "stdout_b64": "Ye+/vWI=",
-              "exact": false
-            }
-          }
-        }
-      ],
-      "requires": {
-        "exact_exec": false
-      }
+      ]
     },
     {
       "id": "exec.stdout.nul-and-control-bytes-in-text",

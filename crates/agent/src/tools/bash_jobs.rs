@@ -158,7 +158,7 @@ pub(crate) struct JobShared {
     table: Weak<BashJobs>,
     /// The model's command, truncated — what a journaled record names it by.
     command: OnceLock<String>,
-    /// exec v1.4: how the session's notify driver steers the task that holds this job's stream
+    /// exec notify: how the session's notify driver steers the task that holds this job's stream
     /// ([`super::bash_sandbox::Ctl`]). Set by that task while it can be steered.
     ctl: Mutex<Option<tokio::sync::mpsc::UnboundedSender<super::bash_sandbox::Ctl>>>,
     /// When the job ended, if a listing said so before its end was read ([`Self::finish`]).
@@ -472,7 +472,7 @@ pub struct BashJobs {
     checked_gone: Mutex<Vec<(u64, String)>>,
     /// Sandbox jobs a tool call has taken out of the table ([`Self::take`]), while it has them.
     in_call: Mutex<Vec<Weak<JobShared>>>,
-    /// exec v1.4: the session's notify driver, where the host registered one (`serve --service`).
+    /// exec notify: the session's notify driver, where the host registered one (`serve --service`).
     notify: Mutex<Option<Weak<super::job_notify::SessionNotify>>>,
 }
 
@@ -1569,7 +1569,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// How exec v1.4's notify driver sees this table ([`super::job_notify`]).
+/// How exec notify's notify driver sees this table ([`super::job_notify`]).
 impl super::job_notify::JobTracker for BashJobs {
     fn facts(&self, id: &crate::exec_endpoint::jobs::JobId) -> super::job_notify::kernel::Facts {
         use super::job_notify::kernel::{Facts, TableJob};

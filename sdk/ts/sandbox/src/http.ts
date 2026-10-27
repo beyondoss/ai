@@ -1,8 +1,7 @@
-import { concat, fromBase64, text, toBase64, utf8 } from "./bytes.js";
+import { concat, fromBase64, text, toBase64 } from "./bytes.js";
 import {
   AuthError,
   EndpointError,
-  NotOfferedError,
   ProtocolError,
   SandboxError,
   TimeoutError,
@@ -14,10 +13,9 @@ import type {
   JobChunk,
   JobFrame,
   JobInfo,
+  JobOps,
   JobSpec,
   JobState,
-  NativeJobs,
-  Offers,
   RunOptions,
   RunResult,
   Survivor,
@@ -40,16 +38,6 @@ const STREAM_DEADLINE_MS = 2_147_483_647;
 const MAX_TIMER_MS = 2_147_483_647;
 const JOB_OP_TIMEOUT_MS = 30_000;
 const KILL_GRACE_MS = 300;
-const PROBE_TIMEOUT_MS = 10_000;
-/** The v1.2 probe: output, a pause, more output. */
-const STREAM_PROBE_SCRIPT =
-  "printf a; sleep 0.3 2>/dev/null || sleep 1; printf b";
-const STREAM_PROBE_MIN_GAP_MS = 100;
-/** The `output_base64` probe: the bytes `ff 00 0a`, which no text round trip keeps. */
-export const OUTPUT_PROBE_SCRIPT = "printf '\\377\\000\\n'";
-export const OUTPUT_PROBE_BYTES = Uint8Array.of(0xff, 0x00, 0x0a);
-/** What a v1.1 endpoint puts at the end of stderr for a command it killed at its deadline. */
-const TIMEOUT_NOTE = "command exceeded its timeout";
 /** Room for the JSON around two base64 strings. */
 const ENVELOPE_SLACK = 4096;
 
@@ -89,25 +77,19 @@ interface Body {
   timeoutMs: number;
   stdin?: Uint8Array | undefined;
   stream?: boolean | undefined;
-  outputBase64?: boolean | undefined;
   job?: Record<string, unknown> | undefined;
 }
 
-/** The default transport: the exec protocol (v1.1 to v1.3) over HTTP `POST`. */
+/** The default transport: the exec protocol over HTTP `POST`. */
 export class HttpTransport implements Transport {
   readonly url: string;
-  readonly nativeJobs: NativeJobs;
+  readonly jobs: JobOps;
   private readonly tokenSource: string | (() => Promise<string>) | undefined;
   private tokenValue: string | undefined;
   private readonly headers: Record<string, string>;
   private readonly cap: number;
   private readonly grace: number;
   private readonly fetchFn: typeof fetch;
-  private readonly learned: {
-    stream?: Promise<boolean>;
-    jobs?: Promise<boolean>;
-    output?: Promise<boolean>;
-  } = {};
 
   constructor(options: HttpTransportOptions) {
     this.url = options.url;
@@ -119,7 +101,7 @@ export class HttpTransport implements Transport {
     this.cap = options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
     this.grace = options.deadlineGraceMs ?? DEADLINE_GRACE_MS;
     this.fetchFn = options.fetch ?? ((...a) => globalThis.fetch(...a));
-    this.nativeJobs = new HttpNativeJobs(this);
+    this.jobs = new HttpJobs(this);
   }
 
   // ---- layer 1: one-shot ---------------------------------------------------------------------
@@ -129,98 +111,26 @@ export class HttpTransport implements Transport {
     args: string[],
     options: RunOptions = {},
   ): Promise<RunResult> {
-    const { text: asText, ...rest } = options;
-    const timeoutMs = rest.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    if (!asText) {
-      // The command's bytes: `output_base64` when the endpoint honours it, else a v1.2 stream's
-      // base64 frames. A probe that failed throws here; it is never read as "not supported".
-      if (await this.once("output", () => this.probeOutput())) {
-        const ex = await this.post({
-          command,
-          args,
-          ...rest,
-          timeoutMs,
-          outputBase64: true,
-        });
-        try {
-          return decodeOutput(
-            this.parseObject(await this.readBounded(ex, bodyCap(this.cap))),
-            this.url,
-            this.cap,
-          );
-        } finally {
-          ex.close();
-        }
-      }
-      // A stream has no stdin in the spec: a call with stdin is a v1.1 call, whose text is what it is.
-      if (
-        rest.stdin === undefined
-        && await this.once("stream", () => this.probeStream())
-      ) {
-        return this.runOverStream(command, args, rest, timeoutMs);
-      }
-    }
-    const ex = await this.post({ command, args, ...rest, timeoutMs });
+    const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const ex = await this.post({ command, args, ...options, timeoutMs });
     try {
-      return this.envelope(await this.readEnvelope(ex));
-    } finally {
-      ex.close();
-    }
-  }
-
-  /** A one-shot call over a v1.2 stream: the frames are base64 already. Answered at the command's exit. */
-  private async runOverStream(
-    command: string,
-    args: string[],
-    options: RunOptions,
-    timeoutMs: number,
-  ): Promise<RunResult> {
-    const ex = await this.post({
-      command,
-      args,
-      ...options,
-      timeoutMs,
-      stream: true,
-    });
-    try {
-      if (!isNdjson(ex.res)) {
-        // One object after all (a fleet mid-rollout): text.
-        return this.envelope(await this.readEnvelope(ex));
-      }
-      const fold = new OneShot();
-      for await (const line of this.lines(ex)) {
-        for (const f of decodeFrameLine(line, this.url)) {
-          if (f === "heartbeat") continue;
-          if (f.type === "error") {
-            throw new TransportError(
-              `exec endpoint ${this.url}: the endpoint failed mid-command: ${f.message} (the command may have been killed)`,
-            );
-          }
-          const done = fold.feed(f);
-          if (done) return done;
-          if (fold.size > this.cap) throw tooLarge(this.url, this.cap);
-        }
-      }
-      throw new TransportError(
-        `exec endpoint ${this.url}: the stream ended before the command's final frame (the command may have been killed)`,
+      return decodeOutput(
+        this.parseObject(await this.readBounded(ex, bodyCap(this.cap))),
+        this.url,
+        this.cap,
       );
     } finally {
       ex.close();
     }
   }
 
-  // ---- layer 1: stream (v1.2) ----------------------------------------------------------------
+  // ---- layer 1: stream -----------------------------------------------------------------------
 
   async *stream(
     command: string,
     args: string[],
     options: RunOptions = {},
   ): AsyncGenerator<Frame> {
-    if (!(await this.once("stream", () => this.probeStream()))) {
-      throw new NotOfferedError(
-        `exec endpoint ${this.url} did not prove it streams (protocol v1.1); the command was not run`,
-      );
-    }
     const timeoutMs = options.timeoutMs ?? STREAM_DEADLINE_MS;
     const ex = await this.post({
       command,
@@ -231,12 +141,9 @@ export class HttpTransport implements Transport {
     });
     try {
       if (!isNdjson(ex.res)) {
-        // A fleet mid-rollout answered with one object after all.
-        const r = this.envelope(await this.readEnvelope(ex));
-        if (r.stdout.length) yield { type: "stdout", data: r.stdout };
-        if (r.stderr.length) yield { type: "stderr", data: r.stderr };
-        yield { type: "exit", code: r.exitCode };
-        return;
+        throw new ProtocolError(
+          `exec endpoint ${this.url} answered a stream request with something that is not a stream`,
+        );
       }
       for await (const line of this.lines(ex)) {
         for (const f of decodeFrameLine(line, this.url)) {
@@ -255,142 +162,6 @@ export class HttpTransport implements Transport {
       throw new TransportError(
         `exec endpoint ${this.url}: the stream ended before the command's final frame (the command may have been killed)`,
       );
-    } finally {
-      ex.close();
-    }
-  }
-
-  // ---- probes --------------------------------------------------------------------------------
-
-  /** What the endpoint offers (v1.2 streaming, v1.3 jobs, exact output), probed once each. A failed probe is retried. */
-  async offers(): Promise<Offers> {
-    const stream = await this.once("stream", () => this.probeStream());
-    const nativeJobs = await this.once("jobs", () => this.probeJobs());
-    const outputBase64 = await this.once("output", () => this.probeOutput());
-    return { stream, nativeJobs, outputBase64 };
-  }
-
-  /** Probe once: the answer is kept; a probe that threw is forgotten so the next call asks again. */
-  private once(
-    key: "stream" | "jobs" | "output",
-    probe: () => Promise<boolean>,
-  ): Promise<boolean> {
-    let p = this.learned[key];
-    if (!p) {
-      p = probe();
-      this.learned[key] = p;
-      const mine = p;
-      mine.catch(() => {
-        if (this.learned[key] === mine) delete this.learned[key];
-      });
-    }
-    return p;
-  }
-
-  /**
-   * The v1.1 `output_base64` probe: `printf '\377\000\n'` must come back as `stdout_base64`
-   * decoding to exactly `ff 00 0a`. A `400` is a strict front refusing the field: not supported.
-   * A request that failed is an error, never "not supported".
-   */
-  private async probeOutput(): Promise<boolean> {
-    let ex: Exchange;
-    try {
-      ex = await this.post({
-        command: "sh",
-        args: ["-c", OUTPUT_PROBE_SCRIPT],
-        timeoutMs: PROBE_TIMEOUT_MS,
-        outputBase64: true,
-      });
-    } catch (e) {
-      if (e instanceof EndpointError && e.status === 400) return false;
-      throw e;
-    }
-    try {
-      const v = this.parseObject(
-        await this.readBounded(ex, bodyCap(OUTPUT_PROBE_BYTES.length)),
-      );
-      checkExitCode(v, this.url);
-      return probeHonoured(v);
-    } finally {
-      ex.close();
-    }
-  }
-
-  private async probeStream(): Promise<boolean> {
-    let ex: Exchange;
-    try {
-      ex = await this.post({
-        command: "sh",
-        args: ["-c", STREAM_PROBE_SCRIPT],
-        timeoutMs: PROBE_TIMEOUT_MS,
-        stream: true,
-      });
-    } catch (e) {
-      // A front that refuses `stream` has answered: it does not stream.
-      if (e instanceof EndpointError && e.status === 400) return false;
-      throw e;
-    }
-    try {
-      if (!isNdjson(ex.res)) return false;
-      let frames = 0;
-      let out = "";
-      let firstAt: number | undefined;
-      let gap: number | undefined;
-      let end: Frame | undefined;
-      for await (const line of this.lines(ex)) {
-        for (const f of decodeFrameLine(line, this.url)) {
-          if (f === "heartbeat") continue;
-          if (f.type === "error") {
-            throw new TransportError(`exec endpoint ${this.url}: ${f.message}`);
-          }
-          if (f.type === "stdout" || f.type === "stderr") {
-            frames++;
-            firstAt ??= performance.now();
-            if (f.type === "stdout") out += text(f.data);
-          } else if (
-            f.type === "exit" || f.type === "signal" || f.type === "timed_out"
-          ) {
-            end = f;
-            if (firstAt !== undefined) gap = performance.now() - firstAt;
-          }
-        }
-        if (end) break;
-      }
-      return (
-        frames >= 2
-        && out === "ab"
-        && end?.type === "exit"
-        && end.code === 0
-        && gap !== undefined
-        && gap >= STREAM_PROBE_MIN_GAP_MS
-      );
-    } finally {
-      ex.close();
-    }
-  }
-
-  private async probeJobs(): Promise<boolean> {
-    let ex: Exchange;
-    try {
-      ex = await this.post({
-        command: "sh",
-        args: ["-c", "printf exec-v1.2"],
-        timeoutMs: PROBE_TIMEOUT_MS,
-        job: { op: "probe" },
-      });
-    } catch (e) {
-      if (e instanceof EndpointError && e.status === 400) return false;
-      throw e;
-    }
-    try {
-      const { body, over } = await this.readCapped(ex);
-      if (over) return false;
-      try {
-        const v: unknown = JSON.parse(text(body));
-        return isRecord(v) && v.jobs === "v1.3";
-      } catch {
-        return false;
-      }
     } finally {
       ex.close();
     }
@@ -424,9 +195,8 @@ export class HttpTransport implements Transport {
       timeout_ms: body.timeoutMs,
     };
     if (body.cwd !== undefined) payload.cwd = body.cwd;
-    if (body.stdin !== undefined) payload.stdin_base64 = toBase64(body.stdin);
+    if (body.stdin !== undefined) payload.stdin = toBase64(body.stdin);
     if (body.stream) payload.stream = true;
-    if (body.outputBase64) payload.output_base64 = true;
     if (body.job !== undefined) payload.job = body.job;
     const json = JSON.stringify(payload);
     const deadline = Math.min(body.timeoutMs + this.grace, MAX_TIMER_MS);
@@ -541,11 +311,6 @@ export class HttpTransport implements Transport {
       });
   }
 
-  /** Read and parse a v1.1 body: one JSON object, capped. */
-  async readEnvelope(ex: Exchange): Promise<Record<string, unknown>> {
-    return this.parseObject(await this.readBounded(ex, this.cap));
-  }
-
   /** The whole body, at most `bound` bytes of it; more is the cap's error (the command ran). */
   private async readBounded(ex: Exchange, bound: number): Promise<Uint8Array> {
     const { body, over } = await this.readCapped(ex, bound);
@@ -572,22 +337,6 @@ export class HttpTransport implements Transport {
       );
     }
     return v;
-  }
-
-  private envelope(v: Record<string, unknown>): RunResult {
-    const code = v.exit_code;
-    if (typeof code !== "number" || !Number.isInteger(code)) {
-      throw new ProtocolError(
-        `exec endpoint ${this.url} returned unparseable JSON (no integer exit_code)`,
-      );
-    }
-    const str = (x: unknown): string => (typeof x === "string" ? x : "");
-    return {
-      exitCode: code,
-      stdout: utf8(str(v.stdout)),
-      stderr: utf8(str(v.stderr)),
-      exact: false,
-    };
   }
 
   /** The lines of a streamed body, each without its newline. Presumes a dead connection after 30 s of silence. */
@@ -711,65 +460,33 @@ function tooLarge(url: string, cap: number): TooLargeError {
 }
 
 /**
- * The most body a client reads for an `output_base64` answer under response cap `cap`: the base64
- * of `cap` decoded bytes plus the envelope. The cap itself is on the decoded bytes.
+ * The most body a client reads for a one-shot answer under response cap `cap`: the base64 of `cap`
+ * decoded bytes plus the envelope. The cap itself is on the decoded bytes.
  */
 export function bodyCap(cap: number): number {
   return Math.ceil(cap / 3) * 4 + ENVELOPE_SLACK;
 }
 
-function checkExitCode(v: Record<string, unknown>, url: string): number {
-  const code = v.exit_code;
-  if (typeof code !== "number" || !Number.isInteger(code)) {
-    throw new ProtocolError(
-      `exec endpoint ${url} returned unparseable JSON (no integer exit_code)`,
-    );
-  }
-  return code;
-}
-
-/** Whether a probe's answer shows `output_base64` honoured: `stdout_base64` decoding to `ff 00 0a`. */
-export function probeHonoured(v: Record<string, unknown>): boolean {
-  const b = typeof v.stdout_base64 === "string"
-    ? fromBase64(v.stdout_base64)
-    : null;
-  return b !== null && b.length === OUTPUT_PROBE_BYTES.length
-    && b.every((x, i) => x === OUTPUT_PROBE_BYTES[i]);
-}
-
 /**
- * An `output_base64` answer. Both `stdout_base64` and `stderr_base64`: the bytes, exact (text fields
- * beside them are ignored). Neither: the endpoint did not honour the field this time (one replica of
- * a fleet in rollout), so it is a text answer and says so. One without the other is malformed, and an
- * error: reading the missing stream as empty would lose output without a word. The cap is on the
- * decoded bytes of both streams together.
+ * A one-shot answer: `exit_code`, and `stdout` and `stderr` as standard base64 (the empty string
+ * for no output). A field that is missing or not base64 is a protocol error, never read as empty.
+ * The cap is on the decoded bytes of both streams together.
  */
 export function decodeOutput(
   v: Record<string, unknown>,
   url: string,
   cap: number,
 ): RunResult {
-  const exitCode = checkExitCode(v, url);
-  const hasOut = v.stdout_base64 !== undefined;
-  const hasErr = v.stderr_base64 !== undefined;
-  if (!hasOut && !hasErr) {
-    const str = (x: unknown): string => (typeof x === "string" ? x : "");
-    return {
-      exitCode,
-      stdout: utf8(str(v.stdout)),
-      stderr: utf8(str(v.stderr)),
-      exact: false,
-    };
-  }
-  if (hasOut !== hasErr) {
+  const code = v.exit_code;
+  if (typeof code !== "number" || !Number.isInteger(code)) {
     throw new ProtocolError(
-      `exec endpoint ${url}: the answer has only one of \`stdout_base64\` and \`stderr_base64\``,
+      `exec endpoint ${url} returned unparseable JSON (no integer exit_code)`,
     );
   }
-  const stdout = b64Output("stdout_base64", v.stdout_base64, url);
-  const stderr = b64Output("stderr_base64", v.stderr_base64, url);
+  const stdout = b64Output("stdout", v.stdout, url);
+  const stderr = b64Output("stderr", v.stderr, url);
   if (stdout.length + stderr.length > cap) throw tooLarge(url, cap);
-  return { exitCode, stdout, stderr, exact: true };
+  return { exitCode: code, stdout, stderr };
 }
 
 function b64Output(field: string, s: unknown, url: string): Uint8Array {
@@ -780,57 +497,6 @@ function b64Output(field: string, s: unknown, url: string): Uint8Array {
     );
   }
   return b;
-}
-
-/**
- * Frames of a one-shot call made over a v1.2 stream, folded into the v1.1 shape of its result.
- * A one-shot call is answered when the command exits, so `shell_exit` ends it too: what the command
- * left running is not its business (closing the stream has the endpoint kill it).
- */
-export class OneShot {
-  private readonly out: Uint8Array[] = [];
-  private readonly err: Uint8Array[] = [];
-  /** Output held so far. */
-  size = 0;
-
-  /** The finished result at the frame that ends the call, `undefined` before it. */
-  feed(f: Frame): RunResult | undefined {
-    let code: number;
-    switch (f.type) {
-      case "stdout":
-        this.out.push(f.data);
-        this.size += f.data.length;
-        return undefined;
-      case "stderr":
-        this.err.push(f.data);
-        this.size += f.data.length;
-        return undefined;
-      case "shell_exit":
-      case "exit":
-        code = f.code;
-        break;
-      case "signal":
-        code = 128 + f.signal;
-        break;
-      case "timed_out": {
-        code = 124;
-        const had = concat(this.err);
-        this.err.length = 0;
-        const note = utf8(TIMEOUT_NOTE);
-        const sep = had.length > 0 && had[had.length - 1] !== 0x0a
-          ? [0x0a]
-          : [];
-        this.err.push(had, Uint8Array.from(sep), note);
-        break;
-      }
-    }
-    return {
-      exitCode: code,
-      stdout: concat(this.out),
-      stderr: concat(this.err),
-      exact: true,
-    };
-  }
 }
 
 type Decoded = Frame | { type: "error"; message: string } | "heartbeat";
@@ -846,7 +512,7 @@ function b64Field(field: string, s: unknown, url: string): Uint8Array {
 }
 
 /**
- * One line of a v1.2 stream. A frame names exactly one field; one that names more is split rather
+ * One line of a stream. A frame names exactly one field; one that names more is split rather
  * than truncated (output first, then the final field), and one with no known field is a heartbeat.
  */
 export function decodeFrameLine(line: Uint8Array, url = "endpoint"): Decoded[] {
@@ -889,7 +555,7 @@ export function decodeFrameLine(line: Uint8Array, url = "endpoint"): Decoded[] {
   return out;
 }
 
-// ---- native jobs (v1.3) ----------------------------------------------------------------------
+// ---- jobs ----------------------------------------------------------------------
 
 function jobState(
   state: unknown,
@@ -939,7 +605,7 @@ function parseSurvivors(v: Record<string, unknown>): Survivor[] {
   });
 }
 
-class HttpNativeJobs implements NativeJobs {
+class HttpJobs implements JobOps {
   private readonly t: HttpTransport;
 
   constructor(t: HttpTransport) {
@@ -1080,7 +746,7 @@ export function isJobId(s: string): boolean {
   return /^[0-9a-z]{1,32}$/.test(s);
 }
 
-/** One line of a v1.3 job stream: v1.2's frames plus `started` and `gap`. */
+/** One line of a job stream: the stream frames plus `started` and `gap`. */
 export function decodeJobFrame(line: Uint8Array): JobFrame | "heartbeat" {
   let s = text(line);
   if (s.endsWith("\r")) s = s.slice(0, -1);

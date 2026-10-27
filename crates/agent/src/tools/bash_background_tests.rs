@@ -417,7 +417,7 @@ async fn run_in_background_must_be_a_boolean() {
     assert_eq!(out, "hi\n");
 }
 
-/// A runner that cannot track a job (a v1.1 exec endpoint; here the default trait methods) is
+/// A runner that cannot track a job (a one-shot exec endpoint; here the default trait methods) is
 /// refused before anything runs.
 #[tokio::test]
 async fn a_runner_that_cannot_track_jobs_refuses_background_without_running_it() {

@@ -1,5 +1,5 @@
 {
-  "spec": "exec protocol v1.2 streamed response (crates/sandbox/src/exec_endpoint.rs, \"Streaming (v1.2)\")",
+  "spec": "exec protocol streamed response (crates/sandbox/src/exec_endpoint.rs, \"Streaming\")",
   "notes": [
     "Each case is the body of one application/x-ndjson response, one string per line, without the trailing newline.",
     "expect.stdout_base64 / expect.stderr_base64 are the bytes a conforming client hands the caller, in order.",

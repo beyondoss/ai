@@ -9,10 +9,9 @@
 //!   cargo nextest run -p beyond-agent -E 'test(/^exec_conformance::/)' --no-capture
 //! ```
 //!
-//! It requires v1.2; set `AGENT_CONFORMANCE_ALLOW_V11=1` to accept a v1.1 endpoint (whose streaming
-//! checks are then skipped). Skipped when the URL is unset.
+//! Skipped when the URL is unset.
 //!
-//! The v1.4 (job notify) checks run a callback receiver here. By default it listens on an
+//! The job notify checks run a callback receiver here. By default it listens on an
 //! ephemeral loopback port, which a sandbox on this host's loopback reaches. For a sandbox
 //! elsewhere, set `AGENT_CONFORMANCE_CALLBACK_LISTEN` (an address to listen on) and
 //! `AGENT_CONFORMANCE_CALLBACK_ORIGIN` (an `https` origin that forwards to it; the TLS check is then
@@ -20,7 +19,7 @@
 //! (default 30).
 //!
 //! **Against the in-repo mock endpoints**, always: the verifier must pass a conforming endpoint and
-//! fail each of the ways an endpoint gets v1.2, v1.3 or v1.4 wrong (one broken mock per v1.4 check)
+//! fail each of the ways an endpoint gets the protocol wrong (one broken mock per notify check)
 //! — otherwise a green run against a real endpoint would mean nothing.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -66,97 +65,19 @@ async fn verify_mock(opts: MockOptions, expect: &Expectations) -> conformance::R
 async fn a_conforming_endpoint_passes_every_check() {
     let (opts, expect) = quick();
     let report = verify_mock(opts, &expect).await;
-    assert!(report.streams);
-    assert!(report.jobs, "the default mock offers v1.3 jobs");
-    assert!(!report.notify, "its deployment setting is off by default");
-    assert!(report.passed(), "{}", report.render());
-    let skipped: Vec<&str> = report
-        .checks
-        .iter()
-        .filter(|c| c.verdict != Verdict::Pass)
-        .map(|c| c.name)
-        .collect();
-    assert_eq!(skipped, conformance::notify::CHECKS, "{}", report.render());
-    assert_eq!(report.checks.len(), 20 + conformance::notify::CHECKS.len());
-}
-
-/// The reference v1.4 endpoint passes every check, the v1.4 ones included.
-#[tokio::test]
-async fn a_conforming_v14_endpoint_passes_every_check() {
-    let (opts, expect) = quick();
-    let report = verify_mock(
-        MockOptions {
-            kept_jobs_survive_idle: true,
-            ..opts
-        },
-        &expect,
-    )
-    .await;
-    assert!(report.jobs && report.notify);
     assert!(
         report.checks.iter().all(|c| c.verdict == Verdict::Pass),
         "{}",
         report.render()
     );
-    assert_eq!(report.checks.len(), 20 + conformance::notify::CHECKS.len());
-    assert!(report.render().contains("v1.4"), "{}", report.render());
+    assert_eq!(report.checks.len(), 18 + conformance::notify::CHECKS.len());
 }
 
-/// The endpoint modes that do not offer notify natively pass, their v1.4 checks skipped: one that
-/// knows it has no egress, an idle-killing sandbox deployed honestly, and one that offers notify
-/// for the baseline.
-#[tokio::test]
-async fn endpoints_without_native_notify_pass_with_its_checks_skipped() {
-    let (opts, expect) = quick();
-    for (name, o, notify) in [
-        (
-            "no egress",
-            MockOptions {
-                kept_jobs_survive_idle: true,
-                egress: false,
-                ..opts.clone()
-            },
-            false,
-        ),
-        (
-            "an idle-killing sandbox",
-            MockOptions {
-                idle_kill: Some(Duration::from_millis(2500)),
-                ..opts.clone()
-            },
-            false,
-        ),
-        (
-            "notify for the baseline",
-            MockOptions {
-                jobs: false,
-                kept_jobs_survive_idle: true,
-                ..opts.clone()
-            },
-            true,
-        ),
-    ] {
-        let report = verify_mock(o, &expect).await;
-        assert!(report.passed(), "{name}: {}", report.render());
-        assert_eq!(report.notify, notify, "{name}");
-        for check in &conformance::notify::CHECKS[1..] {
-            assert_eq!(
-                report.check(check).unwrap().verdict,
-                Verdict::Skip,
-                "{name}: {check}"
-            );
-        }
-    }
-}
-
-/// A conforming v1.4 mock with one fault: of the v1.4 checks, exactly `check` fails. (The v1.2 and
-/// v1.3 checks are other tests' business: a loaded host blurs their timings, not this rule.)
+/// A conforming mock with one fault: of the notify checks, exactly `check` fails. (The other checks
+/// are other tests' business: a loaded host blurs their timings, not this rule.)
 async fn fails_only(check: &str, opts: impl FnOnce(MockOptions) -> MockOptions) {
     let (base, expect) = quick();
-    let opts = opts(MockOptions {
-        kept_jobs_survive_idle: true,
-        ..base
-    });
+    let opts = opts(MockOptions { ..base });
     // The idle window outlasts the idle-killing variant's 2.5 s.
     let expect = Expectations {
         notify_idle: Duration::from_millis(3500),
@@ -176,7 +97,7 @@ fn with(f: NotifyFaults) -> impl FnOnce(MockOptions) -> MockOptions {
     move |o| MockOptions { faults: f, ..o }
 }
 
-/// One broken endpoint per v1.4 check, each failing exactly that check.
+/// One broken endpoint per notify check, each failing exactly that check.
 macro_rules! broken {
     ($($name:ident: $check:ident <= $opts:expr;)*) => {
         $(
@@ -185,9 +106,9 @@ macro_rules! broken {
                 fails_only(conformance::notify::$check, $opts).await;
             }
         )*
-        /// Every v1.4 check has its broken endpoint above.
+        /// Every notify check has its broken endpoint above.
         #[test]
-        fn every_v14_check_has_a_broken_endpoint() {
+        fn every_notify_check_has_a_broken_endpoint() {
             let mut named = vec![$(conformance::notify::$check),*];
             named.sort_unstable();
             let mut all = conformance::notify::CHECKS.to_vec();
@@ -198,11 +119,7 @@ macro_rules! broken {
 }
 
 broken! {
-    notify_answered_as_a_boolean_fails_the_offer: NOTIFY <= with(NotifyFaults {
-        probe_notify: Some(serde_json::json!(true)),
-        ..NotifyFaults::default()
-    });
-    an_idle_killing_sandbox_that_advertises_fails_idling: IDLE <= |o| MockOptions {
+    an_idle_killing_sandbox_fails_idling: IDLE <= |o| MockOptions {
         idle_kill: Some(Duration::from_millis(2500)),
         ..o
     };
@@ -261,38 +178,6 @@ broken! {
 }
 
 #[tokio::test]
-async fn a_v12_endpoint_passes_with_its_job_checks_skipped() {
-    let (opts, expect) = quick();
-    let report = verify_mock(
-        MockOptions {
-            jobs: false,
-            ..opts
-        },
-        &expect,
-    )
-    .await;
-    assert!(report.streams && !report.jobs);
-    assert!(report.passed(), "{}", report.render());
-    for name in [
-        conformance::JOBS,
-        conformance::JOBS_HOLD,
-        conformance::JOBS_KEEP,
-    ] {
-        assert_eq!(
-            report.check(name).unwrap().verdict,
-            Verdict::Skip,
-            "{name}: {}",
-            report.render()
-        );
-    }
-    assert!(
-        report.render().contains("plain exec commands"),
-        "{}",
-        report.render()
-    );
-}
-
-#[tokio::test]
 async fn an_endpoint_whose_dropped_hold_leaves_the_job_running_fails_the_hold_check() {
     let (opts, expect) = quick();
     let report = verify_mock(
@@ -318,29 +203,6 @@ async fn an_endpoint_whose_dropped_hold_leaves_the_job_running_fails_the_hold_ch
             .contains("die with its connection"),
         "{}",
         report.render()
-    );
-}
-
-#[tokio::test]
-async fn a_v11_endpoint_passes_with_its_streaming_checks_skipped() {
-    let (opts, expect) = quick();
-    let report = verify_mock(
-        MockOptions {
-            protocol: Protocol::V11,
-            ..opts
-        },
-        &expect,
-    )
-    .await;
-    assert!(!report.streams);
-    assert!(report.passed(), "{}", report.render());
-    assert_eq!(
-        report.check(conformance::ENVELOPE).unwrap().verdict,
-        Verdict::Pass
-    );
-    assert_eq!(
-        report.check(conformance::DISCONNECT).unwrap().verdict,
-        Verdict::Skip
     );
 }
 
@@ -422,14 +284,14 @@ async fn an_endpoint_that_survives_a_disconnect_fails_the_kill_check() {
     );
 }
 
-/// An endpoint that ignores `timeout_ms` over v1.1 runs a hung command until the client leaves; the
+/// An endpoint that ignores `timeout_ms` on a one-shot request runs a hung command until the client leaves; the
 /// verifier must catch it, and only it.
 #[tokio::test]
-async fn an_endpoint_that_ignores_the_v11_timeout_fails_that_check_alone() {
+async fn an_endpoint_that_ignores_the_one_shot_timeout_fails_that_check_alone() {
     let (opts, expect) = quick();
     let report = verify_mock(
         MockOptions {
-            v11_timeout: false,
+            enforces_timeout: false,
             ..opts
         },
         &expect,
@@ -458,65 +320,26 @@ async fn an_endpoint_that_ignores_the_v11_timeout_fails_that_check_alone() {
     );
 }
 
-/// An endpoint that answers `output_base64` with the base64 fields but converts through lossy UTF-8
-/// first claims what it does not deliver: the verifier must catch it, and only it.
+/// An endpoint whose base64 is not base64 delivers nothing the client can decode: the verifier must
+/// catch it, and only it.
 #[tokio::test]
-async fn an_endpoint_that_base64s_lossy_text_fails_the_byte_check_alone() {
+async fn an_endpoint_with_corrupt_base64_fails_the_byte_check() {
     let (opts, expect) = quick();
     let report = verify_mock(
         MockOptions {
-            lossy_output_base64: true,
+            corrupts_base64: true,
             ..opts
         },
         &expect,
     )
     .await;
-    let failed: Vec<&str> = report
-        .checks
-        .iter()
-        .filter(|c| c.verdict == Verdict::Fail)
-        .map(|c| c.name)
-        .collect();
-    // The probe's `ff` also came back as U+FFFD, so the claim itself is the first thing wrong.
-    assert_eq!(
-        failed,
-        vec![conformance::OUTPUT_BASE64, conformance::OUTPUT_BYTES],
-        "{}",
-        report.render()
-    );
+    let check = report.check(conformance::OUTPUT_BYTES).unwrap();
+    assert_eq!(check.verdict, Verdict::Fail, "{}", report.render());
     assert!(
-        report
-            .check(conformance::OUTPUT_BYTES)
-            .unwrap()
-            .detail
-            .contains("first difference"),
+        check.detail.contains("not standard base64"),
         "{}",
-        report.render()
+        check.detail
     );
-}
-
-/// An endpoint that predates `output_base64` is not held to it: a plain v1.1 or v1.2 endpoint passes
-/// with the two checks skipped.
-#[tokio::test]
-async fn an_endpoint_without_output_base64_passes_with_its_checks_skipped() {
-    let (opts, expect) = quick();
-    let report = verify_mock(
-        MockOptions {
-            honors_output_base64: false,
-            ..opts
-        },
-        &expect,
-    )
-    .await;
-    assert!(report.passed(), "{}", report.render());
-    for name in [conformance::OUTPUT_BASE64, conformance::OUTPUT_BYTES] {
-        assert_eq!(
-            report.check(name).unwrap().verdict,
-            Verdict::Skip,
-            "{}",
-            report.render()
-        );
-    }
 }
 
 #[tokio::test]
@@ -543,11 +366,4 @@ async fn a_live_endpoint_conforms() {
     let report = verify(&url, &headers, &expect).await;
     println!("{}", report.render());
     assert!(report.passed(), "{}", report.render());
-    if std::env::var("AGENT_CONFORMANCE_ALLOW_V11").as_deref() != Ok("1") {
-        assert!(
-            report.streams,
-            "a v1.1 endpoint: `bash` cannot yield or kill its commands (set \
-             AGENT_CONFORMANCE_ALLOW_V11=1 to accept it)"
-        );
-    }
 }

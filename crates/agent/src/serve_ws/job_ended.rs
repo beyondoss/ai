@@ -1,4 +1,4 @@
-//! The `job_ended` callback receiver: exec v1.4's "The receiver" ([`crate::exec_endpoint`]).
+//! The `job_ended` callback receiver: exec notify's "The receiver" ([`crate::exec_endpoint`]).
 //!
 //! A sandbox whose job was kept with `notify` POSTs `{"type":"job_ended","scope","id"}` to the
 //! session's own address with `Authorization: Bearer bjn_v1.…`. Such a request is told apart from
@@ -240,7 +240,7 @@ fn values<'a>(headers: &'a [(String, String)], name: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// A v1.3 job id: lowercase hex, 1 to 32 characters.
+/// A jobs job id: lowercase hex, 1 to 32 characters.
 fn is_job_id(id: &str) -> bool {
     (1..=32).contains(&id.len()) && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }

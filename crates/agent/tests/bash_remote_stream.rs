@@ -1,7 +1,7 @@
-//! `bash` over a streaming (v1.2) exec endpoint behaves as it does on this host: a silent command
+//! `bash` over a streaming exec endpoint behaves as it does on this host: a silent command
 //! yields as a job — heartbeats are not output — progress streams live, and every way a job ends
 //! early (`bash_job` kill, a cancelled call, a dropped tool) kills the command's process group on
-//! the far side. Over a v1.1 endpoint the call still waits for the exit, and says so.
+//! the far side. Over a one-shot endpoint the call still waits for the exit, and says so.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use crate::common;
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use agent_core::ToolProgress;
 use agent_core::tool::Tool;
 use beyond_agent::exec_endpoint::HttpExecRunner;
-use common::exec_mock::{ExecMock, MockOptions, Protocol, StreamEnd, wait_group_gone};
+use common::exec_mock::{ExecMock, MockOptions, StreamEnd, wait_group_gone};
 use common::remote_bash::{call, job_number, kill_job, remote_bash};
 use serde_json::json;
 
@@ -209,39 +209,5 @@ async fn oversized_streamed_output_is_bounded_and_names_no_host_file() {
     assert!(
         !out.contains("Full output: "),
         "no host spill file for a remote command"
-    );
-}
-
-/// The honest fallback: a v1.1 endpoint streams nothing, so its silence says nothing — the call
-/// waits for the command to exit rather than yielding a job it could neither watch nor kill. The
-/// description says so.
-#[tokio::test]
-async fn over_a_v11_endpoint_the_call_waits_for_the_exit() {
-    let dir = tempfile::tempdir().unwrap();
-    let mock = ExecMock::start_with(
-        dir.path(),
-        MockOptions {
-            protocol: Protocol::V11,
-            ..MockOptions::default()
-        },
-    )
-    .await;
-    let (bash, _jobs) = remote_bash(runner(&mock), Duration::from_millis(200));
-    let out = call(
-        bash.as_ref(),
-        json!({ "command": "echo before; sleep 1.2; echo after" }),
-    )
-    .await
-    .unwrap();
-    assert!(
-        out.contains("before") && out.contains("after"),
-        "no yield: {out}"
-    );
-    assert!(job_number(&out).is_none(), "{out}");
-    assert!(
-        bash.description()
-            .contains("cannot stream output as it happens"),
-        "{}",
-        bash.description()
     );
 }

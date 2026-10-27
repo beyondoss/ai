@@ -153,9 +153,6 @@
     {
       "id": "helpers.user.pipeline-with-stdin",
       "description": "Raw exec with stdin is a general filter: a user helper that sends text through sort | uniq -c.",
-      "requires": {
-        "stdin": true
-      },
       "steps": [
         {
           "id": "a",
@@ -180,9 +177,6 @@
     {
       "id": "helpers.user.run-job-to-completion",
       "description": "A user helper built on the raw job calls: start, follow, read the status, clean up.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -242,9 +236,6 @@
     {
       "id": "helpers.user.stream-lines",
       "description": "A user helper built on the raw stream: run a command and collect its output as it arrives.",
-      "requires": {
-        "stream": true
-      },
       "steps": [
         {
           "id": "a",

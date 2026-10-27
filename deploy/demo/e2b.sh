@@ -119,7 +119,7 @@ vm_for() { # session
     # runs are the VM's ordinary unprivileged user and cannot read execd's memory, its environment or its
     # bearer file: the bearer file and the binary are root's, mode 0600 and 0755 (the file stays: the user
     # cannot read it).
-    # EXECD_KEPT_JOBS_SURVIVE_IDLE=1: this VM is not stopped while a kept job runs, so it advertises v1.4 notify.
+    # EXECD_KEPT_JOBS_SURVIVE_IDLE=1: this VM is not stopped while a kept job runs, so it advertises job notify.
     # SSL_CERT_FILE is the demo CA that signed the agent's https callback listener; execd's callback client
     # takes its roots from the OS trust store, which honors it.
     vm_run "$id" "$tok" "chmod +x $VM_HOME/execd; mkdir -p $VM_HOME/workspace

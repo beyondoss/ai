@@ -11,7 +11,7 @@ portability) are built, proven on real infrastructure, and open.
 | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Any pattern**                            | The same binary runs _inside_ the sandbox (local tools, one process, nothing to operate) or _outside_ it: `serve --service` holds the conversation and sends every tool call to a remote sandbox over `--exec-url`. Outside, keys never enter the sandbox, the sandbox can sleep or die, and one replica serves thousands of sessions. | [Service mode](ARCHITECTURE.md#service-mode--one-replica-many-tenants), [exec endpoint](#run-the-tools-somewhere-else)                                                              |
 | **Sessions that survive a killed replica** | Kill a replica mid-job and another picks the session up from the shared store; an epoch fence on the store keeps two replicas from ever writing one session. On real ECS and EFS no acknowledged write was lost across 142,755 turns through rolling deploys and hard kills, and the network-partition takeover passes too.            | [`deploy/efs-proof`](../../deploy/efs-proof/README.md), [the epoch fence](ARCHITECTURE.md#ownership-the-epoch-fence), `demo.sh kill` ([`deploy/demo`](../../deploy/demo/README.md)) |
-| **Work outlives the agent**                | A kept or background job runs in the sandbox, not the replica. When it ends, the sandbox calls back (exec v1.4) so the finish is reported to the session, even if the replica that started it is gone.                                                                                                                                 | [`exec-notify`](../exec-notify/README.md), [Run the tools somewhere else](#run-the-tools-somewhere-else)                                                                            |
+| **Work outlives the agent**                | A kept or background job runs in the sandbox, not the replica. When it ends, the sandbox calls back (job-end notify) so the finish is reported to the session, even if the replica that started it is gone.                                                                                                                            | [`exec-notify`](../exec-notify/README.md), [Run the tools somewhere else](#run-the-tools-somewhere-else)                                                                            |
 | **A connection is only a view**            | Disconnect, reattach from another device, or watch from several at once. The session keeps running and a late attach is caught up server-side.                                                                                                                                                                                         | [Serve](#serve), [`serve`](ARCHITECTURE.md#serve--headless-ndjson-control-protocol)                                                                                                 |
 | **Any medium**                             | One protocol over stdio (built for an `ssh` pipe), WebSocket, HTTP POST, a Unix socket, or TLS.                                                                                                                                                                                                                                        | [Serve](#serve)                                                                                                                                                                     |
 | **The agent never holds a key**            | Provider keys stay in the gateway (`bai_v1` virtual key), connector credentials in the broker (`bmc_v1`), and a grant's secrets are sealed to the replica. In the demo the sandbox cannot open a TCP connection to the session store.                                                                                                  | [Service mode](ARCHITECTURE.md#service-mode--one-replica-many-tenants), [`BEYOND.md`](BEYOND.md), demo check `sandbox-cannot-reach-store`                                           |
@@ -182,7 +182,7 @@ does not create or destroy sandboxes.
 
 **Put [`execd`](../execd/README.md) in the sandbox image and you are done.** It is the endpoint, already written:
 
-- **Conformant.** Exec protocol v1.1 to v1.4 (streaming, kill on disconnect, sandbox-native jobs, job-end notify): 32/32
+- **Conformant.** Exec protocol (one-shot, streaming with kill on disconnect, sandbox-native jobs, job-end notify): 32/32
   conformance checks live on AWS Fargate and on E2B.
 - **Small.** One 5 MB static binary (linux amd64 and arm64), about 2,372 KiB idle PSS, zero idle wakeups.
 - **Isolated.** Under `EXECD_RUN_AS` the commands run as another user and cannot read execd's token or memory.
@@ -239,21 +239,19 @@ provider's (E2B does). What each control guarantees is in
 
 The spec is the module doc of `src/exec_endpoint.rs`; the prose is
 [Running the tools against a remote exec endpoint](ARCHITECTURE.md#running-the-tools-against-a-remote-exec-endpoint). The base
-protocol (v1.1) is one `POST`:
+protocol is one `POST`:
 
 ```jsonc
-// request; cwd, stdin_base64 (standard base64, written to stdin) and output_base64 (true: answer with
-// stdout_base64/stderr_base64, the exact bytes) are optional
+// request; cwd and stdin (standard base64, written to stdin) are optional
 { "command": "rg", "args": ["--files"], "cwd": "/work", "timeout_ms": 120000 }
-// response, 200
+// response, 200: stdout and stderr are the command's bytes, standard base64
 { "exit_code": 0, "stdout": "...", "stderr": "..." }
 ```
 
-v1.2 streams output as NDJSON frames and treats a closed connection as the kill signal; v1.3 lets the endpoint own background
-jobs so they outlive an agent replica; v1.4 has the sandbox call back when a kept job ends
-([`exec-notify`](../exec-notify/README.md)). They are opt-in per endpoint and probed at attach. A v1.1-only endpoint works, but
-`bash` cannot stream, cannot tell a silent command from a hung one, and cannot kill. The conformance suite below grades any
-endpoint.
+The same request with `"stream": true` streams output as NDJSON frames and treats a closed connection as the kill signal;
+the endpoint owns background jobs so they outlive an agent replica; and it calls back when a kept job ends
+([`exec-notify`](../exec-notify/README.md)). An endpoint implements all of it: nothing is probed, and the conformance suite
+below grades the whole contract.
 
 Try it locally with execd, no model needed. In one terminal:
 
@@ -337,7 +335,7 @@ docker run --rm -p 8080:8080 \
 | `--session-idle-timeout`          | Default 60 s in service mode: a detached session releases its lock fast so a failed-over session is not kept waiting.                                            |
 | `--drain-grace <secs>`            | On SIGTERM, finish in-flight sessions and take no new ones; `/readyz` answers 503 while `/livez` stays 200.                                                      |
 | `--max-live-sessions`             | Refuse new sessions past this count. Default 20000; `0` is no limit.                                                                                             |
-| `--notify-origin`                 | Where sandboxes report a kept job's end (exec v1.4).                                                                                                             |
+| `--notify-origin`                 | Where sandboxes report a kept job's end (job-end notify).                                                                                                        |
 
 `GET /livez` answers 200 once the process serves. `GET /readyz` answers 200,
 or 503 with a reason (`draining`, or a shard that is missing or not writable,

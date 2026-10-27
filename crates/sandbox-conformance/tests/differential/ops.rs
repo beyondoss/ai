@@ -485,19 +485,8 @@ pub fn sequence(tc: &TestCase, max_steps: usize) -> Vec<Op> {
                 command: "cat".into(),
                 args: vec![],
                 cwd: None,
-                // Text: exec answers carry stdout as a string, so bytes that are not UTF-8 would not round-trip.
-                stdin: Some(
-                    tc.draw(gs::sampled_from(vec![
-                        "",
-                        "x",
-                        "a\nb\n",
-                        "漢字 ✓",
-                        "tab\there",
-                        "no newline",
-                    ]))
-                    .as_bytes()
-                    .to_vec(),
-                ),
+                // Arbitrary bytes: stdout is bytes on every client, NUL and invalid UTF-8 included.
+                stdin: Some(tc.draw(gs::binary().max_size(64))),
                 timeout_ms: None,
                 stream: false, // exec_stream has no stdin field
             }),

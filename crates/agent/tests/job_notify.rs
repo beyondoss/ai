@@ -1,9 +1,9 @@
-//! exec v1.4's release in `serve --service`: a kept job's stream is let go only after `keep` with
+//! exec notify's release in `serve --service`: a kept job's stream is let go only after `keep` with
 //! `notify` succeeded and the job's proof arrived inside its window, and after that nothing reaches
 //! the sandbox about the job but what a callback, a use or a call causes. Each test names the
-//! `job_notify::` check of `v1.4-checks.json` it is.
+//! `job_notify::` check of `notify-checks.json` it is.
 //!
-//! The fleet here is real: a `serve --service` replica, the reference v1.4 endpoint (`exec_mock`,
+//! The fleet here is real: a `serve --service` replica, the reference notify endpoint (`exec_mock`,
 //! which makes the callbacks itself), and a stand-in for the edge that forwards them to the
 //! replica, as the fleet's edge routes a session's requests (`--notify-origin` names it). The
 //! rules that need no fleet (the reconcile schedule, what a live reconcile may touch) are held to
@@ -39,7 +39,7 @@ async fn release_waits_for_the_first_callback() {
     let f = fleet(
         MockOptions {
             lose_callbacks: LoseCallbacks::Proof,
-            ..MockOptions::notifying()
+            ..MockOptions::default()
         },
         "echo up; sleep 6; echo done-a1",
         None,
@@ -58,7 +58,7 @@ async fn release_waits_for_the_first_callback() {
 
     // The proof arrives: released at once, the job still running.
     let f = fleet(
-        MockOptions::notifying(),
+        MockOptions::default(),
         "echo up; sleep 6; echo done-a2",
         None,
     )
@@ -91,7 +91,7 @@ async fn no_callback_keeps_the_stream() {
     let f = fleet(
         MockOptions {
             lose_callbacks: LoseCallbacks::All,
-            ..MockOptions::notifying()
+            ..MockOptions::default()
         },
         "echo up; sleep 3; echo done-b1",
         None,
@@ -104,26 +104,10 @@ async fn no_callback_keeps_the_stream() {
     assert!(f.model_saw("done-b1", Duration::from_secs(15)).await);
 }
 
-/// N36: no notify without the edge's origin, or from an endpoint that does not offer it: `keep` is
-/// sent without `notify`, exactly as today.
+/// N36: no notify without the edge's origin: `keep` is sent without `notify`, exactly as today.
 #[tokio::test(flavor = "multi_thread")]
 async fn keep_without_notify_when_unavailable() {
-    // The endpoint does not advertise (its deployment does not say kept jobs survive idling).
-    let f = fleet(
-        MockOptions::default(),
-        "echo up; sleep 30; echo done-c1",
-        None,
-    )
-    .await;
-    let _ws = f.start_job().await;
-    let pgid = f.stream("done-c1").await;
-    let _reap = Reap(pgid);
-    assert!(still_held(&f, pgid, Duration::from_secs(1)).await);
-    let keeps = f.keeps();
-    assert!(!keeps.is_empty());
-    assert!(keeps.iter().all(|k| k.get("notify").is_none()), "{keeps:?}");
-
-    // No origin configured: nothing to name, so no notify, whatever the endpoint offers.
+    // No origin configured: nothing to name, so no notify.
     let mut turns = vec![bash_bg("echo up; sleep 3; echo done-c2"), turn_text("ok")];
     turns.extend((0..4).map(|_| turn_text("noted")));
     let (base, _r) = spawn_model_server(turns);
@@ -131,7 +115,7 @@ async fn keep_without_notify_when_unavailable() {
         &base,
         &["s1"],
         Options {
-            exec: Some(MockOptions::notifying()),
+            exec: Some(MockOptions::default()),
             ..Default::default()
         },
     )
@@ -166,7 +150,7 @@ async fn proof_window_opens_before_keep() {
     let f = fleet(
         MockOptions {
             keep_delay: Duration::from_millis(3000),
-            ..MockOptions::notifying()
+            ..MockOptions::default()
         },
         "echo up; sleep 8; echo done-d1",
         None,
@@ -193,7 +177,7 @@ async fn proof_window_opens_before_keep() {
 async fn a_refused_notify_falls_back() {
     // An origin the endpoint refuses: plain http to a host that is not loopback.
     let f = fleet(
-        MockOptions::notifying(),
+        MockOptions::default(),
         "echo up; sleep 3; echo done-e1",
         Some("http://edge.example"),
     )
@@ -212,7 +196,7 @@ async fn a_refused_notify_falls_back() {
 /// list, until a callback or a use.
 #[tokio::test(flavor = "multi_thread")]
 async fn silent_after_release() {
-    let f = fleet(MockOptions::notifying(), "echo up; sleep 300", None).await;
+    let f = fleet(MockOptions::default(), "echo up; sleep 300", None).await;
     let _ws = f.start_job().await;
     let pgid = f.stream("sleep 300").await;
     let _reap = Reap(pgid);
@@ -237,7 +221,7 @@ async fn silent_after_release() {
 /// N42: a live reconcile never keeps; only an open reconcile does.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_live_reconcile_never_keeps() {
-    let f = fleet(MockOptions::notifying(), "echo up; sleep 300", None).await;
+    let f = fleet(MockOptions::default(), "echo up; sleep 300", None).await;
     let _ws = f.start_job().await;
     let pgid = f.stream("sleep 300").await;
     let _reap = Reap(pgid);
@@ -277,7 +261,7 @@ async fn a_live_reconcile_never_keeps() {
 /// N42: a session that moves keeps its running job again, with notify, and proves the path anew.
 #[tokio::test(flavor = "multi_thread")]
 async fn takeover_proves_again() {
-    let mut f = fleet(MockOptions::notifying(), "echo up; sleep 300", None).await;
+    let mut f = fleet(MockOptions::default(), "echo up; sleep 300", None).await;
     let ws = f.start_job().await;
     let pgid = f.stream("sleep 300").await;
     let _reap = Reap(pgid);
@@ -412,7 +396,7 @@ async fn a_call_lets_go_again() {
         turn_text("peeked"),
     ];
     turns.extend((0..6).map(|i| turn_text(&format!("noted {i}"))));
-    let f = fleet_with(MockOptions::notifying(), turns, None).await;
+    let f = fleet_with(MockOptions::default(), turns, None).await;
     let mut ws = f.start_job().await;
     let pgid = f.stream("while-unheld-q7").await;
     let _reap = Reap(pgid);
@@ -463,7 +447,7 @@ async fn a_reaped_session_reads_its_jobs_back_on_reopen() {
                 "--session-idle-timeout".into(),
                 "1".into(),
             ],
-            exec: Some(MockOptions::notifying()),
+            exec: Some(MockOptions::default()),
             ..Default::default()
         },
     )
@@ -508,7 +492,7 @@ async fn a_reaped_session_reads_its_jobs_back_on_reopen() {
 /// callbacks then name a job the session does not know (`410`).
 #[tokio::test(flavor = "multi_thread")]
 async fn new_session_ends_the_unheld_job() {
-    let f = fleet(MockOptions::notifying(), "echo up; sleep 300", None).await;
+    let f = fleet(MockOptions::default(), "echo up; sleep 300", None).await;
     let mut ws = f.start_job().await;
     let pgid = f.stream("sleep 300").await;
     let _reap = Reap(pgid);

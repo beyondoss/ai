@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import { classifyFailure, errorDetail } from "../src/errors.js";
 import { parseDirEntries, parseStat } from "../src/files.js";
 import { compileGlob } from "../src/glob.js";
-import { parseListLine, parseRead } from "../src/jobs.js";
 import {
   classifySearchFailure,
   clip,
@@ -580,54 +579,5 @@ describe("compileGlob (globset semantics)", () => {
     for (const bad of ["[a", "{a,b", "a}", "a**b"]) {
       expect(() => compileGlob(bad, false), bad).toThrow(/bad glob/);
     }
-  });
-});
-
-describe("jobs parsers", () => {
-  it("parses the baseline's read answer", () => {
-    const r = parseRead("running - 0 5\naGVsbG8=\n");
-    expect(r).toMatchObject({
-      state: "running",
-      code: null,
-      offset: 0,
-      end: 5,
-    });
-    expect(new TextDecoder().decode(r.data)).toBe("hello");
-    expect(parseRead("ended 3 10 20\n\n")).toMatchObject({
-      state: "ended",
-      code: 3,
-      offset: 10,
-      end: 20,
-    });
-    expect(parseRead("gone\n")).toMatchObject({ state: "gone", end: 0 });
-    expect(() => parseRead("bogus")).toThrow(/unreadable/);
-    expect(() => parseRead("running - 0 5\n***\n")).toThrow(/unreadable/);
-  });
-
-  it("parses a list line, label with spaces whole", () => {
-    expect(
-      parseListLine(
-        "0123ab ended 0 7 background 120 1700000000 1700000009 sleep 1 && echo hi",
-      ),
-    ).toEqual({
-      id: "0123ab",
-      state: "ended",
-      code: 0,
-      kept: true,
-      num: 7,
-      kind: "background",
-      seen: 120,
-      started: 1700000000,
-      ended: 1700000009,
-      label: "sleep 1 && echo hi",
-    });
-    expect(parseListLine("abc running - - - 0 5 0 ")).toMatchObject({
-      kept: false,
-      num: null,
-      kind: null,
-      label: "",
-    });
-    expect(parseListLine("ABC running - - - 0 5 0 x")).toBeNull();
-    expect(parseListLine("")).toBeNull();
   });
 });

@@ -1,8 +1,8 @@
 {
-  "spec": "exec protocol v1.4 sandbox job notify (crates/sandbox/src/exec_endpoint.rs, \"Sandbox job notify (v1.4)\"), and crates/agent/FLEET.md \"Job-end callbacks\"",
+  "spec": "exec protocol sandbox job notify (crates/sandbox/src/exec_endpoint.rs, \"Sandbox job notify\"), and crates/agent/FLEET.md \"Job-end callbacks\"",
   "notes": [
-    "Every requirement tag in the spec (N…) and in FLEET.md's edge contract (E…), with the checks its text names, in the same order.",
-    "kind: fixture (a v1.4-*.json file in this directory, one of whose cases lists the tag in covers), conformance (a conformance::verify check, by its name), test (a test in this repo, module::name), fleet-sim (a fleet-sim scenario). task: the tracker task that writes the check, or exists."
+    "Every requirement tag in the spec (N\u2026) and in FLEET.md's edge contract (E\u2026), with the checks its text names, in the same order.",
+    "kind: fixture (a notify-*.json file in this directory, one of whose cases lists the tag in covers), conformance (a conformance::verify check, by its name), test (a test in this repo, module::name), fleet-sim (a fleet-sim scenario). task: the tracker task that writes the check, or exists."
   ],
   "requirements": [
     {
@@ -10,35 +10,7 @@
       "checks": [
         {
           "kind": "conformance",
-          "name": "notify offered (v1.4)",
-          "task": "exists"
-        },
-        {
-          "kind": "conformance",
           "name": "a kept job survives idling",
-          "task": "exists"
-        },
-        {
-          "kind": "fixture",
-          "name": "v1.4-probe.json"
-        }
-      ]
-    },
-    {
-      "id": "N2",
-      "checks": [
-        {
-          "kind": "fixture",
-          "name": "v1.4-probe.json"
-        }
-      ]
-    },
-    {
-      "id": "N3",
-      "checks": [
-        {
-          "kind": "test",
-          "name": "sandbox_jobs_notify::baseline_offers_notify_only_with_curl",
           "task": "exists"
         }
       ]
@@ -53,7 +25,7 @@
         },
         {
           "kind": "fixture",
-          "name": "v1.4-keep.json"
+          "name": "notify-keep.json"
         }
       ]
     },
@@ -67,7 +39,7 @@
         },
         {
           "kind": "fixture",
-          "name": "v1.4-keep.json"
+          "name": "notify-keep.json"
         }
       ]
     },
@@ -91,7 +63,7 @@
         },
         {
           "kind": "fixture",
-          "name": "v1.4-callback.json"
+          "name": "notify-callback.json"
         }
       ]
     },
@@ -101,26 +73,6 @@
         {
           "kind": "conformance",
           "name": "the proof and the end reach the same url",
-          "task": "exists"
-        }
-      ]
-    },
-    {
-      "id": "N9",
-      "checks": [
-        {
-          "kind": "test",
-          "name": "sandbox_jobs_notify::the_supervisor_sends_the_proof",
-          "task": "exists"
-        },
-        {
-          "kind": "test",
-          "name": "sandbox_jobs_notify::an_older_supervisor_refuses_notify",
-          "task": "exists"
-        },
-        {
-          "kind": "test",
-          "name": "sandbox_jobs_notify::a_notifier_that_dies_is_started_again",
           "task": "exists"
         }
       ]
@@ -180,7 +132,7 @@
         },
         {
           "kind": "fixture",
-          "name": "v1.4-callback.json"
+          "name": "notify-callback.json"
         }
       ]
     },
@@ -204,7 +156,7 @@
       "checks": [
         {
           "kind": "fixture",
-          "name": "v1.4-retry.json"
+          "name": "notify-retry.json"
         },
         {
           "kind": "conformance",
@@ -218,7 +170,7 @@
       "checks": [
         {
           "kind": "fixture",
-          "name": "v1.4-retry.json"
+          "name": "notify-retry.json"
         },
         {
           "kind": "conformance",
@@ -232,7 +184,7 @@
       "checks": [
         {
           "kind": "fixture",
-          "name": "v1.4-retry.json"
+          "name": "notify-retry.json"
         },
         {
           "kind": "conformance",
@@ -256,7 +208,7 @@
       "checks": [
         {
           "kind": "test",
-          "name": "sandbox_jobs_notify::the_token_is_never_logged",
+          "name": "security::notify_tokens_and_callback_urls_never_reach_the_log",
           "task": "exists"
         }
       ]
@@ -271,7 +223,7 @@
         },
         {
           "kind": "fixture",
-          "name": "v1.4-callback.json"
+          "name": "notify-callback.json"
         }
       ]
     },
@@ -285,7 +237,7 @@
         },
         {
           "kind": "fixture",
-          "name": "v1.4-callback.json"
+          "name": "notify-callback.json"
         }
       ]
     },
@@ -299,7 +251,7 @@
         },
         {
           "kind": "fixture",
-          "name": "v1.4-callback.json"
+          "name": "notify-callback.json"
         }
       ]
     },
@@ -313,7 +265,7 @@
         },
         {
           "kind": "fixture",
-          "name": "v1.4-callback.json"
+          "name": "notify-callback.json"
         }
       ]
     },
@@ -392,7 +344,7 @@
         },
         {
           "kind": "fixture",
-          "name": "v1.4-callback.json"
+          "name": "notify-callback.json"
         }
       ]
     },
@@ -406,7 +358,7 @@
         },
         {
           "kind": "fixture",
-          "name": "v1.4-callback.json"
+          "name": "notify-callback.json"
         }
       ]
     },
@@ -510,7 +462,7 @@
       "checks": [
         {
           "kind": "fixture",
-          "name": "v1.4-token.json"
+          "name": "notify-token.json"
         }
       ]
     },
@@ -534,7 +486,7 @@
       "checks": [
         {
           "kind": "fixture",
-          "name": "v1.4-token.json"
+          "name": "notify-token.json"
         }
       ]
     },
@@ -543,7 +495,7 @@
       "checks": [
         {
           "kind": "fixture",
-          "name": "v1.4-token.json"
+          "name": "notify-token.json"
         }
       ]
     },
@@ -557,7 +509,7 @@
         },
         {
           "kind": "fixture",
-          "name": "v1.4-token.json"
+          "name": "notify-token.json"
         }
       ]
     },
@@ -566,7 +518,7 @@
       "checks": [
         {
           "kind": "fixture",
-          "name": "v1.4-token.json"
+          "name": "notify-token.json"
         },
         {
           "kind": "test",
@@ -580,11 +532,11 @@
       "checks": [
         {
           "kind": "fixture",
-          "name": "v1.4-token.json"
+          "name": "notify-token.json"
         },
         {
           "kind": "fixture",
-          "name": "v1.4-callback.json"
+          "name": "notify-callback.json"
         }
       ]
     },
@@ -598,7 +550,7 @@
         },
         {
           "kind": "fixture",
-          "name": "v1.4-callback.json"
+          "name": "notify-callback.json"
         }
       ]
     },
