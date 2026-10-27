@@ -1,0 +1,35 @@
+name: Release TypeScript SDK
+# Publishes @beyond.dev/sandbox to npm when a tag `sdk/ts/vX.Y.Z` is pushed. The tag drives the version.
+# Trusted publishing (OIDC): no npm token is stored.
+permissions:
+  id-token: write # Required for OIDC
+  contents: read
+on:
+  push:
+    tags: ["sdk/ts/v*"]
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - name: install:ts
+        run: mise run install:ts
+      - name: set version
+        run: |
+          VERSION=${GITHUB_REF_NAME#sdk/ts/v}
+          npm version "$VERSION" --no-git-tag-version --allow-same-version -w @beyond.dev/sandbox
+        working-directory: sdk/ts
+      - name: check:ts
+        run: mise run check:ts
+      - name: build:ts
+        run: mise run build:ts
+      - name: upgrade npm
+        # OIDC trusted publishing requires npm >= 11.5.1; node LTS ships npm 10.
+        run: npm install -g npm@latest
+      - name: publish @beyond.dev/sandbox
+        run: npm publish --access public
+        working-directory: sdk/ts/sandbox
