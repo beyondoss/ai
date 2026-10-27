@@ -5,7 +5,7 @@
   "scenarios": [
     {
       "id": "differential-found.write.below-file-with-separator-in-name",
-      "description": "A write below a regular file fails with not_found or not_a_directory, whatever characters the name has. The failing command's stderr is `sh: N: cannot create PATH: Directory nonexistent`; the kind comes from the first line up to LF. A name containing CR (or another character Python's splitlines() breaks at) must not move the OS message out of that line.",
+      "description": "A write below a regular file fails with not_found or not_a_directory, whatever characters the name has. The failing command's stderr is `sh: N: cannot create PATH: Directory nonexistent`; the kind comes from the first line up to LF. A name containing CR, VT, FF or U+2028 must not move the OS message out of that line: the line ends at LF only.",
       "setup": [
         {
           "id": "setup",
@@ -25,13 +25,6 @@
           "op": "write",
           "path": "${ROOT}/f/cr\rname",
           "data_b64": "",
-          "xfail": {
-            "drivers": [
-              "python",
-              "python-async"
-            ],
-            "reason": "the Python client reads the first stderr line with str.splitlines(), which also splits at this character; FILES-OVER-EXEC 3.3 reads up to LF, so the OS error is missed and the kind falls back to io"
-          },
           "expect": {
             "error": {
               "kind": {
@@ -48,13 +41,6 @@
           "op": "write",
           "path": "${ROOT}/f/ls name",
           "data_b64": "",
-          "xfail": {
-            "drivers": [
-              "python",
-              "python-async"
-            ],
-            "reason": "the Python client reads the first stderr line with str.splitlines(), which also splits at this character; FILES-OVER-EXEC 3.3 reads up to LF, so the OS error is missed and the kind falls back to io"
-          },
           "expect": {
             "error": {
               "kind": {
@@ -71,13 +57,6 @@
           "op": "write",
           "path": "${ROOT}/f/ff\fname",
           "data_b64": "",
-          "xfail": {
-            "drivers": [
-              "python",
-              "python-async"
-            ],
-            "reason": "the Python client reads the first stderr line with str.splitlines(), which also splits at this character; FILES-OVER-EXEC 3.3 reads up to LF, so the OS error is missed and the kind falls back to io"
-          },
           "expect": {
             "error": {
               "kind": {
