@@ -307,3 +307,17 @@ def test_urls() -> None:
 def test_a_header_with_a_newline_is_refused() -> None:
     with pytest.raises(InvalidRequest):
         build_request(parse_url("http://h/"), [("Authorization", "Bearer a\r\nX: y")], b"")
+
+
+def test_the_one_shot_answer_vectors() -> None:
+    for case in fixture("output.json")["answers"]:
+        name, want = case["name"], case["expect"]
+        body = json.dumps(case["answer"]).encode()
+        if want.get("invalid"):
+            with pytest.raises(ProtocolError):
+                _wire.parse_envelope("u", body, 1 << 20)
+            continue
+        r = _wire.parse_envelope("u", body, 1 << 20)
+        assert r.exit_code == want["exit_code"], name
+        assert r.stdout == b64(want["stdout_base64"]), name
+        assert r.stderr == b64(want["stderr_base64"]), name

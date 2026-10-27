@@ -75,7 +75,6 @@ fn profiles() -> Vec<Profile> {
             caps: CapsOverride {
                 search_engine: Some("busybox-grep"),
                 find_printf: Some(false),
-                ..CapsOverride::default()
             },
             ..base()
         },

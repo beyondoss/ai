@@ -58,7 +58,7 @@ async fn the_filesystem_tools_run_on_the_endpoint() {
     )
     .await;
     assert!(out.contains("a.rs"), "{out}");
-    assert!(hits.requests().len() > 0, "the endpoint was never called");
+    assert!(!hits.requests().is_empty(), "the endpoint was never called");
 }
 
 #[tokio::test]

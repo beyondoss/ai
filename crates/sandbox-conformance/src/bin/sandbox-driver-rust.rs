@@ -32,6 +32,7 @@ fn config() -> Config {
                 .as_str()
                 .map(|s| &*Box::leak(s.to_string().into_boxed_str())),
         },
+        jobs_root: None,
     }
 }
 

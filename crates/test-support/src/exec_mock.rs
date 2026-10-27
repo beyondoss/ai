@@ -125,7 +125,7 @@ pub struct MockOptions {
     /// Enforce `timeout_ms` on a one-shot request: at the deadline kill the command's whole process group and
     /// answer 200 with `exit_code` 124. `false` is the endpoint that ignores it (a hung command
     /// runs until the client leaves), which the conformance verifier has to catch.
-    pub v11_timeout: bool,
+    pub enforces_timeout: bool,
 }
 
 /// One way per notify conformance check for an endpoint to get the spec wrong. Each is a change to
@@ -190,7 +190,7 @@ impl Default for MockOptions {
             keep_delay: Duration::ZERO,
             faults: NotifyFaults::default(),
             require_bearer: None,
-            v11_timeout: true,
+            enforces_timeout: true,
         }
     }
 }
@@ -211,7 +211,7 @@ impl MockOptions {
             && self.lose_callbacks == LoseCallbacks::None
             && self.keep_delay.is_zero()
             && self.faults == NotifyFaults::default()
-            && self.v11_timeout
+            && self.enforces_timeout
     }
 }
 
@@ -632,7 +632,7 @@ async fn serve_envelope(mut sock: tokio::net::TcpStream, req: Value, shared: Sha
     .process_group(0);
     let deadline = req["timeout_ms"]
         .as_u64()
-        .filter(|_| shared.opts.v11_timeout)
+        .filter(|_| shared.opts.enforces_timeout)
         .map(Duration::from_millis);
     let payload = match cmd.spawn() {
         Ok(mut child) => {

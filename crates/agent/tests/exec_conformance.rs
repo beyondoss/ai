@@ -291,7 +291,7 @@ async fn an_endpoint_that_ignores_the_one_shot_timeout_fails_that_check_alone() 
     let (opts, expect) = quick();
     let report = verify_mock(
         MockOptions {
-            v11_timeout: false,
+            enforces_timeout: false,
             ..opts
         },
         &expect,
