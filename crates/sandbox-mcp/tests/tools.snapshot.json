@@ -1,0 +1,472 @@
+[
+  {
+    "description": "Replace text in an existing file. old_str must match exactly once (or set replace_all). Never overwrites a concurrent change: if the file changed after it was read, fails with kind conflict and writes nothing; read the file again and retry.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "new_str": {
+          "description": "The text to put in its place.",
+          "type": "string"
+        },
+        "old_str": {
+          "description": "The exact text to replace. Must occur once, unless `replace_all` is true.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path of an existing text file.",
+          "type": "string"
+        },
+        "replace_all": {
+          "description": "Replace every occurrence instead of requiring exactly one. Default false.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "old_str",
+        "new_str"
+      ],
+      "type": "object"
+    },
+    "name": "edit_file"
+  },
+  {
+    "description": "Run a program in the sandbox and wait for it. Returns exit_code, stdout and stderr (text, or base64 with stdout_encoding/stderr_encoding set when the bytes are not UTF-8); a non-zero exit is a normal result, not an error. Not a shell: use sh with [\"-c\", \"...\"] for pipes. The whole output comes back, so for long-running or noisy commands use job_start and page the output with job_output.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "args": {
+          "default": [],
+          "description": "Arguments, one per element.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "command": {
+          "description": "The program to run, e.g. `git`. It is not a shell: for pipes or `&&`, run `sh` with `[\"-c\", \"...\"]`.",
+          "type": "string"
+        },
+        "cwd": {
+          "description": "Working directory. Default: the sandbox's own.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stdin": {
+          "description": "Text for the command's standard input.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stdin_base64": {
+          "description": "Bytes for the command's standard input, base64. Use instead of `stdin` for binary data.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_ms": {
+          "description": "Kill the command after this many milliseconds. Default 120000.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "type": "object"
+    },
+    "name": "exec"
+  },
+  {
+    "description": "Stop jobs: SIGTERM, a short grace, then SIGKILL. Returns survivors, the processes still alive afterwards (normally none). Stopping an ended job is not an error. With remove, the jobs and their output are deleted.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "ids": {
+          "description": "The jobs to stop.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "remove": {
+          "description": "Also delete the stopped jobs and their output. Default false.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "scope": {
+          "description": "The group the jobs belong to. Default: this server's.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "ids"
+      ],
+      "type": "object"
+    },
+    "name": "job_kill"
+  },
+  {
+    "description": "List jobs: id, state (running, exited, ended, lost or gone), code (the exit status once ended), label, started and ended (epoch seconds). exited means the shell is done but processes it started still run.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "scope": {
+          "description": "The group to list. Default: this server's.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "job_list"
+  },
+  {
+    "description": "Read a job's output (stdout and stderr together) from a byte offset. Returns state, code, content (text, or base64), offset, next_offset and end (the output's length so far). At most max bytes (default 131072) per call: to follow a job, call again with offset = next_offset until state is ended.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "encoding": {
+          "description": "`auto` (default) returns text when the bytes are UTF-8 and base64 otherwise; `base64`\nalways returns base64.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "The job's id, from `job_start` or `job_list`.",
+          "type": "string"
+        },
+        "max": {
+          "description": "The most bytes to return. Default 131072. Call again with `offset` set to `next_offset`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Byte offset in the job's combined output to start at. Default 0.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "scope": {
+          "description": "The group the job belongs to. Default: this server's.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "job_output"
+  },
+  {
+    "description": "Start a command that keeps running after this call returns; the sandbox keeps it and its output. Returns the job id. Read output with job_output, check on it with job_list, stop it with job_kill. Use this for servers, builds and anything slower than a few seconds.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "args": {
+          "default": [],
+          "description": "Arguments, one per element.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "command": {
+          "description": "The program to run. It is not a shell: for pipes or `&&`, run `sh` with `[\"-c\", \"...\"]`.",
+          "type": "string"
+        },
+        "cwd": {
+          "description": "Working directory. Default: the sandbox's own.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "The job's id: 1 to 32 characters of [0-9a-z]. Default: a random one, returned.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "description": "A short note shown in `job_list`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scope": {
+          "description": "The group the job belongs to. Default: this server's.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "type": "object"
+    },
+    "name": "job_start"
+  },
+  {
+    "description": "List a directory: entries with name, kind (file, dir or other) and size in bytes, sorted by name. Hidden entries are left out unless include_hidden. At most limit entries (default 1000); truncated says when there were more.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "include_hidden": {
+          "description": "Include entries whose names start with a dot. Default false.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "limit": {
+          "description": "The most entries to return. Default 1000; `truncated` says when there were more.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "The directory.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "list_dir"
+  },
+  {
+    "description": "Create a directory and any missing parents. Succeeds if it already exists.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "path": {
+          "description": "Absolute path, or relative to the sandbox's working directory.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "mkdir"
+  },
+  {
+    "description": "Read bytes of a file. Returns content (text, or base64 when the bytes are not UTF-8), bytes, eof and next_offset. At most max bytes (default 131072) come back: if eof is false, call again with offset = next_offset. Fails with not_found, is_directory or permission_denied.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "encoding": {
+          "description": "`auto` (default) returns text when the bytes are UTF-8 and base64 otherwise; `base64`\nalways returns base64.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max": {
+          "description": "The most bytes to return. Default 131072. When the file is longer, `eof` is false: call\nagain with `offset` set to the `next_offset` you were given.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Byte offset to start at. Default 0.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "Absolute path, or relative to the sandbox's working directory.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "read_file"
+  },
+  {
+    "description": "Search file contents under a directory for a regular expression (ripgrep when the sandbox has it, grep otherwise; see the sandbox://capabilities resource). Returns hits with path, line, text and is_match (false for context lines), and truncated. At most limit hits (default 100). Fails with kind invalid_query for a bad pattern or glob.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "after": {
+          "description": "Lines of context after each match; overrides `context`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "before": {
+          "description": "Lines of context before each match; overrides `context`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "context": {
+          "description": "Lines of context before and after each match. Default 0.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "glob": {
+          "description": "Only search files whose names match this glob, e.g. `*.rs`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "glob_exclude": {
+          "description": "Search every file except those matching `glob`. Default false.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "ignore_case": {
+          "description": "Ignore case. Default false.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "limit": {
+          "description": "The most hits to return (context lines count). Default 100; `truncated` says when there were more.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "literal": {
+          "description": "Treat `pattern` as plain text. Default false.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "The directory to search under. Default: the sandbox's working directory.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pattern": {
+          "description": "What to find: a regular expression, or plain text with `literal`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern"
+      ],
+      "type": "object"
+    },
+    "name": "search"
+  },
+  {
+    "description": "Describe a path. Returns exists; when it does, kind (file, dir or other), size in bytes, mtime (epoch seconds) and whether the sandbox user can write it. A missing path is exists: false, not an error.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "path": {
+          "description": "Absolute path, or relative to the sandbox's working directory.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "stat"
+  },
+  {
+    "description": "Create a file or replace it entirely, atomically; an existing file keeps its permissions. Give content (text) or content_base64 (binary). The parent directory must exist (see mkdir). To change part of a file use edit_file.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "content": {
+          "description": "The new contents as text. Give this or `content_base64`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "content_base64": {
+          "description": "The new contents as base64, for binary files.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "Absolute path, or relative to the sandbox's working directory.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "write_file"
+  }
+]

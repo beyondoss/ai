@@ -388,12 +388,6 @@ pub fn machine(tc: &TestCase, cfg: Config) -> Machine {
     m
 }
 
-/// A path with a newline in it splits the shell's one-line error: the OS message is on a line the spec's
-/// "first line of stderr" rule never reads, so the kind falls back to `io`. Allowed, and reported.
-fn kind_ok(kinds: &[Kind], k: Kind, p: &Path) -> bool {
-    kinds.contains(&k) || (k == Kind::Io && p.to_string_lossy().contains('\n'))
-}
-
 /// An open bug this test found: tolerated (and counted, and printed) until its fix lands, then removed
 /// from here. `known_bugs.rs` holds one deterministic test per entry that fails once the bug is fixed,
 /// so a fix cannot leave a stale exemption behind.
@@ -551,6 +545,33 @@ impl Machine {
         p
     }
 
+    /// Whether `target`, as a symlink at `link`, resolves (lexically, `..` popping a component) to a
+    /// path inside the test root.
+    fn stays_inside(&self, link: &Path, target: &Path) -> bool {
+        use std::path::Component;
+        let Ok(root) = std::fs::canonicalize(&self.root) else {
+            return false;
+        };
+        let mut cur = if target.is_absolute() {
+            PathBuf::from("/")
+        } else {
+            match link.parent().map(std::fs::canonicalize) {
+                Some(Ok(d)) => d,
+                _ => return false,
+            }
+        };
+        for c in target.components() {
+            match c {
+                Component::Normal(n) => cur.push(n),
+                Component::ParentDir => {
+                    cur.pop();
+                }
+                _ => {}
+            }
+        }
+        cur.starts_with(&root) || cur.starts_with(&self.root)
+    }
+
     fn pick_dir(&mut self, tc: &TestCase) -> PathBuf {
         let mut dirs = vec![self.root.clone(); 2];
         dirs.extend(self.known.iter().filter(|k| k.is_dir()).cloned());
@@ -699,29 +720,12 @@ impl Machine {
                 } else {
                     // The command itself failed (a fault may still have hit its cleanup).
                     match &plan {
-                        Plan::Succeed
-                            if kind == Kind::PermissionDenied
-                                && std::fs::metadata(&target).is_ok_and(|m| m.is_file())
-                                && !truth::can(&target, 4) =>
-                        {
-                            // The size check reads the temp back, and the temp has the file's mode.
-                            known(
-                                "N4",
-                                format!(
-                                    "{op} {p:?} refused: the file is writable but not readable by its owner: {e}"
-                                ),
-                            );
-                        }
                         Plan::Succeed => fail(format!(
                             "{op} {p:?} must succeed but failed ({kind:?}): {e}"
                         )),
-                        Plan::Fail(kinds)
-                            if !kind_ok(kinds, kind, &p) && !kind_ok(kinds, kind, &target) =>
-                        {
-                            fail(format!(
-                                "{op} {p:?} failed as {kind:?} ({e}), spec allows {kinds:?}"
-                            ))
-                        }
+                        Plan::Fail(kinds) if !kinds.contains(&kind) => fail(format!(
+                            "{op} {p:?} failed as {kind:?} ({e}), spec allows {kinds:?}"
+                        )),
                         _ => {}
                     }
                     check_unchanged("a failed write");
@@ -949,7 +953,7 @@ impl Machine {
             )),
             (Err(e), Err(kinds)) => {
                 let k = self.kind(&e, &p);
-                if !kind_ok(&kinds, k, &p) {
+                if !kinds.contains(&k) {
                     fail(format!(
                         "read {p:?} failed as {k:?} ({e}); spec allows {kinds:?}"
                     ));
@@ -1008,7 +1012,8 @@ impl Machine {
         match got {
             Err(e) => {
                 let k = self.kind(&e, &p);
-                if report.errored {
+                // A listing larger than the configured response cap is refused, as a search is.
+                if report.errored || (self.cfg.cap.is_some() && k == Kind::TooLarge) {
                     return;
                 }
                 let ok = match &meta {
@@ -1032,20 +1037,6 @@ impl Machine {
                         "list of the missing {p:?} succeeded with {} entries",
                         entries.len()
                     ));
-                }
-                let via_link = std::fs::symlink_metadata(&p)
-                    .is_ok_and(|m| m.file_type().is_symlink())
-                    && matches!(&meta, Ok(m) if m.is_dir());
-                if via_link && entries.is_empty() && !want.is_empty() && cap > 0 {
-                    known(
-                        "N1",
-                        format!(
-                            "list of the symlinked directory {p:?} returned no entries, its target holds {}",
-                            want.len()
-                        ),
-                    );
-                    read_only_ops_unchanged(self, &before, "list");
-                    return;
                 }
                 if matches!(&meta, Ok(m) if !m.is_dir()) && !entries.is_empty() {
                     fail(format!("list of the file {p:?} returned entries"));
@@ -1156,33 +1147,16 @@ impl Machine {
             Err(e) => {
                 let k = self.kind(&e, &root);
                 let tolerated = report.errored || (self.cfg.cap.is_some() && k == Kind::TooLarge);
-                let multiline = k == Kind::InvalidQuery
-                    && (want.root_missing || want.unreadable)
-                    && (root.to_string_lossy().contains('\n')
-                        || snapshot(&self.root)
-                            .keys()
-                            .any(|p| p.to_string_lossy().contains('\n')));
-                if multiline && !tolerated {
-                    known(
-                        "N2",
-                        format!(
-                            "search answered a missing/unreadable path as a bad regex because a path contains a newline: {e}"
-                        ),
-                    );
-                } else if !tolerated {
-                    if want.root_below_file && k == Kind::InvalidQuery {
-                        known(
-                            "N3",
-                            format!(
-                                "search of a root below a regular file answered as a bad regex: {e}"
-                            ),
-                        );
-                    } else if want.root_missing {
-                        if !(k == Kind::NotFound
-                            || (want.root_below_file && k == Kind::NotADirectory))
-                        {
+                if !tolerated {
+                    if want.root_missing {
+                        let expect = if want.root_below_file {
+                            Kind::NotADirectory
+                        } else {
+                            Kind::NotFound
+                        };
+                        if k != expect {
                             fail(format!(
-                                "search of the missing root {root:?} must fail as not_found, got {k:?}: {e}"
+                                "search of the missing root {root:?} must fail as {expect:?}, got {k:?}: {e}"
                             ));
                         }
                     } else if want.unreadable {
@@ -1322,7 +1296,7 @@ impl Machine {
                         Plan::Succeed => fail(format!(
                             "mkdir -p {p:?} must succeed but failed ({k:?}): {e}"
                         )),
-                        Plan::Fail(ks) if !kind_ok(&ks, k, &p) => fail(format!(
+                        Plan::Fail(ks) if !ks.contains(&k) => fail(format!(
                             "mkdir -p {p:?} failed as {k:?}, spec allows {ks:?}"
                         )),
                         _ => {}
@@ -1492,6 +1466,12 @@ impl Machine {
             2 => PathBuf::from(fixtures::name(&tc)).with_extension("lnk"),
             _ => self.pick_path(&tc),
         };
+        // A link must never lead out of the test root: `list` follows it, and the oracle and the
+        // client would then read a live, shared directory (`/tmp`) at different moments. A link to a
+        // file outside (`/dev/null`) is harmless; a dangling one inside is fine.
+        if target != Path::new("/dev/null") && !self.stays_inside(&link, &target) {
+            return;
+        }
         tc.note(&format!(
             "env: symlink {:?} -> {:?}",
             link.strip_prefix(&self.root).unwrap(),

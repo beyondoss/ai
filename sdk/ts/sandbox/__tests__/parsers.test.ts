@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyFailure } from "../src/errors.js";
+import { classifyFailure, errorDetail } from "../src/errors.js";
 import { parseDirEntries, parseStat } from "../src/files.js";
 import { compileGlob } from "../src/glob.js";
 import {
@@ -238,6 +238,45 @@ describe("crlfTolerantEre", () => {
   it("does not rewrite a literal search", () => {
     expect(grepArgs({ ...q("end$"), literal: true }, true)).toContain("end$");
     expect(grepArgs(q("end$"), true)).toContain("end\r?$");
+  });
+});
+
+describe("a newline in a path", () => {
+  it("does not hide the OS error", () => {
+    const root = "/work/no\nwhere";
+    for (
+      const missing of [
+        "rg: /work/no\nwhere: No such file or directory (os error 2)\n",
+        "rg: /work/no\nwhere: IO error for operation on /work/no\nwhere: No such file or directory (os error 2)\n",
+        "grep: /work/no\nwhere: No such file or directory\n",
+      ]
+    ) {
+      expect(classifySearchFailure(missing, root).kind).toBe("missing_root");
+    }
+    const f = classifySearchFailure(
+      "rg: /p/a\nb: Permission denied (os error 13)\nrg: /p/c: Permission denied (os error 13)\n",
+      "/p",
+    );
+    expect((f as { note: string }).note.startsWith("2 path(s)")).toBe(true);
+    expect(
+      classifyFailure("cat x", "cat: a\nb: No such file or directory\n").kind,
+    )
+      .toBe("not_found");
+    expect(errorDetail("one\ntwo\n")).toBe("one");
+  });
+});
+
+describe("a root below a file", () => {
+  it("is a root error", () => {
+    const f = classifySearchFailure(
+      "rg: /w/file/sub: IO error for operation on /w/file/sub: Not a directory (os error 20)\n",
+      "/w/file/sub",
+    );
+    expect(f.kind).toBe("missing_root");
+    expect(
+      classifySearchFailure("grep: /w/file/sub: Not a directory", "/w/file")
+        .kind,
+    ).toBe("skipped");
   });
 });
 

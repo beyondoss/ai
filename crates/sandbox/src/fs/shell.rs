@@ -248,7 +248,7 @@ impl ShellFs {
         // spans several shells, and unpredictable for the reason `LocalFs`'s is: a preplanted name
         // cannot redirect the write. Every script resolves the target the same way (`RESOLVE_TARGET`)
         // and names the temp beside the file it resolves to.
-        let suffix = super::temp_suffix();
+        let suffix = super::shell_temp_suffix();
         let args = sh_script(
             WRITE_STDIN_SCRIPT,
             &[target.clone(), suffix.clone(), bytes.len().to_string()],
@@ -437,8 +437,8 @@ impl FsBackend for ShellFs {
     /// Write-temp-then-`mv`, the same shape [`crate::tools::write_atomic`] uses locally, so a reader or
     /// a crash sees the old file or the new one and never a partial. The scripts keep the rest of the
     /// [`FsBackend::write_bytes`] contract too: the target is resolved through a symlink first
-    /// (`resolve_target!`), and the temp is given the existing file's mode before content goes in
-    /// (`new_temp!`). A bare `mv` would replace a link with a regular file and give the file the temp's
+    /// (`resolve_target!`), and the temp is given the existing file's mode just before the `mv`
+    /// (`copy_mode!`; until then it is 0600, so the size check can read it). A bare `mv` would replace a link with a regular file and give the file the temp's
     /// default mode — 0600 became 0644, 0755 lost its execute bits. The content travels on stdin when
     /// the target has proven it delivers stdin ([`Capabilities::stdin`]) and as argv-sized base64
     /// chunks otherwise — never as one argv entry, which Linux caps at 128 KiB.
@@ -505,6 +505,7 @@ impl FsBackend for ShellFs {
                 .exec(
                     "find",
                     &[
+                        "-H".into(),
                         root.clone(),
                         "-mindepth".into(),
                         "1".into(),
@@ -532,6 +533,7 @@ impl FsBackend for ShellFs {
             .exec(
                 "find",
                 &[
+                    "-H".into(),
                     root.clone(),
                     "-mindepth".into(),
                     "1".into(),
@@ -552,6 +554,7 @@ impl FsBackend for ShellFs {
             .exec(
                 "find",
                 &[
+                    "-H".into(),
                     root,
                     "-mindepth".into(),
                     "1".into(),
@@ -1004,8 +1007,33 @@ fn mtimes_match(a: Option<std::time::SystemTime>, b: Option<std::time::SystemTim
     secs(a) == secs(b)
 }
 
+/// The `detail` of a failed command (spec 3.3): the first line of trimmed stderr; and when that line
+/// names no OS error, the lines through the first one that does, because a path containing a newline
+/// splits the message and the OS error is on a later line. Always a slice of `stderr`.
 fn first_line_or<'a>(stderr: &'a str, fallback: &'a str) -> &'a str {
-    stderr.trim().lines().next().unwrap_or(fallback)
+    const NAMES: [&str; 6] = [
+        "no such file or directory",
+        "directory nonexistent",
+        "nonexistent directory",
+        "is a directory",
+        "not a directory",
+        "permission denied",
+    ];
+    let t = stderr.trim();
+    let mut end = None;
+    for line in t.split_inclusive('\n') {
+        let line_end = (line.as_ptr() as usize - t.as_ptr() as usize) + line.len();
+        let end_of_line = line.trim_end().len() + (line_end - line.len());
+        let low = line.to_ascii_lowercase();
+        if NAMES.iter().any(|n| low.contains(n)) {
+            return &t[..end_of_line];
+        }
+        end.get_or_insert(end_of_line);
+    }
+    match end {
+        Some(e) => &t[..e],
+        None => fallback,
+    }
 }
 
 /// Minimal base64, both directions. Written here rather than pulled in as a dependency: the crate
@@ -1197,14 +1225,14 @@ if [ -L "$t" ]; then
   echo "Too many levels of symbolic links (os error 40)" >&2
   exit 1
 fi
-tmp="$t.tmp.$2"
+case "$t" in */*) tmp="${t%/*}/.tmp.$2" ;; *) tmp=".tmp.$2" ;; esac
 "#
     };
 }
 
 /// Refuse a target that is a directory, with the message `std` gives (so both backends read alike).
 /// Without it the final `mv -f "$tmp" "$t"` moves the temp *into* the directory and exits 0: a write
-/// that reports success and leaves `DIR/DIR.tmp.SUFFIX` behind. `mv -T` would refuse atomically, but
+/// that reports success and leaves `DIR/.tmp.SUFFIX` inside the directory. `mv -T` would refuse atomically, but
 /// it is GNU-only; busybox has no such flag. So the check runs twice, before the temp exists and
 /// again immediately before the `mv`; a directory created at the target inside that last instant is
 /// the one remaining window, the same width as any check-then-rename on a shell.
@@ -1218,11 +1246,13 @@ fi
     };
 }
 
-/// Create the empty temp `$tmp`, with `$t`'s mode when `$t` exists, before any content goes in, so
-/// the replacement keeps the file's mode and a 0600 file's bytes are never in a world-readable temp.
-/// `chmod --reference` is GNU; busybox, which Alpine ships, has no `--reference`, so its fallback is
-/// the octal mode from `stat -L -c %a`. A mode that cannot be copied fails the write: committing would
-/// change the file's permissions, which is exactly what this exists to prevent.
+/// Create the empty temp `$tmp`, mode 0600 when `$t` exists (a new file's temp gets the default mode,
+/// which is the file's mode), then refuse a target the caller may not write, by `[ -w ]`, with the
+/// message `std` gives. The refusal comes after the temp is created so that a read-only or full
+/// filesystem reports its own error (`Read-only file system`), not `Permission denied`. The write needs
+/// no read permission on the file. The temp is 0600 so the size check can read it back whatever the file's mode is (a
+/// file its owner may write but not read, mode 0200, is replaced); [`copy_mode!`] gives it the file's
+/// mode just before the `mv`, and a 0600 file's bytes are never in a world-readable temp.
 ///
 /// `set -C` is the shell's `create_new`: the temp is refused, not followed, if anything was preplanted
 /// at its name.
@@ -1231,9 +1261,26 @@ macro_rules! new_temp {
         concat!(
             not_a_directory!(),
             r#"set -C
-: > "$tmp" || exit 1
+if [ -e "$t" ]; then (umask 077; : > "$tmp") || exit 1; else : > "$tmp" || exit 1; fi
 set +C
-if [ -e "$t" ]; then
+if [ -e "$t" ] && [ ! -w "$t" ]; then
+  echo "Permission denied (os error 13)" >&2
+  rm -f "$tmp"
+  exit 1
+fi
+"#
+        )
+    };
+}
+
+/// Give the finished temp `$tmp` the mode of `$t`, when `$t` exists, just before the `mv`: so the
+/// replacement keeps the file's mode. `chmod --reference` is GNU; busybox, which Alpine ships, has no
+/// `--reference`, so its fallback is the octal mode from `stat -L -c %a`. A mode that cannot be
+/// copied fails the write: committing would change the file's permissions, which is exactly what
+/// this exists to prevent.
+macro_rules! copy_mode {
+    () => {
+        r#"if [ -e "$t" ]; then
   chmod --reference="$t" "$tmp" 2>/dev/null || chmod "$(stat -L -c %a "$t")" "$tmp" || {
     echo "cannot give the new file the mode of $t" >&2
     rm -f "$tmp"
@@ -1241,7 +1288,6 @@ if [ -e "$t" ]; then
   }
 fi
 "#
-        )
     };
 }
 
@@ -1259,7 +1305,9 @@ const WRITE_STDIN_SCRIPT: &str = concat!(
   n=$(wc -c < "$tmp")
   if [ $n -eq "$3" ]; then
     if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
-    mv -f "$tmp" "$t" && exit 0
+"#,
+    copy_mode!(),
+    r#"    mv -f "$tmp" "$t" && exit 0
   else
     echo "short write: $n of $3 bytes arrived on stdin" >&2
   fi
@@ -1276,7 +1324,8 @@ const REMOVE_TEMP_SCRIPT: &str = concat!(resolve_target!(), r#"rm -f "$tmp""#);
 enum SearchFailure {
     /// The engine rejected the pattern.
     BadRegex,
-    /// The search root itself does not exist; carries the engine's message.
+    /// The search root itself does not exist, or lies below a file (`Not a directory`); carries the
+    /// engine's message, whose wording decides `not_found` or `not_a_directory`.
     MissingRoot(String),
     /// Only per-path read errors: the hits on stdout are still valid. Carries the note.
     Skipped(String),
@@ -1284,16 +1333,21 @@ enum SearchFailure {
 
 /// Per-path read errors name the path and end in the OS message (`rg` appends ` (os error N)`).
 /// Anything else on stderr is the engine complaining about the pattern.
+///
+/// A path may contain a newline, which splits one error over two lines, so stderr is read as
+/// *records* that end at an OS error, not as lines: a record runs from where the previous one ended
+/// through the first line that ends in an OS message. The search root is known, so its own error is
+/// found by looking for that exact string, newlines and all.
 fn classify_search_failure(stderr: &str, root: &str) -> SearchFailure {
-    const OS_ERRORS: [&str; 5] = [
+    const OS_ERRORS: [&str; 6] = [
         "No such file or directory",
         "Permission denied",
         "Is a directory",
+        "Not a directory",
         "Too many levels of symbolic links",
         "Input/output error",
     ];
-    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
-    let path_error = |l: &str| {
+    let ends_in_os_error = |l: &str| {
         let l = l.trim_end();
         let l = l
             .strip_suffix(')')
@@ -1301,23 +1355,36 @@ fn classify_search_failure(stderr: &str, root: &str) -> SearchFailure {
             .unwrap_or(l);
         OS_ERRORS.iter().any(|e| l.ends_with(e))
     };
-    if lines.is_empty() || !lines.iter().all(|l| path_error(l)) {
+    let mut records: Vec<&str> = Vec::new();
+    let mut start = 0;
+    for line in stderr.split_inclusive('\n') {
+        let end = (line.as_ptr() as usize - stderr.as_ptr() as usize) + line.len();
+        if ends_in_os_error(line) {
+            records.push(stderr[start..end].trim());
+            start = end;
+        }
+    }
+    if records.is_empty() || !stderr[start..].trim().is_empty() {
         return SearchFailure::BadRegex;
     }
     // The root's own error is `PROGRAM: ROOT: [IO error for operation on ROOT: ]No such file or
     // directory`; a path under the root carries more path after ROOT, so matching the exact
     // `: ROOT: ` form tells them apart.
     let root_prefix = format!(": {root}: ");
-    if let Some(l) = lines
-        .iter()
-        .find(|l| l.contains(&root_prefix) && l.contains("No such file or directory"))
-    {
-        return SearchFailure::MissingRoot(l.trim().to_string());
+    let io_prefix = format!("IO error for operation on {root}: ");
+    if let Some(r) = records.iter().find(|r| {
+        r.match_indices(&root_prefix).any(|(at, _)| {
+            let rest = &r[at + root_prefix.len()..];
+            let rest = rest.strip_prefix(&io_prefix).unwrap_or(rest);
+            rest.starts_with("No such file or directory") || rest.starts_with("Not a directory")
+        })
+    }) {
+        return SearchFailure::MissingRoot((*r).to_string());
     }
-    let first = lines[0].trim();
     SearchFailure::Skipped(format!(
-        "{} path(s) could not be searched; first: {first}",
-        lines.len()
+        "{} path(s) could not be searched; first: {}",
+        records.len(),
+        records[0]
     ))
 }
 
@@ -1771,6 +1838,8 @@ mod tests {
             );
         }
         for missing in [
+            "rg: /work/proj: IO error for operation on /work/proj: Not a directory (os error 20)",
+            "grep: /work/proj: Not a directory",
             "rg: /work/proj: No such file or directory (os error 2)",
             "rg: /work/proj: IO error for operation on /work/proj: No such file or directory (os error 2)",
             "grep: /work/proj: No such file or directory",
@@ -1794,6 +1863,38 @@ mod tests {
             classify_search_failure("grep: /work/proj/x: No such file or directory", root),
             SearchFailure::Skipped(_)
         ));
+    }
+
+    #[test]
+    fn a_path_with_a_newline_does_not_hide_the_os_error() {
+        let root = "/work/no\nwhere";
+        for missing in [
+            "rg: /work/no\nwhere: No such file or directory (os error 2)\n",
+            "rg: /work/no\nwhere: IO error for operation on /work/no\nwhere: No such file or directory (os error 2)\n",
+            "grep: /work/no\nwhere: No such file or directory\n",
+        ] {
+            assert!(
+                matches!(
+                    classify_search_failure(missing, root),
+                    SearchFailure::MissingRoot(_)
+                ),
+                "{missing:?}"
+            );
+        }
+        let SearchFailure::Skipped(note) = classify_search_failure(
+            "rg: /work/proj/a\nb: Permission denied (os error 13)\nrg: /work/proj/c: Permission denied (os error 13)\n",
+            "/work/proj",
+        ) else {
+            panic!("per-file errors must keep the matches");
+        };
+        assert!(note.starts_with("2 path(s)"), "{note}");
+        // The detail of a failed command is cut at the OS error, not at the first newline.
+        assert_eq!(
+            first_line_or("cat: a\nb: No such file or directory\n", "x"),
+            "cat: a\nb: No such file or directory"
+        );
+        assert_eq!(first_line_or("one\ntwo\n", "x"), "one");
+        assert_eq!(first_line_or("  \n", "x"), "x");
     }
 
     /// This host's `sh`, with a prelude run before every script. A `PATH` shim, not a shell function,

@@ -5400,15 +5400,6 @@
           "id": "list",
           "op": "list",
           "path": "${ROOT}/link",
-          "xfail": {
-            "drivers": [
-              "agent-reference",
-              "beyond-sandbox-ts",
-              "python",
-              "python-async"
-            ],
-            "reason": "find does not follow a symlink given as the starting point, so the listing is empty"
-          },
           "expect": {
             "ok": {
               "entries": {
@@ -5427,7 +5418,7 @@
     },
     {
       "id": "files.search.missing-root-with-newline-in-name",
-      "description": "A missing search root is not_found even when its name contains a newline. (The engine's one-line error is then two lines, and the reference agent's classifier reads the second as an unknown message and answers `bad regex`.) Found by the stateful property test.",
+      "description": "A missing search root is not_found even when its name contains a newline: stderr is read as records that end at an OS error, and the root's own error is found by its exact string.",
       "steps": [
         {
           "id": "a",
@@ -5435,15 +5426,6 @@
           "root": "${ROOT}/no\nwhere",
           "pattern": "x",
           "literal": true,
-          "xfail": {
-            "drivers": [
-              "agent-reference",
-              "beyond-sandbox-ts",
-              "python",
-              "python-async"
-            ],
-            "reason": "the stderr classifier needs every line to end in an OS error; a newline in the path breaks the first"
-          },
           "expect": {
             "error": {
               "kind": "not_found"
@@ -5454,7 +5436,7 @@
     },
     {
       "id": "files.search.root-below-a-file",
-      "description": "A search root below a regular file does not exist: not_found or not_a_directory, never invalid_query. (The reference agent's classifier does not know `Not a directory` and answers `bad regex`.) Found by the stateful property test.",
+      "description": "A search root below a regular file is not_a_directory, never invalid_query: the engine's `Not a directory` for the root itself is a root error, not a bad pattern. Found by the stateful property test.",
       "setup": [
         {
           "id": "setup",
@@ -5475,23 +5457,9 @@
           "root": "${ROOT}/file/sub",
           "pattern": "needle",
           "literal": true,
-          "xfail": {
-            "drivers": [
-              "agent-reference",
-              "beyond-sandbox-ts",
-              "python",
-              "python-async"
-            ],
-            "reason": "`Not a directory` is not among the OS errors the classifier recognises, so it reads as a bad regex"
-          },
           "expect": {
             "error": {
-              "kind": {
-                "$oneof": [
-                  "not_found",
-                  "not_a_directory"
-                ]
-              }
+              "kind": "not_a_directory"
             }
           }
         }
@@ -5499,7 +5467,7 @@
     },
     {
       "id": "files.write.write-only-file",
-      "description": "A file its owner may write but not read (mode 0200) can be replaced: the write needs no read permission. (The reference agent's script checks the temp's size with `wc -c < tmp`, and the temp has the file's mode, so the check cannot open it and the write is refused as permission_denied.) Found by the stateful property test.",
+      "description": "A file its owner may write but not read (mode 0200) can be replaced: the write needs no read permission. The temp is 0600 while the size check reads it back and gets the file's mode just before the mv. Found by the stateful property test.",
       "requires": {
         "not_root": true
       },
@@ -5522,15 +5490,6 @@
           "op": "write",
           "path": "${ROOT}/w",
           "data_b64": "bmV3",
-          "xfail": {
-            "drivers": [
-              "agent-reference",
-              "beyond-sandbox-ts",
-              "python",
-              "python-async"
-            ],
-            "reason": "the write script reads the temp back to check its size, and the temp has mode 0200"
-          },
           "expect": {
             "ok": {}
           }
@@ -5545,15 +5504,6 @@
             "sh",
             "${ROOT}/w"
           ],
-          "xfail": {
-            "drivers": [
-              "agent-reference",
-              "beyond-sandbox-ts",
-              "python",
-              "python-async"
-            ],
-            "reason": "the write was refused"
-          },
           "expect": {
             "ok": {
               "exit_code": 0,
@@ -5748,6 +5698,83 @@
               "stdout_utf8": "0\n"
             }
           }
+        }
+      ]
+    },
+    {
+      "id": "files.write.name-of-255-bytes-new-file",
+      "description": "A file whose name is NAME_MAX (255 bytes) can be created: the temp is `.tmp.` plus 16 hex digits in the same directory, not derived from the name; none survives.",
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "data_b64": "eAo=",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "content",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "cd \"$1\"; cat aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; ls -A | grep -c \"^[.]tmp[.]\" || true",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "x\n0\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.name-of-250-bytes-existing-file",
+      "description": "An existing file whose name is 250 bytes can be replaced (a temp named from it would exceed NAME_MAX); no temp survives.",
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "data_b64": "eAo=",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "content",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "cd \"$1\"; cat bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; ls -A | grep -c \"^[.]tmp[.]\" || true",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "x\n0\n"
+            }
+          }
+        }
+      ],
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "cd \"$1\"; printf old > bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "sh",
+            "${ROOT}"
+          ]
         }
       ]
     }

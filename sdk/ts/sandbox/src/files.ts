@@ -335,6 +335,7 @@ export class Files {
     const caps = await this.capabilities();
     if (caps.findPrintf) {
       const r = await this.exec("find", [
+        "-H",
         path,
         "-mindepth",
         "1",
@@ -349,7 +350,7 @@ export class Files {
       return parseDirEntries(text(r.stdout), limit, includeHidden);
     }
     // Busybox: type from a second pass restricted to directories.
-    const base = [path, "-mindepth", "1", "-maxdepth", "1"];
+    const base = ["-H", path, "-mindepth", "1", "-maxdepth", "1"];
     const listing = await this.exec("find", [...base, "-print0"]);
     if (listing.exitCode !== 0 && listing.stdout.length === 0) {
       throw classifyFailure(`ls ${path}`, text(listing.stderr));
@@ -414,7 +415,11 @@ export class Files {
           }`,
         );
       }
-      if (f.kind === "missing_root") throw new NotFoundError(f.line);
+      if (f.kind === "missing_root") {
+        throw f.line.includes("Not a directory")
+          ? new SandboxError("not_a_directory", f.line)
+          : new NotFoundError(f.line);
+      }
       skipped = f.note;
     }
 
