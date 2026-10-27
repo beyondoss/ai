@@ -50,24 +50,20 @@ fn n1_list_of_a_symlinked_directory_lists_the_target() {
     assert_eq!(entries[0].name, "f");
 }
 
-/// N3: a search root below a regular file ("Not a directory") is not among the OS errors the D4
-/// classifier knows, so it is reported as a bad regex.
+/// N3 (fixed): a search root below a regular file is `not_a_directory`, not a bad regex.
 #[test]
-fn n3_search_root_below_a_file_is_a_bad_regex() {
+fn n3_search_root_below_a_file_is_not_a_directory() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("file"), b"needle").unwrap();
     let root = dir.path().join("file/sub");
     let err = env::rt().block_on(fs().search(&query(&root))).unwrap_err();
-    assert!(
-        matches!(err, FsError::InvalidQuery(_)),
-        "N3 is fixed: delete this test and the known(\"N3\") call; got {err}"
-    );
+    assert!(err.to_string().contains("Not a directory"), "{err}");
+    assert!(!matches!(err, FsError::InvalidQuery(_)), "{err}");
 }
 
-/// N4: the write script checks the temp's size by reading it back (`wc -c < tmp`), and the temp has
-/// the target's mode, so a file its owner may write but not read cannot be written.
+/// N4 (fixed): a file its owner may write but not read is replaced, and keeps its mode.
 #[test]
-fn n4_a_write_only_file_cannot_be_written() {
+fn n4_a_write_only_file_can_be_written() {
     if env::truth_is_root() {
         return;
     }
@@ -76,10 +72,9 @@ fn n4_a_write_only_file_cannot_be_written() {
     std::fs::write(&p, b"old").unwrap();
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o200)).unwrap();
     let r = env::rt().block_on(fs().write_bytes(&p, b"new".to_vec()));
+    let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o7777;
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(
-        r.is_err(),
-        "N4 is fixed: delete this test and the known(\"N4\") call"
-    );
-    assert_eq!(std::fs::read(&p).unwrap(), b"old");
+    r.unwrap();
+    assert_eq!(mode, 0o200);
+    assert_eq!(std::fs::read(&p).unwrap(), b"new");
 }

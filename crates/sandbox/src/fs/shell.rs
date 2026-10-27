@@ -468,8 +468,8 @@ impl FsBackend for ShellFs {
     /// Write-temp-then-`mv`, the same shape [`crate::tools::write_atomic`] uses locally, so a reader or
     /// a crash sees the old file or the new one and never a partial. The scripts keep the rest of the
     /// [`FsBackend::write_bytes`] contract too: the target is resolved through a symlink first
-    /// (`resolve_target!`), and the temp is given the existing file's mode before content goes in
-    /// (`new_temp!`). A bare `mv` would replace a link with a regular file and give the file the temp's
+    /// (`resolve_target!`), and the temp is given the existing file's mode just before the `mv`
+    /// (`copy_mode!`; until then it is 0600, so the size check can read it). A bare `mv` would replace a link with a regular file and give the file the temp's
     /// default mode — 0600 became 0644, 0755 lost its execute bits. The content travels on stdin when
     /// the target has proven it delivers stdin ([`Capabilities::stdin`]) and as argv-sized base64
     /// chunks otherwise — never as one argv entry, which Linux caps at 128 KiB.
@@ -1313,11 +1313,13 @@ fi
     };
 }
 
-/// Create the empty temp `$tmp`, with `$t`'s mode when `$t` exists, before any content goes in, so
-/// the replacement keeps the file's mode and a 0600 file's bytes are never in a world-readable temp.
-/// `chmod --reference` is GNU; busybox, which Alpine ships, has no `--reference`, so its fallback is
-/// the octal mode from `stat -L -c %a`. A mode that cannot be copied fails the write: committing would
-/// change the file's permissions, which is exactly what this exists to prevent.
+/// Create the empty temp `$tmp`, mode 0600 when `$t` exists (a new file's temp gets the default mode,
+/// which is the file's mode), then refuse a target the caller may not write, by `[ -w ]`, with the
+/// message `std` gives. The refusal comes after the temp is created so that a read-only or full
+/// filesystem reports its own error (`Read-only file system`), not `Permission denied`. The write needs
+/// no read permission on the file. The temp is 0600 so the size check can read it back whatever the file's mode is (a
+/// file its owner may write but not read, mode 0200, is replaced); [`copy_mode!`] gives it the file's
+/// mode just before the `mv`, and a 0600 file's bytes are never in a world-readable temp.
 ///
 /// `set -C` is the shell's `create_new`: the temp is refused, not followed, if anything was preplanted
 /// at its name.
@@ -1326,9 +1328,26 @@ macro_rules! new_temp {
         concat!(
             not_a_directory!(),
             r#"set -C
-: > "$tmp" || exit 1
+if [ -e "$t" ]; then (umask 077; : > "$tmp") || exit 1; else : > "$tmp" || exit 1; fi
 set +C
-if [ -e "$t" ]; then
+if [ -e "$t" ] && [ ! -w "$t" ]; then
+  echo "Permission denied (os error 13)" >&2
+  rm -f "$tmp"
+  exit 1
+fi
+"#
+        )
+    };
+}
+
+/// Give the finished temp `$tmp` the mode of `$t`, when `$t` exists, just before the `mv`: so the
+/// replacement keeps the file's mode. `chmod --reference` is GNU; busybox, which Alpine ships, has no
+/// `--reference`, so its fallback is the octal mode from `stat -L -c %a`. A mode that cannot be
+/// copied fails the write: committing would change the file's permissions, which is exactly what
+/// this exists to prevent.
+macro_rules! copy_mode {
+    () => {
+        r#"if [ -e "$t" ]; then
   chmod --reference="$t" "$tmp" 2>/dev/null || chmod "$(stat -L -c %a "$t")" "$tmp" || {
     echo "cannot give the new file the mode of $t" >&2
     rm -f "$tmp"
@@ -1336,7 +1355,6 @@ if [ -e "$t" ]; then
   }
 fi
 "#
-        )
     };
 }
 
@@ -1354,7 +1372,9 @@ const WRITE_STDIN_SCRIPT: &str = concat!(
   n=$(wc -c < "$tmp")
   if [ $n -eq "$3" ]; then
     if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
-    mv -f "$tmp" "$t" && exit 0
+"#,
+    copy_mode!(),
+    r#"    mv -f "$tmp" "$t" && exit 0
   else
     echo "short write: $n of $3 bytes arrived on stdin" >&2
   fi
@@ -1380,7 +1400,9 @@ printf %s "$3" | base64 -d >> "$tmp" || { rm -f "$tmp"; exit 1; }
 n=$(wc -c < "$tmp")
 if [ $n -eq "$6" ]; then
   if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
-  mv -f "$tmp" "$t" && exit 0
+"#,
+    copy_mode!(),
+    r#"  mv -f "$tmp" "$t" && exit 0
 else
   echo "short write: $n of $6 bytes assembled" >&2
 fi
@@ -1396,7 +1418,8 @@ const REMOVE_TEMP_SCRIPT: &str = concat!(resolve_target!(), r#"rm -f "$tmp""#);
 enum SearchFailure {
     /// The engine rejected the pattern.
     BadRegex,
-    /// The search root itself does not exist; carries the engine's message.
+    /// The search root itself does not exist, or lies below a file (`Not a directory`); carries the
+    /// engine's message, whose wording decides `not_found` or `not_a_directory`.
     MissingRoot(String),
     /// Only per-path read errors: the hits on stdout are still valid. Carries the note.
     Skipped(String),
@@ -1410,10 +1433,11 @@ enum SearchFailure {
 /// through the first line that ends in an OS message. The search root is known, so its own error is
 /// found by looking for that exact string, newlines and all.
 fn classify_search_failure(stderr: &str, root: &str) -> SearchFailure {
-    const OS_ERRORS: [&str; 5] = [
+    const OS_ERRORS: [&str; 6] = [
         "No such file or directory",
         "Permission denied",
         "Is a directory",
+        "Not a directory",
         "Too many levels of symbolic links",
         "Input/output error",
     ];
@@ -1446,7 +1470,7 @@ fn classify_search_failure(stderr: &str, root: &str) -> SearchFailure {
         r.match_indices(&root_prefix).any(|(at, _)| {
             let rest = &r[at + root_prefix.len()..];
             let rest = rest.strip_prefix(&io_prefix).unwrap_or(rest);
-            rest.starts_with("No such file or directory")
+            rest.starts_with("No such file or directory") || rest.starts_with("Not a directory")
         })
     }) {
         return SearchFailure::MissingRoot((*r).to_string());
@@ -1908,6 +1932,8 @@ mod tests {
             );
         }
         for missing in [
+            "rg: /work/proj: IO error for operation on /work/proj: Not a directory (os error 20)",
+            "grep: /work/proj: Not a directory",
             "rg: /work/proj: No such file or directory (os error 2)",
             "rg: /work/proj: IO error for operation on /work/proj: No such file or directory (os error 2)",
             "grep: /work/proj: No such file or directory",

@@ -740,19 +740,6 @@ impl Machine {
                 } else {
                     // The command itself failed (a fault may still have hit its cleanup).
                     match &plan {
-                        Plan::Succeed
-                            if kind == Kind::PermissionDenied
-                                && std::fs::metadata(&target).is_ok_and(|m| m.is_file())
-                                && !truth::can(&target, 4) =>
-                        {
-                            // The size check reads the temp back, and the temp has the file's mode.
-                            known(
-                                "N4",
-                                format!(
-                                    "{op} {p:?} refused: the file is writable but not readable by its owner: {e}"
-                                ),
-                            );
-                        }
                         Plan::Succeed => fail(format!(
                             "{op} {p:?} must succeed but failed ({kind:?}): {e}"
                         )),
@@ -1180,19 +1167,15 @@ impl Machine {
                 let k = self.kind(&e, &root);
                 let tolerated = report.errored || (self.cfg.cap.is_some() && k == Kind::TooLarge);
                 if !tolerated {
-                    if want.root_below_file && k == Kind::InvalidQuery {
-                        known(
-                            "N3",
-                            format!(
-                                "search of a root below a regular file answered as a bad regex: {e}"
-                            ),
-                        );
-                    } else if want.root_missing {
-                        if !(k == Kind::NotFound
-                            || (want.root_below_file && k == Kind::NotADirectory))
-                        {
+                    if want.root_missing {
+                        let expect = if want.root_below_file {
+                            Kind::NotADirectory
+                        } else {
+                            Kind::NotFound
+                        };
+                        if k != expect {
                             fail(format!(
-                                "search of the missing root {root:?} must fail as not_found, got {k:?}: {e}"
+                                "search of the missing root {root:?} must fail as {expect:?}, got {k:?}: {e}"
                             ));
                         }
                     } else if want.unreadable {
