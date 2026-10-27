@@ -1,9 +1,9 @@
 //! The Rust client's conformance driver (`sdk/conformance/DRIVER.md`): reads requests as JSON lines on
-//! stdin, answers on stdout. The driver itself is the reference driver of the agent's tests, included
-//! rather than copied; it moves to `beyond-sandbox` with the client.
+//! stdin, answers on stdout. The driver itself is the reference driver of the `beyond-sandbox` tests, included
+//! rather than copied.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, dead_code)]
 
-#[path = "../../../agent/tests/sdk_conformance_driver.rs"]
+#[path = "../../../sandbox/tests/sdk_conformance/driver.rs"]
 mod driver;
 
 use std::io::Write as _;

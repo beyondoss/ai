@@ -23,7 +23,7 @@ test (`crates/agent/tests/sdk_conformance.rs`) reaches the in-process reference 
 | `backends.rs`                     | Starts a backend and returns a `Started` (URL, bearer, work directory, extra variables, a guard that stops it).                                            |
 | `matrix.rs`                       | The plan: backends in parallel, each started once, its drivers one after another; the registry file.                                                       |
 | `report.rs`                       | The table and the JSON cell.                                                                                                                               |
-| `bin/sandbox-driver-rust.rs`      | The Rust client's driver. Includes `crates/agent/tests/sdk_conformance_driver.rs` by path until `beyond-sandbox` owns the client.                          |
+| `bin/sandbox-driver-rust.rs`      | The Rust client's driver. Includes `crates/sandbox/tests/sdk_conformance/driver.rs` by path.                                                               |
 | `bin/sandbox-driver-broken.rs`    | Wraps a driver and corrupts one op's answer. `tests/selftest.rs` proves the harness fails exactly the checks that use that op.                             |
 
 ## Outcomes

@@ -2,12 +2,12 @@
 
 The normative specification of the file, search and job helpers that every
 Beyond sandbox client implements on top of the exec protocol. It was derived by
-reading `ShellFs` (`crates/agent/src/tools/fs/shell.rs`) and `HttpExecRunner`
-(`crates/agent/src/exec_endpoint.rs`) as they are, and is proven by the
+reading `ShellFs` (`crates/sandbox/src/fs/shell.rs`) and `HttpExecRunner`
+(`crates/sandbox/src/exec_endpoint.rs`) as they are, and is proven by the
 scenarios in [`scenarios/`](scenarios) (see [README.md](README.md) and
 [DRIVER.md](DRIVER.md)). A client in any language can be written from this
 document and the exec protocol's own spec (the module doc of
-`crates/agent/src/exec_endpoint.rs`) alone.
+`crates/sandbox/src/exec_endpoint.rs`) alone.
 
 The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 
@@ -551,7 +551,7 @@ and may report binary files differently. A client MUST report the engine in use
 
 Jobs are layer 1, specified by the exec protocol (v1.3 natively; the
 **baseline** over plain commands where the endpoint has no native jobs; the
-baseline's layout and supervisor are in `crates/agent/src/exec_endpoint/jobs.rs`).
+baseline's layout and supervisor are in `crates/sandbox/src/exec_endpoint/jobs.rs`).
 A client MUST support native jobs and SHOULD support the baseline; the driver
 ops are in DRIVER.md. Behaviours the scenarios pin, for both:
 

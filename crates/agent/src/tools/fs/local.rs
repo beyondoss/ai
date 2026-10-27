@@ -553,21 +553,8 @@ impl Sink for Collector<'_> {
     }
 }
 
-/// Build a [`SearchQuery`] with the defaults every caller wants — used by tests and the benchmark so
-/// neither has to spell out seven fields to vary one.
 #[doc(hidden)]
-pub fn query(pattern: &str, root: PathBuf, limit: usize) -> SearchQuery {
-    SearchQuery {
-        pattern: pattern.to_string(),
-        literal: false,
-        ignore_case: false,
-        glob: None,
-        root,
-        limit,
-        before: 0,
-        after: 0,
-    }
-}
+pub use super::query;
 
 #[cfg(test)]
 mod tests {

@@ -379,7 +379,8 @@ impl Read {
             // threads too (same pattern as `grep`/`find`'s own blocking walks).
             let bytes = backend
                 .read_bytes(std::path::Path::new(&path), 0, MAX_READ_BYTES)
-                .await?;
+                .await
+                .map_err(super::fs::tool_error)?;
             let path_for_task = path.clone();
             let auto_resize = self.image_auto_resize;
             let result = crate::blocking::spawn(crate::blocking::Site::FileTool, move || {
@@ -451,7 +452,10 @@ impl Read {
         };
         let mut pos = 0u64;
         let counted_all = loop {
-            let chunk = backend.read_bytes(file, pos, READ_CHUNK).await?;
+            let chunk = backend
+                .read_bytes(file, pos, READ_CHUNK)
+                .await
+                .map_err(super::fs::tool_error)?;
             pos += chunk.len() as u64;
             let eof = chunk.len() < READ_CHUNK;
             (window, utf16) = crate::blocking::spawn(crate::blocking::Site::FileTool, move || {

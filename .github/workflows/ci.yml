@@ -512,7 +512,7 @@ jobs:
             fi
             # execd's own code, its timing kernel, and the agent's side of the protocol it is
             # verified against, and this workflow (an edit to the job runs the job).
-            if git diff --name-only "$base"...HEAD | grep -qE '^crates/(execd|exec-notify)/|^crates/agent/src/exec_endpoint|^\.github/workflows/ci\.yml$'; then
+            if git diff --name-only "$base"...HEAD | grep -qE '^crates/(execd|exec-notify)/|^crates/(sandbox/|agent/src/exec_endpoint)|^\.github/workflows/ci\.yml$'; then
               execd=true
             fi
             # The sandbox clients: their SDKs and shared scenarios, the harness, the reference

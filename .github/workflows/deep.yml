@@ -202,12 +202,12 @@ jobs:
           name: fuzz-crash-execd-${{ matrix.target }}
           path: crates/execd/fuzz/artifacts/${{ matrix.target }}/
           if-no-files-found: ignore
-  # Coverage-guided fuzzing of the agent's parsers of tool output: `rg`/`grep` search records, the
+  # Coverage-guided fuzzing of the sandbox client's parsers of tool output: `rg`/`grep` search records, the
   # stat and `find` listings, ShellFs's base64, and the exec protocol's v1.2 stream frames and v1.3
   # job answers. Round-trip and substring/bound properties, not just "does not panic"; four minutes
   # per target, same pinned nightly and crash handling as above.
-  fuzz-agent:
-    name: fuzz agent (${{ matrix.target }})
+  fuzz-sandbox:
+    name: fuzz sandbox (${{ matrix.target }})
     if: ${{ !inputs.only_mutants }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -222,19 +222,19 @@ jobs:
       - run: rustup toolchain install "$FUZZ_NIGHTLY" --profile minimal
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/agent/fuzz
+          workspaces: crates/sandbox/fuzz
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
       - name: fuzz
-        working-directory: crates/agent/fuzz
+        working-directory: crates/sandbox/fuzz
         run: cargo "+$FUZZ_NIGHTLY" fuzz run ${{ matrix.target }} -- -max_total_time=240 -timeout=10 -rss_limit_mb=2048 -max_len=4096
       - name: upload crash inputs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-crash-agent-${{ matrix.target }}
-          path: crates/agent/fuzz/artifacts/${{ matrix.target }}/
+          path: crates/sandbox/fuzz/artifacts/${{ matrix.target }}/
           if-no-files-found: ignore
   # execd's stateful job-table test (random v1.3 operations across scopes with colliding and hostile
   # ids against the real binary, a model beside it, every invariant checked after every step) for

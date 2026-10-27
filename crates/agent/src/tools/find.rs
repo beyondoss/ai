@@ -128,7 +128,11 @@ impl Tool for Find {
         // clearly the moment the search path isn't a directory. Checked via `metadata` (not
         // `is_dir()`) so a path that doesn't exist at all still falls through to the walk below, which
         // already reports that case via `walk_error`.
-        let root_meta = self.backend.stat(&root).await?;
+        let root_meta = self
+            .backend
+            .stat(&root)
+            .await
+            .map_err(super::fs::tool_error)?;
         if let Some(meta) = &root_meta
             && meta.kind != FileKind::Dir
         {
@@ -146,7 +150,8 @@ impl Tool for Find {
                 root: root.clone(),
                 limit,
             })
-            .await?;
+            .await
+            .map_err(super::fs::tool_error)?;
         let (paths, truncated, walk_error) =
             (outcome.paths, outcome.truncated, outcome.first_error);
 

@@ -599,7 +599,10 @@ impl JobTracker for Table {
 }
 
 fn fixture_key() -> NotifyKey {
-    let fx: Value = serde_json::from_str(include_str!("fixtures/exec/v1.4-token.json")).unwrap();
+    let fx: Value = serde_json::from_str(include_str!(
+        "../../sandbox/tests/fixtures/exec/v1.4-token.json"
+    ))
+    .unwrap();
     let bytes: [u8; 32] = base64::engine::general_purpose::STANDARD
         .decode(fx["secrets"]["current"].as_str().unwrap())
         .unwrap()
@@ -727,7 +730,10 @@ async fn prepare(s: &Arc<SessionNotify>, state: &Value) {
 /// Every receiver case of `v1.4-callback.json`, through the real receiver, driver and kernel.
 #[tokio::test]
 async fn every_receiver_case_of_the_fixture() {
-    let fx: Value = serde_json::from_str(include_str!("fixtures/exec/v1.4-callback.json")).unwrap();
+    let fx: Value = serde_json::from_str(include_str!(
+        "../../sandbox/tests/fixtures/exec/v1.4-callback.json"
+    ))
+    .unwrap();
     let cases = fx["receiver"].as_array().unwrap().clone();
     let mut runs = Vec::new();
     for case in cases {
@@ -845,7 +851,10 @@ async fn run_case(case: &Value) {
 }
 
 fn fx_url_session() -> (String, String) {
-    let fx: Value = serde_json::from_str(include_str!("fixtures/exec/v1.4-callback.json")).unwrap();
+    let fx: Value = serde_json::from_str(include_str!(
+        "../../sandbox/tests/fixtures/exec/v1.4-callback.json"
+    ))
+    .unwrap();
     (
         fx["url_session"]["tenant"].as_str().unwrap().to_string(),
         fx["url_session"]["session_id"]

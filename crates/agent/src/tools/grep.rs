@@ -173,7 +173,11 @@ impl Tool for Grep {
         };
         // A malformed regex or glob surfaces from the backend now (it compiles them), but as the same
         // `ToolError::InvalidInput` with the same message text it always produced.
-        let outcome = self.backend.search(&query).await?;
+        let outcome = self
+            .backend
+            .search(&query)
+            .await
+            .map_err(super::fs::tool_error)?;
         let (matches, truncated, walk_error) =
             (outcome.hits, outcome.truncated, outcome.first_error);
 
