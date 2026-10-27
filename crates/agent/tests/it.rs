@@ -160,6 +160,8 @@ mod run_todo;
 mod run_wrap_up_and_export;
 mod sandbox_jobs;
 mod sandbox_jobs_notify;
+mod sdk_conformance;
+mod sdk_conformance_driver;
 mod serve_accept_error;
 mod serve_agent_frontmatter;
 mod serve_approval;
