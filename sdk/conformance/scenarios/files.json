@@ -505,6 +505,16 @@
                 ]
               }
             }
+          },
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "busybox `find` has no -printf, prints its usage and exits 1, and the probe counts exit 1 as present (see Known deviations)",
+            "when": {
+              "find_printf": true,
+              "search_engine": "busybox-grep"
+            }
           }
         },
         {
@@ -1768,6 +1778,16 @@
               "exit_code": 0,
               "stdout_utf8": "made\n"
             }
+          },
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "busybox `readlink -f` of a dangling link resolves the target against the working directory, not the link's directory, so the write lands in the wrong place (see Known deviations)",
+            "when": {
+              "find_printf": true,
+              "search_engine": "busybox-grep"
+            }
           }
         }
       ]
@@ -2804,6 +2824,16 @@
                 ]
               }
             }
+          },
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "busybox `find` has no -printf, prints its usage and exits 1, and the probe counts exit 1 as present (see Known deviations)",
+            "when": {
+              "find_printf": true,
+              "search_engine": "busybox-grep"
+            }
           }
         }
       ]
@@ -2938,6 +2968,16 @@
                 ]
               }
             }
+          },
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "busybox `find` has no -printf, prints its usage and exits 1, and the probe counts exit 1 as present (see Known deviations)",
+            "when": {
+              "find_printf": true,
+              "search_engine": "busybox-grep"
+            }
           }
         }
       ]
@@ -2972,6 +3012,16 @@
                 }
               ]
             }
+          },
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "busybox `find` has no -printf, prints its usage and exits 1, and the probe counts exit 1 as present (see Known deviations)",
+            "when": {
+              "find_printf": true,
+              "search_engine": "busybox-grep"
+            }
           }
         },
         {
@@ -2986,6 +3036,16 @@
                   "kind": "dir"
                 }
               ]
+            }
+          },
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "busybox `find` has no -printf, prints its usage and exits 1, and the probe counts exit 1 as present (see Known deviations)",
+            "when": {
+              "find_printf": true,
+              "search_engine": "busybox-grep"
             }
           }
         }
@@ -3022,6 +3082,16 @@
                 ]
               }
             }
+          },
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "busybox `find` has no -printf, prints its usage and exits 1, and the probe counts exit 1 as present (see Known deviations)",
+            "when": {
+              "find_printf": true,
+              "search_engine": "busybox-grep"
+            }
           }
         },
         {
@@ -3045,6 +3115,16 @@
                   }
                 ]
               }
+            }
+          },
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "busybox `find` has no -printf, prints its usage and exits 1, and the probe counts exit 1 as present (see Known deviations)",
+            "when": {
+              "find_printf": true,
+              "search_engine": "busybox-grep"
             }
           }
         }
@@ -3081,6 +3161,16 @@
                 "$len": 2
               }
             }
+          },
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "busybox `find` has no -printf, prints its usage and exits 1, and the probe counts exit 1 as present (see Known deviations)",
+            "when": {
+              "find_printf": true,
+              "search_engine": "busybox-grep"
+            }
           }
         },
         {
@@ -3102,6 +3192,16 @@
                 }
               }
             }
+          },
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "busybox `find` has no -printf, prints its usage and exits 1, and the probe counts exit 1 as present (see Known deviations)",
+            "when": {
+              "find_printf": true,
+              "search_engine": "busybox-grep"
+            }
           }
         },
         {
@@ -3116,6 +3216,16 @@
                 "$len": 4
               }
             }
+          },
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "busybox `find` has no -printf, prints its usage and exits 1, and the probe counts exit 1 as present (see Known deviations)",
+            "when": {
+              "find_printf": true,
+              "search_engine": "busybox-grep"
+            }
           }
         },
         {
@@ -3127,6 +3237,16 @@
               "entries": {
                 "$len": 3
               }
+            }
+          },
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "busybox `find` has no -printf, prints its usage and exits 1, and the probe counts exit 1 as present (see Known deviations)",
+            "when": {
+              "find_printf": true,
+              "search_engine": "busybox-grep"
             }
           }
         }
@@ -3157,6 +3277,16 @@
             "ok": {
               "entries": []
             }
+          },
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "busybox `find` has no -printf, prints its usage and exits 1, and the probe counts exit 1 as present (see Known deviations)",
+            "when": {
+              "find_printf": true,
+              "search_engine": "busybox-grep"
+            }
           }
         },
         {
@@ -3166,6 +3296,16 @@
           "expect": {
             "ok": {
               "entries": []
+            }
+          },
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "busybox `find` has no -printf, prints its usage and exits 1, and the probe counts exit 1 as present (see Known deviations)",
+            "when": {
+              "find_printf": true,
+              "search_engine": "busybox-grep"
             }
           }
         }
@@ -3182,6 +3322,16 @@
           "expect": {
             "error": {
               "kind": "not_found"
+            }
+          },
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "busybox `find` has no -printf, prints its usage and exits 1, and the probe counts exit 1 as present (see Known deviations)",
+            "when": {
+              "find_printf": true,
+              "search_engine": "busybox-grep"
             }
           }
         }
@@ -3274,6 +3424,16 @@
                 ]
               }
             }
+          },
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "busybox `find` has no -printf, prints its usage and exits 1, and the probe counts exit 1 as present (see Known deviations)",
+            "when": {
+              "find_printf": true,
+              "search_engine": "busybox-grep"
+            }
           }
         }
       ]
@@ -3311,6 +3471,16 @@
                 }
               ]
             }
+          },
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "busybox `find` has no -printf, prints its usage and exits 1, and the probe counts exit 1 as present (see Known deviations)",
+            "when": {
+              "find_printf": true,
+              "search_engine": "busybox-grep"
+            }
           }
         }
       ]
@@ -3341,6 +3511,16 @@
               "entries": {
                 "$len": 3000
               }
+            }
+          },
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "busybox `find` has no -printf, prints its usage and exits 1, and the probe counts exit 1 as present (see Known deviations)",
+            "when": {
+              "find_printf": true,
+              "search_engine": "busybox-grep"
             }
           }
         }
@@ -4183,6 +4363,75 @@
                 }
               ],
               "truncated": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.context-path-starting-with-dashes-newline",
+      "description": "A file whose name begins with '--' and a newline is searched with context, next to a second file so the engine would print a group separator between them. Hits are attributed to the full name; no separator is mistaken for (or taken from) the start of a path.",
+      "requires": {
+        "search_engine": [
+          "rg",
+          "grep"
+        ]
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'p\\nHIT\\nq\\n' > \"$(printf -- '--\\nb')\"; printf 'HIT\\nr\\n' > z",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "ctx",
+          "op": "search",
+          "pattern": "HIT",
+          "before": 1,
+          "after": 1,
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/--\nb",
+                  "line": 1,
+                  "text": "p",
+                  "is_match": false
+                },
+                {
+                  "path": "${ROOT}/--\nb",
+                  "line": 2,
+                  "text": "HIT",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/--\nb",
+                  "line": 3,
+                  "text": "q",
+                  "is_match": false
+                },
+                {
+                  "path": "${ROOT}/z",
+                  "line": 1,
+                  "text": "HIT",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/z",
+                  "line": 2,
+                  "text": "r",
+                  "is_match": false
+                }
+              ]
             }
           }
         }

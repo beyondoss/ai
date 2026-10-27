@@ -273,6 +273,8 @@ required-features = ["code-mode"]
 [dev-dependencies]
 # The mock model server and turn builders, shared with `crates/fleet-sim` — see that crate for why
 # they no longer live in `tests/common`.
+# The one scenario evaluator (`tests/sdk_conformance.rs` and the `sandbox-matrix` binary share it).
+beyond-sandbox-conformance = { path = "../sandbox-conformance" }
 beyond-test-support = { path = "../test-support" }
 # The client side of the WebSocket transport, for `tests/serve_websocket.rs` and the live WS smokes:
 # `connect_async` to a `ws://127.0.0.1` listener (no TLS). Same crate/version as the non-dev dep above.

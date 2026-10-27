@@ -492,6 +492,7 @@ jobs:
     outputs:
       deps: ${{ steps.diff.outputs.deps }}
       execd: ${{ steps.diff.outputs.execd }}
+      clients: ${{ steps.diff.outputs.clients }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -503,6 +504,7 @@ jobs:
         run: |
           deps=false
           execd=false
+          clients=false
           if [ "$EVENT" = pull_request ] || [ "$EVENT" = workflow_dispatch ] || [ "$EVENT" = merge_group ]; then
             base=${BASE_SHA:-$(git rev-parse origin/main)}
             if git diff --name-only "$base"...HEAD | grep -qE '(^|/)Cargo\.toml$|^Cargo\.lock$|^\.cargo/(audit\.toml|config(\.toml)?)$|(^|/)rust-toolchain(\.toml)?$|(^|/)Dockerfile[^/]*$'; then
@@ -513,9 +515,15 @@ jobs:
             if git diff --name-only "$base"...HEAD | grep -qE '^crates/(execd|exec-notify)/|^crates/agent/src/exec_endpoint|^\.github/workflows/ci\.yml$'; then
               execd=true
             fi
+            # The sandbox clients: their SDKs and shared scenarios, the harness, the reference
+            # implementation of the file helpers, and execd (the backend they run against).
+            if git diff --name-only "$base"...HEAD | grep -qE '^sdk/|^crates/sandbox|^crates/execd/|^crates/agent/src/(exec_endpoint|tools/fs/|tools/exec\.rs)|^crates/agent/tests/sdk_conformance|^\.github/workflows/ci\.yml$'; then
+              clients=true
+            fi
           fi
           echo "deps=$deps" >>"$GITHUB_OUTPUT"
           echo "execd=$execd" >>"$GITHUB_OUTPUT"
+          echo "clients=$clients" >>"$GITHUB_OUTPUT"
   # execd on a native arm64 machine. execd ships for arm64 (release-execd.yml) and is Linux-syscall
   # code (subreaper, process groups, /proc, waits) whose struct layouts and syscall numbers differ
   # per arch, so x86 green says nothing about it. The suite runs here as on amd64, including the
@@ -549,6 +557,33 @@ jobs:
       - name: what was left running
         if: always()
         run: ps -eo pid,etime,rss,args | grep -E "execd|agent|gateway" | grep -v grep || echo "  none"
+  # The sandbox clients' conformance matrix: every registered driver (sdk/conformance/drivers.toml)
+  # against execd on this runner, in Alpine (real busybox), in Debian under EXECD_RUN_AS, on a
+  # read-only mount, on a disk that fills, and against the fault-injecting endpoint. Only when the
+  # change touches the clients, the harness, the file helpers or execd (the `changes` job).
+  clients:
+    name: sandbox clients (matrix)
+    needs: changes
+    if: needs.changes.outputs.clients == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clients
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: sudo apt-get install -y musl-tools
+      - name: matrix
+        run: mise run test:clients
+        timeout-minutes: 20
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sandbox-matrix-report
+          path: target/sandbox-matrix/report.json
+          retention-days: 7
   # Advisories only: no license or duplicate-version checks. Ignores live in .cargo/audit.toml.
   advisories:
     name: advisories
@@ -565,21 +600,21 @@ jobs:
   # Mutation testing is not a PR check: a missed mutant is a test gap, not a bug, and the per-PR
   # run added about an hour to every gateway change. The full mutation sweep is weekly (deep.yml).
   # Single required status check. Branch protection can require just `Check`; it stays green only if
-  # every parallel job above did. Two kinds of skip are allowed: `advisories` and `execd-arm64` may be
+  # every parallel job above did. Two kinds of skip are allowed: `advisories`, `execd-arm64` and `clients` may be
   # skipped on any event (each must pass only when it ran: the change touched dependencies / execd), and `gateway-stress` and
   # `build` may be skipped on a pull_request only (they run in the merge queue, so every commit that
   # reaches main passed them). Cheap (no build), and keeps the required-check name stable.
   Check:
     name: Check
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, archive, test, gateway-stress, build, changes, advisories, execd-arm64]
+    needs: [fmt, clippy, archive, test, gateway-stress, build, changes, advisories, execd-arm64, clients]
     if: always()
     steps:
       - name: Gate on all checks
         env:
           EVENT: ${{ github.event_name }}
         run: |
-          echo "event=$EVENT fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} archive=${{ needs.archive.result }} test=${{ needs.test.result }} gateway-stress=${{ needs.gateway-stress.result }} build=${{ needs.build.result }} changes=${{ needs.changes.result }} advisories=${{ needs.advisories.result }} execd-arm64=${{ needs.execd-arm64.result }}"
+          echo "event=$EVENT fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} archive=${{ needs.archive.result }} test=${{ needs.test.result }} gateway-stress=${{ needs.gateway-stress.result }} build=${{ needs.build.result }} changes=${{ needs.changes.result }} advisories=${{ needs.advisories.result }} execd-arm64=${{ needs.execd-arm64.result }} clients=${{ needs.clients.result }}"
           # gateway-stress and build are skipped on a pull_request and nowhere else: a skip on the
           # merge queue or a dispatch is a job that never ran, which must not read as green.
           pr_only() { [ "$1" = "success" ] || { [ "$EVENT" = pull_request ] && [ "$1" = "skipped" ]; }; }
@@ -591,4 +626,5 @@ jobs:
             && pr_only "${{ needs.build.result }}" \
             && [ "${{ needs.changes.result }}" = "success" ] \
             && { [ "${{ needs.advisories.result }}" = "success" ] || [ "${{ needs.advisories.result }}" = "skipped" ]; } \
-            && { [ "${{ needs.execd-arm64.result }}" = "success" ] || [ "${{ needs.execd-arm64.result }}" = "skipped" ]; }
+            && { [ "${{ needs.execd-arm64.result }}" = "success" ] || [ "${{ needs.execd-arm64.result }}" = "skipped" ]; } \
+            && { [ "${{ needs.clients.result }}" = "success" ] || [ "${{ needs.clients.result }}" = "skipped" ]; }

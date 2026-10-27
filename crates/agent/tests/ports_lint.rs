@@ -78,6 +78,8 @@ const ALLOWED: &[(&str, usize)] = &[
     ("fleet-sim/src/replica.rs", 2),
     // The execd benchmark starts each server on port 0 and reads the port from its sockets.
     ("execd/benches/exec_compare.rs", 1),
+    // The matrix's local backend starts execd on port 0 and reads the port from its log.
+    ("sandbox-conformance/src/backends.rs", 1),
 ];
 
 /// A source file with comments blanked out (newlines kept) and its string literals located.

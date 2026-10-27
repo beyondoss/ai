@@ -364,6 +364,7 @@ dependencies = [
  "beyond-agent-core",
  "beyond-exec-notify",
  "beyond-providers",
+ "beyond-sandbox-conformance",
  "beyond-test-support",
  "bytes",
  "chacha20poly1305",
@@ -589,6 +590,25 @@ dependencies = [
  "serde_json",
  "sha2",
  "toml 0.8.23",
+]
+
+[[package]]
+name = "beyond-sandbox-conformance"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "beyond-agent",
+ "beyond-test-support",
+ "clap",
+ "hex",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "toml",
 ]
 
 [[package]]
