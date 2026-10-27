@@ -624,9 +624,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "beyond-agent",
  "beyond-sandbox",
  "beyond-test-support",
  "clap",
+ "futures",
+ "hegeltest",
  "hex",
  "regex",
  "serde",

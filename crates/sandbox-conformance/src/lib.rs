@@ -10,6 +10,7 @@ pub mod backends;
 pub mod eval;
 pub mod link;
 pub mod matrix;
+pub mod reaper;
 pub mod relay;
 pub mod report;
 pub mod run;
