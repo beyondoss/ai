@@ -53,19 +53,6 @@ fn n1_list_of_a_symlinked_directory_is_empty() {
     );
 }
 
-/// N2: a path with a newline in it spreads the engine's one-line error over two lines, and the D4
-/// classifier then reads the missing root as a bad regex.
-#[test]
-fn n2_missing_search_root_with_a_newline_is_a_bad_regex() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("no\nwhere");
-    let err = env::rt().block_on(fs().search(&query(&root))).unwrap_err();
-    assert!(
-        matches!(err, FsError::InvalidQuery(_)),
-        "N2 is fixed: delete this test and the known(\"N2\") call; got {err}"
-    );
-}
-
 /// N3: a search root below a regular file ("Not a directory") is not among the OS errors the D4
 /// classifier knows, so it is reported as a bad regex.
 #[test]
