@@ -578,6 +578,10 @@ jobs:
       - name: matrix
         run: mise run test:clients
         timeout-minutes: 20
+      # Randomized differential testing of the same drivers (fixed seeds and case counts).
+      - name: differential
+        run: mise run test:differential
+        timeout-minutes: 8
       - uses: actions/upload-artifact@v4
         if: always()
         with:

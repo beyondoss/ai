@@ -309,6 +309,20 @@ target/debug/sandbox-matrix --registry sdk/conformance/drivers.toml $backends \
   --report target/sandbox-matrix/report.json "$@"
 """
 
+[tasks."test:differential"]
+description = "Randomized differential testing across every client: Hegel generates operation sequences, each runs through every driver in sdk/conformance/drivers.toml on its own fresh root, and the answers are compared with each other and (local backends) with the filesystem. Fixed seeds and case counts; widen with DIFFERENTIAL_CASES, DIFFERENTIAL_SEED, DIFFERENTIAL_STEPS, DIFFERENTIAL_BACKENDS, DIFFERENTIAL_DRIVERS, DIFFERENTIAL_SHRINK=0. The container backends run when docker is available."
+depends = ["build:execd-static"]
+run = """
+set -e
+cargo build -q -p beyond-execd
+if [ ! -f sdk/ts/sandbox/dist/driver.mjs ]; then
+  npm ci --prefix sdk/ts --silent && npm run build --prefix sdk/ts --silent
+fi
+export EXECD_BIN="$PWD/target/debug/execd"
+export EXECD_STATIC_BIN="$PWD/target/$(uname -m)-unknown-linux-musl/debug/execd"
+cargo test -q -p beyond-sandbox-conformance --test differential -- --nocapture "$@"
+"""
+
 # ---- python client: beyond-sandbox (sdk/python/sandbox) ---------------------------------------------
 
 [tasks."install:py"]
