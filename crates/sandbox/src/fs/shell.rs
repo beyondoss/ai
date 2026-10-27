@@ -1237,10 +1237,11 @@ exec dd if="$1" iflag=skip_bytes,count_bytes skip="$2" count="$3" status=none | 
 /// The opening of every write script: resolve the target `$1` to the file a write lands in, as `$t`,
 /// and name the temp `$tmp` beside it with the host's unpredictable suffix `$2`. The shell spelling of
 /// `LocalFs`'s `resolve_symlink_target`, so both backends write through a symlink rather than replacing
-/// it: `readlink -f` resolves a link whose target exists; a dangling link is never given to it (busybox
-/// resolves its relative target against the working directory, not the link's), but followed one
-/// `readlink` hop at a time, each relative target joined to the directory of the link it came from, for
-/// at most 40 hops (Linux's ELOOP limit, MAXSYMLINKS). The temp sits beside the resolved file, so the
+/// it: every link, live or dangling, is followed one `readlink` hop at a time, each relative target
+/// joined to the directory of the link it came from, for at most 40 hops (Linux's ELOOP limit,
+/// MAXSYMLINKS); a path still a link after that is a loop and fails with ELOOP before any temp exists.
+/// `readlink -f` is not used: it is unbounded in time and memory on an adversarial chain, and busybox
+/// resolves a dangling link's relative target against the working directory, not the link's. The temp sits beside the resolved file, so the
 /// final `mv` is a rename within one filesystem.
 ///
 /// A path starting with `-` is prefixed with `./` so no command reads it as an option; `--` would do
@@ -1249,22 +1250,19 @@ macro_rules! resolve_target {
     () => {
         r#"t="$1"
 case "$t" in -*) t="./$t" ;; esac
-if [ -L "$t" ]; then
-  r=
-  [ -e "$t" ] && r=$(readlink -f "$t" 2>/dev/null)
-  if [ -z "$r" ]; then
-    r="$t" n=0
-    while [ -L "$r" ] && [ $n -lt 40 ]; do
-      l=$(readlink "$r") || exit 1
-      case "$l" in
-        /*) r="$l" ;;
-        *) case "$r" in */*) r="${r%/*}/$l" ;; *) r="$l" ;; esac ;;
-      esac
-      n=$((n + 1))
-    done
-  fi
-  t="$r"
+n=0
+while [ -L "$t" ] && [ $n -lt 40 ]; do
+  l=$(readlink "$t") || exit 1
+  case "$l" in
+    /*) t="$l" ;;
+    *) case "$t" in */*) t="${t%/*}/$l" ;; *) t="$l" ;; esac ;;
+  esac
   case "$t" in -*) t="./$t" ;; esac
+  n=$((n + 1))
+done
+if [ -L "$t" ]; then
+  echo "Too many levels of symbolic links (os error 40)" >&2
+  exit 1
 fi
 tmp="$t.tmp.$2"
 "#

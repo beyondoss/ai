@@ -5,7 +5,7 @@
 // Sources, both in this repository:
 //   - sdk/conformance/FILES-OVER-EXEC.md, appendix "The scripts" (A to F): the file helpers.
 //   - the baseline jobs of the exec protocol: JOB_SCRIPT and the supervisor
-//     (crates/agent/src/exec_endpoint/jobs.rs, with the v1.4 shell kernel from
+//     (crates/sandbox/src/exec_endpoint/jobs.rs, with the v1.4 shell kernel from
 //     crates/exec-notify/src/lib.rs spliced in at `#@kernel`, as the Rust client does).
 // The scripts are constants, never edited by hand: __tests__/scripts.test.ts fails when
 // scripts.ts and the spec disagree.
@@ -35,7 +35,7 @@ function rustRaw(src, name, kind) {
   return m[1];
 }
 
-const jobs = read("crates/agent/src/exec_endpoint/jobs.rs");
+const jobs = read("crates/sandbox/src/exec_endpoint/jobs.rs");
 const notify = read("crates/exec-notify/src/lib.rs");
 const kernel = rustRaw(notify, "SH", "pub const");
 const supervisorTemplate = rustRaw(jobs, "SUPERVISOR_TEMPLATE", "const");
