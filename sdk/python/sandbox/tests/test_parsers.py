@@ -13,6 +13,7 @@ from beyond_sandbox._fs import (
     compile_glob,
     crlf_tolerant_ere,
     finalize,
+    first_line,
     is_under_git_dir,
     parse_colon_records,
     parse_dir_entries,
@@ -157,6 +158,27 @@ def test_an_unparseable_size_is_zero() -> None:
 
 
 # ---- search ----------------------------------------------------------------------------------------
+
+
+def test_a_newline_in_a_path_does_not_hide_the_os_error() -> None:
+    root = "/work/no\nwhere"
+    for missing in [
+        "rg: /work/no\nwhere: No such file or directory (os error 2)\n",
+        "rg: /work/no\nwhere: IO error for operation on /work/no\nwhere: No such file or directory (os error 2)\n",
+        "grep: /work/no\nwhere: No such file or directory\n",
+    ]:
+        assert classify_search_failure(missing, root).kind == "missing_root", missing
+    skipped = classify_search_failure(
+        "rg: /p/a\nb: Permission denied (os error 13)\nrg: /p/c: Permission denied (os error 13)\n",
+        "/p",
+    )
+    assert skipped.kind == "skipped" and skipped.note.startswith("2 path(s)")
+    assert (
+        first_line(b"cat: a\nb: No such file or directory\n")
+        == "cat: a\nb: No such file or directory"
+    )
+    assert first_line(b"one\ntwo\n") == "one"
+    assert first_line(b"  \n") == "command failed"
 
 
 def test_search_exit_two_is_told_apart_by_stderr() -> None:

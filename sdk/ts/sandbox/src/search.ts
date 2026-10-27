@@ -288,14 +288,14 @@ const OS_ERRORS = [
 
 /**
  * Exit 2 is shared by three situations: the engine rejecting the pattern, a missing root, and
- * per-path read errors. Every stderr line a per-path OS error means the hits are good.
+ * per-path read errors. A path may contain a newline, so stderr is read as records that end at an
+ * OS error, not as lines; the root's own error is found by its exact string (newlines included).
  */
 export function classifySearchFailure(
   stderr: string,
   root: string,
 ): SearchFailure {
-  const lines = stderr.split("\n").filter((l) => l.trim() !== "");
-  const pathError = (raw: string): boolean => {
+  const endsInOsError = (raw: string): boolean => {
     let l = raw.trimEnd();
     if (l.endsWith(")")) {
       const at = l.lastIndexOf(" (os error ");
@@ -303,21 +303,39 @@ export function classifySearchFailure(
     }
     return OS_ERRORS.some((e) => l.endsWith(e));
   };
-  if (lines.length === 0 || !lines.every(pathError)) {
+  const records: string[] = [];
+  let start = 0;
+  for (const m of stderr.matchAll(/[^\n]*\n|[^\n]+$/g)) {
+    const end = m.index! + m[0].length;
+    if (endsInOsError(m[0])) {
+      records.push(stderr.slice(start, end).trim());
+      start = end;
+    }
+  }
+  if (records.length === 0 || stderr.slice(start).trim() !== "") {
     return { kind: "bad_regex" };
   }
   const rootPrefix = `: ${root}: `;
-  const missing = lines.find(
-    (l) => l.includes(rootPrefix) && l.includes("No such file or directory"),
-  );
+  const ioPrefix = `IO error for operation on ${root}: `;
+  const missing = records.find((r) => {
+    for (
+      let at = r.indexOf(rootPrefix);
+      at >= 0;
+      at = r.indexOf(rootPrefix, at + 1)
+    ) {
+      let rest = r.slice(at + rootPrefix.length);
+      if (rest.startsWith(ioPrefix)) rest = rest.slice(ioPrefix.length);
+      if (rest.startsWith("No such file or directory")) return true;
+    }
+    return false;
+  });
   if (missing !== undefined) {
-    return { kind: "missing_root", line: missing.trim() };
+    return { kind: "missing_root", line: missing };
   }
   return {
     kind: "skipped",
-    note: `${lines.length} path(s) could not be searched; first: ${
-      lines[0]!.trim()
-    }`,
+    note:
+      `${records.length} path(s) could not be searched; first: ${records[0]!}`,
   };
 }
 
