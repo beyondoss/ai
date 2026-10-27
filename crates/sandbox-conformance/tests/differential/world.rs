@@ -300,7 +300,7 @@ async fn lockstep(world: &World, runs: &mut [Run<'_>], ops: &[Op]) -> Result<(),
             .map(|r| r.d.name.as_str())
             .filter(|n| !majority.contains(n) || faulted.contains(n))
             .collect();
-        if let Some(id) = super::known::divergence(&step, &differing) {
+        if let Some(id) = super::known::divergence(&step, &differing, &canons) {
             *world.known.lock().unwrap().entry(id).or_default() += 1;
             if std::env::var_os("DIFFERENTIAL_VERBOSE").is_some() {
                 eprintln!("KNOWN DIVERGENCE {id}: {differing:?} {step}");

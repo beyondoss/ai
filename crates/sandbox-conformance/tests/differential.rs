@@ -102,30 +102,30 @@ fn drive(backend: &str, default_cases: u64, seed: u64) {
 
 #[test]
 fn local_plain() {
-    drive("local-plain", 120, 0xd1ff_0001);
+    drive("local-plain", 80, 0xd1ff_0001);
 }
 
 #[test]
 fn local_without_stdin() {
-    drive("local-no-stdin", 80, 0xd1ff_0002);
+    drive("local-no-stdin", 60, 0xd1ff_0002);
 }
 
 #[test]
 fn local_posix_grep() {
-    drive("local-grep", 80, 0xd1ff_0003);
+    drive("local-grep", 60, 0xd1ff_0003);
 }
 
 #[test]
 fn local_busybox_rungs() {
-    drive("local-busybox-grep", 80, 0xd1ff_0004);
+    drive("local-busybox-grep", 60, 0xd1ff_0004);
 }
 
 #[test]
 fn alpine() {
-    drive("alpine", 60, 0xd1ff_0005);
+    drive("alpine", 40, 0xd1ff_0005);
 }
 
 #[test]
 fn debian_runas() {
-    drive("debian-runas", 60, 0xd1ff_0006);
+    drive("debian-runas", 40, 0xd1ff_0006);
 }

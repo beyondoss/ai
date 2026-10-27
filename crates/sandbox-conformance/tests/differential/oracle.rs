@@ -469,6 +469,16 @@ pub fn after(
                     {
                         return Ok(Some("D2"));
                     }
+                    // The busybox rung is forced on a GNU grep here (the container backends have the
+                    // real busybox), whose "binary file matches" notice is on stderr and so reads as
+                    // a rejected pattern; busybox prints it on stdout.
+                    if ctx.busybox
+                        && e["detail"]
+                            .as_str()
+                            .is_some_and(|d| d.contains("binary file matches"))
+                    {
+                        return Ok(None);
+                    }
                     let newline = root.to_string_lossy().contains('\n')
                         || pre.snap.keys().any(|p| p.to_string_lossy().contains('\n'));
                     if k == Kind::InvalidQuery && (want.root_missing || want.unreadable) && newline

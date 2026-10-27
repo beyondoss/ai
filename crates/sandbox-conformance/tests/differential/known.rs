@@ -16,7 +16,7 @@ fn strings(v: &Value, out: &mut Vec<String>) {
 
 /// `Some(id)` when `step` is one an open defect explains and exactly the drivers it is known to
 /// afflict (`differing`) are the ones that answered unlike the rest or against the filesystem.
-pub fn divergence(step: &Value, differing: &[&str]) -> Option<&'static str> {
+pub fn divergence(step: &Value, differing: &[&str], answers: &[Value]) -> Option<&'static str> {
     // `DIFFERENTIAL_NO_KNOWN=1` reports these too: to see a defect shrunk, or to check one is fixed.
     if std::env::var_os("DIFFERENTIAL_NO_KNOWN").is_some() {
         return None;
@@ -43,6 +43,18 @@ pub fn divergence(step: &Value, differing: &[&str]) -> Option<&'static str> {
         && only(&["ts"])
     {
         return Some("D3");
+    }
+    // D5: ripgrep prints `PATH: WARNING: stopped searching binary file after match ...` on stdout
+    // when a NUL follows a match. The line has no NUL, so the parser (which scans for the NUL after
+    // the path) takes it as the start of the next record's path; which record that is depends on
+    // the order rg's threads finish in, so one client's run shows it and another's does not.
+    if step["op"] == "search"
+        && answers.iter().any(|a| {
+            a.to_string()
+                .contains("WARNING: stopped searching binary file")
+        })
+    {
+        return Some("D5");
     }
     None
 }
