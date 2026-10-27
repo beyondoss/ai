@@ -205,7 +205,11 @@ describe("Jobs capability", () => {
     expect(await new Jobs(t).capabilities()).toBe("baseline");
     const native: Transport = {
       run: async () => res(1),
-      offers: async () => ({ stream: false, nativeJobs: true }),
+      offers: async () => ({
+        stream: false,
+        nativeJobs: true,
+        outputBase64: false,
+      }),
       nativeJobs: {} as never,
     };
     expect(await new Jobs(native).capabilities()).toBe("native");

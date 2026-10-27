@@ -242,6 +242,7 @@ class HttpTransport:
         self._ssl = ssl_context
         self._lock = threading.Lock()
         self._streams: bool | None = None
+        self._output: bool | None = None
         self._offer: _wire.JobOffer | None = None
 
     # ---- the wire ---------------------------------------------------------------------------
@@ -300,10 +301,10 @@ class HttpTransport:
             return self._open(body, timeout_ms, refresh=True)
         raise _wire.status_error(self.url, reader.status, err_body)
 
-    def _post(self, body: bytes, timeout_ms: int) -> bytes:
+    def _post(self, body: bytes, timeout_ms: int, cap: int | None = None) -> bytes:
         resp = self._open(body, timeout_ms)
         try:
-            return resp.read_capped(self._cap)
+            return resp.read_capped(self._cap if cap is None else cap)
         finally:
             resp.close()
 
@@ -318,8 +319,87 @@ class HttpTransport:
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
         stdin: bytes | None = None,
     ) -> ExecResult:
+        """Run one command; its output is the **bytes** the command wrote (``exact``): over
+        ``output_base64`` when the endpoint honours it, else over a v1.2 stream's base64 frames. A
+        plain v1.1 endpoint (or a call with stdin on one without ``output_base64``) can only answer
+        text, which is returned as UTF-8 with ``exact=False``. A probe that failed raises."""
+        if self.outputs_base64():
+            body = _wire.request_body(
+                command, args, cwd=cwd, timeout_ms=timeout_ms, stdin=stdin, output_base64=True
+            )
+            raw = self._post(body, timeout_ms, _wire.body_cap(self._cap))
+            return _wire.decode_output(self.url, raw, self._cap)
+        # A stream has no stdin in the spec: a call with stdin is a v1.1 call, whose text it is.
+        if stdin is None and self.streams():
+            return self._run_over_stream(command, args, cwd, timeout_ms)
+        return self.run_text(command, args, cwd=cwd, timeout_ms=timeout_ms, stdin=stdin)
+
+    def run_text(
+        self,
+        command: str,
+        args: Sequence[str] = (),
+        *,
+        cwd: str | None = None,
+        timeout_ms: int = DEFAULT_TIMEOUT_MS,
+        stdin: bytes | None = None,
+    ) -> ExecResult:
+        """:meth:`run` the plain v1.1 way: the output is the endpoint's text, ``exact=False``. For
+        the helpers, which read text (or base64 they asked the shell for) and need neither the
+        probe nor the stream; a transport without this method is called through ``run``."""
         body = _wire.request_body(command, args, cwd=cwd, timeout_ms=timeout_ms, stdin=stdin)
         return _wire.parse_envelope(self.url, self._post(body, timeout_ms))
+
+    def outputs_base64(self) -> bool:
+        """Whether the endpoint honours ``output_base64`` (exec v1.1), probing once:
+        ``printf '\\377\\000\\n'`` must come back as ``stdout_base64`` decoding to ``ff 00 0a``. A
+        ``400`` is a strict front refusing the field: no. A request that failed raises; it is never
+        read as "no"."""
+        if self._output is None:
+            body = _wire.request_body(
+                "sh",
+                ["-c", _wire.OUTPUT_PROBE_SCRIPT],
+                cwd=None,
+                timeout_ms=10_000,
+                output_base64=True,
+            )
+            try:
+                raw = self._post(body, 10_000, _wire.body_cap(len(_wire.OUTPUT_PROBE_BYTES)))
+            except EndpointError as e:
+                if e.status != 400:
+                    raise
+                self._output = False
+                return False
+            obj = _wire.parse_json(self.url, raw)
+            if not isinstance(obj, dict) or not isinstance(obj.get("exit_code"), int):
+                raise ProtocolError(
+                    f"exec endpoint {self.url} returned unparseable JSON (no exit_code)"
+                )
+            self._output = _wire.probe_honoured(obj)
+        return self._output
+
+    def _run_over_stream(
+        self, command: str, args: Sequence[str], cwd: str | None, timeout_ms: int
+    ) -> ExecResult:
+        """A one-shot call over a v1.2 stream: the frames are base64 already."""
+        body = _wire.request_body(command, args, cwd=cwd, timeout_ms=timeout_ms, stream=True)
+        resp = self._open(body, timeout_ms)
+        try:
+            if not resp.headers.get("content-type", "").lower().startswith("application/x-ndjson"):
+                # One object after all (a fleet mid-rollout): text.
+                return _wire.parse_envelope(self.url, resp.read_capped(self._cap))
+            decoder, fold = _wire.frame_decoder(), _wire.OneShot()
+            while True:
+                data = resp.next_chunk(_wire.SILENCE_S)
+                if not data:
+                    decoder.eof()
+                for frame in decoder.feed(data):
+                    done = fold.feed(frame)
+                    if done is not None:
+                        return done
+                    if fold.size > self._cap:
+                        raise _wire.too_large(self.url, self._cap)
+        finally:
+            resp.close()
 
     # ---- stream (v1.2) -----------------------------------------------------------------------
 

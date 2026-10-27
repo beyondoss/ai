@@ -115,9 +115,11 @@ class Sandbox:
     def capabilities(self) -> SandboxCapabilities:
         caps = self.files.capabilities()
         probe = getattr(self.transport, "streams", None)
+        outputs = getattr(self.transport, "outputs_base64", None)
         return SandboxCapabilities(
             caps.stdin, bool(probe()) if probe else False, self.jobs.kind(),
             caps.search_engine, caps.find_printf, caps.read_window,
+            bool(outputs()) if outputs else False,
         )  # fmt: skip
 
     def close(self) -> None:
@@ -186,9 +188,11 @@ class AsyncSandbox:
     async def capabilities(self) -> SandboxCapabilities:
         caps = await self.files.capabilities()
         probe = getattr(self.transport, "streams", None)
+        outputs = getattr(self.transport, "outputs_base64", None)
         return SandboxCapabilities(
             caps.stdin, bool(await probe()) if probe else False, await self.jobs.kind(),
             caps.search_engine, caps.find_printf, caps.read_window,
+            bool(await outputs()) if outputs else False,
         )  # fmt: skip
 
     async def aclose(self) -> None:

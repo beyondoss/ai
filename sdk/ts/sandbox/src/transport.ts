@@ -12,6 +12,12 @@ export interface RunOptions {
   timeoutMs?: number;
   /** Bytes fed to the command's stdin, then closed (exec v1.1 `stdin_base64`). */
   stdin?: Uint8Array;
+  /**
+   * The caller reads the output as text (a helper parsing a listing, or base64 it asked the shell
+   * for), so it does not need the command's exact bytes: a transport may answer the plain way and
+   * skip what exact bytes cost. Never needed for correctness; a transport may ignore it.
+   */
+  text?: boolean;
 }
 
 /**
@@ -22,8 +28,18 @@ export interface RunOptions {
  */
 export interface RunResult {
   exitCode: number;
+  /** The bytes the command wrote to stdout. */
   stdout: Uint8Array;
+  /** The bytes the command wrote to stderr. */
   stderr: Uint8Array;
+  /**
+   * Whether `stdout` and `stderr` are exactly what the command wrote. `false` only when the
+   * transport could get nothing but text from the target (a plain v1.1 endpoint, which already
+   * replaced invalid UTF-8 with U+FFFD before this client saw it) or was told the caller reads text
+   * ({@link RunOptions.text}); the bytes are then the UTF-8 of that text. Absent means exact: a
+   * transport that has the bytes (ssh, a vendor SDK) need not set it.
+   */
+  exact?: boolean;
 }
 
 /** One frame of a streamed command (exec v1.2). Heartbeats are not frames. */
@@ -123,6 +139,8 @@ export interface Offers {
   stream: boolean;
   /** The endpoint keeps jobs natively (exec v1.3). */
   nativeJobs: boolean;
+  /** The endpoint answers a one-shot call with the command's bytes (`output_base64`, exec v1.1). */
+  outputBase64: boolean;
 }
 
 /**
