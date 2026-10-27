@@ -95,7 +95,8 @@ export function rgArgs(q: SearchQuery, inGitRepo: boolean): string[] {
 export function grepArgs(q: SearchQuery, gnu: boolean): string[] {
   const r = withDefaults(q);
   const args = ["-r", "-n", "-H"];
-  if (gnu) args.push("-Z", "-I", "--color=never");
+  // `-b`: the offset of each line, which a second run's `-o -b` match offsets turn into a column.
+  if (gnu) args.push("-Z", "-I", "--color=never", "-b");
   args.push(r.literal ? "-F" : "-E");
   if (r.ignoreCase) args.push("-i");
   if (gnu && r.glob !== undefined) {
@@ -196,7 +197,11 @@ function lineNumber(digits: string): number | null {
  * group separator turned off. Scans for the NUL, not for newlines (a path may contain one), skips
  * no `--` bytes (a path may begin with them), and drops a record that does not fit.
  */
-export function parseRecords(stdout: string, columns = false): SearchHit[] {
+export function parseRecords(
+  stdout: string,
+  columns: boolean | "gnu" = false,
+  longs: LongLine[] = [],
+): SearchHit[] {
   const hits: SearchHit[] = [];
   let i = 0;
   while (i < stdout.length) {
@@ -208,6 +213,8 @@ export function parseRecords(stdout: string, columns = false): SearchHit[] {
       stdout.slice(i, nul),
       stdout.slice(nul + 1, nl),
       columns,
+      longs,
+      hits.length,
     );
     if (hit) hits.push(hit);
     i = nl + 1;
@@ -218,7 +225,9 @@ export function parseRecords(stdout: string, columns = false): SearchHit[] {
 function parseBody(
   path: string,
   rest: string,
-  columns: boolean,
+  columns: boolean | "gnu",
+  longs: LongLine[],
+  index: number,
 ): SearchHit | null {
   let d = 0;
   while (isDigit(rest[d])) d++;
@@ -229,14 +238,22 @@ function parseBody(
   if (sep !== ":" && sep !== "-") return null;
   const isMatch = sep === ":";
   let text = rest.slice(d + 1);
-  // `rg --column`: a match record is `LINE:COL:TEXT`, a context record `LINE-TEXT`.
+  // `rg --column`: a match record is `LINE:COL:TEXT`, a context record `LINE-TEXT`. GNU `grep -b`:
+  // `LINE:OFFSET:TEXT` and `LINE-OFFSET-TEXT`, the offset of the line start.
   let col: number | null = null;
-  if (columns && isMatch) {
+  if (columns === "gnu" || (columns && isMatch)) {
     let c = 0;
     while (isDigit(text[c])) c++;
-    if (c === 0 || text[c] !== ":") return null;
-    col = lineNumber(text.slice(0, c));
+    if (c === 0 || text[c] !== sep) return null;
+    const n = lineNumber(text.slice(0, c));
     text = text.slice(c + 1);
+    if (columns === "gnu") {
+      if (isMatch && n !== null && text.length > MAX_LINE) {
+        longs.push({ index, lineStart: n, raw: text });
+      }
+    } else {
+      col = n;
+    }
   }
   return {
     path,
@@ -244,6 +261,13 @@ function parseBody(
     text: clipAt(trimEol(text), matchOffset(text, col)),
     isMatch,
   };
+}
+
+/** A long match line of a GNU `grep` run, whose column the second run finds. */
+export interface LongLine {
+  index: number;
+  lineStart: number;
+  raw: string;
 }
 
 /**
@@ -307,6 +331,7 @@ const OS_ERRORS = [
   "No such file or directory",
   "Permission denied",
   "Is a directory",
+  "Not a directory",
   "Too many levels of symbolic links",
   "Input/output error",
   // rg reading a `.git` file (a gitdir pointer) that is not text.
@@ -352,7 +377,10 @@ export function classifySearchFailure(
     ) {
       let rest = r.slice(at + rootPrefix.length);
       if (rest.startsWith(ioPrefix)) rest = rest.slice(ioPrefix.length);
-      if (rest.startsWith("No such file or directory")) return true;
+      if (
+        rest.startsWith("No such file or directory")
+        || rest.startsWith("Not a directory")
+      ) return true;
     }
     return false;
   });
@@ -374,6 +402,39 @@ export function clip(line: string): string {
   const chars = Array.from(line);
   if (chars.length <= MAX_LINE) return line;
   return chars.slice(0, MAX_LINE).join("") + TRUNCATED_SUFFIX;
+}
+
+/**
+ * Clip the long match lines of a GNU `grep` run (`longs`) from the output of a second run with
+ * `-o -b` and no context: the file offset of a line's first match less the line's offset is the byte
+ * column `rg --column` would have given.
+ */
+export function windowLongLines(
+  hits: SearchHit[],
+  longs: LongLine[],
+  stdout: string,
+): void {
+  const first = new Map<string, number>();
+  let i = 0;
+  while (i < stdout.length) {
+    const nul = stdout.indexOf("\0", i);
+    if (nul < 0) break;
+    let nl = stdout.indexOf("\n", nul);
+    if (nl < 0) nl = stdout.length;
+    const m = /^(\d+):(\d+):/.exec(stdout.slice(nul + 1, nl));
+    if (m) {
+      const key = `${stdout.slice(i, nul)}\0${m[1]}`;
+      if (!first.has(key)) first.set(key, Number(m[2]));
+    }
+    i = nl + 1;
+  }
+  for (const long of longs) {
+    const hit = hits[long.index]!;
+    const off = first.get(`${hit.path}\0${hit.line}`);
+    if (off === undefined || off < long.lineStart) continue;
+    const cs = matchOffset(long.raw, off - long.lineStart + 1);
+    if (cs !== null) hit.text = clipAt(trimEol(long.raw), cs);
+  }
 }
 
 const encoder = new TextEncoder();

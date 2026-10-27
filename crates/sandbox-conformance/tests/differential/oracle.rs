@@ -4,7 +4,7 @@
 //! included, not copied.
 //!
 //! [`before`] looks at the tree and the request, [`after`] checks the driver's answer and the tree it
-//! left. A defect the property test already knows (N1..N4) is returned as `Ok(Some(id))`: tolerated,
+//! left. A defect that has its own scenario (see `known.rs`) is returned as `Ok(Some(id))`: tolerated,
 //! counted, and the operation is left out of the cross-driver comparison, exactly as the property
 //! test's `known(..)` does. When a fix lands its entry is deleted from [`after`] and the divergence
 //! becomes an ordinary failure.
@@ -95,7 +95,7 @@ fn kind_of(e: &Value) -> Kind {
 /// A path with a newline in it splits the shell's one-line error, so the kind falls back to `io`
 /// (FILES-OVER-EXEC 3.3 reads the first line only). Allowed.
 fn kind_ok(kinds: &[Kind], k: Kind, p: &Path) -> bool {
-    kinds.contains(&k) || (k == Kind::Io && (p.to_string_lossy().contains('\n') || has_loop(p)))
+    kinds.contains(&k) || (k == Kind::Io && has_loop(p))
 }
 
 /// A symlink loop on the way ("Too many levels of symbolic links") is none of the errors
@@ -266,13 +266,6 @@ pub fn after(
                         ));
                     }
                     match &plan {
-                        Plan::Succeed
-                            if k == Kind::PermissionDenied
-                                && std::fs::metadata(&target).is_ok_and(|m| m.is_file())
-                                && !truth::can(&target, 4) =>
-                        {
-                            Ok(Some("N4"))
-                        }
                         Plan::Succeed => Err(format!(
                             "{} {rel:?} must succeed but failed ({}): {resp}",
                             op.name(),
@@ -455,7 +448,7 @@ pub fn after(
             want.exact &= !ctx.busybox;
             // GNU grep applies `--include`/`--exclude` to a file named on the command line, ripgrep
             // searches it whatever the glob says: the model is ripgrep's.
-            want.exact &= !(ctx.engine == Engine::Grep && glob.is_some() && root.is_file());
+            want.exact &= !(ctx.engine != Engine::Rg && glob.is_some() && root.is_file());
             match (ok, err) {
                 (None, Some(e)) => {
                     let k = kind_of(e);
@@ -468,15 +461,6 @@ pub fn after(
                             .is_some_and(|d| d.contains("binary file matches"))
                     {
                         return Ok(None);
-                    }
-                    let newline = root.to_string_lossy().contains('\n')
-                        || pre.snap.keys().any(|p| p.to_string_lossy().contains('\n'));
-                    if k == Kind::InvalidQuery && (want.root_missing || want.unreadable) && newline
-                    {
-                        return Ok(Some("N2"));
-                    }
-                    if want.root_below_file && k == Kind::InvalidQuery {
-                        return Ok(Some("N3"));
                     }
                     if want.root_missing {
                         if k == Kind::NotFound || (want.root_below_file && k == Kind::NotADirectory)
@@ -676,11 +660,6 @@ fn list(
                     "list of the missing {rel:?} succeeded with {} entries",
                     entries.len()
                 ));
-            }
-            let via_link = std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink())
-                && matches!(&meta, Ok(m) if m.is_dir());
-            if via_link && entries.is_empty() && !want.is_empty() && cap > 0 {
-                return Ok(Some("N1"));
             }
             if matches!(&meta, Ok(m) if !m.is_dir()) && !entries.is_empty() {
                 return Err(format!("list of the file {rel:?} returned entries"));

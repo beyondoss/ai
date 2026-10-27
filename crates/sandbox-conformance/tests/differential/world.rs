@@ -184,10 +184,10 @@ pub async fn run_case(world: &World, ops: &[Op]) -> Result<(), Failure> {
             vars.insert("ROOT".into(), json!(root));
             let ctx = world.local.then(|| Ctx {
                 root: PathBuf::from(&root),
-                engine: if d.be.caps["search_engine"] == "rg" {
-                    Engine::Rg
-                } else {
-                    Engine::Grep
+                engine: match d.be.caps["search_engine"].as_str() {
+                    Some("rg") => Engine::Rg,
+                    Some("busybox-grep") => Engine::Busybox,
+                    _ => Engine::Grep,
                 },
                 find_printf: d.be.caps["find_printf"] != false,
                 busybox: d.be.caps["search_engine"] == "busybox-grep",
@@ -235,26 +235,45 @@ async fn lockstep(world: &World, runs: &mut [Run<'_>], ops: &[Op]) -> Result<(),
                 r.vars.insert(format!("m{j}"), v.clone());
             }
         }
+        // An op is compared across the drivers whose `hello` lists it (`ks`). A driver without it
+        // is not asked, takes no part in the comparison and is never a divergence; the others are
+        // compared with each other and with the filesystem exactly as if it were absent.
+        let ks: Vec<usize> = (0..runs.len())
+            .filter(|&k| runs[k].d.be.ops.iter().any(|o| o == op.name()))
+            .collect();
+        if ks.is_empty() {
+            return Err(Failure {
+                text: format!("no driver implements {}", op.name()),
+            });
+        }
         // Look at each tree and prepare the request before anything is sent.
-        let pres: Vec<Option<(oracle::Pre, Value)>> = runs
+        let pres: Vec<Option<(oracle::Pre, Value)>> = ks
             .iter()
-            .map(|r| {
+            .map(|&k| {
+                let r = &runs[k];
                 r.ctx.as_ref().map(|c| {
                     let req = subst(&step, &r.vars);
                     (oracle::before(op, c), req)
                 })
             })
             .collect();
-        let answers = futures::future::join_all(runs.iter_mut().map(|r| r.call(&step))).await;
+        let answers = futures::future::join_all(
+            runs.iter_mut()
+                .enumerate()
+                .filter(|(k, _)| ks.contains(k))
+                .map(|(_, r)| r.call(&step)),
+        )
+        .await;
         let mut canons = vec![];
         let mut known: Option<&'static str> = None;
         let mut oracle_msgs: Vec<String> = vec![];
-        for (k, (r, (req, resp))) in runs.iter().zip(&answers).enumerate() {
+        for (j, (&k, (req, resp))) in ks.iter().zip(&answers).enumerate() {
+            let r = &runs[k];
             canons.push(canon(op.name(), resp, &r.root));
             if let Op::Stat { .. } = op {
                 mtimes[k].insert(i, resp["ok"]["mtime"].clone());
             }
-            if let (Some(ctx), Some((pre, _))) = (&r.ctx, &pres[k]) {
+            if let (Some(ctx), Some((pre, _))) = (&r.ctx, &pres[j]) {
                 match oracle::after(op, req, resp, pre, ctx) {
                     Ok(Some(id)) => known = Some(id),
                     Ok(None) => {}
@@ -270,12 +289,14 @@ async fn lockstep(world: &World, runs: &mut [Run<'_>], ops: &[Op]) -> Result<(),
                     eprintln!("KNOWN OPEN BUG {id}: {} {}", op.name(), step);
                 }
             }
+            mirror(runs, &ks, op, &canons[0]).await;
             history.push(canons.swap_remove(0));
             continue;
         }
         // The drivers that are not with the majority, and those the oracle faulted.
         let mut groups: Vec<(&Value, Vec<&str>)> = vec![];
-        for (r, c) in runs.iter().zip(&canons) {
+        for (&k, c) in ks.iter().zip(&canons) {
+            let r = &runs[k];
             match groups.iter_mut().find(|(g, _)| *g == c) {
                 Some((_, m)) => m.push(&r.d.name),
                 None => groups.push((c, vec![&r.d.name])),
@@ -295,9 +316,9 @@ async fn lockstep(world: &World, runs: &mut [Run<'_>], ops: &[Op]) -> Result<(),
             .iter()
             .map(|m| m.split(':').next().unwrap_or(""))
             .collect();
-        let differing: Vec<&str> = runs
+        let differing: Vec<&str> = ks
             .iter()
-            .map(|r| r.d.name.as_str())
+            .map(|&k| runs[k].d.name.as_str())
             .filter(|n| !majority.contains(n) || faulted.contains(n))
             .collect();
         if let Some(id) = super::known::divergence(&step, &differing, &canons) {
@@ -305,6 +326,7 @@ async fn lockstep(world: &World, runs: &mut [Run<'_>], ops: &[Op]) -> Result<(),
             if std::env::var_os("DIFFERENTIAL_VERBOSE").is_some() {
                 eprintln!("KNOWN DIVERGENCE {id}: {differing:?} {step}");
             }
+            mirror(runs, &ks, op, &canons[0]).await;
             history.push(canons.swap_remove(0));
             continue;
         }
@@ -314,9 +336,9 @@ async fn lockstep(world: &World, runs: &mut [Run<'_>], ops: &[Op]) -> Result<(),
             .iter()
             .map(|m| m.split(':').next().unwrap_or(""))
             .collect();
-        let pick = runs
+        let pick = ks
             .iter()
-            .position(|r| !bad.contains(&r.d.name.as_str()))
+            .position(|&k| !bad.contains(&runs[k].d.name.as_str()))
             .unwrap_or(0);
         let mut text = format!(
             "backend {}: step {i} ({}) {}\n",
@@ -326,8 +348,8 @@ async fn lockstep(world: &World, runs: &mut [Run<'_>], ops: &[Op]) -> Result<(),
         );
         if !agree {
             text += "the drivers answered differently:\n";
-            for (r, c) in runs.iter().zip(&canons) {
-                text += &format!("  {:<12} {c}\n", r.d.name);
+            for (&k, c) in ks.iter().zip(&canons) {
+                text += &format!("  {:<12} {c}\n", runs[k].d.name);
             }
         }
         for m in &oracle_msgs {
@@ -342,7 +364,7 @@ async fn lockstep(world: &World, runs: &mut [Run<'_>], ops: &[Op]) -> Result<(),
         let saved = std::fs::write(&file, &json).is_ok();
         text += &format!(
             "\nas a scenario (expect = {}'s answer; edit it to the oracle's before adding it){}:\n{json}\n",
-            runs[pick].d.name,
+            runs[ks[pick]].d.name,
             if saved {
                 format!(", also in {}", file.display())
             } else {
@@ -352,6 +374,29 @@ async fn lockstep(world: &World, runs: &mut [Run<'_>], ops: &[Op]) -> Result<(),
         return Err(Failure { text });
     }
     Ok(())
+}
+
+/// A driver that cannot run `op` must still end the step with the tree the others have. Only
+/// `write_if_unchanged` changes a tree; when the others applied it, the same bytes are written
+/// with `write`, which is what a guard that passed does. A driver with neither op simply cannot
+/// follow, and the read-back shows it.
+async fn mirror(runs: &mut [Run<'_>], ks: &[usize], op: &Op, consensus: &Value) {
+    let Op::WriteIf { rel, data, .. } = op else {
+        return;
+    };
+    if consensus["ok"].is_null() {
+        return; // a conflict or an error: nothing was written
+    }
+    let step = Op::Write {
+        rel: rel.clone(),
+        data: data.clone(),
+    }
+    .step();
+    for (k, r) in runs.iter_mut().enumerate() {
+        if !ks.contains(&k) && r.d.be.ops.iter().any(|o| o == "write") {
+            let _ = r.call(&step).await;
+        }
+    }
 }
 
 /// The sequence up to the failing step, as a file of `sdk/conformance/scenarios` format.

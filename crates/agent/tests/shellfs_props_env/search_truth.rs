@@ -27,7 +27,10 @@ const FIRST_BUFFER: usize = 32 * 1024;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Engine {
     Rg,
+    /// GNU grep.
     Grep,
+    /// busybox grep: GNU's behaviour, except that it cannot place a match in a long line.
+    Busybox,
 }
 
 #[derive(Clone, Debug)]
@@ -143,8 +146,8 @@ pub fn clip(text: &str, is_match: bool, m: &Matcher, engine: Engine) -> String {
         s.push_str("… [truncated]");
         s
     };
-    // Only rg reports a match column; the grep rungs clip every long line at its head.
-    if !is_match || engine == Engine::Grep {
+    // GNU grep places the match with a second `-o -b` run; busybox has no way to.
+    if !is_match || engine == Engine::Busybox {
         return head(&chars);
     }
     let Some((cs, _)) = m.find(text) else {
@@ -200,7 +203,7 @@ fn classify_file(bytes: &[u8], engine: Engine, explicit: bool) -> Class {
             Class::Ambiguous
         };
     }
-    if engine == Engine::Grep && std::str::from_utf8(bytes).is_err() {
+    if engine != Engine::Rg && std::str::from_utf8(bytes).is_err() {
         return Class::Ambiguous;
     }
     Class::Included

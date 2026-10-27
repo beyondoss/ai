@@ -273,7 +273,7 @@ impl ShellFs {
         // spans several shells, and unpredictable for the reason `LocalFs`'s is: a preplanted name
         // cannot redirect the write. Every script resolves the target the same way (`RESOLVE_TARGET`)
         // and names the temp beside the file it resolves to.
-        let suffix = super::temp_suffix();
+        let suffix = super::shell_temp_suffix();
         let outcome = if self.caps.stdin {
             let args = sh_script(
                 WRITE_STDIN_SCRIPT,
@@ -302,6 +302,55 @@ impl ShellFs {
                     )),
                     Err(e) => e,
                 })
+            }
+        }
+    }
+}
+
+impl ShellFs {
+    /// GNU `grep` reports no match column, so the long match lines of a run (`longs`) are found a
+    /// second time, with `-o -b` and no context: the file offset of each match less the line's
+    /// offset (`-b` of the first run) is the byte column `rg --column` would have given. Only lines
+    /// that need it cost the run; a run that fails leaves them clipped at their head.
+    async fn window_long_lines(&self, hits: &mut [Hit], longs: &[Long], q: &SearchQuery) {
+        let mut q2 = q.clone();
+        q2.before = 0;
+        q2.after = 0;
+        let mut args = posix_grep_args(&q2, true);
+        args.insert(0, "-o".to_string());
+        let Ok(result) = self.runner.run("grep", &args, None, self.timeout).await else {
+            return;
+        };
+        // Exit 2 is per-path read errors here too (the first run already reported them).
+        if !matches!(result.code, Some(0..=2)) {
+            return;
+        }
+        // The first match of each line: `PATH NUL LINE:OFFSET:MATCH`.
+        let mut first: std::collections::HashMap<(&str, usize), usize> = Default::default();
+        let out = &result.stdout;
+        let mut i = 0;
+        while let Some(nul) = memchr_from(out.as_bytes(), i, b'\0') {
+            let nl = memchr_from(out.as_bytes(), nul, b'\n').unwrap_or(out.len());
+            let mut it = out[nul + 1..nl].splitn(3, ':');
+            if let (Some(l), Some(o)) = (it.next(), it.next())
+                && let (Ok(l), Ok(o)) = (l.parse::<usize>(), o.parse::<usize>())
+            {
+                first.entry((&out[i..nul], l)).or_insert(o);
+            }
+            i = nl + 1;
+        }
+        for long in longs {
+            let hit = &mut hits[long.index];
+            let Some(off) = hit
+                .path
+                .to_str()
+                .and_then(|p| first.get(&(p, hit.line)))
+                .and_then(|o| o.checked_sub(long.line_start))
+            else {
+                continue;
+            };
+            if let Some(cs) = super::match_offset(&long.raw, off + 1) {
+                hit.text = super::clip_at(&trim_eol(&long.raw), cs);
             }
         }
     }
@@ -372,13 +421,21 @@ impl FsBackend for ShellFs {
             },
         }
 
+        let mut longs = Vec::new();
         let mut hits = if engine == SearchEngine::BusyboxGrep {
             // No `-Z`, so records are `path:line:text` with no unambiguous path terminator, and no
             // `--include`, so the glob is applied here instead.
             parse_colon_records(&result.stdout, q)
         } else {
-            parse_records(&result.stdout, engine == SearchEngine::Ripgrep)
+            let cols = match engine {
+                SearchEngine::Ripgrep => Cols::Rg,
+                _ => Cols::Gnu,
+            };
+            parse_core(&result.stdout, cols, &mut longs)
         };
+        if !longs.is_empty() {
+            self.window_long_lines(&mut hits, &longs, q).await;
+        }
         // The engine was asked to skip `.git` where it can; this is the guarantee for the rungs that
         // can't (busybox `grep`, and a `.git` *file* GNU `--exclude-dir` does not cover).
         hits.retain(|h| !super::is_under_git_dir(&q.root, &h.path));
@@ -466,8 +523,8 @@ impl FsBackend for ShellFs {
     /// Write-temp-then-`mv`, the same shape [`crate::tools::write_atomic`] uses locally, so a reader or
     /// a crash sees the old file or the new one and never a partial. The scripts keep the rest of the
     /// [`FsBackend::write_bytes`] contract too: the target is resolved through a symlink first
-    /// (`resolve_target!`), and the temp is given the existing file's mode before content goes in
-    /// (`new_temp!`). A bare `mv` would replace a link with a regular file and give the file the temp's
+    /// (`resolve_target!`), and the temp is given the existing file's mode just before the `mv`
+    /// (`copy_mode!`; until then it is 0600, so the size check can read it). A bare `mv` would replace a link with a regular file and give the file the temp's
     /// default mode — 0600 became 0644, 0755 lost its execute bits. The content travels on stdin when
     /// the target has proven it delivers stdin ([`Capabilities::stdin`]) and as argv-sized base64
     /// chunks otherwise — never as one argv entry, which Linux caps at 128 KiB.
@@ -1290,14 +1347,14 @@ if [ -L "$t" ]; then
   echo "Too many levels of symbolic links (os error 40)" >&2
   exit 1
 fi
-tmp="$t.tmp.$2"
+case "$t" in */*) tmp="${t%/*}/.tmp.$2" ;; *) tmp=".tmp.$2" ;; esac
 "#
     };
 }
 
 /// Refuse a target that is a directory, with the message `std` gives (so both backends read alike).
 /// Without it the final `mv -f "$tmp" "$t"` moves the temp *into* the directory and exits 0: a write
-/// that reports success and leaves `DIR/DIR.tmp.SUFFIX` behind. `mv -T` would refuse atomically, but
+/// that reports success and leaves `DIR/.tmp.SUFFIX` inside the directory. `mv -T` would refuse atomically, but
 /// it is GNU-only; busybox has no such flag. So the check runs twice, before the temp exists and
 /// again immediately before the `mv`; a directory created at the target inside that last instant is
 /// the one remaining window, the same width as any check-then-rename on a shell.
@@ -1311,11 +1368,13 @@ fi
     };
 }
 
-/// Create the empty temp `$tmp`, with `$t`'s mode when `$t` exists, before any content goes in, so
-/// the replacement keeps the file's mode and a 0600 file's bytes are never in a world-readable temp.
-/// `chmod --reference` is GNU; busybox, which Alpine ships, has no `--reference`, so its fallback is
-/// the octal mode from `stat -L -c %a`. A mode that cannot be copied fails the write: committing would
-/// change the file's permissions, which is exactly what this exists to prevent.
+/// Create the empty temp `$tmp`, mode 0600 when `$t` exists (a new file's temp gets the default mode,
+/// which is the file's mode), then refuse a target the caller may not write, by `[ -w ]`, with the
+/// message `std` gives. The refusal comes after the temp is created so that a read-only or full
+/// filesystem reports its own error (`Read-only file system`), not `Permission denied`. The write needs
+/// no read permission on the file. The temp is 0600 so the size check can read it back whatever the file's mode is (a
+/// file its owner may write but not read, mode 0200, is replaced); [`copy_mode!`] gives it the file's
+/// mode just before the `mv`, and a 0600 file's bytes are never in a world-readable temp.
 ///
 /// `set -C` is the shell's `create_new`: the temp is refused, not followed, if anything was preplanted
 /// at its name.
@@ -1324,9 +1383,26 @@ macro_rules! new_temp {
         concat!(
             not_a_directory!(),
             r#"set -C
-: > "$tmp" || exit 1
+if [ -e "$t" ]; then (umask 077; : > "$tmp") || exit 1; else : > "$tmp" || exit 1; fi
 set +C
-if [ -e "$t" ]; then
+if [ -e "$t" ] && [ ! -w "$t" ]; then
+  echo "Permission denied (os error 13)" >&2
+  rm -f "$tmp"
+  exit 1
+fi
+"#
+        )
+    };
+}
+
+/// Give the finished temp `$tmp` the mode of `$t`, when `$t` exists, just before the `mv`: so the
+/// replacement keeps the file's mode. `chmod --reference` is GNU; busybox, which Alpine ships, has no
+/// `--reference`, so its fallback is the octal mode from `stat -L -c %a`. A mode that cannot be
+/// copied fails the write: committing would change the file's permissions, which is exactly what
+/// this exists to prevent.
+macro_rules! copy_mode {
+    () => {
+        r#"if [ -e "$t" ]; then
   chmod --reference="$t" "$tmp" 2>/dev/null || chmod "$(stat -L -c %a "$t")" "$tmp" || {
     echo "cannot give the new file the mode of $t" >&2
     rm -f "$tmp"
@@ -1334,7 +1410,6 @@ if [ -e "$t" ]; then
   }
 fi
 "#
-        )
     };
 }
 
@@ -1352,7 +1427,9 @@ const WRITE_STDIN_SCRIPT: &str = concat!(
   n=$(wc -c < "$tmp")
   if [ $n -eq "$3" ]; then
     if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
-    mv -f "$tmp" "$t" && exit 0
+"#,
+    copy_mode!(),
+    r#"    mv -f "$tmp" "$t" && exit 0
   else
     echo "short write: $n of $3 bytes arrived on stdin" >&2
   fi
@@ -1378,7 +1455,9 @@ printf %s "$3" | base64 -d >> "$tmp" || { rm -f "$tmp"; exit 1; }
 n=$(wc -c < "$tmp")
 if [ $n -eq "$6" ]; then
   if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
-  mv -f "$tmp" "$t" && exit 0
+"#,
+    copy_mode!(),
+    r#"  mv -f "$tmp" "$t" && exit 0
 else
   echo "short write: $n of $6 bytes assembled" >&2
 fi
@@ -1394,7 +1473,8 @@ const REMOVE_TEMP_SCRIPT: &str = concat!(resolve_target!(), r#"rm -f "$tmp""#);
 enum SearchFailure {
     /// The engine rejected the pattern.
     BadRegex,
-    /// The search root itself does not exist; carries the engine's message.
+    /// The search root itself does not exist, or lies below a file (`Not a directory`); carries the
+    /// engine's message, whose wording decides `not_found` or `not_a_directory`.
     MissingRoot(String),
     /// Only per-path read errors: the hits on stdout are still valid. Carries the note.
     Skipped(String),
@@ -1408,10 +1488,11 @@ enum SearchFailure {
 /// through the first line that ends in an OS message. The search root is known, so its own error is
 /// found by looking for that exact string, newlines and all.
 fn classify_search_failure(stderr: &str, root: &str) -> SearchFailure {
-    const OS_ERRORS: [&str; 6] = [
+    const OS_ERRORS: [&str; 7] = [
         "No such file or directory",
         "Permission denied",
         "Is a directory",
+        "Not a directory",
         "Too many levels of symbolic links",
         "Input/output error",
         // rg reading a `.git` file (a gitdir pointer) that is not text.
@@ -1446,7 +1527,7 @@ fn classify_search_failure(stderr: &str, root: &str) -> SearchFailure {
         r.match_indices(&root_prefix).any(|(at, _)| {
             let rest = &r[at + root_prefix.len()..];
             let rest = rest.strip_prefix(&io_prefix).unwrap_or(rest);
-            rest.starts_with("No such file or directory")
+            rest.starts_with("No such file or directory") || rest.starts_with("Not a directory")
         })
     }) {
         return SearchFailure::MissingRoot((*r).to_string());
@@ -1542,6 +1623,9 @@ fn posix_grep_args(q: &SearchQuery, gnu: bool) -> Vec<String> {
         // rejects `--color` outright.
         args.push("-Z".to_string());
         args.push("-I".to_string());
+        // The byte offset of each line: with a second run's `-o -b` match offsets it gives a long
+        // line's match column (`window_long_lines`).
+        args.push("-b".to_string());
         args.push("--color=never".to_string());
     }
     if q.literal {
@@ -1671,7 +1755,36 @@ fn push_context(args: &mut Vec<String>, q: &SearchQuery) {
 /// There is no group-separator line to skip: the engines are run with it turned off (see `rg_args` and
 /// `posix_grep_args`), because `--` + newline is also a legal start of a path. Every record is
 /// `PATH NUL ...`, so a path beginning with `--` + newline round-trips.
+/// What follows the line number in a `PATH NUL` record.
+#[derive(Clone, Copy, PartialEq)]
+enum Cols {
+    /// Nothing.
+    None,
+    /// `rg --column`: a match record is `LINE:COL:TEXT`, a context record `LINE-TEXT`.
+    Rg,
+    /// GNU `grep -b`: `LINE:OFFSET:TEXT` and `LINE-OFFSET-TEXT`, the byte offset of the line start.
+    Gnu,
+}
+
+/// A long match line of a GNU `grep` run, whose column the second run finds.
+struct Long {
+    /// Index into the hits.
+    index: usize,
+    /// Byte offset of the line start in its file.
+    line_start: usize,
+    /// The text as printed, CRs included.
+    raw: String,
+}
+
 fn parse_records(stdout: &str, columns: bool) -> Vec<Hit> {
+    parse_core(
+        stdout,
+        if columns { Cols::Rg } else { Cols::None },
+        &mut Vec::new(),
+    )
+}
+
+fn parse_core(stdout: &str, cols: Cols, longs: &mut Vec<Long>) -> Vec<Hit> {
     let bytes = stdout.as_bytes();
     let mut hits = Vec::new();
     let mut i = 0usize;
@@ -1693,7 +1806,14 @@ fn parse_records(stdout: &str, columns: bool) -> Vec<Hit> {
         let path = &stdout[i..nul];
         prev_path = path;
         let rest = &stdout[nul + 1..nl];
-        if let Some(hit) = parse_body(path, rest, columns) {
+        if let Some((hit, long)) = parse_body(path, rest, cols) {
+            if let Some((line_start, raw)) = long {
+                longs.push(Long {
+                    index: hits.len(),
+                    line_start,
+                    raw,
+                });
+            }
             hits.push(hit);
         }
         i = nl + 1;
@@ -1723,8 +1843,9 @@ fn is_binary_warning(line: &str, prev_path: &str) -> bool {
 
 /// Split `<line><sep><text>` into its parts. Returns `None` for a record whose line number isn't
 /// digits — malformed output from an implementation we didn't anticipate, dropped rather than
-/// surfaced as a bogus hit at line 0.
-fn parse_body(path: &str, rest: &str, columns: bool) -> Option<Hit> {
+/// surfaced as a bogus hit at line 0. The second part is a GNU long match line left for the second
+/// run: its line-start offset and raw text.
+fn parse_body(path: &str, rest: &str, cols: Cols) -> Option<(Hit, Option<(usize, String)>)> {
     let digits_end = rest.find(|c: char| !c.is_ascii_digit())?;
     if digits_end == 0 {
         return None;
@@ -1737,32 +1858,47 @@ fn parse_body(path: &str, rest: &str, columns: bool) -> Option<Hit> {
         _ => return None,
     };
     let mut text = &rest[digits_end + 1..];
-    // `rg --column`: a match record is `LINE:COL:TEXT`, a context record `LINE-TEXT`.
     let mut col = None;
-    if columns && is_match {
-        let c_end = text.find(|c: char| !c.is_ascii_digit())?;
-        if c_end == 0 || text.as_bytes()[c_end] != b':' {
+    let mut line_start = None;
+    if cols == Cols::Gnu || (cols == Cols::Rg && is_match) {
+        let n_end = text.find(|c: char| !c.is_ascii_digit())?;
+        // The number ends in `:` (rg's column; GNU's offset of a match line) or `-` (GNU, context).
+        if n_end == 0 || text.as_bytes()[n_end] != sep {
             return None;
         }
-        col = text[..c_end].parse::<usize>().ok();
-        text = &text[c_end + 1..];
+        let n = text[..n_end].parse::<usize>().ok();
+        if cols == Cols::Rg {
+            col = n;
+        } else {
+            line_start = n;
+        }
+        text = &text[n_end + 1..];
     }
     let normalized = trim_eol(text);
+    let mut long = None;
     // The same normalization and clip `LocalFs`'s sink applies, from the same functions — see
     // `super`. A match line is clipped around the column the engine reported.
-    let text = match col
-        .filter(|_| text.len() > super::MAX_LINE)
-        .and_then(|c| super::match_offset(text, c))
-    {
-        Some(cs) => super::clip_at(&normalized, cs),
-        None => super::clip(&normalized),
+    let text = if is_match && text.len() > super::MAX_LINE && line_start.is_some() {
+        long = line_start.map(|s| (s, text.to_string()));
+        super::clip(&normalized)
+    } else {
+        match col
+            .filter(|_| text.len() > super::MAX_LINE)
+            .and_then(|c| super::match_offset(text, c))
+        {
+            Some(cs) => super::clip_at(&normalized, cs),
+            None => super::clip(&normalized),
+        }
     };
-    Some(Hit {
-        path: Arc::from(Path::new(path)),
-        line,
-        text,
-        is_match,
-    })
+    Some((
+        Hit {
+            path: Arc::from(Path::new(path)),
+            line,
+            text,
+            is_match,
+        },
+        long,
+    ))
 }
 
 /// `bytes[from..]`-relative byte search returning an absolute index. A tiny helper rather than pulling
@@ -1975,6 +2111,8 @@ mod tests {
             );
         }
         for missing in [
+            "rg: /work/proj: IO error for operation on /work/proj: Not a directory (os error 20)",
+            "grep: /work/proj: Not a directory",
             "rg: /work/proj: No such file or directory (os error 2)",
             "rg: /work/proj: IO error for operation on /work/proj: No such file or directory (os error 2)",
             "grep: /work/proj: No such file or directory",
