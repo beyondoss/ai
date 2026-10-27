@@ -173,7 +173,7 @@ fn the_release_artifact_scan_fails_on_any_seam_name() {
             .output()
             .unwrap()
     };
-    let debug = scan(std::path::Path::new(env!("CARGO_BIN_EXE_beyond-ai-agent")));
+    let debug = scan(std::path::Path::new(env!("CARGO_BIN_EXE_agent")));
     assert_eq!(debug.status.code(), Some(1), "{debug:?}");
     assert!(
         String::from_utf8_lossy(&debug.stderr).contains("BEYOND_AI_AGENT_TEST_SLOW_CHECKPOINT_MS"),

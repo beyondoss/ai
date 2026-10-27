@@ -31,7 +31,7 @@ fn serve_follow_up_steers_an_in_flight_run() {
         turn_text("done with the follow-up"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -95,7 +95,7 @@ fn serve_stop_after_turn_ends_the_run_after_the_current_tool_call_completes() {
         turn_text("also never reached"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -163,7 +163,7 @@ fn serve_stop_after_turn_is_a_no_op_ack_when_idle() {
         turn_text("done"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -205,7 +205,7 @@ fn serve_prompt_ack_arrives_before_the_first_event_frame() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -258,7 +258,7 @@ fn serve_busy_prompt_with_streaming_behavior_is_accepted_not_rejected() {
         turn_text("done with the steered part"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -342,7 +342,7 @@ fn serve_follow_up_queued_while_idle_is_picked_up_by_next_prompt() {
         turn_text("answered the queued follow-up"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -406,7 +406,7 @@ fn serve_follow_up_expands_a_skill_invocation_while_idle() {
         turn_text("answered the skill"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.arg("--trust-project").current_dir(dir.path());
     let mut child = cmd.spawn_guarded();
@@ -479,7 +479,7 @@ fn serve_mid_run_steer_expands_a_skill_invocation() {
     );
     let (base, bodies) = spawn_model_server(vec![turn1, turn_text("answered the skill")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.arg("--trust-project").current_dir(dir.path());
     let mut child = cmd.spawn_guarded();
@@ -530,7 +530,7 @@ fn serve_follow_up_carries_image_attachments_to_the_model() {
     let (base, bodies) =
         spawn_model_server(vec![turn_text("first answer"), turn_text("saw the image")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -591,7 +591,7 @@ fn serve_no_skills_prevents_discovery_and_leaves_an_invocation_unexpanded() {
 
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.args(["--trust-project", "--no-skills"])
         .current_dir(dir.path());
@@ -644,7 +644,7 @@ fn serve_no_prompt_templates_prevents_discovery_and_leaves_an_invocation_unexpan
 
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.args(["--trust-project", "--no-prompt-templates"])
         .current_dir(dir.path());
@@ -704,7 +704,7 @@ fn serve_default_queue_mode_drains_queued_follow_ups_one_at_a_time() {
         turn_text("answered f2"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -758,7 +758,7 @@ fn serve_set_queue_mode_all_folds_queued_follow_ups_into_one_injection() {
     let (base, bodies) =
         spawn_model_server(vec![turn_text("first answer"), turn_text("answered both")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -813,7 +813,7 @@ fn serve_steering_mode_and_follow_up_mode_are_independent_rpc_settings() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -882,7 +882,7 @@ fn serve_refusal_ends_the_run_without_draining_steering() {
         turn_text("answered the queued follow-up"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -966,7 +966,7 @@ fn serve_abort_cancels_an_in_flight_prompt() {
     );
     let (base, _bodies) = spawn_model_server(vec![turn1]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -1024,7 +1024,7 @@ fn serve_bare_prompt_while_busy_is_rejected_not_queued() {
     );
     let (base, _bodies) = spawn_model_server(vec![turn1, turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);

@@ -117,7 +117,7 @@ fn an_addressed_session_wins_over_an_unrelated_session_in_the_same_directory() {
     // capture a launch that named a *different* session.
     let dir = tempfile::tempdir().unwrap();
     let session_dir = dir.path().to_string_lossy().into_owned();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     let (base, _bodies) = spawn_model_server(vec![turn_text("first answer")]);
     let mut squatter = Serve::start(&mut serve_selecting(bin, &base, &session_dir, &[]));
@@ -148,7 +148,7 @@ fn distinct_session_ids_in_one_directory_are_distinct_sessions() {
     // Multi-tenancy, end to end: N ids sharing one `--session-dir` are N conversations.
     let dir = tempfile::tempdir().unwrap();
     let session_dir = dir.path().to_string_lossy().into_owned();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     for tenant in ["tenant-a", "tenant-b"] {
         let (base, _bodies) = spawn_model_server(vec![turn_text("ack")]);
@@ -187,7 +187,7 @@ fn an_addressed_session_is_idempotent_across_restarts() {
     // conversation — deterministically, rather than via "whatever touched this directory most recently".
     let dir = tempfile::tempdir().unwrap();
     let session_dir = dir.path().to_string_lossy().into_owned();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     let (base, _bodies) = spawn_model_server(vec![turn_text("first answer")]);
     let mut first = Serve::start(&mut serve_selecting(
@@ -227,7 +227,7 @@ fn a_bare_serve_starts_fresh_while_continue_reattaches() {
     // candidates by `cwd` rather than by time).
     let dir = tempfile::tempdir().unwrap();
     let session_dir = dir.path().to_string_lossy().into_owned();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     let (base, _bodies) = spawn_model_server(vec![turn_text("first answer")]);
     let mut first = Serve::start(&mut serve_selecting(bin, &base, &session_dir, &[]));
@@ -278,7 +278,7 @@ fn new_session_on_an_addressed_session_keeps_the_id_and_archives_the_old_transcr
     // doubles as "throw the old one away".
     let dir = tempfile::tempdir().unwrap();
     let session_dir = dir.path().to_string_lossy().into_owned();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     let (base, _bodies) = spawn_model_server(vec![turn_text("first answer")]);
     let mut child = Serve::start(&mut serve_selecting(

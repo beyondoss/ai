@@ -66,7 +66,7 @@ fn parallel_runs_multiple_children_and_returns_results_in_task_order() {
         turn_text("fallback"),
     );
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",

@@ -2,7 +2,7 @@
 //! supervisor reaps a session that has had no attached connection for longer than the timeout and isn't
 //! mid-run — dropping its retained `input_tx` so it persists and exits, exactly like a graceful
 //! shutdown does per-session. A reconnect to a reaped id transparently respawns and replays from disk.
-//! These spawn the real `beyond-ai-agent` binary against the mock Anthropic-SSE gateway.
+//! These spawn the real `agent` binary against the mock Anthropic-SSE gateway.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use crate::common;

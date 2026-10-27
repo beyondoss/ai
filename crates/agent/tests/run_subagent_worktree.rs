@@ -70,7 +70,7 @@ fn a_worktree_child_edit_is_merged_back_into_the_real_tree() {
         turn_text("Done."),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",

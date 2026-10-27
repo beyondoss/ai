@@ -96,7 +96,7 @@ fn serve_busy_compact_self_aborts_and_proceeds_in_one_round_trip() {
     // the one that stalls.
     let base =
         spawn_model_server_with_stalled_response(Vec::new(), Duration::from_secs(5), Vec::new());
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -142,7 +142,7 @@ fn serve_busy_new_session_self_aborts_and_proceeds_in_one_round_trip() {
         Duration::from_secs(5),
         Vec::new(),
     );
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let (mut child, mut stdin, mut stdout) = spawn_and_warm_up(bin, &base, &session_dir);
 
     writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
@@ -191,7 +191,7 @@ fn serve_busy_switch_session_self_aborts_and_proceeds_in_one_round_trip() {
         Duration::from_secs(5),
         Vec::new(),
     );
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let (mut child, mut stdin, mut stdout) = spawn_and_warm_up(bin, &base, &session_dir);
 
     writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
@@ -269,7 +269,7 @@ fn serve_busy_fork_self_aborts_and_proceeds_in_one_round_trip() {
         Duration::from_secs(5),
         Vec::new(),
     );
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let (mut child, mut stdin, mut stdout) = spawn_and_warm_up(bin, &base, &session_dir);
 
     writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();
@@ -316,7 +316,7 @@ fn serve_busy_clone_self_aborts_and_proceeds_in_one_round_trip() {
         Duration::from_secs(5),
         Vec::new(),
     );
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let (mut child, mut stdin, mut stdout) = spawn_and_warm_up(bin, &base, &session_dir);
 
     writeln!(stdin, "{}", json!({ "type": "get_state" })).unwrap();

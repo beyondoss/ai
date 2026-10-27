@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 use common::{SpawnGuarded, read_until_response, serve_cmd, spawn_model_server};
 use serde_json::{Value, json};
 
-const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
+const BIN: &str = env!("CARGO_BIN_EXE_agent");
 
 /// The golden vectors' own flag-format keys, so this file and `grant.rs` agree on what valid means.
 fn fixture() -> Value {

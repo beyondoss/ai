@@ -36,7 +36,7 @@ fn session_with_a_torn_tail(path: &Path) {
 }
 
 fn run_on(path: &Path, base: &str) -> std::process::Output {
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     run_cmd(bin)
         .args([
             "run",
@@ -108,7 +108,7 @@ fn serve_refuses_a_session_file_another_process_is_writing() {
     let (base, _bodies) = spawn_model_server(vec![]);
 
     let _held = lock_session_writer(&path).unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let child = serve_cmd(bin, &base, path.to_str().unwrap())
         .current_dir(dir.path())
         .stdin(Stdio::null())

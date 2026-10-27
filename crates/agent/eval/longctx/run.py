@@ -1,6 +1,6 @@
 """Run the long-context sweep: task × model × compaction trigger × attempt, headless.
 
-Each run copies a buggy task tree, runs `beyond-ai-agent run --json` in it with compaction set to
+Each run copies a buggy task tree, runs `agent run --json` in it with compaction set to
 fire at the arm's trigger, prices every request from the provider-reported usage
 on the event stream (including compaction's own summarization calls, carried on `compacted`), then
 restores the pristine tests and grades with the repository's own suite.
@@ -763,7 +763,7 @@ def main(argv: list[str]) -> None:
     import argparse
 
     ap = argparse.ArgumentParser(prog="run")
-    ap.add_argument("--bin", default=str(HERE_ROOT / "target/release/beyond-ai-agent"))
+    ap.add_argument("--bin", default=str(HERE_ROOT / "target/release/agent"))
     ap.add_argument("--models", default="claude-opus-5-5,claude-sonnet-5-5,gpt-6.1-sol")
     ap.add_argument("--arms", default="100k,200k,default",
                     help=f"comma-separated; known: {','.join(ARMS)}, or any <n>k")
@@ -781,7 +781,7 @@ def main(argv: list[str]) -> None:
     ap.add_argument("--runs-dir", default="", help="where results go (default $LONGCTX_WORK/runs)")
     ap.add_argument("--label", default="", help="recorded on each result (e.g. the binary's commit)")
     ap.add_argument("--agent-arg", dest="extra", action="append", default=[],
-                    help="extra flag passed through to `beyond-ai-agent run` (repeatable)")
+                    help="extra flag passed through to `agent run` (repeatable)")
     ap.add_argument("--script", default="",
                     help="JSON file of scripted user turns, [{\"at\": <turn>, \"message\": ...}]: each is "
                          "injected as a steer once the run has finished that many turns, or sent as a new "

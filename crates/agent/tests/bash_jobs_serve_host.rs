@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use common::{SpawnGuarded, read_until_response, serve_cmd, spawn_model_server, turn_text};
 use serde_json::{Value, json};
 
-const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
+const BIN: &str = env!("CARGO_BIN_EXE_agent");
 
 fn send(stdin: &mut ChildStdin, cmd: Value) {
     writeln!(stdin, "{cmd}").unwrap();

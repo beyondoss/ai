@@ -12,7 +12,7 @@ use common::{advertised_tools, body_json, run_cmd, spawn_model_server, turn_text
 const AGENTS_MD: &str = "---\nmodel: claude-frontmatter\ntools: read, grep\nmax-steps: 1\n---\nAlways answer in haiku.\n";
 
 fn run(base: &str, dir: &std::path::Path, extra: &[&str]) -> std::process::Output {
-    run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    run_cmd(env!("CARGO_BIN_EXE_agent"))
         .args([
             "run",
             "do a big task",

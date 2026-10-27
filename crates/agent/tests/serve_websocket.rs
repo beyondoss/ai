@@ -1,5 +1,5 @@
 //! Integration tests for the WebSocket transport (`serve --listen`). Each test spawns the real
-//! `beyond-ai-agent` binary in `--listen` mode against the mock Anthropic-SSE gateway
+//! `agent` binary in `--listen` mode against the mock Anthropic-SSE gateway
 //! (`common::spawn_model_server`), then drives it with a real `tokio-tungstenite` client. The JSON
 //! control protocol is byte-identical to stdio mode, so these assert the *transport* — connect,
 //! command → frames, and (the point of the feature) that a session survives a dropped connection and a

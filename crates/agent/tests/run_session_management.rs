@@ -14,7 +14,7 @@ fn run_binary_session_flag_persists_and_resumes_across_invocations() {
     let session_file = dir.path().join("s.jsonl");
 
     let (base1, bodies1) = spawn_model_server(vec![turn_text("first answer")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output1 = run_cmd(bin)
         .args([
             "run",
@@ -243,7 +243,7 @@ fn run_binary_initializes_an_existing_empty_session_file_instead_of_hard_failing
     assert_eq!(std::fs::metadata(&session_file).unwrap().len(), 0);
 
     let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -285,7 +285,7 @@ fn run_binary_reports_a_clear_error_for_an_invalid_session_file_and_preserves_it
     let original_content = "{\"type\":\"event\",\"data\":\"not a session\"}\n";
     std::fs::write(&session_file, original_content).unwrap();
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -334,7 +334,7 @@ fn run_binary_name_sets_the_session_title() {
     let session_file = dir.path().join("s.jsonl");
     let (base, _bodies) = spawn_model_server(vec![turn_text("hi")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -374,7 +374,7 @@ fn run_binary_short_n_flag_is_an_alias_for_name() {
     let session_file = dir.path().join("s.jsonl");
     let (base, _bodies) = spawn_model_server(vec![turn_text("hi")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -419,7 +419,7 @@ fn run_binary_name_is_a_noop_when_resuming_an_existing_session() {
     // alone, even though `--name` was passed again with a different value.
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl");
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     let (base1, _bodies1) = spawn_model_server(vec![turn_text("first")]);
     let output1 = run_cmd(bin)
@@ -497,7 +497,7 @@ fn run_binary_rejects_a_whitespace_only_name_and_persists_nothing() {
     let session_file = dir.path().join("s.jsonl");
     let (base, _bodies) = spawn_model_server(vec![turn_text("hi")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -542,7 +542,7 @@ fn run_binary_rejects_a_path_traversal_session_id_and_persists_nothing() {
     let session_file = dir.path().join("s.jsonl");
     let (base, _bodies) = spawn_model_server(vec![turn_text("hi")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -602,7 +602,7 @@ fn run_session_flag_restores_the_sessions_own_model_when_no_explicit_model_flag_
 
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -652,7 +652,7 @@ fn run_session_flag_prefers_an_explicit_model_flag_over_the_sessions_own_model()
 
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -841,7 +841,7 @@ fn run_session_flag_warns_when_the_sessions_recorded_cwd_no_longer_matches() {
 
     let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -984,7 +984,7 @@ fn run_fork_by_path_copies_a_session_file_into_a_new_session_and_continues_from_
     let source_path = source_dir.path().join("source.jsonl");
 
     let (base1, _bodies1) = spawn_model_server(vec![turn_text("first answer")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output1 = run_cmd(bin)
         .args([
             "run",
@@ -1224,7 +1224,7 @@ fn run_session_flag_with_a_bare_id_reopens_the_session_in_place_same_project() {
     // session, not forking a new one the way `--fork <id>` would.
     let repo_dir = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     let (base1, _bodies1) = spawn_model_server(vec![turn_text("first answer")]);
     let output1 = run_cmd(bin)
@@ -1306,7 +1306,7 @@ fn run_session_flag_with_a_bare_id_reopens_a_session_found_in_a_different_projec
     let repo_b = sessions_parent.path().join("project-b");
     std::fs::create_dir_all(&repo_b).unwrap();
     let project_dir = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     let (base1, _bodies1) = spawn_model_server(vec![turn_text("first answer")]);
     let output1 = run_cmd(bin)
@@ -1392,7 +1392,7 @@ fn run_session_flag_with_an_unresolvable_bare_id_fails_clearly() {
     // it — must fail clearly rather than silently create a garbage file with that literal name.
     let repo_dir = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     let output = run_cmd(bin)
         .args([
@@ -1437,7 +1437,7 @@ fn run_binary_session_dir_flag_redirects_the_continue_repo() {
     // semantics), not a further per-cwd subdirectory nested under it.
     let repo_dir = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     let (base1, _bodies1) = spawn_model_server(vec![turn_text("first answer")]);
     let output1 = run_cmd(bin)
@@ -1514,7 +1514,7 @@ fn run_binary_session_dir_flag_redirects_the_continue_repo() {
 fn run_binary_ai_agent_session_dir_env_var_redirects_the_continue_repo() {
     let repo_dir = tempfile::tempdir().unwrap();
     let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     let output = run_cmd(bin)
         .env("AI_AGENT_SESSION_DIR", repo_dir.path())
@@ -1560,7 +1560,7 @@ fn run_binary_fork_with_session_dir_scopes_cross_project_search_to_its_parent() 
     let shared_root = tempfile::tempdir().unwrap();
     let repo_a = shared_root.path().join("repo-a");
     let repo_b = shared_root.path().join("repo-b");
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     let (base1, _bodies1) = spawn_model_server(vec![turn_text("first answer")]);
     let output1 = run_cmd(bin)

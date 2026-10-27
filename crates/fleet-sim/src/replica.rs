@@ -1,4 +1,4 @@
-//! A replica under test: a real `beyond-ai-agent serve --service` process.
+//! A replica under test: a real `agent serve --service` process.
 //!
 //! Not a mock and not a library call. The claims this simulator checks are about what happens when a
 //! replica **dies** — its locks outliving it, its segments being sealed by whoever takes over — and

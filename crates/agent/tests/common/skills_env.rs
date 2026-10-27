@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use super::{ChildGuard, SpawnGuarded, body_json, run_cmd, serve_cmd};
 
-pub const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
+pub const BIN: &str = env!("CARGO_BIN_EXE_agent");
 pub const FIXTURE: &str = env!("CARGO_BIN_EXE_mcp_skills_fixture_server");
 pub const SKILL_TOOL: &str = "mcp__docs__skill__read";
 
