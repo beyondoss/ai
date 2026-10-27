@@ -76,7 +76,10 @@ fn answers(data: &[u8]) {
         Some(c) => c.as_i64().and_then(|w| i32::try_from(w).ok()).is_none(),
     };
     if code_out_of_range {
-        assert!(parse_read(&v).is_err(), "an out-of-range code was accepted: {v}");
+        assert!(
+            parse_read(&v).is_err(),
+            "an out-of-range code was accepted: {v}"
+        );
     }
     if let Ok(jobs) = parse_list(&v) {
         assert!(jobs.len() <= v["jobs"].as_array().map_or(0, Vec::len));
