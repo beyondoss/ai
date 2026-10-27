@@ -93,6 +93,13 @@ pub enum Protocol {
 #[derive(Clone, Debug)]
 pub struct MockOptions {
     pub honors_stdin: bool,
+    /// Honour `output_base64` (v1.1 "Exact output"): answer `stdout_base64`/`stderr_base64`. `false`
+    /// is an endpoint that predates it, which ignores the field and answers text with invalid UTF-8
+    /// replaced by U+FFFD, as every endpoint did before.
+    pub honors_output_base64: bool,
+    /// Honours `output_base64` in form only: the answer has the base64 fields, but the bytes went
+    /// through a lossy UTF-8 conversion first. The non-conforming endpoint the verifier has to catch.
+    pub lossy_output_base64: bool,
     pub protocol: Protocol,
     /// The silence after which a stream gets a heartbeat frame. The spec's is 5 s; a suite that
     /// wants to prove heartbeats are not output makes it much shorter than its idle window.
@@ -141,7 +148,7 @@ pub struct MockOptions {
     /// Answer 401 to any request that does not carry `Authorization: Bearer <this>`: an endpoint on
     /// the public internet, reached with the bearer its grant's exec headers carry. `None` accepts all.
     pub require_bearer: Option<String>,
-    /// Answer 400 to a request carrying `stream` or `job`: a front that validates strictly and
+    /// Answer 400 to a request carrying `stream`, `output_base64` or `job`: a front that validates strictly and
     /// refuses the protocol's extensions instead of ignoring them as the spec says to.
     pub refuses_extensions: bool,
     /// Enforce `timeout_ms` over v1.1: at the deadline kill the command's whole process group and
@@ -201,6 +208,8 @@ impl Default for MockOptions {
     fn default() -> Self {
         Self {
             honors_stdin: true,
+            honors_output_base64: true,
+            lossy_output_base64: false,
             protocol: Protocol::Streaming,
             heartbeat: Duration::from_secs(5),
             kills_on_disconnect: true,
@@ -230,6 +239,8 @@ impl MockOptions {
     /// that refuses the extensions, a v1 endpoint that ignores stdin), keeps the mock's own server.
     pub fn is_conforming(&self) -> bool {
         self.honors_stdin
+            && self.honors_output_base64
+            && !self.lossy_output_base64
             && self.protocol == Protocol::Streaming
             && self.kills_on_disconnect
             && self.tracks_leftovers
@@ -640,7 +651,9 @@ async fn serve_one(mut sock: tokio::net::TcpStream, shared: Shared) {
         body: req.clone(),
     });
     if shared.opts.refuses_extensions
-        && (req["stream"].as_bool() == Some(true) || req.get("job").is_some_and(Value::is_object))
+        && (req["stream"].as_bool() == Some(true)
+            || req["output_base64"].as_bool() == Some(true)
+            || req.get("job").is_some_and(Value::is_object))
     {
         respond_json(sock, 400, &json!({ "error": "unknown field" })).await;
         return;
@@ -693,6 +706,7 @@ fn command_for(req: &Value, shared: &Shared) -> tokio::process::Command {
 
 /// v1.1: run to completion, answer with one object.
 async fn serve_envelope(mut sock: tokio::net::TcpStream, req: Value, shared: Shared) {
+    let exact = shared.opts.honors_output_base64 && req["output_base64"] == Value::Bool(true);
     let stdin = req["stdin_base64"]
         .as_str()
         .filter(|_| shared.opts.honors_stdin)
@@ -725,11 +739,33 @@ async fn serve_envelope(mut sock: tokio::net::TcpStream, req: Value, shared: Sha
             match finished {
                 Some((out, ())) => {
                     let o = out.unwrap();
-                    json!({
-                        "exit_code": o.status.code().unwrap_or(-1),
-                        "stdout": String::from_utf8_lossy(&o.stdout),
-                        "stderr": String::from_utf8_lossy(&o.stderr),
-                    })
+                    use std::os::unix::process::ExitStatusExt as _;
+                    // As execd answers: `128 + N` for a command a signal killed.
+                    let code = o
+                        .status
+                        .code()
+                        .or_else(|| o.status.signal().map(|n| 128 + n))
+                        .unwrap_or(-1);
+                    if exact {
+                        let lossy = |b: &[u8]| {
+                            if shared.opts.lossy_output_base64 {
+                                String::from_utf8_lossy(b).into_owned().into_bytes()
+                            } else {
+                                b.to_vec()
+                            }
+                        };
+                        json!({
+                            "exit_code": code,
+                            "stdout_base64": b64(&lossy(&o.stdout)),
+                            "stderr_base64": b64(&lossy(&o.stderr)),
+                        })
+                    } else {
+                        json!({
+                            "exit_code": code,
+                            "stdout": String::from_utf8_lossy(&o.stdout),
+                            "stderr": String::from_utf8_lossy(&o.stderr),
+                        })
+                    }
                 }
                 None => {
                     if let Some(pgid) = pgid {
@@ -738,12 +774,20 @@ async fn serve_envelope(mut sock: tokio::net::TcpStream, req: Value, shared: Sha
                             .stderr(std::process::Stdio::null())
                             .status();
                     }
-                    json!({ "exit_code": 124, "stdout": "",
-                            "stderr": "command exceeded its timeout" })
+                    if exact {
+                        json!({ "exit_code": 124, "stdout_base64": "",
+                                "stderr_base64": b64(b"command exceeded its timeout") })
+                    } else {
+                        json!({ "exit_code": 124, "stdout": "",
+                                "stderr": "command exceeded its timeout" })
+                    }
                 }
             }
         }
         // `Argument list too long` lands here — the defect v1.1 exists to fix.
+        Err(e) if exact => json!({
+            "exit_code": 127, "stdout_base64": "", "stderr_base64": b64(e.to_string().as_bytes())
+        }),
         Err(e) => json!({ "exit_code": 127, "stdout": "", "stderr": e.to_string() }),
     };
     let body = payload.to_string();

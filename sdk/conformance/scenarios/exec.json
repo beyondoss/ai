@@ -340,8 +340,34 @@
       ]
     },
     {
+      "id": "exec.stdout.non-utf8-is-exact",
+      "description": "Bytes that are not valid UTF-8 come back as they were written, where the endpoint honours output_base64 or streams (see the exec-bytes suite).",
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf 'a\\377b'",
+            "sh"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_b64": "Yf9i",
+              "exact": true
+            }
+          }
+        }
+      ],
+      "requires": {
+        "exact_exec": true
+      }
+    },
+    {
       "id": "exec.stdout.non-utf8-is-lossy",
-      "description": "The one-shot answer carries text: bytes that are not valid UTF-8 come back as U+FFFD, which is why file helpers base64 content.",
+      "description": "A text-only endpoint (no output_base64, no streaming) answers text: bytes that are not valid UTF-8 come back as U+FFFD, which is why file helpers base64 content. The client says so: exact is false.",
       "steps": [
         {
           "id": "a",
@@ -356,11 +382,15 @@
             "ok": {
               "exit_code": 0,
               "stdout_utf8": "a�b",
-              "stdout_b64": "Ye+/vWI="
+              "stdout_b64": "Ye+/vWI=",
+              "exact": false
             }
           }
         }
-      ]
+      ],
+      "requires": {
+        "exact_exec": false
+      }
     },
     {
       "id": "exec.stdout.nul-and-control-bytes-in-text",

@@ -5614,6 +5614,194 @@
           }
         }
       ]
+    },
+    {
+      "id": "files.write.symlink-loop-fails-and-changes-nothing",
+      "description": "A write through two links that point at each other fails (ELOOP, kind io); both stay links and no temp is left.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; ln -s b a; ln -s a b",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/a",
+          "data_b64": "eAo=",
+          "expect": {
+            "error": {
+              "kind": "io"
+            }
+          }
+        },
+        {
+          "id": "check",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "cd \"$1\"; [ -L a ] && [ -L b ] && ls -A | tr '\\n' ' '",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "a b "
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.self-symlink-fails-and-changes-nothing",
+      "description": "A write through a link to itself fails (ELOOP, kind io); it stays a link and no temp is left.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; ln -s self self",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/self",
+          "data_b64": "eAo=",
+          "expect": {
+            "error": {
+              "kind": "io"
+            }
+          }
+        },
+        {
+          "id": "check",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "cd \"$1\"; [ -L self ] && ls -A | tr '\\n' ' '",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "self "
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.dangling-symlink-into-missing-directory-is-not-found",
+      "description": "A write through a dangling link whose target is in a directory that does not exist fails not_found; the link stays and nothing is created.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; ln -s nodir/made l",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/l",
+          "data_b64": "eAo=",
+          "expect": {
+            "error": {
+              "kind": "not_found"
+            }
+          }
+        },
+        {
+          "id": "check",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "cd \"$1\"; [ -L l ] && ls -A | tr '\\n' ' '",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "l "
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.symlink-fan-out-is-bounded",
+      "description": "Resolution is bounded: a chain whose links each re-enter the previous one three times (l12 reaches l0 along 3^12 paths) fails fast with kind io, nothing is changed, and neither time nor memory grows with the fan-out. (GNU `readlink -f` does not finish on it.)",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; ln -s . l0; i=1; while [ $i -le 12 ]; do ln -s \"l$((i-1))/l$((i-1))/l$((i-1))\" l$i; i=$((i+1)); done",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/l12",
+          "data_b64": "eAo=",
+          "expect": {
+            "error": {
+              "kind": "io"
+            }
+          }
+        },
+        {
+          "id": "check",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "cd \"$1\"; [ -L l12 ] && { ls -A | grep -c tmp; true; }",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "0\n"
+            }
+          }
+        }
+      ]
     }
   ]
 }

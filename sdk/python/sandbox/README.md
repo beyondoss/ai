@@ -106,8 +106,15 @@ from a path.
   (`sandbox.capabilities().search_engine`), sorts by path components, counts only matches toward
   `limit`, and clips long lines around the match. Engines differ in regex dialect and in honouring
   `.gitignore`; the report says which one ran.
-- The response of a one-shot call is read incrementally and capped at 16 MiB; over the cap the call
-  raises `TooLarge` and says the command ran. Streams are never buffered whole.
+- **Raw exec is bytes.** `sandbox.exec()` returns `stdout` and `stderr` as `bytes` and an `exact` flag
+  (`stdout_text` and `stderr_text` are the lossy views). A `tar`, a `gzip` or a `cat` of a binary comes
+  back intact when the endpoint honours `output_base64` (`execd` does) or streams (v1.2). A plain v1.1
+  endpoint can only answer text, with invalid UTF-8 already replaced by U+FFFD; the result then carries
+  that text as UTF-8 and `exact=False`, so the client never passes text off as bytes. The file and job
+  helpers read text and call `transport.run_text` when the transport has it (`run` otherwise).
+- The response of a one-shot call is read incrementally and capped at 16 MiB (of decoded output, with
+  `output_base64`); over the cap the call raises `TooLarge` and says the command ran. Streams are never
+  buffered whole.
 - Closing a stream (`with`, `.close()`) kills the command. Jobs outlive the connection that started
   them: start with `jobs.start`, follow with `jobs.attach` or `jobs.follow`, stop with `jobs.kill`.
 - One connection per request, no pooling and no proxy support: the standard library's `socket` and

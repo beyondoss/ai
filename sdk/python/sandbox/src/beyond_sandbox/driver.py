@@ -142,6 +142,7 @@ def plan(op: str, req: dict[str, Any]) -> Plan:
                 "exit_code": r.exit_code,
                 "stdout_b64": _b64(r.stdout),
                 "stderr_b64": _b64(r.stderr),
+                "exact": r.exact,
             },
         )
     if op == "exec_stream":
@@ -360,6 +361,9 @@ class Driver:
         return {
             "stdin": c.stdin, "stream": c.stream, "jobs": c.jobs, "search_engine": c.search_engine,
             "find_printf": c.find_printf, "read_window": c.read_window,
+            "output_base64": c.output_base64,
+            # Raw exec returns the command's bytes: over `output_base64`, else over a v1.2 stream.
+            "exact_exec": c.output_base64 or c.stream,
         }  # fmt: skip
 
     def handle(self, line: str) -> Result:

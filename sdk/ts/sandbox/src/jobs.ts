@@ -115,6 +115,7 @@ export class Jobs {
     if (offers?.nativeJobs && this.transport.nativeJobs) return "native";
     const r = await this.transport.run("sh", this.argv("probe", "probe", []), {
       timeoutMs: OP_TIMEOUT_MS,
+      text: true,
       stdin: utf8("stdin-probe\n"),
     });
     const first = text(r.stdout).split("\n")[0]?.trim();
@@ -329,6 +330,7 @@ export class Jobs {
   private async op(scope: string, op: string, args: string[]): Promise<string> {
     const r = await this.transport.run("sh", this.argv(op, scope, args), {
       timeoutMs: OP_TIMEOUT_MS,
+      text: true,
     });
     if (r.exitCode !== 0) {
       throw new SandboxError(

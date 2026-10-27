@@ -17,7 +17,8 @@ def test_exec_and_stream(execd_url: str) -> None:
     sb = Sandbox.connect(execd_url)
     r = sb.exec("sh", ["-c", "echo out; echo err >&2; exit 7"])
     assert (r.exit_code, r.stdout, r.stderr) == (7, b"out\n", b"err\n")
-    assert sb.exec("cat", stdin=b"\x00\xff bytes").stdout == "\x00� bytes".encode()
+    exact = sb.exec("cat", stdin=b"\x00\xff bytes")  # bytes, exactly: invalid UTF-8 and NUL survive
+    assert (exact.stdout, exact.exact) == (b"\x00\xff bytes", True)
 
     t0 = time.monotonic()
     seen: list[tuple[float, object]] = []

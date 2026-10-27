@@ -194,6 +194,9 @@ export class Driver {
         return {
           stdin: c.stdin,
           stream: o.stream,
+          output_base64: o.outputBase64,
+          // Raw exec returns the command's bytes: over `output_base64`, else over a v1.2 stream.
+          exact_exec: o.outputBase64 || o.stream,
           jobs: await jobs.capabilities(),
           search_engine: c.searchEngine,
           find_printf: c.findPrintf,
@@ -218,6 +221,7 @@ export class Driver {
           exit_code: r.exitCode,
           stdout_b64: b64(r.stdout),
           stderr_b64: b64(r.stderr),
+          exact: r.exact ?? true,
         };
       }
       case "exec_stream": {

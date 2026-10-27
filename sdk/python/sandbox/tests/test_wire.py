@@ -26,12 +26,16 @@ from beyond_sandbox.models import (
     TimedOut,
 )
 
-FIXTURES = Path(__file__).resolve().parents[4] / "crates/agent/tests/fixtures/exec"
+REPO = Path(__file__).resolve().parents[4]
+FIXTURES = REPO / "crates/sandbox/tests/fixtures/exec"
 
 
 def fixture(name: str) -> dict[str, Any]:
     path = FIXTURES / name
     if not path.is_file():
+        # Inside a checkout a missing vector is a broken tree, not a skip.
+        if (REPO / "Cargo.toml").is_file():
+            pytest.fail(f"{path} is missing: expected the shared exec vectors in {FIXTURES}")
         pytest.skip(f"{path} is not available outside the repository")
     loaded: dict[str, Any] = json.loads(path.read_text())
     return loaded

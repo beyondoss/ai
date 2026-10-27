@@ -1,0 +1,380 @@
+{
+  "spec": "exec protocol v1.1 exact output (crates/sandbox/src/exec_endpoint.rs, \"Exact output (v1.1 output_base64)\")",
+  "notes": [
+    "probe.script is the command (run as sh -c) and probe.bytes_base64 the bytes it writes. probes lists answers to the probe request and whether a conforming client reads the endpoint as honouring output_base64; error true means the answer is not a v1.1 answer at all and a client MUST report an error, never read it as 'not supported'.",
+    "answers are 200 bodies to a request that carried \"output_base64\": true. expect.stdout_base64 / stderr_base64 are the bytes a conforming client returns, exact says whether it claims them exact; expect.invalid means a conforming client MUST report an error. An answer without either base64 field is a text answer: the client returns the text as UTF-8 with exact false.",
+    "streams are the lines of a v1.2 body used to answer a one-shot call on an endpoint that streams but does not honour output_base64: the same expect, built from the frames. A body that ends without a final frame is invalid. A shell_exit frame ends the call."
+  ],
+  "probe": {
+    "script": "printf '\\377\\000\\n'",
+    "bytes_base64": "/wAK"
+  },
+  "probes": [
+    {
+      "name": "honoured",
+      "answer": {
+        "exit_code": 0,
+        "stdout_base64": "/wAK",
+        "stderr_base64": ""
+      },
+      "supported": true
+    },
+    {
+      "name": "honoured, with a field this client does not know",
+      "answer": {
+        "exit_code": 0,
+        "stdout_base64": "/wAK",
+        "stderr_base64": "",
+        "seq": 1
+      },
+      "supported": true
+    },
+    {
+      "name": "a plain v1.1 endpoint answers text, invalid UTF-8 already replaced",
+      "answer": {
+        "exit_code": 0,
+        "stdout": "�\u0000\n",
+        "stderr": ""
+      },
+      "supported": false
+    },
+    {
+      "name": "text with nothing in it",
+      "answer": {
+        "exit_code": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "supported": false
+    },
+    {
+      "name": "base64 of other bytes",
+      "answer": {
+        "exit_code": 0,
+        "stdout_base64": "/wAL",
+        "stderr_base64": ""
+      },
+      "supported": false
+    },
+    {
+      "name": "base64 of the replacement character, not of ff",
+      "answer": {
+        "exit_code": 0,
+        "stdout_base64": "77+9AAo=",
+        "stderr_base64": ""
+      },
+      "supported": false
+    },
+    {
+      "name": "unpadded base64 is not standard base64",
+      "answer": {
+        "exit_code": 0,
+        "stdout_base64": "/wA",
+        "stderr_base64": ""
+      },
+      "supported": false
+    },
+    {
+      "name": "stderr only",
+      "answer": {
+        "exit_code": 0,
+        "stdout": "",
+        "stderr_base64": ""
+      },
+      "supported": false
+    },
+    {
+      "name": "no exit code is not a v1.1 answer",
+      "answer": {
+        "stdout_base64": "/wAK",
+        "stderr_base64": ""
+      },
+      "error": true
+    },
+    {
+      "name": "not an object",
+      "answer": "ok",
+      "error": true
+    }
+  ],
+  "answers": [
+    {
+      "name": "binary on both streams",
+      "answer": {
+        "exit_code": 3,
+        "stdout_base64": "/wAK",
+        "stderr_base64": "/gAC"
+      },
+      "expect": {
+        "exit_code": 3,
+        "stdout_base64": "/wAK",
+        "stderr_base64": "/gAC",
+        "exact": true
+      }
+    },
+    {
+      "name": "no output",
+      "answer": {
+        "exit_code": 0,
+        "stdout_base64": "",
+        "stderr_base64": ""
+      },
+      "expect": {
+        "exit_code": 0,
+        "stdout_base64": "",
+        "stderr_base64": "",
+        "exact": true
+      }
+    },
+    {
+      "name": "a field this client does not know is ignored",
+      "answer": {
+        "exit_code": 0,
+        "stdout_base64": "aGk=",
+        "stderr_base64": "",
+        "seq": 7
+      },
+      "expect": {
+        "exit_code": 0,
+        "stdout_base64": "aGk=",
+        "stderr_base64": "",
+        "exact": true
+      }
+    },
+    {
+      "name": "text beside base64: the base64 is the output",
+      "answer": {
+        "exit_code": 0,
+        "stdout": "wrong",
+        "stderr": "wrong",
+        "stdout_base64": "/wAK",
+        "stderr_base64": ""
+      },
+      "expect": {
+        "exit_code": 0,
+        "stdout_base64": "/wAK",
+        "stderr_base64": "",
+        "exact": true
+      }
+    },
+    {
+      "name": "a replica that ignored the field: text, said to be inexact",
+      "answer": {
+        "exit_code": 0,
+        "stdout": "hi\n",
+        "stderr": "e"
+      },
+      "expect": {
+        "exit_code": 0,
+        "stdout_base64": "aGkK",
+        "stderr_base64": "ZQ==",
+        "exact": false
+      }
+    },
+    {
+      "name": "text with multi-byte characters is UTF-8 bytes",
+      "answer": {
+        "exit_code": 0,
+        "stdout": "café 漢",
+        "stderr": ""
+      },
+      "expect": {
+        "exit_code": 0,
+        "stdout_base64": "Y2Fmw6kg5ryi",
+        "stderr_base64": "",
+        "exact": false
+      }
+    },
+    {
+      "name": "the timeout answer keeps its bytes and its note",
+      "answer": {
+        "exit_code": 124,
+        "stdout_base64": "/w==",
+        "stderr_base64": "/gpjb21tYW5kIGV4Y2VlZGVkIGl0cyB0aW1lb3V0"
+      },
+      "expect": {
+        "exit_code": 124,
+        "stdout_base64": "/w==",
+        "stderr_base64": "/gpjb21tYW5kIGV4Y2VlZGVkIGl0cyB0aW1lb3V0",
+        "exact": true
+      }
+    },
+    {
+      "name": "invalid base64",
+      "answer": {
+        "exit_code": 0,
+        "stdout_base64": "!!!!",
+        "stderr_base64": ""
+      },
+      "expect": {
+        "invalid": true
+      }
+    },
+    {
+      "name": "unpadded base64",
+      "answer": {
+        "exit_code": 0,
+        "stdout_base64": "/wA",
+        "stderr_base64": ""
+      },
+      "expect": {
+        "invalid": true
+      }
+    },
+    {
+      "name": "url-safe alphabet",
+      "answer": {
+        "exit_code": 0,
+        "stdout_base64": "_-8=",
+        "stderr_base64": ""
+      },
+      "expect": {
+        "invalid": true
+      }
+    },
+    {
+      "name": "stdout_base64 without stderr_base64",
+      "answer": {
+        "exit_code": 0,
+        "stdout_base64": "aGk="
+      },
+      "expect": {
+        "invalid": true
+      }
+    },
+    {
+      "name": "stderr_base64 without stdout_base64",
+      "answer": {
+        "exit_code": 0,
+        "stdout": "x",
+        "stderr_base64": "aGk="
+      },
+      "expect": {
+        "invalid": true
+      }
+    },
+    {
+      "name": "base64 is not a string",
+      "answer": {
+        "exit_code": 0,
+        "stdout_base64": 1,
+        "stderr_base64": ""
+      },
+      "expect": {
+        "invalid": true
+      }
+    },
+    {
+      "name": "no exit code",
+      "answer": {
+        "stdout_base64": "",
+        "stderr_base64": ""
+      },
+      "expect": {
+        "invalid": true
+      }
+    }
+  ],
+  "streams": [
+    {
+      "name": "exit with both streams",
+      "lines": [
+        "{\"stdout\":\"/wAK\"}",
+        "{}",
+        "{\"stderr\":\"/gAC\"}",
+        "{\"exit_code\":3}"
+      ],
+      "expect": {
+        "exit_code": 3,
+        "stdout_base64": "/wAK",
+        "stderr_base64": "/gAC",
+        "exact": true
+      }
+    },
+    {
+      "name": "a signal is 128 + N",
+      "lines": [
+        "{\"stdout\":\"/w==\"}",
+        "{\"signal\":9}"
+      ],
+      "expect": {
+        "exit_code": 137,
+        "stdout_base64": "/w==",
+        "stderr_base64": "",
+        "exact": true
+      }
+    },
+    {
+      "name": "a deadline is 124 and the note, after a newline when stderr lacked one",
+      "lines": [
+        "{\"stderr\":\"/w==\"}",
+        "{\"timed_out\":true}"
+      ],
+      "expect": {
+        "exit_code": 124,
+        "stdout_base64": "",
+        "stderr_base64": "/wpjb21tYW5kIGV4Y2VlZGVkIGl0cyB0aW1lb3V0",
+        "exact": true
+      }
+    },
+    {
+      "name": "a deadline with stderr ending in a newline needs no second one",
+      "lines": [
+        "{\"stderr\":\"cGFydAo=\"}",
+        "{\"timed_out\":true}"
+      ],
+      "expect": {
+        "exit_code": 124,
+        "stdout_base64": "",
+        "stderr_base64": "cGFydApjb21tYW5kIGV4Y2VlZGVkIGl0cyB0aW1lb3V0",
+        "exact": true
+      }
+    },
+    {
+      "name": "a deadline with no stderr is the note alone",
+      "lines": [
+        "{\"timed_out\":true}"
+      ],
+      "expect": {
+        "exit_code": 124,
+        "stdout_base64": "",
+        "stderr_base64": "Y29tbWFuZCBleGNlZWRlZCBpdHMgdGltZW91dA==",
+        "exact": true
+      }
+    },
+    {
+      "name": "shell_exit ends a one-shot call; later frames are not read",
+      "lines": [
+        "{\"stdout\":\"aGk=\"}",
+        "{\"shell_exit\":2}",
+        "{\"stdout\":\"bGF0ZXI=\"}",
+        "{\"exit_code\":0}"
+      ],
+      "expect": {
+        "exit_code": 2,
+        "stdout_base64": "aGk=",
+        "stderr_base64": "",
+        "exact": true
+      }
+    },
+    {
+      "name": "the body ends without a final frame",
+      "lines": [
+        "{\"stdout\":\"aGk=\"}"
+      ],
+      "expect": {
+        "invalid": true
+      }
+    },
+    {
+      "name": "the endpoint failed mid-command",
+      "lines": [
+        "{\"stdout\":\"aGk=\"}",
+        "{\"error\":\"lost the sandbox\"}"
+      ],
+      "expect": {
+        "invalid": true
+      }
+    }
+  ]
+}

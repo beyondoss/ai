@@ -229,8 +229,8 @@ fn write_atomic_with(path: &str, content: &[u8], durable: bool) -> std::io::Resu
     use std::io::Write as _;
 
     let p = std::path::Path::new(path);
-    let resolved = resolve_symlink_target(p);
-    let p = resolved.as_deref().unwrap_or(p);
+    let resolved = resolve_symlink_target(p)?;
+    let p = resolved.as_path();
     // Never a fresh file renamed over a lock file — by its name in any case, by where it sits, or by
     // being one this process holds (see `file_lock::is_lock_file`, which only `stat`s: a FIFO or a
     // device is never opened, nobody's lock is ever tested): the lock would stay on the old inode,
@@ -366,34 +366,60 @@ fn take_durability_steps(path: &std::path::Path) -> Vec<DurabilityStep> {
 /// own path) while leaving the real target completely untouched. A symlink managed by a dotfile
 /// manager (stow, chezmoi) or shared across a monorepo is exactly the case this breaks.
 ///
-/// Returns `None` when `path` isn't a symlink at all — including "doesn't exist yet", `write`'s
-/// ordinary new-file case — so the caller's existing direct-write behavior is unchanged in every case
-/// but an actual symlink.
+/// Follows every link, live or dangling, one `read_link` hop at a time (each relative target joined to
+/// the directory of the link it came from), for at most [`MAX_SYMLINK_HOPS`] hops — the kernel's own
+/// `MAXSYMLINKS`. This is `FILES-OVER-EXEC.md` section 5.3 step 2, which `ShellFs` follows too, so both
+/// backends give the same answer for the same tree. A bare `canonicalize` is not enough: it refuses a
+/// dangling link (the write's own target-to-create) and a loop alike, and a single-hop fallback would
+/// resolve a chain of dangling links one hop short — or, on a loop, rename the temp file over the other
+/// link, replacing a symlink with a regular file.
 ///
-/// Prefers `canonicalize` (resolves the whole chain, including a relative target, against its real
-/// parent directory — a symlink can point through another symlink) and falls back to a single
-/// `read_link` hop, manually joined against the link's own parent when the target is relative, for a
-/// dangling symlink (a target that doesn't exist yet, which `canonicalize` refuses to resolve at all) —
-/// still better than silently destroying the link in that case.
-fn resolve_symlink_target(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    if !meta.file_type().is_symlink() {
-        return None;
+/// A path still a link after the last hop is a loop: `ELOOP` ("Too many levels of symbolic links (os
+/// error 40)"), before anything is created. A `symlink_metadata` that fails with `ELOOP` (a path
+/// through a link fan-out the kernel itself refuses) is the same error; any other failure — a dangling
+/// target in a missing directory — ends the walk at that path, so the write fails as any write into a
+/// missing directory does.
+///
+/// Returns `path` itself when it isn't a symlink at all, including "doesn't exist yet".
+fn resolve_symlink_target(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let mut cur = path.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        if !is_link(&cur)? {
+            return Ok(cur);
+        }
+        let target = std::fs::read_link(&cur)?;
+        cur = if target.is_absolute() {
+            target
+        } else {
+            match cur.parent() {
+                Some(dir) => dir.join(target),
+                None => target,
+            }
+        };
     }
-    if let Ok(real) = std::fs::canonicalize(path) {
-        return Some(real);
+    if is_link(&cur)? {
+        return Err(std::io::Error::from_raw_os_error(ELOOP));
     }
-    let target = std::fs::read_link(path).ok()?;
-    if target.is_absolute() {
-        Some(target)
-    } else {
-        Some(
-            path.parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join(target),
-        )
+    Ok(cur)
+}
+
+/// Whether `path` is a symlink. Missing or unreadable is "no" (the write then fails as any write
+/// there does); only the kernel's own `ELOOP` is an error.
+fn is_link(path: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => Ok(m.file_type().is_symlink()),
+        Err(e) if e.raw_os_error() == Some(ELOOP) => Err(e),
+        Err(_) => Ok(false),
     }
 }
+
+/// Linux's `MAXSYMLINKS`, the bound on [`resolve_symlink_target`]'s walk.
+const MAX_SYMLINK_HOPS: usize = 40;
+/// `ELOOP`: 40 on Linux, 62 on macOS.
+#[cfg(target_os = "linux")]
+const ELOOP: i32 = 40;
+#[cfg(not(target_os = "linux"))]
+const ELOOP: i32 = 62;
 
 /// An unpredictable per-call suffix for [`write_atomic`]'s temp file name — see
 /// [`beyond_sandbox::fs::temp_suffix`].
@@ -1398,6 +1424,126 @@ mod tests {
         assert!(!decoy.exists(), "write_atomic followed the planted symlink");
         assert_eq!(std::fs::read_link(&planted).unwrap(), decoy);
         assert_eq!(std::fs::read(&target).unwrap(), b"new content");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_follows_a_chain_of_dangling_links_across_directories() {
+        use std::os::unix::fs::symlink;
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        std::fs::create_dir_all(r.join("a")).unwrap();
+        std::fs::create_dir_all(r.join("b")).unwrap();
+        symlink("../b/l2", r.join("a/l1")).unwrap();
+        symlink("../a/l3", r.join("b/l2")).unwrap();
+        symlink("../a/final.txt", r.join("a/l3")).unwrap();
+        symlink("a/l1", r.join("l0")).unwrap();
+        let resolved = resolve_symlink_target(&r.join("l0")).unwrap();
+        assert_eq!(resolved.file_name().unwrap(), "final.txt");
+        assert!(!resolved.exists(), "the chain ends in a missing file");
+        write_atomic(r.join("l0").to_str().unwrap(), b"x").unwrap();
+        assert_eq!(std::fs::read(r.join("a/final.txt")).unwrap(), b"x");
+        assert!(
+            std::fs::symlink_metadata(r.join("l0"))
+                .unwrap()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_follows_an_absolute_dangling_target() {
+        let d = tempfile::tempdir().unwrap();
+        let abs = d.path().join("made.txt");
+        std::os::unix::fs::symlink(&abs, d.path().join("l")).unwrap();
+        assert_eq!(resolve_symlink_target(&d.path().join("l")).unwrap(), abs);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_returns_a_non_link_path_unchanged() {
+        let d = tempfile::tempdir().unwrap();
+        for p in [d.path().join("missing"), d.path().to_path_buf()] {
+            assert_eq!(resolve_symlink_target(&p).unwrap(), p);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_fails_a_loop_with_eloop_and_write_changes_nothing() {
+        use std::os::unix::fs::symlink;
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        symlink("b", r.join("a")).unwrap();
+        symlink("a", r.join("b")).unwrap();
+        symlink("self", r.join("self")).unwrap();
+        for name in ["a", "b", "self"] {
+            let err = resolve_symlink_target(&r.join(name)).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(ELOOP), "{name}");
+            let err = write_atomic(r.join(name).to_str().unwrap(), b"x").unwrap_err();
+            assert!(err.to_string().contains("os error 40"), "{err}");
+        }
+        assert_eq!(
+            std::fs::read_link(r.join("a")).unwrap(),
+            std::path::Path::new("b")
+        );
+        assert_eq!(
+            std::fs::read_link(r.join("b")).unwrap(),
+            std::path::Path::new("a")
+        );
+        assert_eq!(std::fs::read_dir(r).unwrap().count(), 3, "no temp left");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_allows_exactly_forty_hops() {
+        use std::os::unix::fs::symlink;
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        // l0 -> l1 -> ... -> l40 -> end.txt: 41 links is one too many, 40 is fine.
+        for n in [40usize, 41] {
+            let sub = r.join(format!("c{n}"));
+            std::fs::create_dir(&sub).unwrap();
+            for i in 0..n {
+                symlink(format!("l{}", i + 1), sub.join(format!("l{i}"))).unwrap();
+            }
+            symlink("end.txt", sub.join(format!("l{n}"))).unwrap();
+        }
+        // From c40/l1: 40 reads reach end.txt. From c41/l0: 41 links, still a link after 40 hops.
+        let ok = resolve_symlink_target(&r.join("c40/l1"));
+        assert_eq!(ok.unwrap(), r.join("c40/end.txt"));
+        let err = resolve_symlink_target(&r.join("c41/l0")).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(ELOOP));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_fails_a_link_fan_out_fast() {
+        use std::os::unix::fs::symlink;
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        symlink(".", r.join("l0")).unwrap();
+        for i in 1..=12 {
+            let p = format!("l{}", i - 1);
+            symlink(format!("{p}/{p}/{p}"), r.join(format!("l{i}"))).unwrap();
+        }
+        let err = write_atomic(r.join("l12").to_str().unwrap(), b"x").unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(ELOOP));
+        assert!(
+            std::fs::symlink_metadata(r.join("l12"))
+                .unwrap()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_through_a_dangling_link_into_a_missing_directory_is_not_found() {
+        let d = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("nodir/f.txt", d.path().join("l")).unwrap();
+        let err = write_atomic(d.path().join("l").to_str().unwrap(), b"x").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1);
     }
 
     #[test]
