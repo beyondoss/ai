@@ -1,0 +1,26 @@
+./crlf.txt:1:foo
+./crlf.txt-2-bar
+--
+./.hidden:1:foo
+./.hidden-2-bar
+--
+./--:1:foo
+--
+./odd:12:name.txt:1:foo
+--
+./we
+ird.txt:1:foo in odd
+--
+./a.txt-1-one
+./a.txt:2:foo two
+./a.txt-3-three
+--
+./a.txt-5-five
+./a.txt:6:foo six
+./a.txt-7-seven
+--
+./sub/b.rs:1:foo
+./sub/b.rs-2-x
+--
+./sub/b.rs-4-z
+./sub/b.rs:5:foo

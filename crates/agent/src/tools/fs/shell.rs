@@ -297,28 +297,33 @@ impl FsBackend for ShellFs {
             .map_err(|e| FsError::Backend(format!("{program}: {e}")))?;
 
         // Both `rg` and `grep` use exit 1 for "no matches" — a perfectly ordinary outcome, not a
-        // failure. Anything above that is a real error, and the overwhelmingly common cause is a
-        // pattern the target's regex dialect rejected, so it maps to the caller's mistake rather than
-        // the backend's.
+        // failure. Exit 2 is shared by three different situations that must not be conflated: a
+        // pattern the target's regex dialect rejected (the caller's mistake), a missing root, and
+        // per-path read errors (the matches found elsewhere are still good).
+        let mut skipped_note = None;
         match result.code {
             Some(0) | Some(1) => {}
-            _ if result.timed_out => {
+            _ if result.timed_out || result.code == Some(124) => {
                 return Err(FsError::Backend(format!(
                     "{program} timed out after {}s",
                     self.timeout.as_secs()
                 )));
             }
-            _ => {
-                let detail = result.stderr.trim();
-                return Err(FsError::InvalidQuery(format!(
-                    "bad regex: {}",
-                    if detail.is_empty() {
-                        format!("{program} rejected the pattern")
-                    } else {
-                        detail.to_string()
-                    }
-                )));
-            }
+            _ => match classify_search_failure(&result.stderr, &q.root.to_string_lossy()) {
+                SearchFailure::BadRegex => {
+                    let detail = result.stderr.trim();
+                    return Err(FsError::InvalidQuery(format!(
+                        "bad regex: {}",
+                        if detail.is_empty() {
+                            format!("{program} rejected the pattern")
+                        } else {
+                            detail.to_string()
+                        }
+                    )));
+                }
+                SearchFailure::MissingRoot(line) => return Err(FsError::Backend(line)),
+                SearchFailure::Skipped(note) => skipped_note = Some(note),
+            },
         }
 
         let mut hits = if engine == SearchEngine::BusyboxGrep {
@@ -347,7 +352,7 @@ impl FsBackend for ShellFs {
             // unreadable subdirectory shows up only as noise on stderr, in a format that varies by
             // implementation. Reported when the command still succeeded but said something — enough
             // for the "search was incomplete" notice to fire, without pretending to name the path.
-            first_error: incomplete_note(&result),
+            first_error: skipped_note.or_else(|| incomplete_note(&result)),
         })
     }
 
@@ -1131,7 +1136,7 @@ else t=o
 fi
 if [ -w "$1" ]; then w=w; else w=-; fi
 printf '%s	%s	' "$w" "$t"
-stat -c '%s	%Y' -- "$1" 2>/dev/null || printf '0	0'
+stat -L -c '%s	%Y' -- "$1" 2>/dev/null || printf '0	0'
 printf '
 '"#;
 
@@ -1211,6 +1216,22 @@ tmp="$t.tmp.$2"
     };
 }
 
+/// Refuse a target that is a directory, with the message `std` gives (so both backends read alike).
+/// Without it the final `mv -f "$tmp" "$t"` moves the temp *into* the directory and exits 0: a write
+/// that reports success and leaves `DIR/DIR.tmp.SUFFIX` behind. `mv -T` would refuse atomically, but
+/// it is GNU-only; busybox has no such flag. So the check runs twice, before the temp exists and
+/// again immediately before the `mv`; a directory created at the target inside that last instant is
+/// the one remaining window, the same width as any check-then-rename on a shell.
+macro_rules! not_a_directory {
+    () => {
+        r#"if [ -d "$t" ]; then
+  echo "Is a directory (os error 21)" >&2
+  exit 1
+fi
+"#
+    };
+}
+
 /// Create the empty temp `$tmp`, with `$t`'s mode when `$t` exists, before any content goes in, so
 /// the replacement keeps the file's mode and a 0600 file's bytes are never in a world-readable temp.
 /// `chmod --reference` is GNU; busybox, which Alpine ships, has no `--reference`, so its fallback is
@@ -1221,7 +1242,9 @@ tmp="$t.tmp.$2"
 /// at its name.
 macro_rules! new_temp {
     () => {
-        r#"set -C
+        concat!(
+            not_a_directory!(),
+            r#"set -C
 : > "$tmp" || exit 1
 set +C
 if [ -e "$t" ]; then
@@ -1232,6 +1255,7 @@ if [ -e "$t" ]; then
   }
 fi
 "#
+        )
     };
 }
 
@@ -1248,6 +1272,7 @@ const WRITE_STDIN_SCRIPT: &str = concat!(
     r#"if cat >> "$tmp"; then
   n=$(wc -c < "$tmp")
   if [ $n -eq "$3" ]; then
+    if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
     mv -f "$tmp" "$t" && exit 0
   else
     echo "short write: $n of $3 bytes arrived on stdin" >&2
@@ -1273,6 +1298,7 @@ printf %s "$3" | base64 -d >> "$tmp" || { rm -f "$tmp"; exit 1; }
 [ -z "$5" ] && exit 0
 n=$(wc -c < "$tmp")
 if [ $n -eq "$6" ]; then
+  if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
   mv -f "$tmp" "$t" && exit 0
 else
   echo "short write: $n of $6 bytes assembled" >&2
@@ -1284,6 +1310,55 @@ exit 1"#
 /// The host's compensating action for a write that failed where the scripts could not clean up (a
 /// transport error, a timeout between chunks): remove the temp, found the way the write named it.
 const REMOVE_TEMP_SCRIPT: &str = concat!(resolve_target!(), r#"rm -f "$tmp""#);
+
+/// What a search exit above 1 means, from stderr alone (the three causes share the exit code).
+enum SearchFailure {
+    /// The engine rejected the pattern.
+    BadRegex,
+    /// The search root itself does not exist; carries the engine's message.
+    MissingRoot(String),
+    /// Only per-path read errors: the hits on stdout are still valid. Carries the note.
+    Skipped(String),
+}
+
+/// Per-path read errors name the path and end in the OS message (`rg` appends ` (os error N)`).
+/// Anything else on stderr is the engine complaining about the pattern.
+fn classify_search_failure(stderr: &str, root: &str) -> SearchFailure {
+    const OS_ERRORS: [&str; 5] = [
+        "No such file or directory",
+        "Permission denied",
+        "Is a directory",
+        "Too many levels of symbolic links",
+        "Input/output error",
+    ];
+    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    let path_error = |l: &str| {
+        let l = l.trim_end();
+        let l = l
+            .strip_suffix(')')
+            .and_then(|x| x.rsplit_once(" (os error ").map(|p| p.0))
+            .unwrap_or(l);
+        OS_ERRORS.iter().any(|e| l.ends_with(e))
+    };
+    if lines.is_empty() || !lines.iter().all(|l| path_error(l)) {
+        return SearchFailure::BadRegex;
+    }
+    // The root's own error is `PROGRAM: ROOT: [IO error for operation on ROOT: ]No such file or
+    // directory`; a path under the root carries more path after ROOT, so matching the exact
+    // `: ROOT: ` form tells them apart.
+    let root_prefix = format!(": {root}: ");
+    if let Some(l) = lines
+        .iter()
+        .find(|l| l.contains(&root_prefix) && l.contains("No such file or directory"))
+    {
+        return SearchFailure::MissingRoot(l.trim().to_string());
+    }
+    let first = lines[0].trim();
+    SearchFailure::Skipped(format!(
+        "{} path(s) could not be searched; first: {first}",
+        lines.len()
+    ))
+}
 
 /// stderr from a *successful* search — an unreadable path, typically. Empty stderr means nothing to
 /// report, which is the common case.
@@ -1502,7 +1577,13 @@ fn parse_records(stdout: &str) -> Vec<Hit> {
             i += 3;
             continue;
         }
-        if rest_bytes == b"--" {
+        // `rg --crlf` (which ShellFs passes) writes the separator as `--\r\n`. A path named `--\r`
+        // is still told apart: its record continues `--\r\0`, never `--\r\n`.
+        if rest_bytes.starts_with(b"--\r\n") {
+            i += 4;
+            continue;
+        }
+        if rest_bytes == b"--" || rest_bytes == b"--\r" {
             break; // a trailing separator with no final newline
         }
         let Some(nul) = memchr_from(bytes, i, b'\0') else {
@@ -1562,9 +1643,113 @@ pub fn query(pattern: &str, root: PathBuf, limit: usize) -> SearchQuery {
     super::local::query(pattern, root, limit)
 }
 
+/// Entry points for the fuzz targets (`crates/agent/fuzz`); not part of the API. The parsers stay
+/// private to this module, as the fuzz crate lives outside the workspace and can reach only `pub`
+/// items. Same shape as `execd::__fuzz`: thin wrappers, no logic of their own.
+#[doc(hidden)]
+pub mod __fuzz {
+    use std::path::PathBuf;
+
+    use super::super::{DirEntry, Hit, Meta};
+
+    /// `rg --null` / `grep -Z` records.
+    pub fn records(stdout: &str) -> Vec<Hit> {
+        super::parse_records(stdout)
+    }
+
+    /// busybox `grep -rn` records (no glob).
+    pub fn colon_records(stdout: &str) -> Vec<Hit> {
+        super::parse_colon_records(stdout, &super::query("x", PathBuf::from("."), 1))
+    }
+
+    /// The one-shot stat line.
+    pub fn stat(stdout: &str) -> Option<Meta> {
+        super::parse_stat(stdout)
+    }
+
+    /// `find -printf '%y\t%p\0'`.
+    pub fn typed_paths(stdout: &str) -> Vec<(PathBuf, bool)> {
+        super::parse_typed_paths(stdout)
+    }
+
+    /// `<type>\t<size>\t<name>\0` directory listing.
+    pub fn dir_entries(stdout: &str, cap: usize, include_hidden: bool) -> Vec<DirEntry> {
+        super::parse_dir_entries(stdout, cap, include_hidden)
+    }
+
+    pub fn encode_base64(bytes: &[u8]) -> String {
+        super::encode_base64(bytes)
+    }
+
+    pub fn decode_base64(s: &str) -> Result<Vec<u8>, String> {
+        super::decode_base64(s)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stat_script_follows_a_symlink_for_size_and_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::write(d.join("t"), "hello world\n").unwrap();
+        std::os::unix::fs::symlink("t", d.join("a-rather-long-link-name")).unwrap();
+        std::os::unix::fs::symlink("gone", d.join("dangling")).unwrap();
+        let run = |name: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", STAT_SCRIPT, "sh"])
+                .arg(d.join(name))
+                .output()
+                .unwrap()
+        };
+        let out = run("a-rather-long-link-name");
+        let line = String::from_utf8(out.stdout).unwrap();
+        let f: Vec<&str> = line.trim_end().split('\t').collect();
+        assert_eq!((f[1], f[2]), ("f", "12"), "{line:?}");
+        assert_eq!(run("dangling").status.code(), Some(1));
+    }
+
+    #[test]
+    fn search_exit_two_is_told_apart_by_stderr() {
+        let root = "/work/proj";
+        for bad in [
+            "regex parse error:\n    (\n    ^\nerror: unclosed group",
+            "grep: Unmatched ( or \\(",
+            "grep: bad regex '(': Unmatched ( or \\(",
+            "",
+        ] {
+            assert!(
+                matches!(classify_search_failure(bad, root), SearchFailure::BadRegex),
+                "{bad:?}"
+            );
+        }
+        for missing in [
+            "rg: /work/proj: No such file or directory (os error 2)",
+            "rg: /work/proj: IO error for operation on /work/proj: No such file or directory (os error 2)",
+            "grep: /work/proj: No such file or directory",
+        ] {
+            assert!(
+                matches!(
+                    classify_search_failure(missing, root),
+                    SearchFailure::MissingRoot(_)
+                ),
+                "{missing:?}"
+            );
+        }
+        let SearchFailure::Skipped(note) = classify_search_failure(
+            "rg: /work/proj/a: Permission denied (os error 13)\nrg: /work/proj/b: Permission denied (os error 13)\n",
+            root,
+        ) else {
+            panic!("per-file errors must keep the matches");
+        };
+        assert!(note.starts_with("2 path(s)"), "{note}");
+        assert!(matches!(
+            classify_search_failure("grep: /work/proj/x: No such file or directory", root),
+            SearchFailure::Skipped(_)
+        ));
+    }
 
     /// This host's `sh`, with a prelude run before every script. A `PATH` shim, not a shell function,
     /// because the read script `exec`s `dd`, which skips functions.
@@ -1640,6 +1825,28 @@ mod tests {
         assert!(caps.no_read_window);
     }
 
+    #[tokio::test]
+    async fn a_write_onto_a_directory_fails_and_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        let probed = ShellFs::connect(Arc::new(Prelude(":".into()))).await;
+        for stdin in [true, false] {
+            let mut caps = probed.capabilities();
+            caps.stdin = stdin;
+            let fs = ShellFs::with_capabilities(Arc::new(Prelude(":".into())), caps);
+            let err = fs.write_bytes(&d, b"x".to_vec()).await.unwrap_err();
+            assert!(err.to_string().contains("Is a directory"), "{err}");
+            let err = fs
+                .write_if_unchanged(&d, b"x".to_vec(), fs.stat(&d).await.unwrap().unwrap().mtime)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("Is a directory"), "{err}");
+            assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0, "stdin={stdin}");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
     #[test]
     fn parses_a_match_record() {
         let hits = parse_records("src/a.rs\u{0}12:let x = 1;\n");
@@ -1665,6 +1872,28 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[1].path.to_string_lossy(), "b.rs");
         assert_eq!(hits[1].line, 9);
+    }
+
+    #[test]
+    fn skips_the_crlf_group_separator_rg_writes_under_crlf() {
+        let hits = parse_records("a.rs\u{0}1:one\r\n--\r\nb.rs\u{0}9:two\r\n");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[1].path.to_string_lossy(), "b.rs");
+        assert_eq!(hits[1].line, 9);
+    }
+
+    #[test]
+    fn files_named_like_a_separator_are_not_skipped() {
+        let hits = parse_records("--\u{0}1:x\n--\r\u{0}2:y\n--\n--\u{0}3:--\n");
+        let got: Vec<_> = hits
+            .iter()
+            .map(|h| (h.path.to_string_lossy().into_owned(), h.line))
+            .collect();
+        assert_eq!(
+            got,
+            [("--".into(), 1), ("--\r".into(), 2), ("--".into(), 3)]
+        );
+        assert_eq!(hits[2].text, "--");
     }
 
     #[test]
