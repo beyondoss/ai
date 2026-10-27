@@ -275,14 +275,18 @@ resolution, in order:
 2. if it is a symlink, resolve it: `readlink -f`, and if that yields nothing
    (a dangling link) one `readlink` hop, joined to the link's directory when
    relative; the prefix rule of 1 is applied again;
-3. the temp is created empty with `set -C` (no-clobber: a preplanted temp is
+3. a target that is a directory is refused (`Is a directory (os error 21)`, exit
+   1), before the temp exists, because `mv -f` would move the temp _into_ it
+   and report success;
+   the temp is created empty with `set -C` (no-clobber: a preplanted temp is
    refused, not followed);
 4. if the target exists, the temp gets its mode **before any content**:
    `chmod --reference`, falling back to `chmod "$(stat -L -c %a TARGET)"`
    (busybox); if neither works the write fails (`cannot give the new file the
    mode of ...`) and the temp is removed;
 5. the content is appended; the temp's size is checked against the expected
-   byte count; only then `mv -f TEMP TARGET`.
+   byte count; the directory check runs again (a directory created meanwhile
+   removes the temp and fails); only then `mv -f TEMP TARGET`.
 
 A write is therefore atomic (a reader sees the old file or the new one), keeps
 the file's mode (a 0600 file stays 0600, a 0755 file stays executable), writes
@@ -573,7 +577,7 @@ else t=o
 fi
 if [ -w "$1" ]; then w=w; else w=-; fi
 printf '%s	%s	' "$w" "$t"
-stat -c '%s	%Y' -- "$1" 2>/dev/null || printf '0	0'
+stat -L -c '%s	%Y' -- "$1" 2>/dev/null || printf '0	0'
 printf '
 '
 ```
@@ -614,6 +618,10 @@ if [ -L "$t" ]; then
   case "$t" in -*) t="./$t" ;; esac
 fi
 tmp="$t.tmp.$2"
+if [ -d "$t" ]; then
+  echo "Is a directory (os error 21)" >&2
+  exit 1
+fi
 set -C
 : > "$tmp" || exit 1
 set +C
@@ -627,6 +635,7 @@ fi
 if cat >> "$tmp"; then
   n=$(wc -c < "$tmp")
   if [ $n -eq "$3" ]; then
+    if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
     mv -f "$tmp" "$t" && exit 0
   else
     echo "short write: $n of $3 bytes arrived on stdin" >&2
@@ -655,6 +664,10 @@ if [ -L "$t" ]; then
 fi
 tmp="$t.tmp.$2"
 if [ "$4" = new ]; then
+if [ -d "$t" ]; then
+  echo "Is a directory (os error 21)" >&2
+  exit 1
+fi
 set -C
 : > "$tmp" || exit 1
 set +C
@@ -670,6 +683,7 @@ printf %s "$3" | base64 -d >> "$tmp" || { rm -f "$tmp"; exit 1; }
 [ -z "$5" ] && exit 0
 n=$(wc -c < "$tmp")
 if [ $n -eq "$6" ]; then
+  if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
   mv -f "$tmp" "$t" && exit 0
 else
   echo "short write: $n of $6 bytes assembled" >&2

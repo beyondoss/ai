@@ -261,3 +261,25 @@ reports="--junit target/nextest/verify/junit.xml"
 if [ -f target/nextest/verify-isolated/junit.xml ]; then reports="$reports --junit target/nextest/verify-isolated/junit.xml"; fi
 cargo run -q -p beyond-verify -- gate $reports
 """
+
+# ---- TypeScript SDK (sdk/ts: npm workspace root; @beyond.dev/sandbox is the sandbox client) ----
+
+[tasks."install:ts"]
+description = "Install the TypeScript SDK's dependencies (npm ci in sdk/ts)."
+run = "npm ci"
+dir = "sdk/ts"
+
+[tasks."build:ts"]
+description = "Build the TypeScript SDK (tsdown): sdk/ts/sandbox/dist, including the conformance driver dist/driver.mjs."
+run = "npm run build"
+dir = "sdk/ts"
+
+[tasks."check:ts"]
+description = "Typecheck the TypeScript SDK (tsc --noEmit, strict). Formatting is dprint's, in check:fmt."
+run = "npm run typecheck"
+dir = "sdk/ts"
+
+[tasks."test:ts"]
+description = "TypeScript SDK tests: parsers and command builders, a fake endpoint, and a loopback execd (EXECD_BIN, or target/debug/execd, built if absent)."
+run = "npm test"
+dir = "sdk/ts"
