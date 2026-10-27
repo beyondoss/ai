@@ -1675,7 +1675,15 @@ fn parse_records(stdout: &str, columns: bool) -> Vec<Hit> {
     let bytes = stdout.as_bytes();
     let mut hits = Vec::new();
     let mut i = 0usize;
+    let mut prev_path = "";
     while i < bytes.len() {
+        // `rg` follows the records of a file it stopped searching at a NUL byte with a line of its
+        // own on stdout, which has no NUL and so must not be read as the start of a record.
+        let first_nl = memchr_from(bytes, i, b'\n').unwrap_or(bytes.len());
+        if is_binary_warning(&stdout[i..first_nl], prev_path) {
+            i = first_nl + 1;
+            continue;
+        }
         let Some(nul) = memchr_from(bytes, i, b'\0') else {
             break; // no NUL anywhere in the remainder — nothing parseable is left
         };
@@ -1683,6 +1691,7 @@ fn parse_records(stdout: &str, columns: bool) -> Vec<Hit> {
         // may contain newlines, so only the terminator *after* the path ends this record.
         let nl = memchr_from(bytes, nul, b'\n').unwrap_or(bytes.len());
         let path = &stdout[i..nul];
+        prev_path = path;
         let rest = &stdout[nul + 1..nl];
         if let Some(hit) = parse_body(path, rest, columns) {
             hits.push(hit);
@@ -1690,6 +1699,26 @@ fn parse_records(stdout: &str, columns: bool) -> Vec<Hit> {
         i = nl + 1;
     }
     hits
+}
+
+/// `PATH: WARNING: stopped searching binary file after match (found "\0" byte around offset N)`,
+/// where PATH is the file of the record just before it: `rg` prints it after the matches it found
+/// ahead of a NUL byte. Matching the previous record's path (not just the text) is what keeps a
+/// file whose name happens to contain these words a path.
+fn is_binary_warning(line: &str, prev_path: &str) -> bool {
+    const MID: &str =
+        ": WARNING: stopped searching binary file after match (found \"\\0\" byte around offset ";
+    let Some(rest) = line
+        .strip_prefix(prev_path)
+        .filter(|_| !prev_path.is_empty())
+    else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix(MID) else {
+        return false;
+    };
+    rest.strip_suffix(')')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Split `<line><sep><text>` into its parts. Returns `None` for a record whose line number isn't
@@ -1843,6 +1872,24 @@ mod appendix_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rgs_binary_file_warning_is_not_the_start_of_a_record() {
+        let w = ": WARNING: stopped searching binary file after match (found \"\\0\" byte around offset 3)";
+        let out = format!("a\u{0}1:1:x\nb\u{0}1:1:y\nb{w}\nc\u{0}1:1:z\n");
+        let paths: Vec<_> = parse_records(&out, true)
+            .iter()
+            .map(|h| h.path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(paths, ["a", "b", "c"]);
+        // Not the previous record's file: a path that merely contains the words.
+        let out = format!("a\u{0}1:1:x\nb{w}\nc\u{0}1:1:z\n");
+        let paths: Vec<_> = parse_records(&out, true)
+            .iter()
+            .map(|h| h.path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(paths, ["a".to_string(), format!("b{w}\nc")]);
+    }
 
     #[test]
     fn stat_mtime_past_systemtime_range_is_unknown_not_a_panic() {
