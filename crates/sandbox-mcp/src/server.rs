@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
 use base64::Engine as _;
 use beyond_sandbox::exec_endpoint::jobs::{JobId, JobScope, JobSpec, JobStatus, READ_MAX};
@@ -223,8 +223,9 @@ fn kind_name(k: FileKind) -> &'static str {
     }
 }
 
-fn epoch_secs(t: std::time::SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+/// Epoch seconds with the nanoseconds `stat` reports, as the double every client compares.
+fn epoch_secs(t: std::time::SystemTime) -> f64 {
+    beyond_sandbox::fs::epoch_f64(t)
 }
 
 /// A count from a tool argument, as `usize`.
@@ -445,7 +446,7 @@ impl SandboxMcp {
 
     #[tool(
         name = "stat",
-        description = "Describe a path. Returns exists; when it does, kind (file, dir or other), size in bytes, mtime (epoch seconds) and whether the sandbox user can write it. A missing path is exists: false, not an error."
+        description = "Describe a path. Returns exists; when it does, kind (file, dir or other), size in bytes, mtime (epoch seconds, with the fraction the filesystem records) and whether the sandbox user can write it. A missing path is exists: false, not an error."
     )]
     async fn stat(&self, Parameters(a): Parameters<PathArgs>) -> ToolReply {
         Ok(reply(self.do_stat(a).await))

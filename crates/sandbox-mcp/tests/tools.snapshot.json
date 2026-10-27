@@ -422,7 +422,7 @@
     "name": "search"
   },
   {
-    "description": "Describe a path. Returns exists; when it does, kind (file, dir or other), size in bytes, mtime (epoch seconds) and whether the sandbox user can write it. A missing path is exists: false, not an error.",
+    "description": "Describe a path. Returns exists; when it does, kind (file, dir or other), size in bytes, mtime (epoch seconds, with the fraction the filesystem records) and whether the sandbox user can write it. A missing path is exists: false, not an error.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
