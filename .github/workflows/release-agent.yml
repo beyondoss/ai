@@ -1,8 +1,7 @@
 name: Release Agent Binary
 # Builds agent as a static musl binary for linux/amd64 and linux/arm64 and publishes them
-# as GitHub Release assets, matching the beyond-<name>-v*-linux-<arch>.tar.gz
-# convention dev/.scripts/publish-primitives.sh (in the beyond repo) expects for every other
-# externally-built primitive binary (beyond-pg, beyond-kv, ...). Separate from publish.yml (which
+# as GitHub Release assets named agent-<tag>-linux-<arch>.tar.gz (+ .sha256), the same shape as
+# execd's; dev/.scripts/publish-primitives.sh (in the beyond repo) downloads them by that name. Separate from publish.yml (which
 # builds the gateway's Docker image) — this only runs on a version tag, not every push to main.
 on:
   push:
@@ -111,8 +110,10 @@ jobs:
       - name: Package release asset
         run: |
           mkdir -p dist
-          tar -C target/${{ matrix.target }}/release -czf \
-            "dist/agent-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz" agent
+          name="agent-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz"
+          tar -C target/${{ matrix.target }}/release -czf "dist/$name" agent
+          # `<hash>  <file>`, relative to dist/, so `sha256sum -c` works next to the tarball.
+          (cd dist && sha256sum "$name" > "$name.sha256")
       - name: Publish GitHub Release asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -121,6 +122,6 @@ jobs:
           # uploads its own distinct per-arch asset, so `--clobber` never races across arches.
           gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" \
             --title "${{ github.ref_name }}" --generate-notes || true
-          gh release upload "${{ github.ref_name }}" \
-            "dist/agent-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz" \
+          name="agent-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz"
+          gh release upload "${{ github.ref_name }}" "dist/$name" "dist/$name.sha256" \
             --repo "${{ github.repository }}" --clobber
