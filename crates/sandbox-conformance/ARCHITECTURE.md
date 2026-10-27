@@ -22,6 +22,7 @@ test (`crates/agent/tests/sdk_conformance.rs`) reaches the in-process reference 
 | `relay.rs`                        | Relay scenarios (steps with `via`): which driver a step goes to, and one run of every relay scenario for a pair A, B on the same sandbox.                  |
 | `link.rs`                         | `ProcessLink`: `sh -c "exec CMD"` with the `CONFORMANCE_*` environment, one request in flight, a named call timeout, stderr kept for the death note.       |
 | `backends.rs`                     | Starts a backend and returns a `Started` (URL, bearer, work directory, extra variables, a guard that stops it).                                            |
+| `reaper.rs`                       | `Leader`: a harness process in its own process group, killed with its whole group on drop and when the harness is killed.                                  |
 | `matrix.rs`                       | The plan: backends in parallel, each started once, its drivers one after another, then every ordered pair of them for the relay scenarios; the registry.   |
 | `report.rs`                       | The table and the JSON cell.                                                                                                                               |
 | `bin/sandbox-driver-rust.rs`      | The Rust client's driver. Includes `crates/sandbox/tests/sdk_conformance/driver.rs` by path.                                                               |
