@@ -5452,15 +5452,6 @@
           "id": "list",
           "op": "list",
           "path": "${ROOT}/link",
-          "xfail": {
-            "drivers": [
-              "agent-reference",
-              "beyond-sandbox-ts",
-              "python",
-              "python-async"
-            ],
-            "reason": "find does not follow a symlink given as the starting point, so the listing is empty"
-          },
           "expect": {
             "ok": {
               "entries": {

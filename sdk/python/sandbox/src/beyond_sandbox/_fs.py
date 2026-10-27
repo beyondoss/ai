@@ -315,7 +315,7 @@ def parse_dir_entries(stdout: str, limit: int, include_hidden: bool) -> list[Ent
 
 
 def _find_children(path: str, *tail: str) -> Run:
-    return Run("find", [path, "-mindepth", "1", "-maxdepth", "1", *tail])
+    return Run("find", ["-H", path, "-mindepth", "1", "-maxdepth", "1", *tail])
 
 
 def list_dir(path: str, limit: int, include_hidden: bool, caps: Capabilities) -> Op[list[Entry]]:

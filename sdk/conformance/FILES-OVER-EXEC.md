@@ -367,7 +367,7 @@ classified by section 3.3 (making a directory below a file is
 
 `list(path, include_hidden = false, limit = 10000) -> entries[{ name, kind, size }]`
 
-**With `find_printf`**: one command, `find PATH -mindepth 1 -maxdepth 1 -printf
+**With `find_printf`**: one command, `find -H PATH -mindepth 1 -maxdepth 1 -printf
 '%Y\t%s\t%f\0'` (the argument is the literal characters `%Y`, backslash, `t`,
 and so on; `find` expands the escapes). Fail with `ls PATH: LINE` when the exit
 is non-zero **and** stdout is empty; a non-zero exit with output is a partial
@@ -384,11 +384,16 @@ counting; map `TYPE` `f` to `file`, `d` to `dir`, `N` and `?` to **skipped**
 the link's own; callers needing it `stat`. Order is unspecified; clients MAY
 sort and the scenarios compare unordered.
 
-**Without `find_printf`** (busybox): two commands, `find PATH -mindepth 1
+**Without `find_printf`** (busybox): two commands, `find -H PATH -mindepth 1
 -maxdepth 1 -print0` (same failure rule) and the same with `-type d` added.
 Entries are the first listing; `name` is the last path component; an entry is
 `dir` if its full path is in the second listing, otherwise `file`; `size` is 0.
 (So FIFOs and links to directories are `file` there.)
+
+`-H` makes `find` follow `PATH` itself when it is a symlink (it does not by
+default): a link to a directory lists the directory it points to, and each
+entry is reported by its name under the link. A link to a file, or a broken
+one, lists nothing.
 
 Listing a **file** gives no entries and no error (`find` finds no children).
 A missing directory is `not_found`. Names that are not valid UTF-8 appear with

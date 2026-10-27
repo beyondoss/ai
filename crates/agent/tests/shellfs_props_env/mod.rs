@@ -1043,20 +1043,6 @@ impl Machine {
                         entries.len()
                     ));
                 }
-                let via_link = std::fs::symlink_metadata(&p)
-                    .is_ok_and(|m| m.file_type().is_symlink())
-                    && matches!(&meta, Ok(m) if m.is_dir());
-                if via_link && entries.is_empty() && !want.is_empty() && cap > 0 {
-                    known(
-                        "N1",
-                        format!(
-                            "list of the symlinked directory {p:?} returned no entries, its target holds {}",
-                            want.len()
-                        ),
-                    );
-                    read_only_ops_unchanged(self, &before, "list");
-                    return;
-                }
                 if matches!(&meta, Ok(m) if !m.is_dir()) && !entries.is_empty() {
                     fail(format!("list of the file {p:?} returned entries"));
                 }
