@@ -209,16 +209,23 @@ pub fn temps(s: &Snap) -> Vec<PathBuf> {
 /// Follow the symlinks at the final component, as the write scripts do (`readlink -f`, one hop for a
 /// dangling link). `None` for a loop.
 pub fn resolve_leaf(p: &Path) -> Option<PathBuf> {
-    let mut cur = p.to_path_buf();
+    // Directories on the way are followed by the kernel; the final component by the script.
+    let canon_parent = |q: &Path| -> Option<PathBuf> {
+        let name = q.file_name()?;
+        let parent = q.parent()?;
+        Some(std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()).join(name))
+    };
+    let mut cur = canon_parent(p)?;
     for _ in 0..40 {
         match std::fs::symlink_metadata(&cur) {
             Ok(m) if m.file_type().is_symlink() => {
                 let t = std::fs::read_link(&cur).ok()?;
-                cur = if t.is_absolute() {
+                let next = if t.is_absolute() {
                     t
                 } else {
                     cur.parent()?.join(t)
                 };
+                cur = canon_parent(&next)?;
             }
             _ => return Some(cur),
         }
@@ -263,8 +270,18 @@ pub fn plan_write(path: &Path) -> Plan {
             return Plan::Fail(vec![Kind::PermissionDenied, Kind::NotFound]);
         }
         Err(_) => return Plan::Fail(vec![Kind::NotADirectory, Kind::NotFound]),
-        Ok(m) if !m.is_dir() => return Plan::Fail(vec![Kind::NotADirectory]),
+        // dash words a redirect below a file as "Directory nonexistent", GNU tools as ENOTDIR.
+        Ok(m) if !m.is_dir() => return Plan::Fail(vec![Kind::NotADirectory, Kind::NotFound]),
         Ok(_) => {}
+    }
+    // A temp name past NAME_MAX fails at lookup, before the permission to create it is asked.
+    let name_len = t.file_name().map_or(0, |n| n.len());
+    if name_len + SUFFIX_MAX + 5 > 255 {
+        return if name_len + SUFFIX_MIN + 5 > 255 {
+            Plan::Fail(vec![Kind::Io, Kind::PermissionDenied])
+        } else {
+            Plan::Either
+        };
     }
     if !can(parent, 0o3) {
         return Plan::Fail(vec![Kind::PermissionDenied]);
@@ -272,14 +289,6 @@ pub fn plan_write(path: &Path) -> Plan {
     let exists = std::fs::symlink_metadata(&t).is_ok();
     if exists && std::fs::metadata(&t).is_ok() && !can(&t, 0o2) {
         return Plan::Fail(vec![Kind::PermissionDenied]);
-    }
-    let name_len = t.file_name().map_or(0, |n| n.len());
-    if name_len + SUFFIX_MAX + 5 > 255 {
-        return if name_len + SUFFIX_MIN + 5 > 255 {
-            Plan::Fail(vec![Kind::Io])
-        } else {
-            Plan::Either
-        };
     }
     Plan::Succeed
 }
@@ -306,7 +315,13 @@ pub fn plan_mkdir(path: &Path) -> Plan {
                 };
             }
             Ok(_) => return Plan::Fail(vec![Kind::NotADirectory, Kind::Io]),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => cur = c.parent(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::symlink_metadata(c).is_ok() {
+                    // A dangling link on the way: `mkdir -p` cannot make it a directory.
+                    return Plan::Fail(vec![Kind::Io, Kind::NotFound]);
+                }
+                cur = c.parent()
+            }
             Err(_) => return Plan::Either,
         }
     }

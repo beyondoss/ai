@@ -52,6 +52,8 @@ pub struct Th {
 
 pub struct Expect {
     pub root_missing: bool,
+    /// The root is below a regular file (ENOTDIR).
+    pub root_below_file: bool,
     pub unreadable: bool,
     pub exact: bool,
     pub hits: Vec<Th>,
@@ -157,10 +159,11 @@ pub fn clip(text: &str, is_match: bool, m: &Matcher) -> String {
         end = total;
         start = total - MAX_LINE;
     }
-    let mut s = String::from("…");
+    // The scenarios (files.json) pin the spelling: `… <window> … [truncated; columns A-B of N]`.
+    let mut s = String::from("… ");
     s.extend(&chars[start..end]);
     if end < total {
-        s.push('…');
+        s.push_str(" …");
     }
     s.push_str(&format!(
         " [truncated; columns {}-{} of {}]",
@@ -207,23 +210,27 @@ pub fn expect(
 ) -> Expect {
     let mut out = Expect {
         root_missing: false,
+        root_below_file: false,
         unreadable: false,
         exact: true,
         hits: vec![],
         truncated: false,
     };
-    let Ok(rm) = std::fs::metadata(root) else {
-        out.root_missing = std::fs::symlink_metadata(root).is_err()
-            && !matches!(root.parent().map(std::fs::metadata), Some(Err(ref e)) if e.kind() == std::io::ErrorKind::PermissionDenied);
-        out.exact = false;
-        return out;
+    let rm = match std::fs::metadata(root) {
+        Ok(m) => m,
+        Err(e) => {
+            // A missing path, a dangling link, or a path below a file is a missing root; a path no
+            // parent lets us search is merely unreadable.
+            out.root_below_file = e.kind() == std::io::ErrorKind::NotADirectory;
+            out.root_missing = e.kind() == std::io::ErrorKind::NotFound || out.root_below_file;
+            out.unreadable = !out.root_missing;
+            out.exact = false;
+            return out;
+        }
     };
     let mut files: Vec<(PathBuf, bool)> = Vec::new(); // (path, explicit)
     if rm.is_dir() {
         collect(root, spec, &mut files, &mut out.unreadable);
-        if !can(root, 0o5) {
-            out.unreadable = true;
-        }
     } else if rm.is_file() {
         if can(root, 4) {
             files.push((root.to_path_buf(), true));
@@ -306,7 +313,7 @@ pub fn expect(
 }
 
 fn collect(dir: &Path, spec: &Spec, files: &mut Vec<(PathBuf, bool)>, unreadable: &mut bool) {
-    if !can(dir, 0o5) {
+    if !can(dir, 0o4) {
         *unreadable = true;
         return;
     }
@@ -315,6 +322,21 @@ fn collect(dir: &Path, spec: &Spec, files: &mut Vec<(PathBuf, bool)>, unreadable
         return;
     };
     let mut entries: Vec<_> = rd.flatten().collect();
+    if !can(dir, 0o1) {
+        // Listable but not searchable: an entry the engine would open cannot be (a file the glob
+        // lets through, or a directory to descend into); the rest are never touched.
+        for e in &entries {
+            let Ok(ft) = e.file_type() else { continue };
+            if e.file_name() == ".git" || ft.is_symlink() {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().into_owned();
+            if ft.is_dir() || (ft.is_file() && glob_allows(spec, &name)) {
+                *unreadable = true;
+            }
+        }
+        return;
+    }
     entries.sort_by_key(|e| e.file_name());
     for e in entries {
         let p = e.path();
@@ -330,12 +352,8 @@ fn collect(dir: &Path, spec: &Spec, files: &mut Vec<(PathBuf, bool)>, unreadable
         if m.is_dir() {
             collect(&p, spec, files, unreadable);
         } else if m.is_file() {
-            if let Some((g, excl)) = &spec.glob {
-                let suffix = g.trim_start_matches('*');
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.ends_with(suffix) == *excl {
-                    continue;
-                }
+            if !glob_allows(spec, &e.file_name().to_string_lossy()) {
+                continue;
             }
             if !can(&p, 4) {
                 *unreadable = true;
@@ -343,5 +361,12 @@ fn collect(dir: &Path, spec: &Spec, files: &mut Vec<(PathBuf, bool)>, unreadable
             }
             files.push((p, false));
         }
+    }
+}
+
+fn glob_allows(spec: &Spec, name: &str) -> bool {
+    match &spec.glob {
+        None => true,
+        Some((g, excl)) => name.ends_with(g.trim_start_matches('*')) != *excl,
     }
 }

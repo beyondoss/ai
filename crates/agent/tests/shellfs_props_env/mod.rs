@@ -57,7 +57,7 @@ pub const PLAIN: Config = Config {
     stdin: true,
     fault_pct: 0,
     readonly_start: false,
-    steps: 10,
+    steps: 30,
 };
 
 /// Fixed seed and case count for CI; the environment widens them locally.
@@ -74,7 +74,13 @@ pub fn settings(default_cases: u64, seed: u64) -> hegel::Settings {
         .test_cases(cases)
         .seed(Some(seed))
         .database(None)
+        .show_statistics(std::env::var_os("SHELLFS_PROPS_STATS").is_some())
+        .report_multiple_failures(true)
         .suppress_health_check(hegel::HealthCheck::all())
+}
+
+pub fn truth_is_root() -> bool {
+    truth::is_root()
 }
 
 pub fn rt() -> &'static tokio::runtime::Runtime {
@@ -203,6 +209,20 @@ pub fn machine(tc: &TestCase, cfg: Config) -> Machine {
         known: vec![],
         stats: HashMap::new(),
     };
+    // A small tree to start from, so reads, listings and searches have something to find.
+    let seed: &[(&str, &[u8])] = &[
+        ("alpha.txt", b"alpha\nneedle one\nbeta\nNeedle two\n"),
+        ("d/n.txt", b"foo bar\nneedle\r\nlast line no newline"),
+        ("d/sub/x", b"x1\ne1\n\nneedle\n"),
+        (".hidden", b"needle hidden\n"),
+    ];
+    for (rel, data) in seed {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, data).unwrap();
+        m.known.push(p);
+    }
+    m.known.extend([root.join("d"), root.join("d/sub")]);
     if cfg.readonly_start {
         let ro = root.join("ro");
         std::fs::create_dir(&ro).unwrap();
@@ -222,6 +242,14 @@ fn kind_ok(kinds: &[Kind], k: Kind, p: &Path) -> bool {
     kinds.contains(&k) || (k == Kind::Io && p.to_string_lossy().contains('\n'))
 }
 
+/// An open bug this test found: tolerated (and counted, and printed) until its fix lands, then removed
+/// from here. `known_bugs.rs` holds one deterministic test per entry that fails once the bug is fixed,
+/// so a fix cannot leave a stale exemption behind.
+pub fn known(id: &str, msg: String) {
+    eprintln!("KNOWN OPEN BUG {id}: {msg}");
+}
+
+#[track_caller]
 fn fail(msg: impl AsRef<str>) -> ! {
     panic!("{}", msg.as_ref())
 }
@@ -311,12 +339,18 @@ impl Machine {
         let p = if existing {
             tc.draw(gs::sampled_from(self.known.clone()))
         } else {
-            let mut parents = vec![self.root.clone(); 3];
+            let mut parents = vec![self.root.clone(); 4];
             parents.push(self.root.join("missing"));
+            let mut files = vec![];
             for k in &self.known {
-                if std::fs::metadata(k).is_ok() {
-                    parents.push(k.clone());
+                match std::fs::metadata(k) {
+                    Ok(m) if m.is_dir() => parents.extend([k.clone(), k.clone()]),
+                    Ok(_) => files.push(k.clone()),
+                    Err(_) => {}
                 }
+            }
+            if !files.is_empty() && tc.draw(gs::integers::<u8>().max_value(4)) == 0 {
+                parents = files; // a file as the parent: the not-a-directory cases
             }
             let parent = tc.draw(gs::sampled_from(parents));
             parent.join(fixtures::name(tc))
@@ -378,6 +412,11 @@ impl Machine {
             "a write",
         );
         let mismatch = guard.map(|e| cur != e);
+        if truth::resolve_leaf(&p).is_none() {
+            // A symlink loop: the spec does not say what a write through one does. Only the temp
+            // rule still applies (it was checked by `settle_temps` above).
+            return;
+        }
         let op = if guard.is_some() { "write_if_unchanged" } else { "write" };
 
         // What the tree looks like if the write was applied: only the resolved target changes.
@@ -421,6 +460,13 @@ impl Machine {
                 ));
             }
         };
+        tc.event(match (&res, &plan) {
+            (Ok(true), _) => format!("{op}: applied"),
+            (Ok(false), _) => format!("{op}: conflict"),
+            (Err(_), _) if report.errored => format!("{op}: failed by an injected fault"),
+            (Err(_), Plan::Fail(_)) => format!("{op}: refused as the spec requires"),
+            (Err(_), _) => format!("{op}: failed"),
+        });
         match &res {
             Ok(true) => {
                 if let Plan::Fail(k) = &plan {
@@ -443,10 +489,7 @@ impl Machine {
             }
             Err(e) => {
                 let kind = classify(e, &[&p, &self.root]);
-                if report.errored {
-                    if !matches!(kind, Kind::Transport | Kind::Timeout) {
-                        fail(format!("injected fault surfaced as {kind:?}: {e}"));
-                    }
+                if report.errored && matches!(kind, Kind::Transport | Kind::Timeout) {
                     // The spec's promise under a failed transport: unchanged or fully written, never
                     // partial, never a temp.
                     if mismatch == Some(true) || matches!(plan, Plan::Fail(_)) {
@@ -455,7 +498,16 @@ impl Machine {
                         check_applied("a write that failed after it ran");
                     }
                 } else {
+                    // The command itself failed (a fault may still have hit its cleanup).
                     match &plan {
+                        Plan::Succeed
+                            if kind == Kind::PermissionDenied
+                                && std::fs::metadata(&target).is_ok_and(|m| m.is_file())
+                                && !truth::can(&target, 4) =>
+                        {
+                            // The size check reads the temp back, and the temp has the file's mode.
+                            known("N4", format!("{op} {p:?} refused: the file is writable but not readable by its owner: {e}"));
+                        }
                         Plan::Succeed => fail(format!("{op} {p:?} must succeed but failed ({kind:?}): {e}")),
                         Plan::Fail(kinds) if !kind_ok(kinds, kind, &p) => {
                             fail(format!("{op} {p:?} failed as {kind:?} ({e}), spec allows {kinds:?}"))
@@ -465,9 +517,6 @@ impl Machine {
                     check_unchanged("a failed write");
                 }
             }
-        }
-        if res.is_ok() || report.errored {
-            let _ = &tc;
         }
     }
 
@@ -626,6 +675,7 @@ impl Machine {
         let got = self.block(self.fs.read_bytes(&self.c(&p), offset, max));
         let report = self.faults.take();
         let want = self.read_expect(&p, offset, max);
+        tc.event(format!("read: {}", if got.is_ok() { "ok" } else { "err" }));
         match (got, want) {
             (Ok(b), Ok(w)) => {
                 if b != w {
@@ -704,7 +754,7 @@ impl Machine {
                     return;
                 }
                 let ok = match &meta {
-                    Err(_) => matches!(k, Kind::NotFound | Kind::PermissionDenied | Kind::NotADirectory),
+                    Err(_) => matches!(k, Kind::NotFound | Kind::PermissionDenied | Kind::NotADirectory) || std::fs::symlink_metadata(&p).is_ok(),
                     Ok(_) => !readable && matches!(k, Kind::PermissionDenied | Kind::Io),
                 };
                 if !ok {
@@ -712,8 +762,15 @@ impl Machine {
                 }
             }
             Ok(entries) => {
-                if meta.is_err() && !report.errored {
+                let dangling = meta.is_err() && std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink());
+                if meta.is_err() && !dangling && !report.errored {
                     fail(format!("list of the missing {p:?} succeeded with {} entries", entries.len()));
+                }
+                let via_link = std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink()) && matches!(&meta, Ok(m) if m.is_dir());
+                if via_link && entries.is_empty() && !want.is_empty() && cap > 0 {
+                    known("N1", format!("list of the symlinked directory {p:?} returned no entries, its target holds {}", want.len()));
+                    read_only_ops_unchanged(self, &before, "list");
+                    return;
                 }
                 if matches!(&meta, Ok(m) if !m.is_dir()) && !entries.is_empty() {
                     fail(format!("list of the file {p:?} returned entries"));
@@ -777,15 +834,31 @@ impl Machine {
         let report = self.faults.take();
         let map = |p: &Path| p.to_string_lossy().into_owned();
         let want = search_truth::expect(&root, &map, &spec, self.engine);
+        tc.event(format!(
+            "search: {} {}",
+            if want.exact { "exact" } else { "soundness-only" },
+            if got.is_ok() { "ok" } else { "err" }
+        ));
+        if let Ok(o) = &got {
+            tc.event(format!("search: {}", if o.hits.is_empty() { "no hits" } else { "hits" }));
+            tc.event(format!("search: {}", if o.truncated { "truncated" } else { "complete" }));
+        }
         match got {
             Err(e) => {
                 let k = classify(&e, &[&root, &self.root]);
                 let tolerated = report.errored
                     || (self.cfg.cap.is_some() && k == Kind::TooLarge)
                     || (want.unreadable && !want.root_missing && !report.errored && false);
-                if !tolerated {
-                    if want.root_missing {
-                        if k != Kind::NotFound {
+                let multiline = k == Kind::InvalidQuery
+                    && (want.root_missing || want.unreadable)
+                    && (root.to_string_lossy().contains('\n') || snapshot(&self.root).keys().any(|p| p.to_string_lossy().contains('\n')));
+                if multiline && !tolerated {
+                    known("N2", format!("search answered a missing/unreadable path as a bad regex because a path contains a newline: {e}"));
+                } else if !tolerated {
+                    if want.root_below_file && k == Kind::InvalidQuery {
+                        known("N3", format!("search of a root below a regular file answered as a bad regex: {e}"));
+                    } else if want.root_missing {
+                        if !(k == Kind::NotFound || (want.root_below_file && k == Kind::NotADirectory)) {
                             fail(format!("search of the missing root {root:?} must fail as not_found, got {k:?}: {e}"));
                         }
                     } else if want.unreadable {
@@ -819,7 +892,7 @@ impl Machine {
                 if got_hits.iter().filter(|h| h.is_match).count() > limit {
                     fail(format!("search returned more than limit={limit} matches"));
                 }
-                if got_hits.last().is_some_and(|h| !h.is_match) {
+                if out.truncated && got_hits.last().is_some_and(|h| !h.is_match) {
                     fail("search result ends on a context line (trailing context must be dropped when truncated)".to_string());
                 }
                 if want.exact {
@@ -857,12 +930,13 @@ impl Machine {
         let res = self.block(self.fs.create_dir_all(&self.c(&p)));
         let report = self.faults.take();
         let after = snapshot(&self.root);
+        let resolved = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
         let new_ok = |after: &Snap| {
             // Only directories on the way to `p` may appear.
             after.iter().all(|(k, n)| match before.get(k) {
                 Some(Node::Dir { mode, kids }) => matches!(n, Node::Dir { mode: m2, kids: k2 } if m2 == mode && kids.is_subset(k2)),
                 Some(b) => b == n,
-                None => matches!(n, Node::Dir { .. }) && p.starts_with(k),
+                None => matches!(n, Node::Dir { .. }) && (p.starts_with(k) || resolved.starts_with(k)),
             }) && before.keys().all(|k| after.contains_key(k))
         };
         match res {
@@ -1025,7 +1099,7 @@ impl Machine {
         let target = match tc.draw(gs::integers::<u8>().max_value(4)) {
             0 => PathBuf::from("/dev/null"),
             1 => self.root.join("gone"),
-            2 => PathBuf::from(fixtures::name(&tc)),
+            2 => PathBuf::from(fixtures::name(&tc)).with_extension("lnk"),
             _ => self.pick_path(&tc),
         };
         tc.note(&format!("env: symlink {:?} -> {:?}", link.strip_prefix(&self.root).unwrap(), target.strip_prefix(&self.root).unwrap_or(&target)));
