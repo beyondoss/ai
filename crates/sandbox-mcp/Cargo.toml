@@ -1,0 +1,46 @@
+[package]
+name = "beyond-sandbox-mcp"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+description = "sandbox-mcp: an MCP server that gives any agent exec, files, search and jobs in a sandbox"
+
+[lib]
+name = "sandbox_mcp"
+
+[[bin]]
+name = "sandbox-mcp"
+path = "src/main.rs"
+
+# The MCP conformance driver: speaks sdk/conformance/DRIVER.md on stdin/stdout and implements every
+# op by calling `sandbox-mcp`'s tools over a real MCP session.
+[[bin]]
+name = "sandbox-driver-mcp"
+path = "src/bin/sandbox-driver-mcp.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+base64.workspace = true
+beyond-sandbox = { path = "../sandbox" }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
+# The same rmcp as crates/agent's MCP client; `client` + `transport-child-process` serve the driver
+# and the end-to-end tests, which speak to this server as an outside agent would.
+rmcp = { version = "3.2.0", default-features = false, features = ["server", "macros", "transport-io", "transport-streamable-http-server", "client", "transport-child-process"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+# The streamable-HTTP client, for the test that connects over `SANDBOX_MCP_LISTEN`; reqwest's rustls
+# has no default provider here, so the test installs `ring`.
+rmcp = { version = "3.2.0", default-features = false, features = ["server", "macros", "transport-io", "transport-streamable-http-server", "client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+beyond-test-support = { path = "../test-support" }
+tempfile = "3"
