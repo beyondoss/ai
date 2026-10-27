@@ -53,18 +53,15 @@ fn n1_list_of_a_symlinked_directory_is_empty() {
     );
 }
 
-/// N3: a search root below a regular file ("Not a directory") is not among the OS errors the D4
-/// classifier knows, so it is reported as a bad regex.
+/// N3 (fixed): a search root below a regular file is `not_a_directory`, not a bad regex.
 #[test]
-fn n3_search_root_below_a_file_is_a_bad_regex() {
+fn n3_search_root_below_a_file_is_not_a_directory() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("file"), b"needle").unwrap();
     let root = dir.path().join("file/sub");
     let err = env::rt().block_on(fs().search(&query(&root))).unwrap_err();
-    assert!(
-        matches!(err, FsError::InvalidQuery(_)),
-        "N3 is fixed: delete this test and the known(\"N3\") call; got {err}"
-    );
+    assert!(err.to_string().contains("Not a directory"), "{err}");
+    assert!(!matches!(err, FsError::InvalidQuery(_)), "{err}");
 }
 
 /// N4: the write script checks the temp's size by reading it back (`wc -c < tmp`), and the temp has

@@ -282,6 +282,7 @@ const OS_ERRORS = [
   "No such file or directory",
   "Permission denied",
   "Is a directory",
+  "Not a directory",
   "Too many levels of symbolic links",
   "Input/output error",
 ];
@@ -325,7 +326,10 @@ export function classifySearchFailure(
     ) {
       let rest = r.slice(at + rootPrefix.length);
       if (rest.startsWith(ioPrefix)) rest = rest.slice(ioPrefix.length);
-      if (rest.startsWith("No such file or directory")) return true;
+      if (
+        rest.startsWith("No such file or directory")
+        || rest.startsWith("Not a directory")
+      ) return true;
     }
     return false;
   });

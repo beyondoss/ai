@@ -471,7 +471,11 @@ export class Files {
           }`,
         );
       }
-      if (f.kind === "missing_root") throw new NotFoundError(f.line);
+      if (f.kind === "missing_root") {
+        throw f.line.includes("Not a directory")
+          ? new SandboxError("not_a_directory", f.line)
+          : new NotFoundError(f.line);
+      }
       skipped = f.note;
     }
 

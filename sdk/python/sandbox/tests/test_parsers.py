@@ -181,6 +181,17 @@ def test_a_newline_in_a_path_does_not_hide_the_os_error() -> None:
     assert first_line(b"  \n") == "command failed"
 
 
+def test_a_root_below_a_file_is_a_root_error() -> None:
+    f = classify_search_failure(
+        "rg: /w/file/sub: IO error for operation on /w/file/sub: Not a directory (os error 20)\n",
+        "/w/file/sub",
+    )
+    assert f.kind == "missing_root" and "Not a directory" in f.note
+    assert (
+        classify_search_failure("grep: /w/file/sub: Not a directory", "/w/file").kind == "skipped"
+    )
+
+
 def test_search_exit_two_is_told_apart_by_stderr() -> None:
     root = "/work/proj"
     for bad in [
