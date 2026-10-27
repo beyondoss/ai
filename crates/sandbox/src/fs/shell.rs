@@ -294,6 +294,7 @@ impl ShellFs {
         let Ok(result) = self.runner.run("grep", &args, None, self.timeout).await else {
             return;
         };
+        let result = Text::from(result);
         // Exit 2 is per-path read errors here too (the first run already reported them).
         if !matches!(result.code, Some(0..=2)) {
             return;
