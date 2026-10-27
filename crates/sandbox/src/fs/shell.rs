@@ -1742,13 +1742,7 @@ mod appendix_tests {
 
     /// Scripts known to differ from the appendix until the pending fixes land; each names its fix.
     /// An entry here that now matches fails the test, so it cannot outlive its fix.
-    const KNOWN_DIFFERENT: &[(char, &str)] = &[
-        // The appendix carries the dangling-link resolve in C, D and E; the Rust code does not yet.
-        // B2 brings the code level, and then this list is empty.
-        ('C', "appendix has the dangling-link resolve, B2"),
-        ('D', "appendix has the dangling-link resolve, B2"),
-        ('E', "appendix has the dangling-link resolve, B2"),
-    ];
+    const KNOWN_DIFFERENT: &[(char, &str)] = &[];
 
     #[test]
     fn the_appendix_scripts_are_the_scripts_sent() {
