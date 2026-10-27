@@ -113,7 +113,10 @@ impl Capabilities {
                 Err(e)
                     if matches!(
                         e.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::Unsupported
+                        std::io::ErrorKind::NotFound
+                            | std::io::ErrorKind::Unsupported
+                            // The command ran and the endpoint answered; the answer was too big.
+                            | std::io::ErrorKind::FileTooLarge
                     ) =>
                 {
                     Ok(None)
@@ -1693,6 +1696,31 @@ mod tests {
                 "exec endpoint http://x returned 401: unauthorized",
             ))
         }
+    }
+
+    /// A runner whose every answer exceeds the response cap.
+    struct TooBig;
+
+    #[async_trait::async_trait]
+    impl CommandRunner for TooBig {
+        async fn run(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<&str>,
+            _: Duration,
+        ) -> std::io::Result<ExecResult> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                "the response exceeded the 9-byte cap",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_ran_but_answered_too_much_reads_as_absent() {
+        let fs = ShellFs::connect(Arc::new(TooBig)).await.unwrap();
+        assert!(!fs.capabilities().rg && !fs.capabilities().stdin);
     }
 
     #[tokio::test]

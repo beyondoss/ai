@@ -1071,12 +1071,17 @@ impl HttpExecRunner {
     async fn envelope(&self, resp: reqwest::Response) -> std::io::Result<ExecResponse> {
         let (body, over_cap) = self.read_capped(resp).await?;
         if over_cap {
-            return Err(std::io::Error::other(format!(
-                "exec endpoint {}: the response exceeded the {}-byte cap and was discarded — the \
+            // `FileTooLarge`, not `Other`: the command ran and the endpoint answered, so a probe
+            // reads this as its answer (not a transport failure); see `Capabilities::probe`.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                format!(
+                    "exec endpoint {}: the response exceeded the {}-byte cap and was discarded — the \
                  command ran, but its output is too large to return; narrow it (e.g. pipe through \
                  `head`) rather than re-running it unchanged",
-                self.url, self.max_response_bytes
-            )));
+                    self.url, self.max_response_bytes
+                ),
+            ));
         }
         serde_json::from_slice(&body).map_err(|e| {
             std::io::Error::other(format!(
