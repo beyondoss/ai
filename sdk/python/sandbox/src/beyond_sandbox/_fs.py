@@ -68,8 +68,9 @@ def text(b: bytes) -> str:
 
 
 def first_line(stderr: bytes, fallback: str = "command failed") -> str:
-    lines = text(stderr).strip().splitlines()
-    return lines[0] if lines else fallback
+    # LF only: str.splitlines() would also break at CR, VT, FF, U+2028 and others (3.3).
+    line = text(stderr).strip().split("\n", 1)[0]
+    return line or fallback
 
 
 def fail(prefix: str, stderr: bytes) -> SandboxError:

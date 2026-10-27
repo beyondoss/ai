@@ -139,7 +139,8 @@ A transport-level failure is never a capability: see
 ### 3.3 From a command that ran and failed
 
 A helper that gets a non-zero exit takes the **first line of trimmed stderr**
-(or `command failed` if there is none) as `detail`, prefixed as each operation
+(the text up to the first LF and no other character: CR, VT, FF and U+2028 do not
+end it; or `command failed` if there is none) as `detail`, prefixed as each operation
 below says, and classifies it case-insensitively by the first rule that
 matches:
 
