@@ -316,12 +316,6 @@
           "id": "size",
           "op": "stat",
           "path": "${ROOT}/a-rather-long-link-name",
-          "xfail": {
-            "drivers": [
-              "agent-reference"
-            ],
-            "reason": "the stat script runs `stat -c` without -L, so size is the link's own length"
-          },
           "expect": {
             "ok": {
               "size": 12
@@ -332,12 +326,6 @@
           "id": "mtime",
           "op": "stat",
           "path": "${ROOT}/a-rather-long-link-name",
-          "xfail": {
-            "drivers": [
-              "agent-reference"
-            ],
-            "reason": "the stat script runs `stat -c` without -L, so mtime is the link's own"
-          },
           "expect": {
             "ok": {
               "mtime": 981173106
@@ -2728,12 +2716,6 @@
           "path": "${ROOT}/l",
           "data_b64": "djIK",
           "expected_mtime": 981173106,
-          "xfail": {
-            "drivers": [
-              "agent-reference"
-            ],
-            "reason": "stat reports the link's own mtime, so the guard compares the wrong file"
-          },
           "expect": {
             "ok": {}
           }

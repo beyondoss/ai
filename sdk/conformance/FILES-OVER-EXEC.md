@@ -219,9 +219,9 @@ Runs `sh -c STAT_SCRIPT sh PATH` (script A). Parse stdout:
 for the calling user (`[ -w ]`), not mode bits. If `stat -c` itself fails the
 script prints `0<TAB>0`.
 
-A symlink's `size` and `mtime` MUST be the target's. The reference runs
-`stat -c` without `-L` and reports the link's own (D2); a client MUST use
-`stat -L -c` (GNU and busybox both accept it).
+A symlink's `size` and `mtime` are the target's, like `kind`: the script runs
+`stat -L -c` (GNU and busybox both accept it). A dangling link fails the
+leading `[ -e ]` and is reported as not found.
 
 A path that is not valid UTF-8 cannot be written in a JSON request, so such a
 file cannot be addressed. It does appear in a `list` (section 5.6), with U+FFFD
@@ -340,7 +340,7 @@ So `expected_mtime` null means "the file must not exist". The key is required.
 The two steps are two round trips and the guard is not a lock: it catches a
 person or agent editing between a read and a write, and misses an edit that
 leaves the mtime second unchanged (a limit, with a scenario). Through a symlink
-the comparison MUST use the target's mtime (D2).
+the comparison MUST use the target's mtime.
 
 ### 5.5 mkdir
 
@@ -720,9 +720,5 @@ The reference (`ShellFs` as of this writing) behaves as follows where a client
 MUST do better. Each has an `xfail` check in the scenarios, marked for the
 reference driver, which turns into a plain pass when the reference is fixed.
 
-- **D2. Symlink size and mtime.** `stat` reports the link's own size and mtime
-  while `kind` follows the link, so `write_if_unchanged` through a link
-  compares the wrong file. Scenarios `files.stat.symlink-size-and-mtime-follow`
-  and `files.write-if-unchanged.through-symlink`.
 - **D3. Probe errors.** See section 4.2. Scenario `errors.auth.*` (the
   reference driver surfaces them itself, with a first request before probing).
