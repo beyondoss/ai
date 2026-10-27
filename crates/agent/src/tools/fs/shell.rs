@@ -157,12 +157,19 @@ impl Capabilities {
             &["-rnZ", "-e", "__cap_probe__", "--", "/dev/null"],
         )
         .await?;
-        let find_printf = ok(
-            runner,
-            "find",
-            &["/dev/null", "-maxdepth", "0", "-printf", "%y"],
-        )
-        .await?;
+        // Busybox `find` has no `-printf`: it prints usage and exits 1, so only the exact `c` (the
+        // type of `/dev/null`) proves the flag works.
+        let find_printf = settle(
+            runner
+                .run(
+                    "find",
+                    &["/dev/null", "-maxdepth", "0", "-printf", "%y"].map(String::from),
+                    None,
+                    PROBE_TIMEOUT,
+                )
+                .await,
+        )?
+        .is_some_and(|r| r.stdout == "c");
         // An echo, not an `Ok`: only the bytes coming back prove they went in. See `Self::stdin`.
         let stdin = settle(
             runner
@@ -1910,6 +1917,49 @@ mod tests {
             .await
             .unwrap();
         assert!(caps.no_read_window);
+    }
+
+    /// A runner that answers only the `find` probe, with the result it holds; every other command reads as absent.
+    struct FindAnswers(ExecResult);
+
+    #[async_trait]
+    impl CommandRunner for FindAnswers {
+        async fn run(
+            &self,
+            program: &str,
+            _: &[String],
+            _: Option<&str>,
+            _: Duration,
+        ) -> std::io::Result<ExecResult> {
+            if program == "find" {
+                Ok(self.0.clone())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    program.to_string(),
+                ))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn busybox_find_usage_and_exit_one_is_probed_as_no_printf() {
+        // Busybox prints its usage and exits 1 for an unknown `-printf`, on stdout or stderr.
+        let usage = ExecResult {
+            code: Some(1),
+            stdout: "BusyBox v1.36 multi-call binary\nUsage: find [-HL] [PATH]...\n".into(),
+            stderr: "find: unrecognized: -printf\n".into(),
+            ..Default::default()
+        };
+        let caps = Capabilities::probe(&FindAnswers(usage)).await.unwrap();
+        assert!(!caps.find_printf);
+        let c = ExecResult {
+            code: Some(0),
+            stdout: "c".into(),
+            ..Default::default()
+        };
+        let caps = Capabilities::probe(&FindAnswers(c)).await.unwrap();
+        assert!(caps.find_printf);
     }
 
     /// A runner whose every request fails, as a wrong bearer's does.
