@@ -5488,7 +5488,7 @@
     },
     {
       "id": "files.search.root-below-a-file",
-      "description": "A search root below a regular file does not exist: not_found or not_a_directory, never invalid_query. (The reference agent's classifier does not know `Not a directory` and answers `bad regex`.) Found by the stateful property test.",
+      "description": "A search root below a regular file is not_a_directory, never invalid_query: the engine's `Not a directory` for the root itself is a root error, not a bad pattern. Found by the stateful property test.",
       "setup": [
         {
           "id": "setup",
@@ -5509,24 +5509,9 @@
           "root": "${ROOT}/file/sub",
           "pattern": "needle",
           "literal": true,
-          "xfail": {
-            "drivers": [
-              "agent-reference",
-              "beyond-sandbox-ts",
-              "python",
-              "python-async",
-              "sandbox-mcp"
-            ],
-            "reason": "`Not a directory` is not among the OS errors the classifier recognises, so it reads as a bad regex"
-          },
           "expect": {
             "error": {
-              "kind": {
-                "$oneof": [
-                  "not_found",
-                  "not_a_directory"
-                ]
-              }
+              "kind": "not_a_directory"
             }
           }
         }

@@ -470,15 +470,17 @@ share exit 2:
 Read stderr as **records**, not lines, because a path may contain a newline: a
 record runs from the end of the previous one through the first line that ends
 in an OS error (`No such file or directory`, `Permission denied`, `Is a
-directory`, `Too many levels of symbolic links`, `Input/output error`, with a
+directory`, `Not a directory`, `Too many levels of symbolic links`, `Input/output error`, with a
 trailing `(os error N)` that `rg` adds ignored).
 
 - stderr is non-empty, nothing is left after its last record (every record is a
   per-path OS error), and one record is the search root's own error: it
-  contains `: ROOT:` immediately followed by `No such file or directory` or
-  by `IO error for operation on ROOT: No such file or directory`, where `ROOT`
-  is the exact root string given to the engine, newlines included (a path
-  under the root continues after `ROOT`, so it does not match): `not_found`;
+  contains `: ROOT:` and a space, immediately followed by `No such file or
+  directory` or `Not a directory`, optionally with `IO error for operation on
+  ROOT:` and a space before it, where `ROOT` is the exact root string given to
+  the engine, newlines included (a path under the root continues after `ROOT`,
+  so it does not match): `not_found` for `No such file or directory`,
+  `not_a_directory` for `Not a directory` (a root below a regular file);
 - every record is a per-path OS error otherwise: success. The hits on stdout
   are returned and `note` says how many records were skipped and names the
   first;

@@ -1396,7 +1396,8 @@ const REMOVE_TEMP_SCRIPT: &str = concat!(resolve_target!(), r#"rm -f "$tmp""#);
 enum SearchFailure {
     /// The engine rejected the pattern.
     BadRegex,
-    /// The search root itself does not exist; carries the engine's message.
+    /// The search root itself does not exist, or lies below a file (`Not a directory`); carries the
+    /// engine's message, whose wording decides `not_found` or `not_a_directory`.
     MissingRoot(String),
     /// Only per-path read errors: the hits on stdout are still valid. Carries the note.
     Skipped(String),
@@ -1410,10 +1411,11 @@ enum SearchFailure {
 /// through the first line that ends in an OS message. The search root is known, so its own error is
 /// found by looking for that exact string, newlines and all.
 fn classify_search_failure(stderr: &str, root: &str) -> SearchFailure {
-    const OS_ERRORS: [&str; 5] = [
+    const OS_ERRORS: [&str; 6] = [
         "No such file or directory",
         "Permission denied",
         "Is a directory",
+        "Not a directory",
         "Too many levels of symbolic links",
         "Input/output error",
     ];
@@ -1446,7 +1448,7 @@ fn classify_search_failure(stderr: &str, root: &str) -> SearchFailure {
         r.match_indices(&root_prefix).any(|(at, _)| {
             let rest = &r[at + root_prefix.len()..];
             let rest = rest.strip_prefix(&io_prefix).unwrap_or(rest);
-            rest.starts_with("No such file or directory")
+            rest.starts_with("No such file or directory") || rest.starts_with("Not a directory")
         })
     }) {
         return SearchFailure::MissingRoot((*r).to_string());
@@ -1908,6 +1910,8 @@ mod tests {
             );
         }
         for missing in [
+            "rg: /work/proj: IO error for operation on /work/proj: Not a directory (os error 20)",
+            "grep: /work/proj: Not a directory",
             "rg: /work/proj: No such file or directory (os error 2)",
             "rg: /work/proj: IO error for operation on /work/proj: No such file or directory (os error 2)",
             "grep: /work/proj: No such file or directory",
