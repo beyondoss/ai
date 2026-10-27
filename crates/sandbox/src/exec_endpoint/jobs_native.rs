@@ -365,16 +365,20 @@ impl SandboxJobs for NativeJobs<'_> {
             )
             .await?;
         let (body, _) = self.runner.read_capped(resp).await?;
-        serde_json::from_slice::<Value>(&body)
+        let started = serde_json::from_slice::<Value>(&body)
             .ok()
             .and_then(|v| v.get("started")?.as_u64())
-            .map(|p| p as u32)
             .ok_or_else(|| {
                 std::io::Error::other(format!(
                     "the endpoint did not report the job's start: {}",
                     String::from_utf8_lossy(&body[..body.len().min(200)])
                 ))
-            })
+            })?;
+        u32::try_from(started).map_err(|_| {
+            std::io::Error::other(format!(
+                "the endpoint reported an out-of-range job start: {started}"
+            ))
+        })
     }
 
     async fn follow(
@@ -533,13 +537,13 @@ pub enum Event {
 
 #[derive(Deserialize)]
 struct WireJobFrame {
-    started: Option<u32>,
+    started: Option<u64>,
     stdout: Option<String>,
     stderr: Option<String>,
     gap: Option<u64>,
-    shell_exit: Option<i32>,
-    exit_code: Option<i32>,
-    signal: Option<i32>,
+    shell_exit: Option<i64>,
+    exit_code: Option<i64>,
+    signal: Option<i64>,
     #[serde(default)]
     timed_out: bool,
     error: Option<String>,
@@ -564,20 +568,28 @@ pub fn decode_job_frame(line: &[u8]) -> Result<JobFrame, String> {
             .decode(s)
             .map_err(|e| format!("output is not standard base64 ({e})"))
     };
+    // Numbers are read wide and narrowed here, so an out-of-range value is an error: never a panic
+    // (the signal sum) and never a truncated status.
     Ok(if let Some(e) = w.error {
         JobFrame::Error(e)
     } else if let Some(p) = w.started {
+        let p = u32::try_from(p).map_err(|_| wire_out_of_range("started", p))?;
         JobFrame::Event(Event::Started(p))
     } else if let Some(s) = w.stdout.as_deref().or(w.stderr.as_deref()) {
         JobFrame::Event(Event::Output(b64(s)?))
     } else if let Some(n) = w.gap {
         JobFrame::Event(Event::Gap(n))
     } else if let Some(c) = w.shell_exit {
-        JobFrame::Event(Event::ShellExit(c))
+        JobFrame::Event(Event::ShellExit(wire_i32("shell_exit", c)?))
     } else if let Some(c) = w.exit_code {
-        JobFrame::End(c)
+        JobFrame::End(wire_i32("exit_code", c)?)
     } else if let Some(s) = w.signal {
-        JobFrame::End(128 + s)
+        let s = wire_i32("signal", s)?;
+        JobFrame::End(
+            128i32
+                .checked_add(s)
+                .ok_or_else(|| wire_out_of_range("signal", s))?,
+        )
     } else if w.timed_out {
         JobFrame::Error("the endpoint timed the job out".into())
     } else {
@@ -585,16 +597,39 @@ pub fn decode_job_frame(line: &[u8]) -> Result<JobFrame, String> {
     })
 }
 
-fn status(state: &str, code: Option<i64>) -> Option<JobStatus> {
-    let code = || code.map(|c| c as i32);
+/// A wire integer that must fit an `i32`; anything wider is a protocol error.
+fn wire_i32(field: &str, v: i64) -> Result<i32, String> {
+    i32::try_from(v).map_err(|_| wire_out_of_range(field, v))
+}
+
+fn wire_out_of_range(field: &str, v: impl std::fmt::Display) -> String {
+    format!("job frame field `{field}` is out of range: {v}")
+}
+
+fn status(state: &str, code: Option<i32>) -> Option<JobStatus> {
     Some(match state {
         "running" => JobStatus::Running,
-        "exited" => JobStatus::ShellExited(code()?),
-        "ended" => JobStatus::Ended(code()?),
+        "exited" => JobStatus::ShellExited(code?),
+        "ended" => JobStatus::Ended(code?),
         "lost" => JobStatus::Lost,
         "gone" => JobStatus::Gone,
         _ => return None,
     })
+}
+
+/// The `code` of a job answer: absent or null is `None`; an integer that does not fit an `i32`
+/// (or is not an integer) is a protocol error.
+fn code_field(v: &Value) -> std::io::Result<Option<i32>> {
+    match v.get("code") {
+        None | Some(Value::Null) => Ok(None),
+        Some(c) => c
+            .as_i64()
+            .and_then(|c| i32::try_from(c).ok())
+            .map(Some)
+            .ok_or_else(|| {
+                std::io::Error::other(format!("unreadable job answer: `code` is not an i32: {c}"))
+            }),
+    }
 }
 
 fn bad(what: &str, v: &Value) -> std::io::Error {
@@ -603,10 +638,11 @@ fn bad(what: &str, v: &Value) -> std::io::Error {
 
 /// A `read` answer: `{"state", "code", "offset", "end", "data"}`.
 pub fn parse_read(v: &Value) -> std::io::Result<ReadChunk> {
+    let code = code_field(v)?;
     let st = v
         .get("state")
         .and_then(Value::as_str)
-        .and_then(|s| status(s, v.get("code").and_then(Value::as_i64)))
+        .and_then(|s| status(s, code))
         .ok_or_else(|| bad("read", v))?;
     let num = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
     let data = base64::engine::general_purpose::STANDARD
@@ -627,30 +663,37 @@ pub fn parse_list(v: &Value) -> std::io::Result<Vec<JobInfo>> {
         .get("jobs")
         .and_then(Value::as_array)
         .ok_or_else(|| bad("list", v))?;
-    Ok(jobs
-        .iter()
-        .filter_map(|j| {
-            let num = |k: &str| j.get(k).and_then(Value::as_u64);
-            Some(JobInfo {
-                id: JobId::parse(j.get("id")?.as_str()?)?,
-                status: status(
-                    j.get("state")?.as_str()?,
-                    j.get("code").and_then(Value::as_i64),
-                )?,
-                kept: j.get("kept").and_then(Value::as_bool).unwrap_or(false),
-                num: num("num"),
-                kind: j.get("kind").and_then(Value::as_str).map(str::to_string),
-                seen: num("seen").unwrap_or(0),
-                started: num("started").unwrap_or(0),
-                ended: num("ended").unwrap_or(0),
-                label: j
-                    .get("label")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-            })
-        })
-        .collect())
+    let mut out = Vec::with_capacity(jobs.len());
+    for j in jobs {
+        // A code that does not fit is a protocol error for the whole answer, even on a job skipped below.
+        let code = code_field(j)?;
+        let (Some(id), Some(state)) = (
+            j.get("id").and_then(Value::as_str).and_then(JobId::parse),
+            j.get("state").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let Some(status) = status(state, code) else {
+            continue;
+        };
+        let num = |k: &str| j.get(k).and_then(Value::as_u64);
+        out.push(JobInfo {
+            id,
+            status,
+            kept: j.get("kept").and_then(Value::as_bool).unwrap_or(false),
+            num: num("num"),
+            kind: j.get("kind").and_then(Value::as_str).map(str::to_string),
+            seen: num("seen").unwrap_or(0),
+            started: num("started").unwrap_or(0),
+            ended: num("ended").unwrap_or(0),
+            label: j
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        });
+    }
+    Ok(out)
 }
 
 /// A `kill`/`wipe` answer: `{"survivors": [{"id"?, "pids": [..]}]}`, described.
@@ -706,5 +749,49 @@ mod tests {
                 case["name"]
             );
         }
+    }
+
+    #[test]
+    fn a_signal_past_the_i32_sum_is_an_error_not_a_panic() {
+        let err = decode_job_frame(br#"{"signal":2147483647}"#).unwrap_err();
+        assert!(
+            err.contains("`signal`") && err.contains("2147483647"),
+            "{err}"
+        );
+        assert!(decode_job_frame(br#"{"signal":4294967297}"#).is_err());
+        assert_eq!(decode_job_frame(br#"{"signal":9}"#), Ok(JobFrame::End(137)));
+    }
+
+    #[test]
+    fn a_wide_exit_code_is_an_error_not_a_truncation() {
+        let err = decode_job_frame(br#"{"exit_code":4294967297}"#).unwrap_err();
+        assert!(
+            err.contains("`exit_code`") && err.contains("4294967297"),
+            "{err}"
+        );
+        assert!(decode_job_frame(br#"{"shell_exit":4294967297}"#).is_err());
+        assert_eq!(
+            decode_job_frame(br#"{"exit_code":3}"#),
+            Ok(JobFrame::End(3))
+        );
+        assert!(decode_job_frame(br#"{"started":4294967297}"#).is_err());
+    }
+
+    #[test]
+    fn a_wide_read_code_is_an_error_not_ended_one() {
+        let wide =
+            json!({"state": "ended", "code": 4294967297_u64, "offset": 0, "end": 0, "data": ""});
+        assert!(parse_read(&wide).is_err());
+        let running =
+            json!({"state": "running", "code": 4294967297_u64, "offset": 0, "end": 0, "data": ""});
+        assert!(parse_read(&running).is_err());
+        let ok = json!({"state": "ended", "code": 3, "offset": 0, "end": 0, "data": ""});
+        assert_eq!(parse_read(&ok).unwrap().status, JobStatus::Ended(3));
+    }
+
+    #[test]
+    fn a_wide_code_in_a_list_is_an_error() {
+        let wide = json!({"jobs": [{"id": "j1", "state": "ended", "code": 4294967297_u64}]});
+        assert!(parse_list(&wide).is_err());
     }
 }

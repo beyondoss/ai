@@ -164,7 +164,7 @@ one `run` with a 10 s timeout.
 | ------------- | ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------- |
 | `rg`          | `rg --version`                                                                                                           | exit 0                                         |
 | `grep_null`   | `grep -rnZ -e __cap_probe__ -- /dev/null`                                                                                | exit 0 or 1                                    |
-| `find_printf` | `find /dev/null -maxdepth 0 -printf %y`                                                                                  | exit 0 or 1 **and** stdout is `c`              |
+| `find_printf` | `find /dev/null -maxdepth 0 -printf %y`                                                                                  | stdout is exactly `c`                          |
 | `stdin`       | `cat` with stdin `stdin-probe`                                                                                           | exit 0 **and** stdout is exactly `stdin-probe` |
 | `read_window` | `sh -c 'printf abc \| dd iflag=skip_bytes,count_bytes skip=1 count=1 status=none 2>/dev/null \| base64 -w0 2>/dev/null'` | exit 0 and stdout trimmed is `Yg==`            |
 
@@ -753,18 +753,7 @@ exit 1
 
 ## Known deviations from the reference implementation
 
-Found by the first run on real busybox (Alpine). This document says what is
-right; the reference still does the old thing until its fix lands. The
-scenarios carry an `xfail` mark for the reference driver on exactly the checks
-that show them, on a backend whose probes found `find_printf` and a busybox
-`grep` (a real busybox sandbox).
-
-1. **The reference's `find_printf` probe accepts busybox.** busybox `find` has
-   no `-printf`: it prints its usage and exits 1, and the reference counts
-   "exit 0 or 1" as present, so `list` runs `find -printf` and fails with `io`
-   (`find: unrecognized: -printf`). Section 4 requires stdout `c` as well.
-   Shown by every `list` check on busybox (19 checks in `files`, `errors` and
-   `helpers`).
+None currently.
 
 When the reference (`ShellFs`) behaves differently from this spec, the
 difference is listed here, and the scenarios carry an `xfail` mark for the
