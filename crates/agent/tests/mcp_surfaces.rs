@@ -72,7 +72,7 @@ fn get_mcp_lists_resources_and_prompts_and_tools_call_them() {
         turn_text("done"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.env("HOME", &home);
     cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
@@ -144,7 +144,7 @@ fn mcp_complete_returns_fixture_suggestions() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![turn_text("idle")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.env("HOME", &home);
     cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");

@@ -8,7 +8,7 @@
 //! work, not just the accept loop — they also cost per-thread stacks and mimalloc heaps. This bench
 //! A/Bs `current_thread` (the production default in `main.rs::build_runtime`) against multi-thread.
 //!
-//! It spawns the real `beyond-ai-agent` binary twice — once per flavor, selected by
+//! It spawns the real `agent` binary twice — once per flavor, selected by
 //! `BEYOND_AI_AGENT_TOKIO_WORKER_THREADS` — and drives concurrent WebSocket sessions against a
 //! loopback mock. The two children are the same binary, same flags, same load; the scheduler is
 //! the only variable. Metrics are process-level (the child's `/proc/<pid>/status` + `/stat`), not
@@ -53,7 +53,7 @@ fn main() {
     let concurrency = env_u64("SERVE_RUNTIME_BENCH_CONCURRENCY", 32) as usize;
     let duration = Duration::from_secs(env_u64("SERVE_RUNTIME_BENCH_DURATION_SECS", 4));
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     eprintln!(
         "serve_runtime: bin={bin} cores={cores} concurrency={concurrency} duration={duration:?}"

@@ -637,8 +637,7 @@ async fn web_keeps_the_runtime_responsive() {
     html.push_str("</body></html>");
     let url = html_server(html).await;
     // The isolated parse runs in the agent binary's `__web-parse` child, not in this test binary.
-    let fresh =
-        || web::Web::new(true, &[], None).with_parser_binary(env!("CARGO_BIN_EXE_beyond-ai-agent"));
+    let fresh = || web::Web::new(true, &[], None).with_parser_binary(env!("CARGO_BIN_EXE_agent"));
     let why = "Fetching is async; building the client, and parsing in (and waiting on) the \
                isolated child, belong on the blocking pool.";
     // A first call builds the client (TLS provider, root certificates): a fresh tool each run.

@@ -76,7 +76,7 @@ fn project() -> tempfile::TempDir {
 fn runs_summary_counts_the_childs_tokens() {
     let dir = project();
     let (base, bodies) = spawn_model_server(script());
-    let out = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let out = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .args([
             "run",
             "go",
@@ -122,7 +122,7 @@ fn serves_session_stats_count_the_childs_tokens() {
     let dir = project();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(script());
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = common::serve_cmd(bin, &base, &session_file)
         .arg("--trust-project")
         .current_dir(dir.path())

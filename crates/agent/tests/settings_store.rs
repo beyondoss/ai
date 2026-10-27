@@ -166,7 +166,7 @@ fn run_binary_with_no_settings_file_at_all_falls_back_to_the_built_in_default() 
     // A missing settings file (the common case — most operators never run `agent settings`) must not
     // error or change behavior from before this feature existed.
     let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",

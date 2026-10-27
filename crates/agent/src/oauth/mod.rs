@@ -146,7 +146,7 @@ pub async fn login(
                 .await
                 .map(OAuthCredential::GithubCopilot)
         }
-        OAuthProviderId::OpenaiCodex => openai_codex::login(callbacks, cancel, "beyond-ai-agent")
+        OAuthProviderId::OpenaiCodex => openai_codex::login(callbacks, cancel, "beyond-agent")
             .await
             .map(OAuthCredential::OpenaiCodex),
     }

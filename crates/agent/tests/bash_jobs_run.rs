@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use common::{SpawnGuarded, run_cmd, spawn_model_server, turn_text, turn_tool_use};
 use serde_json::{Value, json};
 
-const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
+const BIN: &str = env!("CARGO_BIN_EXE_agent");
 
 fn bash_turn(id: &str, command: &str) -> String {
     turn_tool_use(id, "bash", &json!({ "command": command }).to_string())

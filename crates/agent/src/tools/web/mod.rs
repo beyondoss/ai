@@ -37,11 +37,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// follow manually so [`ssrf::validate_url`] runs on every hop.
 const MAX_REDIRECTS: usize = 5;
 
-const USER_AGENT: &str = concat!(
-    "beyond-ai-agent/",
-    env!("CARGO_PKG_VERSION"),
-    " (+web tool)"
-);
+const USER_AGENT: &str = concat!("beyond-agent/", env!("CARGO_PKG_VERSION"), " (+web tool)");
 
 pub struct Web {
     policy: EgressPolicy,

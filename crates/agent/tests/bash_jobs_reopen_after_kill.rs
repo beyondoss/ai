@@ -21,7 +21,7 @@ use common::{
 };
 use serde_json::json;
 
-const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
+const BIN: &str = env!("CARGO_BIN_EXE_agent");
 
 /// The pids of live processes whose command line contains `needle`.
 fn running(needle: &str) -> Vec<u32> {

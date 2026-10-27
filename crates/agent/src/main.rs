@@ -255,7 +255,7 @@ impl beyond_agent::oauth::LoginCallbacks for CliLoginCallbacks {
 
 #[derive(Cli)]
 #[usage(
-    bin = "beyond-ai-agent",
+    bin = "agent",
     version,
     about = "Beyond agent harness",
     unknown_flags = "error"
@@ -2927,22 +2927,17 @@ mod tests {
         use std::time::Instant;
 
         let cases: &[&[&str]] = &[
-            &["beyond-ai-agent", "tools"],
-            &["beyond-ai-agent", "run", "--model", "claude-opus-4-8", "hi"],
+            &["agent", "tools"],
+            &["agent", "run", "--model", "claude-opus-4-8", "hi"],
             &[
-                "beyond-ai-agent",
+                "agent",
                 "serve",
                 "--upstream-http2",
                 "off",
                 "--tools",
                 "bash,read,write",
             ],
-            &[
-                "beyond-ai-agent",
-                "settings",
-                "--model",
-                "claude-sonnet-4-5",
-            ],
+            &["agent", "settings", "--model", "claude-sonnet-4-5"],
         ];
         const WARMUP: u32 = 200;
         const ITERS: u32 = 5_000;

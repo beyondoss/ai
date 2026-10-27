@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7-labs
 #
-# The agent (`beyond-ai-agent`) as a `serve --service` replica: one process, many tenants, each
+# The agent (`agent`) as a `serve --service` replica: one process, many tenants, each
 # connection carrying a verified session grant. Built from the workspace root:
 #
 #     docker build -f Dockerfile.agent -t beyond-ai-agent .
@@ -99,7 +99,7 @@ FROM chef AS builder
 # `code-mode` is not on by default.
 ARG AGENT_FEATURES=""
 COPY --from=planner /app/recipe.json recipe.json
-# Cook only `beyond-ai-agent`'s dependencies — cached until the dependency graph changes. Scoping to
+# Cook only `agent`'s dependencies — cached until the dependency graph changes. Scoping to
 # the package matters: the workspace also holds the gateway, whose pingora tree would drag a cmake
 # build of zlib-ng into an image that never runs it. Cache mounts keep the registry warm across
 # builds; `ring` and `mimalloc` build their C bits with the musl toolchain already installed.
@@ -127,9 +127,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && linker_env="CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')_LINKER" \
     && cc_env="CC_$(echo "$target" | tr '-' '_')" \
     && export "$linker_env=musl-gcc" "$cc_env=musl-gcc" \
-    && cargo build --release --locked --target "$target" -p beyond-agent --bin beyond-ai-agent \
+    && cargo build --release --locked --target "$target" -p beyond-agent --bin agent \
         ${AGENT_FEATURES:+--features "$AGENT_FEATURES"} \
-    && cp "target/$target/release/beyond-ai-agent" /usr/local/bin/beyond-ai-agent
+    && cp "target/$target/release/agent" /usr/local/bin/agent
 
 # ---------------------------------------------------------------------------
 # Stage 4: runtime — Alpine with the binary, a CA store, and nothing else.
@@ -148,7 +148,7 @@ RUN addgroup -S -g 10001 beyond \
     && mkdir -p /mnt/efs \
     && chown beyond:beyond /mnt/efs
 
-COPY --from=builder /usr/local/bin/beyond-ai-agent /usr/local/bin/beyond-ai-agent
+COPY --from=builder /usr/local/bin/agent /usr/local/bin/agent
 
 # Core dumps off, from the entrypoint. A replica holds, in memory, every live tenant's unsealed data
 # key, gateway credential and exec headers — a core file would put all of them on disk in plaintext,
@@ -159,7 +159,7 @@ COPY --from=builder /usr/local/bin/beyond-ai-agent /usr/local/bin/beyond-ai-agen
 COPY <<'SH' /usr/local/bin/agent-entrypoint
 #!/bin/sh
 ulimit -c 0 2>/dev/null || true
-exec /usr/local/bin/beyond-ai-agent "$@"
+exec /usr/local/bin/agent "$@"
 SH
 RUN chmod 0755 /usr/local/bin/agent-entrypoint
 

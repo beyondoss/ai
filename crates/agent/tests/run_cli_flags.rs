@@ -19,7 +19,7 @@ fn run_binary_exports_the_transcript_when_asked() {
     let (base, _bodies) = spawn_model_server(vec![turn_text("all done")]);
     let export_path = dir.path().join("transcript.html");
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -69,7 +69,7 @@ fn run_binary_exports_the_transcript_when_asked() {
 #[test]
 fn run_binary_list_models_prints_known_model_ids_with_no_gateway_or_key() {
     // A pure informational query — no `--gateway-url`/`--key` needed, matching `tools`'s own shape.
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args(["list-models"])
         .output()
@@ -90,7 +90,7 @@ fn run_binary_list_models_search_argument_filters_to_matching_model_ids() {
     // pi-parity fix: `list-models` had no way to narrow a long table down to models matching a search
     // term (pi's own `--list-models <search>`) — an optional positional argument, case-insensitive
     // substring match against the model id.
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args(["list-models", "GPT"])
         .output()
@@ -117,7 +117,7 @@ fn run_binary_list_models_search_argument_fuzzy_matches_a_non_contiguous_subsequ
     // Task #51 (pi-parity fix): `--list-models <search>` used to be a plain case-insensitive substring
     // check, which "sn5" would never match against "claude-sonnet-5" (no such literal substring
     // exists). pi's own `--list-models` uses a fuzzy, order-preserving subsequence match instead.
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args(["list-models", "sn5"])
         .output()
@@ -145,7 +145,7 @@ fn run_binary_list_models_prints_capability_columns_not_just_bare_ids() {
     // with context/max-out/thinking/images columns, all already computed by `agent_core::capabilities`
     // but never surfaced. This pins the enriched shape down so it can't silently regress back to a
     // bare list.
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args(["list-models"])
         .output()
@@ -201,7 +201,7 @@ fn run_binary_version_flag_prints_only_the_version_to_stdout() {
     // and this module's `#![deny(clippy::print_stdout)]` already makes a stray application `println!`
     // a compile error, but neither of those is *proof* that `--version` itself stays clean — this pins
     // it down directly rather than assuming.
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .arg("--version")
         .output()
@@ -214,7 +214,7 @@ fn run_binary_version_flag_prints_only_the_version_to_stdout() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.trim() == format!("beyond-ai-agent {}", env!("CARGO_PKG_VERSION")),
+        stdout.trim() == format!("agent {}", env!("CARGO_PKG_VERSION")),
         "stdout should be exactly the binary name and version, nothing else: {stdout:?}"
     );
     assert_eq!(
@@ -231,7 +231,7 @@ fn run_binary_lowercase_v_alias_prints_the_same_version_as_capital_v() {
     // lowercase `-v` alias too. `expand_short_aliases` (`main.rs`) rewrites it to `--version` before
     // clap ever sees it — this pins down that the two really produce identical output, not just that
     // the process happens to exit 0.
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let lower = run_cmd(bin).arg("-v").output().expect("spawn binary");
     let upper = run_cmd(bin).arg("-V").output().expect("spawn binary");
 
@@ -253,7 +253,7 @@ fn run_binary_lowercase_v_alias_prints_the_same_version_as_capital_v() {
 fn run_binary_help_flag_prints_usage_to_stdout_with_empty_stderr() {
     // F-L3 (pi: stdout-cleanliness.test.ts "prints plain --help to stdout when stdout is redirected"):
     // same idea as the `--version` case above, for clap's generated `--help`.
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin).arg("--help").output().expect("spawn binary");
 
     assert!(
@@ -281,7 +281,7 @@ fn run_binary_json_help_flag_routes_usage_to_stderr_with_empty_stdout() {
     // for `run` + `--json` + a help flag and redirects clap's rendered help to stderr instead of
     // stdout when it does. No `--gateway-url`/`--key` needed: clap's help short-circuit fires before
     // any of that is ever read.
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args(["run", "--json", "--help", "--no-session-persistence"])
         .output()
@@ -311,7 +311,7 @@ fn export_subcommand_renders_an_existing_session_file_with_no_gateway_or_key() {
     // Create a session file the ordinary way, with a real (fake) model server — this part still
     // needs a gateway/key, exactly like any other `run`.
     let (base, _bodies) = spawn_model_server(vec![turn_text("the answer is 42")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let setup = run_cmd(bin)
         .args([
             "run",
@@ -396,7 +396,7 @@ fn export_subcommand_usage_totals_match_run_exports_for_the_same_session() {
     let run_export_path = dir.path().join("run-export.html");
 
     let (base, _bodies) = spawn_model_server(vec![turn_text("the answer is 42")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let setup = run_cmd(bin)
         .args([
             "run",
@@ -467,7 +467,7 @@ fn run_binary_thinking_flag_reaches_the_wire_request() {
     // extended thinking for a one-shot task at all.
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -509,7 +509,7 @@ fn run_binary_with_no_reasoning_flags_defaults_to_medium_thinking_on_a_reasoning
     // (`agent_core::models::budget_for_effort`).
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -546,7 +546,7 @@ fn run_binary_explicit_reasoning_effort_flag_wins_over_the_medium_default() {
     // than the new "medium" default silently overriding it.
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -588,7 +588,7 @@ fn run_binary_with_no_reasoning_flags_sets_no_reasoning_effort_on_a_model_with_n
     // spuriously-defaulted one.
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -628,7 +628,7 @@ fn run_binary_model_flag_colon_suffix_resolves_the_id_and_sets_reasoning_effort(
     // `output_config.effort` rather than a numeric budget.
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -677,7 +677,7 @@ fn run_binary_model_flag_off_suffix_disables_reasoning_and_is_not_overridden_by_
     // `agent-core/src/dialect/anthropic.rs`).
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -732,7 +732,7 @@ fn run_binary_reasoning_effort_off_flag_disables_reasoning_and_is_not_overridden
     // itself rather than the suffix).
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -780,7 +780,7 @@ fn serve_binary_reasoning_effort_off_flag_starts_with_reasoning_off_not_the_medi
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     // `serve_cmd`'s own fixed `--model claude-test` (disable-capable, unlike some reasoning models —
     // see `serve_starts_clamped_not_off_for_a_model_that_cannot_disable_reasoning` in
     // `serve_models_thinking.rs`) is left as-is rather than overridden: clap rejects a repeated
@@ -815,7 +815,7 @@ fn agent_settings_accepts_off_as_the_default_reasoning_effort() {
     // `agent settings` CLI e2e tests) because of this remediation pass's per-agent file-ownership split;
     // `settings_store.rs` wasn't this agent's to touch this round.
     let dir = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     let output = run_cmd(bin)
         .current_dir(dir.path())
@@ -861,7 +861,7 @@ fn run_binary_temperature_flag_reaches_the_wire_request() {
     // thinking/reasoning mechanism at all (`models.rs::capabilities`), so it's unaffected either way.
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -900,7 +900,7 @@ fn run_binary_max_tokens_flag_reaches_the_wire_request() {
     // every `run`/`serve` process was locked to the model-derived default.
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -946,7 +946,7 @@ fn run_binary_carries_a_stable_prompt_cache_affinity_key_on_the_wire() {
     // different condition (Fireworks-hosted or not) than this plain body-field check.
     let (base, bodies) = spawn_model_server(vec![turn_text_responses("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -994,7 +994,7 @@ fn run_binary_omits_session_affinity_header_for_a_non_fireworks_model() {
     // Chat Completions dialect instead.
     let (base, bodies) = spawn_model_server(vec![turn_text_responses("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -1053,7 +1053,7 @@ fn model_calls_on_a_resumed_session(args: &[&str], env: &[(&str, &str)]) -> usiz
     };
     let (base, bodies) =
         spawn_model_server(vec![turn_text("## Goal\nSUMMARY"), turn_text("answered")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -1141,7 +1141,7 @@ fn run_binary_context_window_flag_forces_proactive_compaction_on_a_resumed_sessi
     let (base, bodies) =
         spawn_model_server(vec![turn_text("## Goal\nSUMMARY"), turn_text("answered")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -1227,7 +1227,7 @@ fn run_binary_no_compaction_flag_suppresses_proactive_compaction_on_a_resumed_se
 
     let (base, bodies) = spawn_model_server(vec![turn_text("answered")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -1269,7 +1269,7 @@ fn run_binary_no_compaction_flag_suppresses_proactive_compaction_on_a_resumed_se
 /// The first wire body of a one-turn `run` with `extra` flags.
 fn run_first_body(extra: &[&str]) -> String {
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -1312,7 +1312,7 @@ fn serve_defaults_to_the_1_hour_cache_ttl_and_takes_an_explicit_5m() {
         let dir = tempfile::tempdir().unwrap();
         let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
         let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
-        let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+        let bin = env!("CARGO_BIN_EXE_agent");
         let mut child = serve_cmd(bin, &base, &session_file)
             .args(extra)
             .spawn_guarded();
@@ -1332,7 +1332,7 @@ fn serve_defaults_to_the_1_hour_cache_ttl_and_takes_an_explicit_5m() {
 fn run_binary_cache_long_flag_reaches_the_wire_request() {
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -1387,7 +1387,7 @@ fn run_binary_bash_shell_path_flag_is_used_for_bash_calls() {
     let turn2 = turn_text("done");
     let (base, bodies) = spawn_model_server(vec![turn1, turn2]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -1431,7 +1431,7 @@ fn run_binary_fails_fast_when_bash_shell_path_does_not_exist() {
     // `serve_tools_bash.rs`) — `run_task` had no equivalent at all, so a bad path only ever surfaced as
     // a confusing spawn error on the first `bash` call, potentially well into a multi-step run, rather
     // than failing the whole invocation immediately at startup.
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -1477,7 +1477,7 @@ fn run_binary_bash_command_prefix_flag_runs_before_the_model_s_command() {
     let turn2 = turn_text("done");
     let (base, bodies) = spawn_model_server(vec![turn1, turn2]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -1524,7 +1524,7 @@ fn run_binary_ai_agent_bash_command_prefix_env_var_is_used_for_bash_calls() {
     let turn2 = turn_text("done");
     let (base, bodies) = spawn_model_server(vec![turn1, turn2]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .env("AI_AGENT_BASH_COMMAND_PREFIX", "echo env-prefix-marker")
         .args([
@@ -1581,7 +1581,7 @@ fn run_binary_sequential_tools_flag_is_accepted_and_both_calls_still_run() {
     ]);
     let (base, _bodies) = spawn_model_server(vec![two_bash_calls, turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -1631,7 +1631,7 @@ fn run_binary_deny_tool_flag_blocks_the_named_tool_end_to_end() {
     let turn2 = turn_text("done");
     let (base, bodies) = spawn_model_server(vec![turn1, turn2]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -1688,7 +1688,7 @@ fn run_binary_deny_tool_env_var_blocks_the_named_tool_end_to_end() {
     let turn2 = turn_text("done");
     let (base, bodies) = spawn_model_server(vec![turn1, turn2]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -1741,7 +1741,7 @@ fn run_binary_deny_bash_pattern_flag_blocks_matching_commands_end_to_end() {
     let turn2 = turn_text("done");
     let (base, bodies) = spawn_model_server(vec![turn1, turn2]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -1798,7 +1798,7 @@ fn run_binary_deny_path_flag_blocks_a_write_to_the_matching_path_end_to_end() {
     let turn2 = turn_text("done");
     let (base, bodies) = spawn_model_server(vec![turn1, turn2]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -1858,7 +1858,7 @@ fn run_binary_relative_deny_path_patterns_block_relative_writes_end_to_end() {
         turn_text("done"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -1907,7 +1907,7 @@ fn run_binary_ai_agent_exclude_tools_env_var_restricts_the_registry() {
     // inconsistency.
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .env("AI_AGENT_EXCLUDE_TOOLS", "bash")
         .args([
@@ -1948,7 +1948,7 @@ fn run_binary_ai_agent_exclude_tools_env_var_restricts_the_registry() {
 fn run_binary_ai_agent_tools_env_var_restricts_the_registry_to_an_allow_list() {
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .env("AI_AGENT_TOOLS", "read,write")
         .args([
@@ -1992,7 +1992,7 @@ fn run_binary_short_t_flag_is_an_alias_for_tools() {
     // unlike pi's own CLI (`cli/args.ts`). `-t` matches pi's `--tools`/`-t`.
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -2030,7 +2030,7 @@ fn run_binary_short_t_flag_is_an_alias_for_tools() {
 fn run_binary_short_xt_flag_is_an_alias_for_exclude_tools() {
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -2068,7 +2068,7 @@ fn run_binary_short_xt_flag_is_an_alias_for_exclude_tools() {
 fn run_binary_short_nt_flag_is_an_alias_for_no_tools() {
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -2115,7 +2115,7 @@ fn run_binary_short_a_and_na_flags_are_aliases_for_trust_project_and_force_untru
     .unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -2161,7 +2161,7 @@ fn run_binary_short_ns_flag_is_an_alias_for_no_skills() {
     .unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -2208,7 +2208,7 @@ fn run_binary_short_np_flag_is_an_alias_for_no_prompt_templates() {
     .unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -2248,7 +2248,7 @@ fn run_binary_short_nc_flag_is_an_alias_for_no_context_files() {
     std::fs::write(dir.path().join("CLAUDE.md"), "PROJECT-MARKER-777").unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -2296,7 +2296,7 @@ fn run_binary_model_override_header_only_reaches_the_wire_request() {
     .unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .env("AI_AGENT_CONFIG_DIR", &config_dir)
         .args([
@@ -2346,7 +2346,7 @@ fn run_binary_model_override_header_resolves_a_dollar_var_reference() {
     .unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .env("AI_AGENT_CONFIG_DIR", &config_dir)
         .env("MY_E2E_PROXY_TOKEN", "resolved-from-env")
@@ -2400,7 +2400,7 @@ fn run_binary_model_override_api_key_resolves_a_bang_command() {
     )
     .unwrap();
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .env("AI_AGENT_CONFIG_DIR", &config_dir)
         .args([
@@ -2457,7 +2457,7 @@ fn run_binary_model_override_dialect_forces_anthropic_wire_for_a_model_id_that_f
     )
     .unwrap();
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .env("AI_AGENT_CONFIG_DIR", &config_dir)
         .args([
@@ -2516,7 +2516,7 @@ fn run_binary_model_override_api_version_is_appended_as_a_query_param() {
     )
     .unwrap();
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .env("AI_AGENT_CONFIG_DIR", &config_dir)
         .args([
@@ -2564,7 +2564,7 @@ fn run_binary_model_override_deployment_name_replaces_the_wire_level_model_field
     )
     .unwrap();
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .env("AI_AGENT_CONFIG_DIR", &config_dir)
         .args([
@@ -2619,7 +2619,7 @@ fn run_binary_model_override_auth_header_prefix_prepends_bearer_to_a_named_heade
     )
     .unwrap();
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .env("AI_AGENT_CONFIG_DIR", &config_dir)
         .args([
@@ -2685,7 +2685,7 @@ fn run_binary_idle_timeout_ms_flag_causes_a_stalled_response_to_fail_quickly() {
     });
     let base = format!("http://{addr}");
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let start = std::time::Instant::now();
     let output = run_cmd(bin)
         .args([
@@ -2788,7 +2788,7 @@ fn run_binary_retry_max_backoff_ms_flag_caps_the_exponential_backoff_between_ret
     });
     let base = format!("http://{addr}");
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let start = std::time::Instant::now();
     let output = run_cmd(bin)
         .args([
@@ -2850,7 +2850,7 @@ fn run_binary_block_images_flag_forces_a_read_tool_image_to_a_text_placeholder()
     );
     let (base, bodies) = spawn_model_server(vec![turn1, turn_text("described")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -2903,7 +2903,7 @@ fn run_binary_without_block_images_a_read_tool_image_carries_no_non_vision_place
     );
     let (base, bodies) = spawn_model_server(vec![turn1, turn_text("described")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -2947,7 +2947,7 @@ fn run_binary_without_block_images_a_read_tool_image_carries_no_non_vision_place
 #[test]
 fn deleted_experiment_flags_fail_startup_as_unknown() {
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     for flag in [
         &["--tool-tuning", "edit-schema=split"][..],
         &["--tool-tuning", "bash-test-digest=pytest"],

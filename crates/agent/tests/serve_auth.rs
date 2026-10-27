@@ -38,7 +38,7 @@ fn auth_status_with_nothing_stored_reports_every_provider_logged_out() {
     let home = tempfile::tempdir().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     let mut child = serve_cmd_with_real_home(bin, &session_file, home.path()).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
@@ -69,7 +69,7 @@ fn auth_status_for_a_single_provider_reports_logged_in_when_a_non_expired_creden
     );
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     let mut child = serve_cmd_with_real_home(bin, &session_file, home.path()).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
@@ -97,7 +97,7 @@ fn auth_status_for_an_unknown_provider_is_a_clean_error_not_a_crash() {
     let home = tempfile::tempdir().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     let mut child = serve_cmd_with_real_home(bin, &session_file, home.path()).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
@@ -133,7 +133,7 @@ fn logout_removes_a_stored_credential_and_is_idempotent() {
     );
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     let mut child = serve_cmd_with_real_home(bin, &session_file, home.path()).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
@@ -175,7 +175,7 @@ fn login_acks_then_a_second_concurrent_login_is_rejected_then_abort_login_cancel
     let home = tempfile::tempdir().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     // Anthropic's callback port is fixed (53692: its registered redirect URI), so every login on a
     // host binds the same one — two copies of this suite running at once collide on it. A loopback
@@ -288,7 +288,7 @@ fn a_non_loopback_callback_host_is_refused_with_a_clear_error() {
     let home = tempfile::tempdir().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd_with_real_home(bin, &session_file, home.path())
         .env("AI_AGENT_OAUTH_CALLBACK_HOST", "0.0.0.0")
         .spawn_guarded();

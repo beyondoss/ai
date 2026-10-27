@@ -18,7 +18,7 @@ fn serve_injects_project_instructions_into_system_prompt() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
 
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.current_dir(dir.path()); // CLAUDE.md is discovered relative to cwd
     let mut child = cmd.spawn_guarded();
@@ -49,7 +49,7 @@ fn serve_caches_the_static_system_prompt_until_reload() {
 
     let (base, bodies) =
         spawn_model_server(vec![turn_text("ok"), turn_text("ok"), turn_text("ok")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.current_dir(dir.path());
     let mut child = cmd.spawn_guarded();
@@ -121,7 +121,7 @@ fn serve_gates_skills_and_prompts_on_project_trust() {
     std::fs::write(prompt_dir.join("bar.md"), "Bar template body: $1").unwrap();
 
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     // Untrusted: no --trust-project.
     {
@@ -209,7 +209,7 @@ fn serve_force_untrusted_overrides_a_persisted_trust_grant() {
     )
     .unwrap();
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     // Persist trust for `dir` via the real `trust` subcommand — the same allowlist `serve` itself
     // reads from, not a hand-rolled fixture.
@@ -301,7 +301,7 @@ fn serve_untrusted_project_still_advertises_and_invokes_a_user_global_skill() {
     .unwrap();
 
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
     let mut cmd = serve_cmd(bin, &base, &session_file);
     // No --trust-project: the project is untrusted.
@@ -364,7 +364,7 @@ fn serve_get_commands_reports_a_cross_root_skill_collision() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
 
     let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.arg("--trust-project")
         .current_dir(dir.path())
@@ -443,7 +443,7 @@ fn serve_get_commands_reports_scope_and_path_per_entry() {
     .unwrap();
 
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let (base, _bodies) = spawn_model_server(vec![]);
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.arg("--trust-project")
@@ -505,7 +505,7 @@ fn serve_get_commands_reports_the_prompt_templates_own_description_not_its_argum
 
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.arg("--trust-project")
         .current_dir(dir.path())
@@ -549,7 +549,7 @@ fn serve_warns_on_stderr_when_an_untrusted_projects_gated_resources_are_skipped(
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
 
     let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.current_dir(dir.path());
     cmd.stderr(Stdio::piped());

@@ -55,7 +55,7 @@ fn serve_streams_mcp_progress_before_tool_end() {
         turn_text("done"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.env("HOME", &home);
     // Don't idle-reap mid-test.

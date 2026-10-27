@@ -34,7 +34,7 @@ fn claude_home() -> tempfile::TempDir {
 }
 
 fn run_with_home(home: &Path, cwd: &Path, base: &str, model: &str) -> std::process::Output {
-    run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    run_cmd(env!("CARGO_BIN_EXE_agent"))
         .env("HOME", home)
         .args([
             "run",

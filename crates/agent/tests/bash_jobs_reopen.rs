@@ -18,7 +18,7 @@ use common::{
 };
 use serde_json::{Value, json};
 
-const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
+const BIN: &str = env!("CARGO_BIN_EXE_agent");
 const NOTE: &str = "are no longer running";
 
 fn send(stdin: &mut ChildStdin, cmd: Value) {

@@ -1,8 +1,7 @@
 name: Release Agent Binary
-# Builds beyond-ai-agent as a static musl binary for linux/amd64 and linux/arm64 and publishes them
-# as GitHub Release assets, matching the beyond-<name>-v*-linux-<arch>.tar.gz
-# convention dev/.scripts/publish-primitives.sh (in the beyond repo) expects for every other
-# externally-built primitive binary (beyond-pg, beyond-kv, ...). Separate from publish.yml (which
+# Builds agent as a static musl binary for linux/amd64 and linux/arm64 and publishes them
+# as GitHub Release assets named agent-<tag>-linux-<arch>.tar.gz (+ .sha256), the same shape as
+# execd's; dev/.scripts/publish-primitives.sh (in the beyond repo) downloads them by that name. Separate from publish.yml (which
 # builds the gateway's Docker image) — this only runs on a version tag, not every push to main.
 on:
   push:
@@ -34,7 +33,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
           rustup target add ${{ matrix.target }}
-      - name: Build beyond-ai-agent (static musl, PGO)
+      - name: Build agent (static musl, PGO)
         run: |
           # `musl-tools` installs a native `musl-gcc` on each runner (x86_64 on amd64, aarch64 on
           # arm64), so a native build needs no cross-linker. Point cargo's per-target linker + `cc`
@@ -73,7 +72,7 @@ jobs:
           # even when `--code-mode` is never passed; idle RSS is already dominated by resident code
           # in a 768 MB guest. Experiments rebuild with the feature; the published binary does not.
           python3 .github/pgo-train.py \
-            "target/${{ matrix.target }}/release/beyond-ai-agent" "$PROFDIR/raw"
+            "target/${{ matrix.target }}/release/agent" "$PROFDIR/raw"
           "$profdata" merge -o "$PROFDIR/merged.profdata" "$PROFDIR"/raw/*.profraw
 
           # The instrumented artifacts must not be reused by the optimized build — different
@@ -111,8 +110,10 @@ jobs:
       - name: Package release asset
         run: |
           mkdir -p dist
-          tar -C target/${{ matrix.target }}/release -czf \
-            "dist/beyond-ai-agent-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz" beyond-ai-agent
+          name="agent-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz"
+          tar -C target/${{ matrix.target }}/release -czf "dist/$name" agent
+          # `<hash>  <file>`, relative to dist/, so `sha256sum -c` works next to the tarball.
+          (cd dist && sha256sum "$name" > "$name.sha256")
       - name: Publish GitHub Release asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -121,6 +122,6 @@ jobs:
           # uploads its own distinct per-arch asset, so `--clobber` never races across arches.
           gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" \
             --title "${{ github.ref_name }}" --generate-notes || true
-          gh release upload "${{ github.ref_name }}" \
-            "dist/beyond-ai-agent-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz" \
+          name="agent-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz"
+          gh release upload "${{ github.ref_name }}" "dist/$name" "dist/$name.sha256" \
             --repo "${{ github.repository }}" --clobber

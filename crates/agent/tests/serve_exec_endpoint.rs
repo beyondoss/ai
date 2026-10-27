@@ -20,7 +20,7 @@ use common::{
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 
-const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
+const BIN: &str = env!("CARGO_BIN_EXE_agent");
 
 /// The `response` frame from a command's frame batch. `read_until_response` returns everything it saw
 /// up to and including it; the response is always last.

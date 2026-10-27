@@ -12,7 +12,7 @@ use std::path::Path;
 use common::{run_cmd, spawn_model_server, turn_text, turn_tool_use};
 use serde_json::{Value, json};
 
-const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
+const BIN: &str = env!("CARGO_BIN_EXE_agent");
 
 fn mem_turn(id: &str, args: Value) -> String {
     turn_tool_use(id, "memory", &args.to_string())

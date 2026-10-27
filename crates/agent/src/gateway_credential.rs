@@ -171,7 +171,7 @@ pub enum GatewayCredential {
 /// `oauth/openai_codex.rs` already sends this as the `originator` query param at login time) — reused
 /// verbatim here so a live Codex inference request presents the same identity the account authorized,
 /// rather than a second, inconsistent one.
-const CODEX_ORIGINATOR: &str = "beyond-ai-agent";
+const CODEX_ORIGINATOR: &str = "beyond-agent";
 
 /// Adapts a plain OAuth [`CredentialSource`] (bearer token + `is_oauth`, from `OAuthCredentialSource`)
 /// with routing info the source itself has no way to compute — currently only OpenAI Codex's distinct

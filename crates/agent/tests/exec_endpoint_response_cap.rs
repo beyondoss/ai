@@ -196,7 +196,7 @@ async fn run_applies_the_exec_max_response_bytes_flag() {
         common::turn_tool_use("t1", "bash", &json!({ "command": "yes" }).to_string()),
         common::turn_text("done"),
     ]);
-    let mut cmd = common::run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"));
+    let mut cmd = common::run_cmd(env!("CARGO_BIN_EXE_agent"));
     cmd.args(["run", "do the task", "--exec-url", &url])
         .args(["--exec-max-response-bytes", "777777"])
         .args(["--gateway-url", &base, "--key", "bai_v1.test"])

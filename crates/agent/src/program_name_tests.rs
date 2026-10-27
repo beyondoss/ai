@@ -1,7 +1,7 @@
 //! No user-facing string names the program as anything but [`crate::PROGRAM`].
 //!
 //! A hint like "run `agent login`" sends a user to a command that doesn't exist: the binary is
-//! `beyond-ai-agent`. Every hint formats `PROGRAM` in instead. This scans the crate's sources for a
+//! `agent`. Every hint formats `PROGRAM` in instead. This scans the crate's sources for a
 //! string that hard-codes a command line under another name.
 
 use std::path::Path;
@@ -71,7 +71,7 @@ fn offenders(source: &str) -> Vec<String> {
 
 #[test]
 fn the_program_name_is_the_binary_name() {
-    assert_eq!(crate::PROGRAM, "beyond-ai-agent");
+    assert_eq!(crate::PROGRAM, "agent");
 }
 
 #[test]

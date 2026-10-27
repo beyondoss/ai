@@ -324,7 +324,7 @@ fn installed(rt: Runtime) -> bool {
 fn gateway_bin() -> PathBuf {
     std::env::var_os("VERIFY_GATEWAY_BIN")
         .map(PathBuf::from)
-        .unwrap_or_else(|| repo_root().join("target/debug/beyond-ai"))
+        .unwrap_or_else(|| repo_root().join("target/debug/gateway"))
 }
 
 fn main() {

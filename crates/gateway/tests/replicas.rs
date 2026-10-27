@@ -1,6 +1,6 @@
 //! End-to-end: several gateway replicas sharing one NATS, as production runs them.
 //!
-//! Every other test runs one gateway. Here two `beyond-ai` processes share one `nats-server` (and
+//! Every other test runs one gateway. Here two `gateway` processes share one `nats-server` (and
 //! one mock upstream), and a client alternates between them, the way a load balancer spreads one
 //! caller's requests. What is shared and what is per pod is stated in ARCHITECTURE.md ("Running
 //! several replicas"); these tests back it:

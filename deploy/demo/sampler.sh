@@ -6,7 +6,7 @@ CACHE_DIR=${CACHE_DIR:-/scratch/tmp/agent-bundles}
 WS_PORT=${WS_PORT:-8080}
 METRICS_URL=${METRICS_URL:-http://127.0.0.1:9100/metrics}
 PROC=${PROC:-/proc}
-AGENT_CMD=${AGENT_CMD:-/usr/local/bin/beyond-ai-agent}  # argv[0] of the process to watch, not the shell that starts it
+AGENT_CMD=${AGENT_CMD:-/usr/local/bin/agent}  # argv[0] of the process to watch, not the shell that starts it
 [ ! -d /scratch ] || chmod 1777 /scratch
 LHEX=$(printf '%04X' "$LOADHOST_PORT")
 WHEX=$(printf '%04X' "$WS_PORT")

@@ -9,7 +9,7 @@
 #[cfg(not(feature = "code-mode"))]
 #[test]
 fn default_agent_binary_does_not_link_quickjs() {
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let bytes = std::fs::read(bin).unwrap_or_else(|e| panic!("read {bin}: {e}"));
     let needle = b"JS_NewRuntime";
     assert!(

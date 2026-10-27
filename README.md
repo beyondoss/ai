@@ -40,8 +40,8 @@ curl localhost:8080/v1/chat/completions \
 
 | Path                                       | Package               | What it is                                                                              |
 | ------------------------------------------ | --------------------- | --------------------------------------------------------------------------------------- |
-| [`crates/gateway`](crates/gateway)         | `beyond-gateway`      | The LLM egress proxy (binary `beyond-ai`).                                              |
-| [`crates/agent`](crates/agent)             | `beyond-agent`        | The agent: `run`, `serve`, `serve --service` (binary `beyond-ai-agent`).                |
+| [`crates/gateway`](crates/gateway)         | `beyond-gateway`      | The LLM egress proxy (binary `gateway`).                                                |
+| [`crates/agent`](crates/agent)             | `beyond-agent`        | The agent: `run`, `serve`, `serve --service` (binary `agent`).                          |
 | [`crates/agent-core`](crates/agent-core)   | `beyond-agent-core`   | The agent loop as a library: messages, tool dispatch, compaction, three provider wires. |
 | [`crates/providers`](crates/providers)     | `beyond-providers`    | Provider table, model catalog and the pricing contract. No dependencies.                |
 | [`crates/exec-notify`](crates/exec-notify) | `beyond-exec-notify`  | Exec protocol v1.4 job-end callback rules as a pure function. No dependencies.          |
@@ -98,7 +98,7 @@ Managed keys, the catalog and configuration: [`crates/gateway`](crates/gateway/R
 
 ## The agent
 
-`beyond-ai-agent` reads a task, calls a model, and runs tools (`read`, `write`,
+`agent` reads a task, calls a model, and runs tools (`read`, `write`,
 `edit`, `bash`, `grep`, `find`, `ls`, background jobs, MCP servers) until it is
 done.
 

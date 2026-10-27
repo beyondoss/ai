@@ -42,7 +42,7 @@ fn run_and_signal(dir: &std::path::Path, signal: &str) -> (std::process::ExitSta
     );
     let (base, _bodies) = spawn_model_server(vec![turn1]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = run_cmd(bin)
         .args([
             "run",

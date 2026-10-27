@@ -31,7 +31,7 @@ fn run(servers: Value, responses: Vec<String>) -> (String, Vec<String>) {
     )
     .unwrap();
     let (base, bodies) = spawn_model_server(responses);
-    let output = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let output = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .env("HOME", home.path())
         .args([
             "run",

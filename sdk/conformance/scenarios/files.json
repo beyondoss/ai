@@ -2078,7 +2078,7 @@
     },
     {
       "id": "files.write.onto-directory",
-      "description": "A write onto a directory is an error and changes nothing. (The reference agent's script ends in `mv file dir`, which moves the temp INTO the directory and reports success.)",
+      "description": "A write onto a directory is an error and changes nothing.",
       "setup": [
         {
           "id": "setup",
@@ -2098,12 +2098,6 @@
           "op": "write",
           "path": "${ROOT}/d",
           "data_b64": "eA==",
-          "xfail": {
-            "drivers": [
-              "agent-reference"
-            ],
-            "reason": "the write script's final `mv -f tmp dir` moves the temp into the directory and exits 0"
-          },
           "expect": {
             "error": {
               "kind": {
@@ -2122,12 +2116,6 @@
             "sh",
             "${ROOT}/d"
           ],
-          "xfail": {
-            "drivers": [
-              "agent-reference"
-            ],
-            "reason": "the temp file was moved into the directory"
-          },
           "expect": {
             "ok": {
               "exit_code": 0,
@@ -4370,7 +4358,7 @@
     },
     {
       "id": "files.search.missing-root",
-      "description": "A root that does not exist is an error. (The reference agent calls it invalid_query: the engine exits 2 and every exit above 1 is read as a bad pattern; not_found is the accurate kind.)",
+      "description": "A root that does not exist is an error.",
       "steps": [
         {
           "id": "a",
@@ -4379,12 +4367,7 @@
           "pattern": "x",
           "expect": {
             "error": {
-              "kind": {
-                "$oneof": [
-                  "invalid_query",
-                  "not_found"
-                ]
-              }
+              "kind": "not_found"
             }
           }
         }
@@ -5235,7 +5218,7 @@
     },
     {
       "id": "files.search.unreadable-file",
-      "description": "An unreadable file does not hide the matches elsewhere: they are returned, with a note naming the problem. (The reference agent fails the whole search: the engine exits 2 and any exit above 1 is read as a bad pattern.)",
+      "description": "An unreadable file does not hide the matches elsewhere: they are returned, with a note naming the problem.",
       "requires": {
         "not_root": true
       },
@@ -5258,12 +5241,6 @@
           "op": "search",
           "pattern": "needle",
           "root": "${ROOT}",
-          "xfail": {
-            "drivers": [
-              "agent-reference"
-            ],
-            "reason": "ripgrep/grep exit 2 when any path is unreadable and every exit above 1 is mapped to invalid_query, so the matches are lost"
-          },
           "expect": {
             "ok": {
               "hits": [

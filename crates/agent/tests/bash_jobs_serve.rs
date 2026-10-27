@@ -17,7 +17,7 @@ use common::{
 };
 use serde_json::{Value, json};
 
-const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
+const BIN: &str = env!("CARGO_BIN_EXE_agent");
 
 fn bash_turn(id: &str, command: &str) -> String {
     turn_tool_use(id, "bash", &json!({ "command": command }).to_string())

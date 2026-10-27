@@ -1,5 +1,5 @@
 //! Integration test for systemd socket activation (`serve` adopting a `LISTEN_FDS`-passed socket). We
-//! don't fake the protocol: we launch the real `beyond-ai-agent` under the real `systemd-socket-activate`
+//! don't fake the protocol: we launch the real `agent` under the real `systemd-socket-activate`
 //! helper, which binds a Unix socket, sets `LISTEN_FDS`/`LISTEN_PID`, and execs us with the socket as
 //! fd 3 — exactly what a systemd `.socket` unit does. The agent must adopt that fd (never bind its own)
 //! and serve the byte-identical control protocol over it. Skips cleanly where the helper isn't present.
@@ -62,7 +62,7 @@ fn serve_adopts_a_systemd_activated_socket() {
     let mut child: ChildGuard = Command::new(&activator)
         .arg("-l")
         .arg(&sock)
-        .arg(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+        .arg(env!("CARGO_BIN_EXE_agent"))
         .arg("serve")
         .arg("--gateway-url")
         .arg(&base)
@@ -133,7 +133,7 @@ fn serve_refuses_passed_sockets_without_its_own_listen_pid() {
         let dir = tempfile::tempdir().unwrap();
         let listener = beyond_test_support::ports::listener();
         let mut cmd = common::serve_dir_cmd(
-            env!("CARGO_BIN_EXE_beyond-ai-agent"),
+            env!("CARGO_BIN_EXE_agent"),
             &base,
             &dir.path().join("sessions").to_string_lossy(),
         );
@@ -174,7 +174,7 @@ async fn serve_adopts_a_passed_socket_whose_listen_pid_is_its_own() {
     let held = common::HeldPort::bind();
     let port = held.port();
     let cmd = common::serve_dir_cmd(
-        env!("CARGO_BIN_EXE_beyond-ai-agent"),
+        env!("CARGO_BIN_EXE_agent"),
         &base,
         &dir.path().join("sessions").to_string_lossy(),
     );

@@ -101,7 +101,7 @@ pub(crate) async fn mcp_login(name: String) -> Result<(), Box<dyn std::error::Er
     // rmcp 3.x folds scopes + client name into `AuthorizationRequest`; empty scopes
     // auto-select via the manager's scope policy inside `AuthorizationSession::new`.
     let request = rmcp::transport::auth::AuthorizationRequest::new(&redirect_uri)
-        .with_client_name("beyond-ai-agent");
+        .with_client_name("beyond-agent");
     let session = rmcp::transport::auth::AuthorizationSession::new(manager, request)
         .await
         .map_err(|(_manager, e)| {

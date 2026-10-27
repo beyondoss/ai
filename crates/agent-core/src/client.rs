@@ -3319,7 +3319,7 @@ mod tests {
             },
             static_headers: vec![
                 ("chatgpt-account-id", "acct_123".to_string()),
-                ("originator", "beyond-ai-agent".to_string()),
+                ("originator", "beyond-agent".to_string()),
                 ("OpenAI-Beta", "responses=experimental".to_string()),
             ],
             copilot_dynamic_headers: false,
@@ -3362,7 +3362,7 @@ mod tests {
             "missing chatgpt-account-id header, got:\n{request}"
         );
         assert!(
-            request.contains("originator: beyond-ai-agent"),
+            request.contains("originator: beyond-agent"),
             "missing originator header, got:\n{request}"
         );
         assert!(
