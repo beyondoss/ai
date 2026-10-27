@@ -220,6 +220,11 @@ pub struct ShellFs {
 }
 
 impl ShellFs {
+    /// The file helpers over any exec: [`connect`](Self::connect) by the layer-2 name.
+    pub async fn over(exec: Arc<dyn CommandRunner>) -> std::io::Result<Self> {
+        Self::connect(exec).await
+    }
+
     /// Build a backend over `runner`, probing the target for what it has.
     ///
     /// Fails with the runner's own error when a probe request fails (see [`Capabilities::probe`]);

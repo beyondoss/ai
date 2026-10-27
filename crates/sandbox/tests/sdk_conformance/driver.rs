@@ -13,9 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use beyond_sandbox::exec::CommandRunner;
 use beyond_sandbox::exec_endpoint::HttpExecRunner;
-use beyond_sandbox::exec_endpoint::jobs::{
-    JobEvent, JobId, JobScope, JobSpec, JobStatus, SandboxJobs,
-};
+use beyond_sandbox::exec_endpoint::jobs::{JobEvent, JobId, JobScope, JobSpec, JobStatus};
 use beyond_sandbox::fs::shell::{Capabilities, SearchEngine, ShellFs};
 use beyond_sandbox::fs::{FileKind, FsBackend, FsError, SearchQuery};
 use serde_json::{Value, json};
@@ -42,8 +40,8 @@ pub struct CapsOverride {
 }
 
 pub struct Driver {
-    runner: Arc<HttpExecRunner>,
-    jobs: Arc<dyn SandboxJobs>,
+    runner: Arc<dyn CommandRunner>,
+    jobs: beyond_sandbox::Jobs,
     fs: ShellFs,
     jobs_root: PathBuf,
     /// The error every op returns when the endpoint could not be reached or refused the first
@@ -203,16 +201,31 @@ fn state_of(s: JobStatus) -> (&'static str, Option<i32>) {
 }
 
 impl Driver {
+    /// The reference driver over the HTTP exec client: what the shared matrix runs.
     pub async fn connect(cfg: &Config) -> Self {
         let mut runner = HttpExecRunner::new(&cfg.url).expect("exec url");
         if let Some(token) = &cfg.bearer {
             runner = runner.with_header("Authorization", format!("Bearer {token}"));
         }
         let runner = Arc::new(runner);
+        Self::build(runner.clone(), cfg, Some(runner)).await
+    }
+
+    /// The same driver over any other [`CommandRunner`]: the layers above the transport, unchanged.
+    /// There is no native jobs, and streaming is whatever the runner says it attaches.
+    pub async fn over(runner: Arc<dyn CommandRunner>, cfg: &Config) -> Self {
+        Self::build(runner, cfg, None).await
+    }
+
+    async fn build(
+        runner: Arc<dyn CommandRunner>,
+        cfg: &Config,
+        http: Option<Arc<HttpExecRunner>>,
+    ) -> Self {
         // ShellFs itself decides: a probe whose request failed (unreachable, `401`) fails connect, and
         // that error is what every op reports. The exec/stream/jobs paths then fail the same way
         // on their own first request.
-        let (mut caps, connect_error) = match Capabilities::probe(runner.as_ref()).await {
+        let (mut caps, connect_error) = match Capabilities::probe(&*runner).await {
             Ok(caps) => (caps, None),
             Err(e) => (Capabilities::default(), Some(io_err(&e))),
         };
@@ -238,9 +251,14 @@ impl Driver {
             _ => {}
         }
         let fs = ShellFs::with_capabilities(runner.clone(), caps);
-        let streams = connect_error.is_none() && runner.streams().await;
-        let native_jobs = connect_error.is_none() && runner.offers_jobs().await;
-        let jobs = runner.clone().sandbox_jobs().expect("http jobs");
+        let (streams, native_jobs) = match &http {
+            Some(http) => (
+                connect_error.is_none() && http.streams().await,
+                connect_error.is_none() && http.offers_jobs().await,
+            ),
+            None => (connect_error.is_none() && runner.attaches().await, false),
+        };
+        let jobs = beyond_sandbox::Jobs::over(runner.clone());
         Self {
             runner,
             jobs,

@@ -863,6 +863,8 @@ pub struct HttpExecRunner {
     url: String,
     client: reqwest::Client,
     headers: Vec<(String, String)>,
+    /// Where the `Authorization: Bearer` token comes from, when the endpoint wants one.
+    auth: Option<crate::token::Bearer>,
     max_response_bytes: usize,
     /// Whether the endpoint has proved it streams (v1.2) — probed once, on the first streaming call,
     /// and cached. A probe that could not reach the endpoint is not cached: that is an outage, not
@@ -906,6 +908,7 @@ impl HttpExecRunner {
                     .unwrap_or_else(|_| reqwest::Client::new())
             },
             headers: Vec::new(),
+            auth: None,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             streams: tokio::sync::OnceCell::new(),
             jobs_probe: Arc::default(),
@@ -938,6 +941,13 @@ impl HttpExecRunner {
     /// endpoint needs some form of auth, and which form is the endpoint's business, not the agent's.
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Send `Authorization: Bearer <token>` with every request, the token from `source`. On a `401`
+    /// the source is asked once for a new token and that request is repeated once: the only retry.
+    pub fn bearer(mut self, source: impl Into<crate::token::TokenSource>) -> Self {
+        self.auth = Some(crate::token::Bearer::new(source.into()));
         self
     }
 
@@ -995,30 +1005,54 @@ impl HttpExecRunner {
             stream,
             job,
         };
-        let mut req = self.client.post(&self.url).json(&body);
-        for (name, value) in &self.headers {
-            req = req.header(name.as_str(), value.as_str());
-        }
-        // A little past the command's own budget, so the endpoint gets the chance to enforce and
-        // report the timeout itself — its message is more useful than a bare client-side abort. It
-        // bounds the whole exchange, a stream's body included.
-        let resp = req
-            .timeout(timeout.saturating_add(Duration::from_secs(30)))
-            .send()
-            .await
-            .map_err(|e| {
-                if !e.is_timeout() {
-                    self.suspect();
+        let mut token = match &self.auth {
+            Some(auth) => Some(auth.token().await?),
+            None => None,
+        };
+        let mut renewed = false;
+        let resp = loop {
+            let mut req = self.client.post(&self.url).json(&body);
+            for (name, value) in &self.headers {
+                req = req.header(name.as_str(), value.as_str());
+            }
+            if let Some(t) = &token {
+                req = req.bearer_auth(t);
+            }
+            // A little past the command's own budget, so the endpoint gets the chance to enforce
+            // and report the timeout itself — its message is more useful than a bare client-side
+            // abort. It bounds the whole exchange, a stream's body included.
+            let resp = req
+                .timeout(timeout.saturating_add(Duration::from_secs(30)))
+                .send()
+                .await
+                .map_err(|e| {
+                    if !e.is_timeout() {
+                        self.suspect();
+                    }
+                    if e.is_timeout() {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!("exec endpoint {} timed out: {e}", self.url),
+                        )
+                    } else {
+                        std::io::Error::other(format!(
+                            "exec endpoint {} unreachable: {e}",
+                            self.url
+                        ))
+                    }
+                })?;
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                && !renewed
+                && let (Some(auth), Some(stale)) = (&self.auth, &token)
+            {
+                renewed = true;
+                if let Some(fresh) = auth.renew(stale).await? {
+                    token = Some(fresh);
+                    continue;
                 }
-                if e.is_timeout() {
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("exec endpoint {} timed out: {e}", self.url),
-                    )
-                } else {
-                    std::io::Error::other(format!("exec endpoint {} unreachable: {e}", self.url))
-                }
-            })?;
+            }
+            break resp;
+        };
         let status = resp.status();
         if !status.is_success() {
             // The endpoint refused the *request* — a bad URL, auth, a dead sandbox. Distinct from the

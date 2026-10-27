@@ -21,6 +21,8 @@ use sha2::Digest as _;
 
 #[path = "sdk_conformance/driver.rs"]
 mod driver;
+#[path = "sdk_conformance/local_sh.rs"]
+mod local_sh;
 use driver::{B64, CapsOverride, Config, Driver};
 
 const BEARER: &str = "conformance-secret";
@@ -40,6 +42,8 @@ struct Profile {
     /// imperfect) endpoint exist to prove the client's probes and fallbacks, so they run the
     /// suites that go through those and leave the endpoint-behaviour suites to execd.
     suites: &'static [&'static str],
+    /// Run over a transport written in this test (`local_sh`), not the HTTP client.
+    local: bool,
 }
 
 fn profiles() -> Vec<Profile> {
@@ -49,6 +53,7 @@ fn profiles() -> Vec<Profile> {
         bearer: false,
         caps: CapsOverride::default(),
         suites: &[],
+        local: false,
     };
     vec![
         Profile {
@@ -114,8 +119,28 @@ fn profiles() -> Vec<Profile> {
             },
             ..base()
         },
+        // The same endpoint behaviour, twice: over the HTTP client, and over a transport that is
+        // only `sh` on this host. Same files, same jobs (the baseline), same results.
+        Profile {
+            name: "http-subset",
+            options: MockOptions {
+                jobs: false,
+                ..MockOptions::default()
+            },
+            suites: LAYER_SUITES,
+            ..base()
+        },
+        Profile {
+            name: "local-sh",
+            suites: LAYER_SUITES,
+            local: true,
+            ..base()
+        },
     ]
 }
+
+/// What the transport-independent layers (files, jobs, helpers, bulk) are checked by.
+const LAYER_SUITES: &[&str] = &["files", "jobs", "helpers", "bulk"];
 
 // ---------------------------------------------------------------------------------------------
 // Substitution and derived views
@@ -718,6 +743,7 @@ fn scenario_files_are_well_formed() {
 async fn reference_agent_passes_every_scenario() {
     let files = load();
     let mut grand = Tally::default();
+    let mut outcomes = BTreeMap::new();
     for profile in profiles() {
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().canonicalize().unwrap();
@@ -725,14 +751,22 @@ async fn reference_agent_passes_every_scenario() {
         if profile.bearer {
             options.require_bearer = Some(BEARER.to_string());
         }
-        let mock = ExecMock::start_with(&work, options).await;
+        let mock = if profile.local {
+            None
+        } else {
+            Some(ExecMock::start_with(&work, options).await)
+        };
         let cfg = Config {
-            url: mock.url.clone(),
+            url: mock.as_ref().map(|m| m.url.clone()).unwrap_or_default(),
             bearer: profile.bearer.then(|| BEARER.to_string()),
             caps: profile.caps,
             jobs_root: work.join(".jobs"),
         };
-        let driver = Driver::connect(&cfg).await;
+        let driver = if profile.local {
+            Driver::over(std::sync::Arc::new(local_sh::LocalSh), &cfg).await
+        } else {
+            Driver::connect(&cfg).await
+        };
         let caps = driver.handle(&json!({"id": 0, "op": "capabilities"})).await["ok"].clone();
         let be = Backend {
             driver,
@@ -762,6 +796,15 @@ async fn reference_agent_passes_every_scenario() {
             tally.scenarios_run,
             tally.scenarios_skipped
         );
+        outcomes.insert(
+            profile.name,
+            (
+                tally.passed,
+                tally.xfailed,
+                tally.unsupported,
+                tally.skipped,
+            ),
+        );
         grand.xfailed += tally.xfailed;
         grand.unsupported += tally.unsupported;
         grand.passed += tally.passed;
@@ -782,6 +825,11 @@ async fn reference_agent_passes_every_scenario() {
         grand.failures.join("\n")
     );
     assert!(grand.passed > 0);
+    // The layers compose: a transport that is only `sh` gets exactly the results the HTTP client does.
+    assert_eq!(
+        outcomes["local-sh"], outcomes["http-subset"],
+        "(passed, known defects, unsupported, skipped) over a test-written transport and over HTTP"
+    );
     assert_eq!(grand.unsupported, 0, "the reference driver has every op");
 }
 
