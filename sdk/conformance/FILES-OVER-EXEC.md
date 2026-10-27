@@ -272,12 +272,17 @@ preplanted name cannot redirect the write. The scripts (C and D below) do the
 resolution, in order:
 
 1. a path starting with `-` is prefixed with `./`;
-2. if it is a symlink, resolve it: `readlink -f` when the target exists; for
-   a dangling link (or if that yields nothing) follow the chain one `readlink`
-   hop at a time, each relative target joined to the directory of the link it
-   came from, for at most 40 hops. A dangling link is never given to
-   `readlink -f`: busybox resolves its relative target against the working
-   directory instead of the link's. The prefix rule of 1 is applied again;
+2. while it is a symlink, follow it one `readlink` hop at a time (live or
+   dangling alike), each relative target joined to the directory of the link it
+   came from, for at most 40 hops (Linux's MAXSYMLINKS). A client MUST NOT use
+   `readlink -f`: it is unbounded in time and memory on an adversarial chain,
+   and busybox resolves a dangling link's relative target against the working
+   directory instead of the link's. The prefix rule of 1 is applied after every
+   hop. If the path is still a link after 40 hops it is a loop: the script
+   prints `Too many levels of symbolic links (os error 40)` and exits 1, before
+   any temp exists, so nothing changes (kind `io`: section 3.3 has no better
+   one). A chain that ends in a missing directory fails at the temp as any
+   write into a missing directory does (`not_found`);
 3. a target that is a directory is refused (`Is a directory (os error 21)`, exit
    1), before the temp exists, because `mv -f` would move the temp _into_ it
    and report success;
@@ -614,22 +619,19 @@ exec dd if="$1" iflag=skip_bytes,count_bytes skip="$2" count="$3" status=none | 
 ```sh
 t="$1"
 case "$t" in -*) t="./$t" ;; esac
-if [ -L "$t" ]; then
-  r=
-  [ -e "$t" ] && r=$(readlink -f "$t" 2>/dev/null)
-  if [ -z "$r" ]; then
-    r="$t" n=0
-    while [ -L "$r" ] && [ $n -lt 40 ]; do
-      l=$(readlink "$r") || exit 1
-      case "$l" in
-        /*) r="$l" ;;
-        *) case "$r" in */*) r="${r%/*}/$l" ;; *) r="$l" ;; esac ;;
-      esac
-      n=$((n + 1))
-    done
-  fi
-  t="$r"
+n=0
+while [ -L "$t" ] && [ $n -lt 40 ]; do
+  l=$(readlink "$t") || exit 1
+  case "$l" in
+    /*) t="$l" ;;
+    *) case "$t" in */*) t="${t%/*}/$l" ;; *) t="$l" ;; esac ;;
+  esac
   case "$t" in -*) t="./$t" ;; esac
+  n=$((n + 1))
+done
+if [ -L "$t" ]; then
+  echo "Too many levels of symbolic links (os error 40)" >&2
+  exit 1
 fi
 tmp="$t.tmp.$2"
 if [ -d "$t" ]; then
@@ -664,22 +666,19 @@ exit 1
 ```sh
 t="$1"
 case "$t" in -*) t="./$t" ;; esac
-if [ -L "$t" ]; then
-  r=
-  [ -e "$t" ] && r=$(readlink -f "$t" 2>/dev/null)
-  if [ -z "$r" ]; then
-    r="$t" n=0
-    while [ -L "$r" ] && [ $n -lt 40 ]; do
-      l=$(readlink "$r") || exit 1
-      case "$l" in
-        /*) r="$l" ;;
-        *) case "$r" in */*) r="${r%/*}/$l" ;; *) r="$l" ;; esac ;;
-      esac
-      n=$((n + 1))
-    done
-  fi
-  t="$r"
+n=0
+while [ -L "$t" ] && [ $n -lt 40 ]; do
+  l=$(readlink "$t") || exit 1
+  case "$l" in
+    /*) t="$l" ;;
+    *) case "$t" in */*) t="${t%/*}/$l" ;; *) t="$l" ;; esac ;;
+  esac
   case "$t" in -*) t="./$t" ;; esac
+  n=$((n + 1))
+done
+if [ -L "$t" ]; then
+  echo "Too many levels of symbolic links (os error 40)" >&2
+  exit 1
 fi
 tmp="$t.tmp.$2"
 if [ "$4" = new ]; then
@@ -716,22 +715,19 @@ exit 1
 ```sh
 t="$1"
 case "$t" in -*) t="./$t" ;; esac
-if [ -L "$t" ]; then
-  r=
-  [ -e "$t" ] && r=$(readlink -f "$t" 2>/dev/null)
-  if [ -z "$r" ]; then
-    r="$t" n=0
-    while [ -L "$r" ] && [ $n -lt 40 ]; do
-      l=$(readlink "$r") || exit 1
-      case "$l" in
-        /*) r="$l" ;;
-        *) case "$r" in */*) r="${r%/*}/$l" ;; *) r="$l" ;; esac ;;
-      esac
-      n=$((n + 1))
-    done
-  fi
-  t="$r"
+n=0
+while [ -L "$t" ] && [ $n -lt 40 ]; do
+  l=$(readlink "$t") || exit 1
+  case "$l" in
+    /*) t="$l" ;;
+    *) case "$t" in */*) t="${t%/*}/$l" ;; *) t="$l" ;; esac ;;
+  esac
   case "$t" in -*) t="./$t" ;; esac
+  n=$((n + 1))
+done
+if [ -L "$t" ]; then
+  echo "Too many levels of symbolic links (os error 40)" >&2
+  exit 1
 fi
 tmp="$t.tmp.$2"
 rm -f "$tmp"
