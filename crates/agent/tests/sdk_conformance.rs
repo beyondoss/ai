@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use beyond_ai_test_support::exec_mock::{ExecMock, MockOptions, Protocol};
+use beyond_test_support::exec_mock::{ExecMock, MockOptions, Protocol};
 use serde_json::{Map, Value, json};
 use sha2::Digest as _;
 
