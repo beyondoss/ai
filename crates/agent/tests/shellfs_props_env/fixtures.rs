@@ -83,8 +83,14 @@ pub fn name(tc: &TestCase) -> String {
             tc.draw(gs::sampled_from(FRAGS)),
             tc.draw(gs::sampled_from(FRAGS))
         ),
-        10 => "n".repeat(tc.draw(gs::sampled_from(vec![100usize, 200, 220, 233, 234, 240, 255]))),
-        _ => format!("{}{}", "y".repeat(5), tc.draw(gs::integers::<u8>().max_value(3))),
+        10 => "n".repeat(tc.draw(gs::sampled_from(vec![
+            100usize, 200, 220, 233, 234, 240, 255,
+        ]))),
+        _ => format!(
+            "{}{}",
+            "y".repeat(5),
+            tc.draw(gs::integers::<u8>().max_value(3))
+        ),
     }
 }
 
@@ -104,9 +110,7 @@ fn lines(tc: &TestCase) -> Vec<u8> {
 /// Sizes at and around every boundary the write and read paths have: the 48 KiB write chunk, the 96 KiB
 /// read window, and a response cap.
 pub fn boundary_sizes(cap: Option<usize>, fill: Option<usize>) -> Vec<usize> {
-    let mut v = vec![
-        49151, 49152, 49153, 98303, 98304, 98305, 196608, 150_000,
-    ];
+    let mut v = vec![49151, 49152, 49153, 98303, 98304, 98305, 196608, 150_000];
     if let Some(c) = cap {
         v.extend([c / 3, c / 2, c * 3 / 4 - 400, c * 3 / 4, c * 3 / 4 + 64, c]);
     }
@@ -161,7 +165,13 @@ pub fn query(tc: &TestCase) -> (String, bool, bool) {
     let literal = tc.draw(gs::booleans());
     let ignore_case = tc.draw(gs::booleans());
     if literal {
-        let w = tc.draw(gs::sampled_from(VOCAB.iter().copied().filter(|w| !w.is_empty()).collect::<Vec<_>>()));
+        let w = tc.draw(gs::sampled_from(
+            VOCAB
+                .iter()
+                .copied()
+                .filter(|w| !w.is_empty())
+                .collect::<Vec<_>>(),
+        ));
         let chars: Vec<char> = w.chars().collect();
         let (a, b) = if tc.draw(gs::booleans()) && chars.len() > 1 {
             (0, chars.len() - 1)
@@ -170,7 +180,9 @@ pub fn query(tc: &TestCase) -> (String, bool, bool) {
         };
         (chars[a..b].iter().collect(), true, ignore_case)
     } else {
-        let words = ["alpha", "needle", "Needle", "foo", "bar", "delta", "e1", "x1", "a", "z"];
+        let words = [
+            "alpha", "needle", "Needle", "foo", "bar", "delta", "e1", "x1", "a", "z",
+        ];
         let n = tc.draw(gs::integers::<usize>().min_value(1).max_value(2));
         let alts: Vec<String> = (0..n)
             .map(|_| {

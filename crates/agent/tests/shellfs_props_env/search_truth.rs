@@ -202,12 +202,7 @@ fn components_key(p: &str) -> Vec<Vec<u8>> {
     p.split('/').map(|c| c.as_bytes().to_vec()).collect()
 }
 
-pub fn expect(
-    root: &Path,
-    map: &dyn Fn(&Path) -> String,
-    spec: &Spec,
-    engine: Engine,
-) -> Expect {
+pub fn expect(root: &Path, map: &dyn Fn(&Path) -> String, spec: &Spec, engine: Engine) -> Expect {
     let mut out = Expect {
         root_missing: false,
         root_below_file: false,
@@ -279,7 +274,10 @@ pub fn expect(
             }
         }
         if !hits.is_empty() {
-            by_file.entry(components_key(&path)).or_default().extend(hits);
+            by_file
+                .entry(components_key(&path))
+                .or_default()
+                .extend(hits);
         }
     }
     let mut all: Vec<Th> = by_file.into_values().flatten().collect();

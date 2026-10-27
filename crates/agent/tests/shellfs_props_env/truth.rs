@@ -223,7 +223,11 @@ pub fn resolve_leaf(p: &Path) -> Option<PathBuf> {
     let canon_parent = |q: &Path| -> Option<PathBuf> {
         let name = q.file_name()?;
         let parent = q.parent()?;
-        Some(canon(parent).unwrap_or_else(|_| parent.to_path_buf()).join(name))
+        Some(
+            canon(parent)
+                .unwrap_or_else(|_| parent.to_path_buf())
+                .join(name),
+        )
     };
     let mut cur = canon_parent(p)?;
     for _ in 0..40 {

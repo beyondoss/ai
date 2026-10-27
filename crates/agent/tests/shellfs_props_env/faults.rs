@@ -175,7 +175,8 @@ impl CommandRunner for FaultRunner {
     ) -> std::io::Result<ExecResult> {
         self.go(
             args,
-            self.inner.run_with_stdin(program, args, cwd, timeout, stdin),
+            self.inner
+                .run_with_stdin(program, args, cwd, timeout, stdin),
         )
         .await
     }

@@ -226,7 +226,10 @@ pub fn start_tiny(mount: &Path, kib: usize) -> Result<Tiny, String> {
         let _ = std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut err);
         let _ = child.kill();
         let _ = child.wait();
-        return Err(format!("an unprivileged tmpfs mount is not available: {}", err.trim()));
+        return Err(format!(
+            "an unprivileged tmpfs mount is not available: {}",
+            err.trim()
+        ));
     }
     let pid = child.id();
     Ok(Tiny { child, pid })
@@ -239,7 +242,15 @@ pub fn tiny_unavailable() -> Option<String> {
         Err(e) => Some(e),
         Ok(t) => {
             let ok = std::process::Command::new("nsenter")
-                .args(["-t", &t.pid.to_string(), "-U", "-m", "--preserve-credentials", "--", "true"])
+                .args([
+                    "-t",
+                    &t.pid.to_string(),
+                    "-U",
+                    "-m",
+                    "--preserve-credentials",
+                    "--",
+                    "true",
+                ])
                 .status()
                 .is_ok_and(|s| s.success());
             (!ok).then(|| "nsenter cannot join the namespace".to_string())
@@ -287,13 +298,20 @@ impl NsRunner {
     ) -> std::io::Result<beyond_agent::tools::exec::ExecResult> {
         use tokio::io::AsyncWriteExt;
         let mut c = tokio::process::Command::new("nsenter");
-        c.args(["-t", &self.pid.to_string(), "-U", "-m", "--preserve-credentials", "--"])
-            .arg(program)
-            .args(args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
+        c.args([
+            "-t",
+            &self.pid.to_string(),
+            "-U",
+            "-m",
+            "--preserve-credentials",
+            "--",
+        ])
+        .arg(program)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
         let mut child = c.spawn()?;
         let mut sin = child.stdin.take().unwrap();
         let data = stdin.map(<[u8]>::to_vec);
@@ -324,7 +342,10 @@ pub fn machine(tc: &TestCase, cfg: Config) -> Machine {
     let (root, tiny) = match cfg.tiny_kib {
         Some(kib) => {
             let t = start_tiny(&host_root, kib).expect("checked by tiny_unavailable");
-            (PathBuf::from(format!("/proc/{}/root{}", t.pid, host_root.display())), Some(t))
+            (
+                PathBuf::from(format!("/proc/{}/root{}", t.pid, host_root.display())),
+                Some(t),
+            )
         }
         None => (host_root.clone(), None),
     };
@@ -375,10 +396,14 @@ pub fn machine(tc: &TestCase, cfg: Config) -> Machine {
         std::fs::create_dir(&ro).unwrap();
         std::fs::write(ro.join("kept.txt"), b"needle in ro\n").unwrap();
         std::fs::write(root.join("locked.txt"), b"needle locked\n").unwrap();
-        std::fs::set_permissions(root.join("locked.txt"), std::fs::Permissions::from_mode(0o444))
-            .unwrap();
+        std::fs::set_permissions(
+            root.join("locked.txt"),
+            std::fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
-        m.known.extend([ro.clone(), ro.join("kept.txt"), root.join("locked.txt")]);
+        m.known
+            .extend([ro.clone(), ro.join("kept.txt"), root.join("locked.txt")]);
     }
     m
 }
@@ -444,8 +469,14 @@ fn same_ignoring_mtimes(actual: &Snap, expected: &Snap, ignore: &[&Path]) -> Opt
     // from `actual`.
     let mut e = expected.clone();
     for p in ignore {
-        if let (Some(Node::File { mtime, mode, .. }), Some(Node::File { mtime: am, mode: amode, .. })) =
-            (e.get_mut(*p), actual.get(*p))
+        if let (
+            Some(Node::File { mtime, mode, .. }),
+            Some(Node::File {
+                mtime: am,
+                mode: amode,
+                ..
+            }),
+        ) = (e.get_mut(*p), actual.get(*p))
         {
             *mtime = *am;
             if *mode == 0o644 && *amode & 0o7000 == 0 && amode & 0o600 == 0o600 {
@@ -577,7 +608,11 @@ impl Machine {
         let plan = self.with_space(truth::plan_write(&p), data.len());
         let res: Result<bool, FsError> = self.block(async {
             match guard {
-                None => self.fs.write_bytes(&self.c(&p), data.clone()).await.map(|_| true),
+                None => self
+                    .fs
+                    .write_bytes(&self.c(&p), data.clone())
+                    .await
+                    .map(|_| true),
                 Some(e) => {
                     let exp = e.map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs(s));
                     self.fs
@@ -587,18 +622,18 @@ impl Machine {
             }
         });
         let report = self.faults.take();
-        let after = self.settle_temps(
-            snapshot(&self.root),
-            report.cleanup_faulted,
-            "a write",
-        );
+        let after = self.settle_temps(snapshot(&self.root), report.cleanup_faulted, "a write");
         let mismatch = guard.map(|e| cur != e);
         if truth::resolve_leaf(&p).is_none() {
             // A symlink loop: the spec does not say what a write through one does. Only the temp
             // rule still applies (it was checked by `settle_temps` above).
             return;
         }
-        let op = if guard.is_some() { "write_if_unchanged" } else { "write" };
+        let op = if guard.is_some() {
+            "write_if_unchanged"
+        } else {
+            "write"
+        };
 
         // What the tree looks like if the write was applied: only the resolved target changes.
         let target = truth::resolve_leaf(&p).unwrap_or(p.clone());
@@ -651,7 +686,10 @@ impl Machine {
         match &res {
             Ok(true) => {
                 if let Plan::Fail(k) = &plan {
-                    fail(format!("{op} reported success but the spec requires an error {k:?}; tree:\n{}", diff(&after, &before, &self.root).join("\n")));
+                    fail(format!(
+                        "{op} reported success but the spec requires an error {k:?}; tree:\n{}",
+                        diff(&after, &before, &self.root).join("\n")
+                    ));
                 }
                 if mismatch == Some(true) {
                     fail(format!(
@@ -687,12 +725,19 @@ impl Machine {
                                 && !truth::can(&target, 4) =>
                         {
                             // The size check reads the temp back, and the temp has the file's mode.
-                            known("N4", format!("{op} {p:?} refused: the file is writable but not readable by its owner: {e}"));
+                            known(
+                                "N4",
+                                format!(
+                                    "{op} {p:?} refused: the file is writable but not readable by its owner: {e}"
+                                ),
+                            );
                         }
-                        Plan::Succeed => fail(format!("{op} {p:?} must succeed but failed ({kind:?}): {e}")),
-                        Plan::Fail(kinds) if !kind_ok(kinds, kind, &p) => {
-                            fail(format!("{op} {p:?} failed as {kind:?} ({e}), spec allows {kinds:?}"))
-                        }
+                        Plan::Succeed => fail(format!(
+                            "{op} {p:?} must succeed but failed ({kind:?}): {e}"
+                        )),
+                        Plan::Fail(kinds) if !kind_ok(kinds, kind, &p) => fail(format!(
+                            "{op} {p:?} failed as {kind:?} ({e}), spec allows {kinds:?}"
+                        )),
                         _ => {}
                     }
                     check_unchanged("a failed write");
@@ -745,7 +790,11 @@ impl Machine {
     fn write(&mut self, tc: TestCase) {
         let p = self.pick_path(&tc);
         let data = fixtures::content(&tc, self.cfg.cap, self.fill());
-        tc.note(&format!("write {:?} ({} bytes)", p.strip_prefix(&self.root).unwrap(), data.len()));
+        tc.note(&format!(
+            "write {:?} ({} bytes)",
+            p.strip_prefix(&self.root).unwrap(),
+            data.len()
+        ));
         self.do_write(&tc, p, data, None);
     }
 
@@ -753,7 +802,10 @@ impl Machine {
     fn write_if_unchanged(&mut self, tc: TestCase) {
         let p = self.pick_path(&tc);
         let data = fixtures::content(&tc, self.cfg.cap, self.fill());
-        let truth_now = std::fs::metadata(&p).ok().and_then(|m| m.modified().ok()).map(secs);
+        let truth_now = std::fs::metadata(&p)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(secs);
         let remembered = self.stats.get(&p).copied();
         let expected = match tc.draw(gs::integers::<u8>().max_value(4)) {
             0 => None,
@@ -787,12 +839,16 @@ impl Machine {
                 if let Some(m) = want
                     && !report.errored
                 {
-                    fail(format!("stat says {p:?} is absent but std::fs finds it: {m:?}"));
+                    fail(format!(
+                        "stat says {p:?} is absent but std::fs finds it: {m:?}"
+                    ));
                 }
             }
             Ok(Some(meta)) => {
                 let Some(m) = want else {
-                    fail(format!("stat says {p:?} exists ({meta:?}) but std::fs does not find it"));
+                    fail(format!(
+                        "stat says {p:?} exists ({meta:?}) but std::fs does not find it"
+                    ));
                 };
                 let kind = if m.is_dir() {
                     FileKind::Dir
@@ -805,14 +861,25 @@ impl Machine {
                     fail(format!("stat kind {:?} != {kind:?} for {p:?}", meta.kind));
                 }
                 if meta.len != m.len() {
-                    fail(format!("stat len {} != {} for {p:?} (following symlinks)", meta.len, m.len()));
+                    fail(format!(
+                        "stat len {} != {} for {p:?} (following symlinks)",
+                        meta.len,
+                        m.len()
+                    ));
                 }
                 let ts = m.modified().map(secs).unwrap();
                 if meta.mtime.map(secs) != Some(ts) {
-                    fail(format!("stat mtime {:?} != {ts} for {p:?} (following symlinks)", meta.mtime.map(secs)));
+                    fail(format!(
+                        "stat mtime {:?} != {ts} for {p:?} (following symlinks)",
+                        meta.mtime.map(secs)
+                    ));
                 }
                 if meta.writable != truth::can(&p, 2) {
-                    fail(format!("stat writable {} != {} for {p:?}", meta.writable, truth::can(&p, 2)));
+                    fail(format!(
+                        "stat writable {} != {} for {p:?}",
+                        meta.writable,
+                        truth::can(&p, 2)
+                    ));
                 }
                 self.stats.insert(p.clone(), meta.mtime.map(secs));
             }
@@ -851,7 +918,10 @@ impl Machine {
             1 << 20,
             usize::MAX,
         ]));
-        tc.note(&format!("read {:?} offset={offset} max={max} (size {size})", p.strip_prefix(&self.root).unwrap()));
+        tc.note(&format!(
+            "read {:?} offset={offset} max={max} (size {size})",
+            p.strip_prefix(&self.root).unwrap()
+        ));
         let before = snapshot(&self.root);
         let got = self.block(self.fs.read_bytes(&self.c(&p), offset, max));
         let report = self.faults.take();
@@ -876,7 +946,10 @@ impl Machine {
             }
             (Ok(b), Err(kinds)) => {
                 if !(kinds.contains(&Kind::TooLarge) && kinds.contains(&Kind::Io)) {
-                    fail(format!("read of {p:?} returned {} bytes but the spec requires an error {kinds:?}", b.len()));
+                    fail(format!(
+                        "read of {p:?} returned {} bytes but the spec requires an error {kinds:?}",
+                        b.len()
+                    ));
                 }
                 // inside the margin, a success is fine; it must still be right
                 let w = std::fs::read(&p).unwrap_or_default();
@@ -886,11 +959,16 @@ impl Machine {
                     fail(format!("read bytes differ inside the cap margin for {p:?}"));
                 }
             }
-            (Err(e), Ok(w)) => fail(format!("read {p:?} must return {} bytes but failed: {e}", w.len())),
+            (Err(e), Ok(w)) => fail(format!(
+                "read {p:?} must return {} bytes but failed: {e}",
+                w.len()
+            )),
             (Err(e), Err(kinds)) => {
                 let k = self.kind(&e, &p);
                 if !kind_ok(&kinds, k, &p) {
-                    fail(format!("read {p:?} failed as {k:?} ({e}); spec allows {kinds:?}"));
+                    fail(format!(
+                        "read {p:?} failed as {k:?} ({e}); spec allows {kinds:?}"
+                    ));
                 }
             }
         }
@@ -899,10 +977,17 @@ impl Machine {
 
     #[rule]
     fn list(&mut self, tc: TestCase) {
-        let p = if tc.draw(gs::booleans()) { self.pick_dir(&tc) } else { self.pick_path(&tc) };
+        let p = if tc.draw(gs::booleans()) {
+            self.pick_dir(&tc)
+        } else {
+            self.pick_path(&tc)
+        };
         let hidden = tc.draw(gs::booleans());
         let cap = tc.draw(gs::sampled_from(vec![0usize, 1, 2, 5, 10_000]));
-        tc.note(&format!("list {:?} hidden={hidden} cap={cap}", p.strip_prefix(&self.root).unwrap()));
+        tc.note(&format!(
+            "list {:?} hidden={hidden} cap={cap}",
+            p.strip_prefix(&self.root).unwrap()
+        ));
         let before = snapshot(&self.root);
         let got = self.block(self.fs.list_dir(&self.c(&p), cap, hidden));
         let report = self.faults.take();
@@ -917,9 +1002,17 @@ impl Machine {
                         if !hidden && name.starts_with('.') {
                             continue;
                         }
-                        let Ok(follow) = std::fs::metadata(e.path()) else { continue };
+                        let Ok(follow) = std::fs::metadata(e.path()) else {
+                            continue;
+                        };
                         let own = std::fs::symlink_metadata(e.path()).unwrap();
-                        let k = if follow.is_dir() { 1 } else if follow.is_file() { 0 } else { 2 };
+                        let k = if follow.is_dir() {
+                            1
+                        } else if follow.is_file() {
+                            0
+                        } else {
+                            2
+                        };
                         want.push((name, k, own.len()));
                     }
                 } else {
@@ -935,7 +1028,12 @@ impl Machine {
                     return;
                 }
                 let ok = match &meta {
-                    Err(_) => matches!(k, Kind::NotFound | Kind::PermissionDenied | Kind::NotADirectory) || std::fs::symlink_metadata(&p).is_ok(),
+                    Err(_) => {
+                        matches!(
+                            k,
+                            Kind::NotFound | Kind::PermissionDenied | Kind::NotADirectory
+                        ) || std::fs::symlink_metadata(&p).is_ok()
+                    }
                     Ok(_) => !readable && matches!(k, Kind::PermissionDenied | Kind::Io),
                 };
                 if !ok {
@@ -943,13 +1041,25 @@ impl Machine {
                 }
             }
             Ok(entries) => {
-                let dangling = meta.is_err() && std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink());
+                let dangling = meta.is_err()
+                    && std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink());
                 if meta.is_err() && !dangling && !report.errored {
-                    fail(format!("list of the missing {p:?} succeeded with {} entries", entries.len()));
+                    fail(format!(
+                        "list of the missing {p:?} succeeded with {} entries",
+                        entries.len()
+                    ));
                 }
-                let via_link = std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink()) && matches!(&meta, Ok(m) if m.is_dir());
+                let via_link = std::fs::symlink_metadata(&p)
+                    .is_ok_and(|m| m.file_type().is_symlink())
+                    && matches!(&meta, Ok(m) if m.is_dir());
                 if via_link && entries.is_empty() && !want.is_empty() && cap > 0 {
-                    known("N1", format!("list of the symlinked directory {p:?} returned no entries, its target holds {}", want.len()));
+                    known(
+                        "N1",
+                        format!(
+                            "list of the symlinked directory {p:?} returned no entries, its target holds {}",
+                            want.len()
+                        ),
+                    );
                     read_only_ops_unchanged(self, &before, "list");
                     return;
                 }
@@ -960,7 +1070,15 @@ impl Machine {
                     let mut got: Vec<(String, u8, u64)> = entries
                         .iter()
                         .map(|e| {
-                            (e.name.clone(), match e.kind { FileKind::File => 0, FileKind::Dir => 1, FileKind::Other => 2 }, e.len)
+                            (
+                                e.name.clone(),
+                                match e.kind {
+                                    FileKind::File => 0,
+                                    FileKind::Dir => 1,
+                                    FileKind::Other => 2,
+                                },
+                                e.len,
+                            )
                         })
                         .collect();
                     got.sort();
@@ -971,7 +1089,11 @@ impl Machine {
                         }
                     } else {
                         if got.len() != cap {
-                            fail(format!("list {p:?} cap={cap} returned {} of {} kept entries", got.len(), want.len()));
+                            fail(format!(
+                                "list {p:?} cap={cap} returned {} of {} kept entries",
+                                got.len(),
+                                want.len()
+                            ));
                         }
                         if let Some(g) = got.iter().find(|g| !want.contains(g)) {
                             fail(format!("list {p:?} returned {g:?}, not in {want:?}"));
@@ -985,7 +1107,11 @@ impl Machine {
 
     #[rule]
     fn search(&mut self, tc: TestCase) {
-        let root = if tc.draw(gs::integers::<u8>().max_value(7)) < 4 { self.root.clone() } else { self.pick_path(&tc) };
+        let root = if tc.draw(gs::integers::<u8>().max_value(7)) < 4 {
+            self.root.clone()
+        } else {
+            self.pick_path(&tc)
+        };
         let (pattern, literal, ignore_case) = fixtures::query(&tc);
         let glob = match tc.draw(gs::integers::<u8>().max_value(5)) {
             0 => Some(("*.txt".to_string(), false)),
@@ -995,7 +1121,15 @@ impl Machine {
         let limit = tc.draw(gs::sampled_from(vec![0usize, 1, 2, 3, 100]));
         let before_n = tc.draw(gs::sampled_from(vec![0usize, 0, 1, 2, 150]));
         let after_n = tc.draw(gs::sampled_from(vec![0usize, 0, 1, 2, 150]));
-        let spec = Spec { pattern: pattern.clone(), literal, ignore_case, glob: glob.clone(), limit, before: before_n, after: after_n };
+        let spec = Spec {
+            pattern: pattern.clone(),
+            literal,
+            ignore_case,
+            glob: glob.clone(),
+            limit,
+            before: before_n,
+            after: after_n,
+        };
         tc.note(&format!(
             "search {pattern:?} in {:?} literal={literal} ic={ignore_case} glob={glob:?} limit={limit} -B{before_n} -A{after_n}",
             root.strip_prefix(&self.root).unwrap_or(&root)
@@ -1017,12 +1151,22 @@ impl Machine {
         let want = search_truth::expect(&root, &map, &spec, self.engine);
         tc.event(format!(
             "search: {} {}",
-            if want.exact { "exact" } else { "soundness-only" },
+            if want.exact {
+                "exact"
+            } else {
+                "soundness-only"
+            },
             if got.is_ok() { "ok" } else { "err" }
         ));
         if let Ok(o) = &got {
-            tc.event(format!("search: {}", if o.hits.is_empty() { "no hits" } else { "hits" }));
-            tc.event(format!("search: {}", if o.truncated { "truncated" } else { "complete" }));
+            tc.event(format!(
+                "search: {}",
+                if o.hits.is_empty() { "no hits" } else { "hits" }
+            ));
+            tc.event(format!(
+                "search: {}",
+                if o.truncated { "truncated" } else { "complete" }
+            ));
         }
         match got {
             Err(e) => {
@@ -1032,18 +1176,37 @@ impl Machine {
                     || (want.unreadable && !want.root_missing && !report.errored && false);
                 let multiline = k == Kind::InvalidQuery
                     && (want.root_missing || want.unreadable)
-                    && (root.to_string_lossy().contains('\n') || snapshot(&self.root).keys().any(|p| p.to_string_lossy().contains('\n')));
+                    && (root.to_string_lossy().contains('\n')
+                        || snapshot(&self.root)
+                            .keys()
+                            .any(|p| p.to_string_lossy().contains('\n')));
                 if multiline && !tolerated {
-                    known("N2", format!("search answered a missing/unreadable path as a bad regex because a path contains a newline: {e}"));
+                    known(
+                        "N2",
+                        format!(
+                            "search answered a missing/unreadable path as a bad regex because a path contains a newline: {e}"
+                        ),
+                    );
                 } else if !tolerated {
                     if want.root_below_file && k == Kind::InvalidQuery {
-                        known("N3", format!("search of a root below a regular file answered as a bad regex: {e}"));
+                        known(
+                            "N3",
+                            format!(
+                                "search of a root below a regular file answered as a bad regex: {e}"
+                            ),
+                        );
                     } else if want.root_missing {
-                        if !(k == Kind::NotFound || (want.root_below_file && k == Kind::NotADirectory)) {
-                            fail(format!("search of the missing root {root:?} must fail as not_found, got {k:?}: {e}"));
+                        if !(k == Kind::NotFound
+                            || (want.root_below_file && k == Kind::NotADirectory))
+                        {
+                            fail(format!(
+                                "search of the missing root {root:?} must fail as not_found, got {k:?}: {e}"
+                            ));
                         }
                     } else if want.unreadable {
-                        fail(format!("search lost the matches it could read because a path was unreadable ({k:?}): {e}"));
+                        fail(format!(
+                            "search lost the matches it could read because a path was unreadable ({k:?}): {e}"
+                        ));
                     } else {
                         fail(format!("search {:?} failed ({k:?}): {e}", spec.pattern));
                     }
@@ -1051,7 +1214,10 @@ impl Machine {
             }
             Ok(out) => {
                 if want.root_missing && !report.errored {
-                    fail(format!("search of the missing root {root:?} succeeded with {} hits", out.hits.len()));
+                    fail(format!(
+                        "search of the missing root {root:?} succeeded with {} hits",
+                        out.hits.len()
+                    ));
                 }
                 let got_hits: Vec<Th> = out
                     .hits
@@ -1066,9 +1232,23 @@ impl Machine {
                 if want.unreadable && !want.root_missing && out.first_error.is_none() {
                     fail("search over an unreadable path reported no note".to_string());
                 }
-                let key = |h: &Th| (h.path.split('/').map(|c| c.as_bytes().to_vec()).collect::<Vec<_>>(), h.line);
+                let key = |h: &Th| {
+                    (
+                        h.path
+                            .split('/')
+                            .map(|c| c.as_bytes().to_vec())
+                            .collect::<Vec<_>>(),
+                        h.line,
+                    )
+                };
                 if got_hits.windows(2).any(|w| key(&w[0]) > key(&w[1])) {
-                    fail(format!("search hits are not sorted by (path components, line): {:?}", got_hits.iter().map(|h| (&h.path, h.line)).collect::<Vec<_>>()));
+                    fail(format!(
+                        "search hits are not sorted by (path components, line): {:?}",
+                        got_hits
+                            .iter()
+                            .map(|h| (&h.path, h.line))
+                            .collect::<Vec<_>>()
+                    ));
                 }
                 if got_hits.iter().filter(|h| h.is_match).count() > limit {
                     fail(format!("search returned more than limit={limit} matches"));
@@ -1078,7 +1258,11 @@ impl Machine {
                 }
                 if want.exact {
                     if got_hits != want.hits {
-                        let first = got_hits.iter().zip(&want.hits).position(|(a, b)| a != b).unwrap_or(got_hits.len().min(want.hits.len()));
+                        let first = got_hits
+                            .iter()
+                            .zip(&want.hits)
+                            .position(|(a, b)| a != b)
+                            .unwrap_or(got_hits.len().min(want.hits.len()));
                         fail(format!(
                             "search differs from the brute-force search at hit {first}:\n got  ({}) {:?}\n want ({}) {:?}",
                             got_hits.len(),
@@ -1088,12 +1272,17 @@ impl Machine {
                         ));
                     }
                     if out.truncated != want.truncated {
-                        fail(format!("search truncated={} but expected {}", out.truncated, want.truncated));
+                        fail(format!(
+                            "search truncated={} but expected {}",
+                            out.truncated, want.truncated
+                        ));
                     }
                 } else if !want.root_missing {
                     for h in &got_hits {
                         if !want.hits.contains(h) {
-                            fail(format!("search returned a hit that is not in the tree: {h:?}"));
+                            fail(format!(
+                                "search returned a hit that is not in the tree: {h:?}"
+                            ));
                         }
                     }
                 }
@@ -1105,7 +1294,10 @@ impl Machine {
     #[rule]
     fn mkdir(&mut self, tc: TestCase) {
         let p = self.pick_path(&tc);
-        tc.note(&format!("mkdir -p {:?}", p.strip_prefix(&self.root).unwrap()));
+        tc.note(&format!(
+            "mkdir -p {:?}",
+            p.strip_prefix(&self.root).unwrap()
+        ));
         let before = snapshot(&self.root);
         let plan = truth::plan_mkdir(&p);
         let res = self.block(self.fs.create_dir_all(&self.c(&p)));
@@ -1123,25 +1315,39 @@ impl Machine {
         match res {
             Ok(()) => {
                 if let Plan::Fail(k) = plan {
-                    fail(format!("mkdir -p {p:?} reported success but the spec requires an error {k:?}"));
+                    fail(format!(
+                        "mkdir -p {p:?} reported success but the spec requires an error {k:?}"
+                    ));
                 }
                 if !std::fs::metadata(&p).is_ok_and(|m| m.is_dir()) {
-                    fail(format!("mkdir -p {p:?} reported success but there is no directory"));
+                    fail(format!(
+                        "mkdir -p {p:?} reported success but there is no directory"
+                    ));
                 }
                 if !new_ok(&after) {
-                    fail(format!("mkdir changed more than the path:\n{}", diff(&after, &before, &self.root).join("\n")));
+                    fail(format!(
+                        "mkdir changed more than the path:\n{}",
+                        diff(&after, &before, &self.root).join("\n")
+                    ));
                 }
             }
             Err(e) => {
                 let k = self.kind(&e, &p);
                 if !report.errored {
                     match plan {
-                        Plan::Succeed => fail(format!("mkdir -p {p:?} must succeed but failed ({k:?}): {e}")),
-                        Plan::Fail(ks) if !kind_ok(&ks, k, &p) => fail(format!("mkdir -p {p:?} failed as {k:?}, spec allows {ks:?}")),
+                        Plan::Succeed => fail(format!(
+                            "mkdir -p {p:?} must succeed but failed ({k:?}): {e}"
+                        )),
+                        Plan::Fail(ks) if !kind_ok(&ks, k, &p) => fail(format!(
+                            "mkdir -p {p:?} failed as {k:?}, spec allows {ks:?}"
+                        )),
                         _ => {}
                     }
                     if after != before {
-                        fail(format!("a failed mkdir changed the tree:\n{}", diff(&after, &before, &self.root).join("\n")));
+                        fail(format!(
+                            "a failed mkdir changed the tree:\n{}",
+                            diff(&after, &before, &self.root).join("\n")
+                        ));
                     }
                 } else if !new_ok(&after) {
                     fail("a faulted mkdir changed more than the path".to_string());
@@ -1156,7 +1362,10 @@ impl Machine {
         tc.assume(self.cfg.fault_pct == 0 && self.cfg.tiny_kib.is_none());
         let p = self.pick_path(&tc);
         tc.assume(matches!(truth::plan_write(&p), Plan::Succeed));
-        tc.assume(std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file()) || std::fs::symlink_metadata(&p).is_err());
+        tc.assume(
+            std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file())
+                || std::fs::symlink_metadata(&p).is_err(),
+        );
         let a = fixtures::content(&tc, self.cfg.cap, self.fill());
         let b = fixtures::content(&tc, self.cfg.cap, self.fill());
         let mode = tc.draw(gs::integers::<u8>().max_value(2));
@@ -1217,7 +1426,10 @@ impl Machine {
             fail(format!("second racing write failed: {e}"));
         }
         let fin = std::fs::read(&p).unwrap_or_default();
-        let allowed: Vec<&Vec<u8>> = [Some(&a), (mode > 0).then_some(&b)].into_iter().flatten().collect();
+        let allowed: Vec<&Vec<u8>> = [Some(&a), (mode > 0).then_some(&b)]
+            .into_iter()
+            .flatten()
+            .collect();
         if !allowed.contains(&&fin) {
             fail(format!(
                 "after two writers the file is neither complete content: {} bytes (a={}, b={})",
@@ -1252,7 +1464,11 @@ impl Machine {
         // `keep` re-sets the previous mtime: a same-second edit the guard cannot see (a documented
         // limit); the others move the mtime to a different second.
         let how = tc.draw(gs::integers::<u8>().max_value(3));
-        tc.note(&format!("env: write {:?} {}B mtime-mode {how}", p.strip_prefix(&self.root).unwrap(), data.len()));
+        tc.note(&format!(
+            "env: write {:?} {}B mtime-mode {how}",
+            p.strip_prefix(&self.root).unwrap(),
+            data.len()
+        ));
         let prev = std::fs::metadata(&p).ok().and_then(|m| m.modified().ok());
         if std::fs::write(&p, &data).is_ok()
             && let Ok(f) = std::fs::File::options().write(true).open(&p)
@@ -1270,7 +1486,10 @@ impl Machine {
     #[rule]
     fn env_mkdir(&mut self, tc: TestCase) {
         let p = self.pick_path(&tc);
-        tc.note(&format!("env: mkdir {:?}", p.strip_prefix(&self.root).unwrap()));
+        tc.note(&format!(
+            "env: mkdir {:?}",
+            p.strip_prefix(&self.root).unwrap()
+        ));
         let _ = std::fs::create_dir_all(&p);
     }
 
@@ -1284,7 +1503,11 @@ impl Machine {
             2 => PathBuf::from(fixtures::name(&tc)).with_extension("lnk"),
             _ => self.pick_path(&tc),
         };
-        tc.note(&format!("env: symlink {:?} -> {:?}", link.strip_prefix(&self.root).unwrap(), target.strip_prefix(&self.root).unwrap_or(&target)));
+        tc.note(&format!(
+            "env: symlink {:?} -> {:?}",
+            link.strip_prefix(&self.root).unwrap(),
+            target.strip_prefix(&self.root).unwrap_or(&target)
+        ));
         if target != link {
             let _ = std::os::unix::fs::symlink(&target, &link);
         }
@@ -1295,8 +1518,13 @@ impl Machine {
         // Inside the namespace the caller is root-mapped, so mode bits do not bind there.
         tc.assume(self.cfg.tiny_kib.is_none());
         let p = self.pick_path(&tc);
-        let mode = tc.draw(gs::sampled_from(vec![0o000u32, 0o444, 0o555, 0o600, 0o644, 0o700, 0o755, 0o111, 0o333]));
-        tc.note(&format!("env: chmod {mode:o} {:?}", p.strip_prefix(&self.root).unwrap()));
+        let mode = tc.draw(gs::sampled_from(vec![
+            0o000u32, 0o444, 0o555, 0o600, 0o644, 0o700, 0o755, 0o111, 0o333,
+        ]));
+        tc.note(&format!(
+            "env: chmod {mode:o} {:?}",
+            p.strip_prefix(&self.root).unwrap()
+        ));
         if std::fs::symlink_metadata(&p).is_ok_and(|m| !m.file_type().is_symlink()) {
             let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode));
         }
@@ -1305,7 +1533,10 @@ impl Machine {
     #[rule]
     fn env_remove(&mut self, tc: TestCase) {
         let p = self.pick_path(&tc);
-        tc.note(&format!("env: remove {:?}", p.strip_prefix(&self.root).unwrap()));
+        tc.note(&format!(
+            "env: remove {:?}",
+            p.strip_prefix(&self.root).unwrap()
+        ));
         let _ = snapshot(&self.root); // unlock, so a locked directory can be emptied
         if std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir()) {
             let _ = std::fs::remove_dir_all(&p);
@@ -1320,7 +1551,10 @@ impl Machine {
     fn env_non_utf8_name(&mut self, tc: TestCase) {
         use std::os::unix::ffi::OsStrExt;
         let dir = self.pick_dir(&tc);
-        tc.note(&format!("env: non-UTF-8 file in {:?}", dir.strip_prefix(&self.root).unwrap_or(&dir)));
+        tc.note(&format!(
+            "env: non-UTF-8 file in {:?}",
+            dir.strip_prefix(&self.root).unwrap_or(&dir)
+        ));
         let name = std::ffi::OsStr::from_bytes(b"bad\xff\xfename");
         let _ = std::fs::write(dir.join(name), b"needle in a bad name\n");
     }

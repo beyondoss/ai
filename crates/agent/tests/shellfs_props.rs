@@ -17,10 +17,22 @@ fn plain_stdin_writes(tc: TestCase) {
 
 #[hegel::test(env::settings(30, 0x5e11_f5_02))]
 fn chunked_writes_without_stdin(tc: TestCase) {
-    run_machine(tc, Config { stdin: false, ..PLAIN });
+    run_machine(
+        tc,
+        Config {
+            stdin: false,
+            ..PLAIN
+        },
+    );
 }
 
 #[hegel::test(env::settings(30, 0x5e11_f5_03))]
 fn small_response_cap(tc: TestCase) {
-    run_machine(tc, Config { cap: Some(40_000), ..PLAIN });
+    run_machine(
+        tc,
+        Config {
+            cap: Some(40_000),
+            ..PLAIN
+        },
+    );
 }
