@@ -3945,15 +3945,6 @@
           "before": 1,
           "after": 1,
           "root": "${ROOT}",
-          "xfail": {
-            "drivers": [
-              "agent-reference"
-            ],
-            "reason": "ripgrep run with --crlf writes the context-group separator as '--\\r\\n'; the record parser only recognises '--\\n', so the next hit's path is prefixed with '--\\r\\n' and it sorts and reports wrongly",
-            "when": {
-              "search_engine": "rg"
-            }
-          },
           "expect": {
             "ok": {
               "hits": [
@@ -4071,15 +4062,6 @@
           "pattern": "MATCH",
           "after": 1,
           "root": "${ROOT}",
-          "xfail": {
-            "drivers": [
-              "agent-reference"
-            ],
-            "reason": "ripgrep run with --crlf writes the context-group separator as '--\\r\\n'; the record parser only recognises '--\\n', so the next hit's path is prefixed with '--\\r\\n' and it sorts and reports wrongly",
-            "when": {
-              "search_engine": "rg"
-            }
-          },
           "expect": {
             "ok": {
               "hits": [
@@ -4190,15 +4172,6 @@
           "after": 1,
           "limit": 2,
           "root": "${ROOT}",
-          "xfail": {
-            "drivers": [
-              "agent-reference"
-            ],
-            "reason": "ripgrep run with --crlf writes the context-group separator as '--\\r\\n'; the record parser only recognises '--\\n', so the next hit's path is prefixed with '--\\r\\n' and it sorts and reports wrongly",
-            "when": {
-              "search_engine": "rg"
-            }
-          },
           "expect": {
             "ok": {
               "hits": [
