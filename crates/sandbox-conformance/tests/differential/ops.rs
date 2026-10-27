@@ -254,6 +254,14 @@ fn unambiguous(name: String) -> String {
     }
 }
 
+/// Whether a symlink target (a path under `${ROOT}`, or a name relative to the link's directory)
+/// stays in the root: no `..` component and nothing absolute outside `${ROOT}`.
+fn stays_inside(target: &str) -> bool {
+    let rest = target.strip_prefix("${ROOT}").unwrap_or(target);
+    (target.starts_with("${ROOT}") || !target.starts_with('/'))
+        && rest.split('/').all(|c| c != "..")
+}
+
 /// The paths a sequence has named so far, so later ops can address what earlier ones made.
 struct Pool {
     known: Vec<String>,
@@ -435,7 +443,10 @@ pub fn sequence(tc: &TestCase, max_steps: usize) -> Vec<Op> {
                     2 => format!("{}.lnk", unambiguous(fixtures::name(tc))),
                     _ => abs(&pool.path(tc)),
                 };
-                if abs(&link) != target {
+                // A link must never lead out of the root: `list` follows it, and the oracle and the
+                // client would then read a live, shared directory at different moments. `/dev/null` is
+                // a file, harmless; every other target is under `${ROOT}` or a bare name beside the link.
+                if abs(&link) != target && (target == "/dev/null" || stays_inside(&target)) {
                     ops.push(exec(
                         "ln",
                         vec!["-s".into(), "--".into(), target, abs(&link)],
