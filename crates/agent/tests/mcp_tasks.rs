@@ -65,7 +65,7 @@ fn serve_polls_mcp_task_to_completion_with_progress() {
         turn_text("done"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.env("HOME", &home);
     cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
@@ -150,7 +150,7 @@ fn serve_answers_in_task_elicitation_via_tasks_update() {
         turn_text("done"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.env("HOME", &home);
     cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
@@ -231,7 +231,7 @@ fn serve_maps_failed_mcp_task_to_tool_error() {
         turn_text("done"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.env("HOME", &home);
     cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
@@ -281,7 +281,7 @@ fn serve_maps_server_cancelled_mcp_task_to_tool_error() {
         turn_text("done"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.env("HOME", &home);
     cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
@@ -341,7 +341,7 @@ fn serve_abort_sends_tasks_cancel_for_sticky_task() {
         &json!({}).to_string(),
     )]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.env("HOME", &home);
     cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");

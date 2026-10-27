@@ -32,7 +32,7 @@ fn continue_after_a_failed_invocation_resumes_the_real_conversation() {
     let sessions = dir.path().join("sessions");
     let (base, bodies) = spawn_model_server(vec![turn_text("ok-1"), turn_text("ok-3")]);
     let run = |extra: &[&str]| {
-        run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+        run_cmd(env!("CARGO_BIN_EXE_agent"))
             .args([
                 "run",
                 "--gateway-url",

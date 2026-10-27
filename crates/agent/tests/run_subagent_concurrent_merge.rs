@@ -89,7 +89,7 @@ fn two_parallel_worktree_children_both_merge_back_into_one_repo() {
         turn_text("fallback"),
     );
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",

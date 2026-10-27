@@ -17,7 +17,7 @@ use beyond_agent::session_store::{SessionMeta, SessionRepo, SessionStore};
 use common::{NoFrame, SpawnGuarded, serve_cmd, spawn_model_server_with_stalled_response};
 use serde_json::{Value, json};
 
-const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
+const BIN: &str = env!("CARGO_BIN_EXE_agent");
 /// How long the summary call stalls: far longer than any assertion below waits.
 const STALL: Duration = Duration::from_secs(20);
 

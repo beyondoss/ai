@@ -1,4 +1,4 @@
-# beyond-ai-agent
+# agent
 
 A coding agent in one static binary. It reads a task, calls a model, and runs
 tools (file edits, search, shell) until the task is done.
@@ -43,10 +43,10 @@ Static `linux-amd64` and `linux-arm64` binaries are attached to each
 [GitHub release](https://github.com/beyondoss/ai/releases):
 
 ```sh
-V=v0.1.10   # or any other release tag
-curl -fsSL "https://github.com/beyondoss/ai/releases/download/$V/beyond-ai-agent-$V-linux-amd64.tar.gz" \
+V=<tag>   # a release cut after the binary was renamed to `agent`
+curl -fsSL "https://github.com/beyondoss/ai/releases/download/$V/agent-$V-linux-amd64.tar.gz" \
   | tar xz
-./beyond-ai-agent --version
+./agent --version
 ```
 
 From a checkout, `cargo run -p beyond-agent -- <args>` runs the same binary.
@@ -57,9 +57,9 @@ Export a provider key. The agent picks the provider from the model id and
 sends the key in the header that provider expects.
 
 ```sh
-ANTHROPIC_API_KEY=sk-ant-... beyond-ai-agent run "add a CHANGELOG entry"
-OPENAI_API_KEY=sk-...        beyond-ai-agent run --model gpt-5 "explain src/main.rs"
-beyond-ai-agent list-models   # known model ids and their capabilities
+ANTHROPIC_API_KEY=sk-ant-... agent run "add a CHANGELOG entry"
+OPENAI_API_KEY=sk-...        agent run --model gpt-5 "explain src/main.rs"
+agent list-models   # known model ids and their capabilities
 ```
 
 The default model is `claude-opus-4-8`; `--model`, `AI_AGENT_MODEL` or
@@ -68,7 +68,7 @@ The default model is `claude-opus-4-8`; `--model`, `AI_AGENT_MODEL` or
 | You have                                    | Set                                                                                                              |
 | ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
 | A provider key (OpenAI, Anthropic, Groq, …) | The provider's variable, for example `ANTHROPIC_API_KEY`                                                         |
-| A subscription                              | `beyond-ai-agent login anthropic` (or `github-copilot`, `openai-codex`)                                          |
+| A subscription                              | `agent login anthropic` (or `github-copilot`, `openai-codex`)                                                    |
 | An aggregator key (OpenRouter, Together, …) | `AI_PROVIDER=openrouter` and its key; aggregators serve other vendors' model ids, so the agent cannot infer them |
 | An OpenAI-compatible server (vLLM, Ollama)  | `AI_BASE_URL=http://localhost:8000/v1 AI_API_KEY=local`                                                          |
 | A Beyond AI gateway                         | `AI_GATEWAY_URL=http://ai.internal AI_AGENT_KEY=bai_v1...`                                                       |
@@ -84,7 +84,7 @@ set a dummy key and ask for state:
 
 ```sh
 echo '{"id":"1","type":"get_state"}' \
-  | ANTHROPIC_API_KEY=dummy beyond-ai-agent serve --session-file /tmp/agent.json
+  | ANTHROPIC_API_KEY=dummy agent serve --session-file /tmp/agent.json
 # {"type":"ready",...} then {"command":"get_state","data":{...},"success":true,...}
 ```
 
@@ -101,7 +101,7 @@ echo '{"id":"1","type":"get_state"}' \
 | `structured_output`                           | With `run --output-schema <schema>`: the last stdout line is JSON matching the schema.                                                                                                                               |
 | `mcp__<server>__<tool>`                       | One per tool of each MCP server in `mcp_servers` or `.mcp.json`.                                                                                                                                                     |
 
-`beyond-ai-agent tools` prints the default set with schemas. `--tools`,
+`agent tools` prints the default set with schemas. `--tools`,
 `--exclude-tools`, `--no-tools`, `--deny-tool`, `--deny-bash-pattern` and
 `--deny-path` narrow what the model may call.
 
@@ -121,7 +121,7 @@ Around the tools:
   before running tools
   ([Interactive approval](ARCHITECTURE.md#interactive-approval--the-human-in-the-loop-gate)).
 - **Trust.** A project's `.claude/SYSTEM.md` and settings apply only after
-  `beyond-ai-agent trust` (or `-a` for one run). Trust gates which instructions
+  `agent trust` (or `-a` for one run). Trust gates which instructions
   the model sees, not what it can do.
 
 ## Sessions
@@ -129,9 +129,9 @@ Around the tools:
 A session id is an address. `run` and `serve` take the same three forms:
 
 ```sh
-beyond-ai-agent run "..."                       # a new session
-beyond-ai-agent run --continue "..."            # this directory's latest session
-beyond-ai-agent run --session-id build-42 "..." # open build-42, or create it
+agent run "..."                       # a new session
+agent run --continue "..."            # this directory's latest session
+agent run --session-id build-42 "..." # open build-42, or create it
 ```
 
 `--session-id` outranks `--continue` and is idempotent, so a restarted
@@ -154,11 +154,11 @@ belongs to Claude Code; the agent reads skills, agents, prompt templates and
 
 ```sh
 # stdio: one JSON command per line in, one JSON frame per line out
-beyond-ai-agent serve --session-file /tmp/agent.json
+agent serve --session-file /tmp/agent.json
 # {"type":"prompt","message":"..."} -> ack, event frames, then a response
 
 # loopback socket: WebSocket (GET) and one-shot commands (POST)
-beyond-ai-agent serve --listen 127.0.0.1:8787 --session-dir /tmp/sessions
+agent serve --listen 127.0.0.1:8787 --session-dir /tmp/sessions
 curl -D- -H 'Content-Type: application/json' \
   --data '{"type":"prompt","message":"add a CHANGELOG entry"}' \
   'http://127.0.0.1:8787/_beyond/agent?session_id=build-42'
@@ -219,7 +219,7 @@ sudo env EXECD_LISTEN=0.0.0.0:8081 EXECD_ROOT=~/workspace EXECD_HOME=/home/user 
 **Point the agent at it:**
 
 ```sh
-beyond-ai-agent run \
+agent run \
   --exec-url https://8081-<sandbox id>.e2b.app/ \
   --exec-header "Authorization: Bearer $TOKEN" \
   "fix the failing test under /srv/app"
@@ -266,7 +266,7 @@ In another, run `bash` through it with a `serve` command (the dummy key only sat
 
 ```sh
 (echo '{"id":"1","type":"bash","command":"pwd"}'; sleep 3) \
-  | ANTHROPIC_API_KEY=dummy beyond-ai-agent serve --exec-url http://127.0.0.1:8081/
+  | ANTHROPIC_API_KEY=dummy agent serve --exec-url http://127.0.0.1:8081/
 # ... "result":"/tmp/ws\n" ...
 ```
 
@@ -356,7 +356,7 @@ metadata, never session text.
   conformance kits.
 - [`beyond-agent-core`](../agent-core/README.md): the loop this crate
   builds on.
-- `beyond-ai-agent <command> --help`: every flag, with its `AI_AGENT_*`
+- `agent <command> --help`: every flag, with its `AI_AGENT_*`
   variable.
 
 The agent is modeled on [pi](https://github.com/badlogic/pi-mono); see

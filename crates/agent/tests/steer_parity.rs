@@ -20,7 +20,7 @@ use common::{
 };
 use serde_json::json;
 
-const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
+const BIN: &str = env!("CARGO_BIN_EXE_agent");
 const NUDGE: &str = "getting large";
 const REMINDER: &str = "was just compacted";
 

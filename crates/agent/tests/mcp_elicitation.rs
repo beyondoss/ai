@@ -52,7 +52,7 @@ fn serve_answers_mcp_elicitation_mid_tool_call() {
         turn_text("done"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.env("HOME", &home);
     cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
@@ -142,7 +142,7 @@ fn serve_answers_mcp_mrtr_input_required_elicitation() {
         turn_text("done"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.env("HOME", &home);
     cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");

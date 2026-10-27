@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1.7-labs
 #
-# Multi-stage build for the Beyond AI gateway (`beyond-ai`).
+# Multi-stage build for the Beyond AI gateway (`gateway`).
 #
 # Built from the workspace root. The repo is a Cargo workspace; this image builds
-# only the `beyond-ai` member (`crates/gateway`). All deps come from crates.io:
+# only the `gateway` member (`crates/gateway`). All deps come from crates.io:
 #
 #     docker build -t beyond-ai .
 #
@@ -51,8 +51,8 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    cargo build --release --locked -p beyond-gateway --bin beyond-ai \
-    && cp /app/target/release/beyond-ai /usr/local/bin/beyond-ai
+    cargo build --release --locked -p beyond-gateway --bin gateway \
+    && cp /app/target/release/gateway /usr/local/bin/gateway
 
 # ---------------------------------------------------------------------------
 # Stage 4: runtime — minimal Debian slim with just the binary and the CA
@@ -67,11 +67,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin beyond
 USER beyond
 
-COPY --from=builder /usr/local/bin/beyond-ai /usr/local/bin/beyond-ai
+COPY --from=builder /usr/local/bin/gateway /usr/local/bin/gateway
 
 # 8080: data-plane listener (client requests). 9090: admin — /metrics
 # (Prometheus), /livez, /readyz. Both default to 0.0.0.0; override via the
 # mounted config or the AI_LISTEN / AI_METRICS_LISTEN env vars.
 EXPOSE 8080/tcp 9090/tcp
 
-ENTRYPOINT ["/usr/local/bin/beyond-ai"]
+ENTRYPOINT ["/usr/local/bin/gateway"]

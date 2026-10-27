@@ -219,7 +219,7 @@ fn a_tool_added_mid_run_is_offered_on_the_next_request() {
         turn_tool_use("c2", "mcp__fixture__secret", "{}"),
         turn_text("done"),
     ]);
-    let out = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let out = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .env("HOME", home.path())
         .current_dir(home.path())
         .args([
@@ -294,7 +294,7 @@ fn serve_offers_a_tool_added_mid_run_now_and_on_the_next_prompt() {
         turn_text("a title"),
         turn_text("again"),
     ]);
-    let mut cmd = serve_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"), &base, &session_file);
+    let mut cmd = serve_cmd(env!("CARGO_BIN_EXE_agent"), &base, &session_file);
     cmd.env("HOME", &home).args(["--mcp-tool-loading", "eager"]);
     let mut child = cmd.spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();

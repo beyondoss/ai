@@ -131,7 +131,7 @@ async fn every_response_carries_a_request_id_and_a_served_one_joins_its_row() {
     );
 }
 
-/// `beyond-ai doctor` runs its checks and exits non-zero naming the one that failed (here NATS,
+/// `gateway doctor` runs its checks and exits non-zero naming the one that failed (here NATS,
 /// which nothing listens for).
 /// claim: O3
 #[tokio::test]
@@ -150,7 +150,7 @@ async fn doctor_names_a_failed_check_and_exits_one() {
     let out = tokio::time::timeout(
         Duration::from_secs(60),
         tokio::task::spawn_blocking(move || {
-            std::process::Command::new(env!("CARGO_BIN_EXE_beyond-ai"))
+            std::process::Command::new(env!("CARGO_BIN_EXE_gateway"))
                 .arg("doctor")
                 .arg("-c")
                 .arg(&cmd_path)

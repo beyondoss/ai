@@ -45,8 +45,8 @@ ROOT = find_root(HERE)
 CATALOGS = os.path.join(HERE, "mcp_catalogs")
 WORK = os.path.join(ROOT, "target", "mcp-loading-eval")
 BINS = {
-    "default": os.environ.get("AGENT_BIN", os.path.join(ROOT, "target/release/beyond-ai-agent")),
-    "code": os.environ.get("AGENT_BIN_CODE_MODE", os.path.join(ROOT, "target/code-mode/release/beyond-ai-agent")),
+    "default": os.environ.get("AGENT_BIN", os.path.join(ROOT, "target/release/agent")),
+    "code": os.environ.get("AGENT_BIN_CODE_MODE", os.path.join(ROOT, "target/code-mode/release/agent")),
 }
 MODES = {
     "eager": ("default", ["--mcp-tool-loading", "eager"]),

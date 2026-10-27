@@ -70,7 +70,7 @@ fn run_against(
         "--no-session-persistence",
     ];
     args.extend_from_slice(extra_args);
-    let output = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let output = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .env("HOME", home)
         .args(&args)
         .current_dir(cwd)

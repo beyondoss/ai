@@ -1,0 +1,275 @@
+{
+  "suite": "stream",
+  "version": 1,
+  "description": "Layer 1: the streaming exec call, v1.2.",
+  "scenarios": [
+    {
+      "id": "stream.basic.streams-and-exit",
+      "description": "A streamed command reports stdout and stderr separately, then its exit code.",
+      "requires": {
+        "stream": true
+      },
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec_stream",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo out; echo err >&2; exit 3"
+          ],
+          "expect": {
+            "ok": {
+              "stdout_utf8": "out\n",
+              "stderr_utf8": "err\n",
+              "exit_code": 3
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "stream.bytes.all-256-exact",
+      "description": "Output is base64 on the wire: every byte value, NUL and invalid UTF-8 included, arrives exactly.",
+      "requires": {
+        "stream": true
+      },
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec_stream",
+          "command": "sh",
+          "args": [
+            "-c",
+            "i=0; while [ $i -lt 256 ]; do printf \"\\\\$(printf %03o $i)\"; i=$((i+1)); done"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_len": 256,
+              "stdout_sha256": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "stream.frames.larger-than-a-frame",
+      "description": "Output beyond one 64 KiB frame is split by the endpoint and reassembled by the client without loss.",
+      "requires": {
+        "stream": true
+      },
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec_stream",
+          "command": "sh",
+          "args": [
+            "-c",
+            "head -c 300000 /dev/zero | tr '\\000' x"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_len": 300000,
+              "stdout_sha256": "29927e273accc68286005017f7fa6e4f27bddb4db3083ff8b8d4c3667905b7fa"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "stream.output.beyond-the-v11-cap",
+      "description": "A stream is never buffered whole: 20 MB of output, more than the 16 MiB one-shot cap, streams through.",
+      "requires": {
+        "stream": true
+      },
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec_stream",
+          "command": "sh",
+          "args": [
+            "-c",
+            "head -c 20000000 /dev/zero | tr '\\000' x"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_len": 20000000
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "stream.exit.signal",
+      "description": "A command killed by signal S ends the stream with signal S, not an exit code.",
+      "requires": {
+        "stream": true
+      },
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec_stream",
+          "command": "sh",
+          "args": [
+            "-c",
+            "kill -9 $$"
+          ],
+          "expect": {
+            "ok": {
+              "signal": 9,
+              "exit_code": {
+                "$absent": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "stream.exit.command-not-found",
+      "description": "A command that cannot be started is an ordinary result: stderr, then exit 127.",
+      "requires": {
+        "stream": true
+      },
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec_stream",
+          "command": "no-such-command-xyz",
+          "expect": {
+            "ok": {
+              "exit_code": 127,
+              "stderr_utf8": {
+                "$re": "No such file or directory"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "stream.timeout.timed-out",
+      "description": "At timeout_ms the endpoint kills the group and the stream ends with timed_out; output before the deadline is kept.",
+      "requires": {
+        "stream": true
+      },
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec_stream",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf before; sleep 30"
+          ],
+          "timeout_ms": 500,
+          "expect": {
+            "ok": {
+              "timed_out": true,
+              "stdout_utf8": "before",
+              "exit_code": {
+                "$absent": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "stream.leftovers.stream-waits-for-the-group",
+      "description": "When the shell exits leaving a background child, the stream stays open until the group is empty and carries the child's output; the final status is the shell's.",
+      "requires": {
+        "stream": true
+      },
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec_stream",
+          "command": "sh",
+          "args": [
+            "-c",
+            "(sleep 0.5; echo late) & echo early; exit 4"
+          ],
+          "expect": {
+            "ok": {
+              "stdout_utf8": "early\nlate\n",
+              "exit_code": 4
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "stream.leftovers.none-no-wait",
+      "description": "A command that leaves nothing behind ends the stream at once.",
+      "requires": {
+        "stream": true
+      },
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec_stream",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo done"
+          ],
+          "expect": {
+            "ok": {
+              "stdout_utf8": "done\n",
+              "exit_code": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "stream.cwd",
+      "description": "cwd applies to a streamed command as to a one-shot one.",
+      "requires": {
+        "stream": true
+      },
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec_stream",
+          "command": "pwd",
+          "cwd": "/",
+          "expect": {
+            "ok": {
+              "stdout_utf8": "/\n",
+              "exit_code": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "stream.heartbeat.silent-command",
+      "description": "A command silent for longer than the client's patience still completes: heartbeats are not output and not an end.",
+      "requires": {
+        "stream": true
+      },
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec_stream",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 1; echo ok"
+          ],
+          "expect": {
+            "ok": {
+              "stdout_utf8": "ok\n",
+              "exit_code": 0
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

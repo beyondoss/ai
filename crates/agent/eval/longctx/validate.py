@@ -147,7 +147,7 @@ def check_sandbox(scratch: Path) -> list[tuple[str, bool, str]]:
     (d / "work" / ".probe.py").write_text(PROBE)
     inside = [(d / "work", sandbox.WS), (d / "home", f"{sandbox.ROOT}/home"), (d / "tmp", f"{sandbox.ROOT}/tmp"),
               (d / "sessions", f"{sandbox.ROOT}/sessions")]
-    binary = tasks.REPO_ROOT / "target" / "release" / "beyond-ai-agent"
+    binary = tasks.REPO_ROOT / "target" / "release" / "agent"
     view = tasks.view(inside, binary=binary if binary.exists() else None)
     w = tasks.work_dir()
     # Host paths that exist and must not be reachable from inside (a missing one would pass vacuously).

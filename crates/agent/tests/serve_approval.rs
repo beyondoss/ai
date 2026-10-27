@@ -611,7 +611,7 @@ fn serve_ws_approving(base: &str, session_dir: &str, extra: &[&str]) -> (ChildGu
 /// A safety net, not a pass/fail threshold: [`Client::take`] returns the moment its frame arrives, so
 /// a generous bound costs a healthy run nothing and only sets how long a genuinely stuck socket takes
 /// to report. At 10s it was failing runs that were merely slow — a loaded host (four test threads,
-/// each with a real `beyond-ai-agent` plus a mock model server) can take longer than that to answer.
+/// each with a real `agent` plus a mock model server) can take longer than that to answer.
 const FRAME_WAIT: Duration = Duration::from_secs(60);
 
 /// A WebSocket client that *buffers* frames it wasn't looking for.

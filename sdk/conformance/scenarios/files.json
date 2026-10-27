@@ -1,0 +1,5263 @@
+{
+  "suite": "files",
+  "version": 1,
+  "description": "Layer 2: files over raw exec (stat, read, write, write_if_unchanged, mkdir, list, search).",
+  "scenarios": [
+    {
+      "id": "files.probe.capabilities-reported",
+      "description": "The driver reports what its probes found; a modern GNU sandbox has everything.",
+      "requires": {
+        "stdin": true,
+        "find_printf": true
+      },
+      "steps": [
+        {
+          "id": "a",
+          "op": "capabilities",
+          "expect": {
+            "ok": {
+              "stdin": true,
+              "read_window": true,
+              "find_printf": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.probe.v1-endpoint-has-no-stdin",
+      "description": "An endpoint that ignores stdin_base64 answers the probe with empty output: the client finds stdin absent and never trusts it. Writes still work, by chunks.",
+      "requires": {
+        "stdin": false
+      },
+      "steps": [
+        {
+          "id": "caps",
+          "op": "capabilities",
+          "expect": {
+            "ok": {
+              "stdin": false
+            }
+          }
+        },
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/f.bin",
+          "data_b64": {
+            "$repeat": {
+              "b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fo=",
+              "times": 598,
+              "len": 150000
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "sum",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sha256sum < \"$1\"",
+            "sh",
+            "${ROOT}/f.bin"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "02675bf9284bd74223e98ceea96ebee4c9a469272ead358f462d89753f8c909b  -\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.stat.missing",
+      "description": "A path that does not exist is exists:false, never an error. So is the empty path.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo x > f",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "stat",
+          "path": "${ROOT}/nope",
+          "expect": {
+            "ok": {
+              "exists": false
+            }
+          }
+        },
+        {
+          "id": "empty",
+          "op": "stat",
+          "path": "",
+          "expect": {
+            "ok": {
+              "exists": false
+            }
+          }
+        },
+        {
+          "id": "under-a-file",
+          "op": "stat",
+          "path": "${ROOT}/f/x",
+          "expect": {
+            "ok": {
+              "exists": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.stat.file",
+      "description": "A regular file: kind, exact size, mtime in whole epoch seconds, and whether this caller can write it.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'hello world\\n' > f; : > e; TZ=UTC touch -t 200102030405.06 f",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "stat",
+          "path": "${ROOT}/f",
+          "expect": {
+            "ok": {
+              "exists": true,
+              "kind": "file",
+              "size": 12,
+              "mtime": 981173106,
+              "writable": true
+            }
+          }
+        },
+        {
+          "id": "empty",
+          "op": "stat",
+          "path": "${ROOT}/e",
+          "expect": {
+            "ok": {
+              "exists": true,
+              "kind": "file",
+              "size": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.stat.directory",
+      "description": "A directory is kind dir (its size is the filesystem's business).",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir d",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "stat",
+          "path": "${ROOT}/d",
+          "expect": {
+            "ok": {
+              "exists": true,
+              "kind": "dir",
+              "writable": true
+            }
+          }
+        },
+        {
+          "id": "root",
+          "op": "stat",
+          "path": "${ROOT}",
+          "expect": {
+            "ok": {
+              "exists": true,
+              "kind": "dir"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.stat.mtime-is-whole-seconds",
+      "description": "mtime is the epoch second: a fractional modification time is truncated, not rounded.",
+      "requires": {
+        "commands": [
+          "stat"
+        ]
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo x > f; touch -d @1000000000.9 f 2>/dev/null || touch -t 200109090146.40 f",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "stat",
+          "path": "${ROOT}/f",
+          "expect": {
+            "ok": {
+              "mtime": 1000000000
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.stat.symlink-kind-follows",
+      "description": "A symlink reports the kind of what it points to: a link to a directory is a dir, a link to a file a file; a broken link does not exist.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir d; echo x > f; ln -s d ld; ln -s f lf; ln -s nowhere lb",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "to-dir",
+          "op": "stat",
+          "path": "${ROOT}/ld",
+          "expect": {
+            "ok": {
+              "exists": true,
+              "kind": "dir"
+            }
+          }
+        },
+        {
+          "id": "to-file",
+          "op": "stat",
+          "path": "${ROOT}/lf",
+          "expect": {
+            "ok": {
+              "exists": true,
+              "kind": "file"
+            }
+          }
+        },
+        {
+          "id": "broken",
+          "op": "stat",
+          "path": "${ROOT}/lb",
+          "expect": {
+            "ok": {
+              "exists": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.stat.symlink-size-and-mtime-follow",
+      "description": "size and mtime of a symlink are the target's, as kind is. (stat -c without -L reports the link's own: the reference agent does that, and write_if_unchanged through a link then never sees the target change.)",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'hello world\\n' > target; TZ=UTC touch -t 200102030405.06 target; ln -s target a-rather-long-link-name",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "size",
+          "op": "stat",
+          "path": "${ROOT}/a-rather-long-link-name",
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "the stat script runs `stat -c` without -L, so size is the link's own length"
+          },
+          "expect": {
+            "ok": {
+              "size": 12
+            }
+          }
+        },
+        {
+          "id": "mtime",
+          "op": "stat",
+          "path": "${ROOT}/a-rather-long-link-name",
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "the stat script runs `stat -c` without -L, so mtime is the link's own"
+          },
+          "expect": {
+            "ok": {
+              "mtime": 981173106
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.stat.fifo-is-other",
+      "description": "A FIFO (or socket, or device) is kind other, which callers must never read: opening a FIFO blocks.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkfifo ff",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "stat",
+          "path": "${ROOT}/ff",
+          "expect": {
+            "ok": {
+              "exists": true,
+              "kind": "other"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.stat.odd-names",
+      "description": "Paths with spaces, quotes, shell metacharacters, globs and newlines are one argument each and stat exactly.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; for n in 'sp ace' \"q'\\\"\\`x\\`\" '$(echo pwned)' '*' 'a; b' 'n\nl' 'é漢字'; do echo > \"$n\"; done",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "space",
+          "op": "stat",
+          "path": "${ROOT}/sp ace",
+          "expect": {
+            "ok": {
+              "exists": true,
+              "size": 1
+            }
+          }
+        },
+        {
+          "id": "quotes",
+          "op": "stat",
+          "path": "${ROOT}/q'\"`x`",
+          "expect": {
+            "ok": {
+              "exists": true,
+              "size": 1
+            }
+          }
+        },
+        {
+          "id": "subst",
+          "op": "stat",
+          "path": "${ROOT}/$(echo pwned)",
+          "expect": {
+            "ok": {
+              "exists": true,
+              "size": 1
+            }
+          }
+        },
+        {
+          "id": "glob",
+          "op": "stat",
+          "path": "${ROOT}/*",
+          "expect": {
+            "ok": {
+              "exists": true,
+              "size": 1
+            }
+          }
+        },
+        {
+          "id": "semi",
+          "op": "stat",
+          "path": "${ROOT}/a; b",
+          "expect": {
+            "ok": {
+              "exists": true,
+              "size": 1
+            }
+          }
+        },
+        {
+          "id": "newline",
+          "op": "stat",
+          "path": "${ROOT}/n\nl",
+          "expect": {
+            "ok": {
+              "exists": true,
+              "size": 1
+            }
+          }
+        },
+        {
+          "id": "unicode",
+          "op": "stat",
+          "path": "${ROOT}/é漢字",
+          "expect": {
+            "ok": {
+              "exists": true,
+              "size": 1
+            }
+          }
+        },
+        {
+          "id": "glob-did-not-expand",
+          "op": "stat",
+          "path": "${ROOT}/sp*",
+          "expect": {
+            "ok": {
+              "exists": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.stat.non-utf8-name-is-unaddressable",
+      "description": "A name that is not valid UTF-8 cannot be written in a JSON path: the replacement character does not name it. It lists, with that character, but cannot be stat'ed or read.",
+      "requires": {
+        "find_printf": true
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo x > \"bad$(printf '\\377')name\"",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "exists-as-listed",
+          "op": "list",
+          "path": "${ROOT}",
+          "expect": {
+            "ok": {
+              "entries": {
+                "$unordered": [
+                  {
+                    "name": "bad�name",
+                    "kind": "file"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "stat",
+          "op": "stat",
+          "path": "${ROOT}/bad�name",
+          "expect": {
+            "ok": {
+              "exists": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.stat.not-writable",
+      "description": "writable is a real access check as the calling user, not the mode bits.",
+      "requires": {
+        "not_root": true
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo x > ro; chmod 444 ro; echo x > rw",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "ro",
+          "op": "stat",
+          "path": "${ROOT}/ro",
+          "expect": {
+            "ok": {
+              "writable": false
+            }
+          }
+        },
+        {
+          "id": "rw",
+          "op": "stat",
+          "path": "${ROOT}/rw",
+          "expect": {
+            "ok": {
+              "writable": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.read.text-roundtrip",
+      "description": "Content comes back byte-exact: multibyte UTF-8, CRLF and a missing final newline included.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'h\\303\\251llo \\346\\274\\242\\345\\255\\227\\nline two\\r\\nno newline' > t",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "read",
+          "path": "${ROOT}/t",
+          "expect": {
+            "ok": {
+              "data_b64": "aMOpbGxvIOa8ouWtlwpsaW5lIHR3bw0Kbm8gbmV3bGluZQ=="
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.read.empty-file",
+      "description": "An existing empty file reads as empty data, which is not the same as an error.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; : > e",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "read",
+          "path": "${ROOT}/e",
+          "expect": {
+            "ok": {
+              "data_len": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.read.byte-exact-all-256",
+      "description": "Every byte value, NUL included, survives a read; nothing goes through a text decoder.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; i=0; while [ $i -lt 256 ]; do printf \"\\\\$(printf %03o $i)\"; i=$((i+1)); done > b1; cat b1 b1 b1 b1 > b",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "read",
+          "path": "${ROOT}/b",
+          "expect": {
+            "ok": {
+              "data_len": 1024,
+              "data_sha256": "785b0751fc2c53dc14a4ce3d800e69ef9ce1009eb327ccf458afe09c242c26c9"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.read.window",
+      "description": "offset and max select a byte window; a window past the end is empty; max 0 is empty; a short result means end of file.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 0123456789 > d",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "head",
+          "op": "read",
+          "path": "${ROOT}/d",
+          "offset": 0,
+          "max": 4,
+          "expect": {
+            "ok": {
+              "data_utf8": "0123"
+            }
+          }
+        },
+        {
+          "id": "mid",
+          "op": "read",
+          "path": "${ROOT}/d",
+          "offset": 4,
+          "max": 4,
+          "expect": {
+            "ok": {
+              "data_utf8": "4567"
+            }
+          }
+        },
+        {
+          "id": "tail-short",
+          "op": "read",
+          "path": "${ROOT}/d",
+          "offset": 8,
+          "max": 100,
+          "expect": {
+            "ok": {
+              "data_utf8": "89"
+            }
+          }
+        },
+        {
+          "id": "at-end",
+          "op": "read",
+          "path": "${ROOT}/d",
+          "offset": 10,
+          "max": 5,
+          "expect": {
+            "ok": {
+              "data_len": 0
+            }
+          }
+        },
+        {
+          "id": "past-end",
+          "op": "read",
+          "path": "${ROOT}/d",
+          "offset": 99,
+          "expect": {
+            "ok": {
+              "data_len": 0
+            }
+          }
+        },
+        {
+          "id": "max-zero",
+          "op": "read",
+          "path": "${ROOT}/d",
+          "offset": 2,
+          "max": 0,
+          "expect": {
+            "ok": {
+              "data_len": 0
+            }
+          }
+        },
+        {
+          "id": "offset-only",
+          "op": "read",
+          "path": "${ROOT}/d",
+          "offset": 7,
+          "expect": {
+            "ok": {
+              "data_utf8": "789"
+            }
+          }
+        },
+        {
+          "id": "whole",
+          "op": "read",
+          "path": "${ROOT}/d",
+          "expect": {
+            "ok": {
+              "data_utf8": "0123456789"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.read.chunk-boundaries",
+      "description": "Files around the 96 KiB read-chunk boundary (one, two and three commands) read back identical to the sandbox's own digest.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; head -c 1 /dev/urandom > f1; head -c 98303 /dev/urandom > f98303; head -c 98304 /dev/urandom > f98304; head -c 98305 /dev/urandom > f98305; head -c 196608 /dev/urandom > f196608; head -c 300001 /dev/urandom > f300001",
+            "sh",
+            "${ROOT}"
+          ]
+        },
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf %s \"$(sha256sum \"$1\" | cut -d\" \" -f1)\"",
+            "sh",
+            "${ROOT}/f1"
+          ],
+          "save": {
+            "d1": "stdout_utf8"
+          },
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          }
+        },
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf %s \"$(sha256sum \"$1\" | cut -d\" \" -f1)\"",
+            "sh",
+            "${ROOT}/f98303"
+          ],
+          "save": {
+            "d98303": "stdout_utf8"
+          },
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          }
+        },
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf %s \"$(sha256sum \"$1\" | cut -d\" \" -f1)\"",
+            "sh",
+            "${ROOT}/f98304"
+          ],
+          "save": {
+            "d98304": "stdout_utf8"
+          },
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          }
+        },
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf %s \"$(sha256sum \"$1\" | cut -d\" \" -f1)\"",
+            "sh",
+            "${ROOT}/f98305"
+          ],
+          "save": {
+            "d98305": "stdout_utf8"
+          },
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          }
+        },
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf %s \"$(sha256sum \"$1\" | cut -d\" \" -f1)\"",
+            "sh",
+            "${ROOT}/f196608"
+          ],
+          "save": {
+            "d196608": "stdout_utf8"
+          },
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          }
+        },
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf %s \"$(sha256sum \"$1\" | cut -d\" \" -f1)\"",
+            "sh",
+            "${ROOT}/f300001"
+          ],
+          "save": {
+            "d300001": "stdout_utf8"
+          },
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          }
+        }
+      ],
+      "steps": [
+        {
+          "id": "size-1",
+          "op": "read",
+          "path": "${ROOT}/f1",
+          "expect": {
+            "ok": {
+              "data_len": 1,
+              "data_sha256": "${d1}"
+            }
+          }
+        },
+        {
+          "id": "size-98303",
+          "op": "read",
+          "path": "${ROOT}/f98303",
+          "expect": {
+            "ok": {
+              "data_len": 98303,
+              "data_sha256": "${d98303}"
+            }
+          }
+        },
+        {
+          "id": "size-98304",
+          "op": "read",
+          "path": "${ROOT}/f98304",
+          "expect": {
+            "ok": {
+              "data_len": 98304,
+              "data_sha256": "${d98304}"
+            }
+          }
+        },
+        {
+          "id": "size-98305",
+          "op": "read",
+          "path": "${ROOT}/f98305",
+          "expect": {
+            "ok": {
+              "data_len": 98305,
+              "data_sha256": "${d98305}"
+            }
+          }
+        },
+        {
+          "id": "size-196608",
+          "op": "read",
+          "path": "${ROOT}/f196608",
+          "expect": {
+            "ok": {
+              "data_len": 196608,
+              "data_sha256": "${d196608}"
+            }
+          }
+        },
+        {
+          "id": "size-300001",
+          "op": "read",
+          "path": "${ROOT}/f300001",
+          "expect": {
+            "ok": {
+              "data_len": 300001,
+              "data_sha256": "${d300001}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.read.window-spans-chunks",
+      "description": "A single read whose window crosses chunk boundaries is the same bytes as the file's window, with no seam.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; head -c 300001 /dev/urandom > f300001",
+            "sh",
+            "${ROOT}"
+          ]
+        },
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf %s \"$(tail -c +98301 \"$1\" | head -c 200000 | sha256sum | cut -d\" \" -f1)\"",
+            "sh",
+            "${ROOT}/f300001"
+          ],
+          "save": {
+            "w": "stdout_utf8"
+          }
+        },
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf %s \"$(tail -c +6 \"$1\" | head -c 98304 | sha256sum | cut -d\" \" -f1)\"",
+            "sh",
+            "${ROOT}/f300001"
+          ],
+          "save": {
+            "w2": "stdout_utf8"
+          }
+        },
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf %s \"$(tail -c +250001 \"$1\" | sha256sum | cut -d\" \" -f1)\"",
+            "sh",
+            "${ROOT}/f300001"
+          ],
+          "save": {
+            "w3": "stdout_utf8"
+          }
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "read",
+          "path": "${ROOT}/f300001",
+          "offset": 98300,
+          "max": 200000,
+          "expect": {
+            "ok": {
+              "data_len": 200000,
+              "data_sha256": "${w}"
+            }
+          }
+        },
+        {
+          "id": "b",
+          "op": "read",
+          "path": "${ROOT}/f300001",
+          "offset": 5,
+          "max": 98304,
+          "expect": {
+            "ok": {
+              "data_len": 98304,
+              "data_sha256": "${w2}"
+            }
+          }
+        },
+        {
+          "id": "c",
+          "op": "read",
+          "path": "${ROOT}/f300001",
+          "offset": 250000,
+          "max": 1000000,
+          "expect": {
+            "ok": {
+              "data_len": 50001,
+              "data_sha256": "${w3}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.read.errors",
+      "description": "A read never returns empty for a file it could not read: missing, a directory and (as a non-root user) unreadable are distinct errors.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir d; echo x > f; ln -s nowhere lb",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "missing",
+          "op": "read",
+          "path": "${ROOT}/nope",
+          "expect": {
+            "error": {
+              "kind": "not_found"
+            }
+          }
+        },
+        {
+          "id": "directory",
+          "op": "read",
+          "path": "${ROOT}/d",
+          "expect": {
+            "error": {
+              "kind": "is_directory"
+            }
+          }
+        },
+        {
+          "id": "broken-link",
+          "op": "read",
+          "path": "${ROOT}/lb",
+          "expect": {
+            "error": {
+              "kind": "not_found"
+            }
+          }
+        },
+        {
+          "id": "under-a-file",
+          "op": "read",
+          "path": "${ROOT}/f/x",
+          "expect": {
+            "error": {
+              "kind": {
+                "$oneof": [
+                  "not_found",
+                  "not_a_directory"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.read.permission-denied",
+      "description": "An unreadable file is permission_denied.",
+      "requires": {
+        "not_root": true
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo x > f; chmod 000 f",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "read",
+          "path": "${ROOT}/f",
+          "expect": {
+            "error": {
+              "kind": "permission_denied"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.read.follows-symlinks",
+      "description": "A read follows a symlink to its target.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo target > t; ln -s t l",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "read",
+          "path": "${ROOT}/l",
+          "expect": {
+            "ok": {
+              "data_utf8": "target\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.read.odd-names",
+      "description": "A read of a path with spaces, quotes, substitutions and newlines is one argument.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo odd > \"it's \\$(x) \\`y\\` *;\n.txt\"",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "read",
+          "path": "${ROOT}/it's $(x) `y` *;\n.txt",
+          "expect": {
+            "ok": {
+              "data_utf8": "odd\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.read.growing-file-is-a-snapshot-per-window",
+      "description": "Each window is read by its own command: a file that grows between reads shows the new bytes to a later window.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf abc > g",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "first",
+          "op": "read",
+          "path": "${ROOT}/g",
+          "offset": 0,
+          "max": 3,
+          "expect": {
+            "ok": {
+              "data_utf8": "abc"
+            }
+          }
+        },
+        {
+          "id": "grow",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf def >> \"$1\"",
+            "sh",
+            "${ROOT}/g"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          }
+        },
+        {
+          "id": "second",
+          "op": "read",
+          "path": "${ROOT}/g",
+          "offset": 3,
+          "max": 3,
+          "expect": {
+            "ok": {
+              "data_utf8": "def"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.create-overwrite-shrink",
+      "description": "A write creates a missing file, replaces an existing one whole, and a shorter write leaves no tail of the old content.",
+      "steps": [
+        {
+          "id": "create",
+          "op": "write",
+          "path": "${ROOT}/w",
+          "data_b64": "Zmlyc3QgdmVyc2lvbiwgbG9uZwo=",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "read1",
+          "op": "read",
+          "path": "${ROOT}/w",
+          "expect": {
+            "ok": {
+              "data_utf8": "first version, long\n"
+            }
+          }
+        },
+        {
+          "id": "overwrite",
+          "op": "write",
+          "path": "${ROOT}/w",
+          "data_b64": "djIK",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "read2",
+          "op": "read",
+          "path": "${ROOT}/w",
+          "expect": {
+            "ok": {
+              "data_utf8": "v2\n"
+            }
+          }
+        },
+        {
+          "id": "stat",
+          "op": "stat",
+          "path": "${ROOT}/w",
+          "expect": {
+            "ok": {
+              "size": 3
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.empty",
+      "description": "Writing zero bytes creates an empty file, and truncates an existing one.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo content > full",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "new",
+          "op": "write",
+          "path": "${ROOT}/e",
+          "data_b64": "",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "stat-new",
+          "op": "stat",
+          "path": "${ROOT}/e",
+          "expect": {
+            "ok": {
+              "exists": true,
+              "kind": "file",
+              "size": 0
+            }
+          }
+        },
+        {
+          "id": "over",
+          "op": "write",
+          "path": "${ROOT}/full",
+          "data_b64": "",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "stat-over",
+          "op": "stat",
+          "path": "${ROOT}/full",
+          "expect": {
+            "ok": {
+              "size": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.byte-exact-all-256",
+      "description": "Binary content survives a write, NULs and invalid UTF-8 included.",
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/b",
+          "data_b64": {
+            "$repeat": {
+              "b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==",
+              "times": 4
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "sum",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sha256sum < \"$1\"",
+            "sh",
+            "${ROOT}/b"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "785b0751fc2c53dc14a4ce3d800e69ef9ce1009eb327ccf458afe09c242c26c9  -\n"
+            }
+          }
+        },
+        {
+          "id": "r",
+          "op": "read",
+          "path": "${ROOT}/b",
+          "expect": {
+            "ok": {
+              "data_len": 1024,
+              "data_sha256": "785b0751fc2c53dc14a4ce3d800e69ef9ce1009eb327ccf458afe09c242c26c9"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.sizes-around-the-chunk-boundary",
+      "description": "Files of 1 byte up to 300 KB are written exactly. Where stdin is unavailable the same writes go as 48 KiB chunks, so this covers one chunk, a boundary, and seven chunks.",
+      "steps": [
+        {
+          "id": "write-1",
+          "op": "write",
+          "path": "${ROOT}/w1",
+          "data_b64": {
+            "$repeat": {
+              "b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fo=",
+              "times": 1,
+              "len": 1
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "check-1",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf \"%s %s\" \"$(wc -c < \"$1\" | tr -d \" \")\" \"$(sha256sum < \"$1\" | cut -d\" \" -f1)\"",
+            "sh",
+            "${ROOT}/w1"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "1 6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+            }
+          }
+        },
+        {
+          "id": "write-49151",
+          "op": "write",
+          "path": "${ROOT}/w49151",
+          "data_b64": {
+            "$repeat": {
+              "b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fo=",
+              "times": 196,
+              "len": 49151
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "check-49151",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf \"%s %s\" \"$(wc -c < \"$1\" | tr -d \" \")\" \"$(sha256sum < \"$1\" | cut -d\" \" -f1)\"",
+            "sh",
+            "${ROOT}/w49151"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "49151 5421dbc3cb8a3493804cfb92d0ec9a3d65b56325c450e6031aaa351bf5a48960"
+            }
+          }
+        },
+        {
+          "id": "write-49152",
+          "op": "write",
+          "path": "${ROOT}/w49152",
+          "data_b64": {
+            "$repeat": {
+              "b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fo=",
+              "times": 196,
+              "len": 49152
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "check-49152",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf \"%s %s\" \"$(wc -c < \"$1\" | tr -d \" \")\" \"$(sha256sum < \"$1\" | cut -d\" \" -f1)\"",
+            "sh",
+            "${ROOT}/w49152"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "49152 664d1e34fe80e8713fefa2b9c30df7d7877bbffd850411ffda14f54bd1ce847c"
+            }
+          }
+        },
+        {
+          "id": "write-49153",
+          "op": "write",
+          "path": "${ROOT}/w49153",
+          "data_b64": {
+            "$repeat": {
+              "b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fo=",
+              "times": 196,
+              "len": 49153
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "check-49153",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf \"%s %s\" \"$(wc -c < \"$1\" | tr -d \" \")\" \"$(sha256sum < \"$1\" | cut -d\" \" -f1)\"",
+            "sh",
+            "${ROOT}/w49153"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "49153 20c61a40632e315a836a16167d41e646abdd4b2392625515df571dcd43284c02"
+            }
+          }
+        },
+        {
+          "id": "write-98304",
+          "op": "write",
+          "path": "${ROOT}/w98304",
+          "data_b64": {
+            "$repeat": {
+              "b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fo=",
+              "times": 392,
+              "len": 98304
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "check-98304",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf \"%s %s\" \"$(wc -c < \"$1\" | tr -d \" \")\" \"$(sha256sum < \"$1\" | cut -d\" \" -f1)\"",
+            "sh",
+            "${ROOT}/w98304"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "98304 f39e9f45bf8c7f0acf2b3ec3c812290a6d97f47b5606780cdbd728c348e54758"
+            }
+          }
+        },
+        {
+          "id": "write-150000",
+          "op": "write",
+          "path": "${ROOT}/w150000",
+          "data_b64": {
+            "$repeat": {
+              "b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fo=",
+              "times": 598,
+              "len": 150000
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "check-150000",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf \"%s %s\" \"$(wc -c < \"$1\" | tr -d \" \")\" \"$(sha256sum < \"$1\" | cut -d\" \" -f1)\"",
+            "sh",
+            "${ROOT}/w150000"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "150000 02675bf9284bd74223e98ceea96ebee4c9a469272ead358f462d89753f8c909b"
+            }
+          }
+        },
+        {
+          "id": "write-300001",
+          "op": "write",
+          "path": "${ROOT}/w300001",
+          "data_b64": {
+            "$repeat": {
+              "b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fo=",
+              "times": 1196,
+              "len": 300001
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "check-300001",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf \"%s %s\" \"$(wc -c < \"$1\" | tr -d \" \")\" \"$(sha256sum < \"$1\" | cut -d\" \" -f1)\"",
+            "sh",
+            "${ROOT}/w300001"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "300001 bf9a352f4514ab20bc7c79e65d3c2074dc1f0648b55b58d21a7b9c297c1721eb"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.through-symlink",
+      "description": "A write goes to the symlink's target and the link stays a link; a chain of links resolves to the end.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo old > t; ln -s t l1; ln -s l1 l2",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "w1",
+          "op": "write",
+          "path": "${ROOT}/l1",
+          "data_b64": "bmV3Cg==",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "check",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "cd \"$1\"; [ -L l1 ] && [ -L l2 ] && [ ! -L t ] && cat t",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "new\n"
+            }
+          }
+        },
+        {
+          "id": "w2",
+          "op": "write",
+          "path": "${ROOT}/l2",
+          "data_b64": "Y2hhaW4K",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "r",
+          "op": "read",
+          "path": "${ROOT}/t",
+          "expect": {
+            "ok": {
+              "data_utf8": "chain\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.dangling-symlink-creates-target",
+      "description": "Writing through a dangling link creates the link's target, relative to the link's directory.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir sub; ln -s made sub/l",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/sub/l",
+          "data_b64": "bWFkZQo=",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "check",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "cd \"$1\"; [ -L sub/l ] && cat sub/made",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "made\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.preserves-mode",
+      "description": "An existing file keeps its permission bits exactly: 0600 stays 0600, 0755 stays executable.",
+      "requires": {
+        "commands": [
+          "stat"
+        ]
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo old > secret; chmod 600 secret; printf '#!/bin/sh\\necho old\\n' > run.sh; chmod 755 run.sh",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "w1",
+          "op": "write",
+          "path": "${ROOT}/secret",
+          "data_b64": "bmV3Cg==",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "w2",
+          "op": "write",
+          "path": "${ROOT}/run.sh",
+          "data_b64": "IyEvYmluL3NoCmVjaG8gbmV3Cg==",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "modes",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "cd \"$1\"; stat -c \"%a\" secret run.sh",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "600\n755\n"
+            }
+          }
+        },
+        {
+          "id": "runs",
+          "op": "exec",
+          "command": "${ROOT}/run.sh",
+          "args": [],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "new\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.new-file-default-mode",
+      "description": "A new file gets the ordinary default mode (the umask's), not the temp file's restrictive one.",
+      "requires": {
+        "commands": [
+          "stat"
+        ]
+      },
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/n",
+          "data_b64": "eA==",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "mode",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "cd \"$1\"; m=$(umask); printf \"%s %s\" \"$(stat -c %a n)\" \"$(( 0666 & ~$m ))\"",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": {
+                "$re": "^\\d+ \\d+$"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.leaves-no-temp",
+      "description": "After a write, success or conflict, the directory holds the target and nothing else: the temp is gone.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir d",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/d/t",
+          "data_b64": {
+            "$repeat": {
+              "b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fo=",
+              "times": 479,
+              "len": 120000
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "ls",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "ls -A \"$1\"",
+            "sh",
+            "${ROOT}/d"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "t\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.odd-names",
+      "description": "A path with spaces, quotes, substitutions, globs and newlines is written as that exact name.",
+      "steps": [
+        {
+          "id": "space",
+          "op": "write",
+          "path": "${ROOT}/sp ace",
+          "data_b64": "MQ==",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "quotes",
+          "op": "write",
+          "path": "${ROOT}/it's \"q\"",
+          "data_b64": "Mg==",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "subst",
+          "op": "write",
+          "path": "${ROOT}/$(touch pwned) `touch pwned2`",
+          "data_b64": "Mw==",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "glob",
+          "op": "write",
+          "path": "${ROOT}/*",
+          "data_b64": "NA==",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "newline",
+          "op": "write",
+          "path": "${ROOT}/a\nb",
+          "data_b64": "NQ==",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "unicode",
+          "op": "write",
+          "path": "${ROOT}/é漢",
+          "data_b64": "Ng==",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "listing",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "cd \"$1\"; find . -mindepth 1 -maxdepth 1 -print0 | tr -cd \"\\000\" | wc -c; [ ! -e pwned ] && [ ! -e pwned2 ] && echo clean",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": {
+                "$re": "^\\s*6\nclean\n$"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.leading-dash-name",
+      "description": "A name that begins with a dash is not an option: written, and read back, as that file.",
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/-rf",
+          "data_b64": "ZGFzaA==",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "r",
+          "op": "read",
+          "path": "${ROOT}/-rf",
+          "expect": {
+            "ok": {
+              "data_utf8": "dash"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.missing-parent",
+      "description": "The parent directory must exist: the write is not_found and creates nothing.",
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/no/such/dir/f",
+          "data_b64": "eA==",
+          "expect": {
+            "error": {
+              "kind": "not_found"
+            }
+          }
+        },
+        {
+          "id": "none",
+          "op": "stat",
+          "path": "${ROOT}/no",
+          "expect": {
+            "ok": {
+              "exists": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.onto-directory",
+      "description": "A write onto a directory is an error and changes nothing.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir d",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/d",
+          "data_b64": "eA==",
+          "expect": {
+            "error": {
+              "kind": {
+                "$type": "string"
+              }
+            }
+          }
+        },
+        {
+          "id": "dir-empty",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "ls -A \"$1\"",
+            "sh",
+            "${ROOT}/d"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": ""
+            }
+          }
+        },
+        {
+          "id": "still-dir",
+          "op": "stat",
+          "path": "${ROOT}/d",
+          "expect": {
+            "ok": {
+              "kind": "dir"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.directory-not-writable",
+      "description": "A directory the caller cannot write into makes the write permission_denied.",
+      "requires": {
+        "not_root": true
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir ro; chmod 555 ro",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/ro/f",
+          "data_b64": "eA==",
+          "expect": {
+            "error": {
+              "kind": "permission_denied"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.read-only-file-is-refused",
+      "description": "A file the caller may not write is permission_denied and keeps its old content (the replacement takes the old file's mode before content goes in, so a read-only file's replacement is read-only too).",
+      "requires": {
+        "not_root": true
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo old > ro; chmod 444 ro",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/ro",
+          "data_b64": "bmV3Cg==",
+          "expect": {
+            "error": {
+              "kind": "permission_denied"
+            }
+          }
+        },
+        {
+          "id": "r",
+          "op": "read",
+          "path": "${ROOT}/ro",
+          "expect": {
+            "ok": {
+              "data_utf8": "old\n"
+            }
+          }
+        },
+        {
+          "id": "no-temp",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "ls -A \"$1\"",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "ro\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.concurrent-writers-never-mix",
+      "description": "Two writers to one path leave one of the two complete contents, never a mixture: the rename is atomic.",
+      "steps": [
+        {
+          "id": "w1",
+          "op": "write",
+          "path": "${ROOT}/c",
+          "data_b64": {
+            "$repeat": {
+              "b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fo=",
+              "times": 399,
+              "len": 100000
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "w2",
+          "op": "write",
+          "path": "${ROOT}/c",
+          "data_b64": {
+            "$repeat": {
+              "b64": "Wg==",
+              "times": 100000
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "final",
+          "op": "read",
+          "path": "${ROOT}/c",
+          "expect": {
+            "ok": {
+              "data_len": 100000,
+              "data_sha256": "f734fc90ca6f928f4e772a31dba36dd6924c80bd654c3681f15ee7725eaac713"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write-if-unchanged.matching-mtime-writes",
+      "description": "With the mtime the caller read, the write happens and the content is replaced.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'v1\\n' > f; TZ=UTC touch -t 200102030405.06 f",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "stat",
+          "op": "stat",
+          "path": "${ROOT}/f",
+          "save": {
+            "m": "mtime"
+          },
+          "expect": {
+            "ok": {
+              "mtime": 981173106
+            }
+          }
+        },
+        {
+          "id": "w",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/f",
+          "data_b64": "djIK",
+          "expected_mtime": "${m}",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "r",
+          "op": "read",
+          "path": "${ROOT}/f",
+          "expect": {
+            "ok": {
+              "data_utf8": "v2\n"
+            }
+          }
+        },
+        {
+          "id": "mtime-moved",
+          "op": "stat",
+          "path": "${ROOT}/f",
+          "expect": {
+            "ok": {
+              "mtime": {
+                "$not": 981173106
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write-if-unchanged.different-mtime-conflicts",
+      "description": "A different mtime is a conflict and nothing is written, in either direction.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'v1\\n' > f; TZ=UTC touch -t 200102030405.06 f",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "older",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/f",
+          "data_b64": "eAo=",
+          "expected_mtime": 981173101,
+          "expect": {
+            "error": {
+              "kind": "conflict"
+            }
+          }
+        },
+        {
+          "id": "newer",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/f",
+          "data_b64": "eAo=",
+          "expected_mtime": 981173111,
+          "expect": {
+            "error": {
+              "kind": "conflict"
+            }
+          }
+        },
+        {
+          "id": "zero",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/f",
+          "data_b64": "eAo=",
+          "expected_mtime": 0,
+          "expect": {
+            "error": {
+              "kind": "conflict"
+            }
+          }
+        },
+        {
+          "id": "unchanged",
+          "op": "read",
+          "path": "${ROOT}/f",
+          "expect": {
+            "ok": {
+              "data_utf8": "v1\n"
+            }
+          }
+        },
+        {
+          "id": "no-temp",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "ls -A \"$1\"",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "f\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write-if-unchanged.edit-after-read-conflicts",
+      "description": "The intended use: read, someone else changes the file, the guarded write is refused and the other change survives.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'v1\\n' > f; TZ=UTC touch -t 200102030405.06 f",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "stat",
+          "op": "stat",
+          "path": "${ROOT}/f",
+          "save": {
+            "m": "mtime"
+          }
+        },
+        {
+          "id": "other-editor",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf \"theirs\\n\" > \"$1\"; TZ=UTC touch -t 200301020304.05 \"$1\"",
+            "sh",
+            "${ROOT}/f"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          }
+        },
+        {
+          "id": "w",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/f",
+          "data_b64": "bWluZQo=",
+          "expected_mtime": "${m}",
+          "expect": {
+            "error": {
+              "kind": "conflict"
+            }
+          }
+        },
+        {
+          "id": "theirs",
+          "op": "read",
+          "path": "${ROOT}/f",
+          "expect": {
+            "ok": {
+              "data_utf8": "theirs\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write-if-unchanged.same-second-edit-is-missed",
+      "description": "The comparison is on whole seconds only: an edit that leaves the mtime second unchanged is not detected. This is the guard's stated limit; it is a guard against a person or agent editing in the gap between a read and a write, not a lock.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'v1\\n' > f; TZ=UTC touch -t 200102030405.06 f",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "stat",
+          "op": "stat",
+          "path": "${ROOT}/f",
+          "save": {
+            "m": "mtime"
+          }
+        },
+        {
+          "id": "edit-same-mtime",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf \"sneaky\\n\" > \"$1\"; TZ=UTC touch -t 200102030405.06 \"$1\"",
+            "sh",
+            "${ROOT}/f"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          }
+        },
+        {
+          "id": "w",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/f",
+          "data_b64": "bWluZQo=",
+          "expected_mtime": "${m}",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "r",
+          "op": "read",
+          "path": "${ROOT}/f",
+          "expect": {
+            "ok": {
+              "data_utf8": "mine\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write-if-unchanged.missing-file",
+      "description": "expected_mtime null means 'the file must not exist': it creates; any number on a missing file is a conflict; null on an existing file is a conflict.",
+      "steps": [
+        {
+          "id": "null-creates",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/new",
+          "data_b64": "bWFkZQo=",
+          "expected_mtime": null,
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "read",
+          "op": "read",
+          "path": "${ROOT}/new",
+          "expect": {
+            "ok": {
+              "data_utf8": "made\n"
+            }
+          }
+        },
+        {
+          "id": "null-on-existing",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/new",
+          "data_b64": "YWdhaW4K",
+          "expected_mtime": null,
+          "expect": {
+            "error": {
+              "kind": "conflict"
+            }
+          }
+        },
+        {
+          "id": "number-on-missing",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/gone",
+          "data_b64": "eA==",
+          "expected_mtime": 981173106,
+          "expect": {
+            "error": {
+              "kind": "conflict"
+            }
+          }
+        },
+        {
+          "id": "still-missing",
+          "op": "stat",
+          "path": "${ROOT}/gone",
+          "expect": {
+            "ok": {
+              "exists": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write-if-unchanged.keeps-mode",
+      "description": "A guarded write keeps the file's mode like an unguarded one.",
+      "requires": {
+        "commands": [
+          "stat"
+        ]
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'v1\\n' > f; chmod 600 f; TZ=UTC touch -t 200102030405.06 f",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "w",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/f",
+          "data_b64": "djIK",
+          "expected_mtime": 981173106,
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "mode",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "stat -c %a \"$1\"",
+            "sh",
+            "${ROOT}/f"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "600\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write-if-unchanged.large-content",
+      "description": "A guarded write of a multi-chunk body is whole.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'v1\\n' > f; TZ=UTC touch -t 200102030405.06 f",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "w",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/f",
+          "data_b64": {
+            "$repeat": {
+              "b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fo=",
+              "times": 797,
+              "len": 200000
+            }
+          },
+          "expected_mtime": 981173106,
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "r",
+          "op": "read",
+          "path": "${ROOT}/f",
+          "expect": {
+            "ok": {
+              "data_len": 200000,
+              "data_sha256": "e24bc62381f1224fbbb74688663f8f9743b9680b193edd666835e97b06e730eb"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write-if-unchanged.through-symlink",
+      "description": "Through a symlink the guard compares the target's mtime, and writes the target.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'v1\\n' > t; TZ=UTC touch -t 200102030405.06 t; ln -s t l",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "w",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/l",
+          "data_b64": "djIK",
+          "expected_mtime": 981173106,
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "stat reports the link's own mtime, so the guard compares the wrong file"
+          },
+          "expect": {
+            "ok": {}
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.mkdir.nested-and-idempotent",
+      "description": "mkdir creates every missing parent and succeeds when the directory is already there.",
+      "steps": [
+        {
+          "id": "a",
+          "op": "mkdir",
+          "path": "${ROOT}/x/y/z",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "stat",
+          "op": "stat",
+          "path": "${ROOT}/x/y/z",
+          "expect": {
+            "ok": {
+              "kind": "dir"
+            }
+          }
+        },
+        {
+          "id": "again",
+          "op": "mkdir",
+          "path": "${ROOT}/x/y/z",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "existing-parent",
+          "op": "mkdir",
+          "path": "${ROOT}/x/y",
+          "expect": {
+            "ok": {}
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.mkdir.odd-names",
+      "description": "Directory names with spaces, quotes and a leading dash are single arguments.",
+      "requires": {
+        "find_printf": true
+      },
+      "steps": [
+        {
+          "id": "a",
+          "op": "mkdir",
+          "path": "${ROOT}/sp ace/it's/$(x)",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "dash",
+          "op": "mkdir",
+          "path": "${ROOT}/-d",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "check",
+          "op": "list",
+          "path": "${ROOT}",
+          "expect": {
+            "ok": {
+              "entries": {
+                "$unordered": [
+                  {
+                    "name": "sp ace",
+                    "kind": "dir"
+                  },
+                  {
+                    "name": "-d",
+                    "kind": "dir"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.mkdir.errors",
+      "description": "A path that runs through a file is not_a_directory; making a directory where a file is, is an error.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo x > f",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "through-file",
+          "op": "mkdir",
+          "path": "${ROOT}/f/x",
+          "expect": {
+            "error": {
+              "kind": "not_a_directory"
+            }
+          }
+        },
+        {
+          "id": "over-file",
+          "op": "mkdir",
+          "path": "${ROOT}/f",
+          "expect": {
+            "error": {
+              "kind": {
+                "$type": "string"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.mkdir.permission-denied",
+      "description": "A parent the caller cannot write into is permission_denied.",
+      "requires": {
+        "not_root": true
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir ro; chmod 555 ro",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "mkdir",
+          "path": "${ROOT}/ro/new",
+          "expect": {
+            "error": {
+              "kind": "permission_denied"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.list.kinds-and-sizes",
+      "description": "One level of a directory: name (a single component), kind, and the byte size of files. Symlinks list as what they point to; a broken link is omitted; a FIFO is other. Order is unspecified.",
+      "requires": {
+        "find_printf": true
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 12345 > f; : > e; mkdir d; echo inner > d/inner; ln -s d ld; ln -s f lf; ln -s nowhere lb; mkfifo ff",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "list",
+          "path": "${ROOT}",
+          "expect": {
+            "ok": {
+              "entries": {
+                "$unordered": [
+                  {
+                    "name": "f",
+                    "kind": "file",
+                    "size": 5
+                  },
+                  {
+                    "name": "e",
+                    "kind": "file",
+                    "size": 0
+                  },
+                  {
+                    "name": "d",
+                    "kind": "dir"
+                  },
+                  {
+                    "name": "ld",
+                    "kind": "dir"
+                  },
+                  {
+                    "name": "lf",
+                    "kind": "file"
+                  },
+                  {
+                    "name": "ff",
+                    "kind": "other"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.list.is-one-level",
+      "description": "Only the directory's own entries are listed, never their contents.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir -p d/e/f; echo x > d/e/f/g",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "list",
+          "path": "${ROOT}",
+          "expect": {
+            "ok": {
+              "entries": [
+                {
+                  "name": "d",
+                  "kind": "dir"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "inner",
+          "op": "list",
+          "path": "${ROOT}/d",
+          "expect": {
+            "ok": {
+              "entries": [
+                {
+                  "name": "e",
+                  "kind": "dir"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.list.hidden",
+      "description": "Names beginning with a dot are left out unless include_hidden; . and .. are never listed.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo > v; echo > .h; mkdir .hd",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "default",
+          "op": "list",
+          "path": "${ROOT}",
+          "expect": {
+            "ok": {
+              "entries": {
+                "$unordered": [
+                  {
+                    "name": "v"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "hidden",
+          "op": "list",
+          "path": "${ROOT}",
+          "include_hidden": true,
+          "expect": {
+            "ok": {
+              "entries": {
+                "$unordered": [
+                  {
+                    "name": "v"
+                  },
+                  {
+                    "name": ".h"
+                  },
+                  {
+                    "name": ".hd",
+                    "kind": "dir"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.list.limit-counts-kept-entries",
+      "description": "The limit counts entries kept, after hidden ones are dropped: five hidden entries do not use up a limit of 2.",
+      "requires": {
+        "find_printf": true
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; for n in .h1 .h2 .h3 .h4 .h5 a b c; do echo > $n; done",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "list",
+          "path": "${ROOT}",
+          "limit": 2,
+          "expect": {
+            "ok": {
+              "entries": {
+                "$len": 2
+              }
+            }
+          }
+        },
+        {
+          "id": "none-hidden",
+          "op": "list",
+          "path": "${ROOT}",
+          "limit": 2,
+          "expect": {
+            "ok": {
+              "entries": {
+                "$not": {
+                  "$includes": [
+                    {
+                      "name": {
+                        "$re": "^\\."
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "with-hidden",
+          "op": "list",
+          "path": "${ROOT}",
+          "limit": 4,
+          "include_hidden": true,
+          "expect": {
+            "ok": {
+              "entries": {
+                "$len": 4
+              }
+            }
+          }
+        },
+        {
+          "id": "all",
+          "op": "list",
+          "path": "${ROOT}",
+          "expect": {
+            "ok": {
+              "entries": {
+                "$len": 3
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.list.empty-and-not-a-directory",
+      "description": "An empty directory lists as nothing. Listing a file lists as nothing too (the command finds no children), not an error.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir d; echo x > f",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "empty",
+          "op": "list",
+          "path": "${ROOT}/d",
+          "expect": {
+            "ok": {
+              "entries": []
+            }
+          }
+        },
+        {
+          "id": "file",
+          "op": "list",
+          "path": "${ROOT}/f",
+          "expect": {
+            "ok": {
+              "entries": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.list.errors",
+      "description": "A missing directory is not_found.",
+      "steps": [
+        {
+          "id": "missing",
+          "op": "list",
+          "path": "${ROOT}/nope",
+          "expect": {
+            "error": {
+              "kind": "not_found"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.list.permission-denied",
+      "description": "A directory the caller cannot read is permission_denied.",
+      "requires": {
+        "not_root": true
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir locked; echo x > locked/f; chmod 000 locked",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "list",
+          "path": "${ROOT}/locked",
+          "expect": {
+            "error": {
+              "kind": "permission_denied"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.list.odd-names",
+      "description": "Names with spaces, quotes, globs, a leading dash, a newline and non-ASCII characters are listed exactly (records are NUL-terminated, not line-based).",
+      "requires": {
+        "find_printf": true
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; for n in 'sp ace' \"it's \\\"q\\\"\" '*' '-dash' 'n\nl' 'é漢' '$(x)' \"a$(printf '\\t')b\"; do echo > \"./$n\"; done",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "list",
+          "path": "${ROOT}",
+          "expect": {
+            "ok": {
+              "entries": {
+                "$unordered": [
+                  {
+                    "name": "sp ace"
+                  },
+                  {
+                    "name": "it's \"q\""
+                  },
+                  {
+                    "name": "*"
+                  },
+                  {
+                    "name": "-dash"
+                  },
+                  {
+                    "name": "n\nl"
+                  },
+                  {
+                    "name": "é漢"
+                  },
+                  {
+                    "name": "$(x)"
+                  },
+                  {
+                    "name": "a\tb"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.list.non-utf8-name",
+      "description": "A name that is not valid UTF-8 is listed with U+FFFD in place of the bad bytes (the answer is text).",
+      "requires": {
+        "find_printf": true
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo x > \"bad$(printf '\\377')name\"",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "list",
+          "path": "${ROOT}",
+          "expect": {
+            "ok": {
+              "entries": [
+                {
+                  "name": "bad�name",
+                  "kind": "file"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.list.large-directory",
+      "description": "A directory of 3000 entries is listed whole by default.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; i=0; while [ $i -lt 3000 ]; do : > \"f$i\"; i=$((i+1)); done",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "list",
+          "path": "${ROOT}",
+          "expect": {
+            "ok": {
+              "entries": {
+                "$len": 3000
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.list.without-find-printf",
+      "description": "Where find has no -printf (busybox) the listing is two find passes: names and file/dir kinds are right, sizes are not reported (0), and a symlink to a directory or a FIFO is just a file.",
+      "requires": {
+        "find_printf": false
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 12345 > f; mkdir d; echo > .h",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "list",
+          "path": "${ROOT}",
+          "include_hidden": true,
+          "expect": {
+            "ok": {
+              "entries": {
+                "$unordered": [
+                  {
+                    "name": "f",
+                    "kind": "file",
+                    "size": 0
+                  },
+                  {
+                    "name": "d",
+                    "kind": "dir",
+                    "size": 0
+                  },
+                  {
+                    "name": ".h",
+                    "kind": "file"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "no-hidden",
+          "op": "list",
+          "path": "${ROOT}",
+          "include_hidden": false,
+          "expect": {
+            "ok": {
+              "entries": {
+                "$len": 2
+              }
+            }
+          }
+        },
+        {
+          "id": "missing",
+          "op": "list",
+          "path": "${ROOT}/nope",
+          "expect": {
+            "error": {
+              "kind": "not_found"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.basic-sorted-by-path-components",
+      "description": "Hits are sorted by path component by component, then line: a/b.txt comes before a.txt because the component a sorts before a.txt (a plain string sort would put a.txt first, '.' being below '/').",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir -p a sub; printf 'alpha needle\\nbeta\\n' > a.txt; printf 'needle in a/b\\n' > a/b.txt; printf 'fn needle() {}\\n' > c.rs; printf '// needle\\nNEEDLE upper\\n' > sub/d.rs",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "search",
+          "pattern": "needle",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/a/b.txt",
+                  "line": 1,
+                  "text": "needle in a/b",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/a.txt",
+                  "line": 1,
+                  "text": "alpha needle",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/c.rs",
+                  "line": 1,
+                  "text": "fn needle() {}",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/sub/d.rs",
+                  "line": 1,
+                  "text": "// needle",
+                  "is_match": true
+                }
+              ],
+              "truncated": false,
+              "note": null
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.ignore-case",
+      "description": "ignore_case folds case.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir -p a sub; printf 'alpha needle\\nbeta\\n' > a.txt; printf 'needle in a/b\\n' > a/b.txt; printf 'fn needle() {}\\n' > c.rs; printf '// needle\\nNEEDLE upper\\n' > sub/d.rs",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "cs",
+          "op": "search",
+          "pattern": "NEEDLE",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/sub/d.rs",
+                  "line": 2,
+                  "text": "NEEDLE upper",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "ci",
+          "op": "search",
+          "pattern": "NEEDLE",
+          "ignore_case": true,
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/a/b.txt",
+                  "line": 1,
+                  "text": "needle in a/b",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/a.txt",
+                  "line": 1,
+                  "text": "alpha needle",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/c.rs",
+                  "line": 1,
+                  "text": "fn needle() {}",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/sub/d.rs",
+                  "line": 1,
+                  "text": "// needle",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/sub/d.rs",
+                  "line": 2,
+                  "text": "NEEDLE upper",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.literal-vs-regex",
+      "description": "literal searches for the text itself; otherwise the pattern is a regular expression.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'a.b\\naxb\\n' > t.txt; printf 'f(x) + [y] *\\n' > m.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "literal",
+          "op": "search",
+          "pattern": "a.b",
+          "literal": true,
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/t.txt",
+                  "line": 1,
+                  "text": "a.b",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "regex",
+          "op": "search",
+          "pattern": "a.b",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/t.txt",
+                  "line": 1,
+                  "text": "a.b",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/t.txt",
+                  "line": 2,
+                  "text": "axb",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "literal-metachars",
+          "op": "search",
+          "pattern": "f(x) + [y] *",
+          "literal": true,
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/m.txt",
+                  "line": 1,
+                  "text": "f(x) + [y] *",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.pattern-starting-with-dash",
+      "description": "A pattern, literal or not, that begins with '-' is a pattern and not a flag.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'use -x flag\\nother\\n' > t.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "regex",
+          "op": "search",
+          "pattern": "-x",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/t.txt",
+                  "line": 1,
+                  "text": "use -x flag",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "literal",
+          "op": "search",
+          "pattern": "-x flag",
+          "literal": true,
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/t.txt",
+                  "line": 1,
+                  "text": "use -x flag",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.glob-include-exclude",
+      "description": "glob restricts the search to matching files; with glob_exclude it removes them.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir -p a sub; printf 'alpha needle\\nbeta\\n' > a.txt; printf 'needle in a/b\\n' > a/b.txt; printf 'fn needle() {}\\n' > c.rs; printf '// needle\\nNEEDLE upper\\n' > sub/d.rs",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "include",
+          "op": "search",
+          "pattern": "needle",
+          "glob": "*.rs",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/c.rs",
+                  "line": 1,
+                  "text": "fn needle() {}",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/sub/d.rs",
+                  "line": 1,
+                  "text": "// needle",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "exclude",
+          "op": "search",
+          "pattern": "needle",
+          "glob": "*.rs",
+          "glob_exclude": true,
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/a/b.txt",
+                  "line": 1,
+                  "text": "needle in a/b",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/a.txt",
+                  "line": 1,
+                  "text": "alpha needle",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "include-none",
+          "op": "search",
+          "pattern": "needle",
+          "glob": "*.nope",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.limit-and-truncated",
+      "description": "limit caps the matches reported, taken in sorted order; truncated says more existed. A result of exactly limit matches is not truncated.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir -p a sub; printf 'alpha needle\\nbeta\\n' > a.txt; printf 'needle in a/b\\n' > a/b.txt; printf 'fn needle() {}\\n' > c.rs; printf '// needle\\nNEEDLE upper\\n' > sub/d.rs",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "two",
+          "op": "search",
+          "pattern": "needle",
+          "limit": 2,
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/a/b.txt",
+                  "line": 1,
+                  "text": "needle in a/b",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/a.txt",
+                  "line": 1,
+                  "text": "alpha needle",
+                  "is_match": true
+                }
+              ],
+              "truncated": true
+            }
+          }
+        },
+        {
+          "id": "exact",
+          "op": "search",
+          "pattern": "needle",
+          "limit": 4,
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/a/b.txt",
+                  "line": 1,
+                  "text": "needle in a/b",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/a.txt",
+                  "line": 1,
+                  "text": "alpha needle",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/c.rs",
+                  "line": 1,
+                  "text": "fn needle() {}",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/sub/d.rs",
+                  "line": 1,
+                  "text": "// needle",
+                  "is_match": true
+                }
+              ],
+              "truncated": false
+            }
+          }
+        },
+        {
+          "id": "one",
+          "op": "search",
+          "pattern": "needle",
+          "limit": 1,
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/a/b.txt",
+                  "line": 1,
+                  "text": "needle in a/b",
+                  "is_match": true
+                }
+              ],
+              "truncated": true
+            }
+          }
+        },
+        {
+          "id": "zero",
+          "op": "search",
+          "pattern": "needle",
+          "limit": 0,
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [],
+              "truncated": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.context-lines",
+      "description": "before and after add surrounding lines flagged is_match:false; overlapping windows merge without repeats; group separators are not hits.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'l1\\nl2\\nMATCH a\\nl4\\nl5\\nl6\\nl7\\nMATCH b\\nl9\\n' > ctx.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "b1a1",
+          "op": "search",
+          "pattern": "MATCH",
+          "before": 1,
+          "after": 1,
+          "root": "${ROOT}",
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "ripgrep run with --crlf writes the context-group separator as '--\\r\\n'; the record parser only recognises '--\\n', so the next hit's path is prefixed with '--\\r\\n' and it sorts and reports wrongly",
+            "when": {
+              "search_engine": "rg"
+            }
+          },
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 2,
+                  "text": "l2",
+                  "is_match": false
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 3,
+                  "text": "MATCH a",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 4,
+                  "text": "l4",
+                  "is_match": false
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 7,
+                  "text": "l7",
+                  "is_match": false
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 8,
+                  "text": "MATCH b",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 9,
+                  "text": "l9",
+                  "is_match": false
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "overlap",
+          "op": "search",
+          "pattern": "MATCH",
+          "before": 2,
+          "after": 2,
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 1,
+                  "text": "l1",
+                  "is_match": false
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 2,
+                  "text": "l2",
+                  "is_match": false
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 3,
+                  "text": "MATCH a",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 4,
+                  "text": "l4",
+                  "is_match": false
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 5,
+                  "text": "l5",
+                  "is_match": false
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 6,
+                  "text": "l6",
+                  "is_match": false
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 7,
+                  "text": "l7",
+                  "is_match": false
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 8,
+                  "text": "MATCH b",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 9,
+                  "text": "l9",
+                  "is_match": false
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "after-only",
+          "op": "search",
+          "pattern": "MATCH",
+          "after": 1,
+          "root": "${ROOT}",
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "ripgrep run with --crlf writes the context-group separator as '--\\r\\n'; the record parser only recognises '--\\n', so the next hit's path is prefixed with '--\\r\\n' and it sorts and reports wrongly",
+            "when": {
+              "search_engine": "rg"
+            }
+          },
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 3,
+                  "text": "MATCH a",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 4,
+                  "text": "l4",
+                  "is_match": false
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 8,
+                  "text": "MATCH b",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 9,
+                  "text": "l9",
+                  "is_match": false
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "none",
+          "op": "search",
+          "pattern": "MATCH",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 3,
+                  "text": "MATCH a",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 8,
+                  "text": "MATCH b",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.limit-counts-only-matches-and-drops-dangling-context",
+      "description": "limit counts matches, not context lines. When it cuts, every context line after the last kept match goes too, the kept match's own after-context included: a limited result ends on a match.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'l1\\nl2\\nMATCH a\\nl4\\nl5\\nl6\\nl7\\nMATCH b\\nl9\\n' > ctx.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "search",
+          "pattern": "MATCH",
+          "before": 1,
+          "after": 1,
+          "limit": 1,
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 2,
+                  "text": "l2",
+                  "is_match": false
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 3,
+                  "text": "MATCH a",
+                  "is_match": true
+                }
+              ],
+              "truncated": true
+            }
+          }
+        },
+        {
+          "id": "b",
+          "op": "search",
+          "pattern": "MATCH",
+          "before": 1,
+          "after": 1,
+          "limit": 2,
+          "root": "${ROOT}",
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "ripgrep run with --crlf writes the context-group separator as '--\\r\\n'; the record parser only recognises '--\\n', so the next hit's path is prefixed with '--\\r\\n' and it sorts and reports wrongly",
+            "when": {
+              "search_engine": "rg"
+            }
+          },
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 2,
+                  "text": "l2",
+                  "is_match": false
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 3,
+                  "text": "MATCH a",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 4,
+                  "text": "l4",
+                  "is_match": false
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 7,
+                  "text": "l7",
+                  "is_match": false
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 8,
+                  "text": "MATCH b",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 9,
+                  "text": "l9",
+                  "is_match": false
+                }
+              ],
+              "truncated": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.context-is-clamped-to-100",
+      "description": "A before/after larger than 100 is 100.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; { i=0; while [ $i -lt 150 ]; do echo line$i; i=$((i+1)); done; echo TARGET; } > before.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        },
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; { echo TOP; i=0; while [ $i -lt 150 ]; do echo line$i; i=$((i+1)); done; } > after.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "before",
+          "op": "search",
+          "pattern": "TARGET",
+          "before": 1000,
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": {
+                "$len": 101
+              }
+            }
+          }
+        },
+        {
+          "id": "after",
+          "op": "search",
+          "pattern": "TOP",
+          "after": 1000,
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": {
+                "$len": 101
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.no-match-is-empty-not-error",
+      "description": "No matches is an empty list and truncated false.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir -p a sub; printf 'alpha needle\\nbeta\\n' > a.txt; printf 'needle in a/b\\n' > a/b.txt; printf 'fn needle() {}\\n' > c.rs; printf '// needle\\nNEEDLE upper\\n' > sub/d.rs",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "search",
+          "pattern": "zzzz-not-there",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [],
+              "truncated": false,
+              "note": null
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.bad-pattern-is-invalid-query",
+      "description": "A pattern the engine rejects is invalid_query, the caller's mistake, with the engine's message.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir -p a sub; printf 'alpha needle\\nbeta\\n' > a.txt; printf 'needle in a/b\\n' > a/b.txt; printf 'fn needle() {}\\n' > c.rs; printf '// needle\\nNEEDLE upper\\n' > sub/d.rs",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "unclosed",
+          "op": "search",
+          "pattern": "(",
+          "root": "${ROOT}",
+          "expect": {
+            "error": {
+              "kind": "invalid_query",
+              "detail": {
+                "$re": "bad regex"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.missing-root",
+      "description": "A root that does not exist is an error.",
+      "steps": [
+        {
+          "id": "a",
+          "op": "search",
+          "root": "${ROOT}/nope",
+          "pattern": "x",
+          "expect": {
+            "error": {
+              "kind": "not_found"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.single-file-root",
+      "description": "The root may be a file.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir -p a sub; printf 'alpha needle\\nbeta\\n' > a.txt; printf 'needle in a/b\\n' > a/b.txt; printf 'fn needle() {}\\n' > c.rs; printf '// needle\\nNEEDLE upper\\n' > sub/d.rs",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "search",
+          "root": "${ROOT}/sub/d.rs",
+          "pattern": "needle",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/sub/d.rs",
+                  "line": 1,
+                  "text": "// needle",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.hidden-files-are-searched",
+      "description": "Dotfiles and dot-directories are searched (unlike stock ripgrep).",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir .dir; echo needle > .dir/in.txt; echo needle > .hf",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "search",
+          "pattern": "needle",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/.dir/in.txt",
+                  "line": 1,
+                  "text": "needle",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/.hf",
+                  "line": 1,
+                  "text": "needle",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.git-directory-is-never-searched",
+      "description": "Anything inside a .git entry below the root is skipped, a worktree's .git file included; an explicit root inside .git is searched.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir -p .git/x sub; echo 'needle git' > .git/x/h; echo needle > src.rs; echo 'gitdir: x needle' > sub/.git",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "root",
+          "op": "search",
+          "pattern": "needle",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/src.rs",
+                  "line": 1,
+                  "text": "needle",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "explicit-git",
+          "op": "search",
+          "root": "${ROOT}/.git",
+          "pattern": "needle",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/.git/x/h",
+                  "line": 1,
+                  "text": "needle git",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.gitignore-honored",
+      "description": "With ripgrep, .gitignore (and .ignore) is honored, in a repository and in a plain directory alike.",
+      "requires": {
+        "search_engine": "rg"
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'ign/\\n*.log\\n' > .gitignore; mkdir ign; echo needle > ign/i.rs; echo needle > x.log; echo needle > keep.rs; mkdir -p repo/.git repo/ign; cp .gitignore repo/; echo needle > repo/ign/i.rs; echo needle > repo/x.log; echo needle > repo/keep.rs",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "plain-dir",
+          "op": "search",
+          "pattern": "needle",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/keep.rs",
+                  "line": 1,
+                  "text": "needle",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/repo/keep.rs",
+                  "line": 1,
+                  "text": "needle",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "in-repo",
+          "op": "search",
+          "root": "${ROOT}/repo",
+          "pattern": "needle",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/repo/keep.rs",
+                  "line": 1,
+                  "text": "needle",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.gitignore-not-honored-by-grep",
+      "description": "Without ripgrep nothing honors .gitignore: ignored files are searched. (The engine in use is reported by capabilities, so a caller can tell.)",
+      "requires": {
+        "search_engine": [
+          "grep",
+          "busybox-grep"
+        ]
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'ign/\\n*.log\\n' > .gitignore; mkdir ign; echo needle > ign/i.rs; echo needle > x.log; echo needle > keep.rs",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "search",
+          "pattern": "needle",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/ign/i.rs",
+                  "line": 1,
+                  "text": "needle",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/keep.rs",
+                  "line": 1,
+                  "text": "needle",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/x.log",
+                  "line": 1,
+                  "text": "needle",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.binary-files-are-skipped",
+      "description": "A file containing a NUL is binary and is not searched.",
+      "requires": {
+        "search_engine": [
+          "rg",
+          "grep"
+        ]
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf '\\000 needle \\000binary\\n' > bin.dat; echo needle > text.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "search",
+          "pattern": "needle",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/text.txt",
+                  "line": 1,
+                  "text": "needle",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.line-endings",
+      "description": "The end of line is not part of the text: LF and CRLF endings are stripped, and any other carriage return inside a line is removed. An end-of-line anchor ($) matches before a CRLF.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'crlf needle\\r\\nnext\\r\\n' > crlf.txt; printf 'ab\\rcd needle\\n' > cr.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "crlf",
+          "op": "search",
+          "pattern": "needle$",
+          "root": "${ROOT}/crlf.txt",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/crlf.txt",
+                  "line": 1,
+                  "text": "crlf needle",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "embedded-cr",
+          "op": "search",
+          "pattern": "needle",
+          "root": "${ROOT}/cr.txt",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/cr.txt",
+                  "line": 1,
+                  "text": "abcd needle",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.invalid-utf8-text",
+      "description": "A matching line that is not valid UTF-8 comes back with U+FFFD for the bad bytes. (ripgrep only: GNU grep -I in a UTF-8 locale takes such a file for binary and skips it.)",
+      "requires": {
+        "search_engine": "rg"
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'caf\\351 needle\\n' > latin.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "search",
+          "pattern": "needle",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/latin.txt",
+                  "line": 1,
+                  "text": "caf� needle",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.regex-dialect-ripgrep",
+      "description": "With ripgrep the pattern is a Rust regex: \\d, \\b, non-greedy and (?i) work.",
+      "requires": {
+        "search_engine": "rg"
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'id 4242 end\\nMiXeD\\nid 12\\n' > t.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "digits",
+          "op": "search",
+          "pattern": "\\bid \\d{4}\\b",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/t.txt",
+                  "line": 1,
+                  "text": "id 4242 end",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "flag",
+          "op": "search",
+          "pattern": "(?i)mixed",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/t.txt",
+                  "line": 2,
+                  "text": "MiXeD",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.regex-dialect-ere",
+      "description": "Without ripgrep the pattern is a POSIX extended regex: + ? | () {} work as operators.",
+      "requires": {
+        "search_engine": [
+          "grep",
+          "busybox-grep"
+        ]
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf 'cat\\ndog\\ncaaat\\n' > t.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "alt",
+          "op": "search",
+          "pattern": "^(cat|dog)$",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/t.txt",
+                  "line": 1,
+                  "text": "cat",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/t.txt",
+                  "line": 2,
+                  "text": "dog",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "plus",
+          "op": "search",
+          "pattern": "^ca+t$",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/t.txt",
+                  "line": 1,
+                  "text": "cat",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/t.txt",
+                  "line": 3,
+                  "text": "caaat",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.odd-file-names",
+      "description": "Paths with spaces, colons, quotes, glob characters and newlines come back exactly: records are NUL-delimited. (Not available without grep -Z: see the next scenario.)",
+      "requires": {
+        "search_engine": [
+          "rg",
+          "grep"
+        ]
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; for n in \"it's; rm -rf \\$(id) *.txt\" 'n\nl.txt' 'q:colon-1:x.txt' 'sp ace.txt'; do echo needle > \"./$n\"; done",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "search",
+          "pattern": "needle",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/it's; rm -rf $(id) *.txt",
+                  "line": 1,
+                  "text": "needle",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/n\nl.txt",
+                  "line": 1,
+                  "text": "needle",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/q:colon-1:x.txt",
+                  "line": 1,
+                  "text": "needle",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/sp ace.txt",
+                  "line": 1,
+                  "text": "needle",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.busybox-plain-names",
+      "description": "On the busybox rung (no -Z) ordinary names work; names with a ':' or '-' followed by digits and the same separator, or with a newline, cannot be told apart from the output format and are not supported there.",
+      "requires": {
+        "search_engine": "busybox-grep"
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo needle > plain.txt; echo needle > 'sp ace.txt'",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "search",
+          "pattern": "needle",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/plain.txt",
+                  "line": 1,
+                  "text": "needle",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/sp ace.txt",
+                  "line": 1,
+                  "text": "needle",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.long-lines-are-clipped",
+      "description": "A line longer than 500 characters is cut: a match inside the first 500 shows the head plus '… [truncated]'; a match further in shows a 500-character window centred on it, '… <window> … [truncated; columns A-B of N]'; at the end of the line the window is the last 500 characters. Counts are characters, not bytes. A context line is only ever cut at its head.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf '%s\\n' 'needlexxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' > l1.txt; printf '%s\\n' 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyneedlezzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz' > l2.txt; printf '%s\\n' 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyneedle' > l3.txt; printf '%s\\n' '漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢needle字字字字字字字字字字' > l4.txt; printf '%s\\n' 'nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnneedlemmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm' > l5.txt; printf 'needle\\nqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq\\n' > l6.txt; printf '%s\\n' 'needlepppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp' > l7.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "head",
+          "op": "search",
+          "pattern": "needle",
+          "root": "${ROOT}/l1.txt",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/l1.txt",
+                  "line": 1,
+                  "text": "needlexxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx… [truncated]",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "middle",
+          "op": "search",
+          "pattern": "needle",
+          "root": "${ROOT}/l2.txt",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/l2.txt",
+                  "line": 1,
+                  "text": "… yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyneedlezzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz … [truncated; columns 754-1253 of 2006]",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "end",
+          "op": "search",
+          "pattern": "needle",
+          "root": "${ROOT}/l3.txt",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/l3.txt",
+                  "line": 1,
+                  "text": "… yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyneedle [truncated; columns 507-1006 of 1006]",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "multibyte",
+          "op": "search",
+          "pattern": "needle",
+          "root": "${ROOT}/l4.txt",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/l4.txt",
+                  "line": 1,
+                  "text": "… 漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢漢needle字字字字字字字字字字 [truncated; columns 117-616 of 616]",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "straddles-500",
+          "op": "search",
+          "pattern": "needle",
+          "root": "${ROOT}/l5.txt",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/l5.txt",
+                  "line": 1,
+                  "text": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnneedlemmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm… [truncated]",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "context-line",
+          "op": "search",
+          "pattern": "needle",
+          "after": 1,
+          "root": "${ROOT}/l6.txt",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/l6.txt",
+                  "line": 1,
+                  "text": "needle",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/l6.txt",
+                  "line": 2,
+                  "text": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq… [truncated]",
+                  "is_match": false
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "exactly-500",
+          "op": "search",
+          "pattern": "needle",
+          "root": "${ROOT}/l7.txt",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/l7.txt",
+                  "line": 1,
+                  "text": "needlepppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.many-matches-in-many-files",
+      "description": "Hundreds of hits across files are sorted by path then line.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; for d in 0 1 2 3 4 5; do mkdir -p d$d; for f in 0 1 2 3 4 5 6 7 8 9; do printf 'needle %s\\nneedle %sb\\n' $f $f > d$d/f$f.txt; done; done",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "search",
+          "pattern": "needle",
+          "limit": 1000,
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": {
+                "$len": 120
+              },
+              "truncated": false
+            }
+          }
+        },
+        {
+          "id": "first",
+          "op": "search",
+          "pattern": "needle",
+          "limit": 1000,
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": {
+                "$includes": [
+                  {
+                    "path": "${ROOT}/d0/f0.txt",
+                    "line": 1,
+                    "text": "needle 0",
+                    "is_match": true
+                  },
+                  {
+                    "path": "${ROOT}/d0/f0.txt",
+                    "line": 2,
+                    "text": "needle 0b",
+                    "is_match": true
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.unreadable-file",
+      "description": "An unreadable file does not hide the matches elsewhere: they are returned, with a note naming the problem.",
+      "requires": {
+        "not_root": true
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo needle > ok.txt; echo needle > locked.txt; chmod 000 locked.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "search",
+          "pattern": "needle",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/ok.txt",
+                  "line": 1,
+                  "text": "needle",
+                  "is_match": true
+                }
+              ],
+              "note": {
+                "$any": true
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

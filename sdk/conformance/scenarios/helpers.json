@@ -1,0 +1,365 @@
+{
+  "suite": "helpers",
+  "version": 1,
+  "description": "Layer 2/3: helpers a user builds on the public exec calls alone. Every client must run these.",
+  "scenarios": [
+    {
+      "id": "helpers.user.git-status",
+      "description": "A user helper built from raw exec alone: `git status --porcelain` in a directory, parsed by the caller.",
+      "requires": {
+        "commands": [
+          "git"
+        ]
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; git init -q -b main . && git config user.email t@example.com && git config user.name t && echo one > tracked.txt && git add tracked.txt && git commit -q -m init && echo two >> tracked.txt && echo n > new.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "status",
+          "op": "exec",
+          "command": "git",
+          "args": [
+            "status",
+            "--porcelain"
+          ],
+          "cwd": "${ROOT}",
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": " M tracked.txt\n?? new.txt\n"
+            }
+          }
+        },
+        {
+          "id": "branch",
+          "op": "exec",
+          "command": "git",
+          "args": [
+            "rev-parse",
+            "--abbrev-ref",
+            "HEAD"
+          ],
+          "cwd": "${ROOT}",
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "main\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "helpers.user.changed-since-marker",
+      "description": "The same shape without git: a helper that lists files changed since a marker, with sh -c, find and sort, a script the user owns and sends through raw exec.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo a > a.txt; touch -t 200001010000 a.txt; touch .marker; touch -t 200001010001 .marker; mkdir sub; echo b > b.txt; echo c > sub/c.txt; touch -t 200001010002 b.txt sub/c.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "changed",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "cd \"$1\" && find . -type f -newer .marker | sort",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "./b.txt\n./sub/c.txt\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "helpers.user.write-run-read",
+      "description": "A user helper that composes the layers: write a script with the file helper, run it with raw exec in a chosen directory, read what it produced with the file helper.",
+      "steps": [
+        {
+          "id": "write-script",
+          "op": "write",
+          "path": "${ROOT}/job.sh",
+          "data_b64": "IyEvYmluL3NoCmVjaG8gImN3ZD0kKHB3ZCkiID4gcmVzdWx0LnR4dAplY2hvICJhcmc9JDEiID4+IHJlc3VsdC50eHQKZWNobyBkb25lCg==",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "make-executable",
+          "op": "exec",
+          "command": "chmod",
+          "args": [
+            "+x",
+            "${ROOT}/job.sh"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          }
+        },
+        {
+          "id": "run",
+          "op": "exec",
+          "command": "${ROOT}/job.sh",
+          "args": [
+            "hello world"
+          ],
+          "cwd": "${ROOT}",
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "done\n"
+            }
+          }
+        },
+        {
+          "id": "read-result",
+          "op": "read",
+          "path": "${ROOT}/result.txt",
+          "expect": {
+            "ok": {
+              "data_utf8": "cwd=${ROOT}\narg=hello world\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "helpers.user.pipeline-with-stdin",
+      "description": "Raw exec with stdin is a general filter: a user helper that sends text through sort | uniq -c.",
+      "requires": {
+        "stdin": true
+      },
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sort | uniq -c | sort -rn | head -n 2"
+          ],
+          "stdin_b64": "YgphCmIKYwpiCmEK",
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": {
+                "$re": "^\\s*3 b\n\\s*2 a\n$"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "helpers.user.run-job-to-completion",
+      "description": "A user helper built on the raw job calls: start, follow, read the status, clean up.",
+      "requires": {
+        "jobs": "any"
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "bb01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo building; sleep 0.2; echo built; exit 2"
+          ],
+          "label": "build",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "follow",
+          "op": "job_attach",
+          "scope": "${SCOPE}",
+          "job": "bb01",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "output_utf8": "building\nbuilt\n",
+              "exit_code": 2
+            }
+          }
+        },
+        {
+          "id": "remove",
+          "op": "job_remove",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "bb01"
+          ],
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "gone",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "helpers.user.stream-lines",
+      "description": "A user helper built on the raw stream: run a command and collect its output as it arrives.",
+      "requires": {
+        "stream": true
+      },
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec_stream",
+          "command": "sh",
+          "args": [
+            "-c",
+            "for i in 1 2 3; do echo line$i; done"
+          ],
+          "expect": {
+            "ok": {
+              "stdout_utf8": "line1\nline2\nline3\n",
+              "exit_code": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "helpers.user.copy-dir-with-tar",
+      "description": "A user's own directory copy on raw exec: tar the source to base64 text, then unpack that text on the other side from an argument. This is what the planned bulk helpers do properly.",
+      "requires": {
+        "find_printf": true,
+        "commands": [
+          "tar",
+          "base64"
+        ]
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir -p src/sub; echo a > src/a.txt; i=0; while [ $i -lt 256 ]; do printf \"\\\\$(printf %03o $i)\"; i=$((i+1)); done > src/sub/b.bin",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "pack",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "tar -C \"$1\" -cf - . | base64 | tr -d \"\\n\"",
+            "sh",
+            "${ROOT}/src"
+          ],
+          "save": {
+            "archive": "stdout_utf8"
+          },
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_len": {
+                "$gt": 100
+              }
+            }
+          }
+        },
+        {
+          "id": "unpack",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "mkdir -p \"$1\" && printf %s \"$2\" | base64 -d | tar -C \"$1\" -xf -",
+            "sh",
+            "${ROOT}/dst",
+            "${archive}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          }
+        },
+        {
+          "id": "tree",
+          "op": "list",
+          "path": "${ROOT}/dst",
+          "expect": {
+            "ok": {
+              "entries": {
+                "$unordered": [
+                  {
+                    "name": "a.txt",
+                    "kind": "file",
+                    "size": 2
+                  },
+                  {
+                    "name": "sub",
+                    "kind": "dir"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "nested",
+          "op": "read",
+          "path": "${ROOT}/dst/sub/b.bin",
+          "expect": {
+            "ok": {
+              "data_len": 256,
+              "data_sha256": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

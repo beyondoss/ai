@@ -1,0 +1,597 @@
+{
+  "suite": "exec",
+  "version": 1,
+  "description": "Layer 1: the one-shot exec call, v1.1.",
+  "scenarios": [
+    {
+      "id": "exec.basic.streams-and-exit",
+      "description": "One command: stdout and stderr arrive separately, with the exit code.",
+      "steps": [
+        {
+          "id": "s",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo out; echo err >&2; exit 3",
+            "sh"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 3,
+              "stdout_utf8": "out\n",
+              "stderr_utf8": "err\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "exec.args.verbatim",
+      "description": "Every argument arrives as one argv entry, untouched: spaces, quotes, $, globs, newlines, empty strings, non-ASCII.",
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec",
+          "command": "printf",
+          "args": [
+            "[%s]",
+            "a b",
+            "$HOME",
+            "*",
+            "",
+            "it's \"q\"",
+            "x\ny",
+            "é漢"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "[a b][$HOME][*][][it's \"q\"][x\ny][é漢]"
+            }
+          }
+        },
+        {
+          "id": "b",
+          "op": "exec",
+          "command": "printf",
+          "args": [
+            "%s",
+            "; echo injected"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "; echo injected"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "exec.exit.codes",
+      "description": "The exit code is reported as the process gave it, 0 to 255.",
+      "steps": [
+        {
+          "id": "zero",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "exit 0",
+            "sh"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          }
+        },
+        {
+          "id": "one",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "exit 1",
+            "sh"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 1
+            }
+          }
+        },
+        {
+          "id": "max",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "exit 255",
+            "sh"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 255
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "exec.exit.command-not-found",
+      "description": "A command that cannot be started is an ordinary result: exit 127 with the reason on stderr.",
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec",
+          "command": "no-such-command-xyz",
+          "args": [],
+          "expect": {
+            "ok": {
+              "exit_code": 127,
+              "stdout_utf8": "",
+              "stderr_utf8": {
+                "$re": "No such file or directory"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "exec.exit.signal-is-128-plus-n",
+      "description": "Over the one-shot envelope a command killed by signal S has exit_code 128+S.",
+      "steps": [
+        {
+          "id": "kill9",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "kill -9 $$",
+            "sh"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 137
+            }
+          }
+        },
+        {
+          "id": "kill15",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "kill -15 $$",
+            "sh"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 143
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "exec.cwd.explicit",
+      "description": "cwd sets the working directory; a missing one is exit 127 with the reason on stderr, not a transport error.",
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec",
+          "command": "pwd",
+          "args": [],
+          "cwd": "/",
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "/\n"
+            }
+          }
+        },
+        {
+          "id": "b",
+          "op": "exec",
+          "command": "pwd",
+          "args": [],
+          "cwd": "${ROOT}/missing",
+          "expect": {
+            "ok": {
+              "exit_code": 127,
+              "stderr_utf8": {
+                "$re": "No such file or directory"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "exec.cwd.default-is-absolute",
+      "description": "Without cwd the command runs in the endpoint's own directory, whatever it is.",
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec",
+          "command": "pwd",
+          "args": [],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": {
+                "$re": "^/.*\n$"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "exec.stdin.text",
+      "description": "stdin_b64 is fed to the command and then closed.",
+      "requires": {
+        "stdin": true
+      },
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec",
+          "command": "cat",
+          "stdin_b64": "aGVsbG8Kd29ybGQK",
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "hello\nworld\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "exec.stdin.binary-exact",
+      "description": "All 256 byte values survive stdin, NULs included.",
+      "requires": {
+        "stdin": true
+      },
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sha256sum | cut -d' ' -f1"
+          ],
+          "stdin_b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==",
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "exec.stdin.empty-and-absent",
+      "description": "An empty stdin and no stdin are both end-of-file immediately.",
+      "requires": {
+        "stdin": true
+      },
+      "steps": [
+        {
+          "id": "empty",
+          "op": "exec",
+          "command": "cat",
+          "stdin_b64": "",
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": ""
+            }
+          }
+        },
+        {
+          "id": "absent",
+          "op": "exec",
+          "command": "cat",
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": ""
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "exec.stdin.large",
+      "description": "A 1 MiB stdin arrives whole.",
+      "requires": {
+        "stdin": true
+      },
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec",
+          "command": "wc",
+          "args": [
+            "-c"
+          ],
+          "stdin_b64": {
+            "$repeat": {
+              "b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/wABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2BhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ent8fX5/gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp+goaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2+v8DBwsPExcbHyMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5ufo6err7O3u7/Dx8vP09fb3+Pn6+/z9/v8AAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4/QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl9gYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1+f4CBgoOEhYaHiImKi4yNjo+QkZKTlJWWl5iZmpucnZ6foKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr/AwcLDxMXGx8jJysvMzc7P0NHS09TV1tfY2drb3N3e3+Dh4uPk5ebn6Onq6+zt7u/w8fLz9PX29/j5+vv8/f7/AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==",
+              "times": 1024
+            }
+          },
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": {
+                "$re": "^\\s*1048576\\s*\n$"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "exec.stdout.non-utf8-is-lossy",
+      "description": "The one-shot answer carries text: bytes that are not valid UTF-8 come back as U+FFFD, which is why file helpers base64 content.",
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf 'a\\377b'",
+            "sh"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "a�b",
+              "stdout_b64": "Ye+/vWI="
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "exec.stdout.nul-and-control-bytes-in-text",
+      "description": "NUL and control characters that are valid UTF-8 pass through the JSON answer.",
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf 'a\\000b\\033[0m\\001'",
+            "sh"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_b64": "YQBiG1swbQE="
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "exec.timeout.exit-124",
+      "description": "At timeout_ms the endpoint kills the command's group and answers 200 with exit_code 124 and stderr ending 'command exceeded its timeout'; output so far is kept.",
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf before; sleep 30"
+          ],
+          "timeout_ms": 400,
+          "expect": {
+            "ok": {
+              "exit_code": 124,
+              "stdout_utf8": "before",
+              "stderr_utf8": {
+                "$re": "command exceeded its timeout$"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "exec.timeout.kills-the-group",
+      "description": "The deadline kills the whole process group, grandchildren included: a marker a grandchild would write later never appears.",
+      "steps": [
+        {
+          "id": "run",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "(sleep 1; echo late > \"$1/marker\") & sleep 30",
+            "sh",
+            "${ROOT}"
+          ],
+          "timeout_ms": 300,
+          "expect": {
+            "ok": {
+              "exit_code": 124
+            }
+          }
+        },
+        {
+          "id": "wait",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 1.5; ls \"$1\"",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": ""
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "exec.output.one-mib",
+      "description": "A megabyte of output arrives whole in one answer.",
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "head -c 1048576 /dev/zero | tr '\\000' x",
+            "sh"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_len": 1048576,
+              "stdout_sha256": "8f990ba0b577b51cf009ea049368c16bbda1b21e1b93be07a824758bb253c39b"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "exec.output.both-streams-large",
+      "description": "Large output on both streams at once does not deadlock or lose bytes.",
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "head -c 300000 /dev/zero | tr '\\000' o; head -c 300000 /dev/zero | tr '\\000' e >&2",
+            "sh"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_len": 300000,
+              "stderr_len": 300000
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "exec.env.is-clean-of-endpoint-config",
+      "description": "No EXECD_* setting reaches a command's environment (execd). Endpoints that are not execd may differ, so this only asserts the absence of a bearer-shaped variable.",
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "env | grep -c -i 'bearer' || true",
+            "sh"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "0\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "exec.shell.pipelines-are-the-callers-business",
+      "description": "Raw exec has no shell: a pipeline is only a pipeline when the caller runs sh -c itself.",
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec",
+          "command": "echo",
+          "args": [
+            "a | wc -c"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "a | wc -c\n"
+            }
+          }
+        },
+        {
+          "id": "b",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo abc | wc -c",
+            "sh"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": {
+                "$re": "^\\s*4\\s*\n$"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "exec.concurrent.independent",
+      "description": "Back-to-back commands do not share state: a variable set in one is not there in the next.",
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "export LEAK=1; echo set",
+            "sh"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "set\n"
+            }
+          }
+        },
+        {
+          "id": "b",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo \"[${LEAK-unset}]\"",
+            "sh"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "[unset]\n"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -246,7 +246,7 @@ fn client_info(apps: bool) -> ClientInfo {
         );
     ClientInfo::new(
         capabilities,
-        Implementation::new("beyond-ai-agent", env!("CARGO_PKG_VERSION")),
+        Implementation::new("beyond-agent", env!("CARGO_PKG_VERSION")),
     )
     .with_protocol_version(ProtocolVersion::V_2026_07_28)
 }

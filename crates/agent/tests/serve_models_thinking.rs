@@ -41,7 +41,7 @@ fn serve_switches_model_and_thinking_at_runtime() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -140,7 +140,7 @@ fn serve_cycle_model_advances_and_wraps() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -199,7 +199,7 @@ fn serve_set_model_and_cycle_model_responses_carry_capability_info() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -248,7 +248,7 @@ fn serve_set_model_colon_suffix_resolves_the_id_and_sets_reasoning_effort() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -537,7 +537,7 @@ fn serve_cycle_thinking_level_advances_through_the_ladder_and_wraps() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -579,7 +579,7 @@ fn serve_set_reasoning_effort_sets_the_portable_level_directly() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -642,7 +642,7 @@ fn serve_set_reasoning_effort_wins_over_a_stale_set_thinking_override() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -688,7 +688,7 @@ fn serve_starts_clamped_not_off_for_a_model_that_cannot_disable_reasoning() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd_with_model(bin, &base, &session_file, "gpt-5-codex").spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -720,7 +720,7 @@ fn serve_model_flag_off_suffix_starts_with_reasoning_off_not_the_medium_default(
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child =
         serve_cmd_with_model(bin, &base, &session_file, "claude-haiku-4-5:off").spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
@@ -747,7 +747,7 @@ fn serve_set_model_reclamps_off_when_switching_onto_a_non_disableable_model() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     // `claude-test` is disable-capable, so "off" is a legal level for it — but Fix 1 (pi-parity gap)
     // means a fresh session no longer *starts* there (see `serve_starts_clamped_not_off_...` and
     // `serve_cycle_thinking_level_advances_...` for that default). Forced explicitly here via
@@ -810,7 +810,7 @@ fn serve_cycle_thinking_level_never_gets_stuck_for_a_model_without_xhigh_or_off(
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd_with_model(bin, &base, &session_file, "gpt-5-codex").spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -848,7 +848,7 @@ fn serve_switch_model_retargets_the_next_turn_of_an_in_flight_prompt() {
     );
     let (base, bodies) = spawn_model_server(vec![turn1, turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -907,7 +907,7 @@ fn serve_switch_model_while_idle_is_a_no_op_pointing_at_set_model() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -941,7 +941,7 @@ fn serve_max_tokens_flag_reaches_the_wire_request_and_survives_a_model_switch() 
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, bodies) = spawn_model_server(vec![turn_text("first"), turn_text("second")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file)
         .args(["--max-tokens", "777"])
         .spawn_guarded();

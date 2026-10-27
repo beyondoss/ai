@@ -22,7 +22,7 @@ fn write_agent(dir: &std::path::Path, name: &str, frontmatter: &str, body: &str)
 }
 
 fn run_bin(dir: &std::path::Path, base: &str, message: &str) -> std::process::Output {
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     run_cmd(bin)
         .args([
             "run",

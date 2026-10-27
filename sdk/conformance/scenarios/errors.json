@@ -1,0 +1,813 @@
+{
+  "suite": "errors",
+  "version": 1,
+  "description": "Errors: one vocabulary across every op; auth, transport, size, request shape.",
+  "scenarios": [
+    {
+      "id": "errors.auth.wrong-bearer",
+      "description": "A wrong bearer is auth, on every op, for the one-shot, the stream, the file helpers and the jobs. Nothing is retried and nothing partially works.",
+      "requires": {
+        "auth": true
+      },
+      "connect": {
+        "bearer": "not-the-bearer"
+      },
+      "steps": [
+        {
+          "id": "exec",
+          "op": "exec",
+          "command": "true",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "exec-stream",
+          "op": "exec_stream",
+          "command": "true",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "stat",
+          "op": "stat",
+          "path": "/",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "read",
+          "op": "read",
+          "path": "/etc/hostname",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "write",
+          "op": "write",
+          "path": "${ROOT}/f",
+          "data_b64": "eA==",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "write-if-unchanged",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/f",
+          "data_b64": "eA==",
+          "expected_mtime": null,
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "mkdir",
+          "op": "mkdir",
+          "path": "${ROOT}/d",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "list",
+          "op": "list",
+          "path": "/",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "search",
+          "op": "search",
+          "root": "/",
+          "pattern": "x",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "job-start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "ba01",
+          "command": "true",
+          "args": [],
+          "label": "",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "job-list",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "capabilities",
+          "op": "capabilities",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "errors.auth.no-bearer",
+      "description": "No bearer at all is auth too.",
+      "requires": {
+        "auth": true
+      },
+      "connect": {
+        "bearer": null
+      },
+      "steps": [
+        {
+          "id": "exec",
+          "op": "exec",
+          "command": "true",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "exec-stream",
+          "op": "exec_stream",
+          "command": "true",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "stat",
+          "op": "stat",
+          "path": "/",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "read",
+          "op": "read",
+          "path": "/etc/hostname",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "write",
+          "op": "write",
+          "path": "${ROOT}/f",
+          "data_b64": "eA==",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "write-if-unchanged",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/f",
+          "data_b64": "eA==",
+          "expected_mtime": null,
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "mkdir",
+          "op": "mkdir",
+          "path": "${ROOT}/d",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "list",
+          "op": "list",
+          "path": "/",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "search",
+          "op": "search",
+          "root": "/",
+          "pattern": "x",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "job-start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "ba01",
+          "command": "true",
+          "args": [],
+          "label": "",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "job-list",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        },
+        {
+          "id": "capabilities",
+          "op": "capabilities",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "errors.auth.bearer-must-match-exactly",
+      "description": "A bearer that differs only in case, or by a prefix or an extra character, is refused.",
+      "requires": {
+        "auth": true
+      },
+      "connect": {
+        "bearer": "CONFORMANCE-SECRET"
+      },
+      "steps": [
+        {
+          "id": "upper",
+          "op": "exec",
+          "command": "true",
+          "expect": {
+            "error": {
+              "kind": "auth"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "errors.auth.right-bearer-works",
+      "description": "The configured bearer is accepted by every kind of call (the sanity check for the three scenarios above).",
+      "requires": {
+        "auth": true
+      },
+      "steps": [
+        {
+          "id": "exec",
+          "op": "exec",
+          "command": "echo",
+          "args": [
+            "ok"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "ok\n"
+            }
+          }
+        },
+        {
+          "id": "stream",
+          "op": "exec_stream",
+          "command": "echo",
+          "args": [
+            "ok"
+          ],
+          "expect": {
+            "ok": {
+              "stdout_utf8": "ok\n"
+            }
+          }
+        },
+        {
+          "id": "file",
+          "op": "write",
+          "path": "${ROOT}/f",
+          "data_b64": "eA==",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "job",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "errors.transport.unreachable",
+      "description": "An endpoint nothing listens on is transport, for every op: not a hang, not an empty success, and not a capability found missing.",
+      "connect": {
+        "url": "http://127.0.0.1:1/exec"
+      },
+      "steps": [
+        {
+          "id": "exec",
+          "op": "exec",
+          "command": "true",
+          "expect": {
+            "error": {
+              "kind": "transport"
+            }
+          }
+        },
+        {
+          "id": "exec-stream",
+          "op": "exec_stream",
+          "command": "true",
+          "expect": {
+            "error": {
+              "kind": "transport"
+            }
+          }
+        },
+        {
+          "id": "stat",
+          "op": "stat",
+          "path": "/",
+          "expect": {
+            "error": {
+              "kind": "transport"
+            }
+          }
+        },
+        {
+          "id": "read",
+          "op": "read",
+          "path": "/etc/hostname",
+          "expect": {
+            "error": {
+              "kind": "transport"
+            }
+          }
+        },
+        {
+          "id": "write",
+          "op": "write",
+          "path": "${ROOT}/f",
+          "data_b64": "eA==",
+          "expect": {
+            "error": {
+              "kind": "transport"
+            }
+          }
+        },
+        {
+          "id": "write-if-unchanged",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/f",
+          "data_b64": "eA==",
+          "expected_mtime": null,
+          "expect": {
+            "error": {
+              "kind": "transport"
+            }
+          }
+        },
+        {
+          "id": "mkdir",
+          "op": "mkdir",
+          "path": "${ROOT}/d",
+          "expect": {
+            "error": {
+              "kind": "transport"
+            }
+          }
+        },
+        {
+          "id": "list",
+          "op": "list",
+          "path": "/",
+          "expect": {
+            "error": {
+              "kind": "transport"
+            }
+          }
+        },
+        {
+          "id": "search",
+          "op": "search",
+          "root": "/",
+          "pattern": "x",
+          "expect": {
+            "error": {
+              "kind": "transport"
+            }
+          }
+        },
+        {
+          "id": "job-start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "ba01",
+          "command": "true",
+          "args": [],
+          "label": "",
+          "expect": {
+            "error": {
+              "kind": "transport"
+            }
+          }
+        },
+        {
+          "id": "job-list",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "error": {
+              "kind": "transport"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "errors.too-large.exec-output",
+      "description": "A one-shot answer over the response cap (16 MiB) is too_large, never a truncated success; the error says the command ran.",
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "head -c 20000000 /dev/zero | tr '\\000' x",
+            "sh"
+          ],
+          "expect": {
+            "error": {
+              "kind": "too_large",
+              "detail": {
+                "$re": "(?i)ran"
+              }
+            }
+          }
+        },
+        {
+          "id": "under",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "head -c 1000000 /dev/zero | tr '\\000' x",
+            "sh"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_len": 1000000
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "errors.invalid-request",
+      "description": "A request the driver cannot form is invalid_request and sends nothing: a missing required field, a wrong type, a negative or fractional count, undecodable base64.",
+      "steps": [
+        {
+          "id": "no-command",
+          "op": "exec",
+          "expect": {
+            "error": {
+              "kind": "invalid_request"
+            }
+          }
+        },
+        {
+          "id": "no-path",
+          "op": "stat",
+          "expect": {
+            "error": {
+              "kind": "invalid_request"
+            }
+          }
+        },
+        {
+          "id": "path-type",
+          "op": "stat",
+          "path": 5,
+          "expect": {
+            "error": {
+              "kind": "invalid_request"
+            }
+          }
+        },
+        {
+          "id": "negative-offset",
+          "op": "read",
+          "path": "${ROOT}/f",
+          "offset": -1,
+          "expect": {
+            "error": {
+              "kind": "invalid_request"
+            }
+          }
+        },
+        {
+          "id": "fractional-max",
+          "op": "read",
+          "path": "${ROOT}/f",
+          "max": 1.5,
+          "expect": {
+            "error": {
+              "kind": "invalid_request"
+            }
+          }
+        },
+        {
+          "id": "bad-base64",
+          "op": "write",
+          "path": "${ROOT}/f",
+          "data_b64": "!!not base64!!",
+          "expect": {
+            "error": {
+              "kind": "invalid_request"
+            }
+          }
+        },
+        {
+          "id": "missing-data",
+          "op": "write",
+          "path": "${ROOT}/f",
+          "expect": {
+            "error": {
+              "kind": "invalid_request"
+            }
+          }
+        },
+        {
+          "id": "expected-mtime-required",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/f",
+          "data_b64": "eA==",
+          "expect": {
+            "error": {
+              "kind": "invalid_request"
+            }
+          }
+        },
+        {
+          "id": "args-type",
+          "op": "exec",
+          "command": "true",
+          "args": "not-a-list",
+          "expect": {
+            "error": {
+              "kind": "invalid_request"
+            }
+          }
+        },
+        {
+          "id": "nothing-written",
+          "op": "stat",
+          "path": "${ROOT}/f",
+          "expect": {
+            "ok": {
+              "exists": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "errors.unsupported-op",
+      "description": "An op the driver does not have is unsupported. (The harness treats a driver that says this about an op its scenarios use as lacking the capability, never as a pass.)",
+      "steps": [
+        {
+          "id": "a",
+          "op": "frobnicate",
+          "expect": {
+            "error": {
+              "kind": "unsupported"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "errors.not-offered.stream-on-a-v11-endpoint",
+      "description": "An endpoint that answers a stream request with one JSON object has not proved v1.2: exec_stream is not_offered, and the command is not run as a one-shot instead.",
+      "requires": {
+        "stream": false
+      },
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec_stream",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo ran > \"$1/ran\"",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "error": {
+              "kind": "not_offered"
+            }
+          }
+        },
+        {
+          "id": "did-not-run",
+          "op": "stat",
+          "path": "${ROOT}/ran",
+          "expect": {
+            "ok": {
+              "exists": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "errors.kinds.file-helpers-use-one-vocabulary",
+      "description": "The kinds the file helpers produce for a command that ran and failed: not_found, is_directory, not_a_directory, permission_denied; a failure the vocabulary does not name is io.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir d; echo x > f",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "read-missing",
+          "op": "read",
+          "path": "${ROOT}/nope",
+          "expect": {
+            "error": {
+              "kind": "not_found"
+            }
+          }
+        },
+        {
+          "id": "read-dir",
+          "op": "read",
+          "path": "${ROOT}/d",
+          "expect": {
+            "error": {
+              "kind": "is_directory"
+            }
+          }
+        },
+        {
+          "id": "list-missing",
+          "op": "list",
+          "path": "${ROOT}/nope",
+          "expect": {
+            "error": {
+              "kind": "not_found"
+            }
+          }
+        },
+        {
+          "id": "write-parent-missing",
+          "op": "write",
+          "path": "${ROOT}/nope/f",
+          "data_b64": "eA==",
+          "expect": {
+            "error": {
+              "kind": "not_found"
+            }
+          }
+        },
+        {
+          "id": "mkdir-through-file",
+          "op": "mkdir",
+          "path": "${ROOT}/f/x",
+          "expect": {
+            "error": {
+              "kind": "not_a_directory"
+            }
+          }
+        },
+        {
+          "id": "bad-regex",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "(",
+          "expect": {
+            "error": {
+              "kind": "invalid_query"
+            }
+          }
+        },
+        {
+          "id": "stale-guard",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/f",
+          "data_b64": "eA==",
+          "expected_mtime": 1,
+          "expect": {
+            "error": {
+              "kind": "conflict"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "errors.exec.nonzero-exit-is-not-an-error",
+      "description": "A command that runs and fails is an ok answer with its exit code: only a failure to run it at all is an error.",
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "exit 9",
+            "sh"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 9
+            }
+          }
+        },
+        {
+          "id": "b",
+          "op": "exec",
+          "command": "false",
+          "args": [],
+          "expect": {
+            "ok": {
+              "exit_code": 1
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

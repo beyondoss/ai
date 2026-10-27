@@ -48,7 +48,7 @@ fn a_silent_server_times_out_and_the_others_still_load() {
     let (base, bodies) = spawn_model_server(vec![turn_text("hi")]);
     let stderr_path = home.path().join("stderr");
     let cwd = tempfile::tempdir().unwrap();
-    let mut child = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let mut child = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .env("HOME", home.path())
         .env("BEYOND_AI_AGENT_MCP_HANDSHAKE_SECS", "2")
         .args([

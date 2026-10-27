@@ -68,7 +68,7 @@ struct Defect {
 /// One test function carrying `claim:` / `defect:` tags.
 struct Tagged {
     name: String,
-    /// nextest binary id the test lives in, e.g. `beyond-ai::e2e` or `beyond-ai` (lib).
+    /// nextest binary id the test lives in, e.g. `beyond-gateway::e2e` or `beyond-gateway` (lib).
     binary: String,
     file: PathBuf,
     line: usize,

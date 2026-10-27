@@ -11,7 +11,7 @@ use crate::common;
 use common::{advertised_tools, run_cmd, spawn_model_server, turn_text, turn_tool_use};
 use serde_json::{Value, json};
 
-const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
+const BIN: &str = env!("CARGO_BIN_EXE_agent");
 
 /// A strict schema — `additionalProperties: false` is the right thing for one describing an exact
 /// payload, and is exactly what the loop's injected `_model_supports_vision` key would otherwise break.
