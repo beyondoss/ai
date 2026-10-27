@@ -99,29 +99,53 @@ pub enum SearchEngine {
 }
 
 impl Capabilities {
-    /// Probe the target. Each check is one argv-only command with a short timeout; a probe that errors
-    /// is read as "absent" rather than failing the attach, because a missing optional tool is a
-    /// degraded search, not a broken box.
-    pub async fn probe(runner: &dyn CommandRunner) -> Self {
-        async fn ok(runner: &dyn CommandRunner, program: &str, args: &[&str]) -> bool {
-            runner
-                .run(
-                    program,
-                    &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
-                    None,
-                    PROBE_TIMEOUT,
-                )
-                .await
-                // Exit 1 means "ran fine, found nothing" for grep/find; only a usage error (2 on GNU
-                // and busybox alike) means the flag is unsupported.
-                .map(|r| matches!(r.code, Some(0) | Some(1)))
-                .unwrap_or(false)
+    /// Probe the target. Each check is one argv-only command with a short timeout. A probe that *ran*
+    /// and gave the "absent" answer (non-zero exit, a command that cannot be started, a runner with
+    /// no stdin) is read as absent rather than failing the attach, because a missing optional tool
+    /// is a degraded search, not a broken box. A probe whose *request* failed (unreachable, `401`,
+    /// a timeout, a protocol error) says nothing about the box and is returned: caching it as "no
+    /// stdin, no `dd`" would turn an outage or a wrong bearer into a misleading failure later.
+    pub async fn probe(runner: &dyn CommandRunner) -> std::io::Result<Self> {
+        /// `Ok(None)`: the probe could not run on the target at all, which is its answer.
+        fn settle(r: std::io::Result<ExecResult>) -> std::io::Result<Option<ExecResult>> {
+            match r {
+                Ok(r) => Ok(Some(r)),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::Unsupported
+                    ) =>
+                {
+                    Ok(None)
+                }
+                Err(e) => Err(e),
+            }
         }
-        let rg = runner
-            .run("rg", &["--version".to_string()], None, PROBE_TIMEOUT)
-            .await
-            .map(|r| r.code == Some(0))
-            .unwrap_or(false);
+        async fn ok(
+            runner: &dyn CommandRunner,
+            program: &str,
+            args: &[&str],
+        ) -> std::io::Result<bool> {
+            Ok(settle(
+                runner
+                    .run(
+                        program,
+                        &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                        None,
+                        PROBE_TIMEOUT,
+                    )
+                    .await,
+            )?
+            // Exit 1 means "ran fine, found nothing" for grep/find; only a usage error (2 on GNU
+            // and busybox alike) means the flag is unsupported.
+            .is_some_and(|r| matches!(r.code, Some(0) | Some(1))))
+        }
+        let rg = settle(
+            runner
+                .run("rg", &["--version".to_string()], None, PROBE_TIMEOUT)
+                .await,
+        )?
+        .is_some_and(|r| r.code == Some(0));
         // Probed against `/` because it exists everywhere; the pattern matches nothing, so this is a
         // flag check rather than a search.
         let grep_null = ok(
@@ -129,36 +153,40 @@ impl Capabilities {
             "grep",
             &["-rnZ", "-e", "__cap_probe__", "--", "/dev/null"],
         )
-        .await;
+        .await?;
         let find_printf = ok(
             runner,
             "find",
             &["/dev/null", "-maxdepth", "0", "-printf", "%y"],
         )
-        .await;
+        .await?;
         // An echo, not an `Ok`: only the bytes coming back prove they went in. See `Self::stdin`.
-        let stdin = runner
-            .run_with_stdin("cat", &[], None, PROBE_TIMEOUT, STDIN_PROBE.as_bytes())
-            .await
-            .is_ok_and(|r| r.code == Some(0) && r.stdout == STDIN_PROBE);
+        let stdin = settle(
+            runner
+                .run_with_stdin("cat", &[], None, PROBE_TIMEOUT, STDIN_PROBE.as_bytes())
+                .await,
+        )?
+        .is_some_and(|r| r.code == Some(0) && r.stdout == STDIN_PROBE);
         // The exact pipeline `READ_WINDOW_SCRIPT` ends in, on three bytes: `Yg==` is "b" and nothing
         // else. Judged on stdout, because the pipeline's exit status is `base64`'s alone.
-        let no_read_window = !runner
-            .run(
-                "sh",
-                &["-c".to_string(), READ_WINDOW_PROBE.to_string()],
-                None,
-                PROBE_TIMEOUT,
-            )
-            .await
-            .is_ok_and(|r| r.code == Some(0) && r.stdout.trim() == "Yg==");
-        Self {
+        let no_read_window = !settle(
+            runner
+                .run(
+                    "sh",
+                    &["-c".to_string(), READ_WINDOW_PROBE.to_string()],
+                    None,
+                    PROBE_TIMEOUT,
+                )
+                .await,
+        )?
+        .is_some_and(|r| r.code == Some(0) && r.stdout.trim() == "Yg==");
+        Ok(Self {
             rg,
             grep_null,
             find_printf,
             stdin,
             no_read_window,
-        }
+        })
     }
 
     /// Which engine [`ShellFs::search`] will use.
@@ -190,9 +218,12 @@ pub struct ShellFs {
 
 impl ShellFs {
     /// Build a backend over `runner`, probing the target for what it has.
-    pub async fn connect(runner: Arc<dyn CommandRunner>) -> Self {
-        let caps = Capabilities::probe(runner.as_ref()).await;
-        Self::with_capabilities(runner, caps)
+    ///
+    /// Fails with the runner's own error when a probe request fails (see [`Capabilities::probe`]);
+    /// nothing is learned from a probe that did not run.
+    pub async fn connect(runner: Arc<dyn CommandRunner>) -> std::io::Result<Self> {
+        let caps = Capabilities::probe(runner.as_ref()).await?;
+        Ok(Self::with_capabilities(runner, caps))
     }
 
     /// Build with capabilities already known — used by tests to exercise a specific rung of the
@@ -1623,12 +1654,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("precious.txt");
         std::fs::write(&path, "keep me\n").unwrap();
-        let fs = ShellFs::connect(Arc::new(shim(dir.path(), "dd"))).await;
+        let fs = ShellFs::connect(Arc::new(shim(dir.path(), "dd")))
+            .await
+            .unwrap();
         assert!(fs.capabilities().no_read_window);
         let err = fs.read_bytes(&path, 0, 1024).await.unwrap_err();
         assert!(err.to_string().contains("cannot be read"), "{err}");
         // A target with the flags reads it, and the probe agrees.
-        let fs = ShellFs::connect(Arc::new(Prelude(":".into()))).await;
+        let fs = ShellFs::connect(Arc::new(Prelude(":".into())))
+            .await
+            .unwrap();
         assert!(!fs.capabilities().no_read_window);
         assert_eq!(fs.read_bytes(&path, 0, 1024).await.unwrap(), b"keep me\n");
     }
@@ -1636,8 +1671,34 @@ mod tests {
     #[tokio::test]
     async fn a_target_whose_base64_lacks_dash_w_is_probed_as_unable_to_read() {
         let dir = tempfile::tempdir().unwrap();
-        let caps = Capabilities::probe(&shim(dir.path(), "base64")).await;
+        let caps = Capabilities::probe(&shim(dir.path(), "base64"))
+            .await
+            .unwrap();
         assert!(caps.no_read_window);
+    }
+
+    /// A runner whose every request fails, as a wrong bearer's does.
+    struct Refused;
+
+    #[async_trait::async_trait]
+    impl CommandRunner for Refused {
+        async fn run(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<&str>,
+            _: Duration,
+        ) -> std::io::Result<ExecResult> {
+            Err(std::io::Error::other(
+                "exec endpoint http://x returned 401: unauthorized",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_probe_whose_request_failed_fails_connect_instead_of_reading_as_absent() {
+        let err = ShellFs::connect(Arc::new(Refused)).await.err().unwrap();
+        assert!(err.to_string().contains("returned 401"), "got: {err}");
     }
 
     #[test]

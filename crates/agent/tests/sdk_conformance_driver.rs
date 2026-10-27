@@ -209,18 +209,12 @@ impl Driver {
             runner = runner.with_header("Authorization", format!("Bearer {token}"));
         }
         let runner = Arc::new(runner);
-        // The first request decides whether the endpoint is usable at all. A probe that failed
-        // here would otherwise be read as "this box has no stdin, no dd, no find" and the answer
-        // kept for the life of the driver.
-        let connect_error = runner
-            .run("true", &[], None, Duration::from_secs(10))
-            .await
-            .err()
-            .map(|e| io_err(&e));
-        let mut caps = if connect_error.is_none() {
-            Capabilities::probe(runner.as_ref()).await
-        } else {
-            Capabilities::default()
+        // ShellFs itself decides: a probe whose request failed (unreachable, `401`) fails connect, and
+        // that error is what every op reports. The exec/stream/jobs paths then fail the same way
+        // on their own first request.
+        let (mut caps, connect_error) = match Capabilities::probe(runner.as_ref()).await {
+            Ok(caps) => (caps, None),
+            Err(e) => (Capabilities::default(), Some(io_err(&e))),
         };
         if let Some(s) = cfg.caps.stdin {
             caps.stdin = s;

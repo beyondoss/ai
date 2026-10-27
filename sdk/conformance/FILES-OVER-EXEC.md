@@ -188,9 +188,8 @@ succeeded.
 If a probe request fails at the transport level (unreachable, `auth`,
 `endpoint`, `timeout`), the client MUST report that error from the operation
 that needed the probe, and MUST NOT cache a capability set learned from failed
-probes. (The reference `ShellFs::connect` reads every probe error as "absent",
-so with a wrong bearer it concludes the sandbox has no stdin and no `dd`, and
-the first read then fails with a message about `dd`. See D3.)
+probes. (The reference `ShellFs::connect` fails with the runner's error when a
+probe request fails; only a probe that ran and answered "absent" means absent.)
 
 Probe overrides for testing are in DRIVER.md (`CONFORMANCE_CAPS`).
 
@@ -719,8 +718,6 @@ reference driver, which turns into a plain pass when the reference is fixed.
   while `kind` follows the link, so `write_if_unchanged` through a link
   compares the wrong file. Scenarios `files.stat.symlink-size-and-mtime-follow`
   and `files.write-if-unchanged.through-symlink`.
-- **D3. Probe errors.** See section 4.2. Scenario `errors.auth.*` (the
-  reference driver surfaces them itself, with a first request before probing).
 - **D4. Search on a missing root** is reported as `invalid_query` (`bad regex:
   rg: ...No such file or directory`) because any exit above 1 is read as a bad
   pattern. A client SHOULD report `not_found`; the scenario accepts either.

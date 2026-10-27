@@ -109,7 +109,7 @@ async fn mock_provider(
 }
 
 async fn registry_over(runner: Arc<dyn CommandRunner>) -> agent_core::ToolRegistry {
-    let backend = ShellFs::connect(runner.clone()).await;
+    let backend = ShellFs::connect(runner.clone()).await.unwrap();
     default_registry_with_config(&ToolConfig {
         fs_backend: Some(Arc::new(backend) as Arc<dyn FsBackend>),
         command_runner: Some(runner),

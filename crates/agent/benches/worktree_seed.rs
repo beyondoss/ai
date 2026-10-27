@@ -107,7 +107,7 @@ async fn measure(label: &str, untracked: usize, hop: Option<Duration>) {
                     hop,
                     calls: AtomicUsize::new(0),
                 });
-                let backend = Arc::new(ShellFs::connect(runner.clone()).await);
+                let backend = Arc::new(ShellFs::connect(runner.clone()).await.unwrap());
                 (Git::remote(runner.clone(), backend), Some(runner))
             }
         };
