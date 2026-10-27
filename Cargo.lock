@@ -599,7 +599,6 @@ dependencies = [
  "base64 0.22.1",
  "beyond-exec-notify",
  "beyond-test-support",
- "futures",
  "getrandom 0.3.4",
  "globset",
  "hex",
