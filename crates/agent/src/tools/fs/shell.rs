@@ -1577,7 +1577,13 @@ fn parse_records(stdout: &str) -> Vec<Hit> {
             i += 3;
             continue;
         }
-        if rest_bytes == b"--" {
+        // `rg --crlf` (which ShellFs passes) writes the separator as `--\r\n`. A path named `--\r`
+        // is still told apart: its record continues `--\r\0`, never `--\r\n`.
+        if rest_bytes.starts_with(b"--\r\n") {
+            i += 4;
+            continue;
+        }
+        if rest_bytes == b"--" || rest_bytes == b"--\r" {
             break; // a trailing separator with no final newline
         }
         let Some(nul) = memchr_from(bytes, i, b'\0') else {
@@ -1823,6 +1829,28 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[1].path.to_string_lossy(), "b.rs");
         assert_eq!(hits[1].line, 9);
+    }
+
+    #[test]
+    fn skips_the_crlf_group_separator_rg_writes_under_crlf() {
+        let hits = parse_records("a.rs\u{0}1:one\r\n--\r\nb.rs\u{0}9:two\r\n");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[1].path.to_string_lossy(), "b.rs");
+        assert_eq!(hits[1].line, 9);
+    }
+
+    #[test]
+    fn files_named_like_a_separator_are_not_skipped() {
+        let hits = parse_records("--\u{0}1:x\n--\r\u{0}2:y\n--\n--\u{0}3:--\n");
+        let got: Vec<_> = hits
+            .iter()
+            .map(|h| (h.path.to_string_lossy().into_owned(), h.line))
+            .collect();
+        assert_eq!(
+            got,
+            [("--".into(), 1), ("--\r".into(), 2), ("--".into(), 3)]
+        );
+        assert_eq!(hits[2].text, "--");
     }
 
     #[test]
