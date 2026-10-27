@@ -729,6 +729,16 @@
             "error": {
               "kind": "not_found"
             }
+          },
+          "xfail": {
+            "drivers": [
+              "agent-reference"
+            ],
+            "reason": "busybox `find` has no -printf, prints its usage and exits 1, and the probe counts exit 1 as present (see Known deviations)",
+            "when": {
+              "find_printf": true,
+              "search_engine": "busybox-grep"
+            }
           }
         },
         {
