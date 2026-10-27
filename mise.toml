@@ -261,3 +261,40 @@ reports="--junit target/nextest/verify/junit.xml"
 if [ -f target/nextest/verify-isolated/junit.xml ]; then reports="$reports --junit target/nextest/verify-isolated/junit.xml"; fi
 cargo run -q -p beyond-verify -- gate $reports
 """
+
+# ---- python client: beyond-sandbox (sdk/python/sandbox) ---------------------------------------------
+
+[tasks."install:py"]
+description = "Install beyond-sandbox and its dev tools into sdk/python/sandbox/.venv (uv when present, else venv + pip)."
+run = """
+set -e
+cd sdk/python/sandbox
+if command -v uv >/dev/null 2>&1; then
+  uv venv -q --allow-existing .venv
+  uv pip install -q --python .venv/bin/python -e '.[dev]'
+else
+  [ -x .venv/bin/python ] || python3 -m venv .venv
+  .venv/bin/pip install -q -e '.[dev]'
+fi
+"""
+
+[tasks."check:py"]
+description = "beyond-sandbox: ruff format and lint, mypy --strict."
+depends = ["install:py"]
+run = """
+set -e
+cd sdk/python/sandbox
+.venv/bin/ruff format --check .
+.venv/bin/ruff check .
+.venv/bin/mypy
+"""
+
+[tasks."test:py"]
+description = "beyond-sandbox: the pytest suite. The loopback tests need execd (cargo build -p beyond-execd, or EXECD_BIN) and skip without it. The shared matrix is `mise run test:clients`."
+depends = ["install:py"]
+run = """
+set -e
+cargo build -q -p beyond-execd
+cd sdk/python/sandbox
+.venv/bin/pytest
+"""

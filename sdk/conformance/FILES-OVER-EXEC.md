@@ -272,10 +272,16 @@ preplanted name cannot redirect the write. The scripts (C and D below) do the
 resolution, in order:
 
 1. a path starting with `-` is prefixed with `./`;
-2. if it is a symlink, resolve it: `readlink -f`, and if that yields nothing
-   (a dangling link) one `readlink` hop, joined to the link's directory when
-   relative; the prefix rule of 1 is applied again;
-3. the temp is created empty with `set -C` (no-clobber: a preplanted temp is
+2. if it is a symlink, resolve it: `readlink -f` when the target exists. A
+   dangling link (or a `readlink -f` that yields nothing) is walked by hand, one
+   `readlink` hop at a time (at most 40), each relative hop joined to the
+   directory of the link it came from. busybox's `readlink -f` of a dangling
+   relative link answers against the working directory, not the link's, which
+   is why it is not trusted there. The prefix rule of 1 is applied again;
+3. a target that is a directory is refused (`Is a directory (os error 21)`), before
+   the temp exists and again just before the `mv`, which would otherwise move
+   the temp into the directory and succeed;
+   the temp is created empty with `set -C` (no-clobber: a preplanted temp is
    refused, not followed);
 4. if the target exists, the temp gets its mode **before any content**:
    `chmod --reference`, falling back to `chmod "$(stat -L -c %a TARGET)"`
@@ -573,7 +579,7 @@ else t=o
 fi
 if [ -w "$1" ]; then w=w; else w=-; fi
 printf '%s	%s	' "$w" "$t"
-stat -c '%s	%Y' -- "$1" 2>/dev/null || printf '0	0'
+stat -L -c '%s	%Y' -- "$1" 2>/dev/null || printf '0	0'
 printf '
 '
 ```
@@ -602,18 +608,27 @@ exec dd if="$1" iflag=skip_bytes,count_bytes skip="$2" count="$3" status=none | 
 t="$1"
 case "$t" in -*) t="./$t" ;; esac
 if [ -L "$t" ]; then
-  r=$(readlink -f "$t" 2>/dev/null) || r=
+  r=
+  [ -e "$t" ] && r=$(readlink -f "$t" 2>/dev/null)
   if [ -z "$r" ]; then
-    r=$(readlink "$t") || exit 1
-    case "$r" in
-      /*) ;;
-      *) case "$t" in */*) r="${t%/*}/$r" ;; esac ;;
-    esac
+    r=$t n=0
+    while [ -L "$r" ] && [ $n -lt 40 ]; do
+      l=$(readlink "$r") || exit 1
+      case "$l" in
+        /*) r=$l ;;
+        *) case "$r" in */*) r="${r%/*}/$l" ;; *) r=$l ;; esac ;;
+      esac
+      n=$((n + 1))
+    done
   fi
   t="$r"
   case "$t" in -*) t="./$t" ;; esac
 fi
 tmp="$t.tmp.$2"
+if [ -d "$t" ]; then
+  echo "Is a directory (os error 21)" >&2
+  exit 1
+fi
 set -C
 : > "$tmp" || exit 1
 set +C
@@ -627,6 +642,7 @@ fi
 if cat >> "$tmp"; then
   n=$(wc -c < "$tmp")
   if [ $n -eq "$3" ]; then
+    if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
     mv -f "$tmp" "$t" && exit 0
   else
     echo "short write: $n of $3 bytes arrived on stdin" >&2
@@ -642,19 +658,28 @@ exit 1
 t="$1"
 case "$t" in -*) t="./$t" ;; esac
 if [ -L "$t" ]; then
-  r=$(readlink -f "$t" 2>/dev/null) || r=
+  r=
+  [ -e "$t" ] && r=$(readlink -f "$t" 2>/dev/null)
   if [ -z "$r" ]; then
-    r=$(readlink "$t") || exit 1
-    case "$r" in
-      /*) ;;
-      *) case "$t" in */*) r="${t%/*}/$r" ;; esac ;;
-    esac
+    r=$t n=0
+    while [ -L "$r" ] && [ $n -lt 40 ]; do
+      l=$(readlink "$r") || exit 1
+      case "$l" in
+        /*) r=$l ;;
+        *) case "$r" in */*) r="${r%/*}/$l" ;; *) r=$l ;; esac ;;
+      esac
+      n=$((n + 1))
+    done
   fi
   t="$r"
   case "$t" in -*) t="./$t" ;; esac
 fi
 tmp="$t.tmp.$2"
 if [ "$4" = new ]; then
+if [ -d "$t" ]; then
+  echo "Is a directory (os error 21)" >&2
+  exit 1
+fi
 set -C
 : > "$tmp" || exit 1
 set +C
@@ -670,6 +695,7 @@ printf %s "$3" | base64 -d >> "$tmp" || { rm -f "$tmp"; exit 1; }
 [ -z "$5" ] && exit 0
 n=$(wc -c < "$tmp")
 if [ $n -eq "$6" ]; then
+  if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
   mv -f "$tmp" "$t" && exit 0
 else
   echo "short write: $n of $6 bytes assembled" >&2
@@ -684,13 +710,18 @@ exit 1
 t="$1"
 case "$t" in -*) t="./$t" ;; esac
 if [ -L "$t" ]; then
-  r=$(readlink -f "$t" 2>/dev/null) || r=
+  r=
+  [ -e "$t" ] && r=$(readlink -f "$t" 2>/dev/null)
   if [ -z "$r" ]; then
-    r=$(readlink "$t") || exit 1
-    case "$r" in
-      /*) ;;
-      *) case "$t" in */*) r="${t%/*}/$r" ;; esac ;;
-    esac
+    r=$t n=0
+    while [ -L "$r" ] && [ $n -lt 40 ]; do
+      l=$(readlink "$r") || exit 1
+      case "$l" in
+        /*) r=$l ;;
+        *) case "$r" in */*) r="${r%/*}/$l" ;; *) r=$l ;; esac ;;
+      esac
+      n=$((n + 1))
+    done
   fi
   t="$r"
   case "$t" in -*) t="./$t" ;; esac
