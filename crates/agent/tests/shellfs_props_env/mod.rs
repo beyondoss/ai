@@ -80,7 +80,6 @@ pub fn settings(default_cases: u64, seed: u64) -> hegel::Settings {
         .seed(Some(seed))
         .database(None)
         .show_statistics(std::env::var_os("SHELLFS_PROPS_STATS").is_some())
-        .report_multiple_failures(true)
         .suppress_health_check(hegel::HealthCheck::all())
 }
 
