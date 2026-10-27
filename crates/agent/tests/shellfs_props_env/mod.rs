@@ -565,6 +565,33 @@ impl Machine {
         p
     }
 
+    /// Whether `target`, as a symlink at `link`, resolves (lexically, `..` popping a component) to a
+    /// path inside the test root.
+    fn stays_inside(&self, link: &Path, target: &Path) -> bool {
+        use std::path::Component;
+        let Ok(root) = std::fs::canonicalize(&self.root) else {
+            return false;
+        };
+        let mut cur = if target.is_absolute() {
+            PathBuf::from("/")
+        } else {
+            match link.parent().map(std::fs::canonicalize) {
+                Some(Ok(d)) => d,
+                _ => return false,
+            }
+        };
+        for c in target.components() {
+            match c {
+                Component::Normal(n) => cur.push(n),
+                Component::ParentDir => {
+                    cur.pop();
+                }
+                _ => {}
+            }
+        }
+        cur.starts_with(&root) || cur.starts_with(&self.root)
+    }
+
     fn pick_dir(&mut self, tc: &TestCase) -> PathBuf {
         let mut dirs = vec![self.root.clone(); 2];
         dirs.extend(self.known.iter().filter(|k| k.is_dir()).cloned());
@@ -1462,6 +1489,12 @@ impl Machine {
             2 => PathBuf::from(fixtures::name(&tc)).with_extension("lnk"),
             _ => self.pick_path(&tc),
         };
+        // A link must never lead out of the test root: `list` follows it, and the oracle and the
+        // client would then read a live, shared directory (`/tmp`) at different moments. A link to a
+        // file outside (`/dev/null`) is harmless; a dangling one inside is fine.
+        if target != Path::new("/dev/null") && !self.stays_inside(&link, &target) {
+            return;
+        }
         tc.note(&format!(
             "env: symlink {:?} -> {:?}",
             link.strip_prefix(&self.root).unwrap(),
