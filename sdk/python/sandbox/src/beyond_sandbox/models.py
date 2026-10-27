@@ -82,7 +82,7 @@ FINAL = (Exit, Signal, TimedOut)
 class Stat:
     kind: Kind
     size: int
-    mtime: int  # epoch seconds
+    mtime: float  # epoch seconds, with the fraction stat reports (nanoseconds on GNU and busybox)
     writable: bool
 
 

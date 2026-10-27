@@ -90,8 +90,8 @@ class Files:
         """Replace the file's content atomically, keeping its mode and writing through symlinks."""
         drive(_fs.write(path, data, self.capabilities()), self._t)
 
-    def write_if_unchanged(self, path: str, data: bytes, expected_mtime: int | None) -> None:
-        """Write unless the file's mtime (whole seconds) differs; ``None`` means "must not exist".
+    def write_if_unchanged(self, path: str, data: bytes, expected_mtime: float | None) -> None:
+        """Write unless the file's mtime (epoch seconds, with the fraction) differs; ``None`` means "must not exist".
 
         Raises :class:`~beyond_sandbox.Conflict` on a mismatch. Two round trips: not a lock.
         """
@@ -151,7 +151,7 @@ class AsyncFiles:
     async def write(self, path: str, data: bytes) -> None:
         await adrive(_fs.write(path, data, await self.capabilities()), self._t)
 
-    async def write_if_unchanged(self, path: str, data: bytes, expected_mtime: int | None) -> None:
+    async def write_if_unchanged(self, path: str, data: bytes, expected_mtime: float | None) -> None:
         op = _fs.write_if_unchanged(path, data, expected_mtime, await self.capabilities())
         await adrive(op, self._t)
 

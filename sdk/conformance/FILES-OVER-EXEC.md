@@ -214,12 +214,17 @@ Runs `sh -c STAT_SCRIPT sh PATH` (script A). Parse stdout:
 - otherwise the first line is `W<TAB>T<TAB>SIZE<TAB>MTIME`: `W` is `w`
   (writable) or `-`; `T` is `f` file, `d` directory, `o` other (FIFO, socket,
   device); `SIZE` an integer (a line that does not parse is also "does not
-  exist"); `MTIME` is epoch seconds, optionally with a fractional part, of
-  which the **integer part** is kept (truncated, not rounded).
+  exist"); `MTIME` is `SECS.FRAC`: epoch seconds, a dot, and the fractional
+  digits `stat` reports (nine digits of nanoseconds on GNU coreutils and on
+  busybox; `0` if it reports none). A client keeps **all of it**, as a number
+  (a double is enough: it resolves 0.24 µs at present epochs, finer than any
+  filesystem records).
 
 `kind` follows symlinks (`[ -d ]`/`[ -f ]`), `writable` is a real access check
-for the calling user (`[ -w ]`), not mode bits. If `stat -c` itself fails the
-script prints `0<TAB>0`.
+for the calling user (`[ -w ]`), not mode bits. The script takes the whole
+seconds from `stat -c %Y` and the fraction from the part after the dot of
+`stat -c %y` (`YYYY-MM-DD HH:MM:SS.NNNNNNNNN ZONE` on both GNU and busybox;
+`%.9Y` is GNU-only). If `stat -c` itself fails the script prints `0<TAB>0`.
 
 A symlink's `size` and `mtime` are the target's, like `kind`: the script runs
 `stat -L -c` (GNU and busybox both accept it). A dangling link fails the
@@ -358,16 +363,20 @@ Further rules:
 `write_if_unchanged(path, bytes, expected_mtime: int | null)`
 
 1. `m = stat(path)` and take its `mtime` (absent if the path does not exist).
-2. Compare **whole epoch seconds**: they match when `m` and `expected_mtime`
-   are both absent, or both present and equal. Otherwise fail with `conflict`
-   and write nothing.
+2. Compare the mtimes **at full precision, as numbers**: they match when `m`
+   and `expected_mtime` are both absent, or both present and equal (the same
+   `SECS.FRAC` parsed to a double gives the same double, so the comparison a
+   client makes between two of its own `stat` results is exact). Otherwise fail
+   with `conflict` and write nothing.
 3. `write(path, bytes)`.
 
-So `expected_mtime` null means "the file must not exist". The key is required.
+So `expected_mtime` null means "the file must not exist". The key is required,
+and a number is the `mtime` of an earlier `stat`, fraction included: a value
+truncated to whole seconds does not match a file whose mtime has a fraction.
 The two steps are two round trips and the guard is not a lock: it catches a
-person or agent editing between a read and a write, and misses an edit that
-leaves the mtime second unchanged (a limit, with a scenario). Through a symlink
-the comparison MUST use the target's mtime.
+person or agent editing between a read and a write, including one in the same
+second, and misses an edit that restores the exact timestamp (a limit, with a
+scenario). Through a symlink the comparison MUST use the target's mtime.
 
 ### 5.5 mkdir
 
@@ -624,7 +633,14 @@ else t=o
 fi
 if [ -w "$1" ]; then w=w; else w=-; fi
 printf '%s	%s	' "$w" "$t"
-stat -L -c '%s	%Y' -- "$1" 2>/dev/null || printf '0	0'
+if s=$(stat -L -c '%s %Y %y' -- "$1" 2>/dev/null); then
+  set -- $s
+  f=${4#*.}
+  [ "$f" = "$4" ] && f=0
+  printf '%s	%s.%s' "$1" "$2" "$f"
+else
+  printf '0	0'
+fi
 printf '
 '
 ```
