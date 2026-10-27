@@ -153,7 +153,7 @@ _KINDS: dict[str, Kind] = {"f": "file", "d": "dir"}
 
 
 def parse_stat(stdout: str) -> Stat | None:
-    """``W<TAB>T<TAB>SIZE<TAB>MTIME``; anything else is "does not exist"."""
+    """``W<TAB>T<TAB>SIZE<TAB>MTIME`` (``MTIME`` is ``SECS.FRAC``); anything else is "does not exist"."""
     line = stdout.split("\n", 1)[0]
     parts = line.split("\t")
     if len(parts) < 3:
@@ -163,8 +163,9 @@ def parse_stat(stdout: str) -> Stat | None:
     size = _uint(parts[2].strip())
     if size is None:
         return None
-    mtime = _uint(parts[3].split(".")[0].strip()) if len(parts) > 3 else None
-    return Stat(kind, size, mtime or 0, writable)
+    raw = parts[3].strip() if len(parts) > 3 else ""
+    mtime = float(raw) if re.fullmatch(r"\d+(\.\d+)?", raw) else 0.0
+    return Stat(kind, size, mtime, writable)
 
 
 def _uint(s: str) -> int | None:
@@ -272,9 +273,9 @@ def _cleanup(path: str, suffix: str) -> Op[None]:
 
 
 def write_if_unchanged(
-    path: str, data: bytes, expected_mtime: int | None, caps: Capabilities
+    path: str, data: bytes, expected_mtime: float | None, caps: Capabilities
 ) -> Op[None]:
-    """Compare whole epoch seconds, then write. Two round trips; the guard is not a lock."""
+    """Compare the mtimes (epoch seconds with the fraction, as ``stat`` gave it), then write. Two round trips; the guard is not a lock."""
     current = yield from stat(path)
     if (current.mtime if current else None) != expected_mtime:
         raise Conflict("the file changed since it was read")

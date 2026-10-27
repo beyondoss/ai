@@ -611,6 +611,17 @@ pub fn query(pattern: &str, root: PathBuf, limit: usize) -> SearchQuery {
     }
 }
 
+/// Epoch seconds of `t` as the double a client parsing the decimal `SECS.NNNNNNNNN` gets (correctly
+/// rounded). `Duration::as_secs_f64` adds two doubles and can land one ulp away, which would make the
+/// reference disagree with TypeScript and Python about two equal timestamps.
+pub fn epoch_f64(t: std::time::SystemTime) -> f64 {
+    t.duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| {
+        format!("{}.{:09}", d.as_secs(), d.subsec_nanos())
+            .parse()
+            .unwrap_or(0.0)
+    })
+}
+
 /// The temp suffix of a ShellFs write: exactly 16 lowercase hex digits (64 random bits), the format
 /// `FILES-OVER-EXEC.md` section 5.3 pins so every client names the temp `.tmp.SUFFIX` alike. Each
 /// `RandomState` is seeded from OS entropy, so no two calls collide in practice and none is

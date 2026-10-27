@@ -73,7 +73,7 @@ export interface FilesOptions {
 export interface Stat {
   kind: "file" | "dir" | "other";
   size: number;
-  /** Epoch seconds (the integer part). */
+  /** Epoch seconds, with the fraction `stat` reports (nanoseconds on GNU and busybox). */
   mtime: number;
   /** A real access check for the calling user, not mode bits. */
   writable: boolean;
@@ -351,18 +351,22 @@ export class Files {
   }
 
   /**
-   * Write only if the file's mtime (whole epoch seconds) is `expectedMtime`; `null` means the file
-   * must not exist. Throws `conflict` otherwise and writes nothing. Two round trips and not a lock:
-   * it catches an edit between a read and a write, and misses one inside the same second.
+   * Write only if the file's mtime (epoch seconds, with the fraction) is `expectedMtime`, as `stat`
+   * gave it; `null` means the file must not exist. Throws `conflict` otherwise and writes nothing.
+   * Two round trips and not a lock: it catches an edit between a read and a write, including one
+   * in the same second, and misses one that restores the exact timestamp.
    */
   async writeIfUnchanged(
     path: string,
     data: Uint8Array | string,
     expectedMtime: number | null,
   ): Promise<void> {
-    if (expectedMtime !== null && !Number.isInteger(expectedMtime)) {
+    if (
+      expectedMtime !== null
+      && (!Number.isFinite(expectedMtime) || expectedMtime < 0)
+    ) {
       throw new InvalidRequestError(
-        "`expectedMtime` must be an integer or null",
+        "`expectedMtime` must be a non-negative number or null",
       );
     }
     const current = (await this.stat(path))?.mtime ?? null;
@@ -518,15 +522,15 @@ export class Files {
   }
 }
 
-/** Parse the first line of the stat script: `W<TAB>T<TAB>SIZE<TAB>MTIME`. */
+/** Parse the first line of the stat script: `W<TAB>T<TAB>SIZE<TAB>MTIME` (`MTIME` is `SECS.FRAC`). */
 export function parseStat(stdout: string): Stat | null {
   const line = stdout.split("\n")[0] ?? "";
   const parts = line.split("\t");
   if (parts.length < 3) return null;
   const size = parts[2]!.trim();
   if (!/^\d+$/.test(size)) return null;
-  const secs = (parts[3] ?? "").split(".")[0]!.trim();
-  const mtime = /^-?\d+$/.test(secs) ? Number(secs) : 0;
+  const raw = (parts[3] ?? "").trim();
+  const mtime = /^\d+(\.\d+)?$/.test(raw) ? Number(raw) : 0;
   return {
     writable: parts[0] === "w",
     kind: parts[1] === "f" ? "file" : parts[1] === "d" ? "dir" : "other",

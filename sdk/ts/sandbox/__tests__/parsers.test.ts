@@ -266,6 +266,18 @@ describe("a newline in a path", () => {
   });
 });
 
+describe("stat mtime", () => {
+  it("keeps the fraction", () => {
+    expect(parseStat("w\tf\t3\t1793127211.536029123\n")?.mtime).toBe(
+      1793127211.536029123,
+    );
+    expect(parseStat("w\tf\t3\t981173106.000000000\n")?.mtime).toBe(
+      981173106,
+    );
+    expect(parseStat("w\tf\t3\t981173106\n")?.mtime).toBe(981173106);
+  });
+});
+
 describe("a root below a file", () => {
   it("is a root error", () => {
     const f = classifySearchFailure(
@@ -351,12 +363,12 @@ describe("classifyFailure (a command that ran and failed)", () => {
 });
 
 describe("parseStat", () => {
-  it("parses the line, keeping the integer part of the mtime", () => {
+  it("parses the line, keeping the fraction of the mtime", () => {
     expect(parseStat("w\tf\t12\t1700000000.9876\n")).toEqual({
       writable: true,
       kind: "file",
       size: 12,
-      mtime: 1700000000,
+      mtime: 1700000000.9876,
     });
     expect(parseStat("-\td\t4096\t5\n")).toMatchObject({
       writable: false,

@@ -68,6 +68,21 @@ def _count(req: dict[str, Any], key: str) -> int | None:
     return v
 
 
+def _number(req: dict[str, Any], key: str) -> float | None:
+    v = req.get(key)
+    if v is None:
+        return None
+    if (
+        isinstance(v, bool)
+        or not isinstance(v, (int, float))
+        or v < 0
+        or v != v
+        or v == float("inf")
+    ):
+        raise InvalidRequest(f"`{key}` must be a non-negative number")
+    return v
+
+
 def _flag(req: dict[str, Any], key: str) -> bool:
     v = req.get(key)
     if v is None:
@@ -177,7 +192,7 @@ def plan(op: str, req: dict[str, Any]) -> Plan:
             raise InvalidRequest(
                 "`expected_mtime` is required (null means the file must not exist)"
             )
-        expected = _count(req, "expected_mtime")
+        expected = _number(req, "expected_mtime")
         return (lambda sb: sb.files.write_if_unchanged(path, data, expected), lambda _: {})
     if op == "mkdir":
         path = _str(req, "path")

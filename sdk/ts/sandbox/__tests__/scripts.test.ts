@@ -35,7 +35,10 @@ describe("the scripts are the spec's appendix", () => {
 
   it("has the tab and newline the stat script prints", () => {
     expect(scripts.STAT_SCRIPT).toContain("printf '%s\t%s\t' \"$w\" \"$t\"");
-    expect(scripts.STAT_SCRIPT).toContain("stat -L -c '%s\t%Y' --");
+    expect(scripts.STAT_SCRIPT).toContain("stat -L -c '%s %Y %y' --");
+    expect(scripts.STAT_SCRIPT).toContain(
+      "printf '%s\t%s.%s' \"$1\" \"$2\" \"$f\"",
+    );
     expect(scripts.STAT_SCRIPT.endsWith("printf '\n'")).toBe(true);
   });
 

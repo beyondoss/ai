@@ -21,7 +21,7 @@ pub mod search_truth;
 pub mod truth;
 
 use search_truth::{Engine, Spec, Th};
-use truth::{Kind, Node, Plan, Snap, secs, snapshot};
+use truth::{Kind, Node, Plan, Snap, snapshot};
 
 pub struct Ctx {
     pub root: PathBuf,
@@ -35,8 +35,9 @@ pub struct Ctx {
 pub struct Pre {
     snap: Snap,
     plan: Option<Plan>,
-    /// The mtime (whole seconds, following links) of the path a guarded write addresses, before it.
-    mtime: Option<u64>,
+    /// The mtime (epoch seconds with the nanoseconds, as the double a client compares; following
+    /// links) of the path a guarded write addresses, before it.
+    mtime: Option<f64>,
     /// Where a write to the path lands (links followed as the write script does), before it: a
     /// write replaces a symlink loop, after which the path resolves to itself.
     target: Option<Option<PathBuf>>,
@@ -61,7 +62,7 @@ pub fn before(op: &Op, ctx: &Ctx) -> Pre {
         Op::WriteIf { rel, .. } => std::fs::metadata(path(ctx, rel))
             .ok()
             .and_then(|m| m.modified().ok())
-            .map(secs),
+            .map(beyond_sandbox::fs::epoch_f64),
         _ => None,
     };
     let target = match op {
@@ -216,7 +217,7 @@ pub fn after(
                 return Err(format!("{} left a temp file behind: {temps:?}", op.name()));
             }
             if let Op::WriteIf { .. } = op {
-                let expected = req["expected_mtime"].as_u64();
+                let expected = req["expected_mtime"].as_f64();
                 let cur = pre.mtime;
                 if cur != expected {
                     // The guard fails first (FILES-OVER-EXEC 5.4), whatever the write would do.
@@ -358,8 +359,8 @@ pub fn after(
                     if ok["size"].as_u64() != Some(m.len()) {
                         return Err(format!("stat size {} != {}", ok["size"], m.len()));
                     }
-                    let ts = m.modified().map(secs).unwrap();
-                    if ok["mtime"].as_u64() != Some(ts) {
+                    let ts = m.modified().map(beyond_sandbox::fs::epoch_f64).unwrap();
+                    if ok["mtime"].as_f64() != Some(ts) {
                         return Err(format!("stat mtime {} != {ts}", ok["mtime"]));
                     }
                     if ok["writable"].as_bool() != Some(truth::can(&p, 2)) {

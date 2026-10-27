@@ -178,7 +178,7 @@ pub struct Machine {
     faults: Arc<FaultRunner>,
     engine: Engine,
     known: Vec<PathBuf>,
-    stats: HashMap<PathBuf, Option<u64>>,
+    stats: HashMap<PathBuf, Option<f64>>,
 }
 
 impl Drop for Machine {
@@ -621,12 +621,12 @@ impl Machine {
         snapshot(&self.root)
     }
 
-    fn do_write(&mut self, tc: &TestCase, p: PathBuf, data: Vec<u8>, guard: Option<Option<u64>>) {
+    fn do_write(&mut self, tc: &TestCase, p: PathBuf, data: Vec<u8>, guard: Option<Option<f64>>) {
         let before = snapshot(&self.root);
         let cur = std::fs::metadata(&p)
             .ok()
             .and_then(|m| m.modified().ok())
-            .map(secs);
+            .map(truth::fsecs);
         let plan = self.with_space(truth::plan_write(&p), data.len());
         let res: Result<bool, FsError> = self.block(async {
             match guard {
@@ -636,7 +636,7 @@ impl Machine {
                     .await
                     .map(|_| true),
                 Some(e) => {
-                    let exp = e.map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs(s));
+                    let exp = e.map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs_f64(s));
                     self.fs
                         .write_if_unchanged(&self.c(&p), data.clone(), exp)
                         .await
@@ -814,14 +814,16 @@ impl Machine {
         let truth_now = std::fs::metadata(&p)
             .ok()
             .and_then(|m| m.modified().ok())
-            .map(secs);
+            .map(truth::fsecs);
         let remembered = self.stats.get(&p).copied();
-        let expected = match tc.draw(gs::integers::<u8>().max_value(4)) {
+        let expected = match tc.draw(gs::integers::<u8>().max_value(5)) {
             0 => None,
             1 => remembered.unwrap_or(None),
             2 => truth_now,
-            3 => truth_now.map(|s| s + 1),
-            _ => Some(secs(SystemTime::now())),
+            3 => truth_now.map(|s| s + 1.0),
+            // The same second, a different fraction: the guard compares nanoseconds, not seconds.
+            4 => truth_now.map(|s| s + 0.25),
+            _ => Some(truth::fsecs(SystemTime::now())),
         };
         tc.note(&format!(
             "write_if_unchanged {:?} expected={expected:?} (mtime now {truth_now:?})",
@@ -876,11 +878,11 @@ impl Machine {
                         m.len()
                     ));
                 }
-                let ts = m.modified().map(secs).unwrap();
-                if meta.mtime.map(secs) != Some(ts) {
+                let ts = m.modified().map(truth::fsecs).unwrap();
+                if meta.mtime.map(truth::fsecs) != Some(ts) {
                     fail(format!(
                         "stat mtime {:?} != {ts} for {p:?} (following symlinks)",
-                        meta.mtime.map(secs)
+                        meta.mtime.map(truth::fsecs)
                     ));
                 }
                 if meta.writable != truth::can(&p, 2) {
@@ -890,7 +892,7 @@ impl Machine {
                         truth::can(&p, 2)
                     ));
                 }
-                self.stats.insert(p.clone(), meta.mtime.map(secs));
+                self.stats.insert(p.clone(), meta.mtime.map(truth::fsecs));
             }
         }
         read_only_ops_unchanged(self, &before, "stat");
@@ -1445,9 +1447,9 @@ impl Machine {
     fn env_write(&mut self, tc: TestCase) {
         let p = self.pick_path(&tc);
         let data = fixtures::content(&tc, self.cfg.cap, self.fill());
-        // `keep` re-sets the previous mtime: a same-second edit the guard cannot see (a documented
-        // limit); the others move the mtime to a different second.
-        let how = tc.draw(gs::integers::<u8>().max_value(3));
+        // `keep` re-sets the previous mtime: an edit the guard cannot see (a documented limit); the
+        // others move the mtime, mode 4 by a millisecond inside the same second.
+        let how = tc.draw(gs::integers::<u8>().max_value(4));
         tc.note(&format!(
             "env: write {:?} {}B mtime-mode {how}",
             p.strip_prefix(&self.root).unwrap(),
@@ -1461,6 +1463,7 @@ impl Machine {
                 0 => prev.unwrap_or_else(SystemTime::now),
                 1 => SystemTime::now() + Duration::from_secs(3),
                 2 => SystemTime::now() - Duration::from_secs(3600),
+                4 => prev.map_or_else(SystemTime::now, |t| t + Duration::from_millis(1)),
                 _ => SystemTime::now(),
             };
             let _ = f.set_modified(t);

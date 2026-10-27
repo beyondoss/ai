@@ -195,7 +195,11 @@ fn classify_file(bytes: &[u8], engine: Engine, explicit: bool) -> Class {
     }
     let nul = bytes.contains(&0);
     if nul {
-        return if explicit {
+        // The engines stop at the first NUL but report the matches on the whole lines before it, so
+        // a file with a complete line ahead of its NUL is searched as something shorter than its
+        // bytes. The spec leaves that to the engines.
+        let first_nul = bytes.iter().position(|b| *b == 0).unwrap_or(0);
+        return if explicit || bytes[..first_nul].contains(&b'\n') {
             Class::Ambiguous
         } else if bytes.len() <= FIRST_BUFFER || bytes[..FIRST_BUFFER].contains(&0) {
             Class::Excluded

@@ -84,6 +84,15 @@ function optCount(req: Json, key: string): number | undefined {
   return v;
 }
 
+function optNumber(req: Json, key: string): number | undefined {
+  const v = req[key];
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+    throw invalid(`\`${key}\` must be a non-negative number`);
+  }
+  return v;
+}
+
 function flag(req: Json, key: string): boolean {
   const v = req[key];
   if (v === undefined || v === null) return false;
@@ -330,7 +339,7 @@ export class Driver {
         await files.writeIfUnchanged(
           path,
           data,
-          optCount(req, "expected_mtime") ?? null,
+          optNumber(req, "expected_mtime") ?? null,
         );
         return {};
       }
