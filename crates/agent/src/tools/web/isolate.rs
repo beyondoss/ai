@@ -342,12 +342,48 @@ mod sandbox {
     //! synchronization; the signal calls are the panic/abort path).
     //!
     //! Being slightly generous here is safe. The syscalls that matter for an exploit — `openat`,
-    //! `socket`, `connect`, `execve`, `clone`, `ptrace`, `prctl` — are absent, and no addition below
-    //! reintroduces one.
+    //! `socket`, `connect`, `execve`, `clone`, `ptrace` — are absent, and no addition below
+    //! reintroduces one. `prctl` is present only for the one call that names a mapping (see
+    //! [`prctl_rule`]), never for its other options.
 
     use std::collections::BTreeMap;
 
-    use seccompiler::{SeccompAction, SeccompFilter, TargetArch};
+    use seccompiler::{
+        SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+        SeccompRule, TargetArch,
+    };
+
+    /// `PR_SET_VMA` / `PR_SET_VMA_ANON_NAME` from `<linux/prctl.h>`: the only `prctl` the parse makes.
+    const PR_SET_VMA: u64 = 0x5356_4d41;
+    const PR_SET_VMA_ANON_NAME: u64 = 0;
+
+    /// The one `prctl` the parse is allowed: naming an anonymous mapping.
+    ///
+    /// mimalloc (v3) calls `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ptr, size, "mimalloc")` after
+    /// *every* fresh `mmap` it makes (`unix_mmap_prim`). Whether the parse needs a fresh mapping at
+    /// all, rather than reusing arena memory mapped before the filter went up, depends on the page's
+    /// allocation pattern and timing, so the filter used to kill the child on `prctl` (x86_64
+    /// syscall 157) in roughly 1 parse in 10 on GitHub's runners and almost never elsewhere. The
+    /// call only labels a mapping in `/proc/self/maps`; any other `prctl` option (`PR_SET_SECCOMP`,
+    /// `PR_SET_NO_NEW_PRIVS`, `PR_SET_DUMPABLE`, ...) still kills the process.
+    fn prctl_rule() -> Result<Vec<SeccompRule>, String> {
+        let cond = |arg, val| {
+            SeccompCondition::new(arg, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, val)
+                .map_err(|e| e.to_string())
+        };
+        Ok(vec![
+            SeccompRule::new(vec![cond(0, PR_SET_VMA)?, cond(1, PR_SET_VMA_ANON_NAME)?])
+                .map_err(|e| e.to_string())?,
+        ])
+    }
+
+    /// Every rule of the filter: the unconditional syscalls, plus the argument-filtered `prctl`.
+    fn rules() -> Result<BTreeMap<i64, Vec<SeccompRule>>, String> {
+        let mut rules: BTreeMap<i64, Vec<SeccompRule>> =
+            allowed().into_iter().map(|nr| (nr, Vec::new())).collect();
+        rules.insert(libc::SYS_prctl, prctl_rule()?);
+        Ok(rules)
+    }
 
     /// Syscalls a parse needs. Every entry exists on both release targets (x86_64 and aarch64), so
     /// this list is shared rather than `cfg`-split.
@@ -413,11 +449,8 @@ mod sandbox {
             other => return Err(format!("no seccomp filter for architecture {other}")),
         };
 
-        let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
-            allowed().into_iter().map(|nr| (nr, Vec::new())).collect();
-
         let filter = SeccompFilter::new(
-            rules,
+            rules()?,
             // Anything not on the list kills the process. `Errno` would be quieter but wrong: a
             // parser that keeps running with `openat` failing is a parser whose behavior nobody has
             // reasoned about.
@@ -431,5 +464,26 @@ mod sandbox {
             .try_into()
             .map_err(|e: seccompiler::BackendError| e.to_string())?;
         seccompiler::apply_filter_all_threads(&program).map_err(|e| e.to_string())
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    mod tests {
+        use super::*;
+
+        /// mimalloc names every mapping it makes with `prctl(PR_SET_VMA, ...)`; a filter without it
+        /// kills the parse child at random. And only that one call: a bare `prctl` entry (an empty
+        /// rule list allows every option) would reopen `PR_SET_SECCOMP`, `PR_SET_NO_NEW_PRIVS`, ...
+        #[test]
+        fn prctl_is_allowed_only_to_name_a_mapping() {
+            let rules = rules().unwrap();
+            let prctl = rules.get(&libc::SYS_prctl).expect("prctl is allowed");
+            assert_eq!(
+                prctl.len(),
+                1,
+                "one argument-filtered rule, not a bare allow"
+            );
+            assert!(!allowed().contains(&libc::SYS_prctl));
+        }
     }
 }

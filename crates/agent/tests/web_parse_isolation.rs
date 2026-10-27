@@ -148,3 +148,27 @@ fn a_page_larger_than_a_pipe_buffer_round_trips() {
         "outline should count every <p>: {text}"
     );
 }
+
+/// A page big enough that the allocator must ask the OS for fresh memory *after* the filter is up.
+/// mimalloc labels every such mapping with `prctl(PR_SET_VMA, ...)`, and a filter that forbids that
+/// call kills the child (SIGSYS) on exactly this path: for a small page it only happens when the
+/// allocator's earlier arena happens to run out, which is why it was a rare, runner-dependent
+/// failure rather than a constant one.
+#[test]
+fn a_parse_that_maps_fresh_memory_survives_the_sandbox() {
+    let big = format!(
+        "<html><body>{}</body></html>",
+        "<p>lorem ipsum dolor sit amet</p>".repeat(1_500_000)
+    );
+    assert!(big.len() > 40 << 20, "fixture should need fresh mappings");
+    let (resp, status) = parse(
+        "outline",
+        json!({ "url": "http://x/", "mode": "outline" }),
+        &big,
+    );
+    assert!(
+        status.success(),
+        "huge page did not exit cleanly: {status:?}"
+    );
+    assert!(resp.get("Ok").is_some(), "{resp}");
+}
