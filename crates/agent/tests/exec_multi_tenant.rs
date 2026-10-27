@@ -30,7 +30,9 @@ use serde_json::{Value, json};
 /// the wrong tenant's files. That is the failure this file is looking for.
 async fn tenant_target(dir: &std::path::Path) -> ExecTarget {
     let template = format!("env -C {} {{}}", dir.display());
-    ExecTarget::over(Arc::new(TemplateRunner::parse(&template).unwrap())).await
+    ExecTarget::over(Arc::new(TemplateRunner::parse(&template).unwrap()))
+        .await
+        .unwrap()
 }
 
 fn tenant_dir(name: &str, secret: &str) -> tempfile::TempDir {

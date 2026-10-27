@@ -121,7 +121,7 @@ fn local_backend() -> Arc<dyn FsBackend> {
 /// to be tested is precisely the outcome this suite exists to prevent — and that is not theoretical:
 /// GitHub's runner image ships no ripgrep, this assertion caught it, and `mise.toml` now installs it.
 async fn rg_backend() -> Option<Arc<dyn FsBackend>> {
-    let backend = ShellFs::connect(Arc::new(RealRunner)).await;
+    let backend = ShellFs::connect(Arc::new(RealRunner)).await.unwrap();
     if backend.capabilities().search_engine() == SearchEngine::Ripgrep {
         return Some(Arc::new(backend));
     }

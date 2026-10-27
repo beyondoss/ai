@@ -188,9 +188,8 @@ succeeded.
 If a probe request fails at the transport level (unreachable, `auth`,
 `endpoint`, `timeout`), the client MUST report that error from the operation
 that needed the probe, and MUST NOT cache a capability set learned from failed
-probes. (The reference `ShellFs::connect` reads every probe error as "absent",
-so with a wrong bearer it concludes the sandbox has no stdin and no `dd`, and
-the first read then fails with a message about `dd`. See D3.)
+probes. (The reference `ShellFs::connect` fails with the runner's error when a
+probe request fails; only a probe that ran and answered "absent" means absent.)
 
 Probe overrides for testing are in DRIVER.md (`CONFORMANCE_CAPS`).
 
@@ -716,9 +715,7 @@ exit 1
 
 ## Known deviations from the reference implementation
 
-The reference (`ShellFs` as of this writing) behaves as follows where a client
-MUST do better. Each has an `xfail` check in the scenarios, marked for the
-reference driver, which turns into a plain pass when the reference is fixed.
-
-- **D3. Probe errors.** See section 4.2. Scenario `errors.auth.*` (the
-  reference driver surfaces them itself, with a first request before probing).
+None at present. When the reference (`ShellFs`) behaves differently from this
+spec, the difference is listed here, and the scenarios carry an `xfail` mark for
+the reference driver on exactly those checks, which turns into a plain pass when
+the reference is fixed.

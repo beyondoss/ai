@@ -109,7 +109,7 @@ async fn mock_provider(
 }
 
 async fn registry_over(runner: Arc<dyn CommandRunner>) -> agent_core::ToolRegistry {
-    let backend = ShellFs::connect(runner.clone()).await;
+    let backend = ShellFs::connect(runner.clone()).await.unwrap();
     default_registry_with_config(&ToolConfig {
         fs_backend: Some(Arc::new(backend) as Arc<dyn FsBackend>),
         command_runner: Some(runner),
@@ -217,19 +217,19 @@ async fn write_then_bash_see_the_same_filesystem() {
 
 #[tokio::test]
 async fn an_unreachable_endpoint_fails_loudly_rather_than_looking_empty() {
-    // Nothing listening. Every tool must report it, not return a plausible empty result.
+    // Nothing listening. Connecting must report it (naming the endpoint), not build a backend that
+    // believes the box has no tools and returns plausible empty results later.
     let runner = Arc::new(HttpExecRunner::new("http://127.0.0.1:1/exec").unwrap());
-    let reg = registry_over(runner).await;
-    let err = reg
-        .get("ls")
-        .unwrap()
-        .run(json!({ "path": "/tmp" }))
+    let err = ShellFs::connect(runner)
         .await
-        .expect_err("an unreachable endpoint must be an error");
+        .err()
+        .expect("an unreachable endpoint must fail connect");
+    let msg = err.to_string();
     assert!(
-        err.to_string().contains("127.0.0.1:1"),
-        "the error must name the endpoint: {err}"
+        msg.contains("127.0.0.1:1"),
+        "the error must name the endpoint: {msg}"
     );
+    assert!(msg.contains("unreachable"), "the error must say why: {msg}");
 }
 
 #[tokio::test]
