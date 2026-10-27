@@ -80,6 +80,8 @@ const ALLOWED: &[(&str, usize)] = &[
     ("execd/benches/exec_compare.rs", 1),
     // The matrix's local backend starts execd on port 0 and reads the port from its log.
     ("sandbox-conformance/src/backends.rs", 1),
+    // sandbox-mcp's HTTP test asks the server to bind port 0 and announce the port it got.
+    ("sandbox-mcp/tests/e2e.rs", 1),
 ];
 
 /// A source file with comments blanked out (newlines kept) and its string literals located.
