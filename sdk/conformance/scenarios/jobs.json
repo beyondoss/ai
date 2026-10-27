@@ -1773,7 +1773,7 @@
     },
     {
       "id": "jobs.leftovers.shell-exit-then-end",
-      "description": "When the shell exits leaving a background process in its group, the job is 'exited' (with the shell's code) until the group is empty, then 'ended' with the same code.",
+      "description": "When the shell exits leaving a background process in its group, the job is 'exited' (with the shell's code) until the group is empty, then 'ended' with the same code. The leftover lives until the scenario kills it, so 'exited' lasts as long as the poll needs.",
       "requires": {
         "jobs": "native"
       },
@@ -1786,7 +1786,7 @@
           "command": "sh",
           "args": [
             "-c",
-            "sleep 2 & echo main; exit 5"
+            "sleep 30 & echo main; exit 5"
           ],
           "label": "",
           "expect": {
@@ -1804,7 +1804,7 @@
           "job": "ah01",
           "offset": 0,
           "poll": {
-            "timeout_ms": 1500,
+            "timeout_ms": 8000,
             "interval_ms": 20
           },
           "expect": {
@@ -1812,6 +1812,19 @@
               "state": "exited",
               "code": 5,
               "data_utf8": "main\n"
+            }
+          }
+        },
+        {
+          "id": "kill",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "ah01"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
             }
           }
         },
