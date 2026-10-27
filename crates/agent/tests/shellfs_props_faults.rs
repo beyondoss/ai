@@ -15,7 +15,7 @@ use beyond_agent::tools::exec::CommandRunner;
 use hegel::TestCase;
 use hegel::generators as gs;
 
-#[hegel::test(env::settings(40, 0x5e11_f5_11))]
+#[hegel::test(env::settings(40, 0x5e11_f511))]
 fn a_faulty_transport_with_stdin_writes(tc: TestCase) {
     run_machine(
         tc,
@@ -26,7 +26,7 @@ fn a_faulty_transport_with_stdin_writes(tc: TestCase) {
     );
 }
 
-#[hegel::test(env::settings(30, 0x5e11_f5_12))]
+#[hegel::test(env::settings(30, 0x5e11_f512))]
 fn a_faulty_transport_with_chunked_writes(tc: TestCase) {
     run_machine(
         tc,
@@ -41,7 +41,7 @@ fn a_faulty_transport_with_chunked_writes(tc: TestCase) {
 /// What `connect` may do over a transport that fails: fail, or learn exactly what a healthy one shows.
 /// Never cache a degraded answer (no stdin, no `dd`, no `rg`) learned from failed probes: FILES-OVER-EXEC
 /// section 4.2 (D3).
-#[hegel::test(env::settings(40, 0x5e11_f5_13))]
+#[hegel::test(env::settings(40, 0x5e11_f513))]
 fn connect_never_caches_what_failed_probes_say(tc: TestCase) {
     let seed = tc.draw(gs::integers::<u64>());
     let pct = tc.draw(gs::sampled_from(vec![20u64, 60, 100]));

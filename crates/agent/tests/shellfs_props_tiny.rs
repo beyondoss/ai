@@ -23,12 +23,12 @@ fn tiny(tc: TestCase, stdin: bool) {
     );
 }
 
-#[hegel::test(env::settings(25, 0x5e11_f5_31))]
+#[hegel::test(env::settings(25, 0x5e11_f531))]
 fn a_filesystem_that_fills_up_stdin_writes(tc: TestCase) {
     tiny(tc, true);
 }
 
-#[hegel::test(env::settings(25, 0x5e11_f5_32))]
+#[hegel::test(env::settings(25, 0x5e11_f532))]
 fn a_filesystem_that_fills_up_chunked_writes(tc: TestCase) {
     tiny(tc, false);
 }

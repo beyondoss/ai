@@ -1171,9 +1171,7 @@ impl Machine {
         match got {
             Err(e) => {
                 let k = self.kind(&e, &root);
-                let tolerated = report.errored
-                    || (self.cfg.cap.is_some() && k == Kind::TooLarge)
-                    || (want.unreadable && !want.root_missing && !report.errored && false);
+                let tolerated = report.errored || (self.cfg.cap.is_some() && k == Kind::TooLarge);
                 let multiline = k == Kind::InvalidQuery
                     && (want.root_missing || want.unreadable)
                     && (root.to_string_lossy().contains('\n')
@@ -1230,7 +1228,7 @@ impl Machine {
                     })
                     .collect();
                 if want.unreadable && !want.root_missing && out.first_error.is_none() {
-                    fail("search over an unreadable path reported no note".to_string());
+                    fail("search over an unreadable path reported no note");
                 }
                 let key = |h: &Th| {
                     (
@@ -1254,7 +1252,9 @@ impl Machine {
                     fail(format!("search returned more than limit={limit} matches"));
                 }
                 if out.truncated && got_hits.last().is_some_and(|h| !h.is_match) {
-                    fail("search result ends on a context line (trailing context must be dropped when truncated)".to_string());
+                    fail(
+                        "search result ends on a context line (trailing context must be dropped when truncated)",
+                    );
                 }
                 if want.exact {
                     if got_hits != want.hits {
@@ -1350,7 +1350,7 @@ impl Machine {
                         ));
                     }
                 } else if !new_ok(&after) {
-                    fail("a faulted mkdir changed more than the path".to_string());
+                    fail("a faulted mkdir changed more than the path");
                 }
             }
         }
