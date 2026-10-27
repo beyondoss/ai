@@ -3,6 +3,25 @@
 A client for the exec protocol, in three layers that each stand alone. It was extracted from `crates/agent`, which now
 depends on it; it depends on neither `beyond-agent` nor `beyond-agent-core`.
 
+## Modules
+
+| file                               | what                                                                                          |
+| ---------------------------------- | --------------------------------------------------------------------------------------------- |
+| `src/lib.rs`                       | the public names: `Exec`, `HttpExec`, `Files`, `Jobs`, `Sandbox`, `TokenSource`               |
+| `src/exec.rs`                      | `CommandRunner` (`Exec`), `ExecResult`, `Kill`/`LocalKill`/`kill_all`, bounded output capture |
+| `src/exec_endpoint.rs`             | the protocol spec (module doc), `HttpExecRunner`, `TemplateRunner`                            |
+| `src/exec_endpoint/stream.rs`      | v1.2 frames, the frame reader, the streaming probe                                            |
+| `src/exec_endpoint/jobs.rs`        | `SandboxJobs`, `ShellJobs` (the baseline over plain exec), scopes, ids                        |
+| `src/exec_endpoint/jobs_native.rs` | v1.3 native jobs and `HttpJobs`                                                               |
+| `src/exec_endpoint/far_kill.rs`    | killing a template transport's command on the far side                                        |
+| `src/fs.rs`                        | `FsBackend`, its types, and the result policy every backend shares                            |
+| `src/fs/shell.rs`                  | `ShellFs` (`Files`): file operations as commands, capability probe, parsers, `__fuzz`         |
+| `src/procgroup.rs`                 | process-group identity and kill guards for local children                                     |
+| `src/sandbox.rs`                   | `Jobs`, `Sandbox`, the `Command` builder                                                      |
+| `src/token.rs`                     | `TokenSource` and the one-renewal bearer                                                      |
+| `src/tls.rs`                       | installs the `ring` rustls provider before a client is built                                  |
+| `src/testing.rs`                   | a plain local runner for unit tests                                                           |
+
 ## Layers
 
 ```
