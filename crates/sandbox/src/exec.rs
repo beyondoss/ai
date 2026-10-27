@@ -56,6 +56,53 @@ pub struct ExecResult {
     pub truncated: bool,
 }
 
+/// What a one-shot call returns when the caller wants the command's output as it was: **bytes**.
+///
+/// stdout and stderr are the bytes the command wrote, not text. Whether they are *all* of those
+/// bytes, unaltered, is [`exact`](Self::exact): `true` when the target delivered them losslessly (an
+/// endpoint that honours `output_base64`, a v1.2 stream's base64 frames); `false` only when the
+/// target can deliver text and nothing else (a plain v1.1 endpoint answers JSON strings, and an
+/// invalid UTF-8 sequence in them was already replaced with U+FFFD before this client saw it). A
+/// client that did not get the bytes says so instead of passing text off as them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecOutput {
+    /// The exit code. As over v1.1: `128 + N` for a command killed by signal `N`, `124` for one that
+    /// hit its timeout (the stderr then ends `command exceeded its timeout`), `127` for one that
+    /// could not be started. None of these is an error.
+    pub code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    /// Whether `stdout` and `stderr` are exactly what the command wrote.
+    pub exact: bool,
+}
+
+impl ExecOutput {
+    /// The stdout as text, invalid UTF-8 replaced with U+FFFD. Lossy by construction: use
+    /// [`stdout`](Self::stdout) when the bytes matter.
+    pub fn stdout_text(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.stdout)
+    }
+
+    /// The stderr as text, as [`stdout_text`](Self::stdout_text).
+    pub fn stderr_text(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.stderr)
+    }
+
+    /// A text result as bytes, which is never exact: whatever made it text may have changed them.
+    pub fn from_text(r: ExecResult) -> Self {
+        Self {
+            code: r
+                .code
+                .or_else(|| r.signal.map(|s| 128 + s))
+                .or(r.timed_out.then_some(124))
+                .unwrap_or(-1),
+            stdout: r.stdout.into_bytes(),
+            stderr: r.stderr.into_bytes(),
+            exact: false,
+        }
+    }
+}
+
 /// A sink for output chunks as they stream from a running command — used to surface live progress.
 /// `Send + Sync` because stdout and stderr are drained on separate concurrent tasks.
 pub type ChunkSink<'a> = &'a (dyn Fn(&[u8]) + Send + Sync);
@@ -206,6 +253,31 @@ pub trait CommandRunner: Send + Sync {
         cwd: Option<&str>,
         timeout: Duration,
     ) -> std::io::Result<ExecResult>;
+
+    /// Like [`run`](CommandRunner::run) (or [`run_with_stdin`](CommandRunner::run_with_stdin), when
+    /// `stdin` is given), but the output comes back as the bytes the command wrote: see
+    /// [`ExecOutput`]. This is the call for raw exec; a helper that parses text uses `run`.
+    ///
+    /// Defaults to `run` and a result that says it is not [`exact`](ExecOutput::exact): a runner whose
+    /// `run` returns text cannot know that the text is all the command wrote. A runner that can hand
+    /// over bytes overrides this, and the HTTP runner does (`output_base64`, else a v1.2 stream).
+    async fn run_exact(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        stdin: Option<&[u8]>,
+    ) -> std::io::Result<ExecOutput> {
+        let r = match stdin {
+            Some(stdin) => {
+                self.run_with_stdin(program, args, cwd, timeout, stdin)
+                    .await?
+            }
+            None => self.run(program, args, cwd, timeout).await?,
+        };
+        Ok(ExecOutput::from_text(r))
+    }
 
     /// Like [`run`](CommandRunner::run), but invokes `on_chunk` with each chunk of stdout/stderr as it
     /// arrives, for live progress. Defaults to the non-streaming `run`, which never calls the sink.

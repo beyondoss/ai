@@ -117,11 +117,18 @@ pub(crate) struct Request {
     /// Kept as a value: only `true` streams, and any other type is an unknown shape to ignore.
     pub stream: Option<Value>,
     pub job: Option<Value>,
+    /// v1.1: answer with `stdout_base64`/`stderr_base64`. Kept as a value, like `stream`: only
+    /// `true` asks, and any other type is an unknown shape to ignore.
+    pub output_base64: Option<Value>,
 }
 
 impl Request {
     pub fn wants_stream(&self) -> bool {
         self.stream == Some(Value::Bool(true))
+    }
+
+    pub fn wants_exact_output(&self) -> bool {
+        self.output_base64 == Some(Value::Bool(true))
     }
 }
 
