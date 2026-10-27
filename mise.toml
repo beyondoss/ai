@@ -283,6 +283,7 @@ dir = "sdk/ts"
 description = "TypeScript SDK tests: parsers and command builders, a fake endpoint, and a loopback execd (EXECD_BIN, or target/debug/execd, built if absent)."
 run = "npm test"
 dir = "sdk/ts"
+
 # ---- sandbox clients: the conformance matrix --------------------------------------------------------
 
 [tasks."build:execd-static"]
@@ -306,6 +307,7 @@ for b in ${BACKENDS:-local alpine debian-runas readonly tinydisk fault}; do back
 mkdir -p target/sandbox-matrix
 target/debug/sandbox-matrix --registry sdk/conformance/drivers.toml $backends \
   --report target/sandbox-matrix/report.json "$@"
+"""
 
 # ---- python client: beyond-sandbox (sdk/python/sandbox) ---------------------------------------------
 
