@@ -27,10 +27,10 @@ jobs:
           sudo dmesg -C || true
           stress-ng --cpu 4 --vm 2 --vm-bytes 1G -t 600s >/dev/null 2>&1 &
           fails=0
-          for i in $(seq 1 150); do
+          for i in $(seq 1 300); do
             if ! cargo nextest run -p beyond-agent --locked --test it -E 'test(web_keeps_the_runtime_responsive)' --retries 0 >out.txt 2>&1; then
               fails=$((fails+1)); grep -E "SIGSYS|worst unresp" out.txt | head -3
             fi
           done
-          echo "FAILS=$fails/150"
+          echo "FAILS=$fails/300"
           sudo dmesg | grep -iE "seccomp|1326" | tail -20 || true
