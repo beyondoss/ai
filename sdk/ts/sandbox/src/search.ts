@@ -83,6 +83,9 @@ export function rgArgs(q: SearchQuery, inGitRepo: boolean): string[] {
   }
   args.push("--glob", "!.git");
   pushContext(args, r);
+  // The group separator is the one record with no NUL, so it cannot be told from a path that starts
+  // with `--` and a newline: the engine is told not to print it.
+  args.push("--no-context-separator");
   args.push("-e", r.pattern, "--", r.root);
   return args;
 }
@@ -99,6 +102,8 @@ export function grepArgs(q: SearchQuery, gnu: boolean): string[] {
   }
   if (gnu && lastComponent(r.root) !== ".git") args.push("--exclude-dir=.git");
   pushContext(args, r);
+  // GNU only (busybox rejects it and prints its `--` line, which the colon parser skips).
+  if (gnu) args.push("--no-group-separator");
   args.push(
     "-e",
     r.literal ? r.pattern : crlfTolerantEre(r.pattern),
@@ -186,26 +191,14 @@ function lineNumber(digits: string): number | null {
 }
 
 /**
- * Parse `PATH<NUL>LINE<SEP>TEXT<LF>` records, as `rg --null` and `grep -Z` emit them. Scans for the
- * NUL, not for newlines (a path may contain one), skips group separators (`--` LF and, under
- * `--crlf`, `--` CR LF), and drops a record that does not fit.
+ * Parse `PATH<NUL>LINE<SEP>TEXT<LF>` records, as `rg --null` and `grep -Z` emit them with their
+ * group separator turned off. Scans for the NUL, not for newlines (a path may contain one), skips
+ * no `--` bytes (a path may begin with them), and drops a record that does not fit.
  */
 export function parseRecords(stdout: string): SearchHit[] {
   const hits: SearchHit[] = [];
   let i = 0;
   while (i < stdout.length) {
-    if (stdout.startsWith("--\n", i)) {
-      i += 3;
-      continue;
-    }
-    if (stdout.startsWith("--\r\n", i)) {
-      i += 4;
-      continue;
-    }
-    const rest = stdout.slice(i, i + 3);
-    if (
-      (rest === "--" || rest === "--\r") && i + rest.length === stdout.length
-    ) break;
     const nul = stdout.indexOf("\0", i);
     if (nul < 0) break;
     let nl = stdout.indexOf("\n", nul);

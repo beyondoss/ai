@@ -35,35 +35,22 @@ describe("parseRecords (rg --null / grep -Z)", () => {
     expect(hits.map((h) => h.isMatch)).toEqual([false, true, false]);
   });
 
-  it("skips the group separator between context blocks", () => {
-    const hits = parseRecords("a.rs\x001:one\n--\nb.rs\x009:two\n");
+  it("treats a path that starts with dashes and a newline as a path, not a separator", () => {
+    const hits = parseRecords("--\nb\x002-y\n--\r\nc\x003:z\r\n");
     expect(hits.map((h) => [h.path, h.line])).toEqual([
-      ["a.rs", 1],
-      ["b.rs", 9],
-    ]);
-  });
-
-  it("skips the CRLF separator rg writes under --crlf", () => {
-    const hits = parseRecords("a.rs\x001:one\r\n--\r\nb.rs\x009:two\r\n");
-    expect(hits.map((h) => [h.path, h.line])).toEqual([
-      ["a.rs", 1],
-      ["b.rs", 9],
+      ["--\nb", 2],
+      ["--\r\nc", 3],
     ]);
   });
 
   it("does not mistake a file named like a separator for one", () => {
-    const hits = parseRecords("--\x001:x\n--\r\x002:y\n--\n--\x003:--\n");
+    const hits = parseRecords("--\x001:x\n--\r\x002:y\n--\x003:--\n");
     expect(hits.map((h) => [h.path, h.line])).toEqual([
       ["--", 1],
       ["--\r", 2],
       ["--", 3],
     ]);
     expect(hits[2]!.text).toBe("--");
-  });
-
-  it("skips a trailing separator with no final newline", () => {
-    expect(parseRecords("a\x001:x\n--")).toHaveLength(1);
-    expect(parseRecords("a\x001:x\n--\r")).toHaveLength(1);
   });
 
   it("keeps a record whose path holds a newline whole", () => {
@@ -168,6 +155,7 @@ describe("argument builders", () => {
       "2",
       "-A",
       "100",
+      "--no-context-separator",
       "-e",
       "p",
       "--",
@@ -217,6 +205,11 @@ describe("argument builders", () => {
     ).toBe(
       false,
     );
+  });
+
+  it("turns the group separator off for rg and GNU grep, and only there", () => {
+    expect(grepArgs(q("x"), true)).toContain("--no-group-separator");
+    expect(grepArgs(q("x"), false)).not.toContain("--no-group-separator");
   });
 
   it("uses -F for literal and never pairs it with -E; busybox gets no GNU-only flags", () => {
