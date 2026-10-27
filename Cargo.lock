@@ -591,6 +591,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "beyond-sandbox-conformance"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "beyond-agent",
+ "beyond-test-support",
+ "clap",
+ "hex",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "beyond-slipstream"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
