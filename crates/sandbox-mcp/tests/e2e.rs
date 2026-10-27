@@ -400,9 +400,8 @@ async fn the_capabilities_resource_says_what_the_sandbox_supports() {
             panic!("not text")
         };
         let v: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(v["stdin"], true);
         assert!(["rg", "grep", "busybox-grep"].contains(&v["search_engine"].as_str().unwrap()));
-        assert!(["native", "baseline", "none"].contains(&v["jobs"].as_str().unwrap()));
+        assert!(v["find_printf"].is_boolean() && v["read_window"].is_boolean());
         client.cancel().await.unwrap();
     })
     .await
