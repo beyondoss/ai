@@ -79,7 +79,9 @@ fn summary(reqs: &[Value]) -> Vec<String> {
 async fn a_200k_write_through_a_stdin_endpoint_is_one_call_and_byte_exact() {
     let dir = tempfile::tempdir().unwrap();
     let mock = ExecMock::start(dir.path(), true).await;
-    let fs = ShellFs::connect(Arc::new(HttpExecRunner::new(&mock.url).unwrap())).await;
+    let fs = ShellFs::connect(Arc::new(HttpExecRunner::new(&mock.url).unwrap()))
+        .await
+        .unwrap();
     assert!(
         fs.capabilities().stdin,
         "a v1.1 endpoint echoed the probe, so it must be trusted with stdin"
@@ -105,7 +107,9 @@ async fn a_200k_write_through_a_stdin_endpoint_is_one_call_and_byte_exact() {
 async fn a_200k_write_through_a_v1_endpoint_goes_in_chunks_and_is_byte_exact() {
     let dir = tempfile::tempdir().unwrap();
     let mock = ExecMock::start(dir.path(), false).await;
-    let fs = ShellFs::connect(Arc::new(HttpExecRunner::new(&mock.url).unwrap())).await;
+    let fs = ShellFs::connect(Arc::new(HttpExecRunner::new(&mock.url).unwrap()))
+        .await
+        .unwrap();
     assert!(
         !fs.capabilities().stdin,
         "a v1 endpoint ignores `stdin_base64`; trusting it would write empty files"
@@ -205,7 +209,9 @@ async fn the_write_and_edit_tools_handle_a_200k_file_on_a_v1_endpoint() {
     let mock = ExecMock::start(dir.path(), false).await;
     let runner: Arc<dyn CommandRunner> = Arc::new(HttpExecRunner::new(&mock.url).unwrap());
     let reg = default_registry_with_config(&ToolConfig {
-        fs_backend: Some(Arc::new(ShellFs::connect(runner.clone()).await) as Arc<dyn FsBackend>),
+        fs_backend: Some(
+            Arc::new(ShellFs::connect(runner.clone()).await.unwrap()) as Arc<dyn FsBackend>
+        ),
         command_runner: Some(runner),
         ..ToolConfig::new()
     });
@@ -257,7 +263,7 @@ async fn a_template_transport_uses_stdin_only_when_it_forwards_it() {
         ("forwarding", forwarding, true),
         ("swallowing", swallowing, false),
     ] {
-        let fs = ShellFs::connect(Arc::new(runner)).await;
+        let fs = ShellFs::connect(Arc::new(runner)).await.unwrap();
         assert_eq!(fs.capabilities().stdin, expect_stdin, "{name}");
         let path = dir.path().join(name);
         let bytes = pattern(BIG);
@@ -294,7 +300,9 @@ async fn a_cell_delegates_stdin_to_whatever_it_currently_holds() {
     // Pointed at a target: that target.
     let target = format!("env -C {} {{}}", dir.path().display());
     cell.set(Some(
-        ExecTarget::over(Arc::new(TemplateRunner::parse(&target).unwrap())).await,
+        ExecTarget::over(Arc::new(TemplateRunner::parse(&target).unwrap()))
+            .await
+            .unwrap(),
     ));
     assert_eq!(echo(cell.runner()).await, "through the cell");
 }
@@ -319,7 +327,7 @@ impl CommandRunner for RunOnly {
 #[tokio::test]
 async fn a_runner_without_stdin_support_is_probed_as_such_and_still_writes() {
     let dir = tempfile::tempdir().unwrap();
-    let fs = ShellFs::connect(Arc::new(RunOnly)).await;
+    let fs = ShellFs::connect(Arc::new(RunOnly)).await.unwrap();
     assert!(!fs.capabilities().stdin);
     let path = dir.path().join("f.bin");
     let bytes = pattern(BIG);

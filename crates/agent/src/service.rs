@@ -502,7 +502,7 @@ impl ServiceSession {
             shell: if shell { "bash" } else { "sh" },
         });
         Ok(ExecTarget::over_with_home(runner, Some(home))
-            .await
+            .await?
             .watching(suspect))
     }
 

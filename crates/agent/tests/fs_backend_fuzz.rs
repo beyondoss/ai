@@ -283,7 +283,7 @@ async fn randomized_trees_and_queries_agree_across_backends() {
 
     // Absent `rg` is a skip locally and a hard failure in CI — see `fs_backend_parity.rs`'s
     // `rg_backend` for why the asymmetry, and for the runner that actually tripped it.
-    let shell = ShellFs::connect(Arc::new(RealRunner)).await;
+    let shell = ShellFs::connect(Arc::new(RealRunner)).await.unwrap();
     if shell.capabilities().search_engine() != SearchEngine::Ripgrep {
         assert!(
             std::env::var("CI").is_err(),

@@ -1071,12 +1071,17 @@ impl HttpExecRunner {
     async fn envelope(&self, resp: reqwest::Response) -> std::io::Result<ExecResponse> {
         let (body, over_cap) = self.read_capped(resp).await?;
         if over_cap {
-            return Err(std::io::Error::other(format!(
-                "exec endpoint {}: the response exceeded the {}-byte cap and was discarded — the \
+            // `FileTooLarge`, not `Other`: the command ran and the endpoint answered, so a probe
+            // reads this as its answer (not a transport failure); see `Capabilities::probe`.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                format!(
+                    "exec endpoint {}: the response exceeded the {}-byte cap and was discarded — the \
                  command ran, but its output is too large to return; narrow it (e.g. pipe through \
                  `head`) rather than re-running it unchanged",
-                self.url, self.max_response_bytes
-            )));
+                    self.url, self.max_response_bytes
+                ),
+            ));
         }
         serde_json::from_slice(&body).map_err(|e| {
             std::io::Error::other(format!(
@@ -2134,16 +2139,17 @@ impl ExecTarget {
             let (name, value) = HttpExecRunner::parse_header(raw)?;
             runner = runner.with_header(name, value);
         }
-        Ok(Self::over(std::sync::Arc::new(runner)).await)
+        Self::over(std::sync::Arc::new(runner)).await
     }
 
     /// Build from an argv template (`ssh host -- {}`, `docker exec ctr {}`, …).
     pub async fn template(template: &str) -> Result<Self, String> {
-        Ok(Self::over(std::sync::Arc::new(TemplateRunner::parse(template)?)).await)
+        Self::over(std::sync::Arc::new(TemplateRunner::parse(template)?)).await
     }
 
-    /// Wrap an already-built runner, probing it for the capability rung.
-    pub async fn over(runner: std::sync::Arc<dyn CommandRunner>) -> Self {
+    /// Wrap an already-built runner, probing it for the capability rung. A probe request that fails
+    /// (unreachable, `401`) fails the build with that error.
+    pub async fn over(runner: std::sync::Arc<dyn CommandRunner>) -> Result<Self, String> {
         Self::over_with_home(runner, None).await
     }
 
@@ -2154,19 +2160,21 @@ impl ExecTarget {
     pub async fn over_with_home(
         runner: std::sync::Arc<dyn CommandRunner>,
         home: Option<String>,
-    ) -> Self {
-        let backend = crate::tools::fs::shell::ShellFs::connect(runner.clone()).await;
+    ) -> Result<Self, String> {
+        let backend = crate::tools::fs::shell::ShellFs::connect(runner.clone())
+            .await
+            .map_err(|e| format!("the sandbox did not answer: {e}"))?;
         let backend = match home {
             Some(home) => backend.with_home(home),
             None => backend,
         };
         let caps = backend.capabilities();
-        Self {
+        Ok(Self {
             runner,
             backend: std::sync::Arc::new(backend),
             caps,
             suspect: None,
-        }
+        })
     }
 
     /// Watch `flag` — the one its runner raises on a failed request — so a cell holding this target
@@ -2710,7 +2718,7 @@ mod lazy_cell_tests {
                     Arc::new(TemplateRunner::parse("env {}").map_err(|e| e.to_string())?);
                 Ok(
                     ExecTarget::over_with_home(runner, Some("/sandbox/home".into()))
-                        .await
+                        .await?
                         .watching(flag),
                 )
             })

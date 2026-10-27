@@ -1805,7 +1805,7 @@ async fn open_exec_backend(
         .map_err(std::io::Error::other)?;
     let fs_backend: Option<std::sync::Arc<dyn tools::fs::FsBackend>> = match &exec_runner {
         Some(runner) => {
-            let backend = tools::fs::shell::ShellFs::connect(runner.clone()).await;
+            let backend = tools::fs::shell::ShellFs::connect(runner.clone()).await?;
             // Report the rung, because the alternative is discovering it from a search that walked
             // `target/` — see `SearchEngine::PosixGrep`.
             eprintln!(
