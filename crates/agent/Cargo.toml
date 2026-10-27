@@ -281,6 +281,8 @@ beyond-test-support = { path = "../test-support" }
 # (via its `AllocProfiler` global allocator) alongside timing — so the search bench proves both the
 # speed and the allocation cost of our in-process engine vs shelling out to `rg` (pi's approach).
 divan = "0.1"
+# Property-based testing with shrinking, for the stateful ShellFs ground-truth test (`tests/shellfs_props*.rs`).
+hegeltest = "0.50.3"
 # A throwaway self-signed certificate for the `--tls-listen` tests (same pin as `crates/gateway`).
 rcgen = "0.13"
 # A thread's own CPU clock (`clock_gettime(CLOCK_THREAD_CPUTIME_ID)`) without `unsafe`, for

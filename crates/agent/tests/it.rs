@@ -247,6 +247,8 @@ mod session_segments_fencing;
 mod session_segments_paths;
 mod session_segments_sealing;
 mod session_writer_lock;
+mod shellfs_props;
+mod shellfs_props_env;
 mod settings_project_override;
 mod settings_store;
 mod smoke;
