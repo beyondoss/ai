@@ -5587,6 +5587,203 @@
           }
         }
       ]
+    },
+    {
+      "id": "files.list.symlinked-directory",
+      "description": "Listing a path that is a symlink to a directory lists the directory's entries, as stat (kind dir) promises. (The reference agent runs `find LINK -mindepth 1`, which does not follow a link given as the starting point, and lists nothing.) Found by the stateful property test.",
+      "requires": {
+        "find_printf": true
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir real; printf x > real/f; ln -s real link",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "kind",
+          "op": "stat",
+          "path": "${ROOT}/link",
+          "expect": {
+            "ok": {
+              "kind": "dir"
+            }
+          }
+        },
+        {
+          "id": "list",
+          "op": "list",
+          "path": "${ROOT}/link",
+          "xfail": {
+            "drivers": [
+              "agent-reference",
+              "beyond-sandbox-ts",
+              "python",
+              "python-async"
+            ],
+            "reason": "find does not follow a symlink given as the starting point, so the listing is empty"
+          },
+          "expect": {
+            "ok": {
+              "entries": {
+                "$unordered": [
+                  {
+                    "name": "f",
+                    "kind": "file",
+                    "size": 1
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.missing-root-with-newline-in-name",
+      "description": "A missing search root is not_found even when its name contains a newline. (The engine's one-line error is then two lines, and the reference agent's classifier reads the second as an unknown message and answers `bad regex`.) Found by the stateful property test.",
+      "steps": [
+        {
+          "id": "a",
+          "op": "search",
+          "root": "${ROOT}/no\nwhere",
+          "pattern": "x",
+          "literal": true,
+          "xfail": {
+            "drivers": [
+              "agent-reference",
+              "beyond-sandbox-ts",
+              "python",
+              "python-async"
+            ],
+            "reason": "the stderr classifier needs every line to end in an OS error; a newline in the path breaks the first"
+          },
+          "expect": {
+            "error": {
+              "kind": "not_found"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.search.root-below-a-file",
+      "description": "A search root below a regular file does not exist: not_found or not_a_directory, never invalid_query. (The reference agent's classifier does not know `Not a directory` and answers `bad regex`.) Found by the stateful property test.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo needle > file",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "search",
+          "root": "${ROOT}/file/sub",
+          "pattern": "needle",
+          "literal": true,
+          "xfail": {
+            "drivers": [
+              "agent-reference",
+              "beyond-sandbox-ts",
+              "python",
+              "python-async"
+            ],
+            "reason": "`Not a directory` is not among the OS errors the classifier recognises, so it reads as a bad regex"
+          },
+          "expect": {
+            "error": {
+              "kind": {
+                "$oneof": [
+                  "not_found",
+                  "not_a_directory"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.write-only-file",
+      "description": "A file its owner may write but not read (mode 0200) can be replaced: the write needs no read permission. (The reference agent's script checks the temp's size with `wc -c < tmp`, and the temp has the file's mode, so the check cannot open it and the write is refused as permission_denied.) Found by the stateful property test.",
+      "requires": {
+        "not_root": true
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; printf old > w; chmod 200 w",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/w",
+          "data_b64": "bmV3",
+          "xfail": {
+            "drivers": [
+              "agent-reference",
+              "beyond-sandbox-ts",
+              "python",
+              "python-async"
+            ],
+            "reason": "the write script reads the temp back to check its size, and the temp has mode 0200"
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "content",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "chmod 600 \"$1\"; cat \"$1\"",
+            "sh",
+            "${ROOT}/w"
+          ],
+          "xfail": {
+            "drivers": [
+              "agent-reference",
+              "beyond-sandbox-ts",
+              "python",
+              "python-async"
+            ],
+            "reason": "the write was refused"
+          },
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "new"
+            }
+          }
+        }
+      ]
     }
   ]
 }
