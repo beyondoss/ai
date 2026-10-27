@@ -283,6 +283,7 @@ dir = "sdk/ts"
 description = "TypeScript SDK tests: parsers and command builders, a fake endpoint, and a loopback execd (EXECD_BIN, or target/debug/execd, built if absent)."
 run = "npm test"
 dir = "sdk/ts"
+
 # ---- sandbox clients: the conformance matrix --------------------------------------------------------
 
 [tasks."build:execd-static"]
@@ -306,4 +307,41 @@ for b in ${BACKENDS:-local alpine debian-runas readonly tinydisk fault}; do back
 mkdir -p target/sandbox-matrix
 target/debug/sandbox-matrix --registry sdk/conformance/drivers.toml $backends \
   --report target/sandbox-matrix/report.json "$@"
+"""
+
+# ---- python client: beyond-sandbox (sdk/python/sandbox) ---------------------------------------------
+
+[tasks."install:py"]
+description = "Install beyond-sandbox and its dev tools into sdk/python/sandbox/.venv (uv when present, else venv + pip)."
+run = """
+set -e
+cd sdk/python/sandbox
+if command -v uv >/dev/null 2>&1; then
+  uv venv -q --allow-existing .venv
+  uv pip install -q --python .venv/bin/python -e '.[dev]'
+else
+  [ -x .venv/bin/python ] || python3 -m venv .venv
+  .venv/bin/pip install -q -e '.[dev]'
+fi
+"""
+
+[tasks."check:py"]
+description = "beyond-sandbox: ruff format and lint, mypy --strict."
+depends = ["install:py"]
+run = """
+set -e
+cd sdk/python/sandbox
+.venv/bin/ruff format --check .
+.venv/bin/ruff check .
+.venv/bin/mypy
+"""
+
+[tasks."test:py"]
+description = "beyond-sandbox: the pytest suite. The loopback tests need execd (cargo build -p beyond-execd, or EXECD_BIN) and skip without it. The shared matrix is `mise run test:clients`."
+depends = ["install:py"]
+run = """
+set -e
+cargo build -q -p beyond-execd
+cd sdk/python/sandbox
+.venv/bin/pytest
 """

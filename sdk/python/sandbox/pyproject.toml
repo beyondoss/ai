@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "beyond-sandbox"
+version = "0.1.0.dev0"
+description = "Run commands in a sandbox, and read, write and search its files, over the exec protocol."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = []
+classifiers = [
+  "Typing :: Typed",
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+]
+
+[project.urls]
+Repository = "https://github.com/beyondoss/ai"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "mypy>=1.10", "ruff>=0.5"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/beyond_sandbox"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.mypy]
+strict = true
+files = ["src", "tests"]
+mypy_path = "src"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["src/beyond_sandbox/_scripts.py", "README.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "A", "C4", "SIM", "RUF"]
+ignore = [
+  "E501",
+  "UP007",
+  "UP035",
+] # the formatter owns line length; Union aliases are runtime values
+
+[tool.ruff.format]
+exclude = ["src/beyond_sandbox/_scripts.py"]
