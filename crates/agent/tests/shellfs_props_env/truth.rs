@@ -216,8 +216,7 @@ pub fn canon(p: &Path) -> std::io::Result<PathBuf> {
     }
 }
 
-/// Follow the symlinks at the final component, as the write scripts do (`readlink -f`, one hop for a
-/// dangling link). `None` for a loop.
+/// Follow the symlinks at the final component, as the write scripts do (hop by hop, at most 40). `None` for a loop.
 pub fn resolve_leaf(p: &Path) -> Option<PathBuf> {
     // Directories on the way are followed by the kernel; the final component by the script.
     let canon_parent = |q: &Path| -> Option<PathBuf> {

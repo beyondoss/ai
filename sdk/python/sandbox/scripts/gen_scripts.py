@@ -16,8 +16,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 OUT = Path(__file__).resolve().parents[1] / "src" / "beyond_sandbox" / "_scripts.py"
 
-SHELL = ROOT / "crates/agent/src/tools/fs/shell.rs"
-JOBS = ROOT / "crates/agent/src/exec_endpoint/jobs.rs"
+SHELL = ROOT / "crates/sandbox/src/fs/shell.rs"
+JOBS = ROOT / "crates/sandbox/src/exec_endpoint/jobs.rs"
 NOTIFY = ROOT / "crates/exec-notify/src/lib.rs"
 
 RAW = r'r#"(.*?)"#'

@@ -2851,9 +2851,10 @@ between chunks.
 
 Both paths also keep the rest of `FsBackend::write_bytes`'s contract, which is written down once on
 that trait method and checked on every backend by `tests/fs_backend_parity.rs`. Every write script
-starts by resolving the target the way `LocalFs` does: `readlink -f` for a link whose target exists,
-and for a dangling link (which busybox's `readlink -f` resolves against the working directory) a hop-by-hop `readlink`
-chain, each relative target joined to its link's directory, at most 40 hops. It then names the temp beside the resolved file, so a write through a symlink
+starts by resolving the target the way `LocalFs` does: a hop-by-hop `readlink` chain, each relative target joined to its link's
+directory, at most 40 hops (`readlink -f` is not used: it is unbounded in time and memory on an adversarial chain, and busybox
+resolves a dangling link's relative target against the working directory). A chain still a link after 40 hops is a loop: the
+write fails with `Too many levels of symbolic links (os error 40)` and changes nothing. It then names the temp beside the resolved file, so a write through a symlink
 lands in its target and the link stays a link. The temp is created empty and given the existing file's
 mode before any content goes in, with `chmod --reference` or, on busybox, which has no
 `--reference`, `chmod "$(stat -L -c %a ...)"`. A mode that cannot be copied fails the write. Before
