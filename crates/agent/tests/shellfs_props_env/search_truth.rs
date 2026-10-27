@@ -182,6 +182,14 @@ enum Class {
 }
 
 fn classify_file(bytes: &[u8], engine: Engine, explicit: bool) -> Class {
+    // ripgrep sniffs a byte-order mark and transcodes UTF-16 (and strips UTF-8's): the file is
+    // searched as something else than its bytes. The spec leaves the engines' decoding to them.
+    if bytes.starts_with(&[0xFF, 0xFE])
+        || bytes.starts_with(&[0xFE, 0xFF])
+        || bytes.starts_with(&[0xEF, 0xBB, 0xBF])
+    {
+        return Class::Ambiguous;
+    }
     let nul = bytes.contains(&0);
     if nul {
         return if explicit {
