@@ -735,9 +735,13 @@ impl Machine {
                         Plan::Succeed => fail(format!(
                             "{op} {p:?} must succeed but failed ({kind:?}): {e}"
                         )),
-                        Plan::Fail(kinds) if !kind_ok(kinds, kind, &p) => fail(format!(
-                            "{op} {p:?} failed as {kind:?} ({e}), spec allows {kinds:?}"
-                        )),
+                        Plan::Fail(kinds)
+                            if !kind_ok(kinds, kind, &p) && !kind_ok(kinds, kind, &target) =>
+                        {
+                            fail(format!(
+                                "{op} {p:?} failed as {kind:?} ({e}), spec allows {kinds:?}"
+                            ))
+                        }
                         _ => {}
                     }
                     check_unchanged("a failed write");
@@ -1362,6 +1366,11 @@ impl Machine {
         tc.assume(self.cfg.fault_pct == 0 && self.cfg.tiny_kib.is_none());
         let p = self.pick_path(&tc);
         tc.assume(matches!(truth::plan_write(&p), Plan::Succeed));
+        // (N4: a file its owner cannot read cannot be replaced, so a race over one proves nothing.)
+        tc.assume(
+            std::fs::metadata(&p).is_ok_and(|m| m.is_dir() || truth::can(&p, 4))
+                || std::fs::metadata(&p).is_err(),
+        );
         tc.assume(
             std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file())
                 || std::fs::symlink_metadata(&p).is_err(),
