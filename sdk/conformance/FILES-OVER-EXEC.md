@@ -289,15 +289,20 @@ resolution, in order:
 3. a target that is a directory is refused (`Is a directory (os error 21)`, exit
    1), before the temp exists, because `mv -f` would move the temp _into_ it
    and report success;
-   the temp is created empty with `set -C` (no-clobber: a preplanted temp is
-   refused, not followed);
-4. if the target exists, the temp gets its mode **before any content**:
-   `chmod --reference`, falling back to `chmod "$(stat -L -c %a TARGET)"`
-   (busybox); if neither works the write fails (`cannot give the new file the
-   mode of ...`) and the temp is removed;
+4. if the target exists and `[ -w TARGET ]` is false, the write is refused
+   (`Permission denied (os error 13)`, exit 1) before the temp exists; the
+   temp is then created empty with `set -C` (no-clobber: a preplanted temp is
+   refused, not followed) under `umask 077` (mode 0600), or
+   with the default mode when the target does not exist, so the size check in
+   step 5 can read it back whatever the file's mode is: **a write needs no
+   read permission on the file** (a mode 0200 file is replaced);
 5. the content is appended; the temp's size is checked against the expected
    byte count; the directory check runs again (a directory created meanwhile
-   removes the temp and fails); only then `mv -f TEMP TARGET`.
+   removes the temp and fails); if the target exists the temp gets its mode
+   **now, just before the `mv`**: `chmod --reference`, falling back to
+   `chmod "$(stat -L -c %a TARGET)"` (busybox); if neither works the write fails
+   (`cannot give the new file the mode of ...`) and the temp is removed; only
+   then `mv -f TEMP TARGET`.
 
 A write is therefore atomic (a reader sees the old file or the new one), keeps
 the file's mode (a 0600 file stays 0600, a 0755 file stays executable), writes
@@ -335,8 +340,9 @@ Further rules:
 - The parent directory must exist (`not_found`); `write` does not create
   directories.
 - A file the caller may not write is refused with `permission_denied` and
-  unchanged: the temp inherits the old file's mode (a read-only file gives a
-  read-only temp that cannot be appended to).
+  unchanged: the script tests `[ -w TARGET ]` before creating the temp.
+- A file the caller may write but not read (mode 0200, 0333) is replaced: the
+  temp is 0600 until the `mv`, so the size check can read it.
 - A write onto a **directory** MUST fail and change nothing.
 - Two writers to one path leave one complete content, never a mixture.
 
@@ -658,9 +664,17 @@ if [ -d "$t" ]; then
   echo "Is a directory (os error 21)" >&2
   exit 1
 fi
+if [ -e "$t" ] && [ ! -w "$t" ]; then
+  echo "Permission denied (os error 13)" >&2
+  exit 1
+fi
 set -C
-: > "$tmp" || exit 1
+if [ -e "$t" ]; then (umask 077; : > "$tmp") || exit 1; else : > "$tmp" || exit 1; fi
 set +C
+if cat >> "$tmp"; then
+  n=$(wc -c < "$tmp")
+  if [ $n -eq "$3" ]; then
+    if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
 if [ -e "$t" ]; then
   chmod --reference="$t" "$tmp" 2>/dev/null || chmod "$(stat -L -c %a "$t")" "$tmp" || {
     echo "cannot give the new file the mode of $t" >&2
@@ -668,10 +682,6 @@ if [ -e "$t" ]; then
     exit 1
   }
 fi
-if cat >> "$tmp"; then
-  n=$(wc -c < "$tmp")
-  if [ $n -eq "$3" ]; then
-    if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
     mv -f "$tmp" "$t" && exit 0
   else
     echo "short write: $n of $3 bytes arrived on stdin" >&2
@@ -706,9 +716,19 @@ if [ -d "$t" ]; then
   echo "Is a directory (os error 21)" >&2
   exit 1
 fi
+if [ -e "$t" ] && [ ! -w "$t" ]; then
+  echo "Permission denied (os error 13)" >&2
+  exit 1
+fi
 set -C
-: > "$tmp" || exit 1
+if [ -e "$t" ]; then (umask 077; : > "$tmp") || exit 1; else : > "$tmp" || exit 1; fi
 set +C
+fi
+printf %s "$3" | base64 -d >> "$tmp" || { rm -f "$tmp"; exit 1; }
+[ -z "$5" ] && exit 0
+n=$(wc -c < "$tmp")
+if [ $n -eq "$6" ]; then
+  if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
 if [ -e "$t" ]; then
   chmod --reference="$t" "$tmp" 2>/dev/null || chmod "$(stat -L -c %a "$t")" "$tmp" || {
     echo "cannot give the new file the mode of $t" >&2
@@ -716,12 +736,6 @@ if [ -e "$t" ]; then
     exit 1
   }
 fi
-fi
-printf %s "$3" | base64 -d >> "$tmp" || { rm -f "$tmp"; exit 1; }
-[ -z "$5" ] && exit 0
-n=$(wc -c < "$tmp")
-if [ $n -eq "$6" ]; then
-  if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
   mv -f "$tmp" "$t" && exit 0
 else
   echo "short write: $n of $6 bytes assembled" >&2

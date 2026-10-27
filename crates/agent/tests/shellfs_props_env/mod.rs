@@ -713,19 +713,6 @@ impl Machine {
                 } else {
                     // The command itself failed (a fault may still have hit its cleanup).
                     match &plan {
-                        Plan::Succeed
-                            if kind == Kind::PermissionDenied
-                                && std::fs::metadata(&target).is_ok_and(|m| m.is_file())
-                                && !truth::can(&target, 4) =>
-                        {
-                            // The size check reads the temp back, and the temp has the file's mode.
-                            known(
-                                "N4",
-                                format!(
-                                    "{op} {p:?} refused: the file is writable but not readable by its owner: {e}"
-                                ),
-                            );
-                        }
                         Plan::Succeed => fail(format!(
                             "{op} {p:?} must succeed but failed ({kind:?}): {e}"
                         )),

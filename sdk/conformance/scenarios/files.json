@@ -5519,7 +5519,7 @@
     },
     {
       "id": "files.write.write-only-file",
-      "description": "A file its owner may write but not read (mode 0200) can be replaced: the write needs no read permission. (The reference agent's script checks the temp's size with `wc -c < tmp`, and the temp has the file's mode, so the check cannot open it and the write is refused as permission_denied.) Found by the stateful property test.",
+      "description": "A file its owner may write but not read (mode 0200) can be replaced: the write needs no read permission. The temp is 0600 while the size check reads it back and gets the file's mode just before the mv. Found by the stateful property test.",
       "requires": {
         "not_root": true
       },
@@ -5542,15 +5542,6 @@
           "op": "write",
           "path": "${ROOT}/w",
           "data_b64": "bmV3",
-          "xfail": {
-            "drivers": [
-              "agent-reference",
-              "beyond-sandbox-ts",
-              "python",
-              "python-async"
-            ],
-            "reason": "the write script reads the temp back to check its size, and the temp has mode 0200"
-          },
           "expect": {
             "ok": {}
           }
@@ -5565,15 +5556,6 @@
             "sh",
             "${ROOT}/w"
           ],
-          "xfail": {
-            "drivers": [
-              "agent-reference",
-              "beyond-sandbox-ts",
-              "python",
-              "python-async"
-            ],
-            "reason": "the write was refused"
-          },
           "expect": {
             "ok": {
               "exit_code": 0,
