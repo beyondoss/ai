@@ -2078,7 +2078,7 @@
     },
     {
       "id": "files.write.onto-directory",
-      "description": "A write onto a directory is an error and changes nothing. (The reference agent's script ends in `mv file dir`, which moves the temp INTO the directory and reports success.)",
+      "description": "A write onto a directory is an error and changes nothing.",
       "setup": [
         {
           "id": "setup",
@@ -2098,12 +2098,6 @@
           "op": "write",
           "path": "${ROOT}/d",
           "data_b64": "eA==",
-          "xfail": {
-            "drivers": [
-              "agent-reference"
-            ],
-            "reason": "the write script's final `mv -f tmp dir` moves the temp into the directory and exits 0"
-          },
           "expect": {
             "error": {
               "kind": {
@@ -2122,12 +2116,6 @@
             "sh",
             "${ROOT}/d"
           ],
-          "xfail": {
-            "drivers": [
-              "agent-reference"
-            ],
-            "reason": "the temp file was moved into the directory"
-          },
           "expect": {
             "ok": {
               "exit_code": 0,

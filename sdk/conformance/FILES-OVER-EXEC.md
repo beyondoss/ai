@@ -323,7 +323,7 @@ Further rules:
 - A file the caller may not write is refused with `permission_denied` and
   unchanged: the temp inherits the old file's mode (a read-only file gives a
   read-only temp that cannot be appended to).
-- A write onto a **directory** MUST fail and change nothing (D1).
+- A write onto a **directory** MUST fail and change nothing.
 - Two writers to one path leave one complete content, never a mixture.
 
 ### 5.4 write_if_unchanged
@@ -719,10 +719,6 @@ The reference (`ShellFs` as of this writing) behaves as follows where a client
 MUST do better. Each has an `xfail` check in the scenarios, marked for the
 reference driver, which turns into a plain pass when the reference is fixed.
 
-- **D1. Writing onto a directory.** The final `mv -f TEMP DIR` moves the temp
-  _into_ the directory and exits 0, so `write` reports success and leaves a
-  stray `DIR/DIR.tmp.SUFFIX`. A client MUST fail (and SHOULD test `[ -d "$t" ]`
-  before creating the temp). Scenario `files.write.onto-directory`.
 - **D2. Symlink size and mtime.** `stat` reports the link's own size and mtime
   while `kind` follows the link, so `write_if_unchanged` through a link
   compares the wrong file. Scenarios `files.stat.symlink-size-and-mtime-follow`

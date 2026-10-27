@@ -1216,6 +1216,22 @@ tmp="$t.tmp.$2"
     };
 }
 
+/// Refuse a target that is a directory, with the message `std` gives (so both backends read alike).
+/// Without it the final `mv -f "$tmp" "$t"` moves the temp *into* the directory and exits 0: a write
+/// that reports success and leaves `DIR/DIR.tmp.SUFFIX` behind. `mv -T` would refuse atomically, but
+/// it is GNU-only; busybox has no such flag. So the check runs twice, before the temp exists and
+/// again immediately before the `mv`; a directory created at the target inside that last instant is
+/// the one remaining window, the same width as any check-then-rename on a shell.
+macro_rules! not_a_directory {
+    () => {
+        r#"if [ -d "$t" ]; then
+  echo "Is a directory (os error 21)" >&2
+  exit 1
+fi
+"#
+    };
+}
+
 /// Create the empty temp `$tmp`, with `$t`'s mode when `$t` exists, before any content goes in, so
 /// the replacement keeps the file's mode and a 0600 file's bytes are never in a world-readable temp.
 /// `chmod --reference` is GNU; busybox, which Alpine ships, has no `--reference`, so its fallback is
@@ -1226,7 +1242,9 @@ tmp="$t.tmp.$2"
 /// at its name.
 macro_rules! new_temp {
     () => {
-        r#"set -C
+        concat!(
+            not_a_directory!(),
+            r#"set -C
 : > "$tmp" || exit 1
 set +C
 if [ -e "$t" ]; then
@@ -1237,6 +1255,7 @@ if [ -e "$t" ]; then
   }
 fi
 "#
+        )
     };
 }
 
@@ -1253,6 +1272,7 @@ const WRITE_STDIN_SCRIPT: &str = concat!(
     r#"if cat >> "$tmp"; then
   n=$(wc -c < "$tmp")
   if [ $n -eq "$3" ]; then
+    if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
     mv -f "$tmp" "$t" && exit 0
   else
     echo "short write: $n of $3 bytes arrived on stdin" >&2
@@ -1278,6 +1298,7 @@ printf %s "$3" | base64 -d >> "$tmp" || { rm -f "$tmp"; exit 1; }
 [ -z "$5" ] && exit 0
 n=$(wc -c < "$tmp")
 if [ $n -eq "$6" ]; then
+  if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
   mv -f "$tmp" "$t" && exit 0
 else
   echo "short write: $n of $6 bytes assembled" >&2
@@ -1732,6 +1753,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let caps = Capabilities::probe(&shim(dir.path(), "base64")).await;
         assert!(caps.no_read_window);
+    }
+
+    #[tokio::test]
+    async fn a_write_onto_a_directory_fails_and_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        let probed = ShellFs::connect(Arc::new(Prelude(":".into()))).await;
+        for stdin in [true, false] {
+            let mut caps = probed.capabilities();
+            caps.stdin = stdin;
+            let fs = ShellFs::with_capabilities(Arc::new(Prelude(":".into())), caps);
+            let err = fs.write_bytes(&d, b"x".to_vec()).await.unwrap_err();
+            assert!(err.to_string().contains("Is a directory"), "{err}");
+            let err = fs
+                .write_if_unchanged(&d, b"x".to_vec(), fs.stat(&d).await.unwrap().unwrap().mtime)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("Is a directory"), "{err}");
+            assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0, "stdin={stdin}");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
     }
 
     #[test]
