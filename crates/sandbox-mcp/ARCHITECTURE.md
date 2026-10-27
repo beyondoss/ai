@@ -7,6 +7,7 @@ jobs) and back; the behaviour behind every tool is specified in `sdk/conformance
 
 | file                            | what                                                                                                                       |
 | ------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `src/lib.rs`                    | the library root: `Config`, `SandboxMcp`, and the modules below                                                            |
 | `src/main.rs`                   | reads the environment, serves stdio or streamable HTTP, exits on SIGTERM / SIGINT / stdin closing                          |
 | `src/config.rs`                 | `Config::from_env`: every variable parsed in one place, errors name the variable                                           |
 | `src/server.rs`                 | `SandboxMcp`: the twelve tools, the `sandbox://capabilities` resource, the lazily made connection                          |
