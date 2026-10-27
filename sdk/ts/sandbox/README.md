@@ -32,10 +32,11 @@ await sb.jobs.start("my-session", "dev1", {
 ```
 
 **Proven, not claimed.** The package ships a conformance driver (`dist/driver.mjs`) that runs the shared scenarios of
-[`sdk/conformance`](../../conformance/README.md): the same 421 checks on the plain `execd` backend as the Rust client, 0 failed,
-0 unsupported, and the same counts on every other backend (a bearer, no stdin, GNU `grep`, busybox `grep`, a v1.1-only endpoint,
-baseline jobs). Every file helper's command is the byte-for-byte script of
-[FILES-OVER-EXEC.md](../../conformance/FILES-OVER-EXEC.md), so it works on Alpine (busybox) as it does on Debian.
+[`sdk/conformance`](../../conformance/README.md) against a real `execd`: 421 checks pass on the plain backend, the same as the
+Rust client, with 0 failed and 0 unsupported on all 12 backends (a bearer, no stdin, GNU `grep`, busybox `grep`, a v1.1-only
+endpoint, baseline jobs, Alpine with real busybox, Debian under `EXECD_RUN_AS`, a read-only mount, a disk that fills). On Alpine it
+passes the 20 checks the Rust client fails. Every file helper runs the byte-for-byte script of
+[FILES-OVER-EXEC.md](../../conformance/FILES-OVER-EXEC.md), so it works on busybox as on Debian.
 
 ## Three layers, each usable alone
 
