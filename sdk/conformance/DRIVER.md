@@ -6,7 +6,7 @@ on stdin and writes results as JSON lines on stdout. A harness feeds the same
 scenario files to every driver against every backend and compares the answers.
 The behaviour behind each op is specified in
 [FILES-OVER-EXEC.md](FILES-OVER-EXEC.md) and in the exec protocol. The reference
-driver and harness are in `crates/agent/tests/sdk_conformance*.rs`; where this
+driver and harness are in `crates/sandbox/tests/sdk_conformance*.rs`; where this
 document is unclear, they are the answer.
 
 The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.

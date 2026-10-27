@@ -1,18 +1,6 @@
-//! `beyond-sandbox`: use a sandbox over the exec protocol.
-//!
-//! Three layers, each usable alone:
-//!
-//! 1. **Exec** ([`exec::CommandRunner`], also [`Exec`]): run a command somewhere, one-shot or
-//!    streamed. [`HttpExecRunner`] (protocol v1.1 to v1.4) is the default implementation;
-//!    [`TemplateRunner`] drives `ssh`/`docker exec`; anything else (a vendor SDK, a test double) is
-//!    one trait implementation away.
-//! 2. **Helpers**, built only on layer 1: [`Files`] (read, write, edit, list, search, glob) and
-//!    [`Jobs`] (long-running commands that outlive the call).
-//! 3. **Surface**: [`Sandbox`], one object that connects, owns the three, and always exposes the raw
-//!    [`Exec`].
-//!
-//! The wire protocol is specified in the module doc of [`exec_endpoint`]; the file helpers' exact
-//! commands in `sdk/conformance/FILES-OVER-EXEC.md`.
+#![doc = include_str!("../README.md")]
+// `.unwrap()` *is* the assertion in a unit test.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod exec;
 pub mod exec_endpoint;

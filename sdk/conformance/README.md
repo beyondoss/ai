@@ -30,7 +30,7 @@ skipped.
 
 ## The reference check
 
-`cargo nextest run -p beyond-agent --test it -E 'test(/sdk_conformance/)'`
+`cargo nextest run -p beyond-sandbox -E 'binary(sdk_conformance)'`
 replays every scenario through the agent's own `ShellFs` and `HttpExecRunner`
 against a loopback `execd`, in several backend profiles (plain, bearer, a v1
 endpoint without stdin, a v1.1-only endpoint, forced no-stdin, forced `grep` and

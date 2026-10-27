@@ -1,5 +1,5 @@
 {
-  "spec": "exec protocol v1.4 sandbox job notify (crates/agent/src/exec_endpoint.rs, \"Sandbox job notify (v1.4)\"), \"The notify token (bjn_v1)\"",
+  "spec": "exec protocol v1.4 sandbox job notify (crates/sandbox/src/exec_endpoint.rs, \"Sandbox job notify (v1.4)\"), \"The notify token (bjn_v1)\"",
   "notes": [
     "secrets: fleet seal secrets, standard base64 of 32 bytes, as --seal-key holds them. current is the replica's own, which it mints and verifies under (N49); other is a seal secret the replica does not hold, such as the one before a rotation.",
     "keys: K = HKDF-SHA256(ikm = secret, salt = empty, info = \"bjn_v1 notify\") in hex, and kid = hex(SHA-256(\"bjn_v1 kid\" || K)[0..4]).",

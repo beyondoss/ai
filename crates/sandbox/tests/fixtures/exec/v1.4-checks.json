@@ -1,5 +1,5 @@
 {
-  "spec": "exec protocol v1.4 sandbox job notify (crates/agent/src/exec_endpoint.rs, \"Sandbox job notify (v1.4)\"), and crates/agent/FLEET.md \"Job-end callbacks\"",
+  "spec": "exec protocol v1.4 sandbox job notify (crates/sandbox/src/exec_endpoint.rs, \"Sandbox job notify (v1.4)\"), and crates/agent/FLEET.md \"Job-end callbacks\"",
   "notes": [
     "Every requirement tag in the spec (N…) and in FLEET.md's edge contract (E…), with the checks its text names, in the same order.",
     "kind: fixture (a v1.4-*.json file in this directory, one of whose cases lists the tag in covers), conformance (a conformance::verify check, by its name), test (a test in this repo, module::name), fleet-sim (a fleet-sim scenario). task: the tracker task that writes the check, or exists."

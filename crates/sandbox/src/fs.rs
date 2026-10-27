@@ -145,7 +145,7 @@ pub struct SearchOutcome {
     pub first_error: Option<String>,
 }
 
-/// Why a backend operation failed. Two variants, mapped 1:1 onto the two [`ToolError`] kinds a
+/// Why a backend operation failed. Two variants, mapped 1:1 onto the two `ToolError` kinds a
 /// filesystem tool can produce, each carrying its message already formatted — so the text the model
 /// reads is identical whichever backend produced it.
 #[derive(Debug)]
@@ -163,6 +163,8 @@ impl std::fmt::Display for FsError {
         }
     }
 }
+
+impl std::error::Error for FsError {}
 
 /// What kind of thing a path is. The `Other` bucket exists because `read`/`write`/`edit` must refuse
 /// FIFOs, sockets and devices *before* opening them: opening a FIFO blocks until a peer appears, and a
