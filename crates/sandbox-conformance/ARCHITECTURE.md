@@ -43,6 +43,8 @@ two ways:
    (`oracle.rs`, which includes `truth.rs` and `search_truth.rs` from `crates/agent/tests/shellfs_props_env`). Writes must change only
    their target, failed operations nothing, reads must equal the file's bytes, listings the directory's entries.
 
+An op is compared across the drivers whose `hello` lists it. A driver without it (the MCP driver has no `exec_stream` or `write_if_unchanged`) is not asked, is never a divergence, and does not make the others skip the op. When the others applied a `write_if_unchanged`, the driver without it is brought level with a plain `write` of the same bytes, so its tree stays the same.
+
 A sequence ends with a read-back of every path it named, so the final tree is compared too. On the container backends there
 is no host filesystem to read, so only (1) applies. Hegel shrinks a difference to a minimal sequence and the test prints it,
 and writes it to `target/differential/<backend>.json`, as a scenario file.
