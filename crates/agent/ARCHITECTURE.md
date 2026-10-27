@@ -2267,15 +2267,16 @@ absurdly long line can't blow the model's context — a character count, matchin
 count: the previous byte-based cap never produced invalid UTF-8 (it already backed off to the nearest
 char boundary), but still truncated a CJK/Cyrillic/accented-Latin line to far fewer visible characters
 than an ASCII line under the same nominal cap, for no reason. **A match line is clipped around its
-match, not at its head** (`fs::clip_match`): when the first match ends past character 500, the
-500-character window is centered on it and both cuts are marked — `… <window> … [truncated; columns
-A-B of N]`, 1-based character columns, the trailing `…` dropped when the window reaches the line's end.
-A head clip hid a match at column 100,000 of a minified bundle, lockfile or SVG entirely, and `read`
-(which caps a line at 4,000 bytes) could not show it either. The match is found with a lazily
-compiled `regex::Regex` from the query (`fs::MatchFinder`, built only when a long match line appears
-and shared by the walk's workers), so `LocalFs` and `ShellFs` window identically; `ShellFs` parses
-whole lines and clips afterwards (`fs::clip_hits`). A pattern the `regex` dialect rejects (a
-POSIX-`grep`-only construct), or a context line, keeps the head clip. A line longer than a remote
+match, not at its head** (`fs::clip_at`): the 500-character window starts 250 characters before the first
+match and both cuts are marked — `… <window> … [truncated; columns A-B of N]`, 1-based character
+columns, the trailing `…` dropped when the window reaches the line's end; a match in the first 250
+characters keeps the head clip. A head clip hid a match at column 100,000 of a minified bundle,
+lockfile or SVG entirely, and `read` (which caps a line at 4,000 bytes) could not show it either.
+`ShellFs` takes the match position from `rg --column` (the byte column, turned into a character
+offset by `fs::match_offset`) and never searches the line again, so no client's regex dialect can
+differ; GNU `grep` gets it from a second `-o -b` run over the long lines only (`ShellFs::window_long_lines`), and busybox reports none and clips at the head. `LocalFs` finds the
+match with a lazily compiled `regex::Regex` (`fs::MatchFinder`) and calls the same `clip_at`. A
+context line keeps the head clip. A line longer than a remote
 runner's 128 KiB capture arrives already cut and is flagged as a truncated result. It also takes
 context-line params — `context` (both sides, like ripgrep's `-C`) or `before`/`after` per side, each
 clamped to `MAX_CONTEXT` (100) — emitting surrounding lines flagged as context vs match; only matches

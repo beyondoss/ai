@@ -342,6 +342,7 @@ pub fn machine(tc: &TestCase, cfg: Config) -> Machine {
     faults.enable(cfg.fault_pct > 0);
     let engine = match caps.search_engine() {
         SearchEngine::Ripgrep => Engine::Rg,
+        SearchEngine::BusyboxGrep => Engine::Busybox,
         _ => Engine::Grep,
     };
     let mut m = Machine {

@@ -478,30 +478,37 @@ impl MatchFinder {
     }
 }
 
-/// Clip a *matched* line to [`MAX_LINE`] characters **around its first match**, not just its head.
-///
-/// A line under the cap, or one whose match ends inside the first [`MAX_LINE`] characters, is clipped
-/// exactly as [`clip`] does. Otherwise the window is centered on the match and both cuts are marked:
-/// `… <window> … [truncated; columns A-B of N]` (columns are 1-based characters). Without this a match
-/// at column 100,000 of a minified bundle, a lockfile or an SVG was never visible: `grep` showed the
-/// first 500 characters, and `read` caps a line at 4,000 bytes, so neither tool could show it.
+/// Clip a *matched* line around its first match, found with `finder` ([`clip_at`] has the rules). For
+/// a backend that has the match in hand rather than a position from the engine (`LocalFs`).
 pub fn clip_match(line: &str, finder: &MatchFinder) -> String {
     // Fast path: most lines are short, and only a long one pays for the regex.
     if line.char_indices().nth(MAX_LINE).is_none() {
         return line.to_string();
     }
-    let Some((m_start, m_end)) = finder.find(line) else {
+    let Some((m_start, _)) = finder.find(line) else {
         return clip(line);
     };
-    let char_at = |byte: usize| line[..byte].chars().count();
-    let (cs, ce) = (char_at(m_start), char_at(m_end));
-    if ce <= MAX_LINE {
+    clip_at(line, line[..m_start].chars().count())
+}
+
+/// Clip a matched line of more than [`MAX_LINE`] characters around the character offset `cs` of its
+/// first match, which the engine reported (`rg --column`); no client searches the line again.
+///
+/// The window starts [`MAX_LINE`]` / 2` characters before the match; one that would start at the head
+/// is the head clip ([`clip`]). A window running past the end is moved back to the last
+/// [`MAX_LINE`] characters. Both cuts are marked: `… <window> … [truncated; columns A-B of N]`
+/// (columns are 1-based characters). Without this a match at column 100,000 of a minified bundle, a
+/// lockfile or an SVG was never visible: `grep` showed the first 500 characters, and `read` caps a
+/// line at 4,000 bytes, so neither tool could show it.
+pub fn clip_at(line: &str, cs: usize) -> String {
+    let total = line.chars().count();
+    if total <= MAX_LINE {
+        return line.to_string();
+    }
+    let mut start = cs.saturating_sub(MAX_LINE / 2);
+    if start == 0 {
         return clip(line);
     }
-    let total = cs + line[m_start..].chars().count();
-    // Center the match; a match wider than the window starts at the match.
-    let pad = MAX_LINE.saturating_sub(ce - cs) / 2;
-    let mut start = cs.saturating_sub(pad);
     let mut end = start + MAX_LINE;
     if end > total {
         end = total;
@@ -519,6 +526,14 @@ pub fn clip_match(line: &str, finder: &MatchFinder) -> String {
     }
     let _ = write!(out, "{WINDOW_MARK}{}-{end} of {total}]", start + 1);
     out
+}
+
+/// The character offset, in the normalized text, of rg's 1-based byte column `col` of the raw line:
+/// the characters before it, CRs not counted (normalization removes them all). `None` when the
+/// column is not a character boundary of the line, and the line is then clipped at its head.
+pub fn match_offset(raw: &str, col: usize) -> Option<usize> {
+    let before = raw.get(..col.checked_sub(1)?)?;
+    Some(before.chars().filter(|c| *c != '\r').count())
 }
 
 /// Clip a hit's text in place, if it is over the cap: a match line around its match, a context line
@@ -786,9 +801,9 @@ mod tests {
             .into();
         assert_eq!(window.chars().count(), MAX_LINE);
         let at = window.find("NEEDLE").unwrap();
-        assert!((240..=260).contains(&at), "centered, not at an edge: {at}");
+        assert!((245..=255).contains(&at), "centered, not at an edge: {at}");
         assert!(
-            out.ends_with(" … [truncated; columns 99754-100253 of 150006]"),
+            out.ends_with(" … [truncated; columns 99751-100250 of 150006]"),
             "{out}"
         );
         assert!(is_windowed(&out));
@@ -829,15 +844,15 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(window.chars().count(), MAX_LINE);
-        assert!(out.contains("columns 2754-3253 of 6006"), "{out}");
+        assert!(out.contains("columns 2751-3250 of 6006"), "{out}");
     }
 
     #[test]
-    fn a_match_wider_than_the_window_starts_at_the_match() {
+    fn a_match_wider_than_the_window_is_placed_by_where_it_starts() {
         let line = format!("{}<{}>", "a".repeat(1_000), "z".repeat(800));
         let out = clip_match(&line, &finder("<z+>"));
-        assert!(out.starts_with("… <zzz"), "{out}");
-        assert!(out.contains("columns 1001-1500 of 1802"), "{out}");
+        assert!(out.contains('<'), "{out}");
+        assert!(out.contains("columns 751-1250 of 1802"), "{out}");
     }
 
     #[test]

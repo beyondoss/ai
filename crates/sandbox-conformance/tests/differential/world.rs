@@ -183,10 +183,10 @@ pub async fn run_case(world: &World, ops: &[Op]) -> Result<(), Failure> {
             vars.insert("ROOT".into(), json!(root));
             let ctx = world.local.then(|| Ctx {
                 root: PathBuf::from(&root),
-                engine: if d.be.caps["search_engine"] == "rg" {
-                    Engine::Rg
-                } else {
-                    Engine::Grep
+                engine: match d.be.caps["search_engine"].as_str() {
+                    Some("rg") => Engine::Rg,
+                    Some("busybox-grep") => Engine::Busybox,
+                    _ => Engine::Grep,
                 },
                 find_printf: d.be.caps["find_printf"] != false,
                 busybox: d.be.caps["search_engine"] == "busybox-grep",

@@ -695,7 +695,7 @@ async fn a_match_deep_in_a_long_line_is_windowed_identically_on_every_backend() 
         let out = run_tool(Some(backend), "grep", input.clone()).await;
         assert!(out.contains("é NEEDLE ü"), "{name}: {out}");
         assert!(
-            out.contains("columns 19756-20255 of 25010]"),
+            out.contains("columns 19753-20252 of 25010]"),
             "{name}: {out}"
         );
         outs.push((name, out));
