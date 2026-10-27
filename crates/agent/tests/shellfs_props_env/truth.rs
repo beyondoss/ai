@@ -333,9 +333,7 @@ pub fn plan_mkdir(path: &Path) -> Plan {
 
 /// Epoch seconds with the nanoseconds, as a double: what the guard compares (spec 5.4).
 pub fn fsecs(t: SystemTime) -> f64 {
-    t.duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
+    beyond_sandbox::fs::epoch_f64(t)
 }
 
 pub fn secs(t: SystemTime) -> u64 {

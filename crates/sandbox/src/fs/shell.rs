@@ -1076,12 +1076,7 @@ fn parse_dir_entries(stdout: &str, cap: usize, include_hidden: bool) -> Vec<DirE
 /// whose numbers are doubles (TypeScript, Python, the JSON driver protocol) compares, so every client
 /// agrees. A change made within the same second as the read is therefore caught.
 fn mtimes_match(a: Option<std::time::SystemTime>, b: Option<std::time::SystemTime>) -> bool {
-    fn secs(t: Option<std::time::SystemTime>) -> Option<f64> {
-        t?.duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|d| d.as_secs_f64())
-    }
-    secs(a) == secs(b)
+    a.map(super::epoch_f64) == b.map(super::epoch_f64)
 }
 
 /// The `detail` of a failed command (spec 3.3): the first line of trimmed stderr; and when that line
@@ -1864,6 +1859,21 @@ mod appendix_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stat_keeps_the_nanoseconds_and_the_guard_compares_them() {
+        let a = parse_stat("w\tf\t3\t1793127211.536029123\n").unwrap().mtime;
+        let b = parse_stat("w\tf\t3\t1793127211.536029999\n").unwrap().mtime;
+        let c = parse_stat("w\tf\t3\t1793127211.5\n").unwrap().mtime;
+        let whole = parse_stat("w\tf\t3\t1793127211\n").unwrap().mtime;
+        assert_eq!(parse_mtime("5.25"), (5, 250_000_000));
+        assert_eq!(parse_mtime("5.1234567891"), (5, 123_456_789));
+        assert!(mtimes_match(a, a));
+        assert!(!mtimes_match(a, c), "same second, other fraction");
+        assert!(!mtimes_match(c, whole), "a truncated second does not match");
+        // 876 ns apart: above a double's 0.24 us resolution, so a change that small is caught.
+        assert!(!mtimes_match(a, b));
+    }
 
     #[test]
     fn stat_mtime_past_systemtime_range_is_unknown_not_a_panic() {

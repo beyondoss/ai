@@ -189,8 +189,7 @@ fn kind_name(k: FileKind) -> &'static str {
 }
 
 fn epoch_secs(t: SystemTime) -> f64 {
-    t.duration_since(UNIX_EPOCH)
-        .map_or(0.0, |d| d.as_secs_f64())
+    beyond_sandbox::fs::epoch_f64(t)
 }
 
 fn state_of(s: JobStatus) -> (&'static str, Option<i32>) {

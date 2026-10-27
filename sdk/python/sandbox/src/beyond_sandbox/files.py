@@ -151,7 +151,9 @@ class AsyncFiles:
     async def write(self, path: str, data: bytes) -> None:
         await adrive(_fs.write(path, data, await self.capabilities()), self._t)
 
-    async def write_if_unchanged(self, path: str, data: bytes, expected_mtime: float | None) -> None:
+    async def write_if_unchanged(
+        self, path: str, data: bytes, expected_mtime: float | None
+    ) -> None:
         op = _fs.write_if_unchanged(path, data, expected_mtime, await self.capabilities())
         await adrive(op, self._t)
 
