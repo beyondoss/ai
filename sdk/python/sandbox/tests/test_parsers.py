@@ -9,7 +9,6 @@ from beyond_sandbox._fs import (
     Query,
     classify_search_failure,
     clip,
-    clip_match,
     compile_glob,
     crlf_tolerant_ere,
     finalize,
@@ -235,7 +234,7 @@ def test_rg_args_put_the_pattern_behind_dash_e_and_the_path_behind_dash_dash() -
     args = rg_args(q("-v", "-weird-dir"), False)
     assert args[args.index("-e") + 1] == "-v"
     assert args[args.index("--") + 1] == "-weird-dir"
-    assert args[:7] == ["--null", "--with-filename", "--line-number", "--no-heading",
+    assert args[:8] == ["--null", "--with-filename", "--line-number", "--column", "--no-heading",
                         "--color=never", "--hidden", "--crlf"]  # fmt: skip
 
 
@@ -357,28 +356,39 @@ def test_clip_counts_characters_not_bytes() -> None:
     assert clip("é" * 501) == "é" * 500 + "… [truncated]"
 
 
-def test_a_match_deep_in_a_long_line_is_windowed() -> None:
+def _rec(col: int, line: str) -> str:
+    return f"f\x001:{col}:{line}\n"
+
+
+def test_a_match_deep_in_a_long_line_is_windowed_around_rgs_column() -> None:
     line = "a" * 2000 + "NEEDLE" + "b" * 2000
-    out = clip_match(line, q("NEEDLE"))
-    assert out.startswith("… ") and out.endswith("]") and "NEEDLE" in out
-    assert "[truncated; columns " in out and "of 4006]" in out
-    assert out.count("…") == 2  # both cuts marked
+    [hit] = parse_records(_rec(2001, line), True)
+    assert hit.text.startswith("… ") and "NEEDLE" in hit.text
+    assert hit.text.endswith(" … [truncated; columns 1751-2250 of 4006]")
 
 
 def test_a_match_near_the_end_shows_the_last_window() -> None:
     line = "a" * 2000 + "NEEDLE"
-    out = clip_match(line, q("NEEDLE"))
-    assert out == "… " + line[-500:] + " [truncated; columns 1507-2006 of 2006]"
+    [hit] = parse_records(_rec(2001, line), True)
+    assert hit.text == "… " + line[-500:] + " [truncated; columns 1507-2006 of 2006]"
 
 
-def test_a_match_inside_the_first_window_keeps_the_head_clip() -> None:
+def test_a_match_in_the_first_250_characters_keeps_the_head_clip() -> None:
     line = "NEEDLE" + "b" * 1000
-    assert clip_match(line, q("NEEDLE")) == line[:500] + "… [truncated]"
+    [hit] = parse_records(_rec(1, line), True)
+    assert hit.text == line[:500] + "… [truncated]"
 
 
-def test_an_unusable_pattern_clips_the_head() -> None:
-    line = "b" * 1000
-    assert clip_match(line, q("(")) == line[:500] + "… [truncated]"
+def test_the_column_is_bytes_the_offset_characters_and_crs_do_not_count() -> None:
+    line = "é" * 600 + "\r" + "x" * 600
+    [hit] = parse_records(_rec(1202, line), True)
+    assert hit.text.endswith("[truncated; columns 351-850 of 1200]")
+
+
+def test_no_column_or_one_inside_a_character_clips_the_head() -> None:
+    line = "é" * 1000
+    assert parse_records(_rec(2, line), True)[0].text == clip(line)
+    assert parse_records(f"f\x001:{line}\n")[0].text == clip(line)
 
 
 # ---- error classification --------------------------------------------------------------------------
@@ -404,3 +414,12 @@ def test_the_classifier_reads_the_stderr_line_not_the_path() -> None:
     err = _fs.fail("read /tmp/is a directory/x", b"Permission denied (os error 13)\n")
     assert err.kind == "permission_denied"
     assert str(err.detail) == "read /tmp/is a directory/x: Permission denied (os error 13)"
+
+
+def test_rgs_binary_file_warning_is_not_the_start_of_a_record() -> None:
+    w = ': WARNING: stopped searching binary file after match (found "\\0" byte around offset 3)'
+    out = f"a\x001:1:x\nb\x001:1:y\nb{w}\nc\x001:1:z\n"
+    assert [h.path for h in parse_records(out, True)] == ["a", "b", "c"]
+    # Not the previous record's file: a path that merely contains the words.
+    out = f"a\x001:1:x\nb{w}\nc\x001:1:z\n"
+    assert [h.path for h in parse_records(out, True)] == ["a", f"b{w}\nc"]

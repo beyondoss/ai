@@ -27,7 +27,10 @@ const FIRST_BUFFER: usize = 32 * 1024;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Engine {
     Rg,
+    /// GNU grep.
     Grep,
+    /// busybox grep: GNU's behaviour, except that it cannot place a match in a long line.
+    Busybox,
 }
 
 #[derive(Clone, Debug)]
@@ -132,7 +135,7 @@ impl Matcher {
 }
 
 /// The spec's clipping (FILES-OVER-EXEC "Clipping").
-pub fn clip(text: &str, is_match: bool, m: &Matcher) -> String {
+pub fn clip(text: &str, is_match: bool, m: &Matcher, engine: Engine) -> String {
     let chars: Vec<char> = text.chars().collect();
     let total = chars.len();
     if total <= MAX_LINE {
@@ -143,17 +146,17 @@ pub fn clip(text: &str, is_match: bool, m: &Matcher) -> String {
         s.push_str("… [truncated]");
         s
     };
-    if !is_match {
+    // GNU grep places the match with a second `-o -b` run; busybox has no way to.
+    if !is_match || engine == Engine::Busybox {
         return head(&chars);
     }
-    let Some((cs, ce)) = m.find(text) else {
+    let Some((cs, _)) = m.find(text) else {
         return head(&chars);
     };
-    if ce <= MAX_LINE {
+    let mut start = cs.saturating_sub(MAX_LINE / 2);
+    if start == 0 {
         return head(&chars);
     }
-    let pad = MAX_LINE.saturating_sub(ce - cs) / 2;
-    let mut start = cs.saturating_sub(pad);
     let mut end = start + MAX_LINE;
     if end > total {
         end = total;
@@ -200,7 +203,7 @@ fn classify_file(bytes: &[u8], engine: Engine, explicit: bool) -> Class {
             Class::Ambiguous
         };
     }
-    if engine == Engine::Grep && std::str::from_utf8(bytes).is_err() {
+    if engine != Engine::Rg && std::str::from_utf8(bytes).is_err() {
         return Class::Ambiguous;
     }
     Class::Included
@@ -276,7 +279,7 @@ pub fn expect(root: &Path, map: &dyn Fn(&Path) -> String, spec: &Spec, engine: E
                 hits.push(Th {
                     path: path.clone(),
                     line: i + 1,
-                    text: clip(&t, is_m[i], &matcher),
+                    text: clip(&t, is_m[i], &matcher, engine),
                     is_match: is_m[i],
                 });
             }
