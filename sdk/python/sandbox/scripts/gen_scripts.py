@@ -47,43 +47,9 @@ def concat_const(src: str, name: str, macros: dict[str, str]) -> str:
     return "".join(out)
 
 
-# The reference resolves a dangling link with `readlink -f`, and busybox's answers relative to the
-# working directory instead of the link's (a write through a dangling link then lands in the wrong
-# directory: files.write.dangling-symlink-creates-target on Alpine). This resolve walks the links
-# by hand whenever the target does not exist, and keeps `readlink -f` for the ones that do. It is
-# applied to every script that resolves a target; the check below fails when the reference has
-# adopted it (or changed the block), so this stays a visible deviation, not a silent one.
-RESOLVE_OLD = """  r=$(readlink -f "$t" 2>/dev/null) || r=
-  if [ -z "$r" ]; then
-    r=$(readlink "$t") || exit 1
-    case "$r" in
-      /*) ;;
-      *) case "$t" in */*) r="${t%/*}/$r" ;; esac ;;
-    esac
-  fi
-"""
-RESOLVE_NEW = """  r=
-  [ -e "$t" ] && r=$(readlink -f "$t" 2>/dev/null)
-  if [ -z "$r" ]; then
-    r=$t n=0
-    while [ -L "$r" ] && [ $n -lt 40 ]; do
-      l=$(readlink "$r") || exit 1
-      case "$l" in
-        /*) r=$l ;;
-        *) case "$r" in */*) r="${r%/*}/$l" ;; *) r=$l ;; esac ;;
-      esac
-      n=$((n + 1))
-    done
-  fi
-"""
-
-
 def build() -> dict[str, str]:
     sh = SHELL.read_text()
     resolve = macro(sh, "resolve_target")
-    if RESOLVE_OLD not in resolve:
-        raise SystemExit("the reference's resolve block changed: revisit RESOLVE_NEW")
-    resolve = resolve.replace(RESOLVE_OLD, RESOLVE_NEW)
     not_dir = macro(sh, "not_a_directory")
     new_temp = not_dir + re.findall(RAW, macro_body(sh, "new_temp"), re.S)[0]
     macros = {"resolve_target": resolve, "not_a_directory": not_dir, "new_temp": new_temp}

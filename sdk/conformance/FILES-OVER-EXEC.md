@@ -164,7 +164,7 @@ one `run` with a 10 s timeout.
 | ------------- | ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------- |
 | `rg`          | `rg --version`                                                                                                           | exit 0                                         |
 | `grep_null`   | `grep -rnZ -e __cap_probe__ -- /dev/null`                                                                                | exit 0 or 1                                    |
-| `find_printf` | `find /dev/null -maxdepth 0 -printf %y`                                                                                  | exit 0 or 1                                    |
+| `find_printf` | `find /dev/null -maxdepth 0 -printf %y`                                                                                  | exit 0 or 1 **and** stdout is `c`              |
 | `stdin`       | `cat` with stdin `stdin-probe`                                                                                           | exit 0 **and** stdout is exactly `stdin-probe` |
 | `read_window` | `sh -c 'printf abc \| dd iflag=skip_bytes,count_bytes skip=1 count=1 status=none 2>/dev/null \| base64 -w0 2>/dev/null'` | exit 0 and stdout trimmed is `Yg==`            |
 
@@ -272,15 +272,15 @@ preplanted name cannot redirect the write. The scripts (C and D below) do the
 resolution, in order:
 
 1. a path starting with `-` is prefixed with `./`;
-2. if it is a symlink, resolve it: `readlink -f` when the target exists. A
-   dangling link (or a `readlink -f` that yields nothing) is walked by hand, one
-   `readlink` hop at a time (at most 40), each relative hop joined to the
-   directory of the link it came from. busybox's `readlink -f` of a dangling
-   relative link answers against the working directory, not the link's, which
-   is why it is not trusted there. The prefix rule of 1 is applied again;
-3. a target that is a directory is refused (`Is a directory (os error 21)`), before
-   the temp exists and again just before the `mv`, which would otherwise move
-   the temp into the directory and succeed;
+2. if it is a symlink, resolve it: `readlink -f` when the target exists; for
+   a dangling link (or if that yields nothing) follow the chain one `readlink`
+   hop at a time, each relative target joined to the directory of the link it
+   came from, for at most 40 hops. A dangling link is never given to
+   `readlink -f`: busybox resolves its relative target against the working
+   directory instead of the link's. The prefix rule of 1 is applied again;
+3. a target that is a directory is refused (`Is a directory (os error 21)`, exit
+   1), before the temp exists, because `mv -f` would move the temp _into_ it
+   and report success;
    the temp is created empty with `set -C` (no-clobber: a preplanted temp is
    refused, not followed);
 4. if the target exists, the temp gets its mode **before any content**:
@@ -288,7 +288,8 @@ resolution, in order:
    (busybox); if neither works the write fails (`cannot give the new file the
    mode of ...`) and the temp is removed;
 5. the content is appended; the temp's size is checked against the expected
-   byte count; only then `mv -f TEMP TARGET`.
+   byte count; the directory check runs again (a directory created meanwhile
+   removes the temp and fails); only then `mv -f TEMP TARGET`.
 
 A write is therefore atomic (a reader sees the old file or the new one), keeps
 the file's mode (a 0600 file stays 0600, a 0755 file stays executable), writes
@@ -408,6 +409,7 @@ The command is `rg` or `grep`, with **no shell**, each item one argument.
 [--glob G | --glob !G]        the caller's glob; the second form when excluding
 --glob !.git
 [-B before] [-A after]        each only when greater than 0
+--no-context-separator        always
 -e PATTERN -- ROOT
 ```
 
@@ -420,12 +422,14 @@ The command is `rg` or `grep`, with **no shell**, each item one argument.
 [--include=G | --exclude=G]
 --exclude-dir=.git            unless the root's last path component is .git
 [-B before] [-A after]
+--no-group-separator          always
 -e PATTERN -- ROOT
 ```
 
 where for a non-literal pattern `PATTERN` is rewritten for CRLF files (below).
 
-`busybox-grep` engine: `-r -n -H`, then `-F` or `-E`, `-i`, context flags,
+`busybox-grep` engine: `-r -n -H`, then `-F` or `-E`, `-i`, context flags (no
+`--no-group-separator`: busybox rejects it),
 `-e PATTERN -- ROOT`. It has no `-Z`, `-I`, `--color`, `--include`,
 `--exclude-dir`; the glob is applied by the client.
 
@@ -462,14 +466,17 @@ share exit 2:
 #### Parsing
 
 `rg` and `grep -Z` emit records `PATH<NUL>LINE<SEP>TEXT<LF>`, where `SEP` is `:`
-for a match and `-` for a context line. Parse by scanning for the **NUL**, not
-for newlines: a path may contain a newline. At each position, first check for
-a group separator: the bytes `--` + LF (or `--` at the very end) are skipped.
-(ripgrep with `--crlf` writes `--` + CR + LF; a client MUST skip that too.
-A file actually named `--` is not mistaken for a separator: its record is
-`--` NUL ..., so the byte after `--` (or `--` CR) is NUL, not LF.) Otherwise the path runs to the next NUL, the rest of the record to the
-next LF; `LINE` is one or more digits followed by `:` or `-`; a record that
-does not fit is dropped.
+for a match and `-` for a context line. The command MUST turn off the group
+separator: `rg --no-context-separator` (ripgrep 0.10 and later), GNU
+`grep --no-group-separator` (2.5.4 and later). The separator is the only record
+without a NUL, and a path may begin with `--` + LF (or `--` + CR LF under
+`rg --crlf`), so it cannot be told from the start of such a path; with it off,
+the output is path records only. A client MUST NOT skip any `--` bytes. Parse by
+scanning for the **NUL**, not for newlines: a path may contain a newline. The
+path runs from the start of the record to the next NUL, the rest of the record
+to the next LF; `LINE` is one or more digits followed by `:` or `-`; a record
+that does not fit is dropped. A file named `--` or `--` LF `b` is an ordinary
+path.
 
 `busybox-grep` emits `PATH:LINE:TEXT` (match) or `PATH-LINE-TEXT` (context). A
 line equal to `--` is skipped. Otherwise split at the **first** position `i`
@@ -501,7 +508,7 @@ U+FFFD for the bad bytes (stdout is text).
    an error).
 5. `note` is the first line of the trimmed stderr of a successful run, or null.
 
-Context groups that overlap are merged by the engine; separators are not hits.
+Context groups that overlap are merged by the engine.
 
 #### Clipping
 
@@ -611,12 +618,12 @@ if [ -L "$t" ]; then
   r=
   [ -e "$t" ] && r=$(readlink -f "$t" 2>/dev/null)
   if [ -z "$r" ]; then
-    r=$t n=0
+    r="$t" n=0
     while [ -L "$r" ] && [ $n -lt 40 ]; do
       l=$(readlink "$r") || exit 1
       case "$l" in
-        /*) r=$l ;;
-        *) case "$r" in */*) r="${r%/*}/$l" ;; *) r=$l ;; esac ;;
+        /*) r="$l" ;;
+        *) case "$r" in */*) r="${r%/*}/$l" ;; *) r="$l" ;; esac ;;
       esac
       n=$((n + 1))
     done
@@ -661,12 +668,12 @@ if [ -L "$t" ]; then
   r=
   [ -e "$t" ] && r=$(readlink -f "$t" 2>/dev/null)
   if [ -z "$r" ]; then
-    r=$t n=0
+    r="$t" n=0
     while [ -L "$r" ] && [ $n -lt 40 ]; do
       l=$(readlink "$r") || exit 1
       case "$l" in
-        /*) r=$l ;;
-        *) case "$r" in */*) r="${r%/*}/$l" ;; *) r=$l ;; esac ;;
+        /*) r="$l" ;;
+        *) case "$r" in */*) r="${r%/*}/$l" ;; *) r="$l" ;; esac ;;
       esac
       n=$((n + 1))
     done
@@ -713,12 +720,12 @@ if [ -L "$t" ]; then
   r=
   [ -e "$t" ] && r=$(readlink -f "$t" 2>/dev/null)
   if [ -z "$r" ]; then
-    r=$t n=0
+    r="$t" n=0
     while [ -L "$r" ] && [ $n -lt 40 ]; do
       l=$(readlink "$r") || exit 1
       case "$l" in
-        /*) r=$l ;;
-        *) case "$r" in */*) r="${r%/*}/$l" ;; *) r=$l ;; esac ;;
+        /*) r="$l" ;;
+        *) case "$r" in */*) r="${r%/*}/$l" ;; *) r="$l" ;; esac ;;
       esac
       n=$((n + 1))
     done
@@ -746,7 +753,26 @@ exit 1
 
 ## Known deviations from the reference implementation
 
-None at present. When the reference (`ShellFs`) behaves differently from this
-spec, the difference is listed here, and the scenarios carry an `xfail` mark for
-the reference driver on exactly those checks, which turns into a plain pass when
+Found by the first run on real busybox (Alpine). This document says what is
+right; the reference still does the old thing until its fix lands. The
+scenarios carry an `xfail` mark for the reference driver on exactly the checks
+that show them, on a backend whose probes found `find_printf` and a busybox
+`grep` (a real busybox sandbox).
+
+1. **The reference's `find_printf` probe accepts busybox.** busybox `find` has
+   no `-printf`: it prints its usage and exits 1, and the reference counts
+   "exit 0 or 1" as present, so `list` runs `find -printf` and fails with `io`
+   (`find: unrecognized: -printf`). Section 4 requires stdout `c` as well.
+   Shown by every `list` check on busybox (19 checks in `files`, `errors` and
+   `helpers`).
+2. **The reference's write through a dangling symlink lands in the wrong
+   directory on busybox.** Its resolve step gives a dangling link to
+   `readlink -f`, which on busybox resolves a relative target against the
+   working directory, so it names `CWD/made` instead of `DIR/made`. Section 5.3
+   and scripts C, D and E take `readlink -f` only for a link that resolves.
+   Shown by `files.write.dangling-symlink-creates-target/check`.
+
+When the reference (`ShellFs`) behaves differently from this spec, the
+difference is listed here, and the scenarios carry an `xfail` mark for the
+reference driver on exactly those checks, which turns into a plain pass when
 the reference is fixed.

@@ -250,12 +250,18 @@ All of: `stdin`, `stream`, `find_printf`, `read_window` (booleans, compared with
 `search_engine` (a value or a list of acceptable values); `auth` (true when the
 backend demands a bearer); `not_root` (the sandbox user is not uid 0, so
 permission checks mean something); `commands` (a list that `command -v` finds in
-the sandbox).
+the sandbox); `vars` (a list of variable names the backend defines, see below).
+
+A backend may define directories beyond `${ROOT}` and `${WORK}`, as variables:
+`${RO}` (a read-only mount holding one file, `existing`, with content `old`),
+`${LOCKED}` (a directory the sandbox user may not write, holding the same file)
+and `${TINY}` (a 1 MiB filesystem). The `environments` suite uses them and is
+skipped, visibly, where a backend does not provide them.
 
 ### xfail
 
 `"xfail": {"drivers": ["agent-reference"], "reason": "...", "when": {requires}}`
-marks a check the named driver is known to fail because of a reference defect
+marks a check the named driver (the `driver` its `hello` reports) is known to fail because of a reference defect
 listed in FILES-OVER-EXEC. For that driver (and only when `when` holds) the
 check **must fail** and is counted as a known defect; if it passes, the harness
 reports an error so the mark is removed. Every other driver treats the check as

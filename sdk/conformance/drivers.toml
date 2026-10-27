@@ -1,0 +1,22 @@
+# The clients' conformance drivers (DRIVER.md). `mise run test:clients` builds each and runs it
+# against every backend. Commands run from the repository root. To register a driver, add an entry:
+# `name` is its cell prefix in the report, `build` is optional, `run` starts one driver process
+# (the harness adds CONFORMANCE_URL and the rest to its environment).
+
+[[driver]]
+name = "rust"
+build = "cargo build -q -p beyond-sandbox-conformance --bin sandbox-driver-rust"
+run = "target/debug/sandbox-driver-rust"
+
+[[driver]]
+name = "ts"
+build = "npm ci --prefix sdk/ts --silent && npm run build --prefix sdk/ts --silent"
+run = "node sdk/ts/sandbox/dist/driver.mjs"
+
+[[driver]]
+name = "python"
+run = "env PYTHONPATH=sdk/python/sandbox/src python3 -m beyond_sandbox.driver"
+
+[[driver]]
+name = "python-async"
+run = "env PYTHONPATH=sdk/python/sandbox/src python3 -m beyond_sandbox.driver --async"

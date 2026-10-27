@@ -262,6 +262,51 @@ if [ -f target/nextest/verify-isolated/junit.xml ]; then reports="$reports --jun
 cargo run -q -p beyond-verify -- gate $reports
 """
 
+# ---- TypeScript SDK (sdk/ts: npm workspace root; @beyond.dev/sandbox is the sandbox client) ----
+
+[tasks."install:ts"]
+description = "Install the TypeScript SDK's dependencies (npm ci in sdk/ts)."
+run = "npm ci"
+dir = "sdk/ts"
+
+[tasks."build:ts"]
+description = "Build the TypeScript SDK (tsdown): sdk/ts/sandbox/dist, including the conformance driver dist/driver.mjs."
+run = "npm run build"
+dir = "sdk/ts"
+
+[tasks."check:ts"]
+description = "Typecheck the TypeScript SDK (tsc --noEmit, strict). Formatting is dprint's, in check:fmt."
+run = "npm run typecheck"
+dir = "sdk/ts"
+
+[tasks."test:ts"]
+description = "TypeScript SDK tests: parsers and command builders, a fake endpoint, and a loopback execd (EXECD_BIN, or target/debug/execd, built if absent)."
+run = "npm test"
+dir = "sdk/ts"
+# ---- sandbox clients: the conformance matrix --------------------------------------------------------
+
+[tasks."build:execd-static"]
+description = "A static (musl) execd for this machine's architecture: the binary the container backends of the client matrix mount."
+run = """
+t="$(uname -m)-unknown-linux-musl"
+rustup target add "$t" >/dev/null
+cc="CC_$(echo "$t" | tr '-' '_')"
+ln="CARGO_TARGET_$(echo "$t" | tr 'a-z-' 'A-Z_')_LINKER"
+env "$cc=musl-gcc" "$ln=musl-gcc" cargo build -q -p beyond-execd --target "$t"
+"""
+
+[tasks."test:clients"]
+description = "The client conformance matrix: every driver in sdk/conformance/drivers.toml against every backend (local, alpine, debian-runas, readonly, tinydisk, fault). Needs docker for the container backends. BACKENDS overrides the list; extra arguments go to sandbox-matrix (e.g. --filter 'files.*', --verbose)."
+depends = ["build:execd-static"]
+run = """
+set -e
+cargo build -q -p beyond-execd -p beyond-sandbox-conformance
+backends=""
+for b in ${BACKENDS:-local alpine debian-runas readonly tinydisk fault}; do backends="$backends --backend $b"; done
+mkdir -p target/sandbox-matrix
+target/debug/sandbox-matrix --registry sdk/conformance/drivers.toml $backends \
+  --report target/sandbox-matrix/report.json "$@"
+
 # ---- python client: beyond-sandbox (sdk/python/sandbox) ---------------------------------------------
 
 [tasks."install:py"]
