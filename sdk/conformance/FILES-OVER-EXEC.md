@@ -139,10 +139,13 @@ A transport-level failure is never a capability: see
 ### 3.3 From a command that ran and failed
 
 A helper that gets a non-zero exit takes the **first line of trimmed stderr**
-(the text up to the first LF and no other character: CR, VT, FF and U+2028 do not
-end it; or `command failed` if there is none) as `detail`, prefixed as each operation
+(lines end at LF and at no other character: CR, VT, FF and U+2028 do not end
+one; or `command failed` if there is none) as `detail`, prefixed as each operation
 below says, and classifies it case-insensitively by the first rule that
-matches:
+matches. A path may contain a newline, which splits one message over two lines
+and leaves the OS error on a later one: when the first line contains none of the
+patterns below, `detail` runs through the first line that does (lines joined
+with LF), and if no line does it is the first line.
 
 | stderr contains                                                               | kind                |
 | ----------------------------------------------------------------------------- | ------------------- |
@@ -466,17 +469,24 @@ Exit 0 (matches) and 1 (none) are success. Exit 124, or the endpoint's own
 timeout, is `timeout`. Any other exit is told apart by stderr, since the cases
 share exit 2.
 
-A stderr line is a **per-path error** when it ends in an OS message (`PATH: No
-such file or directory`, `Permission denied`, `Is a directory`, `Too many levels
-of symbolic links`, `Input/output error`; `rg` adds `(os error N)`) or in
+Read stderr as **records**, not lines, because a path may contain a newline: a
+record runs from the end of the previous one through the first line that ends
+in an OS error (`No such file or directory`, `Permission denied`, `Is a
+directory`, `Too many levels of symbolic links`, `Input/output error`, with a
+trailing `(os error N)` that `rg` adds ignored) or in
 `stream did not contain valid UTF-8` (`rg` reading a `.git` file, in or above
-the root, that is not text; the search itself ran, and no flag turns that read
-off without also turning off the `.gitignore` handling the helper promises). Then:
+the root, that is not text: the search itself ran, and no flag turns that read
+off without also turning off the `.gitignore` handling the helper promises).
 
-- every stderr line is a per-path error and one of them names the search root
-  itself as missing: `not_found`;
-- every line is a per-path error otherwise: success. The hits on stdout are
-  returned and `note` says how many paths were skipped and names the first;
+- stderr is non-empty, nothing is left after its last record (every record is a
+  per-path OS error), and one record is the search root's own error: it
+  contains `: ROOT:` immediately followed by `No such file or directory` or
+  by `IO error for operation on ROOT: No such file or directory`, where `ROOT`
+  is the exact root string given to the engine, newlines included (a path
+  under the root continues after `ROOT`, so it does not match): `not_found`;
+- every record is a per-path OS error otherwise: success. The hits on stdout
+  are returned and `note` says how many records were skipped and names the
+  first;
 - anything else (or empty stderr) is the engine rejecting the pattern, whatever
   stdout holds (`rg: regex parse error:`, `rg: error parsing glob ...`,
   `rg: compiled regex exceeds size limit ...` are such lines):

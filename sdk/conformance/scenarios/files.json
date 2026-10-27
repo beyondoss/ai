@@ -5631,7 +5631,7 @@
     },
     {
       "id": "files.search.missing-root-with-newline-in-name",
-      "description": "A missing search root is not_found even when its name contains a newline. (The engine's one-line error is then two lines, and the reference agent's classifier reads the second as an unknown message and answers `bad regex`.) Found by the stateful property test.",
+      "description": "A missing search root is not_found even when its name contains a newline: stderr is read as records that end at an OS error, and the root's own error is found by its exact string.",
       "steps": [
         {
           "id": "a",
@@ -5639,15 +5639,6 @@
           "root": "${ROOT}/no\nwhere",
           "pattern": "x",
           "literal": true,
-          "xfail": {
-            "drivers": [
-              "agent-reference",
-              "beyond-sandbox-ts",
-              "python",
-              "python-async"
-            ],
-            "reason": "the stderr classifier needs every line to end in an OS error; a newline in the path breaks the first"
-          },
           "expect": {
             "error": {
               "kind": "not_found"
