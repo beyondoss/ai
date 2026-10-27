@@ -24,6 +24,7 @@ struct Io {
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,
     _child: Child,
+    _leader: Option<crate::reaper::Leader>,
 }
 
 pub struct ProcessLink {
@@ -41,7 +42,8 @@ impl ProcessLink {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(stderr.try_clone()?))
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            .process_group(0);
         for (k, v) in env {
             match v {
                 Some(v) => c.env(k, v),
@@ -55,6 +57,7 @@ impl ProcessLink {
             io: Mutex::new(Some(Io {
                 stdin,
                 stdout,
+                _leader: crate::reaper::Leader::new(&child),
                 _child: child,
             })),
             stderr,

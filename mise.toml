@@ -320,7 +320,7 @@ if [ ! -f sdk/ts/sandbox/dist/driver.mjs ]; then
 fi
 export EXECD_BIN="$PWD/target/debug/execd"
 export EXECD_STATIC_BIN="$PWD/target/$(uname -m)-unknown-linux-musl/debug/execd"
-cargo test -q -p beyond-sandbox-conformance --test differential -- --nocapture "$@"
+cargo test -q -p beyond-sandbox-conformance --test differential -- --include-ignored --nocapture "$@"
 """
 
 # ---- python client: beyond-sandbox (sdk/python/sandbox) ---------------------------------------------
