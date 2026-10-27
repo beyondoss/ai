@@ -2605,6 +2605,7 @@ killing an unkept job (measured on the far side), a kept job surviving its hold 
 `read` and `attach` from an offset (closing the attach must not kill), `kill` reaching a
 `SIGTERM`-ignoring job and removing it, and `list`/`wipe` staying in their scope. The decoding
 vectors are `tests/fixtures/exec/v1.3-jobs.json` (`tests/exec_jobs_vectors.rs`).
+A number that does not fit its field (a status or code beyond `i32`, a start beyond `u32`, a `128 + signal` past `i32::MAX`) is a protocol error in both decoders, never a panic or a truncated value.
 
 **Job-end notify (v1.4).** A replica holds a v1.2 stream to every kept
 job, and that stream's heartbeat keeps an idle sandbox awake for as long as the job runs. The module
