@@ -6,9 +6,9 @@
 //! the input, every name a substring of it.
 #![no_main]
 
-use beyond_agent::tools::fs::FileKind;
-use beyond_agent::tools::fs::shell::__fuzz::{dir_entries, typed_paths};
-use beyond_agent_fuzz::name;
+use beyond_sandbox::fs::FileKind;
+use beyond_sandbox::fs::shell::__fuzz::{dir_entries, typed_paths};
+use beyond_sandbox_fuzz::name;
 use libfuzzer_sys::arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
 

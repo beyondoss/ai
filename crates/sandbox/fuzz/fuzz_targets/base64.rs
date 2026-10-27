@@ -5,7 +5,7 @@
 #![no_main]
 
 use base64::Engine as _;
-use beyond_agent::tools::fs::shell::__fuzz::{decode_base64, encode_base64};
+use beyond_sandbox::fs::shell::__fuzz::{decode_base64, encode_base64};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

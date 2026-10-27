@@ -7,8 +7,8 @@
 #![no_main]
 
 use base64::Engine as _;
-use beyond_agent::exec_endpoint::jobs::JobStatus;
-use beyond_agent::exec_endpoint::jobs_native::{
+use beyond_sandbox::exec_endpoint::jobs::JobStatus;
+use beyond_sandbox::exec_endpoint::jobs_native::{
     Event, JobFrame, decode_job_frame, parse_list, parse_read, parse_survivors,
 };
 use libfuzzer_sys::fuzz_target;

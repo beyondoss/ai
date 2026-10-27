@@ -7,8 +7,8 @@
 
 use std::time::{Duration, UNIX_EPOCH};
 
-use beyond_agent::tools::fs::FileKind;
-use beyond_agent::tools::fs::shell::__fuzz::stat;
+use beyond_sandbox::fs::FileKind;
+use beyond_sandbox::fs::shell::__fuzz::stat;
 use libfuzzer_sys::arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
 

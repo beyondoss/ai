@@ -5,8 +5,8 @@
 //! generates unambiguous paths; the raw properties hold for everything.
 #![no_main]
 
-use beyond_agent::tools::fs::shell::__fuzz::colon_records;
-use beyond_agent_fuzz::{name, text};
+use beyond_sandbox::fs::shell::__fuzz::colon_records;
+use beyond_sandbox_fuzz::{name, text};
 use libfuzzer_sys::arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
 

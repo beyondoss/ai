@@ -1,5 +1,5 @@
 [package]
-name = "beyond-agent-fuzz"
+name = "beyond-sandbox-fuzz"
 version = "0.0.0"
 edition = "2024"
 license = "MIT"
@@ -14,7 +14,7 @@ cargo-fuzz = true
 
 [dependencies]
 base64 = "0.22"
-beyond-agent = { path = ".." }
+beyond-sandbox = { path = ".." }
 libfuzzer-sys = "0.4"
 serde_json = "1"
 
