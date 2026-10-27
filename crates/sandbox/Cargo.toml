@@ -18,10 +18,9 @@ async-trait.workspace = true
 base64 = "0.22"
 # The v1.4 notifier script (`SH`) spliced into the job supervisor, and its URL check.
 beyond-exec-notify = { path = "../exec-notify" }
-futures.workspace = true
 getrandom = { version = "0.3", features = ["std"] }
-hex = "0.4"
 globset = "0.4"
+hex = "0.4"
 regex = "1"
 # The HTTP client: rustls with `ring` (named once in `tls.rs`; reqwest's own `rustls` feature would
 # link aws-lc-sys instead).
@@ -36,6 +35,6 @@ tracing.workspace = true
 [dev-dependencies]
 beyond-test-support = { path = "../test-support" }
 hmac = "0.12"
-tempfile = "3"
 rcgen = "0.13"
+tempfile = "3"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
