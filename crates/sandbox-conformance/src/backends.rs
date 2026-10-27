@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use beyond_test_support::exec_mock::{ExecMock, MockOptions};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::process::Command;
@@ -140,6 +141,9 @@ pub async fn start(name: &str, bins: &Binaries) -> Result<Started, String> {
             )
             .await
         }
+        // execd's own library behind a loopback listener, in this process: for the harness's own tests,
+        // which need no binary. Not part of any group.
+        "embedded" => embedded(name).await,
         "alpine" => {
             docker(
                 name,
@@ -250,6 +254,24 @@ async fn listening(stderr: tokio::process::ChildStderr) -> Result<String, String
         }
         _ => Err("execd did not report a listening address".into()),
     }
+}
+
+// ---- execd in this process ---------------------------------------------------------------------
+
+async fn embedded(name: &str) -> Result<Started, String> {
+    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let work = dir.path().canonicalize().map_err(|e| e.to_string())?;
+    let mock = ExecMock::start_with(&work, MockOptions::default()).await;
+    Ok(Started {
+        name: name.into(),
+        url: mock.url.clone(),
+        bearer: None,
+        work: work.to_string_lossy().into_owned(),
+        caps: None,
+        suites: None,
+        vars: BTreeMap::new(),
+        _guard: Box::new((mock, dir)),
+    })
 }
 
 // ---- execd in a container ----------------------------------------------------------------------
