@@ -1,0 +1,73 @@
+name: Release sandbox-mcp
+# Builds beyond-sandbox-mcp (the MCP server for a sandbox) as a fully static musl binary for
+# linux/amd64 and linux/arm64 and attaches sandbox-mcp-<tag>-linux-<arch>.tar.gz (+ .sha256) and
+# install-sandbox-mcp.sh to the tag's GitHub Release. Sibling of release-execd.yml, same reasoning:
+# native musl-gcc on a native runner per arch (no cross-linker), and `relocation-model=static`
+# because a static-pie musl binary segfaults at startup in some environments. It runs on whatever
+# machine the agent runs on, so nothing in the build needs a particular libc. No PGO: it is a
+# client, not a resident footprint to squeeze.
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    name: Build & publish sandbox-mcp (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add ${{ matrix.target }}
+      - name: Build sandbox-mcp (static musl)
+        run: |
+          linker_env="CARGO_TARGET_$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_LINKER"
+          cc_env="CC_$(echo '${{ matrix.target }}' | tr '-' '_')"
+          export "$linker_env=musl-gcc"
+          export "$cc_env=musl-gcc"
+          RUSTFLAGS="-C relocation-model=static" \
+            cargo build --release --locked -p beyond-sandbox-mcp --bin sandbox-mcp --target ${{ matrix.target }}
+      - name: Verify the binary is static
+        run: |
+          bin="target/${{ matrix.target }}/release/sandbox-mcp"
+          file "$bin"
+          file "$bin" | grep -q 'statically linked'
+          # glibc's ldd says "not a dynamic executable" (exit 1) for a static binary.
+          if ldd "$bin" 2>&1 | grep -vq 'not a dynamic executable\|statically linked'; then
+            echo "sandbox-mcp is dynamically linked"; ldd "$bin"; exit 1
+          fi
+          ls -l "$bin"
+      - name: Package release asset
+        run: |
+          mkdir -p dist
+          name="sandbox-mcp-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz"
+          tar -C target/${{ matrix.target }}/release -czf "dist/$name" sandbox-mcp
+          # `<hash>  <file>`, relative to dist/, so `sha256sum -c` works next to the tarball.
+          (cd dist && sha256sum "$name" > "$name.sha256")
+      - name: Publish GitHub Release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Create the release once; the other jobs' creates are no-ops (`|| true`). Every upload
+          # is a distinct file (the installer is identical across arches), so `--clobber` never races.
+          gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" --generate-notes || true
+          name="sandbox-mcp-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz"
+          gh release upload "${{ github.ref_name }}" "dist/$name" "dist/$name.sha256" \
+            --repo "${{ github.repository }}" --clobber
+          gh release upload "${{ github.ref_name }}" deploy/sandbox-mcp/install-sandbox-mcp.sh \
+            --repo "${{ github.repository }}" --clobber
