@@ -6,7 +6,7 @@ on stdin and writes results as JSON lines on stdout. A harness feeds the same
 scenario files to every driver against every backend and compares the answers.
 The behaviour behind each op is specified in
 [FILES-OVER-EXEC.md](FILES-OVER-EXEC.md) and in the exec protocol. The reference
-driver and harness are in `crates/agent/tests/sdk_conformance*.rs`; where this
+driver and harness are in `crates/sandbox/tests/sdk_conformance*.rs`; where this
 document is unclear, they are the answer.
 
 The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
@@ -184,7 +184,7 @@ start with the suite name. A **step** is an op request plus harness fields:
 
 `id` (unique in the scenario; a **check** is `<scenario id>/<step id>`), `op`
 and the op's own fields go to the driver. The harness fields are not sent:
-`expect`, `save`, `poll`, `xfail`, `note`.
+`expect`, `save`, `poll`, `xfail`, `note`, `via` (see Relay).
 
 ### Running a scenario
 
@@ -257,6 +257,31 @@ A backend may define directories beyond `${ROOT}` and `${WORK}`, as variables:
 `${LOCKED}` (a directory the sandbox user may not write, holding the same file)
 and `${TINY}` (a 1 MiB filesystem). The `environments` suite uses them and is
 skipped, visibly, where a backend does not provide them.
+
+### Relay
+
+A scenario whose steps (or `setup`) carry `"via": "A"` or `"via": "B"` is a **relay
+scenario**: it proves that two clients working on one sandbox agree. `via` is a harness
+field, not sent. A step without `via` goes to A. The harness:
+
+- starts one process of every registered driver against the backend, as for the
+  ordinary scenarios, and binds A and B to **every ordered pair of distinct
+  drivers**: with N drivers, N(N-1) pairs, each running every relay scenario once.
+  Both drivers address the same sandbox, share `${ROOT}` and `${SCOPE}`, and run
+  one step at a time (a step completes before the next is sent, whichever driver
+  it goes to);
+- runs a pair of a driver with itself (A and B two separate processes of it) only
+  for the scenarios that say `"same_driver": true`;
+- requires every op of the scenario in the `hello.ops` of the driver the step goes
+  to (else the scenario is `unsupported` for that pair), evaluates `requires`
+  against both, and matches `xfail.drivers` against the driver the step goes to;
+- skips relay scenarios in the ordinary single-driver runs, and on backends that
+  run only some suites;
+- reports each pair as its own cell, `relay:A>B`, per backend, counted like any
+  other cell. `connect` is not allowed in a relay scenario.
+
+A client that is wrong about a shared fact fails in the pair that exposes it: the
+cell name says which direction (A wrote, B read).
 
 ### xfail
 

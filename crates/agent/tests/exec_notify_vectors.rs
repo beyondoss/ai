@@ -28,13 +28,13 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const PROBE: &str = include_str!("fixtures/exec/v1.4-probe.json");
-const KEEP: &str = include_str!("fixtures/exec/v1.4-keep.json");
-const CALLBACK: &str = include_str!("fixtures/exec/v1.4-callback.json");
-const TOKEN: &str = include_str!("fixtures/exec/v1.4-token.json");
-const RETRY: &str = include_str!("fixtures/exec/v1.4-retry.json");
-const CHECKS: &str = include_str!("fixtures/exec/v1.4-checks.json");
-const SPEC_DOC: &str = include_str!("../src/exec_endpoint.rs");
+const PROBE: &str = include_str!("../../sandbox/tests/fixtures/exec/v1.4-probe.json");
+const KEEP: &str = include_str!("../../sandbox/tests/fixtures/exec/v1.4-keep.json");
+const CALLBACK: &str = include_str!("../../sandbox/tests/fixtures/exec/v1.4-callback.json");
+const TOKEN: &str = include_str!("../../sandbox/tests/fixtures/exec/v1.4-token.json");
+const RETRY: &str = include_str!("../../sandbox/tests/fixtures/exec/v1.4-retry.json");
+const CHECKS: &str = include_str!("../../sandbox/tests/fixtures/exec/v1.4-checks.json");
+const SPEC_DOC: &str = include_str!("../../sandbox/src/exec_endpoint.rs");
 const FLEET_DOC: &str = include_str!("../FLEET.md");
 
 /// Every v1.4 fixture, by file name, so one added to the directory without a loader fails.
@@ -551,7 +551,8 @@ fn every_v14_fixture_loads_into_its_schema() {
 
 #[test]
 fn every_v14_fixture_in_the_directory_is_loaded_here() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/exec");
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../sandbox/tests/fixtures/exec");
     let on_disk: BTreeSet<String> = std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())

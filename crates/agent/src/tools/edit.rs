@@ -307,7 +307,7 @@ impl Edit {
                 {
                     Ok(true) => landed.push((path, shown, applied)),
                     Ok(false) => refused.push((path, shown, None)),
-                    Err(e) => refused.push((path, shown, Some(ToolError::from(e)))),
+                    Err(e) => refused.push((path, shown, Some(crate::tools::fs::tool_error(e)))),
                 }
             }
             (landed, refused)
@@ -436,7 +436,7 @@ impl Edit {
         let p = Path::new(path.as_str());
         let meta = match self.backend.stat(p).await {
             Ok(m) => m,
-            Err(e) => return FilePlan::failed(path, shown, ToolError::from(e)),
+            Err(e) => return FilePlan::failed(path, shown, crate::tools::fs::tool_error(e)),
         };
         if let Some(m) = &meta {
             if m.kind == FileKind::Other {
@@ -463,7 +463,7 @@ impl Edit {
                 return FilePlan::failed(path, shown, err);
             }
             Ok(b) => b,
-            Err(e) => return FilePlan::failed(path, shown, ToolError::from(e)),
+            Err(e) => return FilePlan::failed(path, shown, crate::tools::fs::tool_error(e)),
         };
 
         // The match/splice work is pure CPU over an in-memory string and can run for tens of

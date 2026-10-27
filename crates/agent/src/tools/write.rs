@@ -114,7 +114,7 @@ impl Tool for Write {
         // exports, Windows PowerShell 5.1 scripts) misread BOM-less UTF-8. Costs one prefix read,
         // and only when the file already exists.
         let mut utf16: Option<(bool, bool)> = None;
-        if let Some(meta) = self.backend.stat(p).await? {
+        if let Some(meta) = self.backend.stat(p).await.map_err(super::fs::tool_error)? {
             if meta.kind == FileKind::Other {
                 return Err(super::non_regular_file_error(path, "write"));
             }
@@ -125,7 +125,8 @@ impl Tool for Write {
                 let head = self
                     .backend
                     .read_bytes(p, 0, super::encoding::SNIFF_LEN)
-                    .await?;
+                    .await
+                    .map_err(super::fs::tool_error)?;
                 if let super::encoding::Encoding::Utf16 { big_endian } =
                     super::encoding::sniff(&head)
                 {
@@ -137,7 +138,10 @@ impl Tool for Write {
         if let Some(parent) = p.parent()
             && !parent.as_os_str().is_empty()
         {
-            self.backend.create_dir_all(parent).await?;
+            self.backend
+                .create_dir_all(parent)
+                .await
+                .map_err(super::fs::tool_error)?;
         }
         // Atomic temp-file + rename: an overwrite killed mid-write must not leave a half-written
         // file — the same guarantee `edit` makes (and which `serve` reattach depends on for the
@@ -160,7 +164,10 @@ impl Tool for Write {
             None => (content.into_bytes(), String::new()),
         };
         let len = bytes.len();
-        self.backend.write_bytes(p, bytes).await?;
+        self.backend
+            .write_bytes(p, bytes)
+            .await
+            .map_err(super::fs::tool_error)?;
         self.touched.record(path);
         Ok(format!("wrote {len} bytes to {path}{kept}").into())
     }

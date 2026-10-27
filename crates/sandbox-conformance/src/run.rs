@@ -131,7 +131,7 @@ fn request(id: u64, step: &Value, vars: &Vars) -> Value {
     for (k, v) in step.as_object().unwrap() {
         if !matches!(
             k.as_str(),
-            "id" | "expect" | "save" | "poll" | "note" | "xfail"
+            "id" | "expect" | "save" | "poll" | "note" | "xfail" | "via"
         ) {
             req.insert(k.clone(), subst(v, vars));
         }
@@ -309,10 +309,25 @@ fn all(sid: &str, steps: &[Value], status: Status, detail: &str) -> Vec<Check> {
         .collect()
 }
 
-/// Run one scenario against a backend: the checks, one per step, in order.
+/// Run one scenario against a backend: the checks, one per step, in order. A relay scenario (steps
+/// with `via`) needs two drivers; here it is skipped (see [`crate::relay`]).
 pub async fn run_scenario(sc: &Value, be: &Backend) -> Vec<Check> {
+    run_scenario_via(sc, be, None).await
+}
+
+/// [`run_scenario`] with a second driver on the same sandbox: steps with `"via": "B"` go to `peer`,
+/// all others to `be`.
+pub async fn run_scenario_via(sc: &Value, be: &Backend, peer: Option<&Backend>) -> Vec<Check> {
     let sid = sc["id"].as_str().unwrap();
     let steps = sc["steps"].as_array().unwrap();
+    if peer.is_none() && crate::relay::is_relay(sc) {
+        return all(
+            sid,
+            steps,
+            Status::Skipped,
+            "relay scenario: needs two drivers",
+        );
+    }
     if let Some(p) = sc.get("planned") {
         return all(sid, steps, Status::Skipped, &format!("planned ({p})"));
     }
@@ -321,14 +336,21 @@ pub async fn run_scenario(sc: &Value, be: &Backend) -> Vec<Check> {
         .into_iter()
         .flatten()
         .chain(steps)
-        .filter_map(|s| s["op"].as_str())
-        .filter(|op| !be.ops.iter().any(|o| o == op))
+        .filter_map(|s| {
+            s["op"]
+                .as_str()
+                .map(|op| (op, crate::relay::side(s, be, peer)))
+        })
+        .filter(|(op, b)| !b.ops.iter().any(|o| o == op))
+        .map(|(op, _)| op)
         .collect();
     if !used.is_empty() && sc["steps"][0]["expect"]["error"]["kind"] != "unsupported" {
         return all(sid, steps, Status::Unsupported, &format!("no op {used:?}"));
     }
-    if let Some(why) = unmet(&sc["requires"], be).await {
-        return all(sid, steps, Status::Skipped, &why);
+    for b in std::iter::once(be).chain(peer) {
+        if let Some(why) = unmet(&sc["requires"], b).await {
+            return all(sid, steps, Status::Skipped, &why);
+        }
     }
 
     // A scenario may connect with its own credentials (a wrong bearer); the rest share the
@@ -372,7 +394,9 @@ pub async fn run_scenario(sc: &Value, be: &Backend) -> Vec<Check> {
         return out;
     }
     for (i, s) in sc["setup"].as_array().into_iter().flatten().enumerate() {
-        if let Err(why) = run_step(link, s, &mut vars, &mut seq, true).await {
+        let l = crate::relay::side(s, be, peer).link.as_ref();
+        let l = if peer.is_some() { l } else { link };
+        if let Err(why) = run_step(l, s, &mut vars, &mut seq, true).await {
             let mut out = vec![Check {
                 id: format!("{sid}/setup[{i}]"),
                 status: Status::Fail,
@@ -388,17 +412,29 @@ pub async fn run_scenario(sc: &Value, be: &Backend) -> Vec<Check> {
             "{sid}/{}",
             step["id"].as_str().expect("every step has an id")
         );
+        let side = crate::relay::side(step, be, peer);
         let known = match step.get("xfail") {
             Some(x) => {
                 x["drivers"]
                     .as_array()
-                    .is_some_and(|d| d.iter().any(|n| n == be.driver.as_str()))
-                    && unmet(&x["when"], be).await.is_none()
+                    .is_some_and(|d| d.iter().any(|n| n == side.driver.as_str()))
+                    && unmet(&x["when"], side).await.is_none()
             }
             None => false,
         };
         let (status, detail) = match (
-            run_step(link, step, &mut vars, &mut seq, false).await,
+            run_step(
+                if peer.is_some() {
+                    side.link.as_ref()
+                } else {
+                    link
+                },
+                step,
+                &mut vars,
+                &mut seq,
+                false,
+            )
+            .await,
             known,
         ) {
             (Ok(()), false) => (Status::Pass, String::new()),

@@ -364,7 +364,7 @@ dependencies = [
  "beyond-agent-core",
  "beyond-exec-notify",
  "beyond-providers",
- "beyond-sandbox-conformance",
+ "beyond-sandbox",
  "beyond-test-support",
  "bytes",
  "chacha20poly1305",
@@ -593,12 +593,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "beyond-sandbox"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "beyond-exec-notify",
+ "beyond-sandbox-conformance",
+ "beyond-test-support",
+ "getrandom 0.3.4",
+ "globset",
+ "hex",
+ "hmac",
+ "rcgen",
+ "regex",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
 name = "beyond-sandbox-conformance"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
- "beyond-agent",
+ "beyond-sandbox",
  "beyond-test-support",
  "clap",
  "futures",

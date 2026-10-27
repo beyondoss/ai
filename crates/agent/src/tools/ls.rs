@@ -139,7 +139,12 @@ impl Tool for Ls {
         // listing — rather than a raw OS errno string covering both. The backend's `stat` follows
         // symlinks (not `symlink_metadata`), matching pi's own `ops.stat` (Node's `fs.stat` follows)
         // and ordinary `ls`'s expectation that listing a symlink-to-a-directory lists the target.
-        match self.backend.stat(std::path::Path::new(&path)).await? {
+        match self
+            .backend
+            .stat(std::path::Path::new(&path))
+            .await
+            .map_err(super::fs::tool_error)?
+        {
             Some(meta) if meta.kind == FileKind::Dir => {}
             Some(_) => return Err(ToolError::Execution(format!("Not a directory: {path}"))),
             None => return Err(ToolError::Execution(format!("Path not found: {path}"))),
@@ -150,7 +155,8 @@ impl Tool for Ls {
         let listed = self
             .backend
             .list_dir(std::path::Path::new(&path), HARD_CAP, all)
-            .await?;
+            .await
+            .map_err(super::fs::tool_error)?;
         let hard_capped = listed.len() >= HARD_CAP;
         let entries: Vec<(String, bool)> = listed
             .into_iter()

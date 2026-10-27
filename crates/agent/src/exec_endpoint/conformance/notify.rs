@@ -67,7 +67,7 @@ const QUIET: Duration = Duration::from_secs(3);
 const PROOF_WAIT: Duration = Duration::from_secs(6);
 
 /// The `keep` vectors: the refused cases are sent as written.
-const KEEP_VECTORS: &str = include_str!("../../../tests/fixtures/exec/v1.4-keep.json");
+const KEEP_VECTORS: &str = include_str!("../../../../sandbox/tests/fixtures/exec/v1.4-keep.json");
 
 /// A throwaway self-signed certificate (and its key) for `localhost` and `127.0.0.1`: no trust
 /// store has it, so an endpoint that verifies the server must refuse the handshake.

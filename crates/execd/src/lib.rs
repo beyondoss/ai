@@ -1,6 +1,6 @@
 //! execd: an exec endpoint that runs inside a sandbox and speaks the agent's exec protocol.
 //!
-//! The normative spec is the module doc of `crates/agent/src/exec_endpoint.rs`. execd implements
+//! The normative spec is the module doc of `crates/sandbox/src/exec_endpoint.rs`. execd implements
 //! all of it: v1.1 (one request, one JSON answer, stdin), v1.2 streaming (frames, heartbeats,
 //! disconnect kills, leftover processes), v1.3 sandbox jobs and v1.4 job-end notify. See this
 //! crate's `ARCHITECTURE.md` for the request flow, the process model and every bound.

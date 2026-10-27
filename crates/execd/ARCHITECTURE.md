@@ -2,7 +2,7 @@
 
 execd is the exec endpoint that runs inside a sandbox. The agent POSTs a command to a URL; execd runs it as a real process and
 answers. It implements the whole of the agent's exec protocol: v1.1 (one request, one JSON answer, stdin), v1.2 streaming,
-v1.3 sandbox jobs and v1.4 job-end notify. The normative spec is the module doc of `crates/agent/src/exec_endpoint.rs`; this
+v1.3 sandbox jobs and v1.4 job-end notify. The normative spec is the module doc of `crates/sandbox/src/exec_endpoint.rs`; this
 file says how execd meets it and what bounds every resource it holds.
 
 It is one crate: a library (`execd`) that embeds in a test or a larger host, and a thin `execd` binary configured by environment

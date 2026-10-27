@@ -395,22 +395,9 @@ fn resolve_symlink_target(path: &std::path::Path) -> Option<std::path::PathBuf> 
     }
 }
 
-/// An unpredictable per-call suffix for [`write_atomic`]'s temp file name, so it can't be preplanted
-/// under a symlink before the call happens. Same salt-plus-counter construction as
-/// `session_store::new_id`: `RandomState` draws OS entropy once per process, and a monotonic counter
-/// keeps same-process calls distinct — no need for a `rand`/`uuid` dependency just for this.
-pub(crate) fn temp_suffix() -> String {
-    use std::collections::hash_map::RandomState;
-    use std::hash::BuildHasher;
-    use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static SALT: OnceLock<u64> = OnceLock::new();
-    let salt = *SALT.get_or_init(|| RandomState::new().hash_one(0xA70A1Cu64));
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("{salt:x}{seq:x}")
-}
+/// An unpredictable per-call suffix for [`write_atomic`]'s temp file name — see
+/// [`beyond_sandbox::fs::temp_suffix`].
+pub(crate) use beyond_sandbox::fs::temp_suffix;
 
 /// Canonicalize a path for use as a same-file grouping key (`Tool::write_target`): two same-turn calls
 /// naming the same underlying file — `./foo.rs`, `foo.rs`, or a symlink alias — must land on one key so

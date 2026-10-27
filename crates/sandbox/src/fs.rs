@@ -1,0 +1,911 @@
+//! `FsBackend` — the seam between a filesystem tool and where its I/O actually lands.
+//!
+//! The tools in this crate were welded to the host: `read`/`write`/`edit`/`ls`/`grep`/`find` called
+//! `std::fs` directly, while `bash` already went through
+//! [`CommandRunner`](super::exec::CommandRunner) — the one place the crate admitted that "where does
+//! this run" is a decision worth naming. This module is that same admission for the other half.
+//!
+//! Two implementations, both selected by the caller and held behind an `Arc`:
+//!
+//! - [`local::LocalFs`] — `std::fs` and ripgrep's in-process walker. The behavior that shipped before
+//!   this seam existed, moved rather than rewritten.
+//! - [`shell::ShellFs`] — the same operations expressed as *commands*, over any `CommandRunner`. It
+//!   works against a box that has nothing of ours installed on it.
+//!
+//! **Most of a tool's behavior is not in the backend.** The split is deliberately drawn so that only
+//! the irreducibly filesystem-shaped part (walk a tree, match lines, read bytes) crosses the seam;
+//! everything downstream of that — line clipping, EOL normalization, sorting, limit trimming, and all
+//! rendering — stays shared, in this module or in the tool. That is what makes the two impls agree on
+//! the fiddly details for free instead of by vigilance: there is only one `clip`, one `trim_eol`, one
+//! [`finalize`], and both backends call them.
+
+pub mod shell;
+
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+
+/// Long match lines are clipped to keep output readable — a *character* count, matching pi's own
+/// `GREP_MAX_LINE_LENGTH` (`truncateLine`'s `line.length`, UTF-16 code units — effectively chars for all
+/// BMP text), not a byte count: a CJK/Cyrillic/accented-Latin line costs more bytes per character than
+/// ASCII, so byte-clipping the same cap would truncate it to far fewer visible characters for no reason.
+pub const MAX_LINE: usize = 500;
+
+/// Hard ceiling on matches collected before a search bails — an OOM guard for pathological patterns
+/// (matching nearly every line of a huge tree). Far above any sane `limit`; when it trips, the
+/// surviving subset can depend on scheduling, which the output flags.
+pub const HARD_CAP: usize = 10_000;
+
+/// Ceiling on the `before`/`after` context window. Context lines aren't bounded by [`HARD_CAP`] (which
+/// counts matches), so clamp them to keep a huge `after` on a match-dense file from ballooning memory.
+pub const MAX_CONTEXT: usize = 100;
+
+/// Suffix [`clip`] appends to a line it truncates. `grep`'s `run` checks surviving hit text for this
+/// suffix to decide whether to append an aggregate "some lines truncated" notice (matching pi's own
+/// grep, which surfaces that as an actionable notice alongside the match-limit/byte-cap ones) — a
+/// single source of truth instead of threading a separate "was this line clipped" flag through
+/// [`Hit`] just for one summary line.
+pub const LINE_TRUNCATED_SUFFIX: &str = "… [truncated]";
+
+/// How [`clip_match`] marks a window cut from the middle of a line: `… <window> … [truncated;
+/// columns A-B of N]`.
+const WINDOW_PREFIX: &str = "… ";
+const WINDOW_MARK: &str = " [truncated; columns ";
+
+/// Which filesystem a path belongs to — and therefore whether host syscalls may be used to reason
+/// about it.
+///
+/// This is not decoration. Path resolution has exactly one host-dependent step (`canonicalize`) and
+/// one user-dependent step (`~` expansion), and both silently produce a *plausible wrong answer*
+/// rather than an error when applied to a path that isn't on this machine. Making the world an
+/// explicit parameter means the choice is visible at every call site instead of being an emergent
+/// property of whether a syscall happened to fail. See
+/// [`write_key`](crate::tools::write_key).
+/// Owns its `home` rather than borrowing it. A backend whose target can be swapped at runtime (see
+/// `ExecCell`) reports its world from behind a lock, and a borrowed variant could not outlive that
+/// guard. The cost is one small `String` clone per path resolution, against a tool call that is
+/// already doing I/O.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathWorld {
+    /// This host. `canonicalize` resolves real symlinks and `~` means this process's `$HOME`.
+    Local,
+    /// Somewhere else. Resolution stays lexical, and `~` means the *target's* home — `None` when it
+    /// isn't known, which leaves a leading `~` untouched rather than guessing.
+    Remote { home: Option<String> },
+}
+
+impl PathWorld {
+    /// Whether the files in question are somewhere other than this host — the one question most
+    /// callers actually have, since what changes is *whether a host syscall may be consulted at all*
+    /// rather than which home a `~` expands against. Spelled once here so no caller has to open-code
+    /// a `matches!` that a future third variant would silently get wrong.
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Self::Remote { .. })
+    }
+}
+
+/// One reported line: its path, line number, text, and whether it is a match (vs a context line). The
+/// path is an `Arc<Path>` so a file with many matches allocates the path **once** and each hit is a
+/// refcount bump, not a fresh `PathBuf` per hit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hit {
+    pub path: Arc<Path>,
+    pub line: usize,
+    pub text: String,
+    /// `true` for a matched line, `false` for a `before`/`after` context line.
+    pub is_match: bool,
+}
+
+/// A prepared search, in terms a *shell* can also express — which is the whole constraint on its
+/// shape. The pattern and glob are carried as **strings**, not as a compiled `RegexMatcher` and
+/// `GlobMatcher`: those are ripgrep types that only [`local::LocalFs`] could ever hold, and putting
+/// them here would have made the trait un-implementable by anything else. Each backend compiles (or
+/// forwards) them itself, so a bad pattern surfaces from the backend rather than at parse time.
+#[derive(Debug, Clone)]
+pub struct SearchQuery {
+    /// The regular expression, or a literal string when `literal` is set.
+    pub pattern: String,
+    /// Search for `pattern` verbatim (regex-escaped) rather than as a regex.
+    pub literal: bool,
+    /// Fold case.
+    pub ignore_case: bool,
+    /// Restrict to files matching this glob, or — when the bool is `true` — *exclude* files matching
+    /// it (ripgrep-CLI-style, from a leading `!` the caller has already stripped).
+    pub glob: Option<(String, bool)>,
+    /// The directory or file to search. Already resolved against the tool's root.
+    pub root: PathBuf,
+    /// Max *matches* to report. Context lines don't count toward it.
+    pub limit: usize,
+    /// Lines of context before each match (ripgrep's `-B`), clamped to [`MAX_CONTEXT`].
+    pub before: usize,
+    /// Lines of context after each match (ripgrep's `-A`), clamped to [`MAX_CONTEXT`].
+    pub after: usize,
+}
+
+impl SearchQuery {
+    /// The point at which a search may stop collecting — `limit` in the common case (a low-limit
+    /// query against a match-dense tree should stop almost immediately, not scan the whole tree only
+    /// to throw away everything past the first `limit` matches), [`HARD_CAP`] as the outer ceiling
+    /// when a caller passes an unusually large `limit`.
+    pub fn stop_at(&self) -> usize {
+        self.limit.min(HARD_CAP)
+    }
+}
+
+/// What a search produced: hits sorted by `(path, line)`, whether the result was cut short, and — when
+/// at least one path couldn't be read (permission denied, a broken symlink, …) — the first such
+/// error's message. Matching real ripgrep, which exits non-zero and reports the real error text the
+/// moment it can't read *any* path in the tree, rather than silently treating it as "not found here".
+#[derive(Debug, Default)]
+pub struct SearchOutcome {
+    pub hits: Vec<Hit>,
+    pub truncated: bool,
+    pub first_error: Option<String>,
+}
+
+/// Why a backend operation failed. Two variants, mapped 1:1 onto the two `ToolError` kinds a
+/// filesystem tool can produce, each carrying its message already formatted — so the text the model
+/// reads is identical whichever backend produced it.
+#[derive(Debug)]
+pub enum FsError {
+    /// The query itself is malformed (a bad regex, a bad glob). The caller's mistake.
+    InvalidQuery(String),
+    /// The backend couldn't complete the operation. Not the caller's mistake.
+    Backend(String),
+}
+
+impl std::fmt::Display for FsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FsError::InvalidQuery(m) | FsError::Backend(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for FsError {}
+
+/// What kind of thing a path is. The `Other` bucket exists because `read`/`write`/`edit` must refuse
+/// FIFOs, sockets and devices *before* opening them: opening a FIFO blocks until a peer appears, and a
+/// character device never signals EOF, and neither has a timeout or a kill-on-drop the way a `bash`
+/// child does — so one wedges the whole turn, unrecoverably, from inside a blocking syscall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKind {
+    File,
+    Dir,
+    /// A FIFO, socket, or device — never safe for these tools to open.
+    Other,
+}
+
+/// One path's metadata. Deliberately one struct rather than several accessors: on a remote filesystem
+/// each field would otherwise cost its own round trip, and the tools want two or three of them at once.
+#[derive(Debug, Clone)]
+pub struct Meta {
+    pub kind: FileKind,
+    pub len: u64,
+    /// Last-modified time, used by `edit` as the compare-and-swap baseline for its guarded write.
+    pub mtime: Option<std::time::SystemTime>,
+    /// Whether *this caller* can actually write the path — a real access check, not an inspection of
+    /// the mode bits. A file owned by another uid can have write bits set for its owner and still be
+    /// unwritable by us, so a pre-check built on `Permissions::readonly()` passes right before the
+    /// real write fails with a generic OS error.
+    pub writable: bool,
+}
+
+/// One directory entry, as `ls` needs it. The name is a single path component, never a full path.
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    pub name: String,
+    pub kind: FileKind,
+    pub len: u64,
+}
+
+/// A prepared `find`. Like [`SearchQuery`], it carries the glob as a **string** so a backend that
+/// shells out can pass it through rather than needing a compiled `globset` matcher it has no way to
+/// apply.
+#[derive(Debug, Clone)]
+pub struct GlobQuery {
+    pub pattern: String,
+    /// Match the pattern against each entry's basename rather than its full path — what `find` does
+    /// when the pattern contains no `/`.
+    pub basename_only: bool,
+    /// Fold case in the glob match.
+    pub case_insensitive: bool,
+    pub root: PathBuf,
+    pub limit: usize,
+}
+
+/// What a glob walk produced.
+///
+/// Each entry carries whether it is a directory, because `find` matches **directories as well as
+/// files** — `find "node_modules"` returning nothing would be surprising — and renders a match with a
+/// trailing `/` when it is one, the same signal real `fd` gives.
+#[derive(Debug, Default)]
+pub struct GlobOutcome {
+    /// `(path, is_dir)`, sorted, already trimmed to the query's limit by [`finalize_glob`].
+    pub paths: Vec<(PathBuf, bool)>,
+    pub truncated: bool,
+    /// First unreadable path encountered, so an empty result can say "couldn't fully search" rather
+    /// than a confidently wrong "no files matching".
+    pub first_error: Option<String>,
+}
+
+/// The VCS metadata entry `grep` and `find` never descend into: a repository's `.git` directory, or
+/// the `.git` *file* a worktree or submodule checkout carries instead.
+pub const GIT_DIR: &str = ".git";
+
+/// Whether `path` is, or lies inside, a `.git` entry **below** `root`.
+///
+/// `hidden(false)` makes the walks include dotfiles, and `.git` is a dotfile nobody ever ignores in
+/// a `.gitignore` — so without this, a search fills with `packed-refs`, reflogs and worktree `HEAD`s.
+/// Only components *after* `root` count, which is what keeps an explicit search inside `.git` (a
+/// root of `repo/.git` or `repo/.git/refs`) working: the caller asked for that tree by name.
+///
+/// [`local::LocalFs`] applies the same rule at walk time (an entry named `.git` below depth 0 is
+/// pruned, so its subtree is never read); [`shell::ShellFs`] asks its engine to skip `.git` where the
+/// engine can, and applies this to every path it gets back, so a rung with no such flag (POSIX
+/// `grep`, `find`) still cannot leak one.
+pub fn is_under_git_dir(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root)
+        .is_ok_and(|rel| rel.components().any(|c| c.as_os_str() == GIT_DIR))
+}
+
+/// Sort, decide truncation, and trim — [`finalize`]'s counterpart for globbing, shared for the same
+/// reason: the ordering and the "was this cut short" rule must not depend on which backend walked.
+pub fn finalize_glob(
+    mut paths: Vec<(PathBuf, bool)>,
+    limit: usize,
+    hit_hard_cap: bool,
+) -> (Vec<(PathBuf, bool)>, bool) {
+    paths.sort();
+    let truncated = paths.len() > limit || hit_hard_cap;
+    paths.truncate(limit);
+    (paths, truncated)
+}
+
+/// Where a filesystem tool's I/O lands.
+///
+/// Deliberately narrow: every method here is an operation that *cannot* be composed from the others.
+/// `edit`, notably, gets no read or write method of its own — it is [`read_bytes`](FsBackend::read_bytes)
+/// plus the existing match logic plus [`write_if_unchanged`](FsBackend::write_if_unchanged), which is
+/// why it has no matching behavior to drift.
+#[async_trait]
+pub trait FsBackend: Send + Sync {
+    /// Search file contents. Returns hits already sorted, clipped, and trimmed to `limit` — see
+    /// [`finalize`], which both implementations use so this contract holds by construction.
+    async fn search(&self, q: &SearchQuery) -> Result<SearchOutcome, FsError>;
+
+    /// Metadata for one path, or `None` if it does not exist.
+    ///
+    /// Missing is `Ok(None)` rather than an error because every caller treats it as an ordinary
+    /// branch — `write` creates the file, `read` wants its own "no such file" wording — and forcing
+    /// them to pattern-match an error kind to find that out invites treating a *permissions* failure
+    /// as "absent", which is how a pre-check silently stops checking anything.
+    async fn stat(&self, path: &Path) -> Result<Option<Meta>, FsError>;
+
+    /// Read at most `max` bytes starting at byte `offset`.
+    ///
+    /// A short read means end-of-file — which is what lets a caller stream a file of unknown size in
+    /// bounded chunks (`read` counts a huge file's total lines this way) without ever holding it whole.
+    async fn read_bytes(&self, path: &Path, offset: u64, max: usize) -> Result<Vec<u8>, FsError>;
+
+    /// Replace a file's entire contents. Every backend keeps the same contract, and
+    /// `tests/fs_backend_parity.rs` checks each clause on each of them:
+    ///
+    /// - **Atomic.** A concurrent reader, or a crash mid-write, sees the old file or the complete new
+    ///   one, never a partial. Both backends write a temp file beside the target and rename it over.
+    /// - **Mode preserved.** An existing file keeps its permission bits exactly: a 0600 secret stays
+    ///   0600, a 0755 script stays executable. The temp gets them before any content goes in, so the
+    ///   new bytes are never more readable than the old ones were. A new file gets the default mode.
+    /// - **Symlinks written through.** When `path` is a symlink, its target gets the bytes and the link
+    ///   stays a link, as `open(2)` would behave. A dangling link's target is created.
+    ///
+    /// The bytes are taken by value: a backend that hands them to a blocking thread moves them there
+    /// instead of copying a whole file on the async executor.
+    async fn write_bytes(&self, path: &Path, bytes: Vec<u8>) -> Result<(), FsError>;
+
+    /// Replace a file's contents **only if** its mtime still equals `expected` — `edit`'s guard against
+    /// clobbering a change made between reading the file and writing it back. Returns `false` when the
+    /// file moved on and nothing was written. A write that does happen keeps
+    /// [`write_bytes`](Self::write_bytes)'s contract: atomic, mode preserved, symlinks written through.
+    ///
+    /// This is one method rather than a stat-then-write by the caller because the check and the write
+    /// have to be as close together as the backend can make them; splitting it across the trait would
+    /// put a guaranteed round trip inside the race window it exists to narrow.
+    ///
+    /// Owned, like [`write_bytes`](Self::write_bytes)'s: a backend that writes from another thread
+    /// takes the buffer as it is, rather than copying the whole file on the caller's (runtime) thread.
+    async fn write_if_unchanged(
+        &self,
+        path: &Path,
+        bytes: Vec<u8>,
+        expected: Option<std::time::SystemTime>,
+    ) -> Result<bool, FsError>;
+
+    /// Create a directory and any missing parents. Succeeds if it already exists.
+    async fn create_dir_all(&self, path: &Path) -> Result<(), FsError>;
+
+    /// List one directory, stopping after `cap` **kept** entries.
+    ///
+    /// `include_hidden` is applied by the backend, before the cap, because that is where the existing
+    /// local behavior applies it: `ls`'s hard cap counts entries it kept, not entries it saw. Doing
+    /// the filtering in the caller instead would silently change how much of a 10,000-entry directory
+    /// full of dotfiles actually gets listed. It is also the right place remotely, where filtering at
+    /// the source is strictly less data to move.
+    async fn list_dir(
+        &self,
+        path: &Path,
+        cap: usize,
+        include_hidden: bool,
+    ) -> Result<Vec<DirEntry>, FsError>;
+
+    /// Walk a tree collecting paths matching a glob, honoring `.gitignore`.
+    async fn glob(&self, q: &GlobQuery) -> Result<GlobOutcome, FsError>;
+
+    /// Which filesystem this backend's paths live on.
+    ///
+    /// Defaults to [`PathWorld::Local`] so an implementation that genuinely is the host — including
+    /// any test double — gets the right answer without stating it. A backend that is *not* the host
+    /// must override this, because the default silently licenses host `canonicalize` and host `~`
+    /// expansion on paths that belong to another machine.
+    fn world(&self) -> PathWorld {
+        PathWorld::Local
+    }
+}
+
+/// Read a whole small text file through `backend`, refusing an oversized one **before** its bytes
+/// move.
+///
+/// Every resource loader that reads through a backend — skills, agent definitions, prompt templates,
+/// `AGENTS.md`/`CLAUDE.md`, `SYSTEM.md` — wants the same three steps: stat, check the cap, read
+/// exactly that many bytes. Their on-host halves do it with `fs::metadata` + `fs::read_to_string`;
+/// this is the one backend spelling of it, so the cap stays where it belongs (before a megabyte
+/// crosses a network hop) in all of them rather than in four near-copies.
+///
+/// A missing path is an `Err`, unlike [`FsBackend::stat`]'s `Ok(None)`: every caller here is opening
+/// a file it has already been told about, so "absent" is a diagnostic, not a branch. The message is
+/// written to be surfaced verbatim as a discovery diagnostic.
+pub async fn read_text_capped(
+    backend: &dyn FsBackend,
+    path: &Path,
+    max: u64,
+) -> Result<String, String> {
+    let meta = backend
+        .stat(path)
+        .await
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .ok_or_else(|| format!("{}: no such file", path.display()))?;
+    if meta.kind != FileKind::File {
+        return Err(format!("{}: not a regular file", path.display()));
+    }
+    if meta.len > max {
+        return Err(format!(
+            "{} exceeds {max} bytes ({} bytes) — skipped without reading",
+            path.display(),
+            meta.len
+        ));
+    }
+    let bytes = backend
+        .read_bytes(path, 0, meta.len as usize)
+        .await
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    String::from_utf8(bytes).map_err(|_| format!("{}: not valid UTF-8", path.display()))
+}
+
+/// Strip a trailing `\n` and then a trailing `\r` (a searcher hands us the line terminator), plus —
+/// pi-parity fix — any further embedded `\r` the trailing strip doesn't reach. `grep-searcher` only
+/// splits on `\n`, so a file using old-Mac-style bare-`\r` line endings (or one with stray corrupted
+/// bytes) hands us "lines" that still carry mid-content `\r` characters; pi strips every `\r` in the
+/// line, not just a trailing one. Borrows unchanged in the overwhelmingly common case (no embedded
+/// `\r` at all) rather than allocating a `String` for every matched line.
+///
+/// Shared by both backends on purpose: `rg`'s stdout needs exactly the same normalization that
+/// `grep-searcher`'s sink does, and two copies of this would drift on the first CRLF fixture.
+pub fn trim_eol(s: &str) -> std::borrow::Cow<'_, str> {
+    let s = s.strip_suffix('\n').unwrap_or(s);
+    let s = s.strip_suffix('\r').unwrap_or(s);
+    if s.contains('\r') {
+        std::borrow::Cow::Owned(s.replace('\r', ""))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
+/// Clip a long line to [`MAX_LINE`] *characters*, not bytes — pi-parity fix: the previous byte-based cap
+/// (with a char-boundary backoff to avoid splitting a codepoint) never produced invalid UTF-8, but still
+/// truncated a non-ASCII line to far fewer visible characters than an ASCII line under the same nominal
+/// cap, unlike pi's own char-counting `truncateLine`.
+///
+/// Runs on every matched *and* every context line, so the common case (a line well under `MAX_LINE`,
+/// which is most source lines) is the one to keep cheap: `char_indices` finds the byte offset of the
+/// `MAX_LINE`-th char in one pass, and a line that doesn't reach it is returned via a single `to_string`
+/// (a memcpy) rather than rebuilt char-by-char through a `Chars` iterator + `collect`. Only a line that
+/// actually needs truncating pays for the slice + suffix, and even then as one allocation, not two.
+pub fn clip(line: &str) -> String {
+    match line.char_indices().nth(MAX_LINE) {
+        None => line.to_string(), // fits within the cap — nothing was truncated
+        Some((cut, _)) => {
+            let mut clipped = String::with_capacity(cut + LINE_TRUNCATED_SUFFIX.len());
+            clipped.push_str(&line[..cut]);
+            clipped.push_str(LINE_TRUNCATED_SUFFIX);
+            clipped
+        }
+    }
+}
+
+/// Finds a query's first match within one line, for [`clip_match`] — compiled lazily, on the first
+/// match line long enough to need it, and then shared by every worker of the search.
+///
+/// Its own `regex::Regex` rather than the backend's matcher, so both backends window a line the same
+/// way: `LocalFs` has a ripgrep matcher, `ShellFs` has only `rg`/`grep`'s text output. Built from the
+/// same pattern, `literal` and `ignore_case` the search ran with; a pattern this dialect rejects (a
+/// POSIX-`grep`-only construct) yields no finder, and such a line falls back to its head.
+#[derive(Debug)]
+pub struct MatchFinder {
+    pattern: String,
+    literal: bool,
+    ignore_case: bool,
+    regex: std::sync::OnceLock<Option<regex::Regex>>,
+}
+
+impl MatchFinder {
+    pub fn new(q: &SearchQuery) -> Self {
+        Self {
+            pattern: q.pattern.clone(),
+            literal: q.literal,
+            ignore_case: q.ignore_case,
+            regex: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The byte range of the first match in `line`, if any.
+    fn find(&self, line: &str) -> Option<(usize, usize)> {
+        let regex = self.regex.get_or_init(|| {
+            let escaped;
+            let pattern = if self.literal {
+                escaped = regex::escape(&self.pattern);
+                escaped.as_str()
+            } else {
+                self.pattern.as_str()
+            };
+            regex::RegexBuilder::new(pattern)
+                .case_insensitive(self.ignore_case)
+                .build()
+                .ok()
+        });
+        regex.as_ref()?.find(line).map(|m| (m.start(), m.end()))
+    }
+}
+
+/// Clip a *matched* line to [`MAX_LINE`] characters **around its first match**, not just its head.
+///
+/// A line under the cap, or one whose match ends inside the first [`MAX_LINE`] characters, is clipped
+/// exactly as [`clip`] does. Otherwise the window is centered on the match and both cuts are marked:
+/// `… <window> … [truncated; columns A-B of N]` (columns are 1-based characters). Without this a match
+/// at column 100,000 of a minified bundle, a lockfile or an SVG was never visible: `grep` showed the
+/// first 500 characters, and `read` caps a line at 4,000 bytes, so neither tool could show it.
+pub fn clip_match(line: &str, finder: &MatchFinder) -> String {
+    // Fast path: most lines are short, and only a long one pays for the regex.
+    if line.char_indices().nth(MAX_LINE).is_none() {
+        return line.to_string();
+    }
+    let Some((m_start, m_end)) = finder.find(line) else {
+        return clip(line);
+    };
+    let char_at = |byte: usize| line[..byte].chars().count();
+    let (cs, ce) = (char_at(m_start), char_at(m_end));
+    if ce <= MAX_LINE {
+        return clip(line);
+    }
+    let total = cs + line[m_start..].chars().count();
+    // Center the match; a match wider than the window starts at the match.
+    let pad = MAX_LINE.saturating_sub(ce - cs) / 2;
+    let mut start = cs.saturating_sub(pad);
+    let mut end = start + MAX_LINE;
+    if end > total {
+        end = total;
+        start = total - MAX_LINE;
+    }
+    // Byte offsets of the window's char bounds, from the start char onward in one pass.
+    let mut idx = line.char_indices().map(|(i, _)| i).skip(start);
+    let b_start = idx.next().unwrap_or(line.len());
+    let b_end = idx.nth(end - start - 1).unwrap_or(line.len());
+    let mut out = String::with_capacity(b_end - b_start + 48);
+    out.push_str(WINDOW_PREFIX);
+    out.push_str(&line[b_start..b_end]);
+    if end < total {
+        out.push_str(" …");
+    }
+    let _ = write!(out, "{WINDOW_MARK}{}-{end} of {total}]", start + 1);
+    out
+}
+
+/// Clip a hit's text in place, if it is over the cap: a match line around its match, a context line
+/// at its head. For a backend that parses whole lines first (`ShellFs`); short lines are untouched
+/// and cost no copy.
+pub fn clip_hits(hits: &mut [Hit], finder: &MatchFinder) {
+    for h in hits {
+        if h.text.char_indices().nth(MAX_LINE).is_some() {
+            h.text = if h.is_match {
+                clip_match(&h.text, finder)
+            } else {
+                clip(&h.text)
+            };
+        }
+    }
+}
+
+/// Whether [`clip_match`] showed this line as a window from its middle — `grep`'s cue for a notice
+/// that does *not* point at `read`, which caps a line at 4,000 bytes and so cannot show it either.
+pub fn is_windowed(text: &str) -> bool {
+    text.starts_with(WINDOW_PREFIX) && text.ends_with(']') && text.contains(WINDOW_MARK)
+}
+
+/// Sort, decide truncation, and trim to `limit` — the impl-independent tail of every search.
+///
+/// This is the largest single reason the two backends agree: sorting by `(path, line)`, counting only
+/// matches toward `limit`, cutting at the match that would exceed it, and dropping the now-dangling
+/// trailing context are all subtle enough to diverge if written twice, and none of it depends on how
+/// the hits were found.
+///
+/// `stopped_early` is the backend's report that it stopped collecting at [`SearchQuery::stop_at`]
+/// rather than exhausting the tree — a result can be truncated either because more matches existed
+/// than `limit`, or because the backend bailed before finding them all.
+pub fn finalize(mut hits: Vec<Hit>, limit: usize, stopped_early: bool) -> (Vec<Hit>, bool) {
+    hits.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+    let match_total = hits.iter().filter(|h| h.is_match).count();
+    let truncated = match_total > limit || stopped_early;
+    // Keep at most `limit` matched lines (context lines don't count toward it). Walk counting matches,
+    // cut at the match that would exceed the limit, then drop any now-dangling trailing context (the
+    // before-context of the dropped match that trailed into the kept prefix). With no context
+    // requested every hit is a match, so this reduces to a plain `truncate(limit)`.
+    if match_total > limit {
+        let mut seen = 0usize;
+        let mut cut = hits.len();
+        for (i, h) in hits.iter().enumerate() {
+            if h.is_match {
+                seen += 1;
+                if seen > limit {
+                    cut = i;
+                    break;
+                }
+            }
+        }
+        hits.truncate(cut);
+        while hits.last().is_some_and(|h| !h.is_match) {
+            hits.pop();
+        }
+    }
+    (hits, truncated)
+}
+
+/// Build a [`SearchQuery`] with the defaults every caller wants — used by tests and the benchmark so
+/// neither has to spell out seven fields to vary one.
+#[doc(hidden)]
+pub fn query(pattern: &str, root: PathBuf, limit: usize) -> SearchQuery {
+    SearchQuery {
+        pattern: pattern.to_string(),
+        literal: false,
+        ignore_case: false,
+        glob: None,
+        root,
+        limit,
+        before: 0,
+        after: 0,
+    }
+}
+
+/// An unpredictable per-call suffix for a temp file name, so it can't be preplanted under a symlink
+/// before the call happens. A process-wide salt (`RandomState` draws OS entropy once) plus a
+/// monotonic counter keeps same-process calls distinct — no `rand`/`uuid` dependency needed.
+pub fn temp_suffix() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SALT: OnceLock<u64> = OnceLock::new();
+    let salt = *SALT.get_or_init(|| RandomState::new().hash_one(0xA70A1Cu64));
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{salt:x}{seq:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- trim_eol / clip: moved verbatim from `tools::grep`'s own test module along with the
+    // functions they cover. Assertions are unchanged; only their address is.
+
+    #[test]
+    fn trim_eol_strips_trailing_newline_and_carriage_return() {
+        assert_eq!(trim_eol("hello\r\n"), "hello");
+        assert_eq!(trim_eol("hello\n"), "hello");
+        assert_eq!(trim_eol("hello"), "hello");
+    }
+
+    #[test]
+    fn trim_eol_strips_an_embedded_carriage_return_not_just_a_trailing_one() {
+        // pi-parity fix (L6): `grep-searcher` only splits on `\n`, so a file using old-Mac-style bare
+        // `\r` line endings hands us "lines" that still carry mid-content `\r` characters after the
+        // trailing strip — pi strips every `\r` in the line, not just a trailing one.
+        assert_eq!(trim_eol("first\rsecond\rthird\n"), "firstsecondthird");
+    }
+
+    #[test]
+    fn trim_eol_borrows_when_there_is_nothing_to_strip() {
+        // Not a behavior a caller can observe directly, but worth pinning: the common case (no
+        // embedded `\r`) must not allocate.
+        assert!(matches!(
+            trim_eol("plain line"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            trim_eol("first\rsecond"),
+            std::borrow::Cow::Owned(_)
+        ));
+    }
+
+    #[test]
+    fn clip_leaves_a_short_line_untouched() {
+        assert_eq!(clip("short line"), "short line");
+    }
+
+    #[test]
+    fn clip_truncates_an_ascii_line_at_exactly_max_line_characters() {
+        let line = "a".repeat(MAX_LINE + 50);
+        let clipped = clip(&line);
+        assert_eq!(
+            clipped,
+            format!("{}{LINE_TRUNCATED_SUFFIX}", "a".repeat(MAX_LINE))
+        );
+    }
+
+    #[test]
+    fn clip_counts_characters_not_bytes_for_non_ascii_text() {
+        // Pi-parity fix: the previous byte-based cap truncated a non-ASCII line to far fewer visible
+        // characters than an equivalent-length ASCII line under the same nominal `MAX_LINE` — pi's own
+        // `truncateLine` counts characters (`line.length`, UTF-16 code units), not bytes. A 3-byte-per-
+        // character CJK line at exactly `MAX_LINE` characters (so ~3x `MAX_LINE` bytes) must survive
+        // whole, not get chopped down to a third of its characters.
+        let line = "漢".repeat(MAX_LINE);
+        assert!(
+            line.len() > MAX_LINE * 2,
+            "sanity: this line must be well over MAX_LINE bytes"
+        );
+        let clipped = clip(&line);
+        assert_eq!(
+            clipped, line,
+            "exactly MAX_LINE characters must not be truncated, even though it's far more than \
+             MAX_LINE bytes"
+        );
+
+        // One character over the cap must truncate to exactly MAX_LINE characters, not MAX_LINE bytes'
+        // worth (which would be roughly a third as many characters for 3-byte-per-char text).
+        let over = "漢".repeat(MAX_LINE + 1);
+        let clipped_over = clip(&over);
+        assert_eq!(
+            clipped_over,
+            format!("{}{LINE_TRUNCATED_SUFFIX}", "漢".repeat(MAX_LINE))
+        );
+    }
+
+    #[test]
+    fn clip_never_splits_a_multi_byte_character_even_though_it_counts_characters_now() {
+        // A mixed-width line where the cut point (character MAX_LINE) falls squarely on a real
+        // character boundary already (since we now count whole characters, not bytes) — this can never
+        // regress into slicing mid-codepoint the way the old byte-index-with-boundary-backoff version
+        // theoretically could if miscounted.
+        let line = format!("{}{}", "a".repeat(MAX_LINE - 1), "漢漢漢");
+        let clipped = clip(&line);
+        assert!(clipped.is_char_boundary(clipped.len() - LINE_TRUNCATED_SUFFIX.len()));
+        assert_eq!(
+            clipped,
+            format!(
+                "{}{}{LINE_TRUNCATED_SUFFIX}",
+                "a".repeat(MAX_LINE - 1),
+                "漢"
+            )
+        );
+    }
+
+    #[test]
+    fn is_under_git_dir_counts_only_components_below_the_root() {
+        let root = Path::new("/repo");
+        assert!(is_under_git_dir(root, Path::new("/repo/.git")));
+        assert!(is_under_git_dir(root, Path::new("/repo/.git/packed-refs")));
+        assert!(is_under_git_dir(root, Path::new("/repo/sub/.git"))); // a worktree's `.git` file
+        assert!(!is_under_git_dir(root, Path::new("/repo/src/main.rs")));
+        assert!(!is_under_git_dir(root, Path::new("/repo/.github/ci.yml")));
+        assert!(!is_under_git_dir(root, Path::new("/repo/.gitignore")));
+        // An explicit root inside `.git` searches that tree.
+        let inside = Path::new("/repo/.git");
+        assert!(!is_under_git_dir(
+            inside,
+            Path::new("/repo/.git/refs/heads/main")
+        ));
+        assert!(!is_under_git_dir(inside, inside));
+    }
+
+    // ---- clip_match: a long match line shows the text around its match.
+
+    fn finder(pattern: &str) -> MatchFinder {
+        MatchFinder::new(&SearchQuery {
+            pattern: pattern.into(),
+            literal: false,
+            ignore_case: false,
+            glob: None,
+            root: PathBuf::from("."),
+            limit: 10,
+            before: 0,
+            after: 0,
+        })
+    }
+
+    #[test]
+    fn a_match_deep_in_a_long_line_is_shown_centered_with_both_cuts_marked() {
+        // A minified bundle: the match sits at column 100,001.
+        let line = format!("{}NEEDLE{}", "a".repeat(100_000), "b".repeat(50_000));
+        let out = clip_match(&line, &finder("NEEDLE"));
+        assert!(out.contains("NEEDLE"), "the match must be visible: {out}");
+        assert!(out.starts_with("… a"), "{out}");
+        let window: String = out
+            .strip_prefix(WINDOW_PREFIX)
+            .unwrap()
+            .split(" …")
+            .next()
+            .unwrap()
+            .into();
+        assert_eq!(window.chars().count(), MAX_LINE);
+        let at = window.find("NEEDLE").unwrap();
+        assert!((240..=260).contains(&at), "centered, not at an edge: {at}");
+        assert!(
+            out.ends_with(" … [truncated; columns 99754-100253 of 150006]"),
+            "{out}"
+        );
+        assert!(is_windowed(&out));
+    }
+
+    #[test]
+    fn a_match_near_the_end_shows_the_last_window_with_no_trailing_cut() {
+        let line = format!("{}NEEDLE!", "a".repeat(2_000));
+        let out = clip_match(&line, &finder("NEEDLE"));
+        assert!(
+            out.ends_with("NEEDLE! [truncated; columns 1508-2007 of 2007]"),
+            "{out}"
+        );
+        assert!(out.starts_with(WINDOW_PREFIX));
+    }
+
+    #[test]
+    fn a_match_inside_the_first_window_keeps_the_head_clip() {
+        let line = format!("x NEEDLE {}", "a".repeat(2_000));
+        assert_eq!(clip_match(&line, &finder("NEEDLE")), clip(&line));
+        // No match found (a context line, or a pattern this dialect rejects): the head too.
+        assert_eq!(clip_match(&line, &finder("(unclosed")), clip(&line));
+        assert_eq!(
+            clip_match("short NEEDLE", &finder("NEEDLE")),
+            "short NEEDLE"
+        );
+    }
+
+    #[test]
+    fn the_window_is_counted_in_characters_and_never_splits_one() {
+        let line = format!("{}NEEDLE{}", "漢".repeat(3_000), "é".repeat(3_000));
+        let out = clip_match(&line, &finder("NEEDLE"));
+        assert!(out.contains("NEEDLE"), "{out}");
+        let window = out
+            .strip_prefix(WINDOW_PREFIX)
+            .unwrap()
+            .split(" …")
+            .next()
+            .unwrap();
+        assert_eq!(window.chars().count(), MAX_LINE);
+        assert!(out.contains("columns 2754-3253 of 6006"), "{out}");
+    }
+
+    #[test]
+    fn a_match_wider_than_the_window_starts_at_the_match() {
+        let line = format!("{}<{}>", "a".repeat(1_000), "z".repeat(800));
+        let out = clip_match(&line, &finder("<z+>"));
+        assert!(out.starts_with("… <zzz"), "{out}");
+        assert!(out.contains("columns 1001-1500 of 1802"), "{out}");
+    }
+
+    #[test]
+    fn clip_hits_windows_matches_and_heads_context() {
+        let long = format!("{}NEEDLE", "a".repeat(1_000));
+        let mut hits = vec![
+            Hit {
+                path: Arc::from(Path::new("f")),
+                line: 1,
+                text: long.clone(),
+                is_match: true,
+            },
+            Hit {
+                path: Arc::from(Path::new("f")),
+                line: 2,
+                text: long.clone(),
+                is_match: false,
+            },
+        ];
+        clip_hits(&mut hits, &finder("NEEDLE"));
+        assert!(hits[0].text.contains("NEEDLE"));
+        assert_eq!(hits[1].text, clip(&long));
+    }
+
+    // ---- finalize: new coverage for the shared tail, since it is now the single definition both
+    // backends depend on rather than an inlined block inside one search function.
+
+    fn hit(path: &str, line: usize, is_match: bool) -> Hit {
+        Hit {
+            path: Arc::from(Path::new(path)),
+            line,
+            text: format!("{path}:{line}"),
+            is_match,
+        }
+    }
+
+    #[test]
+    fn finalize_sorts_by_path_then_line() {
+        let (hits, _) = finalize(
+            vec![
+                hit("b.rs", 1, true),
+                hit("a.rs", 9, true),
+                hit("a.rs", 2, true),
+            ],
+            10,
+            false,
+        );
+        let order: Vec<_> = hits
+            .iter()
+            .map(|h| (h.path.to_string_lossy().into_owned(), h.line))
+            .collect();
+        assert_eq!(
+            order,
+            vec![("a.rs".into(), 2), ("a.rs".into(), 9), ("b.rs".into(), 1)]
+        );
+    }
+
+    #[test]
+    fn finalize_counts_only_matches_toward_the_limit() {
+        // Two matches, each with one context line either side. A limit of 2 must keep everything.
+        let hits = vec![
+            hit("a.rs", 1, false),
+            hit("a.rs", 2, true),
+            hit("a.rs", 3, false),
+            hit("a.rs", 4, false),
+            hit("a.rs", 5, true),
+            hit("a.rs", 6, false),
+        ];
+        let (kept, truncated) = finalize(hits, 2, false);
+        assert_eq!(kept.len(), 6);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn finalize_drops_dangling_context_after_cutting_at_the_limit() {
+        // Limit 1: the second match is cut, and the context line that was leading into it must go
+        // too — otherwise the output ends on a context line for a match the model never sees.
+        let hits = vec![
+            hit("a.rs", 2, true),
+            hit("a.rs", 3, false),
+            hit("a.rs", 4, false),
+            hit("a.rs", 5, true),
+        ];
+        let (kept, truncated) = finalize(hits, 1, false);
+        assert!(truncated);
+        assert_eq!(kept.len(), 1);
+        assert!(kept.last().is_some_and(|h| h.is_match));
+    }
+
+    #[test]
+    fn finalize_reports_truncation_when_the_backend_stopped_early() {
+        // Fewer hits than the limit, but the backend bailed — still truncated, because more matches
+        // exist that were never collected.
+        let (_, truncated) = finalize(vec![hit("a.rs", 1, true)], 100, true);
+        assert!(truncated);
+    }
+}

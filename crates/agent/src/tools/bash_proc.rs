@@ -47,7 +47,7 @@ const POLL: Duration = Duration::from_millis(250);
 /// ms after the TERM on the dev box, `sudo -n sleep`), but a KILL takes `sudo` down alone and leaves
 /// the child — which we may not signal — running. 300 ms is ~7x that, and is only spent in full on a
 /// process that ignores or traps TERM; a job whose processes all exit returns as soon as they have.
-pub const TERM_GRACE: Duration = Duration::from_millis(300);
+pub use beyond_sandbox::exec::TERM_GRACE;
 
 /// How often the grace re-checks whether the jobs' processes have exited.
 const GRACE_POLL: Duration = Duration::from_millis(10);
@@ -210,6 +210,22 @@ impl ProcGroup {
     }
 }
 
+impl super::exec::LocalKill for ProcGroup {
+    fn terminate(&self) {
+        ProcGroup::terminate(self);
+    }
+    fn gone(&self) -> bool {
+        self.members().is_empty()
+    }
+    fn sweep(&self) -> Option<String> {
+        let left = ProcGroup::sweep(self);
+        (!left.is_empty()).then(|| describe(&left))
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 /// Block until every process of `groups` has exited or `deadline` passes. Blocking.
 pub(crate) fn await_exit(groups: &[&ProcGroup], deadline: Instant) {
     while groups.iter().any(|g| !g.members().is_empty()) {
@@ -299,7 +315,7 @@ pub(crate) async fn run_tracked(
     let pgid = child.id().unwrap_or(0);
     let group = ProcGroup::new(pgid, tag);
     let mut guard = KillGuard(Some(group.clone()));
-    (hooks.on_spawn)(Kill::Procs(group.clone()));
+    (hooks.on_spawn)(Kill::local(group.clone()));
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -861,8 +877,8 @@ mod tests {
         let groups = Mutex::new(None);
         let on_chunk = |_b: &[u8]| {};
         let on_spawn = |k: Kill| {
-            if let Kill::Procs(g) = k {
-                *groups.lock().unwrap() = Some(g);
+            if let Some(g) = k.as_local::<ProcGroup>() {
+                *groups.lock().unwrap() = Some(g.clone());
             }
         };
         let on_orphans = |_r: &ExecResult, s: String| *orphans.lock().unwrap() = Some(s);
@@ -959,8 +975,8 @@ mod tests {
         let output = Mutex::new(String::new());
         let on_chunk = |b: &[u8]| output.lock().unwrap().push_str(&String::from_utf8_lossy(b));
         let on_spawn = |k: Kill| {
-            if let Kill::Procs(g) = k {
-                *groups.lock().unwrap() = Some(g);
+            if let Some(g) = k.as_local::<ProcGroup>() {
+                *groups.lock().unwrap() = Some(g.clone());
             }
         };
         let on_orphans = |_r: &ExecResult, s: String| *orphans.lock().unwrap() = Some(s);

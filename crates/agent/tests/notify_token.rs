@@ -9,7 +9,7 @@ use beyond_agent::exec_endpoint::jobs::{JobId, JobScope};
 use beyond_agent::notify_token::{NotifyKey, Verdict};
 use serde_json::Value;
 
-const FIXTURE: &str = include_str!("fixtures/exec/v1.4-token.json");
+const FIXTURE: &str = include_str!("../../sandbox/tests/fixtures/exec/v1.4-token.json");
 
 fn fixture() -> Value {
     serde_json::from_str(FIXTURE).unwrap()

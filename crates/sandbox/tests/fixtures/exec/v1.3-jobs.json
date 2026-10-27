@@ -1,0 +1,183 @@
+{
+  "spec": "exec protocol v1.3 sandbox jobs (crates/sandbox/src/exec_endpoint.rs, \"Sandbox jobs (v1.3)\")",
+  "notes": [
+    "streams: the body of one application/x-ndjson job stream (a held start or an attach), one string per line, without the trailing newline.",
+    "expect.started is the job's process group from the started frame; expect.output_base64 is the job's combined output in order (stdout and stderr frames alike); expect.gap sums the gap frames; expect.shell_exits lists shell_exit codes; expect.end is the job's status from the final frame (128 + N for a signal frame), null when the body is broken; expect.error is a final error frame.",
+    "answers: one JSON answer to a non-streamed job operation, and what a conforming client reads from it."
+  ],
+  "streams": [
+    {
+      "name": "a held start: started, output, end",
+      "lines": [
+        "{\"started\":4242}",
+        "{\"stdout\":\"aGVsbG8K\"}",
+        "{}",
+        "{\"stderr\":\"b29wcwo=\"}",
+        "{\"exit_code\":3}"
+      ],
+      "expect": {
+        "started": 4242,
+        "output_base64": "aGVsbG8Kb29wcwo=",
+        "gap": 0,
+        "shell_exits": [],
+        "end": 3
+      }
+    },
+    {
+      "name": "an attach past pruned output, with leftovers",
+      "lines": [
+        "{\"gap\":1048576}",
+        "{\"stdout\":\"dGFpbAo=\"}",
+        "{\"shell_exit\":0}",
+        "{\"stdout\":\"bGF0ZXIK\"}",
+        "{\"exit_code\":0}"
+      ],
+      "expect": {
+        "started": null,
+        "output_base64": "dGFpbApsYXRlcgo=",
+        "gap": 1048576,
+        "shell_exits": [0],
+        "end": 0
+      }
+    },
+    {
+      "name": "a job killed by a signal",
+      "lines": ["{\"started\":7}", "{\"signal\":9}"],
+      "expect": {
+        "started": 7,
+        "output_base64": "",
+        "gap": 0,
+        "shell_exits": [],
+        "end": 137
+      }
+    },
+    {
+      "name": "unknown fields are ignored; a frame with none known is a heartbeat",
+      "lines": [
+        "{\"seq\":1}",
+        "{\"stdout\":\"eA==\",\"seq\":2}",
+        "{\"exit_code\":0,\"elapsed_ms\":5}"
+      ],
+      "expect": {
+        "started": null,
+        "output_base64": "eA==",
+        "gap": 0,
+        "shell_exits": [],
+        "end": 0
+      }
+    },
+    {
+      "name": "the endpoint failed after answering",
+      "lines": ["{\"started\":9}", "{\"error\":\"lost the sandbox\"}"],
+      "expect": {
+        "started": 9,
+        "output_base64": "",
+        "gap": 0,
+        "shell_exits": [],
+        "error": "lost the sandbox"
+      }
+    }
+  ],
+  "answers": [
+    {
+      "op": "read",
+      "answer": {
+        "state": "exited",
+        "code": 1,
+        "offset": 10,
+        "end": 14,
+        "data": "dHdvCg=="
+      },
+      "expect": {
+        "state": "exited",
+        "code": 1,
+        "offset": 10,
+        "end": 14,
+        "data_base64": "dHdvCg=="
+      }
+    },
+    {
+      "op": "read",
+      "answer": { "state": "gone", "offset": 0, "end": 0, "data": "" },
+      "expect": {
+        "state": "gone",
+        "code": null,
+        "offset": 0,
+        "end": 0,
+        "data_base64": ""
+      }
+    },
+    {
+      "op": "list",
+      "answer": {
+        "jobs": [
+          {
+            "id": "0123456789abcdef",
+            "state": "running",
+            "code": null,
+            "kept": true,
+            "num": 3,
+            "kind": "background",
+            "seen": 17,
+            "started": 1700000000,
+            "ended": 0,
+            "label": "npm run dev"
+          },
+          {
+            "id": "00ff",
+            "state": "ended",
+            "code": 0,
+            "kept": false,
+            "num": null,
+            "kind": null,
+            "seen": 0,
+            "started": 1700000000,
+            "ended": 1700000009,
+            "label": "make"
+          },
+          {
+            "id": "../escape",
+            "state": "running",
+            "kept": true,
+            "label": "never followed"
+          }
+        ]
+      },
+      "expect": {
+        "jobs": [
+          {
+            "id": "0123456789abcdef",
+            "state": "running",
+            "code": null,
+            "kept": true,
+            "num": 3,
+            "kind": "background",
+            "seen": 17,
+            "ended": 0,
+            "label": "npm run dev"
+          },
+          {
+            "id": "00ff",
+            "state": "ended",
+            "code": 0,
+            "kept": false,
+            "num": null,
+            "kind": null,
+            "seen": 0,
+            "ended": 1700000009,
+            "label": "make"
+          }
+        ]
+      }
+    },
+    {
+      "op": "kill",
+      "answer": { "survivors": [{ "id": "00ff", "pids": [12, 34] }] },
+      "expect": {
+        "survivors": [
+          { "id": "00ff", "described": "processes 12, 34 in the sandbox" }
+        ]
+      }
+    }
+  ]
+}

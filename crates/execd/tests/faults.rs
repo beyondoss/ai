@@ -4,7 +4,7 @@
 //! limits are applied to the running binary with `prlimit`, and the disk is a small tmpfs mounted
 //! through `sudo -n` (a test that cannot mount says `SKIPPED`).
 //!
-//! The spec's rules these encode (`crates/agent/src/exec_endpoint.rs`): a command that cannot be
+//! The spec's rules these encode (`crates/sandbox/src/exec_endpoint.rs`): a command that cannot be
 //! spawned is an ordinary result (v1.1 `exit_code` 127, v1.2 a `stderr` frame then 127), a job that
 //! cannot be started is a non-2xx answer, offsets never move (dropped output is a gap, reported in
 //! `offset`), and a failure never ends a job that is running.
