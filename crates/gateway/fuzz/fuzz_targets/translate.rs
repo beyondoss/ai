@@ -9,8 +9,8 @@
 //! cut count `n` (0..16), the next `n` bytes are chunk lengths, the rest is the body.
 #![no_main]
 
-use beyond_ai::__test::route::Endpoint;
-use beyond_ai::__test::translate::{self, SseBridge};
+use beyond_gateway::__test::route::Endpoint;
+use beyond_gateway::__test::translate::{self, SseBridge};
 use libfuzzer_sys::fuzz_target;
 
 const DIALECTS: [Endpoint; 3] = [

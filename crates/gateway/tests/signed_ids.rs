@@ -271,8 +271,8 @@ async fn a_tenants_own_ids_round_trip_and_the_upstream_gets_provider_ids() {
         serde_json::to_string(&full(MSG)).unwrap()
     );
     // Another of the same tenant's keys: ids belong to the tenant, not the key.
-    let other_key = beyond_ai::__test::key::mint(
-        &beyond_ai::__test::key::VirtualKey {
+    let other_key = beyond_gateway::__test::key::mint(
+        &beyond_gateway::__test::key::VirtualKey {
             tenant_id: A,
             vpc_id: 9,
             key_id: Some(77),
@@ -475,7 +475,8 @@ async fn ids_issued_before_a_rotation_still_verify() {
         .unwrap()
         .to_owned();
     assert!(id.starts_with("resp_x2"), "new ids carry the new kid: {id}");
-    let rotated = beyond_ai::__test::signed_id::Signer::new(&[(b'2', &new_secret)], b'2').unwrap();
+    let rotated =
+        beyond_gateway::__test::signed_id::Signer::new(&[(b'2', &new_secret)], b'2').unwrap();
     assert_eq!(rotated.verify(A, &id).as_deref(), Some(RESP));
 
     let (mock2, retired, sk2) =

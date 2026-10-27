@@ -11,11 +11,11 @@
 //! ```sh
 //! # any transparent transport (docker, ssh, kubectl, podman …)
 //! AGENT_LIVE_EXEC_CMD='docker exec my-container {}' \
-//!   cargo nextest run -p beyond-ai-agent -E 'test(/^exec_endpoint_live::/)' --no-capture
+//!   cargo nextest run -p beyond-agent -E 'test(/^exec_endpoint_live::/)' --no-capture
 //!
 //! # any HTTP endpoint speaking the exec protocol
 //! AGENT_LIVE_EXEC_URL=https://exec.example/run AGENT_LIVE_EXEC_HEADER='Authorization: Bearer …' \
-//!   cargo nextest run -p beyond-ai-agent -E 'test(/^exec_endpoint_live::/)' --no-capture
+//!   cargo nextest run -p beyond-agent -E 'test(/^exec_endpoint_live::/)' --no-capture
 //! ```
 //!
 //! `AGENT_LIVE_WORKDIR` names a directory that exists **on the target and not on this host** (default
@@ -269,8 +269,8 @@ fn write_then_read_round_trips_through_the_target() {
 
 /// The runner the live flags describe, built in-process — for a test that needs to hold the job
 /// table itself.
-fn live_runner() -> Option<std::sync::Arc<dyn beyond_ai_agent::tools::exec::CommandRunner>> {
-    use beyond_ai_agent::exec_endpoint::{HttpExecRunner, TemplateRunner};
+fn live_runner() -> Option<std::sync::Arc<dyn beyond_agent::tools::exec::CommandRunner>> {
+    use beyond_agent::exec_endpoint::{HttpExecRunner, TemplateRunner};
     if let Ok(url) = std::env::var("AGENT_LIVE_EXEC_URL")
         && !url.is_empty()
     {
@@ -444,7 +444,7 @@ async fn until(what: &str, cond: impl Fn() -> bool) {
 /// whole job is to work on exactly this image.
 #[tokio::test]
 async fn a_sandbox_job_lives_in_the_target_and_outlives_its_hold_once_kept() {
-    use beyond_ai_agent::exec_endpoint::jobs::{JobEvent, JobId, JobScope, JobSpec, JobStatus};
+    use beyond_agent::exec_endpoint::jobs::{JobEvent, JobId, JobScope, JobSpec, JobStatus};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     let Some(runner) = live_runner() else {

@@ -321,7 +321,7 @@ fn serve_cycle_model_scoped_by_the_models_flag_cycles_only_the_scope_but_lists_t
         .collect();
     assert_eq!(
         all_models,
-        beyond_ai_agent::serve::listed_models()
+        beyond_agent::serve::listed_models()
             .iter()
             .map(|s| s.to_string())
             .collect::<Vec<_>>(),
@@ -389,7 +389,7 @@ fn serve_models_flag_expands_a_glob_against_the_known_catalog() {
     // `available_models()`, in catalog order, wrapping back to the start — never a gpt-*/o*-series id.
     // Derived from the live hint list (not a hardcoded id) so adding a new flagship ahead of the
     // previous first entry does not rotate the expected cycle out from under the fixture.
-    let expected: Vec<&str> = beyond_ai_agent::serve::available_models()
+    let expected: Vec<&str> = beyond_agent::serve::available_models()
         .iter()
         .copied()
         .filter(|id| id.starts_with("claude-"))

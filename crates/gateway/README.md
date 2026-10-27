@@ -1,4 +1,4 @@
-# beyond-ai (the gateway)
+# beyond-gateway
 
 An egress proxy for LLM traffic. Apps keep their stock OpenAI or Anthropic SDK
 and change only the base URL. The gateway authenticates the caller, swaps in a
@@ -37,7 +37,7 @@ gateway picks the provider, fails over, and translates between wires.
 **BYO only: no config, no NATS.** A binary and an upstream key are enough:
 
 ```sh
-cargo run -p beyond-ai --release          # listens on :8080 (data) and :9090 (admin)
+cargo run -p beyond-gateway --release          # listens on :8080 (data) and :9090 (admin)
 curl localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $OPENAI_API_KEY" -H 'Content-Type: application/json' \
   -d '{"model":"gpt-5-mini","messages":[{"role":"user","content":"hi"}]}'
@@ -53,7 +53,7 @@ secret and NATS (`nats_url`, default `nats://localhost:4222`). With a dev
 keypair:
 
 ```sh
-cargo run -p beyond-ai --example mint_dev_key   # prints SIGNING_PUBKEY_B64, KID, DEV_BAI_V1 (dev only)
+cargo run -p beyond-gateway --example mint_dev_key   # prints SIGNING_PUBKEY_B64, KID, DEV_BAI_V1 (dev only)
 ```
 
 ```toml
@@ -64,7 +64,7 @@ cargo run -p beyond-ai --example mint_dev_key   # prints SIGNING_PUBKEY_B64, KID
 
 ```sh
 AI_POOL_KEY_OPENAI=sk-... AI_ID_SIGNING_KEY_1=$(openssl rand -base64 32) \
-  cargo run -p beyond-ai --release
+  cargo run -p beyond-gateway --release
 ```
 
 Then use `DEV_BAI_V1` as the API key against `http://localhost:8080/v1`. Until

@@ -19,8 +19,8 @@
 
 use std::sync::Arc;
 
-use beyond_ai_agent::exec_endpoint::{ExecCell, ExecTarget, TemplateRunner};
-use beyond_ai_agent::tools::{ToolConfig, default_registry_with_config};
+use beyond_agent::exec_endpoint::{ExecCell, ExecTarget, TemplateRunner};
+use beyond_agent::tools::{ToolConfig, default_registry_with_config};
 use serde_json::{Value, json};
 
 /// A stand-in for one tenant's sandbox: a directory only that tenant's target can reach.

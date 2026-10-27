@@ -8,7 +8,7 @@
 //! payload.
 #![no_main]
 
-use beyond_ai::__test::signed_id::{Relay, Signer};
+use beyond_gateway::__test::signed_id::{Relay, Signer};
 use libfuzzer_sys::fuzz_target;
 use std::sync::OnceLock;
 

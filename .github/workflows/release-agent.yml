@@ -68,7 +68,7 @@ jobs:
           test -x "$profdata" || { echo "llvm-profdata missing at $profdata"; exit 1; }
 
           RUSTFLAGS="-Cprofile-generate=$PROFDIR/raw" \
-            cargo build --release --locked -p beyond-ai-agent --target ${{ matrix.target }}
+            cargo build --release --locked -p beyond-agent --target ${{ matrix.target }}
           # Deliberately NOT `--features code-mode`. QuickJS is ~1 MB of `.text` in every agent VM
           # even when `--code-mode` is never passed; idle RSS is already dominated by resident code
           # in a 768 MB guest. Experiments rebuild with the feature; the published binary does not.
@@ -98,7 +98,7 @@ jobs:
           # and it now runs in a seccomp-confined child that holds no credentials — see
           # `tools::web::isolate`. If that isolation is ever removed, this flag must go with it.
           RUSTFLAGS="-Cprofile-use=$PROFDIR/merged.profdata -C relocation-model=static" \
-            cargo build --release --locked -p beyond-ai-agent --target ${{ matrix.target }}
+            cargo build --release --locked -p beyond-agent --target ${{ matrix.target }}
       # Deliberately NOT UPX-compressed. UPX self-extracts the whole image into anonymous memory at
       # exec, which defeats demand paging: the text segment stops being a clean, shared, file-backed
       # mapping and becomes private dirty anon that can't be evicted (only swapped) and can't be

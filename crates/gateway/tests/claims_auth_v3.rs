@@ -7,7 +7,7 @@
 
 mod common;
 
-use beyond_ai::__test::key::{VirtualKey, mint_v3};
+use beyond_gateway::__test::key::{VirtualKey, mint_v3};
 use common::*;
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};

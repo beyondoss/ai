@@ -11,7 +11,7 @@
 
 mod support;
 
-use beyond_ai_agent::exec_endpoint::conformance::{self, Expectations, Verdict, verify};
+use beyond_agent::exec_endpoint::conformance::{self, Expectations, Verdict, verify};
 use support::Execd;
 
 /// A deployment that says its kept jobs survive idling advertises v1.4, and passes every check

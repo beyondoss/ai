@@ -1,17 +1,16 @@
 //! `login`, `logout`, `auth-status` (model providers) and `mcp-login`, `mcp-logout` (MCP servers).
 
-use beyond_ai_agent::session_store::canonical_cwd;
+use beyond_agent::session_store::canonical_cwd;
 
 use crate::{CliLoginCallbacks, unknown_provider_error};
 
 /// `login <provider>`
 pub(crate) async fn login(provider: String) -> Result<(), Box<dyn std::error::Error>> {
-    let provider_id = beyond_ai_agent::oauth::OAuthProviderId::parse(&provider)
+    let provider_id = beyond_agent::oauth::OAuthProviderId::parse(&provider)
         .ok_or_else(|| unknown_provider_error(&provider))?;
     let cancel = agent_core::CancellationToken::new();
-    let credential =
-        beyond_ai_agent::oauth::login(provider_id, &CliLoginCallbacks, &cancel).await?;
-    let mut store = beyond_ai_agent::auth_store::AuthStore::open_default();
+    let credential = beyond_agent::oauth::login(provider_id, &CliLoginCallbacks, &cancel).await?;
+    let mut store = beyond_agent::auth_store::AuthStore::open_default();
     store.set(provider_id.store_key(), credential)?;
     println!("logged in: {provider_id}");
     Ok(())
@@ -19,9 +18,9 @@ pub(crate) async fn login(provider: String) -> Result<(), Box<dyn std::error::Er
 
 /// `logout <provider>`
 pub(crate) fn logout(provider: String) -> Result<(), Box<dyn std::error::Error>> {
-    let provider_id = beyond_ai_agent::oauth::OAuthProviderId::parse(&provider)
+    let provider_id = beyond_agent::oauth::OAuthProviderId::parse(&provider)
         .ok_or_else(|| unknown_provider_error(&provider))?;
-    let mut store = beyond_ai_agent::auth_store::AuthStore::open_default();
+    let mut store = beyond_agent::auth_store::AuthStore::open_default();
     if store.remove(provider_id.store_key())? {
         println!("logged out: {provider_id}");
     } else {
@@ -32,13 +31,13 @@ pub(crate) fn logout(provider: String) -> Result<(), Box<dyn std::error::Error>>
 
 /// `auth-status [provider]`
 pub(crate) fn auth_status(provider: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let store = beyond_ai_agent::auth_store::AuthStore::open_default();
+    let store = beyond_agent::auth_store::AuthStore::open_default();
     let providers = match &provider {
         Some(p) => vec![
-            beyond_ai_agent::oauth::OAuthProviderId::parse(p)
+            beyond_agent::oauth::OAuthProviderId::parse(p)
                 .ok_or_else(|| unknown_provider_error(p))?,
         ],
-        None => beyond_ai_agent::oauth::OAuthProviderId::all().to_vec(),
+        None => beyond_agent::oauth::OAuthProviderId::all().to_vec(),
     };
     for id in providers {
         let status = match store.get(id.store_key()) {
@@ -54,7 +53,7 @@ pub(crate) fn auth_status(provider: Option<String>) -> Result<(), Box<dyn std::e
 /// `mcp-login <name>`: OAuth against an MCP server from the effective settings.
 pub(crate) async fn mcp_login(name: String) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = canonical_cwd(&std::env::current_dir().unwrap_or_default());
-    let settings = beyond_ai_agent::settings::effective_settings_for_cwd(&cwd);
+    let settings = beyond_agent::settings::effective_settings_for_cwd(&cwd);
     let servers = settings.mcp_servers.unwrap_or_default();
     let server = servers.iter().find(|s| s.name == name).ok_or_else(|| {
         format!(
@@ -63,8 +62,8 @@ pub(crate) async fn mcp_login(name: String) -> Result<(), Box<dyn std::error::Er
         )
     })?;
     let url = match &server.transport {
-        beyond_ai_agent::settings::McpTransport::Http { url, .. } => url.clone(),
-        beyond_ai_agent::settings::McpTransport::Stdio { .. } => {
+        beyond_agent::settings::McpTransport::Http { url, .. } => url.clone(),
+        beyond_agent::settings::McpTransport::Stdio { .. } => {
             return Err(format!(
                 "`{name}` uses the stdio transport, which has no OAuth login of its own — \
                      configure a credential via its `env` instead"
@@ -76,7 +75,7 @@ pub(crate) async fn mcp_login(name: String) -> Result<(), Box<dyn std::error::Er
     let mut manager = rmcp::transport::auth::AuthorizationManager::new(&url)
         .await
         .map_err(|e| format!("failed to start MCP OAuth for `{name}`: {e}"))?;
-    let auth_store = beyond_ai_agent::mcp_auth_store::McpAuthStore::open_default();
+    let auth_store = beyond_agent::mcp_auth_store::McpAuthStore::open_default();
     manager.set_credential_store(auth_store.scoped(&name));
     // rmcp 3.x: discovery is `resolve_metadata` (no longer `discover_metadata`).
     let resolution = manager
@@ -92,7 +91,7 @@ pub(crate) async fn mcp_login(name: String) -> Result<(), Box<dyn std::error::Er
     // between, and the login then failed before printing its URL.
     let listener =
             // port-0: the listener is held for the whole login; the redirect URI names its port.
-            beyond_ai_agent::oauth::callback_server::CallbackServer::bind("127.0.0.1", 0)
+            beyond_agent::oauth::callback_server::CallbackServer::bind("127.0.0.1", 0)
                 .map_err(|e| {
                     format!("failed to bind the local OAuth callback listener: {e}")
                 })?;
@@ -134,7 +133,7 @@ pub(crate) async fn mcp_login(name: String) -> Result<(), Box<dyn std::error::Er
 
 /// `mcp-logout <name>`
 pub(crate) fn mcp_logout(name: String) -> Result<(), Box<dyn std::error::Error>> {
-    let store = beyond_ai_agent::mcp_auth_store::McpAuthStore::open_default();
+    let store = beyond_agent::mcp_auth_store::McpAuthStore::open_default();
     let had_credential = store.has_credential(&name);
     store.clear(&name)?;
     if had_credential {

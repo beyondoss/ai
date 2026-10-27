@@ -15,8 +15,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use beyond_ai_agent::exec_endpoint::TemplateRunner;
-use beyond_ai_agent::tools::exec::CommandRunner;
+use beyond_agent::exec_endpoint::TemplateRunner;
+use beyond_agent::tools::exec::CommandRunner;
 use common::exec_mock::{group_alive, wait_group_gone};
 use common::remote_bash::{call, job_number, kill_job, remote_bash};
 use serde_json::json;

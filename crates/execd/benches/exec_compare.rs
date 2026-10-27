@@ -1,7 +1,7 @@
 //! execd against a baseline exec endpoint, A/B, over HTTP on loopback.
 //!
 //! ```sh
-//! EXEC_BENCH_A=/path/to/beyond-ai-demo cargo bench -p beyond-ai-execd --bench exec_compare
+//! EXEC_BENCH_A=/path/to/beyond-ai-demo cargo bench -p beyond-execd --bench exec_compare
 //! ```
 //!
 //! **A** is the baseline, a `beyond-ai-demo exec-stub` binary built from the commit before execd
@@ -96,7 +96,7 @@ impl Server {
         let mut child = cmd.spawn()?;
         let t = Instant::now();
         let addr = loop {
-            if let Some(a) = beyond_ai_test_support::ports::listening_on(child.id()).first() {
+            if let Some(a) = beyond_test_support::ports::listening_on(child.id()).first() {
                 break std::net::SocketAddr::V4(*a);
             }
             if t.elapsed() > Duration::from_secs(20) {

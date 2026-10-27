@@ -77,7 +77,7 @@ jobs:
       - if: steps.cache.outputs.cache-hit != 'true'
         run: mise check:rs
       - if: steps.cache.outputs.cache-hit != 'true'
-        run: cargo clippy -p beyond-ai-agent --all-targets --features code-mode --locked -- -D warnings
+        run: cargo clippy -p beyond-agent --all-targets --features code-mode --locked -- -D warnings
   code-mode:
     name: warm (code-mode)
     runs-on: ubuntu-latest
@@ -96,7 +96,7 @@ jobs:
           tool: nextest
       # The `agent-code-mode` shard's compile in ci.yml.
       - if: steps.cache.outputs.cache-hit != 'true'
-        run: cargo nextest run -p beyond-ai-agent --locked --profile ci --features code-mode --no-run
+        run: cargo nextest run -p beyond-agent --locked --profile ci --features code-mode --no-run
   release:
     name: warm (release)
     runs-on: ubuntu-latest
@@ -129,4 +129,4 @@ jobs:
         with:
           tool: nextest
       - if: steps.cache.outputs.cache-hit != 'true'
-        run: cargo nextest run -p beyond-ai-execd --locked --profile ci --no-run
+        run: cargo nextest run -p beyond-execd --locked --profile ci --no-run

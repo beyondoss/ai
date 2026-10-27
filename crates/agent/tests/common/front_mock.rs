@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
-use beyond_ai_agent::exec_endpoint::conformance::front::{Hooks, State};
+use beyond_agent::exec_endpoint::conformance::front::{Hooks, State};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -66,7 +66,7 @@ pub struct FrontMock {
 
 impl FrontMock {
     pub async fn start(fault: Fault, cap: usize) -> Self {
-        let listener = beyond_ai_test_support::ports::tokio_listener().await;
+        let listener = beyond_test_support::ports::tokio_listener().await;
         let addr = listener.local_addr().unwrap();
         let inner = Arc::new(Mutex::new(Inner {
             stale_routes: fault == Fault::StaleRoute,

@@ -6,7 +6,7 @@
 
 use crate::common;
 
-use beyond_ai_test_support::bundle::{BundleServer, Entry, dir, file, sha256_hex, tar};
+use beyond_test_support::bundle::{BundleServer, Entry, dir, file, sha256_hex, tar};
 use common::grant::Bundle;
 use common::service::{Options, Service};
 use common::{

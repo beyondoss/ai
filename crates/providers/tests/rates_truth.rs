@@ -103,6 +103,6 @@ fn rate_version_names_this_table() {
     assert_eq!(date.len(), 10, "RATE_VERSION date");
     assert_eq!(
         recorded, hash,
-        "the rate table changed: run `cargo run -p beyond-ai-rates-sync -- rate-version` (sets RATE_VERSION to \"{{today}}.{hash}\")"
+        "the rate table changed: run `cargo run -p beyond-rates-sync -- rate-version` (sets RATE_VERSION to \"{{today}}.{hash}\")"
     );
 }

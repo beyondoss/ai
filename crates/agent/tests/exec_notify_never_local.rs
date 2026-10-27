@@ -11,9 +11,9 @@ use crate::common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use beyond_ai_agent::exec_endpoint::HttpExecRunner;
-use beyond_ai_agent::exec_endpoint::jobs::{JobId, JobNotify, JobScope, JobSpec};
-use beyond_ai_agent::tools::exec::CommandRunner;
+use beyond_agent::exec_endpoint::HttpExecRunner;
+use beyond_agent::exec_endpoint::jobs::{JobId, JobNotify, JobScope, JobSpec};
+use beyond_agent::tools::exec::CommandRunner;
 use common::exec_mock::{ExecMock, MockOptions, NotifyFaults, Protocol};
 
 fn spec(script: &str) -> JobSpec {

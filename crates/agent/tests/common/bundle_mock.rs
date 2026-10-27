@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use beyond_ai_agent::conformance::bundle::Hooks;
+use beyond_agent::conformance::bundle::Hooks;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -43,7 +43,7 @@ impl BundleMock {
     pub const WINDOW: Duration = WINDOW;
 
     pub async fn start(fault: Fault) -> Self {
-        let listener = beyond_ai_test_support::ports::tokio_listener().await;
+        let listener = beyond_test_support::ports::tokio_listener().await;
         let addr = listener.local_addr().unwrap();
         let store: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::default();
         let shared = store.clone();
@@ -91,7 +91,7 @@ impl Hooks for BundleMock {
         let mut f = std::fs::File::open(source).map_err(|e| e.to_string())?;
         let len = f.metadata().map_err(|e| e.to_string())?.len();
         let mut bytes = Vec::new();
-        if len > beyond_ai_agent::bundle::MAX_BYTES as u64 {
+        if len > beyond_agent::bundle::MAX_BYTES as u64 {
             if self.fault != Fault::NoValidation {
                 return Ok(None);
             }
@@ -100,7 +100,7 @@ impl Hooks for BundleMock {
         std::io::Read::read_to_end(&mut f, &mut bytes).map_err(|e| e.to_string())?;
         let scratch = tempfile::tempdir().map_err(|e| e.to_string())?;
         if self.fault != Fault::NoValidation
-            && beyond_ai_agent::bundle::unpack(&bytes, scratch.path()).is_err()
+            && beyond_agent::bundle::unpack(&bytes, scratch.path()).is_err()
         {
             return Ok(None);
         }

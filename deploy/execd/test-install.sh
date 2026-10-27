@@ -2,7 +2,7 @@
 # Rerunnable checks for execd's distribution: the installer in alpine (busybox wget) and debian
 # (curl), and the carrier image's `COPY --from`. Needs docker, python3 and a static musl execd.
 #
-#   cargo build --release --locked -p beyond-ai-execd --target x86_64-unknown-linux-musl \
+#   cargo build --release --locked -p beyond-execd --target x86_64-unknown-linux-musl \
 #     (with RUSTFLAGS="-C relocation-model=static")
 #   deploy/execd/test-install.sh target/x86_64-unknown-linux-musl/release/execd
 #

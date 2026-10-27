@@ -3,7 +3,7 @@
 //! fail-closed until the watcher seeds).
 // `dead_code` and `unused_imports` for the same reason: this module is compiled into *every* test
 // binary, and no single binary uses all of it. That was already true of the helpers defined here; it
-// is now also true of the re-exports from `beyond-ai-test-support`, which are `pub use` in a module
+// is now also true of the re-exports from `beyond-test-support`, which are `pub use` in a module
 // that is private to each test crate and so are flagged per binary that happens not to need them.
 #![allow(
     clippy::unwrap_used,
@@ -217,7 +217,7 @@ pub fn gateway_bin() -> PathBuf {
     let dir = agent.parent().unwrap();
     let gw = dir.join("beyond-ai");
     if !gw.exists() {
-        let mut args = vec!["build", "-q", "-p", "beyond-ai", "--bin", "beyond-ai"];
+        let mut args = vec!["build", "-q", "-p", "beyond-gateway", "--bin", "beyond-ai"];
         if agent.to_string_lossy().contains("/release/") {
             args.push("--release");
         }
@@ -231,11 +231,11 @@ pub fn gateway_bin() -> PathBuf {
 }
 
 /// An Anthropic SSE turn that calls one tool with the given JSON-argument string.
-// The mock model server and its turn builders now live in `beyond-ai-test-support`, so the fleet
+// The mock model server and its turn builders now live in `beyond-test-support`, so the fleet
 // simulator — a binary in its own crate — can use the same doubles these tests do. Re-exported
 // rather than re-imported at each call site: every test that already says `common::turn_text`
 // keeps working, and there is one implementation of the wire format rather than two.
-pub use beyond_ai_test_support::{
+pub use beyond_test_support::{
     SCRIPTED_SESSION_TITLE, SESSION_TITLE_MARKER, spawn_model_server, spawn_model_server_routed,
     spawn_model_server_with_stalled_response, sse, title_calls, turn_refusal, turn_text,
     turn_text_responses, turn_tool_use,
@@ -327,7 +327,7 @@ pub struct HeldPort {
 
 impl HeldPort {
     pub fn bind() -> Self {
-        let listener = beyond_ai_test_support::ports::listener();
+        let listener = beyond_test_support::ports::listener();
         let port = listener.local_addr().unwrap().port();
         Self { listener, port }
     }
@@ -404,7 +404,7 @@ impl Drop for PortDown {
     }
 }
 
-pub use beyond_ai_test_support::ports::{DeadPort, GATEWAY_LISTENERS, GatewayPorts};
+pub use beyond_test_support::ports::{DeadPort, GATEWAY_LISTENERS, GatewayPorts};
 
 /// Spawn the gateway (`cmd`: its binary, `run -c <config>`, environment; the config's listeners must be
 /// [`GATEWAY_LISTENERS`]) and return it once both listeners are up, with the ports the kernel gave
@@ -414,7 +414,7 @@ pub fn spawn_gateway(cmd: &mut Command) -> (ChildGuard, GatewayPorts) {
     let mut child = cmd.spawn_guarded();
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        if let Some(ports) = beyond_ai_test_support::ports::gateway_ports(child.id()) {
+        if let Some(ports) = beyond_test_support::ports::gateway_ports(child.id()) {
             return (child, ports);
         }
         if let Ok(Some(status)) = child.try_wait() {
@@ -476,7 +476,7 @@ rm -rf "$2""#;
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok());
             if let Some(port) =
-                server.and_then(|pid| beyond_ai_test_support::ports::nats_port_from(&ports, pid))
+                server.and_then(|pid| beyond_test_support::ports::nats_port_from(&ports, pid))
             {
                 return Self {
                     port,
@@ -700,7 +700,7 @@ impl BufRead for Frames {
 /// reaches its `bash` call, or *after* that call finished, and the assertion fails for a reason with
 /// nothing to do with the behaviour under test. Asking the run where it is has no such window.
 ///
-/// `matches` receives the event body (the `kind`-tagged [`beyond_ai_agent_core::AgentEvent`]), because
+/// `matches` receives the event body (the `kind`-tagged [`agent_core::AgentEvent`]), because
 /// what counts as "there yet" differs per test: `kind == "tool_start"` is "the call is running now",
 /// the first `tool_progress` is "output has already streamed", and a turn that calls the same tool
 /// twice has to key on the tool-use `id` the test itself authored.

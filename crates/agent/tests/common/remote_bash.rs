@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_core::tool::Tool;
-use beyond_ai_agent::tools::bash::{Bash, BashJob};
-use beyond_ai_agent::tools::exec::CommandRunner;
-use beyond_ai_agent::tools::fs::FsBackend;
-use beyond_ai_agent::tools::fs::shell::{Capabilities, ShellFs};
+use beyond_agent::tools::bash::{Bash, BashJob};
+use beyond_agent::tools::exec::CommandRunner;
+use beyond_agent::tools::fs::FsBackend;
+use beyond_agent::tools::fs::shell::{Capabilities, ShellFs};
 use serde_json::{Value, json};
 
 /// A remote `bash` over `runner` that yields after `idle` of silence, and the `bash_job` that

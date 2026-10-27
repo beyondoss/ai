@@ -28,7 +28,7 @@ pub struct Edge {
 
 impl Edge {
     pub async fn bind() -> (Self, tokio::net::TcpListener) {
-        let listener = beyond_ai_test_support::ports::tokio_listener().await;
+        let listener = beyond_test_support::ports::tokio_listener().await;
         let origin = format!("http://{}", listener.local_addr().unwrap());
         (
             Self {
@@ -195,7 +195,7 @@ impl Drop for Reap {
     }
 }
 
-pub fn seal_key(svc: &Service) -> beyond_ai_agent::notify_token::NotifyKey {
+pub fn seal_key(svc: &Service) -> beyond_agent::notify_token::NotifyKey {
     use base64::Engine as _;
     let b64 = std::fs::read_to_string(svc.minter.seal_key()).unwrap();
     let bytes: [u8; 32] = base64::engine::general_purpose::STANDARD
@@ -203,7 +203,7 @@ pub fn seal_key(svc: &Service) -> beyond_ai_agent::notify_token::NotifyKey {
         .unwrap()
         .try_into()
         .unwrap();
-    beyond_ai_agent::notify_token::NotifyKey::from_secret_bytes(&bytes)
+    beyond_agent::notify_token::NotifyKey::from_secret_bytes(&bytes)
 }
 
 /// POST a callback to `origin` + `target`; the status.

@@ -8,8 +8,8 @@ use crate::common;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use beyond_ai_agent::exec_endpoint::HttpExecRunner;
-use beyond_ai_agent::tools::exec::CommandRunner;
+use beyond_agent::exec_endpoint::HttpExecRunner;
+use beyond_agent::tools::exec::CommandRunner;
 use common::exec_mock::{ExecMock, MockOptions, Protocol, StreamEnd};
 
 fn sh(script: &str) -> Vec<String> {
@@ -41,7 +41,7 @@ async fn stream(
     runner: &HttpExecRunner,
     script: &str,
     timeout: Duration,
-) -> (beyond_ai_agent::tools::exec::ExecResult, Sink) {
+) -> (beyond_agent::tools::exec::ExecResult, Sink) {
     let sink = Sink::default();
     let s = sink.clone();
     let on_chunk = move |b: &[u8]| s.0.lock().unwrap().push((Instant::now(), b.to_vec()));

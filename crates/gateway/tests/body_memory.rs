@@ -12,7 +12,7 @@
 
 mod common;
 
-use beyond_ai::__test::key::{VirtualKey, mint};
+use beyond_gateway::__test::key::{VirtualKey, mint};
 use common::*;
 
 fn vkey(sk: &ed25519_dalek::SigningKey) -> String {
@@ -279,7 +279,7 @@ async fn a_translation_needing_exactly_the_budget_is_not_a_413() {
         r#"{{"model":"claude-opus-4-8","store":false,"input":[{}]}}"#,
         tiny_objects(100 * 1024)
     );
-    let heap = beyond_ai::__test::translate::translation_heap(body.as_bytes());
+    let heap = beyond_gateway::__test::translate::translation_heap(body.as_bytes());
     let gw = Gateway::builder(unused_nats_port(), &mock.authority(), &b64(&pubkey))
         .providers(&["anthropic"])
         .config_line(&format!("max_buffered_body_bytes = {heap}"))

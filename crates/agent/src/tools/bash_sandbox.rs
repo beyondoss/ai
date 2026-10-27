@@ -838,7 +838,7 @@ mod notify_tests {
     use super::*;
     use crate::tools::job_notify::kernel::JobState;
     use crate::tools::job_notify::{NotifyHub, SessionNotify};
-    use beyond_ai_test_support::exec_mock::{ExecMock, LoseCallbacks, MockOptions};
+    use beyond_test_support::exec_mock::{ExecMock, LoseCallbacks, MockOptions};
 
     /// A proving job whose stream delivers its final frame leaves v1.4's proving state: the
     /// release table's `proving, held` row, fed as production feeds it.

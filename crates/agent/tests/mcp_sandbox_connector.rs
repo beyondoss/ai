@@ -8,9 +8,9 @@ use crate::common;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use beyond_ai_agent::grant::McpConnector;
-use beyond_ai_agent::tools::mcp::{self, McpEgress};
-use beyond_ai_agent::tools::web::ssrf::EgressPolicy;
+use beyond_agent::grant::McpConnector;
+use beyond_agent::tools::mcp::{self, McpEgress};
+use beyond_agent::tools::web::ssrf::EgressPolicy;
 use common::mcp_session_fixture::{SessionMcpFixture, spawn_session_mcp_fixture};
 use serde_json::json;
 

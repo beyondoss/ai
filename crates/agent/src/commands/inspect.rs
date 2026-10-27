@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use beyond_ai_agent::{serve, tools};
+use beyond_agent::{serve, tools};
 
 use crate::{format_token_count, fuzzy_match};
 
@@ -71,7 +71,7 @@ pub(crate) fn export(
     session: String,
     output: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (store, sess) = beyond_ai_agent::session_store::SessionStore::open(PathBuf::from(&session))
+    let (store, sess) = beyond_agent::session_store::SessionStore::open(PathBuf::from(&session))
         .map_err(|e| format!("failed to open session {session}: {e}"))?;
     let branches = store.abandoned_branches();
     // `export_html_full` (Task #44 integration), but with `system_prompt`/`tools` genuinely
@@ -87,11 +87,11 @@ pub(crate) fn export(
     // `export_html` RPC and `run --export` derive their own totals from, one layer up), which
     // *is* right here in `sess.messages` — previously this passed `usage: None` unconditionally,
     // the one of the three export entry points that silently omitted the line instead.
-    let path = beyond_ai_agent::export::export_html_full(
+    let path = beyond_agent::export::export_html_full(
         store.meta(),
         &sess.messages,
         &branches,
-        Some(beyond_ai_agent::serve::message_export_usage_totals(&sess)),
+        Some(beyond_agent::serve::message_export_usage_totals(&sess)),
         store.export_events(),
         None,
         None,

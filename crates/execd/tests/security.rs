@@ -11,7 +11,7 @@ mod support;
 use std::os::unix::fs::MetadataExt as _;
 use std::process::{Command, Stdio};
 
-use beyond_ai_test_support::ports;
+use beyond_test_support::ports;
 use serde_json::{Value, json};
 use support::{Execd, http::post};
 
@@ -567,7 +567,7 @@ async fn notify_tokens_and_callback_urls_never_reach_the_log() {
     let bearer = token("log");
     let token_secret = format!("TOKSECRET{}", std::process::id());
     let url_secret = format!("URLSECRET{}", std::process::id());
-    let listener = beyond_ai_test_support::ports::tokio_listener().await;
+    let listener = beyond_test_support::ports::tokio_listener().await;
     let port = listener.local_addr().unwrap().port();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     tokio::spawn(async move {

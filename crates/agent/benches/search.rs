@@ -8,7 +8,7 @@
 //! The headline comparison: our in-process `grep` (ripgrep's `grep-searcher`/`grep-regex` engine
 //! linked in) vs shelling out to the `rg` **binary** (what pi does) over the same ~5k-file corpus.
 //! `grep` is measured single-threaded (`1`) and auto/parallel (`0`); `find`'s sequential walk gets one
-//! number. Run: `cargo bench -p beyond-ai-agent --bench search`.
+//! number. Run: `cargo bench -p beyond-agent --bench search`.
 //!
 //! Reading the two grep rows: `grep_engine` allocations are the *real* work — one line + path per hit
 //! held as structured results. `grep_rg_subprocess` allocations are what *our* process spends to
@@ -21,10 +21,10 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use agent_core::Tool;
-use beyond_ai_agent::tools::exec::{CommandRunner, RealRunner};
-use beyond_ai_agent::tools::fs::FsBackend as _;
-use beyond_ai_agent::tools::fs::local::LocalFs;
-use beyond_ai_agent::tools::{edit, fs, ls, output, read};
+use beyond_agent::tools::exec::{CommandRunner, RealRunner};
+use beyond_agent::tools::fs::FsBackend as _;
+use beyond_agent::tools::fs::local::LocalFs;
+use beyond_agent::tools::{edit, fs, ls, output, read};
 use divan::Bencher;
 use tempfile::TempDir;
 

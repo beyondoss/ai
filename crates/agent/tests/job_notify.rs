@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use beyond_ai_agent::tools::job_notify::kernel::{
+use beyond_agent::tools::job_notify::kernel::{
     Action, Event, Facts, JobState, KeepOutcome, Kernel, Listed, RECONCILE_SPACING, TableJob,
     USE_SPACING,
 };
@@ -251,12 +251,12 @@ async fn a_live_reconcile_never_keeps() {
     let lists = f.ops("list");
     // A callback for the unheld job, with its real token, through the edge.
     let job = f.keeps()[0]["id"].as_str().unwrap().to_string();
-    let scope = beyond_ai_agent::exec_endpoint::jobs::JobScope::for_session(Some(TENANT), SESSION);
+    let scope = beyond_agent::exec_endpoint::jobs::JobScope::for_session(Some(TENANT), SESSION);
     let key = seal_key(&f.svc);
     let token = key.mint(
         TENANT,
         SESSION,
-        &beyond_ai_agent::exec_endpoint::jobs::JobId::parse(&job).unwrap(),
+        &beyond_agent::exec_endpoint::jobs::JobId::parse(&job).unwrap(),
     );
     let body = format!(
         r#"{{"type":"job_ended","scope":"{}","id":"{job}"}}"#,
@@ -339,7 +339,7 @@ async fn takeover_proves_again() {
 #[tokio::test(flavor = "multi_thread")]
 async fn no_idle_connection_to_the_endpoint() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = beyond_ai_test_support::ports::tokio_listener().await;
+    let listener = beyond_test_support::ports::tokio_listener().await;
     let url = format!("http://{}/exec", listener.local_addr().unwrap());
     let closed = Arc::new(tokio::sync::Notify::new());
     let seen = closed.clone();
@@ -362,8 +362,8 @@ async fn no_idle_connection_to_the_endpoint() {
         }
         seen.notify_one();
     });
-    let runner = beyond_ai_agent::exec_endpoint::HttpExecRunner::new(url).unwrap();
-    use beyond_ai_agent::tools::exec::CommandRunner as _;
+    let runner = beyond_agent::exec_endpoint::HttpExecRunner::new(url).unwrap();
+    use beyond_agent::tools::exec::CommandRunner as _;
     runner
         .run("true", &[], None, Duration::from_secs(5))
         .await
@@ -540,8 +540,8 @@ async fn new_session_ends_the_unheld_job() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let key = seal_key(&f.svc);
-    let id = beyond_ai_agent::exec_endpoint::jobs::JobId::parse(&job).unwrap();
-    let scope = beyond_ai_agent::exec_endpoint::jobs::JobScope::for_session(Some(TENANT), SESSION);
+    let id = beyond_agent::exec_endpoint::jobs::JobId::parse(&job).unwrap();
+    let scope = beyond_agent::exec_endpoint::jobs::JobScope::for_session(Some(TENANT), SESSION);
     let body = format!(
         r#"{{"type":"job_ended","scope":"{}","id":"{job}"}}"#,
         scope.name()
@@ -628,7 +628,7 @@ fn the_live_reconcile_changes_only_unheld_jobs() {
         [Action::Follow {
             job: J.into(),
             from: 9,
-            end: Some(beyond_ai_agent::tools::job_notify::kernel::ListedEnd {
+            end: Some(beyond_agent::tools::job_notify::kernel::ListedEnd {
                 code: Some(3),
                 at: 100
             })
@@ -727,7 +727,7 @@ fn reconciles_only_on_a_callback_or_a_use() {
         [Action::Answer {
             call: 7,
             status: 200,
-            why: beyond_ai_agent::tools::job_notify::kernel::Why::Hint
+            why: beyond_agent::tools::job_notify::kernel::Why::Hint
         }]
     );
     // One about the unheld job does, after the spacing.

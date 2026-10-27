@@ -10,8 +10,8 @@ use crate::common;
 
 use std::time::{Duration, Instant};
 
-use beyond_ai_agent::settings::{McpServerConfig, McpTransport};
-use beyond_ai_agent::tools::{mcp, mcp_manifest};
+use beyond_agent::settings::{McpServerConfig, McpTransport};
+use beyond_agent::tools::{mcp, mcp_manifest};
 use common::{body_json, run_cmd, spawn_model_server, turn_text, turn_tool_use};
 use serde_json::{Value, json};
 

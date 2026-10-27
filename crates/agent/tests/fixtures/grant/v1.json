@@ -4,7 +4,7 @@
     "The control plane's minter must reproduce `token` byte for byte from the inputs: signing_seed_hex, kid, fleet_public_hex, ephemeral_secret_hex, nonce_hex, claims, secrets.",
     "Intermediates (shared_secret_hex, seal_key_hex, secrets_json, sealed, payload_json) locate the first step a second implementation disagrees on.",
     "Every `negative` token must be rejected, at its `now`, with the named GrantError variant.",
-    "Regenerate only for a deliberate change: UPDATE_FIXTURES=1 cargo test -p beyond-ai-agent grant::, then dprint fmt."
+    "Regenerate only for a deliberate change: UPDATE_FIXTURES=1 cargo test -p beyond-agent grant::, then dprint fmt."
   ],
   "kid": 1,
   "signing_seed_hex": "0707070707070707070707070707070707070707070707070707070707070707",

@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use beyond_ai_agent::managed_mcp_token::{ManagedKey, Reject};
+use beyond_agent::managed_mcp_token::{ManagedKey, Reject};
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -296,13 +296,13 @@ fn provider(sh: &Shared, req: &Req) -> (u16, Vec<(String, String)>, Vec<u8>) {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-    use beyond_ai_agent::managed_mcp_token::Claims;
+    use beyond_agent::managed_mcp_token::Claims;
 
     const SECRET_B64: &str = "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo="; // 0x5a * 32
     const REAL: &str = "psk_live_not_for_the_agent";
 
     async fn up() -> Standin {
-        use beyond_ai_test_support::ports;
+        use beyond_test_support::ports;
         Standin::serve(
             ports::tokio_listener().await,
             ports::tokio_listener().await,

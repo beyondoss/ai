@@ -103,7 +103,7 @@ fn write_generated(root: &Path) -> Result<()> {
         println!("{GENERATED}: regenerated\n{d}");
     }
     println!(
-        "Rates changed: run `cargo run -p beyond-ai-rates-sync -- rate-version` for the new RATE_VERSION\n\
+        "Rates changed: run `cargo run -p beyond-rates-sync -- rate-version` for the new RATE_VERSION\n\
          (`mise run rates:sync` does), and update verify/pricing_vectors.json for any vector whose rates moved."
     );
     Ok(())

@@ -14,7 +14,7 @@ use std::process::Stdio;
 
 use agent_core::compaction::MASKED_PREFIX;
 use agent_core::{ContentBlock, Message, Session};
-use beyond_ai_agent::session_store::{SessionMeta, SessionRepo, SessionStore};
+use beyond_agent::session_store::{SessionMeta, SessionRepo, SessionStore};
 use common::{
     ISOLATED_HOME, SpawnGuarded, read_until_response, spawn_model_server, sse, turn_text,
 };

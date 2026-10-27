@@ -15,9 +15,9 @@
 
 mod props_support;
 
-use beyond_ai::__test::route::Endpoint;
-use beyond_ai::__test::translate::SseBridge;
-use beyond_ai::__test::usage;
+use beyond_gateway::__test::route::Endpoint;
+use beyond_gateway::__test::translate::SseBridge;
+use beyond_gateway::__test::usage;
 use props_support::script::{DIALECTS, Script, Seen, script, seen_stream};
 use props_support::*;
 use proptest::prelude::*;

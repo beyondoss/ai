@@ -18,8 +18,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use beyond_ai_agent::exec_endpoint::jobs::{JobId, JobScope};
-use beyond_ai_agent::notify_token::NotifyKey;
+use beyond_agent::exec_endpoint::jobs::{JobId, JobScope};
+use beyond_agent::notify_token::NotifyKey;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -149,7 +149,7 @@ pub struct Meter {
 
 impl Meter {
     pub async fn start(target_url: &str) -> Self {
-        let listener = beyond_ai_test_support::ports::tokio_listener().await;
+        let listener = beyond_test_support::ports::tokio_listener().await;
         let addr = listener.local_addr().unwrap();
         let rest = target_url.trim_start_matches("http://");
         let (target, path) = rest.split_once('/').unwrap();
@@ -289,7 +289,7 @@ pub struct Front {
 
 impl Front {
     pub async fn bind(slots: usize) -> (Self, tokio::net::TcpListener) {
-        let listener = beyond_ai_test_support::ports::tokio_listener().await;
+        let listener = beyond_test_support::ports::tokio_listener().await;
         let addr = listener.local_addr().unwrap();
         (
             Self {
@@ -602,7 +602,7 @@ pub struct E2e {
 
 impl E2e {
     pub async fn start(setup: Setup) -> Self {
-        let (base, requests) = beyond_ai_test_support::spawn_model_server_fn(answer);
+        let (base, requests) = beyond_test_support::spawn_model_server_fn(answer);
         let (front, listener) = Front::bind(setup.replicas).await;
         let mut replica_args = vec!["--notify-origin".to_string(), front.origin.clone()];
         if let Some(secs) = setup.idle_timeout {

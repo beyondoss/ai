@@ -20,12 +20,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use beyond_ai_agent::tools::fs::local::LocalFs;
-use beyond_ai_agent::tools::fs::{
+use beyond_agent::tools::fs::local::LocalFs;
+use beyond_agent::tools::fs::{
     DirEntry, FsBackend, FsError, GlobOutcome, GlobQuery, Meta, PathWorld, SearchOutcome,
     SearchQuery,
 };
-use beyond_ai_agent::tools::{ToolConfig, default_registry_with_config};
+use beyond_agent::tools::{ToolConfig, default_registry_with_config};
 use serde_json::json;
 
 /// Wraps a real backend and counts every call that would become a round trip.

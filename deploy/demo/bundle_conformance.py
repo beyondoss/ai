@@ -88,7 +88,7 @@ def run():
             AGENT_CONFORMANCE_BUNDLE_FETCH_WINDOW_SECS="10",
         )
         out = subprocess.run(
-            ["cargo", "test", "-p", "beyond-ai-agent", "--test", "bundle_conformance",
+            ["cargo", "test", "-p", "beyond-agent", "--test", "bundle_conformance",
              "the_configured_store_conforms", "--", "--nocapture"],
             cwd=ROOT, env=env, capture_output=True, text=True).stdout
         srv.shutdown()

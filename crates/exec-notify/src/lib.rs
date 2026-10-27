@@ -13,7 +13,7 @@
 //! An endpoint drives it per job: feed every [`Event`] with the time, keep the [`Job`] it returns,
 //! and carry out the [`Action`]s: begin an attempt (with the job's notify as recorded *now*),
 //! abandon the one in flight, or be woken at a time and feed [`Event::Wake`]. The reference endpoint
-//! (`beyond-ai-test-support`'s `exec_mock`) does exactly that; the baseline's shell supervisor
+//! (`beyond-test-support`'s `exec_mock`) does exactly that; the baseline's shell supervisor
 //! follows the same rules in `sh`, and a differential test holds the two together. A model checker
 //! calls [`step`] as production does.
 

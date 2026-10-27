@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use beyond_ai_agent::managed_mcp_token::ManagedKey;
+use beyond_agent::managed_mcp_token::ManagedKey;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -88,7 +88,7 @@ where
     F: Fn(Req, TcpStream) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    let listener = beyond_ai_test_support::ports::listener();
+    let listener = beyond_test_support::ports::listener();
     listener.set_nonblocking(true).unwrap();
     let listener = TcpListener::from_std(listener).unwrap();
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());

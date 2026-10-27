@@ -11,7 +11,10 @@
 /// The installed command's name — what every error, warning and hint tells a user to type
 /// (`beyond-ai-agent login anthropic`). One place, so a hint can't name a command that doesn't
 /// exist; `program_name_tests` fails on a string that spells another name.
-pub const PROGRAM: &str = env!("CARGO_PKG_NAME");
+///
+/// A literal, not `CARGO_PKG_NAME`: the package (`beyond-agent`) and the binary
+/// (`beyond-ai-agent`) are named separately.
+pub const PROGRAM: &str = "beyond-ai-agent";
 
 #[cfg(test)]
 mod program_name_tests;

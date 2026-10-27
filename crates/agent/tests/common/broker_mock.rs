@@ -5,8 +5,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use beyond_ai_agent::conformance::broker::Hooks;
-use beyond_ai_agent::managed_mcp_token::{Claims, ManagedKey};
+use beyond_agent::conformance::broker::Hooks;
+use beyond_agent::managed_mcp_token::{Claims, ManagedKey};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -51,7 +51,7 @@ pub struct BrokerMock {
 
 impl BrokerMock {
     pub async fn start(fault: Fault) -> Self {
-        let listener = beyond_ai_test_support::ports::tokio_listener().await;
+        let listener = beyond_test_support::ports::tokio_listener().await;
         let addr = listener.local_addr().unwrap();
         let inner = Arc::new(Mutex::new(Inner::default()));
         let shared = inner.clone();

@@ -1,5 +1,5 @@
 [package]
-name = "beyond-ai-execd-fuzz"
+name = "beyond-execd-fuzz"
 version = "0.0.0"
 edition = "2024"
 license = "MIT"
@@ -13,7 +13,7 @@ cargo-fuzz = true
 [workspace]
 
 [dependencies]
-beyond-ai-execd = { path = ".." }
+beyond-execd = { path = ".." }
 libfuzzer-sys = "0.4"
 
 # The shipped binary checks overflow in release; the fuzzed build must too.

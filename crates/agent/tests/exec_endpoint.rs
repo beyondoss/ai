@@ -13,11 +13,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use beyond_ai_agent::exec_endpoint::{HttpExecRunner, TemplateRunner};
-use beyond_ai_agent::tools::exec::CommandRunner;
-use beyond_ai_agent::tools::fs::FsBackend;
-use beyond_ai_agent::tools::fs::shell::ShellFs;
-use beyond_ai_agent::tools::{ToolConfig, default_registry_with_config};
+use beyond_agent::exec_endpoint::{HttpExecRunner, TemplateRunner};
+use beyond_agent::tools::exec::CommandRunner;
+use beyond_agent::tools::fs::FsBackend;
+use beyond_agent::tools::fs::shell::ShellFs;
+use beyond_agent::tools::{ToolConfig, default_registry_with_config};
 use serde_json::{Value, json};
 
 /// A stand-in exec provider: accepts the protocol, runs the command in `root`, answers the protocol.
@@ -26,7 +26,7 @@ async fn mock_provider(
     root: std::path::PathBuf,
     seen: Arc<AtomicUsize>,
 ) -> (String, Arc<AtomicUsize>) {
-    let listener = beyond_ai_test_support::ports::tokio_listener().await;
+    let listener = beyond_test_support::ports::tokio_listener().await;
     let addr = listener.local_addr().unwrap();
     let hits = seen.clone();
     tokio::spawn(async move {
@@ -235,7 +235,7 @@ async fn an_unreachable_endpoint_fails_loudly_rather_than_looking_empty() {
 #[tokio::test]
 async fn auth_headers_reach_the_endpoint() {
     // Every real provider needs some form of auth; which form is theirs to decide.
-    let listener = beyond_ai_test_support::ports::tokio_listener().await;
+    let listener = beyond_test_support::ports::tokio_listener().await;
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     tokio::spawn(async move {

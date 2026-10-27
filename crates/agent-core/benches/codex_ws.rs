@@ -7,7 +7,7 @@
 //! frame. This bench measures that waste directly: timing **and** allocations come from `divan`'s
 //! `AllocProfiler` (installed as the global allocator below), so alloc count + bytes-cloned per turn
 //! sit beside ns/turn in one table. Run:
-//! `cargo bench -p beyond-ai-agent-core --bench codex_ws`.
+//! `cargo bench -p beyond-agent-core --bench codex_ws`.
 //!
 //! `codex_websocket`'s `body_fingerprint`/`input_items`/`build_wire_body`/`wire_frame` and its inbound
 //! frame-parse are all module-private (it's a live transport, not a library surface). Rather than
@@ -67,7 +67,7 @@ fn input_item(i: usize) -> Value {
             "type": "function_call",
             "name": "bash",
             "call_id": format!("call_{i:08x}"),
-            "arguments": "{\"command\":\"grep -rn TODO crates/ && cargo test -p beyond-ai-agent-core\"}"
+            "arguments": "{\"command\":\"grep -rn TODO crates/ && cargo test -p beyond-agent-core\"}"
         })
     }
 }

@@ -141,7 +141,7 @@ async fn doctor_names_a_failed_check_and_exits_one() {
         &path,
         format!(
             "{}nats_url = \"nats://127.0.0.1:{}\"\nupstream_tls = false\n",
-            beyond_ai_test_support::ports::GATEWAY_LISTENERS,
+            beyond_test_support::ports::GATEWAY_LISTENERS,
             closed_port()
         ),
     )

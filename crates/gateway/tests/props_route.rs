@@ -9,7 +9,7 @@
 
 mod props_support;
 
-use beyond_ai::__test::route::{
+use beyond_gateway::__test::route::{
     self, Endpoint, SubResource, WireAction, catalog_wire_action, implied_endpoint,
 };
 use props_support::*;

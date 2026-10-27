@@ -8,8 +8,8 @@ use std::fs;
 use std::path::Path;
 
 use agent_core::Message;
-use beyond_ai_agent::memory;
-use beyond_ai_agent::session_store::{
+use beyond_agent::memory;
+use beyond_agent::session_store::{
     Layout, RepoOptions, SessionMeta, SessionRepo, acquire_session_lock,
 };
 use tempfile::TempDir;

@@ -1,5 +1,5 @@
 //! A host that embeds execd with its own authorizer: the minimal correct `main()` that
-//! ARCHITECTURE.md's "Embedding" section shows. `EMBED_KEY=secret cargo run -p beyond-ai-execd
+//! ARCHITECTURE.md's "Embedding" section shows. `EMBED_KEY=secret cargo run -p beyond-execd
 //! --example embed`, then send `X-Host-Key: secret`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

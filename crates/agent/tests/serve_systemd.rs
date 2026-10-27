@@ -131,7 +131,7 @@ fn serve_refuses_passed_sockets_without_its_own_listen_pid() {
     let (base, _requests) = spawn_model_server(vec![]);
     for listen_pid in [None, Some("1")] {
         let dir = tempfile::tempdir().unwrap();
-        let listener = beyond_ai_test_support::ports::listener();
+        let listener = beyond_test_support::ports::listener();
         let mut cmd = common::serve_dir_cmd(
             env!("CARGO_BIN_EXE_beyond-ai-agent"),
             &base,

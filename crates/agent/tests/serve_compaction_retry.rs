@@ -273,7 +273,7 @@ fn serve_compact_reports_already_compacted_reason_when_nothing_new_followed_the_
     let session_file = {
         use agent_core::compaction::SUMMARY_MARKER;
         use agent_core::{ContentBlock, Message, Session};
-        use beyond_ai_agent::session_store::{SessionMeta, SessionRepo};
+        use beyond_agent::session_store::{SessionMeta, SessionRepo};
 
         let repo = SessionRepo::open(dir.path()).unwrap();
         let mut store = repo.create(SessionMeta::new("/w", "claude-test")).unwrap();
@@ -334,7 +334,7 @@ fn serve_proactively_compacts_a_resumed_large_session_on_its_very_next_prompt() 
     // messages so `find_cut` (which declines short conversations) has a real boundary to find.
     let session_file = {
         use agent_core::{ContentBlock, Message, Session};
-        use beyond_ai_agent::session_store::{SessionMeta, SessionRepo};
+        use beyond_agent::session_store::{SessionMeta, SessionRepo};
 
         let repo = SessionRepo::open(dir.path()).unwrap();
         let mut store = repo.create(SessionMeta::new("/w", "claude-test")).unwrap();
@@ -1195,7 +1195,7 @@ fn serve_idle_timeout_ms_flag_causes_a_stalled_response_to_fail_quickly() {
     // partial event, then goes silent well past a deliberately shrunk `--idle-timeout-ms`, must fail
     // the `prompt` quickly instead of hanging on the default (~600s) read timeout — `run`'s identical
     // `run_binary_idle_timeout_ms_flag_causes_a_stalled_response_to_fail_quickly`.
-    let listener = beyond_ai_test_support::ports::listener();
+    let listener = beyond_test_support::ports::listener();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
         use std::io::Read as _;

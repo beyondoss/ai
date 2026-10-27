@@ -620,7 +620,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_listener_serves_metrics_and_refuses_every_other_path() {
-        let listener = beyond_ai_test_support::ports::tokio_listener().await;
+        let listener = beyond_test_support::ports::tokio_listener().await;
         let addr = listener.local_addr().unwrap();
         let m = Metrics::new().unwrap();
         m.sessions_live.set(7);

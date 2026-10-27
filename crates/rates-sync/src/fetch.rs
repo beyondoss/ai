@@ -9,7 +9,7 @@ use std::time::Duration;
 
 pub fn client() -> Result<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
-        .user_agent("beyond-ai-rates-sync/0.1 (+https://github.com/beyondoss/ai)")
+        .user_agent("beyond-rates-sync/0.1 (+https://github.com/beyondoss/ai)")
         .timeout(Duration::from_secs(180))
         .build()
         .map_err(|e| format!("HTTP client: {e}"))

@@ -14,8 +14,8 @@
 
 use std::time::{Duration, Instant};
 
-use beyond_ai_agent::settings::{McpServerConfig, McpTransport};
-use beyond_ai_agent::tools::mcp;
+use beyond_agent::settings::{McpServerConfig, McpTransport};
+use beyond_agent::tools::mcp;
 use serde_json::json;
 
 const FIXTURE: &str = env!("CARGO_BIN_EXE_mcp_fixture_stdio_server");
@@ -214,7 +214,7 @@ async fn a_cached_manifest_advertises_tools_without_starting_the_server() {
     let tag = &unique_tag("reap-manifest-ghi789");
     let dir = std::env::temp_dir().join(format!("mcp-manifest-test-{tag}"));
     let _ = std::fs::remove_dir_all(&dir);
-    let manifest = beyond_ai_agent::tools::mcp_manifest::ManifestDir::at(&dir);
+    let manifest = beyond_agent::tools::mcp_manifest::ManifestDir::at(&dir);
 
     // First start: nothing cached, so it connects, discovers, and records what it found.
     let (tools, _catalog, warnings) = mcp::connect_all(

@@ -6,7 +6,7 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use beyond_ai_test_support::ports;
+use beyond_test_support::ports;
 use serde_json::json;
 use support::http::post;
 

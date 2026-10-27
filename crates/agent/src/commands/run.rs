@@ -12,12 +12,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_core::{Agent, GatewayClient, Session, Tool};
-use beyond_ai_agent::gateway_credential::GatewayCredential;
-use beyond_ai_agent::session_store::{SessionMeta, SessionStore};
-use beyond_ai_agent::{serve, tools};
+use beyond_agent::gateway_credential::GatewayCredential;
+use beyond_agent::session_store::{SessionMeta, SessionStore};
+use beyond_agent::{serve, tools};
 
-use beyond_ai_agent::policy::ToolPolicy;
-use beyond_ai_agent::session_store::{
+use beyond_agent::policy::ToolPolicy;
+use beyond_agent::session_store::{
     SessionRepo, canonical_cwd, default_session_dir, fork_by_arg, is_path_like, open_session_by_id,
     sessions_root,
 };
@@ -45,11 +45,11 @@ struct Composed {
     model_thinking_level: Option<agent_core::ThinkingLevel>,
     resumed_model: Option<String>,
     selected: RunSession,
-    stored_settings: beyond_ai_agent::settings::Settings,
+    stored_settings: beyond_agent::settings::Settings,
     has_gated_resources: bool,
     project_trusted: bool,
-    agent_file: beyond_ai_agent::resources::AgentSettings,
-    timing: beyond_ai_agent::timing::StartupTiming,
+    agent_file: beyond_agent::resources::AgentSettings,
+    timing: beyond_agent::timing::StartupTiming,
 }
 
 /// What `resolve_defaults` settled, on top of `Composed`: every setting, the credential, trust and skills.
@@ -72,8 +72,8 @@ struct Resolved {
     model: String,
     model_extra_headers: std::collections::HashMap<String, String>,
     project_trusted: bool,
-    prompt_templates: Vec<beyond_ai_agent::prompts::PromptTemplate>,
-    provider_env: beyond_ai_agent::gateway_credential::ProviderEnv,
+    prompt_templates: Vec<beyond_agent::prompts::PromptTemplate>,
+    provider_env: beyond_agent::gateway_credential::ProviderEnv,
     raw_gateway_key: Option<String>,
     reasoning_effort: Option<agent_core::ReasoningEffort>,
     resumed_model: Option<String>,
@@ -81,15 +81,15 @@ struct Resolved {
     retry_max_backoff_ms: Option<u64>,
     retry_max_retries: Option<u32>,
     selected: RunSession,
-    skills: Vec<beyond_ai_agent::skills::Skill>,
+    skills: Vec<beyond_agent::skills::Skill>,
     steering: agent_core::Steering,
-    stored_settings: beyond_ai_agent::settings::Settings,
-    timing: beyond_ai_agent::timing::StartupTiming,
+    stored_settings: beyond_agent::settings::Settings,
+    timing: beyond_agent::timing::StartupTiming,
 }
 
 /// What `assemble_run` settled: the tools, the open session, the system prompt and session metadata.
 struct Assembled {
-    _session_lock: Option<beyond_ai_agent::session_store::SessionLock>,
+    _session_lock: Option<beyond_agent::session_store::SessionLock>,
     bash_jobs: Arc<tools::bash_jobs::BashJobs>,
     block_images: bool,
     branch_summary_reserve_tokens: Option<u32>,
@@ -102,7 +102,7 @@ struct Assembled {
     initial_images: Vec<agent_core::ImageSource>,
     initial_message: String,
     key: GatewayCredential,
-    lifecycle: Arc<dyn beyond_ai_agent::lifecycle::RunLifecycle>,
+    lifecycle: Arc<dyn beyond_agent::lifecycle::RunLifecycle>,
     mcp_catalog: tools::mcp::McpCatalog,
     mcp_enabled: tools::mcp::McpEnabledSet,
     mcp_skills: tools::mcp_skills::McpSkills,
@@ -111,10 +111,10 @@ struct Assembled {
     model: String,
     model_extra_headers: std::collections::HashMap<String, String>,
     output_slot: tools::structured_output::OutputSlot,
-    parent_loop: beyond_ai_agent::tools::subagent::ParentCell,
+    parent_loop: beyond_agent::tools::subagent::ParentCell,
     /// Which filesystem the tools act on, so `--deny-path` resolves paths in the same one.
     path_world: tools::fs::PathWorld,
-    prompt_templates: Vec<beyond_ai_agent::prompts::PromptTemplate>,
+    prompt_templates: Vec<beyond_agent::prompts::PromptTemplate>,
     reasoning_effort: Option<agent_core::ReasoningEffort>,
     registry: agent_core::ToolRegistry,
     retry_base_delay_ms: Option<u64>,
@@ -122,10 +122,10 @@ struct Assembled {
     retry_max_retries: Option<u32>,
     session: Session,
     session_memory_active: bool,
-    skills: Vec<beyond_ai_agent::skills::Skill>,
+    skills: Vec<beyond_agent::skills::Skill>,
     steering: agent_core::Steering,
     store: Option<SessionStore>,
-    stored_settings: beyond_ai_agent::settings::Settings,
+    stored_settings: beyond_agent::settings::Settings,
     system: String,
     wants_structured_output: bool,
     write_locks: Arc<agent_core::WriteLockRegistry>,
@@ -133,12 +133,12 @@ struct Assembled {
 
 /// What `build_agent` settled: the agent and everything `drive_run` needs to run and report.
 struct RunSetup {
-    _session_lock: Option<beyond_ai_agent::session_store::SessionLock>,
+    _session_lock: Option<beyond_agent::session_store::SessionLock>,
     agent: Agent,
     bash_jobs: Arc<tools::bash_jobs::BashJobs>,
     initial_images: Vec<agent_core::ImageSource>,
     initial_message: String,
-    lifecycle: Arc<dyn beyond_ai_agent::lifecycle::RunLifecycle>,
+    lifecycle: Arc<dyn beyond_agent::lifecycle::RunLifecycle>,
     mcp_catalog: tools::mcp::McpCatalog,
     mcp_enabled: tools::mcp::McpEnabledSet,
     mcp_skills: tools::mcp_skills::McpSkills,
@@ -146,12 +146,12 @@ struct RunSetup {
     meta: SessionMeta,
     output_slot: tools::structured_output::OutputSlot,
     pressure_point: u32,
-    prompt_templates: Vec<beyond_ai_agent::prompts::PromptTemplate>,
-    retry_policy: beyond_ai_agent::retry::RunRetryPolicy,
+    prompt_templates: Vec<beyond_agent::prompts::PromptTemplate>,
+    retry_policy: beyond_agent::retry::RunRetryPolicy,
     run_journal: Option<&'static RunJournal>,
     session: Session,
     session_memory_active: bool,
-    skills: Vec<beyond_ai_agent::skills::Skill>,
+    skills: Vec<beyond_agent::skills::Skill>,
     steering: agent_core::Steering,
     store: RunStore,
     system_for_export: String,
@@ -172,7 +172,7 @@ pub(crate) async fn run_task(cmd: Command) -> Result<(), Box<dyn std::error::Err
 /// Fill the flags the operator left unset from the workspace's `AGENTS.md` frontmatter (the model is
 /// folded in by `resolve_session`, which resolves it): `--tools` unless `--tools`/`--no-tools` was
 /// given, `--max-steps` unless given. An explicit flag always wins.
-fn apply_agent_file(mut cmd: Command, file: &beyond_ai_agent::resources::AgentSettings) -> Command {
+fn apply_agent_file(mut cmd: Command, file: &beyond_agent::resources::AgentSettings) -> Command {
     if let Command::Run {
         tools,
         no_tools,
@@ -243,8 +243,8 @@ async fn resolve_session(cmd: Command) -> Result<Composed, Box<dyn std::error::E
         &deny_tool,
         no_tools,
     )?;
-    beyond_ai_agent::skills::check_paths("--skill", &extra_skill_paths)?;
-    beyond_ai_agent::skills::check_paths("--prompt-template", &extra_prompt_template_paths)?;
+    beyond_agent::skills::check_paths("--skill", &extra_skill_paths)?;
+    beyond_agent::skills::check_paths("--prompt-template", &extra_prompt_template_paths)?;
     // `--session-id` is embedded directly into a filename (`SessionMeta::with_id` →
     // `SessionRepo::path_for`'s `{created_at}_{id}.jsonl`) with no other sanitization — an id like
     // `../../../tmp/pwned/evil` would write (and `mkdir -p`, since `SessionStore::create` does that
@@ -258,7 +258,7 @@ async fn resolve_session(cmd: Command) -> Result<Composed, Box<dyn std::error::E
         )
         .into());
     }
-    let mut timing = beyond_ai_agent::timing::StartupTiming::new();
+    let mut timing = beyond_agent::timing::StartupTiming::new();
     let cwd = canonical_cwd(&std::env::current_dir().unwrap_or_default());
 
     // A stored `agent settings` default sits between an explicit flag/env var and this crate's own
@@ -276,7 +276,7 @@ async fn resolve_session(cmd: Command) -> Result<Composed, Box<dyn std::error::E
     // image (only on a model-issued `read` tool call, via `Agent::block_images`'s tool-dispatch gate),
     // and `--no-image-auto-resize` was silently ignored for the same reason. Every other
     // `stored_settings`-backed fallback stays resolved in its original place below.
-    let stored_settings = beyond_ai_agent::settings::effective_settings_for_cwd(&cwd);
+    let stored_settings = beyond_agent::settings::effective_settings_for_cwd(&cwd);
     // Trust is settled this early because the workspace's `AGENTS.md` frontmatter, which a trusted
     // project may use to pick the model, is read before the model is resolved just below. Computed
     // once and reused below (it is a filesystem walk — `has_trust_gated_resources`'s own doc comment).
@@ -289,16 +289,16 @@ async fn resolve_session(cmd: Command) -> Result<Composed, Box<dyn std::error::E
     // `never`/`always` default. `serve::resolve_project_trust` is the one shared implementation of this
     // precedence — `run` and `serve` must agree on trust for the same directory under the same
     // settings, so it isn't duplicated here.
-    let has_gated_resources = beyond_ai_agent::trust_store::has_trust_gated_resources(&cwd);
+    let has_gated_resources = beyond_agent::trust_store::has_trust_gated_resources(&cwd);
     let project_trusted = serve::resolve_project_trust(
         trust_project,
         force_untrusted,
         stored_settings.default_project_trust,
-        beyond_ai_agent::trust_store::TrustStore::open_default().lookup(&cwd),
+        beyond_agent::trust_store::TrustStore::open_default().lookup(&cwd),
         has_gated_resources,
     );
     let agent_file = match project_trusted {
-        true => beyond_ai_agent::resources::workspace_agent_settings(&cwd),
+        true => beyond_agent::resources::workspace_agent_settings(&cwd),
         false => Default::default(),
     };
     // Task #26 (pi-parity feature): an explicit `--block-images` always wins; otherwise fall back to a
@@ -506,7 +506,7 @@ fn resolve_defaults(
     let configured_gateway = gateway_url
         .or_else(|| stored_settings.default_gateway_url.clone())
         .or_else(|| key.is_some().then(|| DEFAULT_GATEWAY.to_string()));
-    let provider_env = beyond_ai_agent::gateway_credential::ProviderEnv::from_process_env(
+    let provider_env = beyond_agent::gateway_credential::ProviderEnv::from_process_env(
         configured_gateway.is_some(),
     );
     // Still materialized: in direct mode every credential carries a `RouteOverride::Direct` that replaces
@@ -661,7 +661,7 @@ fn resolve_defaults(
              --trust-project)",
             cwd.display(),
             cwd.display(),
-            program = beyond_ai_agent::PROGRAM
+            program = beyond_agent::PROGRAM
         );
     }
     // Discovered once, up front: a one-shot `run` has no `reload` to re-discover mid-process, unlike
@@ -675,14 +675,14 @@ fn resolve_defaults(
     // do the same (a documented, tested combination; see `skills::discover_extra_only`'s doc comment —
     // pi-parity fix, M2), so `--no-skills --skill ./foo` isn't a self-contradicting no-op.
     let skills = if no_skills {
-        beyond_ai_agent::skills::discover_extra_only(&extra_skill_paths).0
+        beyond_agent::skills::discover_extra_only(&extra_skill_paths).0
     } else {
-        beyond_ai_agent::skills::discover(&cwd, project_trusted, &extra_skill_paths)
+        beyond_agent::skills::discover(&cwd, project_trusted, &extra_skill_paths)
     };
     let prompt_templates = if no_prompt_templates {
-        beyond_ai_agent::prompts::discover_extra_only(&extra_prompt_template_paths).0
+        beyond_agent::prompts::discover_extra_only(&extra_prompt_template_paths).0
     } else {
-        beyond_ai_agent::prompts::discover(&cwd, project_trusted, &extra_prompt_template_paths)
+        beyond_agent::prompts::discover(&cwd, project_trusted, &extra_prompt_template_paths)
     };
     timing.mark("discover skills/prompt templates");
     Ok(Resolved {
@@ -861,13 +861,13 @@ async fn assemble_run(
     // can't strip the agent's memory; `--no-memory`/`--no-tools` opt out. A bad backend fails fast before
     // a model call is billed, and before a session is created (see below). The `MEMORY.md` index is
     // injected into the system prompt below.
-    let memory_backend: Option<Arc<dyn beyond_ai_agent::memory::MemoryBackend>> =
+    let memory_backend: Option<Arc<dyn beyond_agent::memory::MemoryBackend>> =
         if no_memory || no_tools {
             None
         } else {
             let dsn = memory.or_else(|| stored_settings.default_memory_backend.clone());
             Some(
-                beyond_ai_agent::memory::open(dsn.as_deref(), &cwd).unwrap_or_else(|e| {
+                beyond_agent::memory::open(dsn.as_deref(), &cwd).unwrap_or_else(|e| {
                     eprintln!("{e}");
                     exit_process(2);
                 }),
@@ -1111,7 +1111,7 @@ async fn build_agent(
     // this whole-run layer, not `client`'s own pre-connect/mid-stream retry configured just above, which
     // stays governed by `--retry-max-retries`/`--retry-base-delay-ms` alone (matches pi's own
     // `RetrySettings.enabled`, which gates only its equivalent whole-run loop).
-    let retry_policy = beyond_ai_agent::retry::RunRetryPolicy::from_overrides_with_enabled(
+    let retry_policy = beyond_agent::retry::RunRetryPolicy::from_overrides_with_enabled(
         !no_retry,
         retry_max_retries,
         retry_base_delay_ms.map(std::time::Duration::from_millis),
@@ -1119,7 +1119,7 @@ async fn build_agent(
     let (store, run_journal) = attach_run_journal(&bash_jobs, exec_runner, &meta, store).await;
     // `serve`'s own resolution (`build_agent`): the model's window, input limit and compaction cap,
     // then the `--context-window`/`--compact-at`/reserve/keep-recent overrides.
-    let compaction_flags = beyond_ai_agent::serve::CompactionFlags {
+    let compaction_flags = beyond_agent::serve::CompactionFlags {
         context_window,
         compact_at,
         reserve_tokens: compaction_reserve_tokens,
@@ -1131,7 +1131,7 @@ async fn build_agent(
         no_cached_summary,
         candidates: compaction_candidates,
     };
-    let mut compaction = beyond_ai_agent::serve::resolve_compaction(&model, &compaction_flags);
+    let mut compaction = beyond_agent::serve::resolve_compaction(&model, &compaction_flags);
     if no_compaction {
         compaction.enabled = false;
     }
@@ -1139,7 +1139,7 @@ async fn build_agent(
     // The live-prompt size at which to warn the model that a compaction is approaching (see
     // `run_turn_once`), derived from the same trigger the agent will compact at.
     let pressure_point =
-        beyond_ai_agent::memory::compaction_pressure_point(compaction.trigger_tokens());
+        beyond_agent::memory::compaction_pressure_point(compaction.trigger_tokens());
     // Captured before each is moved into the builder chain below — `Agent` exposes no getter for
     // either back, and `run --export`'s own call to `export_html_full` further down needs the exact
     // system prompt/tool set this run actually used, not a recomputed (and possibly out-of-sync) guess.
@@ -1154,7 +1154,7 @@ async fn build_agent(
         .with_compaction(compaction)
         .with_cache_long(cache_long)
         .with_sequential_tools(sequential_tools)
-        .with_rate_limit_retry(beyond_ai_agent::retry::rate_limit_policy(
+        .with_rate_limit_retry(beyond_agent::retry::rate_limit_policy(
             retry_rate_limit_secs,
         ))
         .with_cache_key(meta.id.clone())
@@ -1212,7 +1212,7 @@ async fn build_agent(
     if block_images {
         agent = agent.with_block_images(true);
     }
-    parent_loop.set(beyond_ai_agent::tools::subagent::ParentLoop {
+    parent_loop.set(beyond_agent::tools::subagent::ParentLoop {
         model: model.clone(),
         max_steps,
         compaction: compaction_flags,
@@ -1220,7 +1220,7 @@ async fn build_agent(
         thinking: effective_thinking,
         reasoning_effort,
         block_images,
-        rate_limit: beyond_ai_agent::retry::rate_limit_policy(retry_rate_limit_secs),
+        rate_limit: beyond_agent::retry::rate_limit_policy(retry_rate_limit_secs),
     });
     // Always installed: besides the deny-lists, the hooks carry the SEP-2640 code-execution gate,
     // which must hold even when no deny-list was given.
@@ -1394,7 +1394,7 @@ async fn drive_run(cmd: Command, runsetup: RunSetup) -> Result<(), Box<dyn std::
     if !resumed.is_empty() {
         // Into the turn just pushed: the call it answers is at the tip.
         let messages: &mut Vec<agent_core::Message> = Arc::make_mut(&mut session.messages);
-        beyond_ai_agent::mcp_resume::splice(messages, &resumed, &placeholders);
+        beyond_agent::mcp_resume::splice(messages, &resumed, &placeholders);
     }
     // `--export` renders the transcript however the run ends: a failed or cancelled run's transcript
     // (everything up to the failure, its closing error record included) is the one most worth
@@ -1415,11 +1415,11 @@ async fn drive_run(cmd: Command, runsetup: RunSetup) -> Result<(), Box<dyn std::
         // transcript's own System Prompt/Available Tools sections reflect what this run really used.
         // `session`'s own running token counters are right here too, so the stats section gets real
         // usage numbers rather than omitting that line entirely.
-        match beyond_ai_agent::export::export_html_full(
+        match beyond_agent::export::export_html_full(
             &meta,
             &session.messages,
             &branches,
-            Some(beyond_ai_agent::export::UsageTotals {
+            Some(beyond_agent::export::UsageTotals {
                 input_tokens: session.input_tokens,
                 output_tokens: session.output_tokens,
                 cache_read_tokens: session.cache_read_tokens,
@@ -1435,7 +1435,7 @@ async fn drive_run(cmd: Command, runsetup: RunSetup) -> Result<(), Box<dyn std::
         }
     };
     let life = lifecycle.enabled().then(|| {
-        beyond_ai_agent::lifecycle::Run::begin(
+        beyond_agent::lifecycle::Run::begin(
             std::sync::Arc::clone(&lifecycle),
             meta.id.clone(),
             // `run` is single-tenant by construction: no grant, so no tenant to report.
@@ -1577,7 +1577,7 @@ fn select_session(
     session_dir: Option<String>,
     session_id: &Option<String>,
     session_path: Option<String>,
-    stored_settings: &beyond_ai_agent::settings::Settings,
+    stored_settings: &beyond_agent::settings::Settings,
 ) -> Result<(String, RunSession), Box<dyn std::error::Error>> {
     // `--session`/`--continue` persist this run (and load prior history to continue it) exactly like
     // `serve`'s own repo/file modes. pi-parity fix: neither given previously kept `run` in-memory-only —
@@ -1702,9 +1702,9 @@ fn select_session(
 async fn connect_run_mcp(
     approve_mcp_skills: bool,
     no_skills: bool,
-    skills: &[beyond_ai_agent::skills::Skill],
-    stored_settings: &beyond_ai_agent::settings::Settings,
-    timing: &mut beyond_ai_agent::timing::StartupTiming,
+    skills: &[beyond_agent::skills::Skill],
+    stored_settings: &beyond_agent::settings::Settings,
+    timing: &mut beyond_agent::timing::StartupTiming,
 ) -> (
     tools::mcp::McpTools,
     tools::mcp::McpCatalog,
@@ -1770,7 +1770,7 @@ async fn open_exec_backend(
 ) -> Result<
     (
         Option<Arc<dyn tools::exec::CommandRunner>>,
-        Arc<dyn beyond_ai_agent::lifecycle::RunLifecycle>,
+        Arc<dyn beyond_agent::lifecycle::RunLifecycle>,
         Option<Arc<dyn tools::fs::FsBackend>>,
     ),
     Box<dyn std::error::Error>,
@@ -1781,7 +1781,7 @@ async fn open_exec_backend(
     let exec_runner: Option<std::sync::Arc<dyn tools::exec::CommandRunner>> =
         match (&exec_url, &exec_cmd) {
             (Some(url), _) => {
-                let mut runner = beyond_ai_agent::exec_endpoint::HttpExecRunner::new(url.clone())
+                let mut runner = beyond_agent::exec_endpoint::HttpExecRunner::new(url.clone())
                     .map_err(std::io::Error::other)?;
                 if let Some(max) = exec_max_response_bytes {
                     runner =
@@ -1789,19 +1789,19 @@ async fn open_exec_backend(
                 }
                 for raw in &exec_header {
                     let (name, value) =
-                        beyond_ai_agent::exec_endpoint::HttpExecRunner::parse_header(raw)
+                        beyond_agent::exec_endpoint::HttpExecRunner::parse_header(raw)
                             .map_err(std::io::Error::other)?;
                     runner = runner.with_header(name, value);
                 }
                 Some(std::sync::Arc::new(runner))
             }
             (None, Some(template)) => Some(std::sync::Arc::new(
-                beyond_ai_agent::exec_endpoint::TemplateRunner::parse(template)
+                beyond_agent::exec_endpoint::TemplateRunner::parse(template)
                     .map_err(std::io::Error::other)?,
             )),
             (None, None) => None,
         };
-    let lifecycle = beyond_ai_agent::lifecycle::open(lifecycle_url.as_deref(), &lifecycle_header)
+    let lifecycle = beyond_agent::lifecycle::open(lifecycle_url.as_deref(), &lifecycle_header)
         .map_err(std::io::Error::other)?;
     let fs_backend: Option<std::sync::Arc<dyn tools::fs::FsBackend>> = match &exec_runner {
         Some(runner) => {
@@ -1835,7 +1835,7 @@ fn build_run_registry(
     mcp_loading: tools::tool_search::McpLoading,
     mcp_tools: &[Arc<dyn Tool>],
     no_tools: bool,
-    skills: &[beyond_ai_agent::skills::Skill],
+    skills: &[beyond_agent::skills::Skill],
     steering: &agent_core::Steering,
     tools_allow: Option<Vec<String>>,
     tools_exclude: &Option<Vec<String>>,
@@ -1906,7 +1906,7 @@ fn build_run_registry(
 type OpenedSession = (
     Option<SessionStore>,
     Session,
-    Option<beyond_ai_agent::session_store::SessionLock>,
+    Option<beyond_agent::session_store::SessionLock>,
 );
 
 /// Opens, creates or goes without the session the flags select, and takes its writer lock.
@@ -1937,7 +1937,7 @@ fn open_run_session(
     // is refused with the file named, not shared — two writers each chain their turns onto their own
     // stale tip. See `session_store::lock_session_writer`.
     let _session_lock = match &store {
-        Some(store) => beyond_ai_agent::session_store::lock_session_writer(store.path())
+        Some(store) => beyond_agent::session_store::lock_session_writer(store.path())
             .map_err(|e| format!("cannot use this session: {e}"))?,
         None => None,
     };
@@ -1956,13 +1956,13 @@ fn open_run_session(
 /// Builds the durable and session memory mounts and registers the `memory` tool over them.
 async fn mount_memory(
     fresh_meta: &dyn Fn() -> SessionMeta,
-    memory_backend: Option<Arc<dyn beyond_ai_agent::memory::MemoryBackend>>,
+    memory_backend: Option<Arc<dyn beyond_agent::memory::MemoryBackend>>,
     no_session_memory: bool,
     registry: &mut agent_core::ToolRegistry,
     store: &Option<SessionStore>,
 ) -> (
-    Vec<beyond_ai_agent::memory::Mount>,
-    Vec<(beyond_ai_agent::memory::MountKind, String)>,
+    Vec<beyond_agent::memory::Mount>,
+    Vec<(beyond_agent::memory::MountKind, String)>,
     bool,
 ) {
     // Build the mount list: durable `/memories`, plus (unless `--no-session-memory`) a per-session
@@ -1971,8 +1971,8 @@ async fn mount_memory(
     // file (so `session_store` trashes/restores it together), or an id-keyed tempdir when ephemeral. The
     // `open_run_session` runs before this, so `store` is already resolved here. Shared with every
     // subagent below by `Arc`, so a child sees the very same `/session` as the parent.
-    let mounts: Vec<beyond_ai_agent::memory::Mount> = {
-        use beyond_ai_agent::memory::{Mount, MountKind};
+    let mounts: Vec<beyond_agent::memory::Mount> = {
+        use beyond_agent::memory::{Mount, MountKind};
         let mut v = Vec::new();
         if let Some(backend) = &memory_backend {
             v.push(Mount {
@@ -1985,20 +1985,19 @@ async fn mount_memory(
                     .as_ref()
                     .map(|s| s.meta().id.clone())
                     .unwrap_or_else(|| fresh_meta().id);
-                let dir =
-                    beyond_ai_agent::memory::session_dir(session_file.as_deref(), &session_id);
+                let dir = beyond_agent::memory::session_dir(session_file.as_deref(), &session_id);
                 v.push(Mount {
                     kind: MountKind::Session,
-                    backend: Arc::new(beyond_ai_agent::memory::file::FileBackend::session_at(dir)),
+                    backend: Arc::new(beyond_agent::memory::file::FileBackend::session_at(dir)),
                 });
             }
         }
         v
     };
-    let memory_sections: Vec<(beyond_ai_agent::memory::MountKind, String)> = if mounts.is_empty() {
+    let memory_sections: Vec<(beyond_agent::memory::MountKind, String)> = if mounts.is_empty() {
         Vec::new()
     } else {
-        let sections = beyond_ai_agent::memory::mount_sections(&mounts).await;
+        let sections = beyond_agent::memory::mount_sections(&mounts).await;
         registry.register(Arc::new(tools::memory::Memory::mounted(mounts.clone())));
         sections
     };
@@ -2006,7 +2005,7 @@ async fn mount_memory(
     // `/session` working-memory mount is live.
     let session_memory_active = mounts
         .iter()
-        .any(|m| m.kind == beyond_ai_agent::memory::MountKind::Session);
+        .any(|m| m.kind == beyond_agent::memory::MountKind::Session);
 
     (mounts, memory_sections, session_memory_active)
 }
@@ -2031,37 +2030,37 @@ fn register_subagent(
     mcp_live: tools::mcp::McpTools,
     mcp_loading: tools::tool_search::McpLoading,
     model: &String,
-    mounts: Vec<beyond_ai_agent::memory::Mount>,
+    mounts: Vec<beyond_agent::memory::Mount>,
     no_context_files: bool,
     project_trusted: bool,
     prompt_guidelines: &Vec<String>,
-    provider_env: beyond_ai_agent::gateway_credential::ProviderEnv,
+    provider_env: beyond_agent::gateway_credential::ProviderEnv,
     raw_gateway_key: Option<String>,
     registry: &mut agent_core::ToolRegistry,
     retry_base_delay_ms: Option<u64>,
     retry_max_backoff_ms: Option<u64>,
     retry_max_retries: Option<u32>,
-    skills: &Vec<beyond_ai_agent::skills::Skill>,
+    skills: &Vec<beyond_agent::skills::Skill>,
     tools_exclude: Option<Vec<String>>,
     web_allow_host: Vec<String>,
     web_allow_private: bool,
     web_timeout_ms: Option<u64>,
 ) -> (
     Arc<agent_core::WriteLockRegistry>,
-    Vec<beyond_ai_agent::agents::AgentDef>,
-    beyond_ai_agent::tools::subagent::ParentCell,
+    Vec<beyond_agent::agents::AgentDef>,
+    beyond_agent::tools::subagent::ParentCell,
 ) {
     // Subagents. A shared write-lock registry (rather than `Agent::new`'s private default) so the parent
     // and every child serialize same-path writes against each other. Registered only when at least one
     // agent definition exists — a `subagent` tool with no agents to call is dead weight in the prompt.
     let write_locks = Arc::new(agent_core::WriteLockRegistry::new());
-    beyond_ai_agent::worktree::sweep(cwd); // reap any worktree orphaned by a previous crash
-    let agent_defs = beyond_ai_agent::agents::discover(cwd, project_trusted);
+    beyond_agent::worktree::sweep(cwd); // reap any worktree orphaned by a previous crash
+    let agent_defs = beyond_agent::agents::discover(cwd, project_trusted);
     // What a child inherits of this run's loop configuration — written once the parent's agent is
     // built (see `ParentLoop`), read by each dispatch.
-    let parent_loop = beyond_ai_agent::tools::subagent::ParentCell::default();
+    let parent_loop = beyond_agent::tools::subagent::ParentCell::default();
     if !agent_defs.is_empty() {
-        use beyond_ai_agent::tools::subagent;
+        use beyond_agent::tools::subagent;
         // `parent_tools` is what a child with no `tools:` of its own inherits — the parent's effective
         // set minus `subagent` itself, so a restricted parent can't spawn a fully-armed child.
         let parent_tools: Vec<String> = registry
@@ -2147,19 +2146,19 @@ fn register_subagent(
 /// The system prompt: the base, `--append-system-prompt`, context files, skills, memory and agents.
 #[allow(clippy::too_many_arguments)]
 fn build_run_system(
-    agent_defs: Vec<beyond_ai_agent::agents::AgentDef>,
+    agent_defs: Vec<beyond_agent::agents::AgentDef>,
     append_system_prompt: Vec<String>,
     cwd: &Path,
     mcp_skills: &tools::mcp_skills::McpSkills,
-    memory_sections: Vec<(beyond_ai_agent::memory::MountKind, String)>,
+    memory_sections: Vec<(beyond_agent::memory::MountKind, String)>,
     model: &str,
     no_context_files: bool,
     project_trusted: bool,
     prompt_guidelines: Vec<String>,
     registry: &agent_core::ToolRegistry,
-    skills: &[beyond_ai_agent::skills::Skill],
+    skills: &[beyond_agent::skills::Skill],
     system_prompt: Option<String>,
-    timing: &mut beyond_ai_agent::timing::StartupTiming,
+    timing: &mut beyond_agent::timing::StartupTiming,
 ) -> String {
     // `--system-prompt`/`--append-system-prompt` may each name an existing, readable file instead of
     // literal text (pi-parity fix — matches pi's own `resolvePromptInput`); resolved once, here, rather
@@ -2180,8 +2179,7 @@ fn build_run_system(
     // `build_system_prompt` can tell "an explicit override was given" apart from "nothing given, use the
     // built-in default" — an explicit flag must win outright over a trusted project's on-disk
     // `SYSTEM.md`, which previously always won regardless (pi-parity fix).
-    let default_base =
-        beyond_ai_agent::resources::default_system_prompt(registry, &prompt_guidelines);
+    let default_base = beyond_agent::resources::default_system_prompt(registry, &prompt_guidelines);
     // Skills are discovered by path, not inlined into the prompt — invoking one relies on the model
     // being able to open its `SKILL.md` itself, so advertising them at all when `read` isn't registered
     // (a restricted `--tools`/`--exclude-tools` invocation) just adds dead weight (pi-parity fix).
@@ -2189,8 +2187,8 @@ fn build_run_system(
     let has_todo = registry.get("todo").is_some();
     let has_structured_output = registry.get(tools::structured_output::NAME).is_some();
     let has_memory = registry.get(tools::memory::NAME).is_some();
-    let system = beyond_ai_agent::resources::build_system_prompt(
-        &beyond_ai_agent::resources::PromptOptions {
+    let system =
+        beyond_agent::resources::build_system_prompt(&beyond_agent::resources::PromptOptions {
             base: system_prompt.as_deref(),
             default_base: &default_base,
             append: append_system_prompt.as_deref(),
@@ -2206,8 +2204,7 @@ fn build_run_system(
             project_trusted,
             agents: &agent_defs,
             disk_overrides: true,
-        },
-    );
+        });
     // MCP-served skills get their own origin-tagged `<available_skills origin="mcp">` block, loaded
     // through their server's `mcp__<server>__skill__read` tool rather than `read` (`serve` renders the
     // same block per turn, through its session gate).
@@ -2229,7 +2226,7 @@ fn open_run_meta(
     name: &Option<String>,
     session: &Session,
     mut store: &mut Option<SessionStore>,
-    timing: &mut beyond_ai_agent::timing::StartupTiming,
+    timing: &mut beyond_agent::timing::StartupTiming,
 ) -> Result<SessionMeta, Box<dyn std::error::Error>> {
     // `--name`, applied uniformly across every session-open path (mirrors `serve`'s own startup check) —
     // only for a genuinely fresh session (no messages, no title yet). `--continue`'s
@@ -2342,7 +2339,7 @@ async fn attach_run_journal(
     // so whatever an earlier run of this session left there (it was killed before it could stop
     // them) is stopped now — the reopen note says so.
     bash_jobs.set_scope(Some(
-        beyond_ai_agent::exec_endpoint::jobs::JobScope::for_session(None, &meta.id),
+        beyond_agent::exec_endpoint::jobs::JobScope::for_session(None, &meta.id),
     ));
     if let Some(runner) = &exec_runner {
         tools::bash_sandbox::reattach(bash_jobs, runner.clone()).await;
@@ -2438,7 +2435,7 @@ async fn report_run_outcome(
     broken_pipe: AtomicBool,
     cancel: agent_core::CancellationToken,
     json: bool,
-    life: Option<Arc<beyond_ai_agent::lifecycle::Run>>,
+    life: Option<Arc<beyond_agent::lifecycle::Run>>,
     output_slot: tools::structured_output::OutputSlot,
     session: Session,
     stop_reason: agent_core::StopReason,

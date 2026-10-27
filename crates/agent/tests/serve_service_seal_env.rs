@@ -67,7 +67,7 @@ fn keys() -> Keys {
 fn refused(k: &Keys, seal_flag: bool, env: Option<&str>) -> String {
     // Startup must fail before it binds; a held, never-listening port keeps a regression from
     // ever serving on it.
-    let dead = beyond_ai_test_support::ports::DeadPort::bind();
+    let dead = beyond_test_support::ports::DeadPort::bind();
     let listen = format!("127.0.0.1:{}", dead.port());
     let mut c = common::agent_cmd();
     c.args([

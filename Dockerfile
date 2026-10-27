@@ -51,7 +51,7 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    cargo build --release --locked -p beyond-ai --bin beyond-ai \
+    cargo build --release --locked -p beyond-gateway --bin beyond-ai \
     && cp /app/target/release/beyond-ai /usr/local/bin/beyond-ai
 
 # ---------------------------------------------------------------------------

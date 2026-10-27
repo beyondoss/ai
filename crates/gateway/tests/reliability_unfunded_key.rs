@@ -7,7 +7,7 @@
 
 mod common;
 
-use beyond_ai::__test::route::OPENROUTER_402_STRIKES;
+use beyond_gateway::__test::route::OPENROUTER_402_STRIKES;
 use common::*;
 use serde_json::Value;
 

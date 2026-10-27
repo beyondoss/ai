@@ -103,7 +103,7 @@ async fn recv_request(ws: &mut WebSocketStream<tokio::net::TcpStream>) -> Value 
 
 #[tokio::test]
 async fn first_turn_sends_the_full_transcript_with_no_previous_response_id() {
-    let listener = beyond_ai_test_support::ports::tokio_listener().await;
+    let listener = beyond_test_support::ports::tokio_listener().await;
     let addr = listener.local_addr().expect("addr");
 
     let server = tokio::spawn(async move {
@@ -153,7 +153,7 @@ async fn first_turn_sends_the_full_transcript_with_no_previous_response_id() {
 
 #[tokio::test]
 async fn second_turn_on_the_same_session_sends_only_the_new_delta() {
-    let listener = beyond_ai_test_support::ports::tokio_listener().await;
+    let listener = beyond_test_support::ports::tokio_listener().await;
     let addr = listener.local_addr().expect("addr");
 
     let server = tokio::spawn(async move {
@@ -238,7 +238,7 @@ async fn second_turn_on_the_same_session_sends_only_the_new_delta() {
 
 #[tokio::test]
 async fn a_failed_websocket_handshake_falls_back_to_http_sse_transparently() {
-    let listener = beyond_ai_test_support::ports::tokio_listener().await;
+    let listener = beyond_test_support::ports::tokio_listener().await;
     let addr = listener.local_addr().expect("addr");
 
     let server = tokio::spawn(async move {
@@ -312,7 +312,7 @@ async fn a_failed_websocket_handshake_falls_back_to_http_sse_transparently() {
 /// corrupt a binary zstd body) to check the header and decompress the body directly.
 #[tokio::test]
 async fn the_http_sse_fallback_sends_a_zstd_compressed_body_with_the_matching_header() {
-    let listener = beyond_ai_test_support::ports::tokio_listener().await;
+    let listener = beyond_test_support::ports::tokio_listener().await;
     let addr = listener.local_addr().expect("addr");
 
     let server = tokio::spawn(async move {

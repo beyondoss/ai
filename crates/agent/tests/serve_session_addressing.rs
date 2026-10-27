@@ -308,7 +308,7 @@ fn new_session_on_an_addressed_session_keeps_the_id_and_archives_the_old_transcr
         2,
         "the outgoing conversation was archived, not overwritten"
     );
-    let archived = beyond_ai_agent::session_store::SessionRepo::open(dir.path())
+    let archived = beyond_agent::session_store::SessionRepo::open(dir.path())
         .unwrap()
         .list()
         .unwrap()

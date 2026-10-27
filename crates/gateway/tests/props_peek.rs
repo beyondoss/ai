@@ -9,7 +9,7 @@
 
 mod props_support;
 
-use beyond_ai::__test::peek::{self, ModelScanner, OUTPUT_LIMIT_KEYS};
+use beyond_gateway::__test::peek::{self, ModelScanner, OUTPUT_LIMIT_KEYS};
 use props_support::*;
 use proptest::prelude::*;
 use serde_json::{Map, Value, json};

@@ -36,7 +36,7 @@ fn a_silent_stdout_fails_the_read_at_its_deadline() {
 /// A WebSocket that stays open and silent fails the read at the deadline.
 #[tokio::test]
 async fn a_silent_websocket_fails_the_read_at_its_deadline() {
-    let listener = beyond_ai_test_support::ports::tokio_listener().await;
+    let listener = beyond_test_support::ports::tokio_listener().await;
     let port = listener.local_addr().unwrap().port();
     let server = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();

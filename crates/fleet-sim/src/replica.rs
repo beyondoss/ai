@@ -233,7 +233,7 @@ impl Replica {
                 .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
                 .map(|a| a.port());
             if let Some(ws) = ws {
-                let listening: Vec<u16> = beyond_ai_test_support::ports::listening_on(pid)
+                let listening: Vec<u16> = beyond_test_support::ports::listening_on(pid)
                     .into_iter()
                     .map(|a| a.port())
                     .collect();

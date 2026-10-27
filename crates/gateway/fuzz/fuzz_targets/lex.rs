@@ -3,7 +3,7 @@
 //! raw bytes).
 #![no_main]
 
-use beyond_ai::__test::lex::{unescape, unescapes_to};
+use beyond_gateway::__test::lex::{unescape, unescapes_to};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|raw: &[u8]| {

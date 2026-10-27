@@ -69,7 +69,7 @@ cmd_run() {
   lh=$(svc_ip loadhost)
   [ -n "$ip" ] && [ -n "$lh" ] || { echo "load: the stack is not up (run ./deploy/demo/load.sh up)" >&2; return 1; }
 
-  (cd "$ROOT" && cargo build -q --release -p beyond-ai-demo)
+  (cd "$ROOT" && cargo build -q --release -p beyond-demo)
   target=$(cd "$ROOT" && cargo metadata --format-version 1 --no-deps | jq -r .target_directory)
   bin=$target/release/beyond-ai-demo
 

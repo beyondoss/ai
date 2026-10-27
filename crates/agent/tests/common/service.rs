@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use beyond_ai_agent::memory::file::FileBackend;
-use beyond_ai_agent::session_store::{Layout, RepoOptions, SessionRepo, TenantCodec};
+use beyond_agent::memory::file::FileBackend;
+use beyond_agent::session_store::{Layout, RepoOptions, SessionRepo, TenantCodec};
 
 use super::exec_mock::ExecMock;
 use super::grant::{Claims, Minter, Secrets};

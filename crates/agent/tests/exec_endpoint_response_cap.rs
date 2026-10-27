@@ -14,9 +14,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use beyond_ai_agent::exec_endpoint::{DEFAULT_MAX_RESPONSE_BYTES, HttpExecRunner};
-use beyond_ai_agent::tools::exec::CommandRunner;
-use beyond_ai_agent::tools::{ToolConfig, default_registry_with_config};
+use beyond_agent::exec_endpoint::{DEFAULT_MAX_RESPONSE_BYTES, HttpExecRunner};
+use beyond_agent::tools::exec::CommandRunner;
+use beyond_agent::tools::{ToolConfig, default_registry_with_config};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -28,7 +28,7 @@ where
     F: Fn(tokio::net::TcpStream) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    let listener = beyond_ai_test_support::ports::tokio_listener().await;
+    let listener = beyond_test_support::ports::tokio_listener().await;
     let url = format!("http://{}/exec", listener.local_addr().unwrap());
     let respond = Arc::new(respond);
     tokio::spawn(async move {

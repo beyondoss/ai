@@ -9,7 +9,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use beyond_ai::__test::key::{VirtualKey, mint};
+use beyond_gateway::__test::key::{VirtualKey, mint};
 use common::*;
 use store::snapshot::SnapshotWriter;
 use store::{KvEntry, KvUpdate, VersionToken, WatchCursor};

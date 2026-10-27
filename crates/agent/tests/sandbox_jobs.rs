@@ -11,11 +11,11 @@ use crate::common;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use beyond_ai_agent::exec_endpoint::jobs::{
+use beyond_agent::exec_endpoint::jobs::{
     JobEvent, JobId, JobScope, JobSpec, JobStatus, SandboxJobs, ShellJobs,
 };
-use beyond_ai_agent::exec_endpoint::{HttpExecRunner, TemplateRunner};
-use beyond_ai_agent::tools::exec::{CommandRunner, RealRunner};
+use beyond_agent::exec_endpoint::{HttpExecRunner, TemplateRunner};
+use beyond_agent::tools::exec::{CommandRunner, RealRunner};
 use common::exec_mock::{ExecMock, MockOptions, Protocol, group_alive, wait_group_gone};
 
 #[derive(Clone, Copy, Debug)]

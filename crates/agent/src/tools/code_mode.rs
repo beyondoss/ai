@@ -17,7 +17,7 @@
 //! feature. Experiments:
 //!
 //! ```sh
-//! cargo run -p beyond-ai-agent --features code-mode -- run --code-mode …
+//! cargo run -p beyond-agent --features code-mode -- run --code-mode …
 //! ```
 //!
 //! `--code-mode` on a binary built without the feature is a hard error, not a silent fallback: hiding
@@ -48,7 +48,7 @@ pub fn require_compiled() -> Result<(), String> {
             "`--code-mode` requires a binary built with `--features code-mode`. \
              Default and release agent binaries omit QuickJS so every 768 MB guest \
              does not pay ~1 MB of resident .text for an interpreter it is not running. \
-             Rebuild: cargo build -p beyond-ai-agent --features code-mode"
+             Rebuild: cargo build -p beyond-agent --features code-mode"
                 .into(),
         )
     }

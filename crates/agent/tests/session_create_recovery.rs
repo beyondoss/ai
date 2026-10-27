@@ -11,7 +11,7 @@ use std::fs;
 use std::path::Path;
 
 use agent_core::Message;
-use beyond_ai_agent::session_store::{Layout, RepoOptions, SessionRepo, SessionStore};
+use beyond_agent::session_store::{Layout, RepoOptions, SessionRepo, SessionStore};
 use tempfile::TempDir;
 
 fn segmented(dir: &Path) -> SessionRepo {
@@ -109,7 +109,7 @@ fn a_create_is_whole_and_still_exclusive() {
         .collect();
     assert_eq!(names, ["000001.jsonl"], "temp files left behind");
     assert!(
-        repo.create(beyond_ai_agent::session_store::SessionMeta::with_id(
+        repo.create(beyond_agent::session_store::SessionMeta::with_id(
             "one", "/w", "m"
         ))
         .is_err()
@@ -121,7 +121,7 @@ fn a_create_is_whole_and_still_exclusive() {
     fs::write(&path, b"").unwrap();
     let store = SessionStore::create(
         path.clone(),
-        beyond_ai_agent::session_store::SessionMeta::new("/w", "m"),
+        beyond_agent::session_store::SessionMeta::new("/w", "m"),
     )
     .unwrap();
     drop(store);

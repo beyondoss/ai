@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use beyond_ai_test_support::{turn_text, turn_tool_use};
+use beyond_test_support::{turn_text, turn_tool_use};
 use serde_json::{Value, json};
 
 pub struct Args {
@@ -193,7 +193,7 @@ fn handle(stream: TcpStream, st: &State, args: &Args) {
 
 /// Serve until the process ends.
 pub fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    beyond_ai_test_support::spawn_model_server_fn_on(&args.model_listen, answer);
+    beyond_test_support::spawn_model_server_fn_on(&args.model_listen, answer);
     let listener = TcpListener::bind(&args.listen)?;
     eprintln!(
         "load-host: bundles on {}, model on {}",

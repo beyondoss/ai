@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use beyond_ai_agent::exec_endpoint::jobs::JobId;
+use beyond_agent::exec_endpoint::jobs::JobId;
 use common::TestWs;
 use common::exec_mock::StreamEnd;
 use common::notify_e2e::{
@@ -698,7 +698,7 @@ async fn guarded(mut f: E2e, seed: u64) -> (Option<E2e>, Result<Outcome, String>
 
 fn replay_command(seed: u64) -> String {
     format!(
-        "NOTIFY_E2E_SEED={seed} cargo nextest run -p beyond-ai-agent -E 'test(/^notify_e2e_orderings::/ and test(replay))' --no-capture"
+        "NOTIFY_E2E_SEED={seed} cargo nextest run -p beyond-agent -E 'test(/^notify_e2e_orderings::/ and test(replay))' --no-capture"
     )
 }
 

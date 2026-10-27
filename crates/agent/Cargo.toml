@@ -1,5 +1,5 @@
 [package]
-name = "beyond-ai-agent"
+name = "beyond-agent"
 version = "0.1.0"
 autotests = false
 edition.workspace = true
@@ -22,10 +22,10 @@ workspace = true
 # not do.
 # The harness core. Depended on by package name; imported as `agent_core` (its lib name).
 async-trait.workspace = true
-beyond-ai-agent-core = { path = "../agent-core" }
+beyond-agent-core = { path = "../agent-core" }
 # The exec protocol v1.4 notification kernel (`exec_endpoint::notify_kernel`): zero dependencies,
 # shared with every endpoint that calls back, the reference mock included.
-beyond-ai-exec-notify = { path = "../exec-notify" }
+beyond-exec-notify = { path = "../exec-notify" }
 # `serve`'s `OutFrame::Raw` payload: a serialized event line shared — by refcount bump, not deep copy —
 # across the in-flight-turn recording and every attached connection's sink on the per-event fan-out
 # hot path. Same zero-copy byte buffer `agent-core` frames SSE lines with.
@@ -41,7 +41,7 @@ prometheus = "0.13"
 # The shared provider table: where each provider lives, which wire it speaks, which header its key goes
 # in, and which env var conventionally holds it. The same rows `crates/gateway` proxies on — so the
 # agent's direct route and the gateway's proxy route can never disagree about a provider.
-providers = { package = "beyond-ai-providers", path = "../providers" }
+providers = { package = "beyond-providers", path = "../providers" }
 serde.workspace = true
 serde_json.workspace = true
 # `skills.rs`'s `SKILL.md`/prompt-template frontmatter parsing — a real YAML parser instead of a
@@ -237,7 +237,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 # OPTIONAL — default/release binaries must not link this. Idle RSS in a 768 MB guest is dominated by
 # resident `.text`; QuickJS is ~1 MB of extra code in every agent VM even when `--code-mode` is never
 # passed (the same class of cost that rejected aws-lc). Enable only for experiments:
-#   cargo run -p beyond-ai-agent --features code-mode -- run --code-mode …
+#   cargo run -p beyond-agent --features code-mode -- run --code-mode …
 # `futures` bridges JS Promises to Rust async so nested tool calls can `await` / `Promise.all`.
 # `parallel` so `AsyncRuntime` is `Send` (`Tool::run_streaming`). `rust-alloc` routes JS malloc
 # through the crate's global allocator (mimalloc) instead of a second musl malloc. No `loader`/
@@ -273,7 +273,7 @@ required-features = ["code-mode"]
 [dev-dependencies]
 # The mock model server and turn builders, shared with `crates/fleet-sim` — see that crate for why
 # they no longer live in `tests/common`.
-beyond-ai-test-support = { path = "../test-support" }
+beyond-test-support = { path = "../test-support" }
 # The client side of the WebSocket transport, for `tests/serve_websocket.rs` and the live WS smokes:
 # `connect_async` to a `ws://127.0.0.1` listener (no TLS). Same crate/version as the non-dev dep above.
 # Scratch files/dirs for the file-tool tests.

@@ -227,7 +227,7 @@ fn events_arriving_during_a_busy_run_coalesce_into_one_follow_up_after_it() {
     // A user prompt whose model call stalls for 2 s: the run is provably in flight meanwhile.
     send(
         &mut s.stdin,
-        json!({ "type": "prompt", "id": "user", "message": beyond_ai_test_support::stall_prompt(2000) }),
+        json!({ "type": "prompt", "id": "user", "message": beyond_test_support::stall_prompt(2000) }),
     );
     s.frames
         .wait(Duration::from_secs(10), "the user's ack", |f| {

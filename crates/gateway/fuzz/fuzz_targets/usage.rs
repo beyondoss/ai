@@ -4,7 +4,7 @@
 //! Input: 8 bytes of relayed-byte count, 2 bytes of split point, the rest is the body.
 #![no_main]
 
-use beyond_ai::__test::usage::{self, InputTally};
+use beyond_gateway::__test::usage::{self, InputTally};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

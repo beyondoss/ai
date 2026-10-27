@@ -13,11 +13,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use beyond_ai_agent::exec_endpoint::{ExecCell, ExecTarget, HttpExecRunner, TemplateRunner};
-use beyond_ai_agent::tools::exec::{CommandRunner, ExecResult, RealRunner};
-use beyond_ai_agent::tools::fs::FsBackend;
-use beyond_ai_agent::tools::fs::shell::{Capabilities, ShellFs};
-use beyond_ai_agent::tools::{ToolConfig, default_registry_with_config};
+use beyond_agent::exec_endpoint::{ExecCell, ExecTarget, HttpExecRunner, TemplateRunner};
+use beyond_agent::tools::exec::{CommandRunner, ExecResult, RealRunner};
+use beyond_agent::tools::fs::FsBackend;
+use beyond_agent::tools::fs::shell::{Capabilities, ShellFs};
+use beyond_agent::tools::{ToolConfig, default_registry_with_config};
 use common::exec_mock::ExecMock;
 use serde_json::{Value, json};
 
