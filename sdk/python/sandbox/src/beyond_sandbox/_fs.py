@@ -530,6 +530,22 @@ class LongLine:
     raw: str
 
 
+_BINARY_WARNING = (
+    ': WARNING: stopped searching binary file after match (found "\\0" byte around offset '
+)
+
+
+def is_binary_warning(line: str, prev: str) -> bool:
+    """``PATH: WARNING: stopped searching binary file after match (found "\\0" byte around offset N)``,
+    where PATH is the file of the record just before it: ``rg`` prints it after the matches it found
+    ahead of a NUL byte. Matching the previous record's path, not only the text, keeps a file whose
+    name happens to contain these words a path."""
+    if not prev or not line.startswith(prev + _BINARY_WARNING):
+        return False
+    rest = line[len(prev) + len(_BINARY_WARNING) :]
+    return rest.endswith(")") and rest[:-1].isascii() and rest[:-1].isdigit()
+
+
 def parse_records(
     stdout: str, columns: bool | str = False, longs: list[LongLine] | None = None
 ) -> list[Hit]:
@@ -541,7 +557,16 @@ def parse_records(
     """
     hits: list[Hit] = []
     i, n = 0, len(stdout)
+    prev = ""
     while i < n:
+        # ``rg`` follows the records of a file it stopped searching at a NUL byte with a line of its
+        # own, which has no NUL and so must not be read as the start of a record.
+        first = stdout.find("\n", i)
+        if first < 0:
+            first = n
+        if is_binary_warning(stdout[i:first], prev):
+            i = first + 1
+            continue
         if stdout.startswith("--\n", i):
             i += 3
             continue
@@ -556,7 +581,8 @@ def parse_records(
         nl = stdout.find("\n", nul)
         if nl < 0:
             nl = n
-        hit = _parse_body(stdout[i:nul], stdout[nul + 1 : nl], columns, longs, len(hits))
+        prev = stdout[i:nul]
+        hit = _parse_body(prev, stdout[nul + 1 : nl], columns, longs, len(hits))
         if hit is not None:
             hits.append(hit)
         i = nl + 1

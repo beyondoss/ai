@@ -204,11 +204,21 @@ export function parseRecords(
 ): SearchHit[] {
   const hits: SearchHit[] = [];
   let i = 0;
+  let prev = "";
   while (i < stdout.length) {
+    // `rg` follows the records of a file it stopped searching at a NUL byte with a line of its own,
+    // which has no NUL and so must not be read as the start of a record.
+    let first = stdout.indexOf("\n", i);
+    if (first < 0) first = stdout.length;
+    if (isBinaryWarning(stdout.slice(i, first), prev)) {
+      i = first + 1;
+      continue;
+    }
     const nul = stdout.indexOf("\0", i);
     if (nul < 0) break;
     let nl = stdout.indexOf("\n", nul);
     if (nl < 0) nl = stdout.length;
+    prev = stdout.slice(i, nul);
     const hit = parseBody(
       stdout.slice(i, nul),
       stdout.slice(nul + 1, nl),
@@ -220,6 +230,20 @@ export function parseRecords(
     i = nl + 1;
   }
   return hits;
+}
+
+const BINARY_WARNING =
+  ": WARNING: stopped searching binary file after match (found \"\\0\" byte around offset ";
+
+/**
+ * `PATH: WARNING: stopped searching binary file after match (found "\0" byte around offset N)`,
+ * where PATH is the file of the record just before it: `rg` prints it after the matches it found
+ * ahead of a NUL byte. Matching the previous record's path, not only the text, keeps a file whose
+ * name happens to contain these words a path.
+ */
+export function isBinaryWarning(line: string, prev: string): boolean {
+  if (prev === "" || !line.startsWith(prev + BINARY_WARNING)) return false;
+  return /^\d+\)$/.test(line.slice(prev.length + BINARY_WARNING.length));
 }
 
 function parseBody(

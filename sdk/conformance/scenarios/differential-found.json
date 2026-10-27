@@ -230,10 +230,7 @@
     },
     {
       "id": "differential-found.search.binary-file-warning-is-not-a-path",
-      "description": "ripgrep, given a directory, searches a file with a NUL byte after a match as far as the NUL and then prints `PATH: WARNING: stopped searching binary file after match (found \"\\0\" byte around offset N)` on stdout. That line has no NUL, so a parser that scans for the NUL after the path reads it as the start of the next record's path. No hit's path may contain the warning. (Three such files: whichever is printed first is followed by another record.)",
-      "requires": {
-        "search_engine": "rg"
-      },
+      "description": "A file with a NUL byte after a match is not a path. ripgrep searches it as far as the NUL and then prints `PATH: WARNING: stopped searching binary file after match (found \"\\\\0\" byte around offset N)` on stdout, a line with no NUL that follows the file's own records and names the file; a parser that scans for the NUL after the path would read it as the start of the next record. No hit's path may contain the warning, on any search engine (busybox grep prints `Binary file PATH matches`, GNU grep with -I prints nothing).",
       "setup": [
         {
           "id": "setup",
@@ -241,7 +238,7 @@
           "command": "sh",
           "args": [
             "-c",
-            "set -e; cd \"$1\"; i=10; while [ $i -lt 40 ]; do echo x1 > f$i; i=$((i+1)); done; for b in bin1 bin2 bin3; do printf 'x1\\n\\000\\n' > $b; done",
+            "set -e; cd \"$1\"; mkdir plain; i=10; while [ $i -lt 40 ]; do echo x1 > plain/f$i; i=$((i+1)); done; for b in bin1 bin2 bin3; do printf 'x1\\n\\000\\n' > $b; done",
             "sh",
             "${ROOT}"
           ]
@@ -251,15 +248,14 @@
         {
           "id": "control",
           "op": "search",
-          "root": "${ROOT}",
+          "root": "${ROOT}/plain",
           "pattern": "x1",
           "literal": true,
-          "glob": "f2*",
           "limit": 100,
           "expect": {
             "ok": {
               "hits": {
-                "$len": 10
+                "$len": 30
               }
             }
           }
@@ -271,16 +267,6 @@
           "pattern": "x1",
           "literal": true,
           "limit": 100,
-          "xfail": {
-            "drivers": [
-              "agent-reference",
-              "beyond-sandbox-ts",
-              "python",
-              "python-async",
-              "sandbox-mcp"
-            ],
-            "reason": "the warning line is read as the beginning of the next record's path"
-          },
           "expect": {
             "ok": {
               "hits": {

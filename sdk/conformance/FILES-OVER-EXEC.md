@@ -529,6 +529,21 @@ record then has `COL`, one or more digits followed by `:`; a record that does
 not fit is dropped. A file named `--` or `--` LF `b` is an ordinary
 path.
 
+`rg` also prints, after the records of a file it stopped searching at a NUL
+byte (a NUL after a match), one line `PATH: WARNING: stopped searching binary
+file after match (found "\0" byte around offset N)` on **stdout**, where `\0` is
+a backslash and a zero and `N` digits. It has no NUL, so it would read as the
+start of the next record's path. `rg --no-messages` does not suppress it,
+`--binary` only rewords it (still on stdout), and `--text` changes the results
+(binary files would be searched whole), so the client drops it: a line is that
+warning when it is exactly the **previous record's path** followed by the text
+above, and a record is parsed from the line after it. Requiring the previous
+record's path means a file merely named like the warning is still a path (the
+one ambiguity left is a file whose name is the previous record's path plus
+that text and a newline, listed right after it). GNU `grep -I` prints nothing
+for such a file, and busybox `grep` prints `Binary file PATH matches`, which has
+no `LINE:` field and is dropped by its parser.
+
 `busybox-grep` emits `PATH:LINE:TEXT` (match) or `PATH-LINE-TEXT` (context). A
 line equal to `--` is skipped. Otherwise split at the **first** position `i`
 where the byte is `:` or `-`, followed by one or more digits, followed by the

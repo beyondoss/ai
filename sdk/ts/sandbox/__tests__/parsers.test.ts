@@ -523,6 +523,22 @@ describe("clipping", () => {
   });
 });
 
+describe("rg binary-file warning", () => {
+  const w =
+    ": WARNING: stopped searching binary file after match (found \"\\0\" byte around offset 3)";
+  it("is not the start of a record", () => {
+    const out = `a\x001:1:x\nb\x001:1:y\nb${w}\nc\x001:1:z\n`;
+    expect(parseRecords(out, true).map((h) => h.path)).toEqual(["a", "b", "c"]);
+  });
+  it("is a path when it is not the previous record's file", () => {
+    const out = `a\x001:1:x\nb${w}\nc\x001:1:z\n`;
+    expect(parseRecords(out, true).map((h) => h.path)).toEqual([
+      "a",
+      `b${w}\nc`,
+    ]);
+  });
+});
+
 describe("compileGlob (globset semantics)", () => {
   const m = (glob: string, path: string, ic = false) =>
     compileGlob(glob, ic).test(path);

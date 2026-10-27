@@ -414,3 +414,12 @@ def test_the_classifier_reads_the_stderr_line_not_the_path() -> None:
     err = _fs.fail("read /tmp/is a directory/x", b"Permission denied (os error 13)\n")
     assert err.kind == "permission_denied"
     assert str(err.detail) == "read /tmp/is a directory/x: Permission denied (os error 13)"
+
+
+def test_rgs_binary_file_warning_is_not_the_start_of_a_record() -> None:
+    w = ': WARNING: stopped searching binary file after match (found "\\0" byte around offset 3)'
+    out = f"a\x001:1:x\nb\x001:1:y\nb{w}\nc\x001:1:z\n"
+    assert [h.path for h in parse_records(out, True)] == ["a", "b", "c"]
+    # Not the previous record's file: a path that merely contains the words.
+    out = f"a\x001:1:x\nb{w}\nc\x001:1:z\n"
+    assert [h.path for h in parse_records(out, True)] == ["a", f"b{w}\nc"]
