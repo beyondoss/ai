@@ -1,7 +1,7 @@
 //! Integration tests for the supervisor-level `list_daemon_sessions` command (`serve --listen`). Only
 //! the daemon supervisor sees every session, so this command is answered *there* — it unions the live
 //! in-memory session map with an on-disk scan of `<session-dir>/*.jsonl`, tagging each entry with a
-//! `live` flag. These spawn the real `beyond-ai-agent` binary against the mock Anthropic-SSE gateway
+//! `live` flag. These spawn the real `agent` binary against the mock Anthropic-SSE gateway
 //! and drive it with a real `tokio-tungstenite` client.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

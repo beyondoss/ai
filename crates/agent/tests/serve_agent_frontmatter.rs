@@ -26,7 +26,7 @@ fn requests_until_the_run_ends(trust: bool, flags: &[&str]) -> Vec<String> {
     turns.push(turn_text("never reached"));
     let (base, requests) = spawn_model_server(turns);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.args(flags).current_dir(dir.path());
     if trust {

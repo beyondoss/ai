@@ -45,7 +45,7 @@ run = "cargo test -p beyond-agent --features code-mode --test code_mode_eval -- 
 description = "Long-context compaction sweep (crates/agent/eval/longctx): multi-bug repair tasks in 11 real Python repos × model × compaction trigger, headless, graded by each repo's own tests. Spends real money: `-- --estimate` first, `--budget-usd` caps it. Reads keys from .env. Args go to run.py (--models, --arms 100k,200k,default,model or any <n>k, --tasks, --attempts, --jobs)."
 run = """
 cargo build -q --release -p beyond-agent
-python3 crates/agent/eval/longctx/run.py --bin target/release/beyond-ai-agent "$@"
+python3 crates/agent/eval/longctx/run.py --bin target/release/agent "$@"
 python3 crates/agent/eval/longctx/report.py
 """
 
@@ -178,7 +178,7 @@ description = "divan micro-benchmarks of the IO-free hot paths (key/peek/usage/r
 run = "cargo bench --bench unit"
 
 [tasks."bench:e2e"]
-description = "A-1 end-to-end bench: real beyond-ai binary + nats-server + mock upstream over HTTP."
+description = "A-1 end-to-end bench: real gateway binary + nats-server + mock upstream over HTTP."
 run = "cargo bench --bench e2e"
 
 [tasks."bench:decode"]

@@ -48,7 +48,7 @@ fn repo() -> tempfile::TempDir {
 }
 
 fn run(dir: &Path, cache: &Path, base: &str, extra: &[&str]) -> std::process::Output {
-    run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    run_cmd(env!("CARGO_BIN_EXE_agent"))
         .args([
             "run",
             "go",

@@ -2,7 +2,7 @@
 //!
 //! `agent_core::hooks::AgentHooks` is the seam a permission/approval system hangs off of, but the
 //! crate that defines it ships zero implementations (it has no concrete `Tool`s to gate, and no
-//! opinion on what a host's policy should look like). This is that implementation for `beyond-ai-agent`
+//! opinion on what a host's policy should look like). This is that implementation for `agent`
 //! itself: a static, config-time deny-list — the smallest useful policy, and the one every richer
 //! policy (an approval round-trip to a client, a rules engine) would still need as its base case.
 //!

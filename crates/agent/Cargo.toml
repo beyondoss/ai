@@ -9,7 +9,7 @@ rust-version.workspace = true
 description = "Beyond agent harness — CLI (one-shot `run` and headless `serve`)"
 
 [[bin]]
-name = "beyond-ai-agent"
+name = "agent"
 path = "src/main.rs"
 
 [lints]
@@ -258,7 +258,7 @@ default = []
 code-mode = ["dep:rquickjs"]
 
 # Catalog-token + composition evals (and the ignored live Grok/OpenRouter eval). Requires the
-# feature so `CARGO_BIN_EXE_beyond-ai-agent` is the binary that actually links QuickJS;
+# feature so `CARGO_BIN_EXE_agent` is the binary that actually links QuickJS;
 # `--code-mode` on the density-default binary is a hard error.
 # Every integration test file is a module of this one binary (see the header of `tests/it.rs`).
 [[test]]

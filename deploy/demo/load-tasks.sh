@@ -29,7 +29,7 @@ esac
 AGENT_SCRIPT=$(cat <<'EOS'
 until [ -w /scratch ]; do sleep 1; done
 mkdir -p /scratch/tmp "$STORE_DIR"; export TMPDIR=/scratch/tmp; ulimit -c 0 2>/dev/null || true
-/usr/local/bin/beyond-ai-agent serve --service --listen 0.0.0.0:8080 --gateway-url "$GATEWAY_URL" --model "$MODEL" \
+/usr/local/bin/agent serve --service --listen 0.0.0.0:8080 --gateway-url "$GATEWAY_URL" --model "$MODEL" \
   --grant-key "$GRANT_KEY_FLAG" --shard demo="$STORE_DIR" --bundle-cache-mb "$CACHE_MB" --metrics-listen 127.0.0.1:9100 &
 wait $!
 EOS

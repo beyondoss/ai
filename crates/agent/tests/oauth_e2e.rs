@@ -27,7 +27,7 @@ fn a_stored_anthropic_credential_is_used_with_no_key_flag_and_carries_the_oauth_
     );
 
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     let output = run_cmd(bin)
         .args([
@@ -73,7 +73,7 @@ fn a_stored_anthropic_credential_is_used_with_no_key_flag_and_carries_the_oauth_
 #[test]
 fn no_key_and_no_stored_credential_is_a_clean_error_naming_agent_login() {
     let home = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     let output = run_cmd(bin)
         .args([

@@ -1,11 +1,11 @@
-"""MCP Events interop check — NOT part of CI. Drives the real `beyond-ai-agent serve --listen`
+"""MCP Events interop check — NOT part of CI. Drives the real `agent serve --listen`
 against an independent server implementation: the `mcp-webhook-events` PyPI package (0.2.0) on
 the official Python MCP SDK (`mcp` 2.3.0), whose deliveries are signed by the official
 `standardwebhooks` library.
 
     python3 -m venv venv && venv/bin/pip install mcp-webhook-events==0.2.0 uvicorn websockets
     cargo build -p beyond-agent
-    AGENT_BIN=target/debug/beyond-ai-agent venv/bin/python crates/agent/eval/mcp_events_interop/check.py [http|stdio]
+    AGENT_BIN=target/debug/agent venv/bin/python crates/agent/eval/mcp_events_interop/check.py [http|stdio]
 
 Asserts: discovery, subscribe (incl. the package's verification challenge), a delivery reaching
 the session as an `mcp_event` frame, a refresh that rotates the secret (and the package
@@ -25,7 +25,7 @@ import websockets
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 VENV_PY = sys.executable
-AGENT = os.path.abspath(os.environ.get("AGENT_BIN", "target/debug/beyond-ai-agent"))
+AGENT = os.path.abspath(os.environ.get("AGENT_BIN", "target/debug/agent"))
 
 
 def free_port():

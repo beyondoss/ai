@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use common::{SpawnGuarded, run_cmd, spawn_model_server, turn_text};
 
 fn spawn(base: &str, args: &[&str], dir: &std::path::Path) -> common::ChildGuard {
-    run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    run_cmd(env!("CARGO_BIN_EXE_agent"))
         .arg("run")
         .args(args)
         .args([

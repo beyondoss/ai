@@ -415,7 +415,7 @@ scan_agent_memory() {
   task=$(q ecs list-tasks --cluster "$CLUSTER" --service-name "$P-agent" --desired-status RUNNING --query 'taskArns[0]')
   [ -n "$task" ] || { echo '{"scanned":false,"why":"no running agent task"}'; return; }
   script='pid=""
-for p in /proc/[0-9]*; do [ "$(readlink $p/exe 2>/dev/null)" = /usr/local/bin/beyond-ai-agent ] && pid=${p#/proc/}; done
+for p in /proc/[0-9]*; do [ "$(readlink $p/exe 2>/dev/null)" = /usr/local/bin/agent ] && pid=${p#/proc/}; done
 [ -n "$pid" ] || { echo "SCAN-ERROR no agent pid"; exit 0; }
 : > /tmp/scan.hits; kb=0; bad=0
 while read -r range perms rest; do

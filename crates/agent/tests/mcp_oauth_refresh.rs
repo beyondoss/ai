@@ -76,7 +76,7 @@ fn a_refresh_that_fails_names_mcp_login_and_is_not_retried() {
         let results = tool_results(body);
         let (_, text, is_error) = results.iter().find(|(i, ..)| i == id).unwrap();
         assert!(
-            *is_error && text.contains("`beyond-ai-agent mcp-login protected`"),
+            *is_error && text.contains("`agent mcp-login protected`"),
             "a failed refresh must tell the user to log in again: {text}"
         );
     }
@@ -105,7 +105,7 @@ fn a_permanent_refresh_refusal(status: &str, body: Value) {
     let results = tool_results(&bodies[2]);
     let (_, text, is_error) = results.iter().find(|(i, ..)| i == "toolu_2").unwrap();
     assert!(
-        *is_error && text.contains("`beyond-ai-agent mcp-login protected`"),
+        *is_error && text.contains("`agent mcp-login protected`"),
         "{status} {body}: a permanent refusal must tell the user to log in again: {text}"
     );
     assert_eq!(fixture.refresh_grants.load(Ordering::SeqCst), 1);

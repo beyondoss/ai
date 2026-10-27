@@ -34,7 +34,7 @@ fn continue_after_a_hard_kill_never_sends_two_user_turns() {
     let dir = tempfile::tempdir().unwrap();
     let sessions = dir.path().join("sessions");
     let stalled = spawn_model_server_with_stalled_response(vec![], Duration::from_secs(30), vec![]);
-    let mut child = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let mut child = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .args([
             "run",
             "FIRST-PROMPT",
@@ -66,7 +66,7 @@ fn continue_after_a_hard_kill_never_sends_two_user_turns() {
     let _ = child.wait();
 
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let out = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let out = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .args([
             "run",
             "SECOND-PROMPT",

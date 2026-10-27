@@ -36,7 +36,7 @@ use crate::common;
 
 use serde_json::json;
 
-const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
+const BIN: &str = env!("CARGO_BIN_EXE_agent");
 
 /// The exec flags to pass through, or `None` to skip.
 fn target() -> Option<Vec<String>> {

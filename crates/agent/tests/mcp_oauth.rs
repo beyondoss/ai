@@ -76,7 +76,7 @@ fn mcp_login_completes_the_real_oauth_flow_and_the_token_authenticates_a_real_to
     );
     let (base, bodies) = spawn_model_server(vec![turn1, turn_text("done")]);
     let cwd = tempfile::tempdir().unwrap();
-    let run_output = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let run_output = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .env("HOME", home.path())
         .args([
             "run",
@@ -194,7 +194,7 @@ fn mcp_connect_to_an_oauth_protected_server_without_ever_logging_in_fails_naming
     );
     let cwd = tempfile::tempdir().unwrap();
     let (base, _bodies) = spawn_model_server(vec![turn_text("hi")]);
-    let output = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let output = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .env("HOME", home.path())
         .args([
             "run",
@@ -256,7 +256,7 @@ fn mcp_get_access_token_transparently_refreshes_an_expired_token_on_the_next_con
     );
     let (base, bodies) = spawn_model_server(vec![turn1, turn_text("done")]);
     let cwd = tempfile::tempdir().unwrap();
-    let run_output = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let run_output = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .env("HOME", home.path())
         .args([
             "run",
@@ -323,7 +323,7 @@ fn mcp_login_established_credential_is_honored_by_serve_too_not_just_run() {
     let (base, bodies) = spawn_model_server(vec![turn1, turn_text("done")]);
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
-    let mut child = serve_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"), &base, &session_file)
+    let mut child = serve_cmd(env!("CARGO_BIN_EXE_agent"), &base, &session_file)
         .env("HOME", home.path())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();

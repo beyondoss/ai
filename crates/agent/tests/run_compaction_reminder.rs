@@ -41,7 +41,7 @@ fn the_reminder_rides_the_first_request_after_a_compaction_and_costs_no_extra_on
         turn_text("answered"),
         turn_text("answered again"),
     ]);
-    let out = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let out = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .args([
             "run",
             "continue please",

@@ -1,4 +1,4 @@
-//! The full stack: the real `beyond-ai-agent` binary → the real `beyond-ai` gateway binary →
+//! The full stack: the real `agent` binary → the real gateway binary →
 //! a scripted mock upstream.
 //!
 //! This is the end-to-end proof that the harness works *through the actual gateway*: the agent

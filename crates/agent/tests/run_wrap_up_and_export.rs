@@ -11,7 +11,7 @@ use std::process::Stdio;
 use common::{run_cmd, spawn_model_server, turn_text, turn_tool_use};
 
 fn run(base: &str, dir: &std::path::Path, extra: &[&str]) -> std::process::Output {
-    run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    run_cmd(env!("CARGO_BIN_EXE_agent"))
         .args([
             "run",
             "do a big task",

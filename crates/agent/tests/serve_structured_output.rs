@@ -16,7 +16,7 @@ use common::{
 };
 use serde_json::{Value, json};
 
-const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
+const BIN: &str = env!("CARGO_BIN_EXE_agent");
 
 fn schema() -> Value {
     json!({

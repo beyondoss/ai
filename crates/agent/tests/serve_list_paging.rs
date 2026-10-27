@@ -20,7 +20,7 @@ fn three_sessions() -> (tempfile::TempDir, common::ChildGuard, common::Frames) {
     let dir_str = dir.path().to_string_lossy().into_owned();
     let (base, _bodies) =
         spawn_model_server(vec![turn_text("ok"), turn_text("ok"), turn_text("ok")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_dir_cmd(bin, &base, &dir_str).spawn_guarded();
     // One reader for the child's life: it owns stdout, so it is handed back with the child.
     let mut stdout = common::child_frames(&mut child);

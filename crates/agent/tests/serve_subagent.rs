@@ -37,7 +37,7 @@ fn serve_runs_a_subagent_and_streams_its_progress() {
         turn_text("The scout found it."),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = common::serve_cmd(bin, &base, &session_file)
         .arg("--trust-project")
         .current_dir(dir.path())
@@ -115,7 +115,7 @@ fn reload_makes_a_newly_added_agent_delegable_without_a_restart() {
         turn_text("the scout reported back"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = common::serve_cmd(bin, &base, &session_file)
         .arg("--trust-project")
         .current_dir(dir.path())

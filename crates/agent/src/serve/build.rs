@@ -6,7 +6,7 @@ use crate::serve::*;
 /// The extra per-request headers a `models.json` override configures for this model id, if any (Task
 /// #11 pi-parity feature) — the lib-crate-side twin of `main.rs::model_override_extra_headers`. Not
 /// literally shared with it: `main.rs` is a separate binary crate over this library (see
-/// `beyond-ai-agent`'s `Cargo.toml` `[[bin]]` target), so a `pub(crate)` there still wouldn't be
+/// `agent`'s `Cargo.toml` `[[bin]]` target), so a `pub(crate)` there still wouldn't be
 /// visible here, and vice versa — the two must each call through to
 /// `settings::ModelOverrides::open_default()`/`ModelOverride::resolved_headers` (the one real shared
 /// primitive both live in this same library crate and already depend on) rather than one calling the

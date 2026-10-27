@@ -32,7 +32,7 @@ fn a_child_dispatched_after_set_model_runs_on_the_new_model() {
         turn_text("CHILD"),
         turn_text("parent done"),
     ]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = common::serve_cmd(bin, &base, &session_file)
         .arg("--trust-project")
         .current_dir(dir.path())
@@ -101,7 +101,7 @@ fn a_child_dispatched_after_set_thinking_thinks_like_its_parent() {
         turn_text("CHILD"),
         turn_text("parent done"),
     ]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = common::serve_cmd(bin, &base, &session_file)
         .arg("--trust-project")
         .current_dir(dir.path())

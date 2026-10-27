@@ -119,7 +119,7 @@ fn a_proxy_in_the_environment_does_not_carry_a_web_fetch_past_the_ssrf_guard() {
         turn_text("done"),
     ]);
     let dir = tempfile::tempdir().unwrap();
-    let output = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let output = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .envs(proxy_env(&proxy))
         .args([
             "run",

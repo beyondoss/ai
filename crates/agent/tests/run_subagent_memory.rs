@@ -12,7 +12,7 @@ use std::process::Stdio;
 use common::{advertised_tools, run_cmd, spawn_model_server, turn_text, turn_tool_use};
 use serde_json::json;
 
-const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
+const BIN: &str = env!("CARGO_BIN_EXE_agent");
 
 fn write_agent(dir: &Path, name: &str, frontmatter: &str, body: &str) {
     let agents = dir.join(".claude/agents");

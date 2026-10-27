@@ -1,5 +1,5 @@
 //! Integration tests for the Unix-domain-socket transport (`serve --listen-uds`). Each test spawns the
-//! real `beyond-ai-agent` binary bound to a UDS (and, for the cross-transport case, a TCP port too)
+//! real `agent` binary bound to a UDS (and, for the cross-transport case, a TCP port too)
 //! against the mock Anthropic-SSE gateway, then drives it with a real `tokio-tungstenite` client over a
 //! `UnixStream`. The JSON control protocol is byte-identical to the TCP/stdio transports, so these
 //! assert the *UDS transport*: a full session over the socket, that a session created over TCP is

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 /// The agent binary under test.
-pub const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
+pub const BIN: &str = env!("CARGO_BIN_EXE_agent");
 
 /// A reference connector broker, and its broken modes, for the broker conformance kit's own tests.
 pub mod broker_mock;
@@ -213,11 +213,11 @@ impl SpawnGuarded for Command {
 
 /// Locate the gateway binary (built beside the agent binary); build it on demand if absent.
 pub fn gateway_bin() -> PathBuf {
-    let agent = PathBuf::from(env!("CARGO_BIN_EXE_beyond-ai-agent"));
+    let agent = PathBuf::from(env!("CARGO_BIN_EXE_agent"));
     let dir = agent.parent().unwrap();
-    let gw = dir.join("beyond-ai");
+    let gw = dir.join("gateway");
     if !gw.exists() {
-        let mut args = vec!["build", "-q", "-p", "beyond-gateway", "--bin", "beyond-ai"];
+        let mut args = vec!["build", "-q", "-p", "beyond-gateway", "--bin", "gateway"];
         if agent.to_string_lossy().contains("/release/") {
             args.push("--release");
         }
@@ -696,7 +696,7 @@ impl BufRead for Frames {
 /// This is the deterministic replacement for sleeping a fixed duration and hoping the run has reached
 /// a particular point. A wall-clock guess ("150ms should land mid the tool call's own `sleep 0.5`")
 /// holds only while the machine is idle. Under a loaded shard — every test spawning a real
-/// `beyond-ai-agent` plus a mock model server, four at a time — the probe lands *before* the turn
+/// `agent` plus a mock model server, four at a time — the probe lands *before* the turn
 /// reaches its `bash` call, or *after* that call finished, and the assertion fails for a reason with
 /// nothing to do with the behaviour under test. Asking the run where it is has no such window.
 ///

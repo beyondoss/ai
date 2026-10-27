@@ -355,7 +355,7 @@ impl Conn {
                 json!({
                     "io.modelcontextprotocol/protocolVersion": protocol_version,
                     "io.modelcontextprotocol/clientInfo": {
-                        "name": "beyond-ai-agent",
+                        "name": "beyond-agent",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
                     "io.modelcontextprotocol/clientCapabilities": {},
