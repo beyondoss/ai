@@ -715,7 +715,26 @@ exit 1
 
 ## Known deviations from the reference implementation
 
-None at present. When the reference (`ShellFs`) behaves differently from this
-spec, the difference is listed here, and the scenarios carry an `xfail` mark for
-the reference driver on exactly those checks, which turns into a plain pass when
+Found by the first run on real busybox (Alpine). Both are in the reference
+and, as written, in this document; the scenarios carry an `xfail` mark for the
+reference driver on exactly the checks that show them, on a backend whose
+probes found `find_printf` and a busybox `grep` (a real busybox sandbox).
+
+1. **The `find_printf` probe (section 4) accepts busybox.** busybox `find` has
+   no `-printf`: it prints its usage and exits 1, and "exit 0 or 1" counts that
+   as present, so `list` runs `find -printf` and fails with `io`
+   (`find: unrecognized: -printf`). A client MUST count `find_printf` present
+   only when the probe's stdout is `c` (GNU prints the type of `/dev/null`, a
+   character device). Shown by every `list` check on busybox (19 checks in
+   `files`, `errors` and `helpers`).
+2. **A write through a dangling symlink lands in the wrong directory on
+   busybox.** busybox `readlink -f` of a dangling relative link resolves its
+   target against the working directory, not the link's directory, so the
+   resolve step of section 5.3 names `CWD/made` instead of `DIR/made`. Not yet
+   specified: a resolve that does not depend on `readlink -f` for a dangling
+   link. Shown by `files.write.dangling-symlink-creates-target/check`.
+
+When the reference (`ShellFs`) behaves differently from this spec, the
+difference is listed here, and the scenarios carry an `xfail` mark for the
+reference driver on exactly those checks, which turns into a plain pass when
 the reference is fixed.

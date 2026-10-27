@@ -432,7 +432,19 @@ async fn docker(name: &str, bins: &Binaries, image: &str, c: Container) -> Resul
 
     let started = Instant::now();
     loop {
-        let logs = docker_out(&["logs", &id]).await.unwrap_or_default();
+        // A container's stderr comes back on this command's stderr.
+        let logs = Command::new("docker")
+            .args(["logs", &id])
+            .output()
+            .await
+            .map(|o| {
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                )
+            })
+            .unwrap_or_default();
         if logs.contains(" listening listen=") {
             break;
         }

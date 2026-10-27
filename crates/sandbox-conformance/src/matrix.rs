@@ -148,6 +148,47 @@ pub fn parse_driver(spec: &str) -> Result<Driver, String> {
     }
 }
 
+/// The drivers of a registry file. Each `[[driver]]` has a `name`, a `build` command (optional) and
+/// a `run` command; commands run from the current directory (the repository root).
+pub fn registry(path: &Path, build: bool) -> Result<Vec<Driver>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let doc: toml::Table = text
+        .parse()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut out = Vec::new();
+    for d in doc
+        .get("driver")
+        .and_then(|d| d.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let field = |k: &str| d.get(k).and_then(|v| v.as_str());
+        let (Some(name), Some(run)) = (field("name"), field("run")) else {
+            return Err(format!(
+                "{}: a [[driver]] needs `name` and `run`",
+                path.display()
+            ));
+        };
+        if let (true, Some(cmd)) = (build, field("build")) {
+            eprintln!("sandbox-matrix: building {name}: {cmd}");
+            let ok = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .status()
+                .map_err(|e| format!("{name}: {e}"))?
+                .success();
+            if !ok {
+                return Err(format!("{name}: the build failed: {cmd}"));
+            }
+        }
+        out.push(Driver {
+            name: name.into(),
+            cmd: run.into(),
+        });
+    }
+    Ok(out)
+}
+
 pub fn load(dir: &Path) -> Result<Vec<(String, Value)>, String> {
     crate::run::load_scenarios(dir)
 }

@@ -9,6 +9,8 @@ pub struct Cell {
     pub tally: Tally,
     /// The failing checks with their reasons, for the human report.
     pub failures: Vec<Check>,
+    /// Known defects, unsupported and skipped checks, with why: shown by `--verbose`.
+    pub others: Vec<Check>,
 }
 
 impl Cell {
@@ -29,6 +31,16 @@ impl Cell {
             failures: checks
                 .iter()
                 .filter(|c| c.status == Status::Fail)
+                .cloned()
+                .collect(),
+            others: checks
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c.status,
+                        Status::KnownDefect | Status::Unsupported | Status::Skipped
+                    )
+                })
                 .cloned()
                 .collect(),
             tally,
@@ -65,7 +77,7 @@ impl Cell {
 }
 
 /// The table: one line per cell.
-pub fn table(cells: &[Cell]) -> String {
+pub fn table(cells: &[Cell], verbose: bool) -> String {
     let w = cells.iter().map(|c| c.name().len()).max().unwrap_or(0);
     let mut out = format!(
         "{:<w$}  {:<5}  {:>6} {:>6} {:>12} {:>11} {:>7}\n",
@@ -88,6 +100,20 @@ pub fn table(cells: &[Cell]) -> String {
         for f in &c.failures {
             out.push_str(&format!("\nFAIL {} {}: {}\n", c.name(), f.id, f.detail));
         }
+    }
+    if verbose {
+        for c in cells {
+            for o in &c.others {
+                out.push_str(&format!(
+                    "\n{:?} {} {}: {}",
+                    o.status,
+                    c.name(),
+                    o.id,
+                    o.detail
+                ));
+            }
+        }
+        out.push('\n');
     }
     out
 }

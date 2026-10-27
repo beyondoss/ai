@@ -57,4 +57,6 @@ fn main() {
         writeln!(out, "{resp}").unwrap();
         out.flush().unwrap();
     }
+    drop(to);
+    let _ = child.wait();
 }

@@ -364,6 +364,7 @@ dependencies = [
  "beyond-agent-core",
  "beyond-exec-notify",
  "beyond-providers",
+ "beyond-sandbox-conformance",
  "beyond-test-support",
  "bytes",
  "chacha20poly1305",
@@ -606,6 +607,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "toml",
 ]
 
 [[package]]
