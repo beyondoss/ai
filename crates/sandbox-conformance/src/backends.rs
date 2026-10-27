@@ -245,6 +245,7 @@ async fn local(
     let mut c = Command::new(execd);
     c.env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
+        // port-0: execd binds it, keeps it, and announces the port it got (read by `listening`).
         .env("EXECD_LISTEN", "127.0.0.1:0")
         .env("EXECD_ROOT", &work)
         .stdin(Stdio::null())
