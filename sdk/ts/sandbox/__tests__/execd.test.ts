@@ -7,6 +7,9 @@ import type { Frame, Transport } from "../src/index.js";
 import { HttpTransport } from "../src/index.js";
 
 const execd = inject("execd");
+/** Writes every byte value, 0x00 to 0xFF, to stdout. */
+const ALL_256 =
+  "i=0; while [ $i -lt 256 ]; do printf \"\\\\$(printf %03o $i)\"; i=$((i+1)); done";
 const d = execd ? describe : describe.skip;
 
 let n = 0;
@@ -32,6 +35,48 @@ async function connectBaseline(): Promise<Sandbox> {
 }
 
 d("against a loopback execd", () => {
+  it("raw exec returns every byte value exactly, on both streams, over output_base64", async () => {
+    const sb = await connect();
+    const r = await sb.exec("sh", [
+      "-c",
+      `${ALL_256}; ${ALL_256} >&2; exit 3`,
+    ]);
+    const all = Array.from({ length: 256 }, (_, i) => i);
+    expect(r.exact).toBe(true);
+    expect(r.exitCode).toBe(3);
+    expect(Array.from(r.stdout)).toEqual(all);
+    expect(Array.from(r.stderr)).toEqual(all);
+    expect((await sb.transport.offers!()).outputBase64).toBe(true);
+    // And with stdin: binary in, binary out.
+    const echoed = await sb.exec("cat", [], {
+      stdin: Uint8Array.from(all),
+    });
+    expect(echoed.exact).toBe(true);
+    expect(Array.from(echoed.stdout)).toEqual(all);
+  });
+
+  it("raw exec is exact over a stream when output_base64 is hidden", async () => {
+    const http = new HttpTransport({ url: execd!.url, token: execd!.token });
+    // An endpoint that predates output_base64: the field is dropped from the request.
+    const dropping = new HttpTransport({
+      url: execd!.url,
+      token: execd!.token,
+      fetch: (input, init) => {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        delete body.output_base64;
+        return fetch(input, { ...init, body: JSON.stringify(body) });
+      },
+    });
+    expect((await http.offers()).outputBase64).toBe(true);
+    expect((await dropping.offers()).outputBase64).toBe(false);
+    const r = await dropping.run("sh", ["-c", `${ALL_256}; kill -9 $$`]);
+    expect(r.exact).toBe(true);
+    expect(r.exitCode).toBe(137);
+    expect(Array.from(r.stdout)).toEqual(
+      Array.from({ length: 256 }, (_, i) => i),
+    );
+  });
+
   it("runs a command, with stdin, and reports a non-zero exit as a result", async () => {
     const sb = await connect();
     const r = await sb.exec("sh", ["-c", "cat; echo err >&2; exit 3"], {

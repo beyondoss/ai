@@ -169,7 +169,9 @@ describe("HttpTransport.run", () => {
       /* never answers */
     });
     const t = new HttpTransport({ url: e.url, deadlineGraceMs: 50 });
-    expect(await kindOf(t.run("x", [], { timeoutMs: 50, text: true }))).toBe("timeout");
+    expect(await kindOf(t.run("x", [], { timeoutMs: 50, text: true }))).toBe(
+      "timeout",
+    );
   });
 
   it("reads incrementally and errors over the cap instead of returning a partial result", async () => {

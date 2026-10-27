@@ -87,7 +87,12 @@ describe("the output_base64 vectors (crates/sandbox/tests/fixtures/exec/v1.1-out
     it(`answer: ${c.name}`, () => {
       check(
         c.name,
-        () => decodeOutput(c.answer as Record<string, unknown>, "http://x", 1 << 20),
+        () =>
+          decodeOutput(
+            c.answer as Record<string, unknown>,
+            "http://x",
+            1 << 20,
+          ),
         c.expect,
       );
     });
@@ -137,10 +142,12 @@ async function endpoint(...a: Parameters<typeof fakeEndpoint>) {
 }
 
 const ALL = Uint8Array.from({ length: 256 }, (_, i) => i);
-const b64 = (s: Uint8Array | string) => toBase64(typeof s === "string" ? utf8(s) : s);
+const b64 = (s: Uint8Array | string) =>
+  toBase64(typeof s === "string" ? utf8(s) : s);
 
 /** An endpoint that honours output_base64: answers the probe and every call with base64. */
-const honours = (bytes: Uint8Array) => (
+const honours = (bytes: Uint8Array) =>
+(
   seen: { body: Record<string, unknown> },
   res: import("node:http").ServerResponse,
 ) => {
@@ -182,9 +189,7 @@ describe("HttpTransport.run returns bytes", () => {
   });
 
   it("a plain v1.1 endpoint answers text, and the result says it is not exact", async () => {
-    const e = await endpoint((_, res) =>
-      json(res, 200, ok("café �", 4, "e"))
-    );
+    const e = await endpoint((_, res) => json(res, 200, ok("café �", 4, "e")));
     const r = await new HttpTransport({ url: e.url }).run("x", []);
     expect(r.exact).toBe(false);
     expect(r.exitCode).toBe(4);
@@ -237,7 +242,9 @@ describe("HttpTransport.run returns bytes", () => {
         return;
       }
       res.write(JSON.stringify({ stdout: b64(ALL) }) + "\n");
-      res.write(JSON.stringify({ stderr: b64(new Uint8Array([255, 0])) }) + "\n");
+      res.write(
+        JSON.stringify({ stderr: b64(new Uint8Array([255, 0])) }) + "\n",
+      );
       res.end("{\"signal\":9}\n");
     });
     const r = await new HttpTransport({ url: e.url }).run("gen", []);
@@ -261,7 +268,9 @@ describe("HttpTransport.run returns bytes", () => {
       const probe = String((seen.body.args as string[])[1]).includes("377");
       json(res, 200, {
         exit_code: 0,
-        stdout_base64: probe ? b64(OUTPUT_PROBE_BYTES) : b64(new Uint8Array(600)),
+        stdout_base64: probe
+          ? b64(OUTPUT_PROBE_BYTES)
+          : b64(new Uint8Array(600)),
         stderr_base64: probe ? "" : b64(new Uint8Array(600)),
       });
     });

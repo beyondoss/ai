@@ -30,8 +30,8 @@ from beyond_sandbox.models import ShellExit
 FIXTURE = (
     Path(__file__).resolve().parents[4] / "crates/sandbox/tests/fixtures/exec/v1.1-output.json"
 )
-VECTORS: dict[str, Any] = json.loads(FIXTURE.read_text()) if FIXTURE.is_file() else {}
-needs_fixture = pytest.mark.skipif(not VECTORS, reason="the shared vectors are in the repository")
+# The vectors are the repository's: a missing file fails the run, it does not skip it.
+VECTORS: dict[str, Any] = json.loads(FIXTURE.read_text())
 
 ALL = bytes(range(256))
 
@@ -55,13 +55,11 @@ def check(name: str, got: Callable[[], ExecResult], want: dict[str, Any]) -> Non
 # ---- the vectors ----------------------------------------------------------------------------------
 
 
-@needs_fixture
 def test_the_probe_is_the_bytes_the_vectors_name() -> None:
     assert VECTORS["probe"]["script"] == _wire.OUTPUT_PROBE_SCRIPT
     assert b64(_wire.OUTPUT_PROBE_BYTES) == VECTORS["probe"]["bytes_base64"]
 
 
-@needs_fixture
 @pytest.mark.parametrize("case", VECTORS.get("probes", []), ids=lambda c: c["name"])
 def test_probe_vectors(case: dict[str, Any]) -> None:
     if case.get("error"):
@@ -71,7 +69,6 @@ def test_probe_vectors(case: dict[str, Any]) -> None:
         assert probe_honoured(case["answer"]) is case["supported"]
 
 
-@needs_fixture
 @pytest.mark.parametrize("case", VECTORS.get("answers", []), ids=lambda c: c["name"])
 def test_answer_vectors(case: dict[str, Any]) -> None:
     check(
@@ -81,7 +78,6 @@ def test_answer_vectors(case: dict[str, Any]) -> None:
     )
 
 
-@needs_fixture
 @pytest.mark.parametrize("case", VECTORS.get("streams", []), ids=lambda c: c["name"])
 def test_stream_vectors(case: dict[str, Any]) -> None:
     def run() -> ExecResult:

@@ -57,6 +57,15 @@ Transport  run, stream, nativeJobs, offers             raw exec; replace it with
    base64 chunks, a listing without `-printf` takes two `find` passes.
 3. **`Sandbox`** composes both and always exposes raw exec (`sb.exec`, `sb.stream`, `sb.transport`).
 
+### Raw exec is bytes
+
+`sb.exec()` returns `stdout` and `stderr` as `Uint8Array` (`stdoutText` and `stderrText` are the lossy UTF-8 views) and an
+`exact` flag. A `tar`, a `gzip` or a `cat` of a binary comes back intact when the endpoint honours `output_base64` (`execd`
+does) or streams (v1.2). A plain v1.1 endpoint can only answer text, with invalid UTF-8 already replaced by U+FFFD; the result then
+carries that text as UTF-8 and `exact: false`, so the client never passes text off as bytes. The file and job helpers read text
+and ask for it (`run(..., { text: true })`); a transport of your own may ignore that, and leaves `exact` unset (meaning exact)
+when it has the bytes.
+
 ### Files
 
 | call                                                        | notes                                                                                                                                                      |

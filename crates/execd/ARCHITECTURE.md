@@ -77,6 +77,14 @@ stderr ending in `command exceeded its timeout`. A request without `timeout_ms` 
 that a descendant holds open. The group is then killed (the spec's SHOULD for v1.1), and it is killed if the client leaves
 first.
 
+**Exact output (`"output_base64": true`).** The same buffers, the same cap (on the raw bytes across both pipes, so the cap
+is on the decoded bytes, as the spec says), answered as `stdout_base64` and `stderr_base64` (both always present) instead of
+`stdout`/`stderr`. `answer` is the one place that builds the object: the text form converts through lossy UTF-8, the exact
+form never converts. The note a deadline appends to stderr is appended to the bytes. Only the JSON value `true` asks
+(`Request::wants_exact_output`), as for `stream`. `tests/exact_output.rs` pins every byte value on both streams, the empty
+answer, the deadline, a command that cannot start, stdin, and the cap; the verifier's `exact output offered` and
+`output_base64 returns every byte value intact` checks run against the binary in `tests/conformance.rs`.
+
 ### v1.2: `exec::stream`
 
 ```text

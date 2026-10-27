@@ -26,7 +26,7 @@ from beyond_sandbox.models import (
     TimedOut,
 )
 
-FIXTURES = Path(__file__).resolve().parents[4] / "crates/sandbox/tests/fixtures/exec"
+FIXTURES = Path(__file__).resolve().parents[4] / "crates/agent/tests/fixtures/exec"
 
 
 def fixture(name: str) -> dict[str, Any]:

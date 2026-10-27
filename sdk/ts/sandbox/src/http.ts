@@ -817,7 +817,9 @@ export class OneShot {
         const had = concat(this.err);
         this.err.length = 0;
         const note = utf8(TIMEOUT_NOTE);
-        const sep = had.length > 0 && had[had.length - 1] !== 0x0a ? [0x0a] : [];
+        const sep = had.length > 0 && had[had.length - 1] !== 0x0a
+          ? [0x0a]
+          : [];
         this.err.push(had, Uint8Array.from(sep), note);
         break;
       }

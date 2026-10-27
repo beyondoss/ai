@@ -5,22 +5,23 @@ depends on it; it depends on neither `beyond-agent` nor `beyond-agent-core`.
 
 ## Modules
 
-| file                               | what                                                                                          |
-| ---------------------------------- | --------------------------------------------------------------------------------------------- |
-| `src/lib.rs`                       | the public names: `Exec`, `HttpExec`, `Files`, `Jobs`, `Sandbox`, `TokenSource`               |
-| `src/exec.rs`                      | `CommandRunner` (`Exec`), `ExecResult`, `Kill`/`LocalKill`/`kill_all`, bounded output capture |
-| `src/exec_endpoint.rs`             | the protocol spec (module doc), `HttpExecRunner`, `TemplateRunner`                            |
-| `src/exec_endpoint/stream.rs`      | v1.2 frames, the frame reader, the streaming probe                                            |
-| `src/exec_endpoint/jobs.rs`        | `SandboxJobs`, `ShellJobs` (the baseline over plain exec), scopes, ids                        |
-| `src/exec_endpoint/jobs_native.rs` | v1.3 native jobs and `HttpJobs`                                                               |
-| `src/exec_endpoint/far_kill.rs`    | killing a template transport's command on the far side                                        |
-| `src/fs.rs`                        | `FsBackend`, its types, and the result policy every backend shares                            |
-| `src/fs/shell.rs`                  | `ShellFs` (`Files`): file operations as commands, capability probe, parsers, `__fuzz`         |
-| `src/procgroup.rs`                 | process-group identity and kill guards for local children                                     |
-| `src/sandbox.rs`                   | `Jobs`, `Sandbox`, the `Command` builder                                                      |
-| `src/token.rs`                     | `TokenSource` and the one-renewal bearer                                                      |
-| `src/tls.rs`                       | installs the `ring` rustls provider before a client is built                                  |
-| `src/testing.rs`                   | a plain local runner for unit tests                                                           |
+| file                               | what                                                                                                                |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `src/lib.rs`                       | the public names: `Exec`, `HttpExec`, `Files`, `Jobs`, `Sandbox`, `TokenSource`                                     |
+| `src/exec.rs`                      | `CommandRunner` (`Exec`), `ExecResult`, `ExecOutput` (bytes), `Kill`/`LocalKill`/`kill_all`, bounded output capture |
+| `src/exec_endpoint.rs`             | the protocol spec (module doc), `HttpExecRunner`, `TemplateRunner`                                                  |
+| `src/exec_endpoint/stream.rs`      | v1.2 frames, the frame reader, the streaming probe                                                                  |
+| `src/exec_endpoint/exact.rs`       | `output_base64` (v1.1): its probe and `run_exact`, exact over the answer, a stream, or said not to be               |
+| `src/exec_endpoint/jobs.rs`        | `SandboxJobs`, `ShellJobs` (the baseline over plain exec), scopes, ids                                              |
+| `src/exec_endpoint/jobs_native.rs` | v1.3 native jobs and `HttpJobs`                                                                                     |
+| `src/exec_endpoint/far_kill.rs`    | killing a template transport's command on the far side                                                              |
+| `src/fs.rs`                        | `FsBackend`, its types, and the result policy every backend shares                                                  |
+| `src/fs/shell.rs`                  | `ShellFs` (`Files`): file operations as commands, capability probe, parsers, `__fuzz`                               |
+| `src/procgroup.rs`                 | process-group identity and kill guards for local children                                                           |
+| `src/sandbox.rs`                   | `Jobs`, `Sandbox`, the `Command` builder                                                                            |
+| `src/token.rs`                     | `TokenSource` and the one-renewal bearer                                                                            |
+| `src/tls.rs`                       | installs the `ring` rustls provider before a client is built                                                        |
+| `src/testing.rs`                   | a plain local runner for unit tests                                                                                 |
 
 ## Layers
 
@@ -98,6 +99,17 @@ kills it on drop, and `spawn_tracked_cleanup` runs the blocking kill on its own 
 `LocalKill`, which the embedding program implements for its own local jobs; `kill_all` spends one SIGTERM grace for any
 number of them.
 
+## Raw exec is bytes
+
+`CommandRunner::run` returns text (an `ExecResult` with `String` output), which is what the helpers parse and what the
+agent's `bash` tool shows. `CommandRunner::run_exact` returns `ExecOutput`: `stdout`/`stderr` as `Vec<u8>` and `exact`. The
+HTTP runner answers it over `output_base64` when its probe (`printf '\377\000\n'`, once per runner, a failed request
+is an error and not cached) shows the endpoint honours it; else over a v1.2 stream (the frames are base64 already, answered
+at the command's exit, `128 + N` for a signal and `124` plus the note for a deadline built to the v1.1 shape); else it returns the
+endpoint's text as UTF-8 with `exact: false`, as a call with stdin on an endpoint without `output_base64` does. The default
+`run_exact` wraps `run` and is `exact: false`. `Sandbox::exec().run()` is `run_exact`. The response cap is on the decoded bytes
+of both streams together.
+
 ## What is not here
 
 The host command runner (`RealRunner`), `LocalFs`, the model-facing tools, the lazily attached `ExecCell`, the v1.4
@@ -106,6 +118,6 @@ callback receiver and the server-conformance verifier are agent policy and stay 
 ## Specification and tests
 
 The normative protocol spec is the module doc of `src/exec_endpoint.rs` (v1.1 to v1.4); the vectors are in
-`tests/fixtures/exec/`. Tests are small sibling files: `exec_stream_*` (frames, kill on disconnect), `exec_notify_*`
+`tests/fixtures/exec/`. Tests are small sibling files: `exec_stream_*` (frames, kill on disconnect), `exec_output_exact` (raw exec is bytes: all 256 values, each path, the probe rules, the cap), `exec_notify_*`
 (v1.4 against the mock), `exec_jobs_vectors`, `token_refresh`, `sandbox_surface`, and `sdk_conformance` (the shared
 matrix, with the reference driver in `tests/sdk_conformance/driver.rs`). Run them with `cargo nextest run -p beyond-sandbox`.
