@@ -3,7 +3,8 @@
 //!
 //! Properties: never a panic; an accepted line is blank or a JSON object whose output is canonical
 //! base64; a final `End` carries the status the endpoint sent (`exit_code`) or `128 + signal`; a
-//! `read` answer's data, offset and status code are the ones in the JSON, not truncated copies.
+//! value out of range (a status or code that does not fit an `i32`) is an error, never a panic or
+//! a truncated copy; a `read` answer's data and offset are the ones in the JSON.
 #![no_main]
 
 use base64::Engine as _;
@@ -17,15 +18,6 @@ use serde_json::Value;
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
 fn line(data: &[u8]) {
-    // KNOWN (F3, unfixed): `128 + signal` overflows an i32 for a signal above `i32::MAX - 128`.
-    // Drop this guard when the decoder is fixed; corpus/jobs/known-signal-overflow is the input.
-    if serde_json::from_slice::<Value>(data).is_ok_and(|v| {
-        v["signal"]
-            .as_i64()
-            .is_some_and(|s| s > i64::from(i32::MAX - 128))
-    }) {
-        return;
-    }
     let Ok(frame) = decode_job_frame(data) else {
         return;
     };
@@ -49,13 +41,18 @@ fn line(data: &[u8]) {
             let s = v["stdout"].as_str().or_else(|| v["stderr"].as_str());
             assert_eq!(s, Some(B64.encode(&b).as_str()), "non-canonical output");
         }
+        // A status that does not fit an i32, or a `128 + signal` that does not, is an error (the
+        // decoder returned `Err` and never reaches here). The expected value is computed checked,
+        // so an out-of-range input that decodes to an `End` fails the assertion.
         JobFrame::End(code) if v["error"].is_null() && v["started"].is_null() => {
             let want = match (v["exit_code"].as_i64(), v["signal"].as_i64()) {
-                (Some(c), _) if v["stdout"].is_null() && v["stderr"].is_null() => c,
-                (_, Some(s)) => 128 + s,
+                (Some(c), _) if v["stdout"].is_null() && v["stderr"].is_null() => {
+                    i32::try_from(c).ok()
+                }
+                (_, Some(s)) => i32::try_from(s).ok().and_then(|s| 128i32.checked_add(s)),
                 _ => return,
             };
-            assert_eq!(i64::from(code), want, "{v}");
+            assert_eq!(Some(code), want, "a value out of range was accepted: {v}");
         }
         _ => {}
     }
@@ -69,14 +66,17 @@ fn answers(data: &[u8]) {
         assert_eq!(v["data"].as_str().unwrap_or(""), B64.encode(&chunk.data));
         assert_eq!(chunk.offset, v["offset"].as_u64().unwrap_or(0));
         assert_eq!(chunk.end, v["end"].as_u64().unwrap_or(0));
-        // KNOWN (F4, unfixed): `code` is narrowed with `as i32`, so 4294967297 reads as 1. Only
-        // codes that fit are held to the property; drop the range test when the parser is fixed
-        // (corpus/jobs/known-code-truncation is the input).
-        if let JobStatus::Ended(c) | JobStatus::ShellExited(c) = chunk.status
-            && v["code"].as_i64().is_some_and(|w| i32::try_from(w).is_ok())
-        {
+        if let JobStatus::Ended(c) | JobStatus::ShellExited(c) = chunk.status {
             assert_eq!(Some(i64::from(c)), v["code"].as_i64(), "status code: {v}");
         }
+    }
+    // A present code that does not fit an i32 is an error, whatever the state says.
+    let code_out_of_range = match v.get("code") {
+        None | Some(Value::Null) => false,
+        Some(c) => c.as_i64().and_then(|w| i32::try_from(w).ok()).is_none(),
+    };
+    if code_out_of_range {
+        assert!(parse_read(&v).is_err(), "an out-of-range code was accepted: {v}");
     }
     if let Ok(jobs) = parse_list(&v) {
         assert!(jobs.len() <= v["jobs"].as_array().map_or(0, Vec::len));
