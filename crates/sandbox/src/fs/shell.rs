@@ -1314,9 +1314,10 @@ fi
 }
 
 /// Create the empty temp `$tmp`, mode 0600 when `$t` exists (a new file's temp gets the default mode,
-/// which is the file's mode), after refusing a target the caller may not write: the write needs no
-/// read permission on the file, and a read-only file is refused here, by `[ -w ]`, with the message
-/// `std` gives. The temp is 0600 so the size check can read it back whatever the file's mode is (a
+/// which is the file's mode), then refuse a target the caller may not write, by `[ -w ]`, with the
+/// message `std` gives. The refusal comes after the temp is created so that a read-only or full
+/// filesystem reports its own error (`Read-only file system`), not `Permission denied`. The write needs
+/// no read permission on the file. The temp is 0600 so the size check can read it back whatever the file's mode is (a
 /// file its owner may write but not read, mode 0200, is replaced); [`copy_mode!`] gives it the file's
 /// mode just before the `mv`, and a 0600 file's bytes are never in a world-readable temp.
 ///
@@ -1326,13 +1327,14 @@ macro_rules! new_temp {
     () => {
         concat!(
             not_a_directory!(),
-            r#"if [ -e "$t" ] && [ ! -w "$t" ]; then
-  echo "Permission denied (os error 13)" >&2
-  exit 1
-fi
-set -C
+            r#"set -C
 if [ -e "$t" ]; then (umask 077; : > "$tmp") || exit 1; else : > "$tmp" || exit 1; fi
 set +C
+if [ -e "$t" ] && [ ! -w "$t" ]; then
+  echo "Permission denied (os error 13)" >&2
+  rm -f "$tmp"
+  exit 1
+fi
 "#
         )
     };

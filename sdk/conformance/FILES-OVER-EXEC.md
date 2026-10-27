@@ -289,13 +289,15 @@ resolution, in order:
 3. a target that is a directory is refused (`Is a directory (os error 21)`, exit
    1), before the temp exists, because `mv -f` would move the temp _into_ it
    and report success;
-4. if the target exists and `[ -w TARGET ]` is false, the write is refused
-   (`Permission denied (os error 13)`, exit 1) before the temp exists; the
-   temp is then created empty with `set -C` (no-clobber: a preplanted temp is
+4. the temp is created empty with `set -C` (no-clobber: a preplanted temp is
    refused, not followed) under `umask 077` (mode 0600), or
    with the default mode when the target does not exist, so the size check in
    step 5 can read it back whatever the file's mode is: **a write needs no
-   read permission on the file** (a mode 0200 file is replaced);
+   read permission on the file** (a mode 0200 file is replaced). Creating the
+   temp comes first, so a read-only filesystem reports its own
+   `Read-only file system` and a full one its own error. Then, if the target
+   exists and `[ -w TARGET ]` is false, the temp is removed and the write is
+   refused (`Permission denied (os error 13)`, exit 1);
 5. the content is appended; the temp's size is checked against the expected
    byte count; the directory check runs again (a directory created meanwhile
    removes the temp and fails); if the target exists the temp gets its mode
@@ -340,7 +342,7 @@ Further rules:
 - The parent directory must exist (`not_found`); `write` does not create
   directories.
 - A file the caller may not write is refused with `permission_denied` and
-  unchanged: the script tests `[ -w TARGET ]` before creating the temp.
+  unchanged: the script tests `[ -w TARGET ]` once the temp exists, and only then.
 - A file the caller may write but not read (mode 0200, 0333) is replaced: the
   temp is 0600 until the `mv`, so the size check can read it.
 - A write onto a **directory** MUST fail and change nothing.
@@ -664,13 +666,14 @@ if [ -d "$t" ]; then
   echo "Is a directory (os error 21)" >&2
   exit 1
 fi
-if [ -e "$t" ] && [ ! -w "$t" ]; then
-  echo "Permission denied (os error 13)" >&2
-  exit 1
-fi
 set -C
 if [ -e "$t" ]; then (umask 077; : > "$tmp") || exit 1; else : > "$tmp" || exit 1; fi
 set +C
+if [ -e "$t" ] && [ ! -w "$t" ]; then
+  echo "Permission denied (os error 13)" >&2
+  rm -f "$tmp"
+  exit 1
+fi
 if cat >> "$tmp"; then
   n=$(wc -c < "$tmp")
   if [ $n -eq "$3" ]; then
@@ -716,13 +719,14 @@ if [ -d "$t" ]; then
   echo "Is a directory (os error 21)" >&2
   exit 1
 fi
-if [ -e "$t" ] && [ ! -w "$t" ]; then
-  echo "Permission denied (os error 13)" >&2
-  exit 1
-fi
 set -C
 if [ -e "$t" ]; then (umask 077; : > "$tmp") || exit 1; else : > "$tmp" || exit 1; fi
 set +C
+if [ -e "$t" ] && [ ! -w "$t" ]; then
+  echo "Permission denied (os error 13)" >&2
+  rm -f "$tmp"
+  exit 1
+fi
 fi
 printf %s "$3" | base64 -d >> "$tmp" || { rm -f "$tmp"; exit 1; }
 [ -z "$5" ] && exit 0
