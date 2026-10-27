@@ -1,0 +1,364 @@
+{
+  "suite": "environments",
+  "version": 1,
+  "description": "Environments a plain execd cannot give: a read-only mount, a directory the sandbox user may not write, and a disk that fills. A scenario runs only on a backend that provides its directory (`requires.vars`: RO, LOCKED, TINY); everywhere else it is skipped, visibly.",
+  "scenarios": [
+    {
+      "id": "environments.readonly.write-new-refused",
+      "description": "Writing a new file into a read-only mount is an error, and no temp file is left in the mount.",
+      "requires": {
+        "vars": [
+          "RO"
+        ]
+      },
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${RO}/new",
+          "data_b64": "aGk=",
+          "expect": {
+            "error": {
+              "kind": "io",
+              "detail": {
+                "$re": "(?i)read-only file system"
+              }
+            }
+          }
+        },
+        {
+          "id": "gone",
+          "op": "stat",
+          "path": "${RO}/new",
+          "expect": {
+            "ok": {
+              "exists": false
+            }
+          }
+        },
+        {
+          "id": "nothing-left",
+          "op": "list",
+          "path": "${RO}",
+          "include_hidden": true,
+          "expect": {
+            "ok": {
+              "entries": {
+                "$unordered": [
+                  {
+                    "name": "existing"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "environments.readonly.overwrite-refused",
+      "description": "Overwriting a file on a read-only mount is an error and the old content is intact (the replacement cannot even be staged).",
+      "requires": {
+        "vars": [
+          "RO"
+        ]
+      },
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${RO}/existing",
+          "data_b64": "bmV3Cg==",
+          "expect": {
+            "error": {
+              "kind": "io",
+              "detail": {
+                "$re": "(?i)read-only file system"
+              }
+            }
+          }
+        },
+        {
+          "id": "old-intact",
+          "op": "read",
+          "path": "${RO}/existing",
+          "expect": {
+            "ok": {
+              "data_utf8": "old\n"
+            }
+          }
+        },
+        {
+          "id": "nothing-left",
+          "op": "list",
+          "path": "${RO}",
+          "include_hidden": true,
+          "expect": {
+            "ok": {
+              "entries": {
+                "$unordered": [
+                  {
+                    "name": "existing"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "environments.readonly.mkdir-refused",
+      "description": "Making a directory on a read-only mount is an error and leaves nothing.",
+      "requires": {
+        "vars": [
+          "RO"
+        ]
+      },
+      "steps": [
+        {
+          "id": "mk",
+          "op": "mkdir",
+          "path": "${RO}/sub",
+          "expect": {
+            "error": {
+              "kind": "io",
+              "detail": {
+                "$re": "(?i)read-only file system"
+              }
+            }
+          }
+        },
+        {
+          "id": "gone",
+          "op": "stat",
+          "path": "${RO}/sub",
+          "expect": {
+            "ok": {
+              "exists": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "environments.locked.write-refused",
+      "description": "A directory the sandbox user may not write refuses a new file and a replacement with permission_denied, and leaves nothing behind.",
+      "requires": {
+        "vars": [
+          "LOCKED"
+        ],
+        "not_root": true
+      },
+      "steps": [
+        {
+          "id": "w-new",
+          "op": "write",
+          "path": "${LOCKED}/new",
+          "data_b64": "aGk=",
+          "expect": {
+            "error": {
+              "kind": "permission_denied"
+            }
+          }
+        },
+        {
+          "id": "w-over",
+          "op": "write",
+          "path": "${LOCKED}/existing",
+          "data_b64": "bmV3Cg==",
+          "expect": {
+            "error": {
+              "kind": "permission_denied"
+            }
+          }
+        },
+        {
+          "id": "old-intact",
+          "op": "read",
+          "path": "${LOCKED}/existing",
+          "expect": {
+            "ok": {
+              "data_utf8": "old\n"
+            }
+          }
+        },
+        {
+          "id": "nothing-left",
+          "op": "list",
+          "path": "${LOCKED}",
+          "include_hidden": true,
+          "expect": {
+            "ok": {
+              "entries": {
+                "$unordered": [
+                  {
+                    "name": "existing"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "environments.tinydisk.new-file-fills-disk",
+      "description": "A write larger than the free space is an error (no space left) and leaves no partial file or temp.",
+      "requires": {
+        "vars": [
+          "TINY"
+        ]
+      },
+      "setup": [
+        {
+          "id": "dir",
+          "op": "exec",
+          "command": "mkdir",
+          "args": [
+            "-p",
+            "${TINY}/new"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "keep",
+          "op": "write",
+          "path": "${TINY}/new/keep",
+          "data_b64": "b2xkCg=="
+        },
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${TINY}/new/big",
+          "data_b64": {
+            "$repeat": {
+              "b64": "QQ==",
+              "times": 2097152
+            }
+          },
+          "expect": {
+            "error": {
+              "kind": "io",
+              "detail": {
+                "$re": "(?i)no space left"
+              }
+            }
+          }
+        },
+        {
+          "id": "gone",
+          "op": "stat",
+          "path": "${TINY}/new/big",
+          "expect": {
+            "ok": {
+              "exists": false
+            }
+          }
+        },
+        {
+          "id": "old-intact",
+          "op": "read",
+          "path": "${TINY}/new/keep",
+          "expect": {
+            "ok": {
+              "data_utf8": "old\n"
+            }
+          }
+        },
+        {
+          "id": "nothing-left",
+          "op": "list",
+          "path": "${TINY}/new",
+          "include_hidden": true,
+          "expect": {
+            "ok": {
+              "entries": {
+                "$unordered": [
+                  {
+                    "name": "keep"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "environments.tinydisk.overwrite-fills-disk",
+      "description": "A replacement that does not fit is an error and the old file is intact, with no temp left.",
+      "requires": {
+        "vars": [
+          "TINY"
+        ]
+      },
+      "setup": [
+        {
+          "id": "dir",
+          "op": "exec",
+          "command": "mkdir",
+          "args": [
+            "-p",
+            "${TINY}/over"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "keep",
+          "op": "write",
+          "path": "${TINY}/over/keep",
+          "data_b64": "b2xkCg=="
+        },
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${TINY}/over/keep",
+          "data_b64": {
+            "$repeat": {
+              "b64": "QQ==",
+              "times": 2097152
+            }
+          },
+          "expect": {
+            "error": {
+              "kind": "io",
+              "detail": {
+                "$re": "(?i)no space left"
+              }
+            }
+          }
+        },
+        {
+          "id": "old-intact",
+          "op": "read",
+          "path": "${TINY}/over/keep",
+          "expect": {
+            "ok": {
+              "data_utf8": "old\n"
+            }
+          }
+        },
+        {
+          "id": "nothing-left",
+          "op": "list",
+          "path": "${TINY}/over",
+          "include_hidden": true,
+          "expect": {
+            "ok": {
+              "entries": {
+                "$unordered": [
+                  {
+                    "name": "keep"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

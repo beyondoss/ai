@@ -598,6 +598,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "beyond-exec-notify",
+ "beyond-sandbox-conformance",
  "beyond-test-support",
  "getrandom 0.3.4",
  "globset",
@@ -614,6 +615,25 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+]
+
+[[package]]
+name = "beyond-sandbox-conformance"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "beyond-sandbox",
+ "beyond-test-support",
+ "clap",
+ "hex",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "toml",
 ]
 
 [[package]]
