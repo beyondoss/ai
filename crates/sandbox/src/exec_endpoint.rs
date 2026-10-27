@@ -39,8 +39,8 @@
 //! specifics belong — not in here.
 //!
 //! **v1.1 is backward compatible.** `stdin_base64` and `output_base64` (below) are the only
-//! additions. Only `ShellFs`'s file writes send `stdin_base64`, after a probe (`cat` must echo `stdin-probe`) has shown the endpoint honors it. A
-//! v1 endpoint ignores the unknown field and answers the probe with empty stdout, so writes fall back
+//! additions. Only `ShellFs`'s file writes send `stdin_base64`, after a probe (`cat` must echo
+//! `stdin-probe`) has shown the endpoint honors it. A v1 endpoint ignores the unknown field and answers the probe with empty stdout, so writes fall back
 //! to argv-sized chunks. The field is never trusted blindly: writing through an endpoint that dropped
 //! it would silently produce *empty files*.
 //!
@@ -69,9 +69,9 @@
 //!   The values are standard base64 with padding (RFC 4648 section 4). It MUST NOT also send
 //!   `stdout`/`stderr`, and a client that finds both reads the base64 and ignores the text. An answer
 //!   with only one of the two base64 fields is malformed: a client reports an error rather than read
-//!   the missing stream as empty. Everything else (`exit_code`, the
-//!   deadline's `124` and the note ending stderr, a command that cannot be started answered `127`
-//!   with its reason as stderr, status codes, `timeout_ms`, `stdin_base64`) is as without the field.
+//!   the missing stream as empty. Everything else (`exit_code`, the deadline's `124` and the note
+//!   ending stderr, a command that cannot be started answered `127` with its reason as stderr,
+//!   status codes, `timeout_ms`, `stdin_base64`) is as without the field.
 //!   A timeout note is appended to the decoded stderr bytes, a newline first if stderr did not end
 //!   in one.
 //! - **An endpoint that does not** ignores the field, like any unknown field, and answers with
