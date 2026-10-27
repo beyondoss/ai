@@ -1131,7 +1131,7 @@ else t=o
 fi
 if [ -w "$1" ]; then w=w; else w=-; fi
 printf '%s	%s	' "$w" "$t"
-stat -c '%s	%Y' -- "$1" 2>/dev/null || printf '0	0'
+stat -L -c '%s	%Y' -- "$1" 2>/dev/null || printf '0	0'
 printf '
 '"#;
 
@@ -1565,6 +1565,27 @@ pub fn query(pattern: &str, root: PathBuf, limit: usize) -> SearchQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stat_script_follows_a_symlink_for_size_and_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::write(d.join("t"), "hello world\n").unwrap();
+        std::os::unix::fs::symlink("t", d.join("a-rather-long-link-name")).unwrap();
+        std::os::unix::fs::symlink("gone", d.join("dangling")).unwrap();
+        let run = |name: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", STAT_SCRIPT, "sh"])
+                .arg(d.join(name))
+                .output()
+                .unwrap()
+        };
+        let out = run("a-rather-long-link-name");
+        let line = String::from_utf8(out.stdout).unwrap();
+        let f: Vec<&str> = line.trim_end().split('\t').collect();
+        assert_eq!((f[1], f[2]), ("f", "12"), "{line:?}");
+        assert_eq!(run("dangling").status.code(), Some(1));
+    }
 
     /// This host's `sh`, with a prelude run before every script. A `PATH` shim, not a shell function,
     /// because the read script `exec`s `dd`, which skips functions.
