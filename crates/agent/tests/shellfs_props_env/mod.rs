@@ -1032,7 +1032,8 @@ impl Machine {
         match got {
             Err(e) => {
                 let k = self.kind(&e, &p);
-                if report.errored {
+                // A listing larger than the configured response cap is refused, as a search is.
+                if report.errored || (self.cfg.cap.is_some() && k == Kind::TooLarge) {
                     return;
                 }
                 let ok = match &meta {

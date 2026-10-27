@@ -273,7 +273,7 @@ impl ShellFs {
         // spans several shells, and unpredictable for the reason `LocalFs`'s is: a preplanted name
         // cannot redirect the write. Every script resolves the target the same way (`RESOLVE_TARGET`)
         // and names the temp beside the file it resolves to.
-        let suffix = super::temp_suffix();
+        let suffix = super::shell_temp_suffix();
         let outcome = if self.caps.stdin {
             let args = sh_script(
                 WRITE_STDIN_SCRIPT,
@@ -1292,14 +1292,14 @@ if [ -L "$t" ]; then
   echo "Too many levels of symbolic links (os error 40)" >&2
   exit 1
 fi
-tmp="$t.tmp.$2"
+case "$t" in */*) tmp="${t%/*}/.tmp.$2" ;; *) tmp=".tmp.$2" ;; esac
 "#
     };
 }
 
 /// Refuse a target that is a directory, with the message `std` gives (so both backends read alike).
 /// Without it the final `mv -f "$tmp" "$t"` moves the temp *into* the directory and exits 0: a write
-/// that reports success and leaves `DIR/DIR.tmp.SUFFIX` behind. `mv -T` would refuse atomically, but
+/// that reports success and leaves `DIR/.tmp.SUFFIX` inside the directory. `mv -T` would refuse atomically, but
 /// it is GNU-only; busybox has no such flag. So the check runs twice, before the temp exists and
 /// again immediately before the `mv`; a directory created at the target inside that last instant is
 /// the one remaining window, the same width as any check-then-rename on a shell.

@@ -5752,6 +5752,83 @@
           }
         }
       ]
+    },
+    {
+      "id": "files.write.name-of-255-bytes-new-file",
+      "description": "A file whose name is NAME_MAX (255 bytes) can be created: the temp is `.tmp.` plus 16 hex digits in the same directory, not derived from the name; none survives.",
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "data_b64": "eAo=",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "content",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "cd \"$1\"; cat aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; ls -A | grep -c \"^[.]tmp[.]\" || true",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "x\n0\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.name-of-250-bytes-existing-file",
+      "description": "An existing file whose name is 250 bytes can be replaced (a temp named from it would exceed NAME_MAX); no temp survives.",
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "data_b64": "eAo=",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "content",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "cd \"$1\"; cat bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; ls -A | grep -c \"^[.]tmp[.]\" || true",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "x\n0\n"
+            }
+          }
+        }
+      ],
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "cd \"$1\"; printf old > bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ]
     }
   ]
 }

@@ -268,10 +268,15 @@ Rules:
 
 `write(path, bytes)`: replace the file's whole content, atomically.
 
-The write goes to a temp file `T.tmp.SUFFIX` **beside the file the path
-resolves to**, and is committed with `mv -f`. `SUFFIX` is chosen by the client
-per write, unpredictable (at least 64 bits of randomness, lowercase hex), so a
-preplanted name cannot redirect the write. The scripts (C and D below) do the
+The write goes to a temp file **in the directory of the file the path
+resolves to** (so the `mv` is a rename within one filesystem), named
+`.tmp.SUFFIX` whatever the target is called, and is committed with `mv -f`.
+`SUFFIX` is chosen by the client per write: **exactly 16 lowercase hex digits**
+(64 random bits, unpredictable), so a preplanted name cannot redirect the
+write. The name is therefore always 21 bytes, and a target whose own name is
+anything up to `NAME_MAX` (255 bytes) can be written; a name derived from the
+target's (`NAME.tmp.SUFFIX`) overflowed `NAME_MAX` for names over about 230
+bytes. The scripts (C and D below) do the
 resolution, in order:
 
 1. a path starting with `-` is prefixed with `./`;
@@ -661,7 +666,7 @@ if [ -L "$t" ]; then
   echo "Too many levels of symbolic links (os error 40)" >&2
   exit 1
 fi
-tmp="$t.tmp.$2"
+case "$t" in */*) tmp="${t%/*}/.tmp.$2" ;; *) tmp=".tmp.$2" ;; esac
 if [ -d "$t" ]; then
   echo "Is a directory (os error 21)" >&2
   exit 1
@@ -713,7 +718,7 @@ if [ -L "$t" ]; then
   echo "Too many levels of symbolic links (os error 40)" >&2
   exit 1
 fi
-tmp="$t.tmp.$2"
+case "$t" in */*) tmp="${t%/*}/.tmp.$2" ;; *) tmp=".tmp.$2" ;; esac
 if [ "$4" = new ]; then
 if [ -d "$t" ]; then
   echo "Is a directory (os error 21)" >&2
@@ -767,7 +772,7 @@ if [ -L "$t" ]; then
   echo "Too many levels of symbolic links (os error 40)" >&2
   exit 1
 fi
-tmp="$t.tmp.$2"
+case "$t" in */*) tmp="${t%/*}/.tmp.$2" ;; *) tmp=".tmp.$2" ;; esac
 rm -f "$tmp"
 ```
 
