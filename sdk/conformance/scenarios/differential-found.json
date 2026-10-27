@@ -89,7 +89,7 @@
     },
     {
       "id": "differential-found.search.git-file-not-utf8",
-      "description": "A file called .git whose content is not UTF-8, in a directory above the search root, does not make the search fail. ripgrep reads the nearest .git as a gitdir pointer, complains on stderr (`stream did not contain valid UTF-8`) and exits 2; the line is not a per-path OS error, so the clients report invalid_query although the pattern is fine and the matches were printed.",
+      "description": "A file called .git whose content is not UTF-8, in a directory above the search root, does not make the search fail. ripgrep reads the nearest .git as a gitdir pointer, complains on stderr (`stream did not contain valid UTF-8`) and exits 2; FILES-OVER-EXEC (search, exit codes) counts that line as a per-path error, so the search succeeds with a note and the matches are returned.",
       "requires": {
         "search_engine": "rg"
       },
@@ -113,15 +113,6 @@
           "root": "${ROOT}/sub",
           "pattern": "needle",
           "literal": true,
-          "xfail": {
-            "drivers": [
-              "agent-reference",
-              "beyond-sandbox-ts",
-              "python",
-              "python-async"
-            ],
-            "reason": "rg's complaint about the unreadable .git file above the root is not an OS error, so its exit 2 reads as a rejected pattern"
-          },
           "expect": {
             "ok": {
               "hits": []
@@ -134,15 +125,6 @@
           "root": "${ROOT}/sub",
           "pattern": "nothing",
           "literal": true,
-          "xfail": {
-            "drivers": [
-              "agent-reference",
-              "beyond-sandbox-ts",
-              "python",
-              "python-async"
-            ],
-            "reason": "rg's complaint about the unreadable .git file above the root is not an OS error, so its exit 2 reads as a rejected pattern"
-          },
           "expect": {
             "ok": {
               "hits": [

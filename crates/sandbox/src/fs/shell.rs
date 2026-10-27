@@ -1380,12 +1380,14 @@ enum SearchFailure {
 /// Per-path read errors name the path and end in the OS message (`rg` appends ` (os error N)`).
 /// Anything else on stderr is the engine complaining about the pattern.
 fn classify_search_failure(stderr: &str, root: &str) -> SearchFailure {
-    const OS_ERRORS: [&str; 5] = [
+    const OS_ERRORS: [&str; 6] = [
         "No such file or directory",
         "Permission denied",
         "Is a directory",
         "Too many levels of symbolic links",
         "Input/output error",
+        // rg reading a `.git` file (a gitdir pointer) that is not text.
+        "stream did not contain valid UTF-8",
     ];
     let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
     let path_error = |l: &str| {

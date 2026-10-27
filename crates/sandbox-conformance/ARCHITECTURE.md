@@ -46,7 +46,7 @@ A sequence ends with a read-back of every path it named, so the final tree is co
 is no host filesystem to read, so only (1) applies. Hegel shrinks a difference to a minimal sequence and the test prints it,
 and writes it to `target/differential/<backend>.json`, as a scenario file.
 
-Open defects are tolerated by id so one cannot hide the rest: `N1..N4` (the property test's, in `oracle.rs`), `D2`, `D3`, `D5` (found
+Open defects are tolerated by id so one cannot hide the rest: `N1..N4` (the property test's, in `oracle.rs`), `D3`, `D5` (found
 here, in `known.rs` and `oracle.rs`), each with a scenario in `differential-found.json` or `files.json`. A fix deletes
 its entry and its `xfail` mark.
 

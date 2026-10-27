@@ -463,14 +463,22 @@ character is copied.
 
 Exit 0 (matches) and 1 (none) are success. Exit 124, or the endpoint's own
 timeout, is `timeout`. Any other exit is told apart by stderr, since the cases
-share exit 2:
+share exit 2.
 
-- every stderr line is a per-path OS error (`PATH: No such file or directory`,
-  `Permission denied`, `Is a directory`, ...; `rg` adds `(os error N)`) and one
-  of them names the search root itself as missing: `not_found`;
-- every line is a per-path OS error otherwise: success. The hits on stdout are
+A stderr line is a **per-path error** when it ends in an OS message (`PATH: No
+such file or directory`, `Permission denied`, `Is a directory`, `Too many levels
+of symbolic links`, `Input/output error`; `rg` adds `(os error N)`) or in
+`stream did not contain valid UTF-8` (`rg` reading a `.git` file, in or above
+the root, that is not text; the search itself ran, and no flag turns that read
+off without also turning off the `.gitignore` handling the helper promises). Then:
+
+- every stderr line is a per-path error and one of them names the search root
+  itself as missing: `not_found`;
+- every line is a per-path error otherwise: success. The hits on stdout are
   returned and `note` says how many paths were skipped and names the first;
-- anything else (or empty stderr) is the engine rejecting the pattern:
+- anything else (or empty stderr) is the engine rejecting the pattern, whatever
+  stdout holds (`rg: regex parse error:`, `rg: error parsing glob ...`,
+  `rg: compiled regex exceeds size limit ...` are such lines):
   `invalid_query` with detail `bad regex: STDERR` (trimmed; `bad regex: PROGRAM
   rejected the pattern` if stderr is empty).
 

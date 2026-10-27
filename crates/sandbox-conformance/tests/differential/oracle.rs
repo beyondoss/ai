@@ -459,16 +459,6 @@ pub fn after(
             match (ok, err) {
                 (None, Some(e)) => {
                     let k = kind_of(e);
-                    // D2: rg reads a file called `.git` as a gitdir pointer and says so on stderr
-                    // when it is not UTF-8; that line is not a per-path OS error, so it is read as a
-                    // rejected pattern when nothing matched.
-                    if k == Kind::InvalidQuery
-                        && e["detail"]
-                            .as_str()
-                            .is_some_and(|d| d.contains("stream did not contain valid UTF-8"))
-                    {
-                        return Ok(Some("D2"));
-                    }
                     // The busybox rung is forced on a GNU grep here (the container backends have the
                     // real busybox), whose "binary file matches" notice is on stderr and so reads as
                     // a rejected pattern; busybox prints it on stdout.

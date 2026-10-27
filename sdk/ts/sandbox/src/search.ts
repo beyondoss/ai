@@ -284,6 +284,8 @@ const OS_ERRORS = [
   "Is a directory",
   "Too many levels of symbolic links",
   "Input/output error",
+  // rg reading a `.git` file (a gitdir pointer) that is not text.
+  "stream did not contain valid UTF-8",
 ];
 
 /**
