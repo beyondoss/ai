@@ -156,7 +156,12 @@ describe("driver without an endpoint", () => {
     });
     expect(ex).toEqual({
       id: 8,
-      ok: { exit_code: 2, stdout_b64: b64("x"), stderr_b64: "" },
+      ok: {
+        exit_code: 2,
+        stdout_b64: b64("x"),
+        stderr_b64: "",
+        exact: true,
+      },
     });
     const es = await ask(d, {
       id: 9,

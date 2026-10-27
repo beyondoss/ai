@@ -49,6 +49,8 @@ pub struct Driver {
     connect_error: Option<Value>,
     caps: Capabilities,
     streams: bool,
+    /// The endpoint honours `output_base64` (probed).
+    output_base64: bool,
     native_jobs: bool,
 }
 
@@ -258,6 +260,10 @@ impl Driver {
             ),
             None => (connect_error.is_none() && runner.attaches().await, false),
         };
+        let output_base64 = match &http {
+            Some(http) => connect_error.is_none() && http.outputs_base64().await,
+            None => false,
+        };
         let jobs = beyond_sandbox::Jobs::over(runner.clone());
         Self {
             runner,
@@ -267,6 +273,7 @@ impl Driver {
             connect_error,
             caps,
             streams,
+            output_base64,
             native_jobs,
         }
     }
@@ -349,6 +356,9 @@ impl Driver {
         Ok(json!({
             "stdin": self.caps.stdin,
             "stream": self.streams,
+            "output_base64": self.output_base64,
+            // Raw exec returns the command's bytes: over `output_base64`, else over a v1.2 stream.
+            "exact_exec": self.output_base64 || self.streams,
             "jobs": jobs,
             "search_engine": engine,
             "find_printf": self.caps.find_printf,
@@ -385,19 +395,21 @@ impl Driver {
         let args = strings(req, "args")?;
         let cwd = opt_str(req, "cwd")?;
         let timeout = Duration::from_millis(u64_arg(req, "timeout_ms")?.unwrap_or(120_000));
-        let r = if !req["stdin_b64"].is_null() {
-            let stdin = bytes_arg(req, "stdin_b64")?;
-            self.runner
-                .run_with_stdin(command, &args, cwd, timeout, &stdin)
-                .await
+        let stdin = if req["stdin_b64"].is_null() {
+            None
         } else {
-            self.runner.run(command, &args, cwd, timeout).await
-        }
-        .map_err(|e| io_err(&e))?;
+            Some(bytes_arg(req, "stdin_b64")?)
+        };
+        let r = self
+            .runner
+            .run_exact(command, &args, cwd, timeout, stdin.as_deref())
+            .await
+            .map_err(|e| io_err(&e))?;
         Ok(json!({
-            "exit_code": r.code.unwrap_or(-1),
-            "stdout_b64": b64(r.stdout.as_bytes()),
-            "stderr_b64": b64(r.stderr.as_bytes()),
+            "exit_code": r.code,
+            "stdout_b64": b64(&r.stdout),
+            "stderr_b64": b64(&r.stderr),
+            "exact": r.exact,
         }))
     }
 

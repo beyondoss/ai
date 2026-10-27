@@ -38,11 +38,73 @@
 //! front of a vendor's SDK is a few dozen lines on their side, and that seam is where vendor
 //! specifics belong — not in here.
 //!
-//! **v1.1 is backward compatible.** `stdin_base64` is the only addition, and only `ShellFs`'s file
-//! writes send it — after a probe (`cat` must echo `stdin-probe`) has shown the endpoint honors it. A
-//! v1 endpoint ignores the unknown field and answers the probe with empty stdout, so writes fall back
+//! **v1.1 is backward compatible.** `stdin_base64` and `output_base64` (below) are the only
+//! additions. Only `ShellFs`'s file writes send `stdin_base64`, after a probe (`cat` must echo
+//! `stdin-probe`) has shown the endpoint honors it. A v1 endpoint ignores the unknown field and answers the probe with empty stdout, so writes fall back
 //! to argv-sized chunks. The field is never trusted blindly: writing through an endpoint that dropped
 //! it would silently produce *empty files*.
+//!
+//! ## Exact output (v1.1 `output_base64`)
+//!
+//! The answer above carries stdout and stderr as JSON strings, and a string is text: a command that
+//! writes `ff 00 0a` (a `tar`, a `gzip`, a compiled artifact, `cat` of any binary) cannot be
+//! answered with its bytes, only with a rendering of them, and a rendering is a different value.
+//! An endpoint that converts invalid UTF-8 to U+FFFD answers *successfully* with corrupt data.
+//! `output_base64` asks for the bytes. The key words MUST, MUST NOT, SHOULD and MAY are used as in
+//! RFC 2119.
+//!
+//! ```jsonc
+//! // request: the v1.1 request plus the flag (mirrors stdin_base64)
+//! { "command": "cat", "args": ["/bin/ls"], "timeout_ms": 10000, "output_base64": true }
+//! // response — 200, from an endpoint that honours it
+//! { "exit_code": 0, "stdout_base64": "f0VMRg…", "stderr_base64": "" }
+//! ```
+//!
+//! - **Request.** `"output_base64": true`. Only the JSON value `true` asks; any other value, or the
+//!   field absent, is a request for text, and the endpoint answers exactly as before.
+//! - **An endpoint that honours it** MUST answer with `stdout_base64` and `stderr_base64`, both
+//!   present on every `200` answer (the empty string for no output), **instead of** `stdout` and
+//!   `stderr`, and MUST NOT apply a lossy conversion (UTF-8 replacement, newline translation,
+//!   trimming, truncation) to what they carry: the decoded bytes are the bytes the command wrote.
+//!   The values are standard base64 with padding (RFC 4648 section 4). It MUST NOT also send
+//!   `stdout`/`stderr`, and a client that finds both reads the base64 and ignores the text. An answer
+//!   with only one of the two base64 fields is malformed: a client reports an error rather than read
+//!   the missing stream as empty. Everything else (`exit_code`, the deadline's `124` and the note
+//!   ending stderr, a command that cannot be started answered `127` with its reason as stderr,
+//!   status codes, `timeout_ms`, `stdin_base64`) is as without the field.
+//!   A timeout note is appended to the decoded stderr bytes, a newline first if stderr did not end
+//!   in one.
+//! - **An endpoint that does not** ignores the field, like any unknown field, and answers with
+//!   `stdout`/`stderr` text. Nothing changes for it.
+//! - **The cap** (see below) applies to the **decoded** bytes: `len(stdout) + len(stderr)` after
+//!   decoding, together, must be at most the cap, whatever the base64 or the JSON around it
+//!   weighs. An endpoint with a cap MUST answer a command that wrote more as it answers an
+//!   oversized text response (`422`, naming the cap, saying the command ran), never with a prefix.
+//!   A client reading the body incrementally MAY stop at `4 * ceil(cap / 3) + 4096` body bytes
+//!   (the base64 of a cap's worth of output and the envelope around it) and treats that as over the
+//!   cap; it checks the decoded sum once it has the answer.
+//! - **Probe.** Support is learned, never assumed, once per connection: a request with
+//!   `"output_base64": true` running `sh -c "printf '\377\000\n'"` (the bytes `ff 00 0a`) is
+//!   answered by an endpoint that honours the field with `stdout_base64` decoding to exactly those
+//!   three bytes; anything else (text, no `stdout_base64`, other bytes) means it does not. A probe
+//!   whose *request* failed (unreachable, a non-2xx status other than `400`, an unparseable answer)
+//!   is an error and is asked again later, never "not supported". A `400` is the answer of a strict
+//!   front that refuses the unknown field: not supported.
+//! - **Clients.** The raw one-shot call returns **bytes**, with an `exact` flag. If the endpoint
+//!   honours `output_base64` the client always sends it. Otherwise, if the endpoint streams (v1.2)
+//!   the client runs the call over the stream, whose frames are base64, answering at the command's
+//!   exit (a `shell_exit` frame ends the call and the client closes the stream) and building the
+//!   v1.1 shape from the final frame: `exit_code` N, `128 + S` for a `signal` frame, `124` with the
+//!   note for `timed_out`. Otherwise (a plain v1.1 endpoint, or a call with stdin) the text the
+//!   endpoint gave is returned encoded as UTF-8, with `exact: false`: the client did not get the
+//!   bytes and says so. A client that sent the field and received no `stdout_base64`/`stderr_base64`
+//!   (one replica of a fleet in rollout) treats that answer as text, `exact: false`. Helpers that
+//!   parse text (file listings, search, jobs) are not affected.
+//! - **Conformance.** [`conformance::verify`] sends the probe to every endpoint. One that answers
+//!   with either field is held to the whole of the above (both fields, no text fields, all 256 byte
+//!   values intact on each stream, the exit code and the deadline unchanged); one that answers
+//!   text is a plain v1.1 endpoint, and the check is skipped. `tests/fixtures/exec/v1.1-output.json`
+//!   holds the response vectors every client decodes.
 //!
 //! **The response is capped** ([`DEFAULT_MAX_RESPONSE_BYTES`], `--exec-max-response-bytes`). The body
 //! is read incrementally and reading stops at the cap; an oversized response is an **error**, never a
@@ -50,7 +112,8 @@
 //! honest partial `ExecResult` to return (not even the exit code, which may come after the output),
 //! and presenting whatever fit as the command's output would be a confident wrong answer. The error
 //! says the command *did run*, so the caller narrows its output instead of blindly repeating a
-//! command that may not be idempotent. The cap applies to v1.1 objects only; a v1.2 stream is read
+//! command that may not be idempotent. With `output_base64` the cap is on the decoded bytes (see
+//! "Exact output"). The cap applies to v1.1 objects only; a v1.2 stream is read
 //! a frame at a time and never buffered whole.
 //!
 //! ## Streaming (v1.2)
@@ -788,10 +851,11 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::exec::{
-    ChunkSink, CommandRunner, ExecResult, JobHooks, Kill, STREAM_HEAD, STREAM_TAIL, SpawnSink,
-    UNTRACKED_DEADLINE, drain_capped, feed_stdin,
+    ChunkSink, CommandRunner, ExecOutput, ExecResult, JobHooks, Kill, STREAM_HEAD, STREAM_TAIL,
+    SpawnSink, UNTRACKED_DEADLINE, drain_capped, feed_stdin,
 };
 
+mod exact;
 mod far_kill;
 pub mod jobs;
 pub mod jobs_native;
@@ -816,6 +880,9 @@ struct ExecRequest<'a> {
     /// v1.3: a job operation (see "Sandbox jobs (v1.3)"). Absent means the command is run as ever.
     #[serde(skip_serializing_if = "Option::is_none")]
     job: Option<&'a serde_json::Value>,
+    /// v1.1: answer with `stdout_base64`/`stderr_base64` (see "Exact output"). Absent means text.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    output_base64: bool,
 }
 
 /// What the agent expects back. Extra fields are ignored, so an endpoint may return more.
@@ -827,6 +894,11 @@ pub struct ExecResponse {
     pub stdout: String,
     #[serde(default)]
     pub stderr: String,
+    /// v1.1 `output_base64`: the bytes, standard base64. Present only on an endpoint that honours it.
+    #[serde(default)]
+    pub stdout_base64: Option<String>,
+    #[serde(default)]
+    pub stderr_base64: Option<String>,
 }
 
 /// The `timeout_ms` a streamed `bash` job sends: `i32::MAX` ms (~24.8 days), the longest deadline
@@ -870,6 +942,8 @@ pub struct HttpExecRunner {
     /// and cached. A probe that could not reach the endpoint is not cached: that is an outage, not
     /// an answer.
     streams: tokio::sync::OnceCell<bool>,
+    /// Whether the endpoint honours `output_base64` (v1.1, "Exact output") — probed once, the same way.
+    output_probe: tokio::sync::OnceCell<bool>,
     /// Whether the sandbox can run jobs of its own ([`jobs::ShellJobs`]) — probed once, the same way.
     jobs_probe: Arc<tokio::sync::OnceCell<jobs::Baseline>>,
     /// What the endpoint offers for jobs: natively (v1.3, [`jobs_native`]), and `notify` (v1.4) —
@@ -911,6 +985,7 @@ impl HttpExecRunner {
             auth: None,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             streams: tokio::sync::OnceCell::new(),
+            output_probe: tokio::sync::OnceCell::new(),
             jobs_probe: Arc::default(),
             job_offer: tokio::sync::OnceCell::new(),
             suspect: None,
@@ -1004,14 +1079,24 @@ impl HttpExecRunner {
             stdin_base64: stdin.map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
             stream,
             job,
+            output_base64: false,
         };
+        self.send_request(timeout, &body).await
+    }
+
+    /// Send one request body and return the response once its status is known to be a success.
+    async fn send_request(
+        &self,
+        timeout: Duration,
+        body: &ExecRequest<'_>,
+    ) -> std::io::Result<reqwest::Response> {
         let mut token = match &self.auth {
             Some(auth) => Some(auth.token().await?),
             None => None,
         };
         let mut renewed = false;
         let resp = loop {
-            let mut req = self.client.post(&self.url).json(&body);
+            let mut req = self.client.post(&self.url).json(body);
             for (name, value) in &self.headers {
                 req = req.header(name.as_str(), value.as_str());
             }
@@ -1105,7 +1190,16 @@ impl HttpExecRunner {
     /// Read and parse a v1.1 response body: one JSON object, capped.
     #[doc(hidden)]
     pub async fn envelope(&self, resp: reqwest::Response) -> std::io::Result<ExecResponse> {
-        let (body, over_cap) = self.read_capped(resp).await?;
+        self.envelope_to(resp, self.max_response_bytes).await
+    }
+
+    /// [`Self::envelope`] reading at most `cap` bytes of body.
+    async fn envelope_to(
+        &self,
+        resp: reqwest::Response,
+        cap: usize,
+    ) -> std::io::Result<ExecResponse> {
+        let (body, over_cap) = self.read_capped_to(resp, cap).await?;
         if over_cap {
             // `FileTooLarge`, not `Other`: the command ran and the endpoint answered, so a probe
             // reads this as its answer (not a transport failure); see `Capabilities::probe`.
@@ -1131,11 +1225,16 @@ impl HttpExecRunner {
     /// Read the body incrementally, stopping at the cap instead of buffering whatever the endpoint
     /// sends. `true` means the cap was hit and the bytes returned are only a prefix.
     #[doc(hidden)]
-    pub async fn read_capped(
+    pub async fn read_capped(&self, resp: reqwest::Response) -> std::io::Result<(Vec<u8>, bool)> {
+        self.read_capped_to(resp, self.max_response_bytes).await
+    }
+
+    /// [`Self::read_capped`] with the cap given.
+    async fn read_capped_to(
         &self,
         mut resp: reqwest::Response,
+        cap: usize,
     ) -> std::io::Result<(Vec<u8>, bool)> {
-        let cap = self.max_response_bytes;
         // A declared length over the cap fails before a byte of it is read.
         let declared = resp.content_length().unwrap_or(0);
         if declared > cap as u64 {
@@ -1176,6 +1275,20 @@ impl CommandRunner for HttpExecRunner {
             stderr: parsed.stderr,
             ..Default::default()
         })
+    }
+
+    /// The command's bytes, never a lossy conversion of them: `output_base64` when the endpoint
+    /// honours it, else a v1.2 stream's base64 frames, else (a plain v1.1 endpoint) the text it
+    /// gave, said to be inexact. See the module doc's "Exact output".
+    async fn run_exact(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        stdin: Option<&[u8]>,
+    ) -> std::io::Result<ExecOutput> {
+        self.exact(program, args, cwd, timeout, stdin).await
     }
 
     async fn run(
@@ -1417,6 +1530,12 @@ impl HttpExecRunner {
     /// Whether this endpoint streams (v1.2), probing it the first time. See the module doc's "The
     /// probe".
     pub async fn streams(&self) -> bool {
+        self.try_streams().await.unwrap_or(false)
+    }
+
+    /// [`Self::streams`], but a probe that could not reach the endpoint is an error, not "no": for
+    /// the caller whose answer depends on it (`run_exact`). Not cached, so the next call asks again.
+    pub async fn try_streams(&self) -> std::io::Result<bool> {
         self.streams
             .get_or_try_init(|| async {
                 let resp = match self
@@ -1452,7 +1571,6 @@ impl HttpExecRunner {
             })
             .await
             .copied()
-            .unwrap_or(false)
     }
 
     /// The v1.2 exchange. Falls back to v1.1 when the endpoint has not proved it streams, or when it

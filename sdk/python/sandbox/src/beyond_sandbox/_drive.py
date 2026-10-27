@@ -102,7 +102,7 @@ def drive_iter(op: Op[T], transport: Transport) -> Iterator[Any]:
         while True:
             try:
                 if isinstance(effect, Run):
-                    answer: Any = transport.run(
+                    answer: Any = getattr(transport, "run_text", transport.run)(
                         effect.command,
                         effect.args,
                         timeout_ms=effect.timeout_ms,
@@ -162,7 +162,7 @@ async def adrive_emit(
         while True:
             try:
                 if isinstance(effect, Run):
-                    answer: Any = await transport.run(
+                    answer: Any = await getattr(transport, "run_text", transport.run)(
                         effect.command,
                         effect.args,
                         timeout_ms=effect.timeout_ms,

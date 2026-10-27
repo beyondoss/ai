@@ -373,6 +373,30 @@ impl CommandRunner for CellRunner {
         }
     }
 
+    /// Forwarded, so a cell over an endpoint that honours `output_base64` returns bytes, not the
+    /// default's text.
+    async fn run_exact(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        stdin: Option<&[u8]>,
+    ) -> std::io::Result<beyond_sandbox::exec::ExecOutput> {
+        match self.target().await? {
+            Some(t) => {
+                t.runner()
+                    .run_exact(program, args, cwd, timeout, stdin)
+                    .await
+            }
+            None => {
+                crate::tools::exec::RealRunner
+                    .run_exact(program, args, cwd, timeout, stdin)
+                    .await
+            }
+        }
+    }
+
     async fn run_streaming(
         &self,
         program: &str,

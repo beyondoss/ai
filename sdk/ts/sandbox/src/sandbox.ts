@@ -8,8 +8,14 @@ import { Jobs } from "./jobs.js";
 import type { JobsOptions } from "./jobs.js";
 import type { Frame, RunOptions, RunResult, Transport } from "./transport.js";
 
-/** What {@link Sandbox.exec} returns: the raw result plus the output decoded as UTF-8 text. */
+/**
+ * What {@link Sandbox.exec} returns: the command's output as **bytes**, plus the same decoded as
+ * UTF-8 text (invalid sequences as U+FFFD: lossy by construction, use the bytes when they matter).
+ * `exact` says whether the bytes are all the command wrote: they are over an endpoint that honours
+ * `output_base64` or streams, and not over a plain v1.1 endpoint, which can only answer text.
+ */
 export interface ExecResult extends RunResult {
+  exact: boolean;
   stdoutText: string;
   stderrText: string;
 }
@@ -78,7 +84,12 @@ export class Sandbox {
         ? { stdin: typeof stdin === "string" ? utf8(stdin) : stdin }
         : {}),
     });
-    return { ...r, stdoutText: text(r.stdout), stderrText: text(r.stderr) };
+    return {
+      ...r,
+      exact: r.exact ?? true,
+      stdoutText: text(r.stdout),
+      stderrText: text(r.stderr),
+    };
   }
 
   /**

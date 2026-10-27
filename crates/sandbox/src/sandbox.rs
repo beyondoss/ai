@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::exec::{ChunkSink, CommandRunner, ExecResult};
+use crate::exec::{ChunkSink, CommandRunner, ExecOutput, ExecResult};
 use crate::exec_endpoint::HttpExecRunner;
 use crate::exec_endpoint::jobs::{SandboxJobs, ShellJobs};
 use crate::fs::shell::ShellFs;
@@ -129,21 +129,20 @@ impl Command<'_> {
         self
     }
 
-    /// Run to completion and return the captured output.
-    pub async fn run(self) -> std::io::Result<ExecResult> {
-        let cwd = self.cwd.as_deref();
-        match &self.stdin {
-            Some(stdin) => {
-                self.exec
-                    .run_with_stdin(&self.program, &self.args, cwd, self.timeout, stdin)
-                    .await
-            }
-            None => {
-                self.exec
-                    .run(&self.program, &self.args, cwd, self.timeout)
-                    .await
-            }
-        }
+    /// Run to completion and return the captured output as **bytes**, with
+    /// [`exact`](ExecOutput::exact) saying whether they are all the command wrote: they are over an
+    /// endpoint that honours `output_base64` or streams, and not over a plain v1.1 endpoint, which
+    /// can only answer text.
+    pub async fn run(self) -> std::io::Result<ExecOutput> {
+        self.exec
+            .run_exact(
+                &self.program,
+                &self.args,
+                self.cwd.as_deref(),
+                self.timeout,
+                self.stdin.as_deref(),
+            )
+            .await
     }
 
     /// Run to completion, handing `on_chunk` each chunk of output as it arrives. Over an exec that
@@ -152,7 +151,13 @@ impl Command<'_> {
     /// not streamed.
     pub async fn stream(self, on_chunk: ChunkSink<'_>) -> std::io::Result<ExecResult> {
         if self.stdin.is_some() {
-            return self.run().await;
+            let out = self.run().await?;
+            return Ok(ExecResult {
+                code: Some(out.code),
+                stdout: out.stdout_text().into_owned(),
+                stderr: out.stderr_text().into_owned(),
+                ..Default::default()
+            });
         }
         self.exec
             .run_streaming(

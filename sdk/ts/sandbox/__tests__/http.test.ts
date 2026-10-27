@@ -35,6 +35,7 @@ describe("HttpTransport.run", () => {
       cwd: "/w",
       timeoutMs: 5000,
       stdin: utf8("in"),
+      text: true,
     });
     expect(r.exitCode).toBe(3);
     expect(text(r.stdout)).toBe("héllo");
@@ -53,7 +54,7 @@ describe("HttpTransport.run", () => {
 
   it("sends no Authorization without a token, and no cwd or stdin unless given", async () => {
     const e = await endpoint((_, res) => json(res, 200, ok()));
-    await new HttpTransport({ url: e.url }).run("true", []);
+    await new HttpTransport({ url: e.url }).run("true", [], { text: true });
     expect(e.requests[0]!.headers.authorization).toBeUndefined();
     expect(e.requests[0]!.body).toEqual({
       command: "true",
@@ -73,14 +74,14 @@ describe("HttpTransport.run", () => {
       url: e.url,
       token: async () => `t${++calls}`,
     });
-    expect(text((await t.run("x", [])).stdout)).toBe("fine");
+    expect(text((await t.run("x", [], { text: true })).stdout)).toBe("fine");
     expect(calls).toBe(2);
     expect(e.requests.map((r) => r.headers.authorization)).toEqual([
       "Bearer t1",
       "Bearer t2",
     ]);
     // The refreshed token is kept: no second refresh for the next request.
-    await t.run("x", []);
+    await t.run("x", [], { text: true });
     expect(calls).toBe(2);
   });
 
@@ -168,7 +169,9 @@ describe("HttpTransport.run", () => {
       /* never answers */
     });
     const t = new HttpTransport({ url: e.url, deadlineGraceMs: 50 });
-    expect(await kindOf(t.run("x", [], { timeoutMs: 50 }))).toBe("timeout");
+    expect(await kindOf(t.run("x", [], { timeoutMs: 50, text: true }))).toBe(
+      "timeout",
+    );
   });
 
   it("reads incrementally and errors over the cap instead of returning a partial result", async () => {
@@ -211,7 +214,11 @@ describe("probes", () => {
       json(res, 200, ok(seen.body.job ? "exec-v1.2" : "a"))
     );
     const t = new HttpTransport({ url: e.url });
-    expect(await t.offers()).toEqual({ stream: false, nativeJobs: false });
+    expect(await t.offers()).toEqual({
+      stream: false,
+      nativeJobs: false,
+      outputBase64: false,
+    });
     const before = e.requests.length;
     const it = t.stream("echo", ["hi"]);
     expect(await kindOf(it.next())).toBe("not_offered");
@@ -224,7 +231,11 @@ describe("probes", () => {
       res.end("unknown field");
     });
     const t = new HttpTransport({ url: e.url });
-    expect(await t.offers()).toEqual({ stream: false, nativeJobs: false });
+    expect(await t.offers()).toEqual({
+      stream: false,
+      nativeJobs: false,
+      outputBase64: false,
+    });
     const n = e.requests.length;
     await t.offers();
     expect(e.requests.length).toBe(n);
@@ -271,6 +282,10 @@ async function streamingEndpoint(
   script: (res: import("node:http").ServerResponse) => void,
 ) {
   return endpoint((seen, res, req) => {
+    if (seen.body.output_base64) {
+      json(res, 200, ok(""));
+      return;
+    }
     const probe = Array.isArray(seen.body.args)
       && String(seen.body.args[1]).startsWith("printf a;");
     if (seen.body.job) {
@@ -324,7 +339,9 @@ describe("HttpTransport.stream", () => {
 
   it("refuses an endpoint that buffers: all frames at once is not streaming", async () => {
     const e = await endpoint((seen, res) => {
-      if (seen.body.job) return json(res, 200, ok(""));
+      if (seen.body.job || seen.body.output_base64) {
+        return json(res, 200, ok(""));
+      }
       res.writeHead(200, { "content-type": "application/x-ndjson" });
       res.end(
         JSON.stringify({ stdout: b64("a") })

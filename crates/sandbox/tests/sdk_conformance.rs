@@ -69,19 +69,32 @@ fn profiles() -> Vec<Profile> {
             name: "v1-no-stdin",
             options: MockOptions {
                 honors_stdin: false,
+                honors_output_base64: false,
                 ..MockOptions::default()
             },
-            suites: &["files", "errors", "helpers"],
+            suites: &["files", "errors", "helpers", "exec-bytes"],
             ..base()
         },
         Profile {
-            // An endpoint that never learned streaming: `stream` is an unknown field to it.
+            // An endpoint that never learned streaming: `stream` is an unknown field to it, and so
+            // is `output_base64`: raw exec output is text, and the client says so (`exact: false`).
             name: "v11-endpoint",
             options: MockOptions {
                 protocol: Protocol::V11,
+                honors_output_base64: false,
                 ..MockOptions::default()
             },
-            suites: &["files", "errors", "helpers"],
+            suites: &["files", "errors", "helpers", "exec-bytes"],
+            ..base()
+        },
+        Profile {
+            // v1.2 without `output_base64`: raw exec is exact over a stream.
+            name: "v12-no-output-base64",
+            options: MockOptions {
+                honors_output_base64: false,
+                ..MockOptions::default()
+            },
+            suites: &["exec-bytes"],
             ..base()
         },
         Profile {

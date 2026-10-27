@@ -167,7 +167,7 @@ export class Files {
         throw e;
       }
     };
-    const opts = { timeoutMs: PROBE_TIMEOUT_MS };
+    const opts = { timeoutMs: PROBE_TIMEOUT_MS, text: true };
     const [rg, grep, find, stdin, window] = await Promise.all([
       settle(t.run("rg", ["--version"], opts)),
       settle(
@@ -220,6 +220,7 @@ export class Files {
   ): Promise<RunResult> {
     return this.transport.run(command, args, {
       timeoutMs: COMMAND_TIMEOUT_MS,
+      text: true,
       ...(stdin !== undefined ? { stdin } : {}),
     });
   }

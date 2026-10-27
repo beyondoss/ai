@@ -2822,9 +2822,16 @@ One `POST` per command:
 { "exit_code": 0, "stdout": "hello", "stderr": "" }
 ```
 
-v1.1 is v1 plus one optional request field, **`stdin_base64`**: standard base64 of the bytes to write
+v1.1 is v1 plus two optional request fields. **`stdin_base64`**: standard base64 of the bytes to write
 to the command's stdin, which is then closed. Absent, the command gets no stdin: v1 behavior. A v1
-endpoint keeps working unchanged. It just never gets stdin.
+endpoint keeps working unchanged. It just never gets stdin. **`output_base64`**: `true` asks for the
+answer's `stdout`/`stderr` as `stdout_base64`/`stderr_base64`, the bytes the command wrote, instead of
+JSON strings (which cannot carry invalid UTF-8: an endpoint replaces it with U+FFFD and answers
+success with corrupt data). Raw exec (`Sandbox::exec`, the other clients' `exec`) returns bytes with an
+`exact` flag: over `output_base64` when a probe (`printf '\377\000\n'`) shows the endpoint honours it,
+else over a v1.2 stream's base64 frames, else the endpoint's text with `exact: false`. The file and job
+helpers read text and keep the plain answer. The spec ("Exact output") is the module doc of
+`crates/sandbox/src/exec_endpoint.rs`; the verifier checks any endpoint that answers the probe.
 
 **Why stdin exists: the 128 KiB argv limit.** A remote write used to ship the whole file as _one_
 base64 argv entry, and Linux caps a single argv string at 128 KiB (`MAX_ARG_STRLEN`), so every
