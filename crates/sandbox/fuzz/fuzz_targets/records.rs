@@ -1,7 +1,7 @@
 //! `parse_records`: `rg --null` / `grep -Z` search output.
 //!
 //! Structured input is printed exactly as the tools print it (`<path>\0<line><:|-><text><eol>`,
-//! `--\n` between context groups; `eol` is `\n`, or `\r\n` as `rg --crlf` echoes a CRLF file) and must
+//! no group separator, as the engines are run without one; `eol` is `\n`, or `\r\n` as `rg --crlf` echoes a CRLF file) and must
 //! parse back to the records it was made from. Raw input must not panic, must not return more bytes
 //! than it was given, must return only paths that occur in the input, and must be a fixed point of
 //! print-then-parse.
@@ -22,10 +22,7 @@ struct Rec {
 
 fn print(recs: &[(bool, Rec)], crlf: bool) -> String {
     let mut out = String::new();
-    for (sep_before, r) in recs {
-        if *sep_before {
-            out.push_str("--\n");
-        }
+    for (_, r) in recs {
         out.push_str(&r.path);
         out.push('\0');
         out.push_str(&r.line.to_string());
@@ -53,12 +50,6 @@ fn structured(u: &mut Unstructured<'_>) -> libfuzzer_sys::arbitrary::Result<()> 
                 is_match: u.arbitrary()?,
             },
         ));
-    }
-    // KNOWN (F1, unfixed): a path that starts with `--\n` is read as a group separator plus a shorter
-    // path. Drop this guard when the parser is fixed; corpus/records/known-dashdash-newline-path is
-    // the minimal input.
-    if recs.iter().any(|(_, r)| r.path.starts_with("--\n")) {
-        return Ok(());
     }
     let printed = print(&recs, crlf);
     let got = records(&printed);
