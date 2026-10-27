@@ -5,16 +5,16 @@ jobs) and back; the behaviour behind every tool is specified in `sdk/conformance
 
 ## Modules
 
-| file                           | what                                                                                                                                    |
-| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `src/main.rs`                  | reads the environment, serves stdio or streamable HTTP, exits on SIGTERM / SIGINT / stdin closing                                       |
-| `src/config.rs`                | `Config::from_env`: every variable parsed in one place, errors name the variable                                                        |
-| `src/server.rs`                | `SandboxMcp`: the twelve tools, the `sandbox://capabilities` resource, the lazily made connection                                       |
-| `src/error.rs`                 | `ToolError` and `classify`: the spec's error kinds, as a tool result                                                                    |
-| `src/http.rs`                  | the streamable-HTTP listener (loopback unless told otherwise)                                                                           |
-| `src/bin/sandbox-driver-mcp.rs` | the conformance driver: DRIVER.md on stdin/stdout, every op a tool call over a real MCP session to a spawned `sandbox-mcp`             |
-| `tests/tools_snapshot.rs`      | pins the tools' names, descriptions and input schemas (`tests/tools.snapshot.json`)                                                     |
-| `tests/e2e.rs`                 | a generic MCP client driving the real binary: list tools, write, `cat`, read back; errors; jobs; HTTP; token command                    |
+| file                            | what                                                                                                                       |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `src/main.rs`                   | reads the environment, serves stdio or streamable HTTP, exits on SIGTERM / SIGINT / stdin closing                          |
+| `src/config.rs`                 | `Config::from_env`: every variable parsed in one place, errors name the variable                                           |
+| `src/server.rs`                 | `SandboxMcp`: the twelve tools, the `sandbox://capabilities` resource, the lazily made connection                          |
+| `src/error.rs`                  | `ToolError` and `classify`: the spec's error kinds, as a tool result                                                       |
+| `src/http.rs`                   | the streamable-HTTP listener (loopback unless told otherwise)                                                              |
+| `src/bin/sandbox-driver-mcp.rs` | the conformance driver: DRIVER.md on stdin/stdout, every op a tool call over a real MCP session to a spawned `sandbox-mcp` |
+| `tests/tools_snapshot.rs`       | pins the tools' names, descriptions and input schemas (`tests/tools.snapshot.json`)                                        |
+| `tests/e2e.rs`                  | a generic MCP client driving the real binary: list tools, write, `cat`, read back; errors; jobs; HTTP; token command       |
 
 ## One connection, made on first use
 
@@ -74,15 +74,15 @@ browser.
 built beside it, and the harness crate should not depend on the thing it judges. It reports `driver: "sandbox-mcp"` in
 `hello` and implements each op by calling a tool; `CONFORMANCE_*` is translated to `SANDBOX_*` for the child it spawns.
 
-| op                                       | how                                                                                   |
-| ---------------------------------------- | ------------------------------------------------------------------------------------- |
-| `exec`, `stat`, `mkdir`, `write`, `list`, `search`, `job_start`, `job_list`, `job_kill` | one tool call                                          |
-| `read`, `job_read`                       | `read_file` / `job_output` asking for base64; `read` loops until `max` bytes or EOF   |
-| `job_attach`                             | `job_output` polled to the job's end (the client library's own follow)                |
-| `job_remove`, `job_wipe`                 | `job_list`, then `job_kill` with `remove` on the ended jobs / on every job            |
-| `capabilities`                           | the `sandbox://capabilities` resource                                                 |
-| `exec_stream`                            | `unsupported`: a tool result is not streamed                                          |
-| `write_if_unchanged`                     | `unsupported`: no tool takes a caller-supplied mtime                                  |
+| op                                                                                      | how                                                                                 |
+| --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `exec`, `stat`, `mkdir`, `write`, `list`, `search`, `job_start`, `job_list`, `job_kill` | one tool call                                                                       |
+| `read`, `job_read`                                                                      | `read_file` / `job_output` asking for base64; `read` loops until `max` bytes or EOF |
+| `job_attach`                                                                            | `job_output` polled to the job's end (the client library's own follow)              |
+| `job_remove`, `job_wipe`                                                                | `job_list`, then `job_kill` with `remove` on the ended jobs / on every job          |
+| `capabilities`                                                                          | the `sandbox://capabilities` resource                                               |
+| `exec_stream`                                                                           | `unsupported`: a tool result is not streamed                                        |
+| `write_if_unchanged`                                                                    | `unsupported`: no tool takes a caller-supplied mtime                                |
 
 An unsupported op is left out of `hello`'s list, so the harness counts the scenarios that need it as `unsupported`, never
 as passes.

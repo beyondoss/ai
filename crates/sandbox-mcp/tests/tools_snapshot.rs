@@ -12,11 +12,17 @@ const SNAPSHOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tools.snapsho
 
 /// `tools/list` over an in-process MCP session (no sandbox needed: nothing is called).
 async fn listed() -> Vec<Value> {
-    let config = Config::from_env(|k| (k == "SANDBOX_URL").then(|| "http://127.0.0.1:1".to_string()))
-        .unwrap();
+    let config =
+        Config::from_env(|k| (k == "SANDBOX_URL").then(|| "http://127.0.0.1:1".to_string()))
+            .unwrap();
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     let server = tokio::spawn(async move {
-        SandboxMcp::new(config).serve(server_io).await.unwrap().waiting().await
+        SandboxMcp::new(config)
+            .serve(server_io)
+            .await
+            .unwrap()
+            .waiting()
+            .await
     });
     let client = ().serve(client_io).await.unwrap();
     let tools = client.peer().list_all_tools().await.unwrap();
@@ -56,8 +62,18 @@ async fn the_tools_are_exactly_the_documented_twelve() {
     assert_eq!(
         names,
         [
-            "edit_file", "exec", "job_kill", "job_list", "job_output", "job_start", "list_dir",
-            "mkdir", "read_file", "search", "stat", "write_file"
+            "edit_file",
+            "exec",
+            "job_kill",
+            "job_list",
+            "job_output",
+            "job_start",
+            "list_dir",
+            "mkdir",
+            "read_file",
+            "search",
+            "stat",
+            "write_file"
         ]
     );
 }

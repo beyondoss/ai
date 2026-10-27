@@ -20,7 +20,9 @@ use std::io::Write as _;
 use std::time::Duration;
 
 use base64::Engine as _;
-use rmcp::model::{CallToolRequestParams, CallToolResult, ReadResourceRequestParams, ResourceContents};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, ReadResourceRequestParams, ResourceContents,
+};
 use rmcp::service::{Peer, RunningService};
 use rmcp::transport::TokioChildProcess;
 use rmcp::{RoleClient, ServiceExt as _};
@@ -102,7 +104,10 @@ fn flag(req: &Value, key: &str) -> Result<bool, Value> {
     match &req[key] {
         Value::Null => Ok(false),
         Value::Bool(b) => Ok(*b),
-        _ => Err(err("invalid_request", format!("`{key}` must be true or false"))),
+        _ => Err(err(
+            "invalid_request",
+            format!("`{key}` must be true or false"),
+        )),
     }
 }
 
@@ -128,7 +133,11 @@ fn bytes_arg(req: &Value, key: &str) -> Result<Vec<u8>, Value> {
 
 /// A tool's arguments: the keys given, with `null`s left out.
 fn args(pairs: Vec<(&str, Value)>) -> Map<String, Value> {
-    pairs.into_iter().filter(|(_, v)| !v.is_null()).map(|(k, v)| (k.to_string(), v)).collect()
+    pairs
+        .into_iter()
+        .filter(|(_, v)| !v.is_null())
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
 }
 
 struct Mcp {
@@ -146,17 +155,32 @@ impl Mcp {
             p.to_string_lossy().into_owned()
         });
         let mut cmd = tokio::process::Command::new(&bin);
-        for k in ["SANDBOX_TOKEN", "SANDBOX_TOKEN_CMD", "SANDBOX_CAPS", "SANDBOX_JOBS_ROOT", "SANDBOX_JOBS_SCOPE"] {
+        for k in [
+            "SANDBOX_TOKEN",
+            "SANDBOX_TOKEN_CMD",
+            "SANDBOX_CAPS",
+            "SANDBOX_JOBS_ROOT",
+            "SANDBOX_JOBS_SCOPE",
+        ] {
             cmd.env_remove(k);
         }
         cmd.env("SANDBOX_URL", &url);
-        if let Some(b) = std::env::var("CONFORMANCE_BEARER").ok().filter(|b| !b.is_empty()) {
+        if let Some(b) = std::env::var("CONFORMANCE_BEARER")
+            .ok()
+            .filter(|b| !b.is_empty())
+        {
             cmd.env("SANDBOX_TOKEN", b);
         }
-        if let Some(root) = std::env::var("CONFORMANCE_JOBS_ROOT").ok().filter(|r| !r.is_empty()) {
+        if let Some(root) = std::env::var("CONFORMANCE_JOBS_ROOT")
+            .ok()
+            .filter(|r| !r.is_empty())
+        {
             cmd.env("SANDBOX_JOBS_ROOT", root);
         }
-        if let Some(c) = std::env::var("CONFORMANCE_CAPS").ok().filter(|c| !c.is_empty()) {
+        if let Some(c) = std::env::var("CONFORMANCE_CAPS")
+            .ok()
+            .filter(|c| !c.is_empty())
+        {
             cmd.env("SANDBOX_CAPS", c);
         }
         let transport = TokioChildProcess::new(cmd)
@@ -166,7 +190,10 @@ impl Mcp {
             .await
             .map_err(|e| err("transport", format!("MCP handshake with {bin} failed: {e}")))?;
         let peer = service.peer().clone();
-        Ok(Self { _service: service, peer })
+        Ok(Self {
+            _service: service,
+            peer,
+        })
     }
 
     /// Call a tool; a failed call is the server's `{"error": {kind, detail}}`.
@@ -190,14 +217,20 @@ impl Mcp {
     async fn capabilities(&self) -> Out {
         let r = self
             .peer
-            .read_resource(ReadResourceRequestParams::new("sandbox://capabilities".to_string()))
+            .read_resource(ReadResourceRequestParams::new(
+                "sandbox://capabilities".to_string(),
+            ))
             .await
             .map_err(|e| err("protocol", format!("capabilities: {e}")))?;
         let Some(ResourceContents::TextResourceContents { text, .. }) = r.contents.first() else {
             return Err(err("protocol", "capabilities: no text content"));
         };
         let v: Value = serde_json::from_str(text).map_err(|e| err("protocol", e.to_string()))?;
-        if v["error"].is_object() { Err(v["error"].clone()) } else { Ok(v) }
+        if v["error"].is_object() {
+            Err(v["error"].clone())
+        } else {
+            Ok(v)
+        }
     }
 
     async fn handle(&self, op: &str, req: &Value) -> Out {
@@ -240,7 +273,10 @@ impl Mcp {
             }
             "job_list" => {
                 let r = self
-                    .tool("job_list", args(vec![("scope", json!(str_arg(req, "scope")?))]))
+                    .tool(
+                        "job_list",
+                        args(vec![("scope", json!(str_arg(req, "scope")?))]),
+                    )
                     .await?;
                 Ok(json!({ "jobs": r["jobs"] }))
             }
@@ -334,7 +370,8 @@ impl Mcp {
                 Ok(json!({}))
             }
             "mkdir" => {
-                self.tool("mkdir", args(vec![("path", json!(str_arg(req, "path")?))])).await?;
+                self.tool("mkdir", args(vec![("path", json!(str_arg(req, "path")?))]))
+                    .await?;
                 Ok(json!({}))
             }
             "list" => {
@@ -361,7 +398,10 @@ impl Mcp {
                             ("literal", json!(flag(req, "literal")?)),
                             ("ignore_case", json!(flag(req, "ignore_case")?)),
                             ("glob", json!(glob)),
-                            ("glob_exclude", json!(glob.map(|_| flag(req, "glob_exclude")).transpose()?)),
+                            (
+                                "glob_exclude",
+                                json!(glob.map(|_| flag(req, "glob_exclude")).transpose()?),
+                            ),
                             ("limit", json!(u64_arg(req, "limit")?)),
                             ("before", json!(u64_arg(req, "before")?)),
                             ("after", json!(u64_arg(req, "after")?)),
@@ -467,7 +507,9 @@ impl Mcp {
     }
 
     async fn listed(&self, scope: &str) -> Result<Vec<Value>, Value> {
-        let r = self.tool("job_list", args(vec![("scope", json!(scope))])).await?;
+        let r = self
+            .tool("job_list", args(vec![("scope", json!(scope))]))
+            .await?;
         Ok(r["jobs"].as_array().cloned().unwrap_or_default())
     }
 
@@ -475,7 +517,11 @@ impl Mcp {
         let r = self
             .tool(
                 "job_kill",
-                args(vec![("scope", json!(scope)), ("ids", json!(ids)), ("remove", json!(true))]),
+                args(vec![
+                    ("scope", json!(scope)),
+                    ("ids", json!(ids)),
+                    ("remove", json!(true)),
+                ]),
             )
             .await?;
         Ok(r["survivors"].as_array().cloned().unwrap_or_default())
@@ -500,7 +546,10 @@ async fn main() {
                 let result = if op == "hello" {
                     Ok(json!({ "driver": DRIVER, "protocol": 1, "ops": OPS }))
                 } else if !OPS.contains(&op.as_str()) {
-                    Err(err("unsupported", unsupported_reason(&op).unwrap_or("no such op")))
+                    Err(err(
+                        "unsupported",
+                        unsupported_reason(&op).unwrap_or("no such op"),
+                    ))
                 } else {
                     if mcp.is_none() {
                         mcp = Some(Mcp::start().await);

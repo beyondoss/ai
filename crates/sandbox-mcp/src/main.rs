@@ -16,7 +16,10 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(r) => r,
         Err(e) => {
             eprintln!("sandbox-mcp: cannot start the runtime: {e}");

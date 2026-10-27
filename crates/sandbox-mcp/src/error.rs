@@ -121,7 +121,10 @@ mod tests {
     #[test]
     fn kinds_follow_the_text() {
         let k = |m: &str| classify(m, None).kind;
-        assert_eq!(k("read /a: No such file or directory (os error 2)"), "not_found");
+        assert_eq!(
+            k("read /a: No such file or directory (os error 2)"),
+            "not_found"
+        );
         assert_eq!(k("exec endpoint returned 401"), "auth");
         assert_eq!(k("exec endpoint returned 500: boom"), "endpoint");
         assert_eq!(k("exec endpoint unreachable: refused"), "transport");

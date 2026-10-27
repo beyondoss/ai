@@ -5457,7 +5457,8 @@
               "agent-reference",
               "beyond-sandbox-ts",
               "python",
-              "python-async"
+              "python-async",
+              "sandbox-mcp"
             ],
             "reason": "find does not follow a symlink given as the starting point, so the listing is empty"
           },
@@ -5492,7 +5493,8 @@
               "agent-reference",
               "beyond-sandbox-ts",
               "python",
-              "python-async"
+              "python-async",
+              "sandbox-mcp"
             ],
             "reason": "the stderr classifier needs every line to end in an OS error; a newline in the path breaks the first"
           },
@@ -5532,7 +5534,8 @@
               "agent-reference",
               "beyond-sandbox-ts",
               "python",
-              "python-async"
+              "python-async",
+              "sandbox-mcp"
             ],
             "reason": "`Not a directory` is not among the OS errors the classifier recognises, so it reads as a bad regex"
           },
@@ -5579,7 +5582,8 @@
               "agent-reference",
               "beyond-sandbox-ts",
               "python",
-              "python-async"
+              "python-async",
+              "sandbox-mcp"
             ],
             "reason": "the write script reads the temp back to check its size, and the temp has mode 0200"
           },
@@ -5602,7 +5606,8 @@
               "agent-reference",
               "beyond-sandbox-ts",
               "python",
-              "python-async"
+              "python-async",
+              "sandbox-mcp"
             ],
             "reason": "the write was refused"
           },

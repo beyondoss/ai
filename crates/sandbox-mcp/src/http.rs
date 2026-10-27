@@ -47,7 +47,8 @@ pub async fn serve(
     insecure_no_auth: bool,
     stop: CancellationToken,
 ) {
-    let mut config = StreamableHttpServerConfig::default().with_cancellation_token(stop.child_token());
+    let mut config =
+        StreamableHttpServerConfig::default().with_cancellation_token(stop.child_token());
     if insecure_no_auth {
         config = config.disable_allowed_hosts();
     }

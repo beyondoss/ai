@@ -69,8 +69,9 @@ impl Config {
     /// or a map in a test).
     pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
         let get = |name: &str| get(name).filter(|v| !v.is_empty());
-        let url = get("SANDBOX_URL")
-            .ok_or("SANDBOX_URL is required: the sandbox's exec endpoint, e.g. http://127.0.0.1:8080")?;
+        let url = get("SANDBOX_URL").ok_or(
+            "SANDBOX_URL is required: the sandbox's exec endpoint, e.g. http://127.0.0.1:8080",
+        )?;
         let token = match (get("SANDBOX_TOKEN"), get("SANDBOX_TOKEN_CMD")) {
             (None, None) => Token::None,
             (Some(t), None) => Token::Fixed(t),
@@ -158,7 +159,11 @@ mod tests {
     #[test]
     fn a_bad_scope_or_caps_names_its_variable() {
         let bad = env(&[("SANDBOX_URL", "u"), ("SANDBOX_JOBS_SCOPE", "Bad Scope")]);
-        assert!(Config::from_env(bad).unwrap_err().contains("SANDBOX_JOBS_SCOPE"));
+        assert!(
+            Config::from_env(bad)
+                .unwrap_err()
+                .contains("SANDBOX_JOBS_SCOPE")
+        );
         let bad = env(&[("SANDBOX_URL", "u"), ("SANDBOX_CAPS", "{")]);
         assert!(Config::from_env(bad).unwrap_err().contains("SANDBOX_CAPS"));
         let ok = env(&[

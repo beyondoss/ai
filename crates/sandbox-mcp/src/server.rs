@@ -240,7 +240,10 @@ fn decode(what: &str, b64: &str) -> Result<Vec<u8>, ToolError> {
 /// Bytes as the tool result carries them: `(encoding, content, bytes used)`. In `auto` mode text is
 /// text, and a read that ended in the middle of a multi-byte character gives that character up (the
 /// caller continues at `offset + bytes`); anything else is base64.
-fn payload(bytes: &[u8], encoding: Option<&str>) -> Result<(&'static str, String, usize), ToolError> {
+fn payload(
+    bytes: &[u8],
+    encoding: Option<&str>,
+) -> Result<(&'static str, String, usize), ToolError> {
     match encoding {
         None | Some("auto") => match std::str::from_utf8(bytes) {
             Ok(s) => Ok(("utf8", s.to_string(), bytes.len())),
@@ -294,7 +297,7 @@ impl SandboxMcp {
             return Ok(t.clone());
         }
         let c = &self.inner.config;
-        let mut http = HttpExec::new(&c.url).map_err(|e| ToolError::invalid(e))?;
+        let mut http = HttpExec::new(&c.url).map_err(ToolError::invalid)?;
         match &c.token {
             Token::None => {}
             Token::Fixed(t) => http = http.bearer(TokenSource::fixed(t.clone())),
@@ -524,7 +527,10 @@ impl SandboxMcp {
         let offset = a.offset.unwrap_or(0);
         let max = a.max.map_or(DEFAULT_READ_MAX, count);
         let t = self.target().await?;
-        let bytes = t.files().read_bytes(Path::new(&a.path), offset, max).await?;
+        let bytes = t
+            .files()
+            .read_bytes(Path::new(&a.path), offset, max)
+            .await?;
         let (encoding, content, used) = payload(&bytes, a.encoding.as_deref())?;
         Ok(json!({
             "path": a.path,
@@ -540,7 +546,9 @@ impl SandboxMcp {
     async fn do_write(&self, a: WriteFileArgs) -> Out {
         let bytes = match (a.content, a.content_base64) {
             (Some(_), Some(_)) => {
-                return Err(ToolError::invalid("give content or content_base64, not both"));
+                return Err(ToolError::invalid(
+                    "give content or content_base64, not both",
+                ));
             }
             (Some(t), None) => t.into_bytes(),
             (None, Some(b)) => decode("content_base64", &b)?,
@@ -566,7 +574,10 @@ impl SandboxMcp {
         match meta.kind {
             FileKind::File => {}
             FileKind::Dir => {
-                return Err(ToolError::new("is_directory", format!("{}: is a directory", a.path)));
+                return Err(ToolError::new(
+                    "is_directory",
+                    format!("{}: is a directory", a.path),
+                ));
             }
             FileKind::Other => {
                 return Err(ToolError::new(
@@ -785,7 +796,9 @@ impl ServerHandler for SandboxMcp {
             // Arguments that do not fit the schema are the agent's mistake to see and fix. rmcp
             // answers them with a bare error result (no structured content) or, for some shapes,
             // a protocol error; both become the same `invalid_request` result as every other failure.
-            Ok(CallToolResponse::Complete(r)) if r.is_error == Some(true) && r.structured_content.is_none() => {
+            Ok(CallToolResponse::Complete(r))
+                if r.is_error == Some(true) && r.structured_content.is_none() =>
+            {
                 let text = r
                     .content
                     .iter()
@@ -795,7 +808,9 @@ impl ServerHandler for SandboxMcp {
                 Ok(ToolError::invalid(text).into_result().into())
             }
             Err(e) if e.code == rmcp::model::ErrorCode::INVALID_PARAMS => {
-                Ok(ToolError::invalid(e.message.to_string()).into_result().into())
+                Ok(ToolError::invalid(e.message.to_string())
+                    .into_result()
+                    .into())
             }
             other => other,
         }
@@ -834,7 +849,8 @@ impl ServerHandler for SandboxMcp {
             Err(e) => json!({ "error": { "kind": e.kind, "detail": e.detail } }),
         };
         Ok(ReadResourceResult::new(vec![
-            ResourceContents::text(body.to_string(), CAPABILITIES_URI).with_mime_type("application/json"),
+            ResourceContents::text(body.to_string(), CAPABILITIES_URI)
+                .with_mime_type("application/json"),
         ])
         .into())
     }
