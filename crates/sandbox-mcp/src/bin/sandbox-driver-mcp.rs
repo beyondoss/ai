@@ -249,10 +249,19 @@ impl Mcp {
                         ]),
                     )
                     .await?;
+                let bytes = |k: &str| -> Result<Vec<u8>, Value> {
+                    let text = r[k].as_str().unwrap_or("");
+                    if r[format!("{k}_encoding")] == json!("base64") {
+                        B64.decode(text)
+                            .map_err(|e| err("protocol", format!("exec {k}: {e}")))
+                    } else {
+                        Ok(text.as_bytes().to_vec())
+                    }
+                };
                 Ok(json!({
                     "exit_code": r["exit_code"].as_i64().unwrap_or(-1),
-                    "stdout_b64": b64(r["stdout"].as_str().unwrap_or("").as_bytes()),
-                    "stderr_b64": b64(r["stderr"].as_str().unwrap_or("").as_bytes()),
+                    "stdout_b64": b64(&bytes("stdout")?),
+                    "stderr_b64": b64(&bytes("stderr")?),
                 }))
             }
             "job_start" => {

@@ -34,7 +34,7 @@
     "name": "edit_file"
   },
   {
-    "description": "Run a program in the sandbox and wait for it. Returns exit_code, stdout and stderr as text; a non-zero exit is a normal result, not an error. Not a shell: use sh with [\"-c\", \"...\"] for pipes. The whole output comes back, so for long-running or noisy commands use job_start and page the output with job_output.",
+    "description": "Run a program in the sandbox and wait for it. Returns exit_code, stdout and stderr (text, or base64 with stdout_encoding/stderr_encoding set when the bytes are not UTF-8); a non-zero exit is a normal result, not an error. Not a shell: use sh with [\"-c\", \"...\"] for pipes. The whole output comes back, so for long-running or noisy commands use job_start and page the output with job_output.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {

@@ -260,6 +260,14 @@ fn payload(
     }
 }
 
+/// Command output as the result carries it: text when the bytes are UTF-8, base64 (marked) when not.
+fn text_or_base64(bytes: Vec<u8>) -> (&'static str, String) {
+    match String::from_utf8(bytes) {
+        Ok(s) => ("utf8", s),
+        Err(e) => ("base64", B64.encode(e.into_bytes())),
+    }
+}
+
 fn state_of(s: JobStatus) -> (&'static str, Option<i32>) {
     match s {
         JobStatus::Running => ("running", None),
@@ -349,9 +357,10 @@ impl SandboxMcp {
         } else {
             "none"
         };
+        let stream = t.http.streams().await;
         Ok(json!({
             "stdin": caps.stdin,
-            "stream": t.http.streams().await,
+            "stream": stream,
             "jobs": jobs,
             "search_engine": engine,
             "find_printf": caps.find_printf,
@@ -396,7 +405,7 @@ type ToolReply = Result<rmcp::model::CallToolResult, ErrorData>;
 impl SandboxMcp {
     #[tool(
         name = "exec",
-        description = "Run a program in the sandbox and wait for it. Returns exit_code, stdout and stderr as text; a non-zero exit is a normal result, not an error. Not a shell: use sh with [\"-c\", \"...\"] for pipes. The whole output comes back, so for long-running or noisy commands use job_start and page the output with job_output."
+        description = "Run a program in the sandbox and wait for it. Returns exit_code, stdout and stderr (text, or base64 with stdout_encoding/stderr_encoding set when the bytes are not UTF-8); a non-zero exit is a normal result, not an error. Not a shell: use sh with [\"-c\", \"...\"] for pipes. The whole output comes back, so for long-running or noisy commands use job_start and page the output with job_output."
     )]
     async fn exec(&self, Parameters(a): Parameters<ExecArgs>) -> ToolReply {
         Ok(reply(self.do_exec(a).await))
@@ -513,13 +522,14 @@ impl SandboxMcp {
             cmd = cmd.stdin(stdin);
         }
         let r = cmd.run().await?;
+        let (stdout_enc, stdout) = text_or_base64(r.stdout);
+        let (stderr_enc, stderr) = text_or_base64(r.stderr);
         Ok(json!({
             "exit_code": r.code,
-            "signal": r.signal,
-            "timed_out": r.timed_out,
-            "stdout": r.stdout,
-            "stderr": r.stderr,
-            "truncated": r.truncated,
+            "stdout": stdout,
+            "stdout_encoding": stdout_enc,
+            "stderr": stderr,
+            "stderr_encoding": stderr_enc,
         }))
     }
 
