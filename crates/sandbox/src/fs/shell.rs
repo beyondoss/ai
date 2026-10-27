@@ -1736,12 +1736,11 @@ mod appendix_tests {
     /// Scripts known to differ from the appendix until the pending fixes land; each names its fix.
     /// An entry here that now matches fails the test, so it cannot outlive its fix.
     const KNOWN_DIFFERENT: &[(char, &str)] = &[
-        // The code is ahead: `stat -L` (#564) and the directory refusal in C/D. The appendix is
-        // brought level by #574, and the dangling-link resolve and stdout-`c` probe it adds to
-        // C/D/E by B1/B2; then this list is empty.
-        ('A', "appendix lacks `stat -L`, #574"),
-        ('C', "appendix lacks the directory refusal, #574, B1/B2"),
-        ('D', "appendix lacks the directory refusal, #574, B1/B2"),
+        // The appendix carries the dangling-link resolve in C, D and E; the Rust code does not yet.
+        // B2 brings the code level, and then this list is empty.
+        ('C', "appendix has the dangling-link resolve, B2"),
+        ('D', "appendix has the dangling-link resolve, B2"),
+        ('E', "appendix has the dangling-link resolve, B2"),
     ];
 
     #[test]
