@@ -566,6 +566,33 @@ impl Machine {
         p
     }
 
+    /// Whether `target`, as a symlink at `link`, resolves (lexically, `..` popping a component) to a
+    /// path inside the test root.
+    fn stays_inside(&self, link: &Path, target: &Path) -> bool {
+        use std::path::Component;
+        let Ok(root) = std::fs::canonicalize(&self.root) else {
+            return false;
+        };
+        let mut cur = if target.is_absolute() {
+            PathBuf::from("/")
+        } else {
+            match link.parent().map(std::fs::canonicalize) {
+                Some(Ok(d)) => d,
+                _ => return false,
+            }
+        };
+        for c in target.components() {
+            match c {
+                Component::Normal(n) => cur.push(n),
+                Component::ParentDir => {
+                    cur.pop();
+                }
+                _ => {}
+            }
+        }
+        cur.starts_with(&root) || cur.starts_with(&self.root)
+    }
+
     fn pick_dir(&mut self, tc: &TestCase) -> PathBuf {
         let mut dirs = vec![self.root.clone(); 2];
         dirs.extend(self.known.iter().filter(|k| k.is_dir()).cloned());
@@ -714,19 +741,6 @@ impl Machine {
                 } else {
                     // The command itself failed (a fault may still have hit its cleanup).
                     match &plan {
-                        Plan::Succeed
-                            if kind == Kind::PermissionDenied
-                                && std::fs::metadata(&target).is_ok_and(|m| m.is_file())
-                                && !truth::can(&target, 4) =>
-                        {
-                            // The size check reads the temp back, and the temp has the file's mode.
-                            known(
-                                "N4",
-                                format!(
-                                    "{op} {p:?} refused: the file is writable but not readable by its owner: {e}"
-                                ),
-                            );
-                        }
                         Plan::Succeed => fail(format!(
                             "{op} {p:?} must succeed but failed ({kind:?}): {e}"
                         )),
@@ -1019,7 +1033,8 @@ impl Machine {
         match got {
             Err(e) => {
                 let k = self.kind(&e, &p);
-                if report.errored {
+                // A listing larger than the configured response cap is refused, as a search is.
+                if report.errored || (self.cfg.cap.is_some() && k == Kind::TooLarge) {
                     return;
                 }
                 let ok = match &meta {
@@ -1154,19 +1169,15 @@ impl Machine {
                 let k = self.kind(&e, &root);
                 let tolerated = report.errored || (self.cfg.cap.is_some() && k == Kind::TooLarge);
                 if !tolerated {
-                    if want.root_below_file && k == Kind::InvalidQuery {
-                        known(
-                            "N3",
-                            format!(
-                                "search of a root below a regular file answered as a bad regex: {e}"
-                            ),
-                        );
-                    } else if want.root_missing {
-                        if !(k == Kind::NotFound
-                            || (want.root_below_file && k == Kind::NotADirectory))
-                        {
+                    if want.root_missing {
+                        let expect = if want.root_below_file {
+                            Kind::NotADirectory
+                        } else {
+                            Kind::NotFound
+                        };
+                        if k != expect {
                             fail(format!(
-                                "search of the missing root {root:?} must fail as not_found, got {k:?}: {e}"
+                                "search of the missing root {root:?} must fail as {expect:?}, got {k:?}: {e}"
                             ));
                         }
                     } else if want.unreadable {
@@ -1476,6 +1487,12 @@ impl Machine {
             2 => PathBuf::from(fixtures::name(&tc)).with_extension("lnk"),
             _ => self.pick_path(&tc),
         };
+        // A link must never lead out of the test root: `list` follows it, and the oracle and the
+        // client would then read a live, shared directory (`/tmp`) at different moments. A link to a
+        // file outside (`/dev/null`) is harmless; a dangling one inside is fine.
+        if target != Path::new("/dev/null") && !self.stays_inside(&link, &target) {
+            return;
+        }
         tc.note(&format!(
             "env: symlink {:?} -> {:?}",
             link.strip_prefix(&self.root).unwrap(),

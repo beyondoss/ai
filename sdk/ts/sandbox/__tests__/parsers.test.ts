@@ -266,6 +266,20 @@ describe("a newline in a path", () => {
   });
 });
 
+describe("a root below a file", () => {
+  it("is a root error", () => {
+    const f = classifySearchFailure(
+      "rg: /w/file/sub: IO error for operation on /w/file/sub: Not a directory (os error 20)\n",
+      "/w/file/sub",
+    );
+    expect(f.kind).toBe("missing_root");
+    expect(
+      classifySearchFailure("grep: /w/file/sub: Not a directory", "/w/file")
+        .kind,
+    ).toBe("skipped");
+  });
+});
+
 describe("classifySearchFailure (exit 2)", () => {
   const root = "/work/proj";
   it("reads an engine complaint, or silence, as a rejected pattern", () => {

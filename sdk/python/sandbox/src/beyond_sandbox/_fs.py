@@ -21,6 +21,7 @@ from .errors import (
     Conflict,
     InvalidQuery,
     IoError,
+    NotADirectory,
     NotFound,
     NotOffered,
     SandboxError,
@@ -452,6 +453,7 @@ _OS_ERRORS = (
     "No such file or directory",
     "Permission denied",
     "Is a directory",
+    "Not a directory",
     "Too many levels of symbolic links",
     "Input/output error",
     # rg reading a `.git` file (a gitdir pointer) that is not text.
@@ -496,7 +498,7 @@ def classify_search_failure(stderr: str, root: str) -> SearchFailure:
         at = rec.find(marker)
         while at >= 0:
             rest = rec[at + len(marker) :].removeprefix(io_prefix)
-            if rest.startswith("No such file or directory"):
+            if rest.startswith(("No such file or directory", "Not a directory")):
                 return SearchFailure("missing_root", rec)
             at = rec.find(marker, at + 1)
     return SearchFailure(
@@ -859,7 +861,7 @@ def search(q: Query, state: FsState, caps: Capabilities) -> Op[SearchResult]:
             detail = stderr.strip()
             raise InvalidQuery(f"bad regex: {detail or program + ' rejected the pattern'}")
         if failure.kind == "missing_root":
-            raise NotFound(failure.note)
+            raise (NotADirectory if "Not a directory" in failure.note else NotFound)(failure.note)
         note = failure.note
     stdout = text(r.stdout)
     longs: list[LongLine] = []
