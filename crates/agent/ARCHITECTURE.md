@@ -2856,9 +2856,10 @@ starts by resolving the target the way `LocalFs` does: a hop-by-hop `readlink` c
 directory, at most 40 hops (`readlink -f` is not used: it is unbounded in time and memory on an adversarial chain, and busybox
 resolves a dangling link's relative target against the working directory). A chain still a link after 40 hops is a loop: the
 write fails with `Too many levels of symbolic links (os error 40)` and changes nothing. It then names the temp beside the resolved file, so a write through a symlink
-lands in its target and the link stays a link. The temp is created empty and given the existing file's
-mode before any content goes in, with `chmod --reference` or, on busybox, which has no
-`--reference`, `chmod "$(stat -L -c %a ...)"`. A mode that cannot be copied fails the write. Before
+lands in its target and the link stays a link. A target the caller may not write (`[ -w ]`) is refused with
+`Permission denied`. The temp is created empty at mode 0600, so the size check can read it back even when the
+file's own mode is 0200, and is given the existing file's mode just before the `mv`, with `chmod --reference` or, on
+busybox, which has no `--reference`, `chmod "$(stat -L -c %a ...)"`. A mode that cannot be copied fails the write. Before
 this, the `mv` replaced a symlink with a regular file and gave every rewritten file the temp's default
 mode: a 0600 secret became 0644, and a 0755 script lost its execute bits. `LocalFs` sets the mode on
 the temp's open descriptor as well as in `open`, whose mode passes through the umask, so a 0664 file
