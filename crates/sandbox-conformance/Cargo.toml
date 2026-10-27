@@ -42,5 +42,8 @@ tokio.workspace = true
 toml = "0.8"
 
 [dev-dependencies]
+# The oracle of the differential test is the `ShellFs` property test's (`truth.rs`, `search_truth.rs`),
+# included by path; it names the agent's re-export of `FsError`.
+beyond-agent = { path = "../agent" }
 futures.workspace = true
 hegeltest = { version = "0.50.3", features = ["static-engine"] }

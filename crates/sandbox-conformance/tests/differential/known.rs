@@ -26,10 +26,23 @@ pub fn divergence(step: &Value, differing: &[&str]) -> Option<&'static str> {
     let only = |names: &[&str]| differing.iter().all(|d| names.contains(d));
     // D1: Python reads the first line of a failed command's stderr with `str.splitlines()`, which
     // also splits at CR, VT, FF, FS, GS, RS, NEL, LS and PS; the spec splits at LF only.
-    if text.iter().any(|s| s.contains(['\r', '\x0b', '\x0c', '\x1c', '\x1d', '\x1e', '\u{85}', '\u{2028}', '\u{2029}']))
-        && only(&["python", "python-async"])
+    if text.iter().any(|s| {
+        s.contains([
+            '\r', '\x0b', '\x0c', '\x1c', '\x1d', '\x1e', '\u{85}', '\u{2028}', '\u{2029}',
+        ])
+    }) && only(&["python", "python-async"])
     {
         return Some("D1");
+    }
+    // D3: the TypeScript client compiles the pattern of a non-literal query with a JavaScript
+    // RegExp to find the match it clips a long line around; the spec says Rust syntax, so
+    // `(?i)`, `(?P<name>..)` and the like do not compile and the line is clipped as a context line.
+    if step["op"] == "search"
+        && step["literal"] == false
+        && step["pattern"].as_str().is_some_and(|p| p.contains("(?"))
+        && only(&["ts"])
+    {
+        return Some("D3");
     }
     None
 }

@@ -116,7 +116,17 @@ impl World {
             let mut c = d.be.caps.clone();
             // `read_window` and friends are probe results; a driver may report extra keys.
             if let Some(o) = c.as_object_mut() {
-                o.retain(|k, _| ["stdin", "stream", "jobs", "search_engine", "find_printf", "read_window"].contains(&k.as_str()));
+                o.retain(|k, _| {
+                    [
+                        "stdin",
+                        "stream",
+                        "jobs",
+                        "search_engine",
+                        "find_printf",
+                        "read_window",
+                    ]
+                    .contains(&k.as_str())
+                });
             }
             seen.push((d.name.clone(), c));
         }
@@ -207,7 +217,10 @@ async fn lockstep(world: &World, runs: &mut [Run<'_>], ops: &[Op]) -> Result<(),
     for (r, (_, resp)) in runs.iter().zip(made) {
         if resp.get("ok").is_none() {
             return Err(Failure {
-                text: format!("{}: cannot create the case root {}: {resp}", r.d.name, r.root),
+                text: format!(
+                    "{}: cannot create the case root {}: {resp}",
+                    r.d.name, r.root
+                ),
             });
         }
     }
@@ -253,7 +266,9 @@ async fn lockstep(world: &World, runs: &mut [Run<'_>], ops: &[Op]) -> Result<(),
         if oracle_msgs.is_empty() && (agree || known.is_some()) {
             if let Some(id) = known {
                 *world.known.lock().unwrap().entry(id).or_default() += 1;
-                eprintln!("KNOWN OPEN BUG {id}: {} {}", op.name(), step);
+                if std::env::var_os("DIFFERENTIAL_VERBOSE").is_some() {
+                    eprintln!("KNOWN OPEN BUG {id}: {} {}", op.name(), step);
+                }
             }
             history.push(canons.swap_remove(0));
             continue;
@@ -268,7 +283,12 @@ async fn lockstep(world: &World, runs: &mut [Run<'_>], ops: &[Op]) -> Result<(),
         }
         let majority = groups
             .iter()
-            .max_by_key(|(_, m)| (m.len(), std::cmp::Reverse(runs.iter().position(|r| r.d.name == m[0]))))
+            .max_by_key(|(_, m)| {
+                (
+                    m.len(),
+                    std::cmp::Reverse(runs.iter().position(|r| r.d.name == m[0])),
+                )
+            })
             .map(|(_, m)| m.clone())
             .unwrap_or_default();
         let faulted: Vec<&str> = oracle_msgs
@@ -282,7 +302,9 @@ async fn lockstep(world: &World, runs: &mut [Run<'_>], ops: &[Op]) -> Result<(),
             .collect();
         if let Some(id) = super::known::divergence(&step, &differing) {
             *world.known.lock().unwrap().entry(id).or_default() += 1;
-            eprintln!("KNOWN DIVERGENCE {id}: {differing:?} {step}");
+            if std::env::var_os("DIFFERENTIAL_VERBOSE").is_some() {
+                eprintln!("KNOWN DIVERGENCE {id}: {differing:?} {step}");
+            }
             history.push(canons.swap_remove(0));
             continue;
         }
@@ -321,7 +343,11 @@ async fn lockstep(world: &World, runs: &mut [Run<'_>], ops: &[Op]) -> Result<(),
         text += &format!(
             "\nas a scenario (expect = {}'s answer; edit it to the oracle's before adding it){}:\n{json}\n",
             runs[pick].d.name,
-            if saved { format!(", also in {}", file.display()) } else { String::new() }
+            if saved {
+                format!(", also in {}", file.display())
+            } else {
+                String::new()
+            }
         );
         return Err(Failure { text });
     }

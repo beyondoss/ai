@@ -37,6 +37,9 @@ pub struct Pre {
     plan: Option<Plan>,
     /// The mtime (whole seconds, following links) of the path a guarded write addresses, before it.
     mtime: Option<u64>,
+    /// Where a write to the path lands (links followed as the write script does), before it: a
+    /// write replaces a symlink loop, after which the path resolves to itself.
+    target: Option<Option<PathBuf>>,
 }
 
 fn path(ctx: &Ctx, rel: &str) -> PathBuf {
@@ -61,7 +64,18 @@ pub fn before(op: &Op, ctx: &Ctx) -> Pre {
             .map(secs),
         _ => None,
     };
-    Pre { snap, plan, mtime }
+    let target = match op {
+        Op::Write { rel, .. } | Op::WriteIf { rel, .. } => {
+            Some(truth::resolve_leaf(&path(ctx, rel)))
+        }
+        _ => None,
+    };
+    Pre {
+        snap,
+        plan,
+        mtime,
+        target,
+    }
 }
 
 fn kind_of(e: &Value) -> Kind {
@@ -81,7 +95,14 @@ fn kind_of(e: &Value) -> Kind {
 /// A path with a newline in it splits the shell's one-line error, so the kind falls back to `io`
 /// (FILES-OVER-EXEC 3.3 reads the first line only). Allowed.
 fn kind_ok(kinds: &[Kind], k: Kind, p: &Path) -> bool {
-    kinds.contains(&k) || (k == Kind::Io && p.to_string_lossy().contains('\n'))
+    kinds.contains(&k) || (k == Kind::Io && (p.to_string_lossy().contains('\n') || has_loop(p)))
+}
+
+/// A symlink loop on the way ("Too many levels of symbolic links") is none of the errors
+/// FILES-OVER-EXEC 3.3 names, so it is `io`.
+fn has_loop(p: &Path) -> bool {
+    p.ancestors()
+        .any(|a| std::fs::metadata(a).is_err_and(|e| e.raw_os_error() == Some(40)))
 }
 
 fn node_desc(n: &Node) -> String {
@@ -143,12 +164,7 @@ fn applied(pre: &Snap, post: &Snap, target: &Path, data: &[u8]) -> Result<Snap, 
     let mut e = pre.clone();
     let actual = post.get(target);
     match (e.get_mut(target), actual) {
-        (
-            Some(Node::File { bytes, mtime, .. }),
-            Some(Node::File {
-                mtime: am, ..
-            }),
-        ) => {
+        (Some(Node::File { bytes, mtime, .. }), Some(Node::File { mtime: am, .. })) => {
             *bytes = data.to_vec();
             *mtime = *am;
         }
@@ -178,7 +194,13 @@ fn applied(pre: &Snap, post: &Snap, target: &Path, data: &[u8]) -> Result<Snap, 
     Ok(e)
 }
 
-pub fn after(op: &Op, req: &Value, resp: &Value, pre: &Pre, ctx: &Ctx) -> Result<Option<&'static str>, String> {
+pub fn after(
+    op: &Op,
+    req: &Value,
+    resp: &Value,
+    pre: &Pre,
+    ctx: &Ctx,
+) -> Result<Option<&'static str>, String> {
     let err = resp.get("error");
     let ok = resp.get("ok");
     match op {
@@ -210,7 +232,7 @@ pub fn after(op: &Op, req: &Value, resp: &Value, pre: &Pre, ctx: &Ctx) -> Result
                     };
                 }
             }
-            let Some(target) = truth::resolve_leaf(&p) else {
+            let Some(target) = pre.target.clone().flatten() else {
                 return Ok(None); // a symlink loop: unspecified
             };
             let plan = pre.plan.clone().expect("a write has a plan");
@@ -277,7 +299,9 @@ pub fn after(op: &Op, req: &Value, resp: &Value, pre: &Pre, ctx: &Ctx) -> Result
             match err {
                 None => {
                     if let Plan::Fail(k) = &plan {
-                        return Err(format!("mkdir reported success but the spec requires {k:?}"));
+                        return Err(format!(
+                            "mkdir reported success but the spec requires {k:?}"
+                        ));
                     }
                     if !p.is_dir() {
                         return Err(format!("mkdir said ok but {rel:?} is not a directory"));
@@ -300,7 +324,9 @@ pub fn after(op: &Op, req: &Value, resp: &Value, pre: &Pre, ctx: &Ctx) -> Result
                         ));
                     }
                     match &plan {
-                        Plan::Succeed => Err(format!("mkdir {rel:?} must succeed but failed: {resp}")),
+                        Plan::Succeed => {
+                            Err(format!("mkdir {rel:?} must succeed but failed: {resp}"))
+                        }
                         Plan::Fail(kinds) if !kind_ok(kinds, k, &p) => Err(format!(
                             "mkdir {rel:?} failed as {} but the spec allows {kinds:?}",
                             kind_str(e)
@@ -319,8 +345,12 @@ pub fn after(op: &Op, req: &Value, resp: &Value, pre: &Pre, ctx: &Ctx) -> Result
             let want = std::fs::metadata(&p).ok();
             match (ok["exists"].as_bool(), want) {
                 (Some(false), None) => Ok(None),
-                (Some(false), Some(m)) => Err(format!("stat says {rel:?} is absent but std::fs finds it: {m:?}")),
-                (Some(true), None) => Err(format!("stat says {rel:?} exists but std::fs does not find it")),
+                (Some(false), Some(m)) => Err(format!(
+                    "stat says {rel:?} is absent but std::fs finds it: {m:?}"
+                )),
+                (Some(true), None) => Err(format!(
+                    "stat says {rel:?} exists but std::fs does not find it"
+                )),
                 (Some(true), Some(m)) => {
                     let kind = if m.is_dir() {
                         "dir"
@@ -340,7 +370,11 @@ pub fn after(op: &Op, req: &Value, resp: &Value, pre: &Pre, ctx: &Ctx) -> Result
                         return Err(format!("stat mtime {} != {ts}", ok["mtime"]));
                     }
                     if ok["writable"].as_bool() != Some(truth::can(&p, 2)) {
-                        return Err(format!("stat writable {} != {}", ok["writable"], truth::can(&p, 2)));
+                        return Err(format!(
+                            "stat writable {} != {}",
+                            ok["writable"],
+                            truth::can(&p, 2)
+                        ));
                     }
                     Ok(None)
                 }
@@ -368,12 +402,17 @@ pub fn after(op: &Op, req: &Value, resp: &Value, pre: &Pre, ctx: &Ctx) -> Result
                     "read {rel:?} must return {} bytes but failed: {resp}",
                     w.len()
                 )),
-                (Some(_), _, Err(k)) => Err(format!("read of {rel:?} succeeded but the spec requires an error {k:?}")),
+                (Some(_), _, Err(k)) => Err(format!(
+                    "read of {rel:?} succeeded but the spec requires an error {k:?}"
+                )),
                 (None, Some(e), Err(kinds)) => {
                     if kind_ok(&kinds, kind_of(e), &p) {
                         Ok(None)
                     } else {
-                        Err(format!("read {rel:?} failed as {} but the spec allows {kinds:?}", kind_str(e)))
+                        Err(format!(
+                            "read {rel:?} failed as {} but the spec allows {kinds:?}",
+                            kind_str(e)
+                        ))
                     }
                 }
                 _ => Err(format!("read answered {resp}")),
@@ -393,6 +432,12 @@ pub fn after(op: &Op, req: &Value, resp: &Value, pre: &Pre, ctx: &Ctx) -> Result
         } => {
             unchanged(ctx, pre, "search")?;
             if *raw {
+                return Ok(None);
+            }
+            // FILES-OVER-EXEC 5.7: busybox grep "cannot represent" a path with a newline in it, and
+            // it mis-splits any `-DIGITS-`; the rung is the last resort and is compared only with
+            // the other drivers when the tree has such a name.
+            if ctx.busybox && pre.snap.keys().any(|p| p.to_string_lossy().contains('\n')) {
                 return Ok(None);
             }
             let root = path(ctx, rel);
@@ -418,32 +463,43 @@ pub fn after(op: &Op, req: &Value, resp: &Value, pre: &Pre, ctx: &Ctx) -> Result
                     // when it is not UTF-8; that line is not a per-path OS error, so it is read as a
                     // rejected pattern when nothing matched.
                     if k == Kind::InvalidQuery
-                        && e["detail"].as_str().is_some_and(|d| d.contains("stream did not contain valid UTF-8"))
+                        && e["detail"]
+                            .as_str()
+                            .is_some_and(|d| d.contains("stream did not contain valid UTF-8"))
                     {
                         return Ok(Some("D2"));
                     }
                     let newline = root.to_string_lossy().contains('\n')
                         || pre.snap.keys().any(|p| p.to_string_lossy().contains('\n'));
-                    if k == Kind::InvalidQuery && (want.root_missing || want.unreadable) && newline {
+                    if k == Kind::InvalidQuery && (want.root_missing || want.unreadable) && newline
+                    {
                         return Ok(Some("N2"));
                     }
                     if want.root_below_file && k == Kind::InvalidQuery {
                         return Ok(Some("N3"));
                     }
                     if want.root_missing {
-                        if k == Kind::NotFound || (want.root_below_file && k == Kind::NotADirectory) {
+                        if k == Kind::NotFound || (want.root_below_file && k == Kind::NotADirectory)
+                        {
                             return Ok(None);
                         }
-                        return Err(format!("search of the missing root {rel:?} must fail as not_found, got {}", kind_str(e)));
+                        return Err(format!(
+                            "search of the missing root {rel:?} must fail as not_found, got {}",
+                            kind_str(e)
+                        ));
                     }
                     if want.unreadable {
-                        return Err(format!("search lost the matches it could read because a path was unreadable: {resp}"));
+                        return Err(format!(
+                            "search lost the matches it could read because a path was unreadable: {resp}"
+                        ));
                     }
                     Err(format!("search {pattern:?} failed: {resp}"))
                 }
                 (Some(ok), None) => {
                     if want.root_missing {
-                        return Err(format!("search of the missing root {rel:?} succeeded: {resp}"));
+                        return Err(format!(
+                            "search of the missing root {rel:?} succeeded: {resp}"
+                        ));
                     }
                     let hits: Vec<Th> = ok["hits"]
                         .as_array()
@@ -479,17 +535,29 @@ pub fn after(op: &Op, req: &Value, resp: &Value, pre: &Pre, ctx: &Ctx) -> Result
                             ));
                         }
                         if truncated != want.truncated {
-                            return Err(format!("search truncated={truncated} but expected {}", want.truncated));
+                            return Err(format!(
+                                "search truncated={truncated} but expected {}",
+                                want.truncated
+                            ));
                         }
                     } else if let Some(h) = hits.iter().find(|h| !want.hits.contains(h)) {
-                        return Err(format!("search returned a hit that is not in the tree: {h:?}"));
+                        return Err(format!(
+                            "search returned a hit that is not in the tree: {h:?}"
+                        ));
                     }
                     Ok(None)
                 }
                 _ => Err(format!("search answered {resp}")),
             }
         }
-        Op::Exec { command, stdin, stream, timeout_ms, args, .. } => {
+        Op::Exec {
+            command,
+            stdin,
+            stream,
+            timeout_ms,
+            args,
+            ..
+        } => {
             // The only exec with an answer known in advance: `cat` echoes its stdin.
             if command == "cat" && !stream && timeout_ms.is_none() && args.is_empty() {
                 let got = ok.map(|o| data_of(o, "stdout_b64"));
@@ -526,7 +594,14 @@ fn read_expect(p: &Path, offset: u64, max: u64) -> Result<Vec<u8>, Vec<Kind>> {
     Ok(data[lo..hi].to_vec())
 }
 
-fn list(ctx: &Ctx, pre: &Pre, rel: &str, hidden: bool, limit: Option<usize>, resp: &Value) -> Result<Option<&'static str>, String> {
+fn list(
+    ctx: &Ctx,
+    pre: &Pre,
+    rel: &str,
+    hidden: bool,
+    limit: Option<usize>,
+    resp: &Value,
+) -> Result<Option<&'static str>, String> {
     let p = path(ctx, rel);
     unchanged(ctx, pre, "list")?;
     let cap = limit.unwrap_or(10_000);
@@ -579,8 +654,10 @@ fn list(ctx: &Ctx, pre: &Pre, rel: &str, hidden: bool, limit: Option<usize>, res
             let k = kind_of(e);
             let ok = match &meta {
                 Err(_) => {
-                    matches!(k, Kind::NotFound | Kind::PermissionDenied | Kind::NotADirectory)
-                        || std::fs::symlink_metadata(&p).is_ok()
+                    matches!(
+                        k,
+                        Kind::NotFound | Kind::PermissionDenied | Kind::NotADirectory
+                    ) || std::fs::symlink_metadata(&p).is_ok()
                 }
                 Ok(_) => !readable && matches!(k, Kind::PermissionDenied | Kind::Io),
             };
@@ -595,7 +672,10 @@ fn list(ctx: &Ctx, pre: &Pre, rel: &str, hidden: bool, limit: Option<usize>, res
             let dangling = meta.is_err()
                 && std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink());
             if meta.is_err() && !dangling {
-                return Err(format!("list of the missing {rel:?} succeeded with {} entries", entries.len()));
+                return Err(format!(
+                    "list of the missing {rel:?} succeeded with {} entries",
+                    entries.len()
+                ));
             }
             let via_link = std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink())
                 && matches!(&meta, Ok(m) if m.is_dir());
@@ -641,7 +721,11 @@ fn list(ctx: &Ctx, pre: &Pre, rel: &str, hidden: bool, limit: Option<usize>, res
                 }
             } else {
                 if got.len() != cap {
-                    return Err(format!("list {rel:?} limit={cap} returned {} of {} kept entries", got.len(), want.len()));
+                    return Err(format!(
+                        "list {rel:?} limit={cap} returned {} of {} kept entries",
+                        got.len(),
+                        want.len()
+                    ));
                 }
                 if let Some(g) = got.iter().find(|g| !want.contains(g)) {
                     return Err(format!("list {rel:?} returned {g:?}, not in {want:?}"));

@@ -224,10 +224,7 @@ pub fn seed() -> Vec<Op> {
         ("d/sub/x", b"x1\ne1\n\nneedle\n"),
         (".hidden", b"needle hidden\n"),
     ];
-    let mut ops = vec![exec(
-        "mkdir",
-        vec!["-p".into(), "--".into(), abs("d/sub")],
-    )];
+    let mut ops = vec![exec("mkdir", vec!["-p".into(), "--".into(), abs("d/sub")])];
     for (rel, data) in files {
         ops.push(env_write(rel, data.to_vec()));
     }
@@ -310,7 +307,10 @@ impl Pool {
                     parents = files; // a file as the parent: the not-a-directory cases
                 }
             }
-            join(&tc.draw(gs::sampled_from(parents)), &unambiguous(fixtures::name(tc)))
+            join(
+                &tc.draw(gs::sampled_from(parents)),
+                &unambiguous(fixtures::name(tc)),
+            )
         };
         self.remember(&p);
         p
@@ -368,9 +368,7 @@ pub fn sequence(tc: &TestCase, max_steps: usize) -> Vec<Op> {
                 ]));
                 ops.push(Op::Read { rel, offset, max });
             }
-            8 | 9 => ops.push(Op::Stat {
-                rel: pool.path(tc),
-            }),
+            8 | 9 => ops.push(Op::Stat { rel: pool.path(tc) }),
             10..=12 => {
                 let rel = if tc.draw(gs::booleans()) {
                     pool.dir(tc)
@@ -380,7 +378,14 @@ pub fn sequence(tc: &TestCase, max_steps: usize) -> Vec<Op> {
                 ops.push(Op::List {
                     rel,
                     hidden: tc.draw(gs::booleans()),
-                    limit: tc.draw(gs::sampled_from(vec![None, None, Some(0), Some(1), Some(2), Some(5)])),
+                    limit: tc.draw(gs::sampled_from(vec![
+                        None,
+                        None,
+                        Some(0),
+                        Some(1),
+                        Some(2),
+                        Some(5),
+                    ])),
                 });
             }
             13..=15 => {
@@ -431,7 +436,10 @@ pub fn sequence(tc: &TestCase, max_steps: usize) -> Vec<Op> {
                     _ => abs(&pool.path(tc)),
                 };
                 if abs(&link) != target {
-                    ops.push(exec("ln", vec!["-s".into(), "--".into(), target, abs(&link)]));
+                    ops.push(exec(
+                        "ln",
+                        vec!["-s".into(), "--".into(), target, abs(&link)],
+                    ));
                 }
             }
             20 => {
@@ -468,9 +476,16 @@ pub fn sequence(tc: &TestCase, max_steps: usize) -> Vec<Op> {
                 cwd: None,
                 // Text: exec answers carry stdout as a string, so bytes that are not UTF-8 would not round-trip.
                 stdin: Some(
-                    tc.draw(gs::sampled_from(vec!["", "x", "a\nb\n", "漢字 ✓", "tab\there", "no newline"]))
-                        .as_bytes()
-                        .to_vec(),
+                    tc.draw(gs::sampled_from(vec![
+                        "",
+                        "x",
+                        "a\nb\n",
+                        "漢字 ✓",
+                        "tab\there",
+                        "no newline",
+                    ]))
+                    .as_bytes()
+                    .to_vec(),
                 ),
                 timeout_ms: None,
                 stream: false, // exec_stream has no stdin field
@@ -497,7 +512,17 @@ pub fn sequence(tc: &TestCase, max_steps: usize) -> Vec<Op> {
                 rel: String::new(),
                 pattern: tc
                     .draw(gs::sampled_from(vec![
-                        "(", "[", "*", "a{", "\\", "(?i)needle", "\\d+", "needle|", "^$", "[[:alpha:]]+", "x{2,1}",
+                        "(",
+                        "[",
+                        "*",
+                        "a{",
+                        "\\",
+                        "(?i)needle",
+                        "\\d+",
+                        "needle|",
+                        "^$",
+                        "[[:alpha:]]+",
+                        "x{2,1}",
                     ]))
                     .into(),
                 literal: false,

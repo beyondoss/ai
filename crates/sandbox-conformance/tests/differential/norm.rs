@@ -14,8 +14,8 @@
 //! | `search.note` (when present)  | `{"$type":"string"}`             | text of the engine's first error, has paths    |
 //!
 //! The result is a valid `expect` for a scenario step, which is how a divergence is printed.
-use sandbox_conformance::eval::B64;
 use base64::Engine as _;
+use sandbox_conformance::eval::B64;
 use serde_json::{Value, json};
 
 fn replace_root(v: &mut Value, root: &str) {

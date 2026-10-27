@@ -18,8 +18,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, dead_code)]
 
 mod differential {
-    pub mod norm;
     pub mod known;
+    pub mod norm;
     pub mod ops;
     pub mod oracle;
     pub mod world;
@@ -37,7 +37,12 @@ fn env_u64(name: &str) -> Option<u64> {
 
 fn settings(default_cases: u64, seed: u64) -> hegel::Settings {
     // `DIFFERENTIAL_SHRINK=0` reports the first failing sequence unshrunk, for a quick look.
-    let mut phases = vec![hegel::Phase::Explicit, hegel::Phase::Reuse, hegel::Phase::Generate, hegel::Phase::Target];
+    let mut phases = vec![
+        hegel::Phase::Explicit,
+        hegel::Phase::Reuse,
+        hegel::Phase::Generate,
+        hegel::Phase::Target,
+    ];
     if std::env::var("DIFFERENTIAL_SHRINK").as_deref() != Ok("0") {
         phases.push(hegel::Phase::Shrink);
     }
@@ -97,30 +102,30 @@ fn drive(backend: &str, default_cases: u64, seed: u64) {
 
 #[test]
 fn local_plain() {
-    drive("local-plain", 60, 0xd1ff_0001);
+    drive("local-plain", 120, 0xd1ff_0001);
 }
 
 #[test]
 fn local_without_stdin() {
-    drive("local-no-stdin", 40, 0xd1ff_0002);
+    drive("local-no-stdin", 80, 0xd1ff_0002);
 }
 
 #[test]
 fn local_posix_grep() {
-    drive("local-grep", 40, 0xd1ff_0003);
+    drive("local-grep", 80, 0xd1ff_0003);
 }
 
 #[test]
 fn local_busybox_rungs() {
-    drive("local-busybox-grep", 40, 0xd1ff_0004);
+    drive("local-busybox-grep", 80, 0xd1ff_0004);
 }
 
 #[test]
 fn alpine() {
-    drive("alpine", 30, 0xd1ff_0005);
+    drive("alpine", 60, 0xd1ff_0005);
 }
 
 #[test]
 fn debian_runas() {
-    drive("debian-runas", 30, 0xd1ff_0006);
+    drive("debian-runas", 60, 0xd1ff_0006);
 }

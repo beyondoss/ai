@@ -178,6 +178,106 @@
           }
         }
       ]
+    },
+    {
+      "id": "differential-found.search.clip-uses-rust-regex-syntax",
+      "description": "A match line longer than 500 characters is clipped around the first match of the query, the pattern read as a Rust-syntax regular expression (FILES-OVER-EXEC 5.7, Clipping). The line here is 600 z, `needle`, 10 w; the match ends past column 500, so the text is `… ` + columns 117-616 and the `[truncated; columns 117-616 of 616]` suffix. A pattern that is valid Rust syntax but not JavaScript syntax must clip the same way.",
+      "requires": {
+        "search_engine": "rg"
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; { head -c 600 /dev/zero | tr '\\000' z; printf 'needlewwwwwwwwww\\n'; } > long.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "plain",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "needle",
+          "literal": false,
+          "limit": 5,
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/long.txt",
+                  "line": 1,
+                  "is_match": true,
+                  "text": {
+                    "$contains": "[truncated; columns 117-616 of 616]"
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "inline-flag",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "(?i)NEEDLE",
+          "literal": false,
+          "limit": 5,
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/long.txt",
+                  "line": 1,
+                  "is_match": true,
+                  "text": {
+                    "$contains": "[truncated; columns 117-616 of 616]"
+                  }
+                }
+              ]
+            }
+          },
+          "xfail": {
+            "drivers": [
+              "beyond-sandbox-ts"
+            ],
+            "reason": "the TypeScript client finds the match to clip around with a JavaScript RegExp, which rejects Rust syntax such as (?i) and (?P<name>..); the line is then clipped as a context line"
+          }
+        },
+        {
+          "id": "named-group",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "nee(?P<x>d)le",
+          "literal": false,
+          "limit": 5,
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/long.txt",
+                  "line": 1,
+                  "is_match": true,
+                  "text": {
+                    "$contains": "[truncated; columns 117-616 of 616]"
+                  }
+                }
+              ]
+            }
+          },
+          "xfail": {
+            "drivers": [
+              "beyond-sandbox-ts"
+            ],
+            "reason": "the TypeScript client finds the match to clip around with a JavaScript RegExp, which rejects Rust syntax such as (?i) and (?P<name>..); the line is then clipped as a context line"
+          }
+        }
+      ]
     }
   ]
 }
