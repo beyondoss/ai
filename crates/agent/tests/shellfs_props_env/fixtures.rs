@@ -103,17 +103,21 @@ fn lines(tc: &TestCase) -> Vec<u8> {
 
 /// Sizes at and around every boundary the write and read paths have: the 48 KiB write chunk, the 96 KiB
 /// read window, and a response cap.
-pub fn boundary_sizes(cap: Option<usize>) -> Vec<usize> {
+pub fn boundary_sizes(cap: Option<usize>, fill: Option<usize>) -> Vec<usize> {
     let mut v = vec![
         49151, 49152, 49153, 98303, 98304, 98305, 196608, 150_000,
     ];
     if let Some(c) = cap {
         v.extend([c / 3, c / 2, c * 3 / 4 - 400, c * 3 / 4, c * 3 / 4 + 64, c]);
     }
+    if let Some(f) = fill {
+        // Around the size of the tiny filesystem: half, and the last few blocks.
+        v.extend([f / 2, f / 2 + 4096, f - 16384, f - 8192, f - 4096, f]);
+    }
     v
 }
 
-pub fn content(tc: &TestCase, cap: Option<usize>) -> Vec<u8> {
+pub fn content(tc: &TestCase, cap: Option<usize>, fill: Option<usize>) -> Vec<u8> {
     match tc.draw(gs::integers::<u8>().min_value(0).max_value(13)) {
         0 => vec![],
         1 => tc.draw(gs::binary().max_size(40)),
@@ -132,7 +136,7 @@ pub fn content(tc: &TestCase, cap: Option<usize>) -> Vec<u8> {
             b
         }
         9 | 10 => {
-            let n = tc.draw(gs::sampled_from(boundary_sizes(cap)));
+            let n = tc.draw(gs::sampled_from(boundary_sizes(cap, fill)));
             let unit = {
                 let mut u = tc.draw(gs::binary().min_size(1).max_size(24));
                 if tc.draw(gs::booleans()) {

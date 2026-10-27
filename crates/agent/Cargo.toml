@@ -287,7 +287,7 @@ hegeltest = "0.50.3"
 rcgen = "0.13"
 # A thread's own CPU clock (`clock_gettime(CLOCK_THREAD_CPUTIME_ID)`) without `unsafe`, for
 # `tests/tool_reactor_stall.rs`'s load-proof probe. Already in the tree through `tempfile`.
-rustix = { version = "1", features = ["time"] }
+rustix = { version = "1", features = ["time", "fs"] }
 # Exhaustive model checking of exec v1.4's job-end notify protocol (`tests/notify_model.rs`): every
 # interleaving of the network, the edge, crashes and takeovers within bounds, driving the real kernels.
 stateright = "0.31.0"

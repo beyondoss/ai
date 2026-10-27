@@ -49,6 +49,10 @@ pub struct Config {
     pub fault_pct: u64,
     /// Start with a read-only directory and read-only files in the tree.
     pub readonly_start: bool,
+    /// Run in a user+mount namespace whose root is a tmpfs of this many KiB, so writes can hit a real
+    /// ENOSPC. Needs `unshare` and `nsenter` and no privilege; the test skips, with the reason
+    /// printed, where they are unavailable. Commands reach it through `nsenter`, not execd.
+    pub tiny_kib: Option<usize>,
     pub steps: i64,
 }
 
@@ -57,6 +61,7 @@ pub const PLAIN: Config = Config {
     stdin: true,
     fault_pct: 0,
     readonly_start: false,
+    tiny_kib: None,
     steps: 30,
 };
 
@@ -163,7 +168,11 @@ fn capabilities(cap: Option<usize>) -> Capabilities {
 
 pub struct Machine {
     cfg: Config,
+    /// Where `std::fs` (the oracle) sees the tree.
     root: PathBuf,
+    /// Where the commands `ShellFs` runs see it: the same unless the tree is in a namespace.
+    cmd_root: PathBuf,
+    _tiny: Option<Tiny>,
     dir: Option<tempfile::TempDir>,
     fs: ShellFs,
     fs2: ShellFs,
@@ -183,13 +192,150 @@ impl Drop for Machine {
     }
 }
 
+/// A tmpfs of a few KiB in a private user+mount namespace, held open by a `sleep`. Commands run in it
+/// through `nsenter`; the test reads it through `/proc/PID/root`. No privilege needed.
+pub struct Tiny {
+    child: std::process::Child,
+    pub pid: u32,
+}
+
+impl Drop for Tiny {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+pub fn start_tiny(mount: &Path, kib: usize) -> Result<Tiny, String> {
+    use std::io::BufRead;
+    let mut child = std::process::Command::new("unshare")
+        .args(["-rm", "sh", "-c"])
+        .arg(format!(
+            "mount -t tmpfs -o size={kib}k tmpfs '{}' && echo ready && exec sleep 100000",
+            mount.display()
+        ))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run unshare: {e}"))?;
+    let mut line = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .map_err(|e| e.to_string())?;
+    if line.trim() != "ready" {
+        let mut err = String::new();
+        let _ = std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut err);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("an unprivileged tmpfs mount is not available: {}", err.trim()));
+    }
+    let pid = child.id();
+    Ok(Tiny { child, pid })
+}
+
+/// Why the tiny-filesystem environment cannot run here, or `None` when it can.
+pub fn tiny_unavailable() -> Option<String> {
+    let dir = tempfile::tempdir().unwrap();
+    match start_tiny(dir.path(), 64) {
+        Err(e) => Some(e),
+        Ok(t) => {
+            let ok = std::process::Command::new("nsenter")
+                .args(["-t", &t.pid.to_string(), "-U", "-m", "--preserve-credentials", "--", "true"])
+                .status()
+                .is_ok_and(|s| s.success());
+            (!ok).then(|| "nsenter cannot join the namespace".to_string())
+        }
+    }
+}
+
+/// Runs each command inside the tiny filesystem's namespace.
+struct NsRunner {
+    pid: u32,
+}
+
+#[async_trait::async_trait]
+impl CommandRunner for NsRunner {
+    async fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+    ) -> std::io::Result<beyond_agent::tools::exec::ExecResult> {
+        self.go(program, args, cwd, timeout, None).await
+    }
+
+    async fn run_with_stdin(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        stdin: &[u8],
+    ) -> std::io::Result<beyond_agent::tools::exec::ExecResult> {
+        self.go(program, args, cwd, timeout, Some(stdin)).await
+    }
+}
+
+impl NsRunner {
+    async fn go(
+        &self,
+        program: &str,
+        args: &[String],
+        _cwd: Option<&str>,
+        timeout: Duration,
+        stdin: Option<&[u8]>,
+    ) -> std::io::Result<beyond_agent::tools::exec::ExecResult> {
+        use tokio::io::AsyncWriteExt;
+        let mut c = tokio::process::Command::new("nsenter");
+        c.args(["-t", &self.pid.to_string(), "-U", "-m", "--preserve-credentials", "--"])
+            .arg(program)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = c.spawn()?;
+        let mut sin = child.stdin.take().unwrap();
+        let data = stdin.map(<[u8]>::to_vec);
+        let feed = async move {
+            if let Some(d) = data {
+                let _ = sin.write_all(&d).await;
+            }
+            drop(sin);
+        };
+        let (out, ()) = tokio::time::timeout(timeout, async {
+            tokio::join!(child.wait_with_output(), feed)
+        })
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"))?;
+        let out = out?;
+        Ok(beyond_agent::tools::exec::ExecResult {
+            code: out.status.code(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            ..Default::default()
+        })
+    }
+}
+
 pub fn machine(tc: &TestCase, cfg: Config) -> Machine {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
+    let host_root = dir.path().canonicalize().unwrap();
+    let (root, tiny) = match cfg.tiny_kib {
+        Some(kib) => {
+            let t = start_tiny(&host_root, kib).expect("checked by tiny_unavailable");
+            (PathBuf::from(format!("/proc/{}/root{}", t.pid, host_root.display())), Some(t))
+        }
+        None => (host_root.clone(), None),
+    };
     let seed = tc.draw_silent(gs::integers::<u64>());
     let mut caps = capabilities(cfg.cap);
     caps.stdin &= cfg.stdin;
-    let http: Arc<dyn CommandRunner> = http_runner(cfg.cap);
+    let http: Arc<dyn CommandRunner> = match &tiny {
+        Some(t) => Arc::new(NsRunner { pid: t.pid }),
+        None => http_runner(cfg.cap),
+    };
     let faults = FaultRunner::new(http.clone(), seed, cfg.fault_pct);
     let fs = ShellFs::with_capabilities(faults.clone(), caps);
     let fs2 = ShellFs::with_capabilities(http, caps);
@@ -201,6 +347,8 @@ pub fn machine(tc: &TestCase, cfg: Config) -> Machine {
     let mut m = Machine {
         cfg,
         root: root.clone(),
+        cmd_root: host_root,
+        _tiny: tiny,
         dir: Some(dir),
         fs,
         fs2,
@@ -324,8 +472,42 @@ impl Machine {
         rt().block_on(f)
     }
 
+    /// The path as the commands see it.
     fn c(&self, p: &Path) -> PathBuf {
-        p.to_path_buf()
+        self.cmd_root.join(p.strip_prefix(&self.root).unwrap_or(p))
+    }
+
+    fn fill(&self) -> Option<usize> {
+        self.cfg.tiny_kib.map(|k| k * 1024)
+    }
+
+    /// Free bytes on the tree's filesystem, when it is the small one.
+    fn free_bytes(&self) -> Option<u64> {
+        self.cfg.tiny_kib?;
+        let s = rustix::fs::statvfs(&self.root).ok()?;
+        Some(s.f_bavail * s.f_frsize)
+    }
+
+    /// The disk-full rule: a temp of `n` bytes needs its blocks while the old file still holds its
+    /// own, so a write that does not fit must fail (and clean up), one that clearly fits must
+    /// succeed, and the last couple of blocks are the filesystem's business.
+    fn with_space(&self, plan: Plan, n: usize) -> Plan {
+        let (Some(free), Plan::Succeed) = (self.free_bytes(), &plan) else {
+            return plan;
+        };
+        let need = (n as u64).div_ceil(4096);
+        let have = free / 4096;
+        if need > have {
+            Plan::Fail(vec![Kind::Io])
+        } else if need + 2 > have {
+            Plan::Either
+        } else {
+            plan
+        }
+    }
+
+    fn kind(&self, e: &FsError, p: &Path) -> Kind {
+        classify(e, &[p, &self.c(p), &self.root, &self.cmd_root])
     }
 
     fn remember(&mut self, p: &Path) {
@@ -393,7 +575,7 @@ impl Machine {
             .ok()
             .and_then(|m| m.modified().ok())
             .map(secs);
-        let plan = truth::plan_write(&p);
+        let plan = self.with_space(truth::plan_write(&p), data.len());
         let res: Result<bool, FsError> = self.block(async {
             match guard {
                 None => self.fs.write_bytes(&self.c(&p), data.clone()).await.map(|_| true),
@@ -488,7 +670,7 @@ impl Machine {
                 check_unchanged("a conflict");
             }
             Err(e) => {
-                let kind = classify(e, &[&p, &self.root]);
+                let kind = self.kind(e, &p);
                 if report.errored && matches!(kind, Kind::Transport | Kind::Timeout) {
                     // The spec's promise under a failed transport: unchanged or fully written, never
                     // partial, never a temp.
@@ -563,7 +745,7 @@ impl Machine {
     #[rule]
     fn write(&mut self, tc: TestCase) {
         let p = self.pick_path(&tc);
-        let data = fixtures::content(&tc, self.cfg.cap);
+        let data = fixtures::content(&tc, self.cfg.cap, self.fill());
         tc.note(&format!("write {:?} ({} bytes)", p.strip_prefix(&self.root).unwrap(), data.len()));
         self.do_write(&tc, p, data, None);
     }
@@ -571,7 +753,7 @@ impl Machine {
     #[rule]
     fn write_if_unchanged(&mut self, tc: TestCase) {
         let p = self.pick_path(&tc);
-        let data = fixtures::content(&tc, self.cfg.cap);
+        let data = fixtures::content(&tc, self.cfg.cap, self.fill());
         let truth_now = std::fs::metadata(&p).ok().and_then(|m| m.modified().ok()).map(secs);
         let remembered = self.stats.get(&p).copied();
         let expected = match tc.draw(gs::integers::<u8>().max_value(4)) {
@@ -688,7 +870,7 @@ impl Machine {
                 }
             }
             (Err(e), _) if report.errored => {
-                let k = classify(&e, &[&p, &self.root]);
+                let k = self.kind(&e, &p);
                 if !matches!(k, Kind::Transport | Kind::Timeout) {
                     fail(format!("injected fault surfaced as {k:?}: {e}"));
                 }
@@ -707,7 +889,7 @@ impl Machine {
             }
             (Err(e), Ok(w)) => fail(format!("read {p:?} must return {} bytes but failed: {e}", w.len())),
             (Err(e), Err(kinds)) => {
-                let k = classify(&e, &[&p, &self.root]);
+                let k = self.kind(&e, &p);
                 if !kind_ok(&kinds, k, &p) {
                     fail(format!("read {p:?} failed as {k:?} ({e}); spec allows {kinds:?}"));
                 }
@@ -749,7 +931,7 @@ impl Machine {
         }
         match got {
             Err(e) => {
-                let k = classify(&e, &[&p, &self.root]);
+                let k = self.kind(&e, &p);
                 if report.errored {
                     return;
                 }
@@ -832,7 +1014,7 @@ impl Machine {
         };
         let got = self.block(self.fs.search(&q));
         let report = self.faults.take();
-        let map = |p: &Path| p.to_string_lossy().into_owned();
+        let map = |p: &Path| self.c(p).to_string_lossy().into_owned();
         let want = search_truth::expect(&root, &map, &spec, self.engine);
         tc.event(format!(
             "search: {} {}",
@@ -845,7 +1027,7 @@ impl Machine {
         }
         match got {
             Err(e) => {
-                let k = classify(&e, &[&root, &self.root]);
+                let k = self.kind(&e, &root);
                 let tolerated = report.errored
                     || (self.cfg.cap.is_some() && k == Kind::TooLarge)
                     || (want.unreadable && !want.root_missing && !report.errored && false);
@@ -930,7 +1112,7 @@ impl Machine {
         let res = self.block(self.fs.create_dir_all(&self.c(&p)));
         let report = self.faults.take();
         let after = snapshot(&self.root);
-        let resolved = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+        let resolved = truth::canon(&p).unwrap_or_else(|_| p.clone());
         let new_ok = |after: &Snap| {
             // Only directories on the way to `p` may appear.
             after.iter().all(|(k, n)| match before.get(k) {
@@ -952,7 +1134,7 @@ impl Machine {
                 }
             }
             Err(e) => {
-                let k = classify(&e, &[&p, &self.root]);
+                let k = self.kind(&e, &p);
                 if !report.errored {
                     match plan {
                         Plan::Succeed => fail(format!("mkdir -p {p:?} must succeed but failed ({k:?}): {e}")),
@@ -972,12 +1154,12 @@ impl Machine {
     /// Two writers to one path: one complete content wins; a reader sees only whole contents.
     #[rule]
     fn race_write(&mut self, tc: TestCase) {
-        tc.assume(self.cfg.fault_pct == 0);
+        tc.assume(self.cfg.fault_pct == 0 && self.cfg.tiny_kib.is_none());
         let p = self.pick_path(&tc);
         tc.assume(matches!(truth::plan_write(&p), Plan::Succeed));
         tc.assume(std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file()) || std::fs::symlink_metadata(&p).is_err());
-        let a = fixtures::content(&tc, self.cfg.cap);
-        let b = fixtures::content(&tc, self.cfg.cap);
+        let a = fixtures::content(&tc, self.cfg.cap, self.fill());
+        let b = fixtures::content(&tc, self.cfg.cap, self.fill());
         let mode = tc.draw(gs::integers::<u8>().max_value(2));
         tc.note(&format!(
             "race_write {:?} a={}B b={}B second={}",
@@ -1067,7 +1249,7 @@ impl Machine {
     #[rule]
     fn env_write(&mut self, tc: TestCase) {
         let p = self.pick_path(&tc);
-        let data = fixtures::content(&tc, self.cfg.cap);
+        let data = fixtures::content(&tc, self.cfg.cap, self.fill());
         // `keep` re-sets the previous mtime: a same-second edit the guard cannot see (a documented
         // limit); the others move the mtime to a different second.
         let how = tc.draw(gs::integers::<u8>().max_value(3));
@@ -1095,6 +1277,7 @@ impl Machine {
 
     #[rule]
     fn env_symlink(&mut self, tc: TestCase) {
+        tc.assume(self.cfg.tiny_kib.is_none());
         let link = self.pick_path(&tc);
         let target = match tc.draw(gs::integers::<u8>().max_value(4)) {
             0 => PathBuf::from("/dev/null"),
@@ -1110,6 +1293,8 @@ impl Machine {
 
     #[rule]
     fn env_chmod(&mut self, tc: TestCase) {
+        // Inside the namespace the caller is root-mapped, so mode bits do not bind there.
+        tc.assume(self.cfg.tiny_kib.is_none());
         let p = self.pick_path(&tc);
         let mode = tc.draw(gs::sampled_from(vec![0o000u32, 0o444, 0o555, 0o600, 0o644, 0o700, 0o755, 0o111, 0o333]));
         tc.note(&format!("env: chmod {mode:o} {:?}", p.strip_prefix(&self.root).unwrap()));

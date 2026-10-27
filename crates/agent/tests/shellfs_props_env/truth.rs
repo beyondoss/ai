@@ -206,6 +206,16 @@ pub fn temps(s: &Snap) -> Vec<PathBuf> {
         .collect()
 }
 
+/// `canonicalize`, except under `/proc/PID/root`, whose magic link would send it to the host's own
+/// view of the path instead of the namespace's.
+pub fn canon(p: &Path) -> std::io::Result<PathBuf> {
+    if p.starts_with("/proc") {
+        Ok(p.to_path_buf())
+    } else {
+        std::fs::canonicalize(p)
+    }
+}
+
 /// Follow the symlinks at the final component, as the write scripts do (`readlink -f`, one hop for a
 /// dangling link). `None` for a loop.
 pub fn resolve_leaf(p: &Path) -> Option<PathBuf> {
@@ -213,7 +223,7 @@ pub fn resolve_leaf(p: &Path) -> Option<PathBuf> {
     let canon_parent = |q: &Path| -> Option<PathBuf> {
         let name = q.file_name()?;
         let parent = q.parent()?;
-        Some(std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()).join(name))
+        Some(canon(parent).unwrap_or_else(|_| parent.to_path_buf()).join(name))
     };
     let mut cur = canon_parent(p)?;
     for _ in 0..40 {
