@@ -1216,7 +1216,8 @@ fn covers_in(v: &Value, out: &mut BTreeSet<String>) {
 #[test]
 fn every_requirement_has_a_check() {
     let spec = spec_requirements();
-    // Tags run N1, N2, … and E1, E2, … with no gap or repeat.
+    // Tags run in increasing order, N… and E…, none repeated. (N2, N3 and N9 belonged to the version
+    // negotiation and the baseline's sender, and are gone; numbers are never reused.)
     for tag in ['N', 'E'] {
         let ids: Vec<&String> = spec
             .iter()
@@ -1224,13 +1225,11 @@ fn every_requirement_has_a_check() {
             .filter(|id| id.starts_with(tag))
             .collect();
         assert!(!ids.is_empty(), "no {tag} requirements found");
-        for (i, id) in ids.iter().enumerate() {
-            assert_eq!(
-                **id,
-                format!("{tag}{}", i + 1),
-                "requirement tags are sequential"
-            );
-        }
+        let numbers: Vec<u32> = ids.iter().map(|id| id[1..].parse().unwrap()).collect();
+        assert!(
+            numbers.windows(2).all(|w| w[0] < w[1]),
+            "requirement tags increase: {numbers:?}"
+        );
     }
     let defined: BTreeSet<&String> = spec.iter().map(|(id, _)| id).collect();
     for (id, text) in &spec {

@@ -194,7 +194,11 @@ async fn run_applies_the_exec_max_response_bytes_flag() {
     // the one the model's `bash` result reports.
     let url = endless(Arc::new(AtomicUsize::new(0))).await;
     let (base, _bodies) = common::spawn_model_server(vec![
-        common::turn_tool_use("t1", "bash", &json!({ "command": "yes" }).to_string()),
+        common::turn_tool_use(
+            "t1",
+            "write",
+            &json!({ "path": "/work/big", "content": "x" }).to_string(),
+        ),
         common::turn_text("done"),
     ]);
     let mut cmd = common::run_cmd(env!("CARGO_BIN_EXE_agent"));

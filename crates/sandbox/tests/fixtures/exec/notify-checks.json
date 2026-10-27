@@ -78,26 +78,6 @@
       ]
     },
     {
-      "id": "N9",
-      "checks": [
-        {
-          "kind": "test",
-          "name": "sandbox_jobs_notify::the_supervisor_sends_the_proof",
-          "task": "exists"
-        },
-        {
-          "kind": "test",
-          "name": "sandbox_jobs_notify::an_older_supervisor_refuses_notify",
-          "task": "exists"
-        },
-        {
-          "kind": "test",
-          "name": "sandbox_jobs_notify::a_notifier_that_dies_is_started_again",
-          "task": "exists"
-        }
-      ]
-    },
-    {
       "id": "N10",
       "checks": [
         {
@@ -228,7 +208,7 @@
       "checks": [
         {
           "kind": "test",
-          "name": "sandbox_jobs_notify::the_token_is_never_logged",
+          "name": "security::notify_tokens_and_callback_urls_never_reach_the_log",
           "task": "exists"
         }
       ]

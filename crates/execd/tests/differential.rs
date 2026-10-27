@@ -15,8 +15,8 @@
 //!
 //! - **Per stream, not across.** The order of stdout against stderr is best-effort (v1.2
 //!   "Ordering"), so each stream is compared on its own.
-//! - **v1.1 strings are UTF-8.** The answer is JSON, so its `stdout`/`stderr` are the command's
-//!   bytes decoded lossily; the direct bytes are decoded the same way. v1.2 is base64 and exact.
+//! - **Output is bytes.** A one-shot answer's `stdout`/`stderr` are base64, like a stream's frames, so
+//!   both are compared with the direct bytes exactly.
 //! - **v1.1 signals are `128 + S`** (the convention `shell_exit` documents); the direct run's signal
 //!   is mapped the same way. v1.2 carries `{"signal": S}` and is compared exactly.
 //! - **stdin is v1.1 only.** A v1.2 command has no stdin, so it is compared against a direct run
@@ -354,18 +354,24 @@ fn request(script: &str) -> Value {
     json!({ "command": "sh", "args": ["-c", script], "timeout_ms": 60_000 })
 }
 
-/// v1.1: one JSON answer. `128 + S` stands for a signal here, so it is reported as an exit code.
+fn decode(v: &Value) -> Vec<u8> {
+    base64::engine::general_purpose::STANDARD
+        .decode(v.as_str().expect("base64 output"))
+        .expect("standard base64")
+}
+
+/// One-shot: one JSON answer. `128 + S` stands for a signal here, so it is reported as an exit code.
 async fn via_v11(addr: SocketAddr, script: &str, stdin: Option<&[u8]>) -> Outcome {
     let mut req = request(script);
     if let Some(b) = stdin {
-        req["stdin_base64"] = json!(base64::engine::general_purpose::STANDARD.encode(b));
+        req["stdin"] = json!(base64::engine::general_purpose::STANDARD.encode(b));
     }
     let a = post(addr, &[], &req).await;
     assert_eq!(a.status, 200, "v1.1 status");
     let j = a.json();
     Outcome {
-        stdout: j["stdout"].as_str().expect("stdout").as_bytes().to_vec(),
-        stderr: j["stderr"].as_str().expect("stderr").as_bytes().to_vec(),
+        stdout: decode(&j["stdout"]),
+        stderr: decode(&j["stderr"]),
         ended: Ended::Exit(j["exit_code"].as_i64().expect("exit_code") as i32),
     }
 }
@@ -465,8 +471,7 @@ async fn check(addr: SocketAddr, root: &Path, home: &Path, p: &Program) -> Resul
         ("stdout", Stream::Out, &got.stdout, &want.stdout),
         ("stderr", Stream::Err, &got.stderr, &want.stderr),
     ] {
-        let w = String::from_utf8_lossy(w).into_owned().into_bytes();
-        same(g, &w, p.loose_bytes(on), false).map_err(|e| format!("v1.1 {name}: {e}"))?;
+        same(g, w, p.loose_bytes(on), false).map_err(|e| format!("v1.1 {name}: {e}"))?;
     }
     Ok(())
 }

@@ -21,6 +21,13 @@ async fn start(opts: impl FnOnce(&mut execd::Options)) -> (execd::Handle, tempfi
     (server, dir)
 }
 
+/// What a one-shot answer carries in `stdout` or `stderr`: the bytes, decoded from base64.
+fn bytes(answer: &Value, key: &str) -> Vec<u8> {
+    base64::engine::general_purpose::STANDARD
+        .decode(answer[key].as_str().unwrap())
+        .unwrap()
+}
+
 fn run(cmd: &str, args: &[&str]) -> Value {
     json!({ "command": cmd, "args": args, "timeout_ms": 30_000 })
 }
@@ -80,7 +87,7 @@ async fn livez_answers_without_auth_and_everything_else_wants_the_bearer() {
     );
     let ok = post(addr, &[("Authorization", "Bearer open-sesame")], &req).await;
     assert_eq!(ok.status, 200);
-    assert_eq!(ok.json()["stdout"], "hi\n");
+    assert_eq!(bytes(&ok.json(), "stdout"), b"hi\n");
     server.shutdown().await;
 }
 
@@ -89,15 +96,17 @@ async fn the_envelope_runs_a_command_with_stdin_and_reports_signals() {
     let (server, dir) = start(|_| {}).await;
     let addr = server.local_addr();
     let mut req = run("cat", &[]);
-    req["stdin_base64"] = json!(base64::engine::general_purpose::STANDARD.encode(b"stdin-probe"));
+    req["stdin"] = json!(base64::engine::general_purpose::STANDARD.encode(b"stdin-probe"));
     let a = post(addr, &[], &req).await;
-    assert_eq!(a.json()["stdout"], "stdin-probe");
+    assert_eq!(bytes(&a.json(), "stdout"), b"stdin-probe");
     assert_eq!(a.json()["exit_code"], 0);
     // cwd defaults to the root.
     let a = post(addr, &[], &run("pwd", &[])).await;
     let want = dir.path().canonicalize().unwrap();
     assert_eq!(
-        a.json()["stdout"].as_str().unwrap().trim(),
+        String::from_utf8(bytes(&a.json(), "stdout"))
+            .unwrap()
+            .trim(),
         want.to_str().unwrap()
     );
     // A command that kills itself is 128 + the signal, as a shell reports it.
@@ -122,7 +131,7 @@ async fn v11_answers_when_the_command_exits_and_kills_what_it_left_behind() {
     let script = format!("(sleep 0.3; touch {}) & echo done", marker.display());
     let t0 = Instant::now();
     let a = post(addr, &[], &run("sh", &["-c", &script])).await;
-    assert_eq!(a.json()["stdout"], "done\n");
+    assert_eq!(bytes(&a.json(), "stdout"), b"done\n");
     assert!(t0.elapsed() < Duration::from_secs(5));
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert!(!marker.exists(), "the leftover outlived the v1.1 answer");
@@ -134,7 +143,7 @@ async fn an_oversize_request_is_refused_before_it_is_read() {
     let (server, _dir) = start(|o| o.max_request_bytes = 1024).await;
     let addr = server.local_addr();
     let mut req = run("true", &[]);
-    req["stdin_base64"] = json!("A".repeat(4096));
+    req["stdin"] = json!("A".repeat(4096));
     assert_eq!(post(addr, &[], &req).await.status, 413);
     // Malformed JSON and a missing command are the client's fault.
     assert_eq!(send(addr, "POST", "/exec", &[], b"{").await.status, 400);
@@ -331,7 +340,7 @@ async fn http2_prior_knowledge_is_served_on_the_same_port() {
     assert_eq!(resp.status(), 200);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let v: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(v["stdout"], "h2\n");
+    assert_eq!(bytes(&v, "stdout"), b"h2\n");
     server.shutdown().await;
 }
 
@@ -402,7 +411,7 @@ async fn output_over_the_cap_is_an_error_and_exactly_at_it_is_the_whole_output()
     )
     .await;
     assert_eq!(a.status, 200);
-    assert_eq!(a.json()["stdout"].as_str().unwrap().len(), 1000);
+    assert_eq!(bytes(&a.json(), "stdout").len(), 1000);
     let pidfile = dir.path().join("pid");
     let script = format!(
         "echo $$ > {}; head -c 1001 /dev/zero | tr '\\0' x; (sleep 300 &) ; echo done",

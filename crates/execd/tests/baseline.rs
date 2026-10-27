@@ -105,10 +105,10 @@ async fn round(addr: SocketAddr, n: usize) {
     // v1.1: stdin, a failure, and a command that leaves a process behind.
     let a = run(
         addr,
-        json!({ "command": "cat", "args": [], "timeout_ms": 30_000, "stdin_base64": "aGVsbG8=" }),
+        json!({ "command": "cat", "args": [], "timeout_ms": 30_000, "stdin": "aGVsbG8=" }),
     )
     .await;
-    assert_eq!(a.json()["stdout"], "hello");
+    assert_eq!(a.json()["stdout"], "aGVsbG8=");
     let a = run(addr, sh("echo e >&2; exit 3")).await;
     assert_eq!(a.json()["exit_code"], 3);
     let a = run(addr, sh("sleep 60 & echo left")).await;

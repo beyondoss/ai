@@ -161,7 +161,7 @@ async fn assert_spawns_work(e: &Execd, why: &str) {
         "v1.1 ({why}): {}",
         String::from_utf8_lossy(&a.body)
     );
-    assert_eq!(a.json()["stdout"], "ok", "v1.1 ({why})");
+    assert_eq!(a.json()["stdout"], "b2s=", "v1.1 ({why})");
     let a = call(e, stream("printf ok")).await;
     let frames = a.frames();
     assert_eq!(
@@ -471,7 +471,12 @@ async fn running_out_of_descriptors_fails_spawns_cleanly_and_recovers() {
         assert_eq!(a.status, 200, "{}", String::from_utf8_lossy(&a.body));
         let v = a.json();
         if v["exit_code"] == 127 {
-            let why = v["stderr"].as_str().unwrap_or("");
+            let why = String::from_utf8_lossy(
+                &base64::engine::general_purpose::STANDARD
+                    .decode(v["stderr"].as_str().unwrap_or(""))
+                    .unwrap_or_default(),
+            )
+            .into_owned();
             assert!(
                 why.contains("Too many open files"),
                 "unexpected reason: {v}"
