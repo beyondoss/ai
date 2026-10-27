@@ -5,7 +5,7 @@
   "scenarios": [
     {
       "id": "differential-found.write.below-file-with-separator-in-name",
-      "description": "A write below a regular file fails with not_found or not_a_directory, whatever characters the name has. The failing command's stderr is `sh: N: cannot create PATH: Directory nonexistent`; the kind comes from the first line up to LF. A name containing CR (or another character Python's splitlines() breaks at) must not move the OS message out of that line.",
+      "description": "A write below a regular file fails with not_found or not_a_directory, whatever characters the name has. The failing command's stderr is `sh: N: cannot create PATH: Directory nonexistent`; the kind comes from the first line up to LF. A name containing CR, VT, FF or U+2028 must not move the OS message out of that line: the line ends at LF only.",
       "setup": [
         {
           "id": "setup",
@@ -89,7 +89,7 @@
     },
     {
       "id": "differential-found.search.git-file-not-utf8",
-      "description": "A file called .git whose content is not UTF-8, in a directory above the search root, does not make the search fail. ripgrep reads the nearest .git as a gitdir pointer, complains on stderr (`stream did not contain valid UTF-8`) and exits 2; the line is not a per-path OS error, so the clients report invalid_query although the pattern is fine and the matches were printed.",
+      "description": "A file called .git whose content is not UTF-8, in a directory above the search root, does not make the search fail. ripgrep reads the nearest .git as a gitdir pointer, complains on stderr (`stream did not contain valid UTF-8`) and exits 2; FILES-OVER-EXEC (search, exit codes) counts that line as a per-path error, so the search succeeds with a note and the matches are returned.",
       "requires": {
         "search_engine": "rg"
       },
@@ -113,16 +113,6 @@
           "root": "${ROOT}/sub",
           "pattern": "needle",
           "literal": true,
-          "xfail": {
-            "drivers": [
-              "agent-reference",
-              "beyond-sandbox-ts",
-              "python",
-              "python-async",
-              "sandbox-mcp"
-            ],
-            "reason": "rg's complaint about the unreadable .git file above the root is not an OS error, so its exit 2 reads as a rejected pattern"
-          },
           "expect": {
             "ok": {
               "hits": []
@@ -135,16 +125,6 @@
           "root": "${ROOT}/sub",
           "pattern": "nothing",
           "literal": true,
-          "xfail": {
-            "drivers": [
-              "agent-reference",
-              "beyond-sandbox-ts",
-              "python",
-              "python-async",
-              "sandbox-mcp"
-            ],
-            "reason": "rg's complaint about the unreadable .git file above the root is not an OS error, so its exit 2 reads as a rejected pattern"
-          },
           "expect": {
             "ok": {
               "hits": [
@@ -162,7 +142,7 @@
     },
     {
       "id": "differential-found.search.clip-uses-rust-regex-syntax",
-      "description": "A match line longer than 500 characters is clipped around the first match of the query, the pattern read as a Rust-syntax regular expression (FILES-OVER-EXEC 5.7, Clipping). The line here is 600 z, `needle`, 10 w; the match ends past column 500, so the text is `… ` + columns 117-616 and the `[truncated; columns 117-616 of 616]` suffix. A pattern that is valid Rust syntax but not JavaScript syntax must clip the same way.",
+      "description": "A match line longer than 500 characters is clipped around the column rg reports for its first match, never by searching the line again, so the pattern may use any Rust-syntax construct. The line here is 600 z, `needle`, 10 w; the window would start at character 350 and run past the end, so the text is `… ` + columns 117-616 and the `[truncated; columns 117-616 of 616]` suffix.",
       "requires": {
         "search_engine": "rg"
       },
@@ -222,12 +202,6 @@
                 }
               ]
             }
-          },
-          "xfail": {
-            "drivers": [
-              "beyond-sandbox-ts"
-            ],
-            "reason": "the TypeScript client finds the match to clip around with a JavaScript RegExp, which rejects Rust syntax such as (?i) and (?P<name>..); the line is then clipped as a context line"
           }
         },
         {
@@ -250,22 +224,13 @@
                 }
               ]
             }
-          },
-          "xfail": {
-            "drivers": [
-              "beyond-sandbox-ts"
-            ],
-            "reason": "the TypeScript client finds the match to clip around with a JavaScript RegExp, which rejects Rust syntax such as (?i) and (?P<name>..); the line is then clipped as a context line"
           }
         }
       ]
     },
     {
       "id": "differential-found.search.binary-file-warning-is-not-a-path",
-      "description": "ripgrep, given a directory, searches a file with a NUL byte after a match as far as the NUL and then prints `PATH: WARNING: stopped searching binary file after match (found \"\\0\" byte around offset N)` on stdout. That line has no NUL, so a parser that scans for the NUL after the path reads it as the start of the next record's path. No hit's path may contain the warning. (Three such files: whichever is printed first is followed by another record.)",
-      "requires": {
-        "search_engine": "rg"
-      },
+      "description": "A file with a NUL byte after a match is not a path. ripgrep searches it as far as the NUL and then prints `PATH: WARNING: stopped searching binary file after match (found \"\\\\0\" byte around offset N)` on stdout, a line with no NUL that follows the file's own records and names the file; a parser that scans for the NUL after the path would read it as the start of the next record. No hit's path may contain the warning, on any search engine (busybox grep prints `Binary file PATH matches`, GNU grep with -I prints nothing).",
       "setup": [
         {
           "id": "setup",
@@ -273,7 +238,7 @@
           "command": "sh",
           "args": [
             "-c",
-            "set -e; cd \"$1\"; i=10; while [ $i -lt 40 ]; do echo x1 > f$i; i=$((i+1)); done; for b in bin1 bin2 bin3; do printf 'x1\\n\\000\\n' > $b; done",
+            "set -e; cd \"$1\"; mkdir plain; i=10; while [ $i -lt 40 ]; do echo x1 > plain/f$i; i=$((i+1)); done; for b in bin1 bin2 bin3; do printf 'x1\\n\\000\\n' > $b; done",
             "sh",
             "${ROOT}"
           ]
@@ -283,15 +248,14 @@
         {
           "id": "control",
           "op": "search",
-          "root": "${ROOT}",
+          "root": "${ROOT}/plain",
           "pattern": "x1",
           "literal": true,
-          "glob": "f2*",
           "limit": 100,
           "expect": {
             "ok": {
               "hits": {
-                "$len": 10
+                "$len": 30
               }
             }
           }
@@ -303,16 +267,6 @@
           "pattern": "x1",
           "literal": true,
           "limit": 100,
-          "xfail": {
-            "drivers": [
-              "agent-reference",
-              "beyond-sandbox-ts",
-              "python",
-              "python-async",
-              "sandbox-mcp"
-            ],
-            "reason": "the warning line is read as the beginning of the next record's path"
-          },
           "expect": {
             "ok": {
               "hits": {

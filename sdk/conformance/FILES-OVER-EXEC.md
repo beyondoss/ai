@@ -139,7 +139,8 @@ A transport-level failure is never a capability: see
 ### 3.3 From a command that ran and failed
 
 A helper that gets a non-zero exit takes the **first line of trimmed stderr**
-(or `command failed` if there is none) as `detail`, prefixed as each operation
+(lines end at LF and at no other character: CR, VT, FF and U+2028 do not end
+one; or `command failed` if there is none) as `detail`, prefixed as each operation
 below says, and classifies it case-insensitively by the first rule that
 matches. A path may contain a newline, which splits one message over two lines
 and leaves the OS error on a later one: when the first line contains none of the
@@ -438,7 +439,8 @@ The command is `rg` or `grep`, with **no shell**, each item one argument.
 `rg` engine (in this order):
 
 ```text
---null --with-filename --line-number --no-heading --color=never --hidden --crlf
+--null --with-filename --line-number --column --no-heading --color=never
+--hidden --crlf
 [--no-require-git]            unless the root is inside a git repository (below)
 [--ignore-case] [--fixed-strings]
 [--glob G | --glob !G]        the caller's glob; the second form when excluding
@@ -487,13 +489,16 @@ character is copied.
 
 Exit 0 (matches) and 1 (none) are success. Exit 124, or the endpoint's own
 timeout, is `timeout`. Any other exit is told apart by stderr, since the cases
-share exit 2:
+share exit 2.
 
 Read stderr as **records**, not lines, because a path may contain a newline: a
 record runs from the end of the previous one through the first line that ends
 in an OS error (`No such file or directory`, `Permission denied`, `Is a
 directory`, `Not a directory`, `Too many levels of symbolic links`, `Input/output error`, with a
-trailing `(os error N)` that `rg` adds ignored).
+trailing `(os error N)` that `rg` adds ignored) or in
+`stream did not contain valid UTF-8` (`rg` reading a `.git` file, in or above
+the root, that is not text: the search itself ran, and no flag turns that read
+off without also turning off the `.gitignore` handling the helper promises).
 
 - stderr is non-empty, nothing is left after its last record (every record is a
   per-path OS error), and one record is the search root's own error: it
@@ -506,14 +511,21 @@ trailing `(os error N)` that `rg` adds ignored).
 - every record is a per-path OS error otherwise: success. The hits on stdout
   are returned and `note` says how many records were skipped and names the
   first;
-- anything else (or empty stderr) is the engine rejecting the pattern:
+- anything else (or empty stderr) is the engine rejecting the pattern, whatever
+  stdout holds (`rg: regex parse error:`, `rg: error parsing glob ...`,
+  `rg: compiled regex exceeds size limit ...` are such lines):
   `invalid_query` with detail `bad regex: STDERR` (trimmed; `bad regex: PROGRAM
   rejected the pattern` if stderr is empty).
 
 #### Parsing
 
 `rg` and `grep -Z` emit records `PATH<NUL>LINE<SEP>TEXT<LF>`, where `SEP` is `:`
-for a match and `-` for a context line. The command MUST turn off the group
+for a match and `-` for a context line. `rg --column` puts the byte column of the
+line's first match between the separator and the text of a **match** record:
+`PATH<NUL>LINE:COL:TEXT<LF>` (`COL` is 1-based, in bytes of the raw line, CRs
+included; a context record has none). GNU `grep -b` puts the byte offset of the
+line start there instead, in match **and** context records
+(`PATH<NUL>LINE:OFF:TEXT`, `PATH<NUL>LINE-OFF-TEXT`). The command MUST turn off the group
 separator: `rg --no-context-separator` (ripgrep 0.10 and later), GNU
 `grep --no-group-separator` (2.5.4 and later). The separator is the only record
 without a NUL, and a path may begin with `--` + LF (or `--` + CR LF under
@@ -521,9 +533,25 @@ without a NUL, and a path may begin with `--` + LF (or `--` + CR LF under
 the output is path records only. A client MUST NOT skip any `--` bytes. Parse by
 scanning for the **NUL**, not for newlines: a path may contain a newline. The
 path runs from the start of the record to the next NUL, the rest of the record
-to the next LF; `LINE` is one or more digits followed by `:` or `-`; a record
-that does not fit is dropped. A file named `--` or `--` LF `b` is an ordinary
+to the next LF; `LINE` is one or more digits followed by `:` or `-`, and under `rg` a match
+record then has `COL`, one or more digits followed by `:`; a record that does
+not fit is dropped. A file named `--` or `--` LF `b` is an ordinary
 path.
+
+`rg` also prints, after the records of a file it stopped searching at a NUL
+byte (a NUL after a match), one line `PATH: WARNING: stopped searching binary
+file after match (found "\0" byte around offset N)` on **stdout**, where `\0` is
+a backslash and a zero and `N` digits. It has no NUL, so it would read as the
+start of the next record's path. `rg --no-messages` does not suppress it,
+`--binary` only rewords it (still on stdout), and `--text` changes the results
+(binary files would be searched whole), so the client drops it: a line is that
+warning when it is exactly the **previous record's path** followed by the text
+above, and a record is parsed from the line after it. Requiring the previous
+record's path means a file merely named like the warning is still a path (the
+one ambiguity left is a file whose name is the previous record's path plus
+that text and a newline, listed right after it). GNU `grep -I` prints nothing
+for such a file, and busybox `grep` prints `Binary file PATH matches`, which has
+no `LINE:` field and is dropped by its parser.
 
 `busybox-grep` emits `PATH:LINE:TEXT` (match) or `PATH-LINE-TEXT` (context). A
 line equal to `--` is skipped. Otherwise split at the **first** position `i`
@@ -560,19 +588,31 @@ Context groups that overlap are merged by the engine.
 #### Clipping
 
 `MAX_LINE` is 500 **characters** (Unicode scalar values, not bytes or UTF-16
-units). A line of at most 500 characters is unchanged. For a **context** line
-longer than that: the first 500 characters followed by `… [truncated]`
-(U+2026, then `[truncated]`). For a **match** line longer than 500: find the
-first match of the query in the line (the pattern as a Rust-syntax regular
-expression, escaped when `literal`, case-insensitive when `ignore_case`; if
-that fails to compile or finds nothing, treat as a context line). With `cs` and
-`ce` its start and end character offsets and `total` the line's length: if
-`ce <= 500` clip as a context line. Otherwise
-`pad = (500 - (ce - cs)) / 2` (integer division, floored at 0),
-`start = max(0, cs - pad)`, `end = start + 500`; if `end > total` then
+units). A line of at most 500 characters is unchanged. A line longer than that
+is clipped at its **head** (the first 500 characters followed by `… [truncated]`,
+U+2026, space, `[truncated]`) if it is a context line, if the engine reported no
+column for it, or if its match starts early (below). A client never searches the
+line for the match itself: the position is what the engine reported, so clients
+cannot differ on pattern syntax.
+
+For a **match** line with a byte column `COL` (from `rg --column`; for GNU
+`grep`, below): `cs` is the number of characters
+of the line's UTF-8 encoding before byte `COL - 1`, not counting CRs (the text
+has none, see Parsing); a `COL` that is not a character boundary of the line
+(possible only when the line had bytes that are not UTF-8) counts as no column.
+`start = max(0, cs - 250)`. If `start` is 0, clip at the head. Otherwise
+`end = start + 500`; if `end > total` (the line's length in characters) then
 `end = total` and `start = total - 500`. The text is `…` + characters
 `[start, end)` + (`…` if `end < total`) + `[truncated; columns
 {start+1}-{end} of {total}]`.
+
+GNU `grep` has no column field. When the run returned a match line of more than
+500 characters, the client runs the same command once more with `-o` added and
+no context flags (`-o -b` prints `PATH<NUL>LINE:OFF:MATCH` per match, `OFF` the
+byte offset of the match in its file). For each such line the first record with
+its path and line number gives `COL = OFF - LINEOFF + 1`, where `LINEOFF` is the
+offset the first run printed for the line. A second run that fails, or has no
+record for the line, leaves the line clipped at its head.
 
 #### Engines differ; say which you used
 
@@ -580,7 +620,9 @@ that fails to compile or finds nothing, treat as a context line). With `cs` and
 regex syntax and searches hidden files. `grep` does none of the ignore
 handling, skips binary files with `-I` (in a UTF-8 locale also files with
 invalid UTF-8), and uses POSIX ERE; `\d` and non-greedy quantifiers are not
-available. `busybox-grep` additionally cannot represent some path names (above)
+available. `busybox-grep` reports no match position and clips every long line
+at its head.
+`busybox-grep` additionally cannot represent some path names (above)
 and may report binary files differently. A client MUST report the engine in use
 (`capabilities.search_engine`); scenarios that depend on one declare
 `requires.search_engine`.

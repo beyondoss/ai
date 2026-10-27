@@ -313,7 +313,7 @@ async fn the_git_repo_answer_is_asked_once_per_root_not_once_per_search() {
 async fn grep_renders_hits_relative_to_a_root_that_exists_only_on_the_target() {
     // Relative to the tool root — the base `read` resolves against — which here exists only there.
     let runner = Recorder::new(|program, _| match program {
-        "rg" => ok("/sbx/proj/sub/a.rs\u{0}12:hit here\n"),
+        "rg" => ok("/sbx/proj/sub/a.rs\u{0}12:5:hit here\n"),
         _ => ok(""),
     });
     let (reg, _backend) = registry_over(runner, "/sbx/proj");
@@ -338,7 +338,7 @@ async fn grep_renders_hits_relative_to_a_root_that_exists_only_on_the_target() {
 async fn grep_on_a_single_target_file_renders_it_relative_to_the_tool_root() {
     // A single-file search prints the file the way `read` would open it, not as a bare basename.
     let runner = Recorder::new(|program, _| match program {
-        "rg" => ok("/sbx/proj/src/a.rs\u{0}3:only file\n"),
+        "rg" => ok("/sbx/proj/src/a.rs\u{0}3:1:only file\n"),
         _ => ok(""),
     });
     let (reg, _backend) = registry_over(runner, "/sbx/proj");
@@ -357,7 +357,7 @@ async fn with_no_tool_root_remote_hits_print_as_the_search_produced_them() {
     // No cwd this process can name on the target, so nothing is stripped: an absolute search prints
     // absolute paths, which `read` on the same backend opens as-is.
     let runner = Recorder::new(|program, _| match program {
-        "rg" => ok("/sbx/proj/sub/a.rs\u{0}12:hit here\n"),
+        "rg" => ok("/sbx/proj/sub/a.rs\u{0}12:5:hit here\n"),
         _ => ok(""),
     });
     let (reg, _backend) = registry_over(runner, "");

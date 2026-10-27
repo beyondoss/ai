@@ -6,12 +6,10 @@ import { parseListLine, parseRead } from "../src/jobs.js";
 import {
   classifySearchFailure,
   clip,
-  clipMatch,
   crlfTolerantEre,
   finalize,
   grepArgs,
   isUnderGitDir,
-  matchFinder,
   parseColonRecords,
   parseRecords,
   rgArgs,
@@ -142,6 +140,7 @@ describe("argument builders", () => {
       "--null",
       "--with-filename",
       "--line-number",
+      "--column",
       "--no-heading",
       "--color=never",
       "--hidden",
@@ -496,50 +495,59 @@ describe("clipping", () => {
     );
   });
 
-  it("windows a long match line around its first match", () => {
+  it("windows a long match line around the column rg reported", () => {
     const line = "a".repeat(1000) + "NEEDLE" + "b".repeat(1000);
-    const out = clipMatch(line, matchFinder({ pattern: "NEEDLE", root: "." }));
-    expect(out.startsWith("… ")).toBe(true);
-    expect(out).toContain("NEEDLE");
-    // total = 2006; pad = (500 - 6) / 2 = 247; start = 1000 - 247 = 753; end = 1253
-    expect(out.endsWith(" … [truncated; columns 754-1253 of 2006]")).toBe(true);
-    expect(Array.from(out.slice(2, out.indexOf(" … [")))).toHaveLength(500);
-  });
-
-  it("clips the head when the match ends inside the first 500 characters", () => {
-    const line = "NEEDLE" + "b".repeat(1000);
-    expect(clipMatch(line, matchFinder({ pattern: "NEEDLE", root: "." }))).toBe(
-      line.slice(0, 500) + "… [truncated]",
-    );
-  });
-
-  it("anchors the window to the end of a line when the match is near it", () => {
-    const line = "a".repeat(1000) + "NEEDLE";
-    const out = clipMatch(line, matchFinder({ pattern: "NEEDLE", root: "." }));
-    expect(out.endsWith("NEEDLE [truncated; columns 507-1006 of 1006]")).toBe(
+    const [hit] = parseRecords(`f\x001:1001:${line}\n`, true);
+    // total = 2006; start = 1000 - 250 = 750; end = 1250
+    expect(hit!.text.startsWith("… ")).toBe(true);
+    expect(hit!.text).toContain("NEEDLE");
+    expect(hit!.text.endsWith(" … [truncated; columns 751-1250 of 2006]")).toBe(
       true,
     );
   });
 
-  it("falls back to the head when the pattern finds nothing or does not compile", () => {
-    const line = "a".repeat(1000);
-    expect(clipMatch(line, matchFinder({ pattern: "zzz", root: "." }))).toBe(
-      clip(line),
-    );
-    expect(clipMatch(line, matchFinder({ pattern: "(", root: "." }))).toBe(
-      clip(line),
+  it("clips the head when the match starts in the first 250 characters", () => {
+    const line = "NEEDLE" + "b".repeat(1000);
+    const [hit] = parseRecords(`f\x001:1:${line}\n`, true);
+    expect(hit!.text).toBe(line.slice(0, 500) + "… [truncated]");
+  });
+
+  it("anchors the window to the end of a line when the match is near it", () => {
+    const line = "a".repeat(1000) + "NEEDLE";
+    const [hit] = parseRecords(`f\x001:1001:${line}\n`, true);
+    expect(hit!.text.endsWith("NEEDLE [truncated; columns 507-1006 of 1006]"))
+      .toBe(true);
+  });
+
+  it("counts the column in bytes, the offset in characters, and ignores CRs", () => {
+    // 600 two-byte characters, a CR, then the match at byte column 1202.
+    const line = "é".repeat(600) + "\r" + "x".repeat(600);
+    const [hit] = parseRecords(`f\x001:1202:${line}\n`, true);
+    expect(hit!.text.endsWith("[truncated; columns 351-850 of 1200]")).toBe(
+      true,
     );
   });
 
-  it("escapes a literal pattern and honors ignore_case", () => {
-    const line = "x".repeat(900) + "A.B(C)" + "y".repeat(100);
-    const lit = matchFinder({
-      pattern: "a.b(c)",
-      root: ".",
-      literal: true,
-      ignoreCase: true,
-    });
-    expect(clipMatch(line, lit)).toContain("A.B(C)");
+  it("falls back to the head with no column or one inside a character", () => {
+    const line = "é".repeat(1000);
+    expect(parseRecords(`f\x001:2:${line}\n`, true)[0]!.text).toBe(clip(line));
+    expect(parseRecords(`f\x001:${line}\n`)[0]!.text).toBe(clip(line));
+  });
+});
+
+describe("rg binary-file warning", () => {
+  const w =
+    ": WARNING: stopped searching binary file after match (found \"\\0\" byte around offset 3)";
+  it("is not the start of a record", () => {
+    const out = `a\x001:1:x\nb\x001:1:y\nb${w}\nc\x001:1:z\n`;
+    expect(parseRecords(out, true).map((h) => h.path)).toEqual(["a", "b", "c"]);
+  });
+  it("is a path when it is not the previous record's file", () => {
+    const out = `a\x001:1:x\nb${w}\nc\x001:1:z\n`;
+    expect(parseRecords(out, true).map((h) => h.path)).toEqual([
+      "a",
+      `b${w}\nc`,
+    ]);
   });
 });
 
