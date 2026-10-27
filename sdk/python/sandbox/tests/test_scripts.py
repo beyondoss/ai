@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-REFERENCE = ROOT.parents[2] / "crates/agent/src/tools/fs/shell.rs"
+REFERENCE = ROOT.parents[2] / "crates/sandbox/src/fs/shell.rs"
 
 
 def test_scripts_match_the_reference_sources() -> None:
