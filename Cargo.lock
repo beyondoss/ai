@@ -608,7 +608,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
- "toml",
+ "toml 0.8.23",
 ]
 
 [[package]]
