@@ -142,7 +142,7 @@ async fn a_command_never_sees_the_bearer_delivered_in_a_file() {
     );
 }
 
-/// The same for every way a command is started: a stream and a job, not only v1.1.
+/// The same for every way a command is started: a stream and a job, not only one-shot.
 #[tokio::test]
 async fn a_streamed_command_and_a_job_do_not_see_the_bearer_either() {
     let bearer = token("a_streamed_c");

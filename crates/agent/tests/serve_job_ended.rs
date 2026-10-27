@@ -1,4 +1,4 @@
-//! exec v1.4's `job_ended` receiver in `serve --service` ("The receiver" in the `exec_endpoint`
+//! exec notify's `job_ended` receiver in `serve --service` ("The receiver" in the `exec_endpoint`
 //! module doc): how a sandbox's callback is told apart, checked, refused, and answered, and that it
 //! never opens a session, never counts as a client, and never waits behind the session's run.
 //!

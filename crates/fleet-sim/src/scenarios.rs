@@ -270,7 +270,7 @@ fn attached_cannot(
     None
 }
 
-/// Whether a fleet offers exec v1.4 job notify, and the replica knob its scenarios need with it.
+/// Whether a fleet offers exec notify job notify, and the replica knob its scenarios need with it.
 #[derive(Clone, Copy, Default)]
 pub struct Notify {
     /// Start a callback front and give every replica its origin as `--notify-origin`.
@@ -296,7 +296,7 @@ pub struct Fleet {
     /// How this fleet's faults are performed. Local mechanisms for a fleet it spawned; a
     /// caller-supplied command for one it attached to — see [`crate::faults`].
     pub faults: Faults,
-    /// The edge's front for exec v1.4 job-end callbacks, when the fleet was started to offer
+    /// The edge's front for exec notify job-end callbacks, when the fleet was started to offer
     /// notify: every replica carries its origin as `--notify-origin`, and it routes over the same
     /// ring as [`Self::edge`].
     pub front: Option<crate::front::Front>,
@@ -551,7 +551,7 @@ impl Fleet {
         .await
     }
 
-    /// As [`start_against`](Self::start_against), with exec v1.4 notify as `notify` says.
+    /// As [`start_against`](Self::start_against), with exec job notify as `notify` says.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_against_with(
         kind: Kind,
@@ -614,7 +614,7 @@ impl Fleet {
         let sandbox = tempfile::tempdir().map_err(|e| format!("sandbox: {e}"))?;
         let sandbox_home = sandbox.path().join("home");
         std::fs::create_dir_all(&sandbox_home).map_err(|e| format!("sandbox home: {e}"))?;
-        // A real endpoint speaking the v1.1 exec protocol, rooted at a directory standing in for the
+        // A real endpoint speaking the one-shot exec protocol, rooted at a directory standing in for the
         // tenant's box. Service mode probes it at session start, so a session whose endpoint does not
         // work never comes up at all — which is the correct behaviour, and makes a broken double look
         // exactly like a broken sandbox.
@@ -2259,7 +2259,7 @@ fn replica_at(fleet: &Fleet, addr: &Addr) -> Option<usize> {
 /// session's sandbox; the owning replica is killed outright; the session reopens on the other
 /// replica, which lists the job under its number as **not yet checked** (it has not woken the
 /// sandbox to look), and, at the model's first look, finds it still running, shows its output from
-/// where the model left off, and kills it. On both kinds of sandbox: one that runs jobs itself (v1.3) and
+/// where the model left off, and kills it. On both kinds of sandbox: one that runs jobs itself (jobs) and
 /// one that only runs commands (the baseline). Before, the job lived in the dead replica's exec
 /// stream, and the endpoint killed it with the connection.
 pub async fn sandbox_job_survives_its_replica(

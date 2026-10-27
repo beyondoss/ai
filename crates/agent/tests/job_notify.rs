@@ -1,9 +1,9 @@
-//! exec v1.4's release in `serve --service`: a kept job's stream is let go only after `keep` with
+//! exec notify's release in `serve --service`: a kept job's stream is let go only after `keep` with
 //! `notify` succeeded and the job's proof arrived inside its window, and after that nothing reaches
 //! the sandbox about the job but what a callback, a use or a call causes. Each test names the
 //! `job_notify::` check of `notify-checks.json` it is.
 //!
-//! The fleet here is real: a `serve --service` replica, the reference v1.4 endpoint (`exec_mock`,
+//! The fleet here is real: a `serve --service` replica, the reference notify endpoint (`exec_mock`,
 //! which makes the callbacks itself), and a stand-in for the edge that forwards them to the
 //! replica, as the fleet's edge routes a session's requests (`--notify-origin` names it). The
 //! rules that need no fleet (the reconcile schedule, what a live reconcile may touch) are held to

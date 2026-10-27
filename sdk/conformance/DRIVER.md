@@ -18,11 +18,11 @@ talks to it over its stdin and stdout. The driver:
 
 - MUST read its configuration from the environment:
 
-| variable                | meaning                                                                                                                             |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `CONFORMANCE_URL`       | the exec endpoint's URL (required)                                                                                                  |
-| `CONFORMANCE_BEARER`    | the bearer token; absent or empty means no `Authorization` header                                                                   |
-| `CONFORMANCE_CAPS`      | optional JSON object overriding probe results: `find_printf` (bool), `search_engine` (`rg`, `grep`, `busybox-grep`) |
+| variable             | meaning                                                                                                             |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `CONFORMANCE_URL`    | the exec endpoint's URL (required)                                                                                  |
+| `CONFORMANCE_BEARER` | the bearer token; absent or empty means no `Authorization` header                                                   |
+| `CONFORMANCE_CAPS`   | optional JSON object overriding probe results: `find_printf` (bool), `search_engine` (`rg`, `grep`, `busybox-grep`) |
 
 - MUST read requests one line at a time, answer each with exactly one line on
   stdout, **in order**, and never have two requests in flight. stdout carries
@@ -68,10 +68,10 @@ absent or `null`.
 
 ### Meta
 
-| op             | request | result                                                                                                                  |
-| -------------- | ------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `hello`        |         | `{driver, protocol: 1, ops: [names]}`: the ops this driver implements                                                   |
-| `capabilities` |         | `{search_engine, find_printf, read_window}` |
+| op             | request | result                                                                |
+| -------------- | ------- | --------------------------------------------------------------------- |
+| `hello`        |         | `{driver, protocol: 1, ops: [names]}`: the ops this driver implements |
+| `capabilities` |         | `{search_engine, find_printf, read_window}`                           |
 
 `hello` MUST succeed without reaching the endpoint. `capabilities` reports what
 the environment probe found (after `CONFORMANCE_CAPS`), or the connection error
@@ -81,7 +81,7 @@ if the endpoint cannot be used (for example `auth`).
 
 | op            | request                                                                                | result                                                                                  |
 | ------------- | -------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| `exec`        | `command`, `args` (default `[]`), `cwd?`, `timeout_ms?` (default 120000), `stdin_b64?` | `{exit_code, stdout_b64, stderr_b64}`                                            |
+| `exec`        | `command`, `args` (default `[]`), `cwd?`, `timeout_ms?` (default 120000), `stdin_b64?` | `{exit_code, stdout_b64, stderr_b64}`                                                   |
 | `exec_stream` | `command`, `args`, `cwd?`, `timeout_ms?`                                               | `{stdout_b64, stderr_b64}` plus exactly one of `exit_code`, `signal`, `timed_out: true` |
 
 `exec` is the one-shot call: a non-zero `exit_code` is a normal result; a
@@ -132,19 +132,19 @@ reference returns a boolean, and the driver turns `false` into `conflict`.
 
 ## 4. Errors
 
-| kind                                                                      | when                                                          |
-| ------------------------------------------------------------------------- | ------------------------------------------------------------- |
-| `not_found`, `is_directory`, `not_a_directory`, `permission_denied`, `io` | a command ran and failed (FILES-OVER-EXEC section 3.3)        |
-| `invalid_query`                                                           | the search pattern or glob was rejected                       |
-| `conflict`                                                                | `write_if_unchanged`: the mtime is not the expected one       |
-| `too_large`                                                               | the endpoint's answer exceeded the response cap               |
-| `auth`                                                                    | HTTP 401 or 403                                               |
-| `timeout`                                                                 | the request deadline passed                                   |
-| `transport`                                                               | unreachable, reset, or a stream that broke                    |
-| `protocol`                                                                | the answer is not the protocol                                |
-| `endpoint`                                                                | any other non-2xx status                                      |
-| `invalid_request`                                                         | the **request** cannot be formed; nothing was sent            |
-| `unsupported`                                                             | the **driver** does not implement the op                      |
+| kind                                                                      | when                                                    |
+| ------------------------------------------------------------------------- | ------------------------------------------------------- |
+| `not_found`, `is_directory`, `not_a_directory`, `permission_denied`, `io` | a command ran and failed (FILES-OVER-EXEC section 3.3)  |
+| `invalid_query`                                                           | the search pattern or glob was rejected                 |
+| `conflict`                                                                | `write_if_unchanged`: the mtime is not the expected one |
+| `too_large`                                                               | the endpoint's answer exceeded the response cap         |
+| `auth`                                                                    | HTTP 401 or 403                                         |
+| `timeout`                                                                 | the request deadline passed                             |
+| `transport`                                                               | unreachable, reset, or a stream that broke              |
+| `protocol`                                                                | the answer is not the protocol                          |
+| `endpoint`                                                                | any other non-2xx status                                |
+| `invalid_request`                                                         | the **request** cannot be formed; nothing was sent      |
+| `unsupported`                                                             | the **driver** does not implement the op                |
 
 `unsupported` is how a driver reports a capability it does not have. It is never
 a pass: see section 6.

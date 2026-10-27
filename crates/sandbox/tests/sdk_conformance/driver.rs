@@ -28,6 +28,8 @@ pub struct Config {
     pub bearer: Option<String>,
     /// `CONFORMANCE_CAPS`: overrides of what the probes found.
     pub caps: CapsOverride,
+    /// Where a job lives when the jobs run over plain commands, standing in for `/tmp/beyond-jobs`.
+    pub jobs_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -42,6 +44,7 @@ pub struct Driver {
     fs: ShellFs,
     /// The error every op returns when the endpoint could not be reached or refused the first
     /// request: probes that fail at that level are not capabilities, they are an outage.
+    jobs_root: Option<PathBuf>,
     connect_error: Option<Value>,
     caps: Capabilities,
 }
@@ -242,6 +245,7 @@ impl Driver {
             runner,
             jobs,
             fs,
+            jobs_root: cfg.jobs_root.clone(),
             connect_error,
             caps,
         }
@@ -249,10 +253,10 @@ impl Driver {
 
     fn scope(&self, req: &Value) -> Result<JobScope, Value> {
         let name = str_arg(req, "scope")?;
-        Ok(JobScope::under(
-            beyond_sandbox::exec_endpoint::jobs::JOBS_ROOT,
-            name,
-        ))
+        Ok(match &self.jobs_root {
+            Some(root) => JobScope::under(root.to_string_lossy(), name),
+            None => JobScope::under(beyond_sandbox::exec_endpoint::jobs::JOBS_ROOT, name),
+        })
     }
 
     fn job_id(req: &Value, key: &str) -> Result<JobId, Value> {

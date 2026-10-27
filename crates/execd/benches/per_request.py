@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""What one request costs execd: its own CPU per v1.1 `true`, and the latency, with and without --run-as (EXECD_RUN_AS).
+"""What one request costs execd: its own CPU per one-shot `true`, and the latency, with and without --run-as (EXECD_RUN_AS).
 
     benches/per_request.py --bin /path/to/execd [--n 2000] [--run-as nobody]
 

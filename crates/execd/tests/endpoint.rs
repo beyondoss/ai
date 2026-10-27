@@ -134,7 +134,10 @@ async fn v11_answers_when_the_command_exits_and_kills_what_it_left_behind() {
     assert_eq!(bytes(&a.json(), "stdout"), b"done\n");
     assert!(t0.elapsed() < Duration::from_secs(5));
     tokio::time::sleep(Duration::from_millis(800)).await;
-    assert!(!marker.exists(), "the leftover outlived the v1.1 answer");
+    assert!(
+        !marker.exists(),
+        "the leftover outlived the one-shot answer"
+    );
     server.shutdown().await;
 }
 

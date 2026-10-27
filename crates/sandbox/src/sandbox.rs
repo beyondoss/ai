@@ -157,7 +157,7 @@ impl Command<'_> {
     }
 
     /// Run to completion, handing `on_chunk` each chunk of output as it arrives. Over an exec that
-    /// streams (HTTP v1.2, the template transports) that is live; over one that does not, `on_chunk`
+    /// streams (HTTP streaming, the template transports) that is live; over one that does not, `on_chunk`
     /// is never called and the output is in the result. A command given [`stdin`](Self::stdin) is
     /// not streamed.
     pub async fn stream(self, on_chunk: ChunkSink<'_>) -> std::io::Result<ExecResult> {

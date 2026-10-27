@@ -463,7 +463,7 @@ impl Verifier {
         }
     }
 
-    /// `timeout_ms` is the endpoint's to enforce over v1.1 too: a command that hangs is killed, whole
+    /// `timeout_ms` is the endpoint's to enforce over one-shot too: a command that hangs is killed, whole
     /// group, and the request answered, within a bound. The MUST is the kill and the prompt answer;
     /// the status 124 and the stderr note are a SHOULD, reported in the detail.
     async fn envelope_timeout(&self) -> Check {
@@ -482,7 +482,7 @@ impl Verifier {
             Err(_) => fail(
                 ENVELOPE_TIMEOUT,
                 format!(
-                    "no answer {} ms after a 1 s `timeout_ms`: the endpoint ignores the deadline over v1.1, so a hung command runs until the client gives up",
+                    "no answer {} ms after a 1 s `timeout_ms`: the endpoint ignores the deadline over one-shot, so a hung command runs until the client gives up",
                     bound.as_millis()
                 ),
             ),
@@ -515,7 +515,7 @@ impl Verifier {
                     }
                     Ok(_) => fail(
                         ENVELOPE_TIMEOUT,
-                        "a backgrounded grandchild survived the v1.1 timeout: the endpoint killed \
+                        "a backgrounded grandchild survived the one-shot timeout: the endpoint killed \
                          the command, not its process group",
                     ),
                     Err(e) => fail(ENVELOPE_TIMEOUT, e),
@@ -1003,8 +1003,8 @@ impl Verifier {
     }
 }
 
-/// The v1.3 checks: every operation through the agent's own client ([`NativeJobs`]), with the far
-/// side's processes observed by v1.1 requests, never taken on trust.
+/// The jobs checks: every operation through the agent's own client ([`NativeJobs`]), with the far
+/// side's processes observed by one-shot requests, never taken on trust.
 impl Verifier {
     fn scope(&self, which: &str) -> JobScope {
         JobScope::under(

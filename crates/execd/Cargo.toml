@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 readme = "README.md"
 rust-version.workspace = true
-description = "execd: a production exec endpoint that runs inside a sandbox and speaks the agent's exec protocol (v1.1 to v1.4)"
+description = "execd: a production exec endpoint that runs inside a sandbox and speaks the agent's exec protocol (the whole protocol)"
 
 [lib]
 name = "execd"
@@ -25,7 +25,7 @@ mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 base64.workspace = true
-# The v1.4 timing kernel: when a callback is owed, retried or given up. Every endpoint drives the
+# The notify timing kernel: when a callback is owed, retried or given up. Every endpoint drives the
 # same pure function.
 beyond-exec-notify = { path = "../exec-notify", version = "0.1.0" }
 bytes.workspace = true

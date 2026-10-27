@@ -1,4 +1,4 @@
-//! v1.2 frames: one JSON object per line, output as standard base64 with padding.
+//! streaming frames: one JSON object per line, output as standard base64 with padding.
 
 use base64::Engine as _;
 use bytes::Bytes;

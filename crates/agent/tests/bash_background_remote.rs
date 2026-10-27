@@ -1,9 +1,9 @@
-//! `run_in_background` and `timeout_ms` over a remote exec endpoint. On a streaming (v1.2) endpoint
+//! `run_in_background` and `timeout_ms` over a remote exec endpoint. On a streaming endpoint
 //! both behave as on this host: a background start returns with a job whose stream is its lifetime,
-//! and a `timeout_ms` returns the call while the command keeps running. A v1.1 endpoint can neither
+//! and a `timeout_ms` returns the call while the command keeps running. A one-shot endpoint can neither
 //! stream nor stop a command, so `run_in_background` is refused before anything runs, and a
 //! `timeout_ms` it outlived is said to have had no effect. The wire carries the deadlines `bash`
-//! derives: `i32::MAX` ms on a stream, 30 minutes on v1.1.
+//! derives: `i32::MAX` ms on a stream, 30 minutes on one-shot.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use crate::common;

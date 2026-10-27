@@ -1,7 +1,7 @@
 # sandbox-mcp
 
 Give any MCP agent a sandbox: run commands, read, write, edit and search files, and run background jobs, in a sandbox
-that speaks the [exec protocol](../execd/README.md) (`execd`, or anything that implements v1.1 or later).
+that speaks the [exec protocol](../execd/README.md) (`execd`, or anything that implements one-shot or later).
 
 ```json
 {
@@ -59,7 +59,7 @@ Environment variables only, as `execd` does; there are no flags.
 | `SANDBOX_JOBS_SCOPE`           | the name jobs are kept under (default `mcp`); a later server with the same scope sees them            |
 | `SANDBOX_MCP_LISTEN`           | `127.0.0.1:PORT`: serve streamable HTTP at `/mcp` instead of stdio                                    |
 | `SANDBOX_MCP_INSECURE_NO_AUTH` | allow a non-loopback `SANDBOX_MCP_LISTEN`; the server then checks nobody (default 0)                  |
-| `SANDBOX_CAPS`                 | JSON that overrides the probe (`find_printf`, `search_engine`), to test a search rung     |
+| `SANDBOX_CAPS`                 | JSON that overrides the probe (`find_printf`, `search_engine`), to test a search rung                 |
 
 The server holds the sandbox's token, so over HTTP it listens on loopback only unless told otherwise, and rejects a `Host`
 that is not a loopback name.

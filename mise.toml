@@ -199,7 +199,7 @@ description = "Process-level Tokio runtime A/B: current_thread vs multi_thread u
 run = "cargo bench -p beyond-agent --bench serve_runtime"
 
 [tasks."bench:execd"]
-description = "execd vs the baseline exec endpoint, A/B over HTTP on loopback (v1.1 round trip, stream throughput, first frame, RSS, kill-on-disconnect). Set EXEC_BENCH_A to a baseline `beyond-ai-demo` binary built from the commit before execd."
+description = "execd vs the baseline exec endpoint, A/B over HTTP on loopback (one-shot round trip, stream throughput, first frame, RSS, kill-on-disconnect). Set EXEC_BENCH_A to a baseline `beyond-ai-demo` binary built from the commit before execd."
 run = "cargo bench -p beyond-execd --bench exec_compare"
 
 [tasks."bench:execd:sandbox"]

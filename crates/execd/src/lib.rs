@@ -60,14 +60,14 @@ pub use proc::become_subreaper;
 pub use runas::{HELPER_FLAG, Resolved, RunAs, helper_main};
 pub use spool::remove_stale_jobs_dirs;
 
-/// The spec's heartbeat: a stream silent for this long gets `{}` (v1.2).
+/// The spec's heartbeat: a stream silent for this long gets `{}` (streaming).
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
-/// How much of a job's output is kept: the spec's floor (v1.3), 8 MiB. Older bytes read back as a
+/// How much of a job's output is kept: the spec's floor (jobs), 8 MiB. Older bytes read back as a
 /// gap.
 pub const JOB_OUTPUT_RETENTION: usize = 8 * 1024 * 1024;
 
-/// The largest answer the agent accepts (`DEFAULT_MAX_RESPONSE_BYTES`, 16 MiB). A v1.1 answer is
+/// The largest answer the agent accepts (`DEFAULT_MAX_RESPONSE_BYTES`, 16 MiB). A one-shot answer is
 /// one JSON object; the agent refuses a bigger one, so output past this would be thrown away at the
 /// far end anyway.
 pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -88,7 +88,7 @@ pub type Authorizer = Arc<dyn Fn(&HeaderMap) -> bool + Send + Sync>;
 /// usual 400. See [`Options::job_op_hook`].
 pub type JobOpHook = Arc<dyn Fn(&str, &Value) -> Option<(u16, Value)> + Send + Sync>;
 
-/// What the deployment tells execd. [`Options::new`] is a conforming v1.4 endpoint with the spec's
+/// What the deployment tells execd. [`Options::new`] is a conforming notify endpoint with the spec's
 /// numbers and notify off, as an operator's deployment setting starts out.
 #[derive(Clone)]
 pub struct Options {
@@ -123,14 +123,14 @@ pub struct Options {
     /// execd's own (mode 0700); `None` is `$TMPDIR`, else `/tmp`. Use a disk-backed directory:
     /// on tmpfs the output is RAM.
     pub jobs_dir: Option<PathBuf>,
-    /// The most output a v1.1 answer carries; see [`MAX_RESPONSE_BYTES`].
+    /// The most output a one-shot answer carries; see [`MAX_RESPONSE_BYTES`].
     pub max_response_bytes: usize,
     /// The most a request may carry; see [`MAX_REQUEST_BYTES`].
     pub max_request_bytes: usize,
     /// Told of every request, stream and callback attempt. `None` costs one branch per event.
     pub observer: Option<Arc<dyn Observer>>,
     /// Close a connection that has had no request in flight for this long: HTTP/1.1 is closed, HTTP/2
-    /// is sent a GOAWAY. A request in flight (a v1.2 stream or a held job, however long, even while it
+    /// is sent a GOAWAY. A request in flight (a stream or a held job, however long, even while it
     /// only sends heartbeats) is never cut, and the clock starts again when its answer ends. `None`
     /// (the default) starts no timer at all. For a sandbox that sleeps when it has no network
     /// traffic behind a proxy that pools connections.
@@ -220,11 +220,11 @@ pub trait Observer: Send + Sync + 'static {
     fn stream_started(&self, _start: &StreamStart) {}
     /// The stream `seq` ended so.
     fn stream_ended(&self, _seq: u64, _end: StreamEnd, _at: Instant) {}
-    /// A v1.4 callback attempt ended.
+    /// A notify callback attempt ended.
     fn callback(&self, _attempt: &CallbackAttempt) {}
 }
 
-/// A kept v1.3 job that has not ended.
+/// A kept jobs job that has not ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeptJob {
     /// The job's process group.
@@ -237,13 +237,13 @@ pub struct KeptJob {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Activity {
     /// Requests from handler start until the response body is dropped: an open stream, an `attach`,
-    /// a held `start` and a long v1.1 command all count. `/livez` and `/healthz` never do.
+    /// a held `start` and a long one-shot command all count. `/livez` and `/healthz` never do.
     pub in_flight: usize,
     /// Every job that was kept and has not ended, with its process group.
     pub running_kept: Vec<KeptJob>,
     /// Every job in the table that has not ended, in any scope, held or kept.
     pub jobs_alive: usize,
-    /// Jobs whose v1.4 notification is owed and not yet settled: an attempt in flight or a retry
+    /// Jobs whose notify notification is owed and not yet settled: an attempt in flight or a retry
     /// waiting on its backoff, from the moment a callback becomes owed until it is settled,
     /// abandoned at the attempt limit, or the job is removed. A host that pauses idle machines
     /// must stay awake while this is not zero.

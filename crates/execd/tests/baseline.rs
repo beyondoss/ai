@@ -1,6 +1,6 @@
 //! After a mixed workload has finished, execd is back where it started.
 //!
-//! The real binary runs a representative mix: v1.1 commands (with stdin, failing, leaving a
+//! The real binary runs a representative mix: one-shot commands (with stdin, failing, leaving a
 //! background process), streams that finish, streams the client drops mid-way, and jobs (one that
 //! writes past the 8 MiB the spool keeps, running ones killed, a held one dropped unkept, a kept one,
 //! ended ones removed, a final `wipe`). Then every connection is closed and every job gone, and
@@ -102,7 +102,7 @@ fn start(id: &str, script: &str, hold: bool) -> Value {
 
 /// One round of the mix. Rounds run side by side.
 async fn round(addr: SocketAddr, n: usize) {
-    // v1.1: stdin, a failure, and a command that leaves a process behind.
+    // one-shot: stdin, a failure, and a command that leaves a process behind.
     let a = run(
         addr,
         json!({ "command": "cat", "args": [], "timeout_ms": 30_000, "stdin": "aGVsbG8=" }),

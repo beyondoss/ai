@@ -58,7 +58,7 @@ async fn the_exit_path_reaches_a_parked_remote_job() {
 fn sigterm_to_run_kills_the_remote_command_group() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    // A v1.2-only sandbox: this is about the stream a command lives in (a v1.3 sandbox kills an
+    // A streaming sandbox: this is about the stream a command lives in (a sandbox kills an
     // unkept job the same way when its stream closes, which `sandbox_jobs.rs` covers).
     let mock = rt.block_on(ExecMock::start_with(
         dir.path(),

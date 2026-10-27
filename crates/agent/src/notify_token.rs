@@ -1,5 +1,5 @@
 //! The `bjn_v1` notify token: the bearer credential a sandbox presents when it tells a replica that
-//! a kept job's state changed (exec v1.4, "The notify token (`bjn_v1`)" in [`crate::exec_endpoint`]).
+//! a kept job's state changed (exec notify, "The notify token (`bjn_v1`)" in [`crate::exec_endpoint`]).
 //!
 //! This module is the only way to make or check one. Nothing else in the crate builds the MAC
 //! input, holds the derived key or compares a tag.

@@ -1,4 +1,4 @@
-//! Exec protocol v1.2: the connection is the command's lifetime. Hanging up mid-stream — by
+//! Exec protocol streaming: the connection is the command's lifetime. Hanging up mid-stream — by
 //! dropping the call, or through the [`Kill`] a tracked run hands out — must leave the endpoint
 //! killing the command's whole process group, a backgrounded grandchild included.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

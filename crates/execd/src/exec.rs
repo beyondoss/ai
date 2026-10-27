@@ -1,15 +1,15 @@
-//! Running a command: v1.1 (one request, one JSON answer) and v1.2 (the connection is the
+//! Running a command: one-shot (one request, one JSON answer) and streaming (the connection is the
 //! command's lifetime, output streamed as frames).
 //!
 //! **Bounds, per command.**
 //!
-//! - v1.1: the captured output, at most [`crate::Options::max_response_bytes`] (16 MiB, the agent's
+//! - one-shot: the captured output, at most [`crate::Options::max_response_bytes`] (16 MiB, the agent's
 //!   own cap) across both pipes. Output past it is read and dropped so the command never blocks on
 //!   a full pipe, and the exchange is then answered `422` saying the command ran and its output was
 //!   too large, never with the prefix as if it were the output (the agent refuses an answer that
 //!   big anyway, and a JSON string is never shorter than the bytes it encodes). Freed when the
 //!   answer is built. N concurrent cold callers hold up to N times that.
-//! - v1.2: two pipe readers with one 64 KiB buffer each, a channel of depth 1 between them and the
+//! - streaming: two pipe readers with one 64 KiB buffer each, a channel of depth 1 between them and the
 //!   writer, a channel of depth 1 to hyper, and hyper's own write buffer (400 KiB by default). The
 //!   channels are bounded, so a client that stops reading stalls the readers, the pipes fill and the
 //!   command blocks on its own write: memory does not grow. That stall ends with the command's
@@ -37,7 +37,7 @@ use crate::proc::{self, Proc, locked};
 use crate::{Ctx, StreamEnd, StreamStart};
 
 /// How long, after a command's process exits, to keep reading pipes a descendant may be holding
-/// open: the client's own grace (v1.2 "Ordering").
+/// open: the client's own grace (streaming "Ordering").
 pub(crate) const PIPE_GRACE: Duration = Duration::from_millis(100);
 
 /// The command a request describes, ready to spawn: its `cwd` (default: the root), `HOME`, and
@@ -101,7 +101,7 @@ fn exit_code(s: ExitStatus) -> i32 {
 }
 
 // ---------------------------------------------------------------------------------------------
-// v1.1
+// one-shot
 // ---------------------------------------------------------------------------------------------
 
 /// Read `pipe` into `into` as it arrives, keeping at most what is left of `budget` across both
@@ -129,8 +129,8 @@ async fn capture<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-/// What a v1.1 command killed at its deadline is answered with: `timeout(1)`'s status, and a note
-/// ending its stderr (the agent's own words for a v1.2 `timed_out`).
+/// What a one-shot command killed at its deadline is answered with: `timeout(1)`'s status, and a note
+/// ending its stderr (the agent's own words for a streaming `timed_out`).
 const TIMEOUT_EXIT: i32 = 124;
 const TIMEOUT_NOTE: &str = "command exceeded its timeout";
 
@@ -141,7 +141,7 @@ fn answer(code: i32, stdout: &[u8], stderr: &[u8]) -> Value {
     json!({ "exit_code": code, "stdout": b64(stdout), "stderr": b64(stderr) })
 }
 
-/// v1.1: run to completion, answer with one object.
+/// one-shot: run to completion, answer with one object.
 pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
     let line = Line::new("exec", &req.command);
     let stdin = match req.stdin.as_deref() {
@@ -168,7 +168,7 @@ pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
             return http::json_response(200, &answer(127, b"", e.to_string().as_bytes()));
         }
     };
-    // Killed on every way out, including this future being dropped when the client leaves (v1.1: a
+    // Killed on every way out, including this future being dropped when the client leaves (one-shot: a
     // SHOULD once it has answered; a MUST that nothing is left behind an abandoned request).
     let _slot = GroupSlot::new(ctx, proc.pgid);
     let feed = proc.stdin.take().zip(stdin);
@@ -254,7 +254,7 @@ pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
 }
 
 // ---------------------------------------------------------------------------------------------
-// v1.2
+// streaming
 // ---------------------------------------------------------------------------------------------
 
 /// Why the exchange stopped short of a final frame.
@@ -374,7 +374,7 @@ fn final_frame(s: ExitStatus) -> Bytes {
     }
 }
 
-/// v1.2: frames as the command produces them; the process group dies with the connection.
+/// streaming: frames as the command produces them; the process group dies with the connection.
 pub(crate) fn stream(ctx: &Arc<Ctx>, req: Request) -> Resp {
     let (resp, out) = http::stream_response();
     tokio::spawn(run_stream(ctx.clone(), req, out));

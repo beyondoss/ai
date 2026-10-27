@@ -127,7 +127,7 @@ fn status_result(code: i32) -> ExecResult {
     }
 }
 
-/// How exec v1.4's notify driver steers the task that holds a kept job's stream: the actions of
+/// How exec notify's notify driver steers the task that holds a kept job's stream: the actions of
 /// [`crate::tools::job_notify::kernel`] that concern one job.
 #[derive(Debug)]
 pub(crate) enum Ctl {
@@ -146,7 +146,7 @@ pub(crate) enum Ctl {
 
 /// The runner task of a new remote command run as a sandbox job: held when the sandbox can stream
 /// it, kept from the start otherwise. A held stream that breaks after the job was kept does not end
-/// the job; it is followed from where the stream left off. Under exec v1.4 the notify driver can
+/// the job; it is followed from where the stream left off. Under exec notify the notify driver can
 /// close either ([`Ctl`]), and the task then holds nothing until it is told to follow.
 pub(crate) async fn run(
     shared: &Arc<JobShared>,
@@ -330,7 +330,7 @@ fn ago(epoch: u64) -> Instant {
         .unwrap_or_else(Instant::now)
 }
 
-/// A `bash_job` call takes the job (exec v1.4): the kernel is told, and an unheld job is read in
+/// A `bash_job` call takes the job (exec notify): the kernel is told, and an unheld job is read in
 /// now, before the call looks at it (so a peek shows what it printed), then followed for the call.
 pub(crate) async fn taken(shared: &JobShared) {
     let (Some(n), Some(link)) = (shared.table().and_then(|t| t.notify()), shared.sandbox()) else {
@@ -390,7 +390,7 @@ async fn follow(shared: &JobShared, link: &SandboxLink, from: u64) -> Result<Exe
 /// The offset recorded as seen is the output the model has been shown, which is all of it so far:
 /// the call that parks a job reports its output first.
 ///
-/// Where exec v1.4's notify is available, the session's kernel decides how: `keep` with `notify`
+/// Where exec notify's notify is available, the session's kernel decides how: `keep` with `notify`
 /// (its proof window open first), then a plain `keep` if that is refused ([`keep_through`]).
 pub(crate) async fn keep(
     shared: &JobShared,
@@ -755,7 +755,7 @@ async fn read_back(
                 let result = if ended_at.is_some() {
                     follow(&shared, &link, from).await
                 } else {
-                    // Standing for the job's stream: a proof can let go of it (exec v1.4).
+                    // Standing for the job's stream: a proof can let go of it (exec notify).
                     follow_held(&shared, &link).await
                 };
                 shared.untrack();
@@ -766,7 +766,7 @@ async fn read_back(
             })
         };
         // Adopted kept and still running: where notify is available it is kept again with it,
-        // and proves its path like a new one (exec v1.4). Never from a live reconcile: only here.
+        // and proves its path like a new one (exec notify). Never from a live reconcile: only here.
         if !j.status.ended()
             && let Some(n) = jobs.notify()
         {
@@ -840,7 +840,7 @@ mod notify_tests {
     use crate::tools::job_notify::{NotifyHub, SessionNotify};
     use beyond_test_support::exec_mock::{ExecMock, LoseCallbacks, MockOptions};
 
-    /// A proving job whose stream delivers its final frame leaves v1.4's proving state: the
+    /// A proving job whose stream delivers its final frame leaves notify's proving state: the
     /// release table's `proving, held` row, fed as production feeds it.
     #[tokio::test]
     async fn a_proving_jobs_stream_end_leaves_proving() {

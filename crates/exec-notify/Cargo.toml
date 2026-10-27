@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 readme = "README.md"
 rust-version.workspace = true
-description = "The exec protocol v1.4 notification kernel: when a sandbox calls back about a kept job, as a pure function"
+description = "The exec protocol notify notification kernel: when a sandbox calls back about a kept job, as a pure function"
 
 [lib]
 name = "exec_notify"

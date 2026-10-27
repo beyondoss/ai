@@ -1,8 +1,8 @@
 # execd architecture
 
 execd is the exec endpoint that runs inside a sandbox. The agent POSTs a command to a URL; execd runs it as a real process and
-answers. It implements the whole of the agent's exec protocol: v1.1 (one request, one JSON answer, stdin), v1.2 streaming,
-v1.3 sandbox jobs and v1.4 job-end notify. The normative spec is the module doc of `crates/sandbox/src/exec_endpoint.rs`; this
+answers. It implements the whole of the agent's exec protocol: one-shot (one request, one JSON answer: stdin and the output are base64), streaming,
+sandbox jobs and job-end notify. The normative spec is the module doc of `crates/sandbox/src/exec_endpoint.rs`; this
 file says how execd meets it and what bounds every resource it holds.
 
 It is one crate: a library (`execd`) that embeds in a test or a larger host, and a thin `execd` binary configured by environment
@@ -18,18 +18,18 @@ variables alone ([Configuration](#configuration)).
 | `src/log.rs`    | the logger: one line per event to stderr, a level and a format (text or JSON), no subscriber             |
 | `src/runas.rs`  | `EXECD_RUN_AS`: resolving the user, proving execd can switch, the switch helper                          |
 | `src/http.rs`   | hyper (HTTP/1.1 and h2c), routing, `/livez`, the bearer check, the request limit, the log line           |
-| `src/exec.rs`   | v1.1 envelope and v1.2 stream: pumps, the sink, heartbeat, leftovers, timeout, disconnect                |
-| `src/jobs.rs`   | v1.3 jobs: the table, the output ring, the supervisor, job streams                                       |
-| `src/notify.rs` | v1.4: the sender that drives the `exec-notify` kernel                                                    |
+| `src/exec.rs`   | one-shot envelope and streams: pumps, the sink, heartbeat, leftovers, timeout, disconnect                |
+| `src/jobs.rs`   | jobs: the table, the output ring, the supervisor, job streams                                            |
+| `src/notify.rs` | notify: the sender that drives the `exec-notify` kernel                                                  |
 | `src/proc.rs`   | spawning, the reaper that collects every child, process groups by syscall, the subreaper                 |
 | `src/spool.rs`  | the jobs directory: where a kept job's retained output lives as chunk files, and stale-directory cleanup |
-| `src/frame.rs`  | v1.2 frame encoding                                                                                      |
+| `src/frame.rs`  | streaming frame encoding                                                                                 |
 
 ## Configuration
 
 execd has no command-line flags. It is configured by `EXECD_*` environment variables, each read once at startup in
 `src/config.rs` and nowhere else: `EXECD_LISTEN`, `EXECD_ROOT`, `EXECD_HOME`, `EXECD_BEARER_FILE`, `EXECD_BEARER`,
-`EXECD_INSECURE_NO_AUTH`, `EXECD_RUN_AS`, `EXECD_KEPT_JOBS_SURVIVE_IDLE`, `EXECD_MAX_RESPONSE_BYTES`, `EXECD_JOBS_DIR`,
+`EXECD_INSECURE_NO_AUTH`, `EXECD_RUN_AS`, `EXECD_MAX_RESPONSE_BYTES`, `EXECD_JOBS_DIR`,
 `EXECD_LOG`, `EXECD_WORKER_THREADS` and `EXECD_IDLE_TIMEOUT_MS` (the table is in the README). A value that does not parse is an error
 naming the variable and the value, with exit status 2; a boolean is `1`, `true`, `0` or `false`; an empty variable is unset.
 Any argument other than the internal `--execd-run-as-helper` re-exec marker (handled before anything else) prints the variable
@@ -61,31 +61,30 @@ accept ──► hyper (HTTP/1.1, or prior-knowledge HTTP/2 on the same port)
    │ `job` object          │ `"stream": true`        │ otherwise
    ▼                       ▼                         ▼
  jobs::serve            exec::stream              exec::envelope
- (v1.3, and the         (v1.2: the connection     (v1.1: run to the end,
-  v1.4 `keep`)           is the command's life)    one JSON object)
+ (jobs, and the         (streaming: the connection     (one-shot: run to the end,
+  notify `keep`)           is the command's life)    one JSON object)
 ```
 
 A request that is none of those fails before a process exists. A command that cannot be spawned is an ordinary result (exit
 127), as a shell reports it.
 
-### v1.1: `exec::envelope`
+### one-shot: `exec::envelope`
 
 The command runs as the leader of a new process group. `timeout_ms` is enforced here too (the spec's "Timeouts"): at the
 deadline the whole group is killed and the answer is `200` with `exit_code` 124 (`timeout(1)`'s status), the output read so far, and
 stderr ending in `command exceeded its timeout`. A request without `timeout_ms` has no deadline but the connection. Its stdout and stderr are read into buffers capped at 16 MiB across both
 (`EXECD_MAX_RESPONSE_BYTES`; see the bounds table). If output went past the cap it was drained and dropped, and the answer is a `422` (the agent treats 400 and 422 as a refusal of this request, not a dead sandbox) whose message says the command ran and its output exceeded the cap, so the model narrows it instead of rerunning. The answer is sent when the command exits and the pipes have been read, with a 100 ms grace for pipes
-that a descendant holds open. The group is then killed (the spec's SHOULD for v1.1), and it is killed if the client leaves
+that a descendant holds open. The group is then killed (the spec's SHOULD for one-shot), and it is killed if the client leaves
 first.
 
-**Exact output (`"output_base64": true`).** The same buffers, the same cap (on the raw bytes across both pipes, so the cap
-is on the decoded bytes, as the spec says), answered as `stdout_base64` and `stderr_base64` (both always present) instead of
-`stdout`/`stderr`. `answer` is the one place that builds the object: the text form converts through lossy UTF-8, the exact
-form never converts. The note a deadline appends to stderr is appended to the bytes. Only the JSON value `true` asks
-(`Request::wants_exact_output`), as for `stream`. `tests/exact_output.rs` pins every byte value on both streams, the empty
-answer, the deadline, a command that cannot start, stdin, and the cap; the verifier's `exact output offered` and
-`output_base64 returns every byte value intact` checks run against the binary in `tests/conformance.rs`.
+**Output is bytes.** `stdout` and `stderr` are always standard base64 of the bytes the command wrote, both always present
+(the empty string for none). The cap is on the raw bytes across both pipes, so it is on the decoded bytes, as the spec says.
+`answer` is the one place that builds the object, and it never converts. The note a deadline appends to stderr is appended
+to the bytes. `tests/output.rs` pins every byte value on both streams, the empty answer, the deadline, a command that
+cannot start, stdin (and a stdin that is not base64: `400`) and the cap; the verifier's `every byte value round-trips`
+check runs against the binary in `tests/conformance.rs`.
 
-### v1.2: `exec::stream`
+### streaming: `exec::stream`
 
 ```text
 child ──stdout──► pump ─┐
@@ -108,16 +107,16 @@ blocks the command on its own write. Nothing grows. There are four ways out of a
 - **Disconnect.** The client left: the response body is dropped, the sender's `closed()` resolves, and the group is killed at
   once. This does not wait for a heartbeat write to fail.
 
-### v1.3 and v1.4: `jobs`, `notify`
+### jobs and notify: `jobs`, `notify`
 
 A job is a command in its own process group whose output is kept by byte offset. `start` registers the job and spawns a
 supervisor task; `hold: true` answers with a job stream, `hold: false` answers `{"started": pgid}`. Every operation is scoped:
 it only ever sees the jobs of its own scope.
 
 The supervisor waits for the shell, and when the shell exits leaving its group alive records `shell_exit`, waits for the group to
-empty, and records the end. Each of those is a state change that v1.4 calls back about.
+empty, and records the end. Each of those is a state change that notify calls back about.
 
-v1.4 is the `notify` module driving `crates/exec-notify`, the pure timing kernel every endpoint shares. The kernel says when an
+notify is the `notify` module driving `crates/exec-notify`, the pure timing kernel every endpoint shares. The kernel says when an
 attempt begins, when to wait, and when to stop; `notify` makes the request (one `POST`, no redirect, the server's certificate
 verified, 30 s at most) and feeds back what happened. A job's latest `keep` governs, a `keep` abandons the attempt in flight,
 and a removed job's timers are dropped with it. The token is held in the job and in the request header, and appears in no log,
@@ -143,7 +142,7 @@ TLS or a private network); and a holder of the bearer doing what the bearer allo
 | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | The bearer check       | Every request but `GET`/`HEAD /livez` is refused (`401`, or `405` for a method that cannot exec) before its body is read, unless it carries exactly one `Authorization` header whose value is `Bearer`, one space, and the token (compared in constant time). The path does not matter: `//livez`, `/livez/`, `/%6civez` are paths like any other, and a `POST` to `/livez` is an exec request that needs the bearer. Two `Authorization` headers are refused in either order. The scheme is case-sensitive (`bearer <token>` is refused, as is `Bearer  <token>`). `Proxy-Authorization`, cookies, query strings and forwarding headers are never read. | HTTP/1.1 strips optional whitespace around a header value before execd sees it, so `Bearer <token>` followed by a space or tab on the wire is the same credential and runs; over HTTP/2 nothing is stripped and it is refused. There is no rate limit and no TLS. | `tests/auth_matrix.rs`: about 180 requests over HTTP/1.1 and h2c, each answered and each proven to run nothing    |
 | Fail-closed start      | With no bearer, execd refuses to start (non-zero exit, a message) unless every address in `EXECD_LISTEN` is loopback, or `EXECD_INSECURE_NO_AUTH=1` is passed. An empty `EXECD_BEARER` is no bearer; a named bearer file that is empty or unreadable is an error. With `EXECD_INSECURE_NO_AUTH=1` or on loopback it starts and logs `NO BEARER CONFIGURED`. The library does the same: `serve` returns `PermissionDenied` for a non-loopback listener with no bearer unless `Options::insecure_no_auth` is set.                                                                                                                                          | Loopback is not private on a multi-tenant host: any local user can connect.                                                                                                                                                                                       | `tests/security.rs`; the loopback decision is a unit test in `src/main.rs`                                        |
-| The token stays secret | The bearer is never an argument. Every `EXECD_*` variable is removed from every command's environment (v1.1, v1.2, jobs). A bearer handed over in `EXECD_BEARER` is moved out of execd's own environment by re-executing it (see below). No log line, `Debug` output or error carries the bearer, a notify token or a callback URL.                                                                                                                                                                                                                                                                                                                      | A process that runs as execd's uid can still read execd's memory and a bearer file execd owns. The observer an embedding host sets sees every request's headers, `Authorization` included; the host is trusted.                                                   | `tests/security.rs`, `tests/conformance.rs` (the whole verifier at `trace` level, then a search of its log)       |
+| The token stays secret | The bearer is never an argument. Every `EXECD_*` variable is removed from every command's environment (one-shot, streaming, jobs). A bearer handed over in `EXECD_BEARER` is moved out of execd's own environment by re-executing it (see below). No log line, `Debug` output or error carries the bearer, a notify token or a callback URL.                                                                                                                                                                                                                                                                                                             | A process that runs as execd's uid can still read execd's memory and a bearer file execd owns. The observer an embedding host sets sees every request's headers, `Authorization` included; the host is trusted.                                                   | `tests/security.rs`, `tests/conformance.rs` (the whole verifier at `trace` level, then a search of its log)       |
 | `EXECD_RUN_AS`         | Commands run as another uid, gid and groups, so they cannot read execd's memory, `/proc/<execd>/environ`, or a 0600 bearer file owned by execd's uid, and cannot signal or trace execd.                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | A setuid program the user can run (`sudo`, `su`) can still become root, and then reads everything. A process that leaves its process group (`setsid`) outlives a kill of the group, as it does without `EXECD_RUN_AS`.                                            | `tests/security.rs` (as root), `tests/conformance.rs` (the whole verifier under `EXECD_RUN_AS`)                   |
 | Job scopes             | A job is addressed by the exact pair `(scope, id)`. Every operation filters by its own scope before it looks at an id, so another scope's id reads as `gone`/`404` and an answer, a listing or an error never names, orders or times anything of another scope. `kill` and `wipe` only signal groups of their own scope's jobs that have not ended.                                                                                                                                                                                                                                                                                                      | A scope is a name, not a secret: a client with the bearer can ask for any scope it can name. The agent sends a digest of tenant and session, which is the capability; there is no operation that lists scopes.                                                    | `tests/jobtable.rs`: random operations across scopes with colliding ids, a model, every invariant after each step |
 | No panic, no poison    | Every lock is taken with `locked`, which recovers a poisoned mutex (the data under each is a map or a plain record), so one panicking handler cannot stop a kill, a list or the shutdown sweep. After the sweep the group set is closed: a group registered by a spawn that raced the shutdown is killed at once.                                                                                                                                                                                                                                                                                                                                        | A panic still ends that one request.                                                                                                                                                                                                                              | `tests/jobtable.rs` (the log never says `panicked`, every later request works), `tests/parsers.rs`, `fuzz/`       |
@@ -208,9 +207,10 @@ What the spec and the conformance verifier assume, and what holds:
 | `tests/security.rs`                             | the bearer is in none of a command's `env`, its parent's environ, or any readable `/proc/*/environ` (by environment, by file, for streams and jobs); fail-closed start in all its cases; `EXECD_RUN_AS` refusals; as root, a user who cannot read execd's memory, environ or a root-owned bearer file, gets the right uid, groups, `HOME` and directory, and is killed by the shutdown |
 | `tests/auth_matrix.rs`                          | path, method, `Authorization`, body-framing and smuggling cases over HTTP/1.1 and h2c, each refused and each proven to have run nothing by a command that would create a marker file; a control per family proves the vehicle runs                                                                                                                                                     |
 | `tests/jobtable.rs`                             | the job table against a model, over random operations (`EXECD_JOBS_SEED`, `EXECD_JOBS_CASES`, `EXECD_JOBS_SECS`, `EXECD_JOBS_OPS`; a failure prints its seed and a shrunk list); at the end of every case, once every scope is wiped, execd is back at its starting state (see `tests/baseline.rs`)                                                                                    |
-| `tests/baseline.rs`                             | after a mixed workload (v1.1, streams finished and dropped, jobs past the 8 MiB spool, kills, removes, a wipe), `/proc` shows the starting open fds and threads, no zombie child, and an empty jobs directory                                                                                                                                                                          |
+| `tests/baseline.rs`                             | after a mixed workload (one-shot, streams finished and dropped, jobs past the 8 MiB spool, kills, removes, a wipe), `/proc` shows the starting open fds and threads, no zombie child, and an empty jobs directory                                                                                                                                                                      |
 | `tests/parsers.rs`, `fuzz/` (`request`, `ring`) | no body panics the parsers, every refused body is a `4xx`, and the output ring agrees with a plain buffer for every offset and size                                                                                                                                                                                                                                                    |
 | `tests/conformance.rs`                          | the full verifier, also at `debug` level (then its log is searched for the bearer) and under `EXECD_RUN_AS`                                                                                                                                                                                                                                                                            |
+| `tests/output.rs`, `tests/timeout.rs`           | one-shot output is bytes (every byte value on both streams, the empty answer, the deadline note, stdin, the cap on decoded bytes) and `timeout_ms` kills the group and answers 124                                                                                                                                                                                                     |
 
 Every test that starts the binary owns it from the moment it exists, and a detached watchdog shell kills execd and everything under it if the test process dies without running destructors (`tests/guard.rs` SIGKILLs a test mid-run, as user and as root, and looks for survivors). The tests that need root run execd through `sudo -n` (or as root) and print `SKIPPED` where a host gives them neither. The long
 runs (ten minutes of job-table seeds, two of parser seeds, four of each fuzz target) are in `.github/workflows/deep.yml`.
@@ -261,9 +261,9 @@ cold callers. No limit here is invented: each is the spec's, the agent's own, or
 | what                          | bound                                                                                                                                                                                 | derivation                                                                                                                                                                                                                                                                                                                                                                                                          | freed by                                                                          | N concurrent cold callers                                                                                                                                                                         |
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Request body                  | 91,575,640 bytes (`MAX_REQUEST_BYTES`)                                                                                                                                                | The agent's largest request is a file's content as `stdin_base64`: the biggest file it writes is an edit's, `MAX_EDIT_BYTES` = 64 MiB, which is `ceil(64 MiB / 3) * 4` = 89,478,488 bytes of base64. Plus 2 MiB, Linux's default `ARG_MAX`, for the command and arguments the kernel itself refuses past.                                                                                                           | The handler returning                                                             | N times the cap, held only while parsed; the callers are the agent's own tool calls. Over the cap: `413`, read stops at the cap, and `Content-Length` over it is refused before any byte is read. |
-| v1.1 captured output          | 16 MiB (`MAX_RESPONSE_BYTES`) across stdout and stderr                                                                                                                                | The agent refuses a bigger answer (`DEFAULT_MAX_RESPONSE_BYTES`), and a JSON string is never shorter than the bytes it encodes, so nothing the agent would have accepted is lost. Past it, output is read and dropped so the command never blocks, and the answer is a `422` that says the command ran and its output was too large; a prefix is never answered as the result.                                      | The answer being built                                                            | N times 16 MiB at the worst                                                                                                                                                                       |
-| v1.1 stdin                    | the decoded request body                                                                                                                                                              | already counted in the request body                                                                                                                                                                                                                                                                                                                                                                                 | the handler returning                                                             | as above                                                                                                                                                                                          |
-| v1.2 stream buffers           | two 64 KiB read buffers, one frame in each of two depth-1 channels, hyper's write buffer (400 KiB, its default)                                                                       | A frame carries at most 64 KiB (the spec). Depth 1 is the least that lets the next frame be built while the last is written; nothing observable depends on it.                                                                                                                                                                                                                                                      | the stream ending                                                                 | N streams hold N times a few hundred KiB. A stalled client holds the same, and stalls its command.                                                                                                |
+| one-shot captured output      | 16 MiB (`MAX_RESPONSE_BYTES`) across stdout and stderr                                                                                                                                | The agent refuses a bigger answer (`DEFAULT_MAX_RESPONSE_BYTES`), and a JSON string is never shorter than the bytes it encodes, so nothing the agent would have accepted is lost. Past it, output is read and dropped so the command never blocks, and the answer is a `422` that says the command ran and its output was too large; a prefix is never answered as the result.                                      | The answer being built                                                            | N times 16 MiB at the worst                                                                                                                                                                       |
+| one-shot stdin                | the decoded request body                                                                                                                                                              | already counted in the request body                                                                                                                                                                                                                                                                                                                                                                                 | the handler returning                                                             | as above                                                                                                                                                                                          |
+| streams buffers               | two 64 KiB read buffers, one frame in each of two depth-1 channels, hyper's write buffer (400 KiB, its default)                                                                       | A frame carries at most 64 KiB (the spec). Depth 1 is the least that lets the next frame be built while the last is written; nothing observable depends on it.                                                                                                                                                                                                                                                      | the stream ending                                                                 | N streams hold N times a few hundred KiB. A stalled client holds the same, and stalls its command.                                                                                                |
 | Settle on exit                | 100 ms quiet, or one pipe capacity of further bytes (`F_GETPIPE_SZ`, 64 KiB by default)                                                                                               | The spec's grace is 100 ms (the client's). A command can only have written, and not been read, as much as its pipes hold.                                                                                                                                                                                                                                                                                           | the settle returning                                                              | one timer per exiting stream                                                                                                                                                                      |
 | Leftover wait                 | until a `SIGCHLD`, with a 5 s fallback, while a shell has exited and its group lives                                                                                                  | The reaper collects execd's children at once, so the last member of a group is nearly always collected and a waiter is woken for it; the slow tick (a heartbeat period) covers a zombie whose live parent is neither execd nor in the group, and only sets how late that is noticed. Without a subreaper (an embedding host) it polls every 50 ms.                                                                  | the group emptying, the deadline, or the client leaving                           | one `/proc` scan per 5 s tick per waiting stream, only while leftovers live                                                                                                                       |
 | Heartbeat                     | every 5 s of silence                                                                                                                                                                  | The spec.                                                                                                                                                                                                                                                                                                                                                                                                           | the stream ending                                                                 | one timer per stream                                                                                                                                                                              |
@@ -293,8 +293,8 @@ writes 256 MiB against a client that never reads and asserts it stalls and stays
 
 `tests/differential.rs` generates seeded shell programs (arbitrary bytes on both streams, sizes from 0 to several MiB, stdin,
 exit codes, self-kills, background children) and runs each directly with `std::process::Command` and through a real server over
-v1.1 and v1.2. Stdout, stderr, exit code and signal must agree per stream; the spec's allowances (lossy UTF-8 in v1.1, `128 + S`
-for a signal in v1.1, a late background write possibly lost in v1.1) are encoded in the comparison. A failure prints its seed
+one-shot and streaming. Stdout, stderr, exit code and signal must agree per stream; the spec's allowances (`128 + S`
+for a signal in one-shot, a late background write possibly lost in one-shot) are encoded in the comparison. A failure prints its seed
 (`EXECD_DIFF_SEED`, `EXECD_DIFF_CASES`) and a shrunk program.
 
 ### What the machine failing costs
@@ -303,10 +303,10 @@ for a signal in v1.1, a late background write possibly lost in v1.1) are encoded
 `sudo -n`; `SKIPPED` without it), `RLIMIT_NOFILE` and `RLIMIT_NPROC` lowered on the live process with `prlimit`.
 
 - **Disk full.** A kept job keeps running. Output that cannot be written reads back as a gap (`offset` moves forward, never back,
-  and the bytes at it are the bytes written), a refused chunk leaves no file behind, and other jobs, v1.1 and v1.2 are unaffected.
+  and the bytes at it are the bytes written), a refused chunk leaves no file behind, and other jobs, one-shot and streaming are unaffected.
   Output written after space returns is retained again.
-- **No descriptors, no processes.** A command that cannot be spawned is an ordinary result on v1.1 (`exit_code` 127 with the
-  reason) and v1.2 (a `stderr` frame, then 127); a job that cannot start is `500` and leaves no job behind. `/livez` and the jobs
+- **No descriptors, no processes.** A command that cannot be spawned is an ordinary result on one-shot (`exit_code` 127 with the
+  reason) and streaming (a `stderr` frame, then 127); a job that cannot start is `500` and leaves no job behind. `/livez` and the jobs
   already running are unaffected, and everything works again, with no descriptor leaked, once the limit clears. With no descriptor
   left to accept with, a request waits in the kernel's queue rather than failing. The `/proc` scans that run off the runtime
   (`proc::off_runtime`) fall back to running in place when no thread can be created, since `tokio::task::spawn_blocking` panics there.
@@ -320,9 +320,9 @@ double, and these are the places this crate differs from it on purpose:
   work.
 - Liveness and kills are syscalls; the mock spawned `kill`.
 - Channels are bounded; the mock's were unbounded, so a slow client grew its memory without limit.
-- A v1.1 command is killed after it has answered, as the spec says it SHOULD be. The mock left it running.
-- A command killed by a signal answers `exit_code` 128 + the signal in v1.1, as `shell_exit` does; the mock answered `-1`.
-- v1.1 output is capped at what the agent would accept (`EXECD_MAX_RESPONSE_BYTES`), and past the cap the answer is a `422` saying the command ran; the mock buffered all of it.
+- A one-shot command is killed after it has answered, as the spec says it SHOULD be. The mock left it running.
+- A command killed by a signal answers `exit_code` 128 + the signal in one-shot, as `shell_exit` does; the mock answered `-1`.
+- one-shot output is capped at what the agent would accept (`EXECD_MAX_RESPONSE_BYTES`), and past the cap the answer is a `422` saying the command ran; the mock buffered all of it.
 - Job output is a set of chunk files, not a `Vec` drained on every read of the pipe (see "Job output on disk").
 - A job's table entry is the claim on its id, taken before the process is spawned, so two starts of one id cannot both run.
 - The orphan reaper, the subreaper, the signal-driven shutdown and the request limit exist only here.
@@ -351,33 +351,33 @@ same.
 
 ### Sandbox-like host (few processes in `/proc`)
 
-| metric                                          | N (each side) | A: reference mock         | B: execd                  |
-| ----------------------------------------------- | ------------- | ------------------------- | ------------------------- |
-| v1.1 `true`, sequential p50 / p99 / max         | 2000          | 0.53 / 1.04 / 11.6 ms     | 0.55 / 1.05 / 1.2 ms      |
-| v1.1 `cat` of 4 KiB, sequential p50 / p99 / max | 2000          | 0.63 / 1.23 / 10.5 ms     | 0.64 / 1.19 / 1.7 ms      |
-| v1.1 `true`, new connection each p50 / p99      | 2000          | 0.57 / 1.07 ms            | 0.63 / 1.07 ms            |
-| v1.1 `true`, 16 concurrent p50 / p99 / max      | 3200          | 0.89 / 5.3 / 36 ms        | 2.8 / 53 / 128 ms         |
-| v1.1 `cat` of 4 KiB, 16 concurrent p50 / p99    | 3200          | 1.06 / 2.3 ms             | 2.7 / 56 ms               |
-| time to first frame p50 / p99 / max             | 200           | 2.25 / 2.94 / 13.5 ms     | 0.49 / 1.54 / 1.9 ms      |
-| kill on disconnect, whole group gone p50 / p99  | 50            | 1.20 / 2.13 ms            | 1.12 / 2.16 ms            |
-| stream `/dev/zero`, 1 GiB, decoded MB/s         | 5             | 954 (740 to 1088)         | 1396 (426 to 1409)        |
-| stream random file, 1 GiB, decoded MB/s         | 5             | 958 (809 to 1026)         | 1396 (491 to 1461)        |
-| server CPU per GB, zeros                        | 5             | 2.08 s (1.89 to 2.50)     | 1.29 s (1.29 to 1.77)     |
-| server CPU per GB, random                       | 5             | 1.88 s (1.74 to 2.23)     | 1.14 s (1.09 to 1.66)     |
-| RSS idle after start                            | 2             | 5.9 MiB                   | 5.9 MiB                   |
-| RSS with 100 idle streams (`sleep 30`)          | 2             | 15.3 MiB                  | 11.9 MiB                  |
-| peak RSS, 16 slow readers of 256 MiB streams    | 1             | 9838 MiB (VmHWM 9920 MiB) | 33.5 MiB (VmHWM 33.6 MiB) |
+| metric                                              | N (each side) | A: reference mock         | B: execd                  |
+| --------------------------------------------------- | ------------- | ------------------------- | ------------------------- |
+| one-shot `true`, sequential p50 / p99 / max         | 2000          | 0.53 / 1.04 / 11.6 ms     | 0.55 / 1.05 / 1.2 ms      |
+| one-shot `cat` of 4 KiB, sequential p50 / p99 / max | 2000          | 0.63 / 1.23 / 10.5 ms     | 0.64 / 1.19 / 1.7 ms      |
+| one-shot `true`, new connection each p50 / p99      | 2000          | 0.57 / 1.07 ms            | 0.63 / 1.07 ms            |
+| one-shot `true`, 16 concurrent p50 / p99 / max      | 3200          | 0.89 / 5.3 / 36 ms        | 2.8 / 53 / 128 ms         |
+| one-shot `cat` of 4 KiB, 16 concurrent p50 / p99    | 3200          | 1.06 / 2.3 ms             | 2.7 / 56 ms               |
+| time to first frame p50 / p99 / max                 | 200           | 2.25 / 2.94 / 13.5 ms     | 0.49 / 1.54 / 1.9 ms      |
+| kill on disconnect, whole group gone p50 / p99      | 50            | 1.20 / 2.13 ms            | 1.12 / 2.16 ms            |
+| stream `/dev/zero`, 1 GiB, decoded MB/s             | 5             | 954 (740 to 1088)         | 1396 (426 to 1409)        |
+| stream random file, 1 GiB, decoded MB/s             | 5             | 958 (809 to 1026)         | 1396 (491 to 1461)        |
+| server CPU per GB, zeros                            | 5             | 2.08 s (1.89 to 2.50)     | 1.29 s (1.29 to 1.77)     |
+| server CPU per GB, random                           | 5             | 1.88 s (1.74 to 2.23)     | 1.14 s (1.09 to 1.66)     |
+| RSS idle after start                                | 2             | 5.9 MiB                   | 5.9 MiB                   |
+| RSS with 100 idle streams (`sleep 30`)              | 2             | 15.3 MiB                  | 11.9 MiB                  |
+| peak RSS, 16 slow readers of 256 MiB streams        | 1             | 9838 MiB (VmHWM 9920 MiB) | 33.5 MiB (VmHWM 33.6 MiB) |
 
 Read this table as follows.
 
-- The sequential v1.1 round trip is a tie: the median differs by 0.02 ms and the per-round medians overlap (A 0.44 to 0.75, B
+- The sequential one-shot round trip is a tie: the median differs by 0.02 ms and the per-round medians overlap (A 0.44 to 0.75, B
   0.52 to 0.68). B's slowest request was 1.2 ms; A's was 11.6 ms.
 - Streaming is faster and cheaper: B moves about 1.4 GB/s against about 1.0 GB/s and spends about 40% less server CPU per GB.
   The throughput minimums (426 and 491 MB/s) are single rounds that overlapped another session's load on the host; the other
   four rounds are 1246 to 1461 MB/s.
 - A slow reader shows backpressure: 16 clients reading 256 MiB streams at about 1 MB/s each make A buffer them in memory (9.8
   GiB at the sample peak) and leave B flat at 33.5 MiB.
-- Concurrent v1.1 was **slower** in B when this table was measured: 2.8 ms against 0.9 ms at the median, and a p99 of 53 ms
+- Concurrent one-shot was **slower** in B when this table was measured: 2.8 ms against 0.9 ms at the median, and a p99 of 53 ms
   against 5 ms (one of B's five rounds was hit by other work on the host: its median was 22.7 ms, the other four 2.5 to 3.2
   ms). The cause was `proc::spawn` holding a global lock across the spawn, so concurrent commands spawned one at a time. It is
   fixed; see below.
@@ -458,7 +458,7 @@ host differs from a VM; "2 CPUs" rows pin the server with `taskset -c 0,1`.
 | (f) PGO, on top of (a)                             | 2544     | 1       | -300 (not combined with (c) and (d))   |
 | (e) mimalloc, arena alloc disabled, on top of (a)  | 3252     | 1       | +408; default arena multi-thread: 4044 |
 
-(a) ships. (b) was already true: the callback client is built on the first v1.4 attempt, so nothing of reqwest, rustls or ring
+(a) ships. (b) was already true: the callback client is built on the first notify attempt, so nothing of reqwest, rustls or ring
 runs at startup. (c) and (d) are bounds, measured by removing the code, not by a replacement: an `EnvFilter` pulls in a regex
 engine, and clap's parser accounts for the 284 KiB of (d). Both are now replaced: `src/log.rs` is a one-knob logger and
 `src/config.rs` reads environment variables, with no flags at all (see "Footprint of the replacements" below). (f) ships in the
@@ -595,7 +595,7 @@ average 55 to 62). The run is a one-off script, not in the repository.
 The environment form pays a second `exec` of the same binary, about 0.3 ms, to leave the token out of
 `/proc/<pid>/environ`. Both are far below a sandbox's own boot, so use whichever the launcher can do; the file is the better one.
 
-**`EXECD_RUN_AS` per command** (v1.1 `true` over one kept-alive connection to each of two execd processes, as root through
+**`EXECD_RUN_AS` per command** (one-shot `true` over one kept-alive connection to each of two execd processes, as root through
 `sudo -n`, one without `EXECD_RUN_AS` and one with it, n=2000 each, interleaved request by request; two runs):
 
 | run | without run-as, median | with run-as, median | added by run-as |
@@ -614,13 +614,13 @@ short-lived orphans made it do so thousands of times. The reaper now makes `wait
 "Reaping"). Measured with the children files forced absent, which is what those kernels are, against the same tree before this
 change, on a host with about 2,500 processes (static musl, one thread):
 
-| load                                                                                    | before               | after                |
-| --------------------------------------------------------------------------------------- | -------------------- | -------------------- |
-| server CPU: a stream starts 5,000 orphans (`(/bin/true &)`), with a held leftover (n=3) | 1.74 to 1.80 s       | 0.07 to 0.08 s       |
-| server CPU per v1.1 `true` on a kept-alive connection (n=2000, +0 and +2000 idle procs) | 720 to 755 us        | 135 to 140 us        |
-| v1.1 `true` p50 / p99, +0 idle processes                                                | 513-614 / 914-918 us | 555-584 / 881-889 us |
-| v1.1 `true` p50 / p99, +2000 idle processes                                             | 487-551 / 934 us     | 452-617 / 914-923 us |
-| context switches per second: idle / one stream / a held leftover (30 s)                 | 0 / 0.4 / 0          | 0 / 0.6 / 0.7        |
+| load                                                                                        | before               | after                |
+| ------------------------------------------------------------------------------------------- | -------------------- | -------------------- |
+| server CPU: a stream starts 5,000 orphans (`(/bin/true &)`), with a held leftover (n=3)     | 1.74 to 1.80 s       | 0.07 to 0.08 s       |
+| server CPU per one-shot `true` on a kept-alive connection (n=2000, +0 and +2000 idle procs) | 720 to 755 us        | 135 to 140 us        |
+| one-shot `true` p50 / p99, +0 idle processes                                                | 513-614 / 914-918 us | 555-584 / 881-889 us |
+| one-shot `true` p50 / p99, +2000 idle processes                                             | 487-551 / 934 us     | 452-617 / 914-923 us |
+| context switches per second: idle / one stream / a held leftover (30 s)                     | 0 / 0.4 / 0          | 0 / 0.6 / 0.7        |
 
 Server CPU drops 22 times under the build-like load and 5 times per request; the round trips are the same, because the scan ran
 on the blocking pool beside the request, not in front of it. The wakeups were already zero, because they are driven by the signal
@@ -712,7 +712,7 @@ that moves whenever that may have changed (a request starts or ends, a job start
   guard the idle timeout counts with, summed over connections, so the two cannot disagree.
 - `running_kept`: every job that was kept and has not ended, with its process group.
 - `jobs_alive`: every job in the table that has not ended, in any scope, held or kept.
-- `callbacks_owed`: the jobs whose v1.4 notification is owed and not settled, as the `exec-notify` kernel defines it (`notify` set,
+- `callbacks_owed`: the jobs whose notify notification is owed and not settled, as the `exec-notify` kernel defines it (`notify` set,
   `owed > settled`, not removed): an attempt in flight or a retry waiting on its backoff, from the moment a callback becomes owed
   until it is settled, abandoned at the attempt limit, or the job is removed. A host that pauses idle machines must stay awake
   while it is not zero, or a paused machine never sends the callback. Every kernel step bumps `activity_changed`.

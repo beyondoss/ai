@@ -1,4 +1,4 @@
-//! The real `execd` binary against the agent's conformance verifier, v1.1 through v1.4.
+//! The real `execd` binary against the agent's conformance verifier, the whole protocol.
 //!
 //! The verifier is the agent's, the endpoint's only client: it checks framing, the probe, exit,
 //! signal and timeout frames, heartbeats, the 64 KiB frame cap, kill on disconnect (measured
@@ -14,7 +14,7 @@ mod support;
 use beyond_agent::exec_endpoint::conformance::{self, Expectations, Verdict, verify};
 use support::Execd;
 
-/// A deployment that says its kept jobs survive idling advertises v1.4, and passes every check
+/// A deployment that says its kept jobs survive idling advertises notify, and passes every check
 /// the verifier has, behind a bearer.
 #[tokio::test]
 async fn the_binary_passes_every_check_v11_to_v14() {

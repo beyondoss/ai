@@ -1,4 +1,4 @@
-//! exec v1.4 end to end, callbacks that are not the sandbox's honest report: forged ones, repeats
+//! exec notify end to end, callbacks that are not the sandbox's honest report: forged ones, repeats
 //! and a loop. A callback is a hint: a forged one is refused before the replica looks for the
 //! session and changes nothing; a repeat costs at most one reconcile a second and starts no model
 //! turn; and however many arrive, the end is reported once. Every case runs in every endpoint mode,

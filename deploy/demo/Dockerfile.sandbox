@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7-labs
 #
-# The demo's sandbox: `execd`, the repo's production exec endpoint (v1.1 to v1.4, job-end notify
+# The demo's sandbox: `execd`, the repo's production exec endpoint (the whole protocol, job-end notify
 # included) as a static musl binary on a bare Alpine. Commands run in this container through busybox,
 # which is what the conformance suite's own commands need.
 #
@@ -40,7 +40,7 @@ COPY --from=build /usr/local/bin/execd /usr/local/bin/execd
 # cannot read execd's memory, its environment or its bearer. Where they start and their HOME: execd does
 # not create them.
 RUN adduser -D -h /home/sandbox sandbox && mkdir -p /workspace && chown sandbox:sandbox /workspace /home/sandbox
-# The defaults a bare `docker run` gets: a v1.4 endpoint (kept jobs survive idling, which is what lets it
+# The defaults a bare `docker run` gets: a notify endpoint (kept jobs survive idling, which is what lets it
 # advertise notify) logging JSON. It listens beyond loopback, so it needs EXECD_BEARER (or a bearer
 # file): `docker run -e EXECD_BEARER=... `. up.sh starts it with the demo's CA and a per-stack bearer.
 ENV EXECD_LISTEN=0.0.0.0:8081 EXECD_ROOT=/workspace EXECD_HOME=/home/sandbox EXECD_RUN_AS=sandbox EXECD_KEPT_JOBS_SURVIVE_IDLE=1

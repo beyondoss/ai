@@ -1,4 +1,4 @@
-//! The session side of exec v1.4's job-end callbacks ("Sandbox job notify (v1.4)" in
+//! The session side of exec notify's job-end callbacks ("Sandbox job notify" in
 //! [`crate::exec_endpoint`]): which sessions this process holds open, and the driver that feeds
 //! each session's [`kernel`] its events and performs what it decides.
 //!
@@ -145,7 +145,7 @@ struct Inner {
     next_call: CallId,
 }
 
-/// One open session's v1.4 state and its driver. Registered with its [`NotifyHub`] for as long
+/// One open session's notify state and its driver. Registered with its [`NotifyHub`] for as long
 /// as the session task holds it; dropping it unregisters the session.
 pub struct SessionNotify {
     hub: Weak<NotifyHub>,

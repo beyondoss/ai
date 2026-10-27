@@ -1,4 +1,4 @@
-//! `Activity::callbacks_owed`: a v1.4 callback is owed from the moment it becomes owed until it is
+//! `Activity::callbacks_owed`: a notify callback is owed from the moment it becomes owed until it is
 //! settled, abandoned at the attempt limit, or its job is removed.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

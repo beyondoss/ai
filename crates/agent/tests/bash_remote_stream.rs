@@ -1,7 +1,7 @@
-//! `bash` over a streaming (v1.2) exec endpoint behaves as it does on this host: a silent command
+//! `bash` over a streaming exec endpoint behaves as it does on this host: a silent command
 //! yields as a job — heartbeats are not output — progress streams live, and every way a job ends
 //! early (`bash_job` kill, a cancelled call, a dropped tool) kills the command's process group on
-//! the far side. Over a v1.1 endpoint the call still waits for the exit, and says so.
+//! the far side. Over a one-shot endpoint the call still waits for the exit, and says so.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use crate::common;

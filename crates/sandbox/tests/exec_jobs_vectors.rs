@@ -1,4 +1,4 @@
-//! The v1.3 sandbox-job decoding vectors (`tests/fixtures/exec/jobs.json`): job stream frames
+//! The jobs sandbox-job decoding vectors (`tests/fixtures/exec/jobs.json`): job stream frames
 //! and the answers to non-streamed job operations, read the way the agent reads them. An endpoint
 //! implementer can check their encoder against the same file.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

@@ -1,6 +1,6 @@
-//! Exec protocol v1.2 at the runner: frames reach the sink in order, arbitrary bytes survive, output
+//! Exec protocol streaming at the runner: frames reach the sink in order, arbitrary bytes survive, output
 //! is bounded, every final frame maps onto the result — and an endpoint that has not *proved* it
-//! streams is driven exactly as v1.1 always was.
+//! streams is driven exactly as one-shot always was.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::{Arc, Mutex};

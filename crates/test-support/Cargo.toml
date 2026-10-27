@@ -14,7 +14,7 @@ workspace = true
 # The `bsg_v1` minter — the edge's half of the grant contract, written from the spec rather than
 # shared with the verifier, so a mistake in one cannot cancel out in the other.
 base64 = "0.22"
-# When the exec double's v1.4 sender calls back: the same pure kernel every endpoint shares.
+# When the exec double's notify sender calls back: the same pure kernel every endpoint shares.
 beyond-exec-notify = { path = "../exec-notify" }
 # The conforming exec endpoint the double runs: the shipping code, not a copy of it.
 beyond-execd = { path = "../execd" }
@@ -22,7 +22,7 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
 getrandom = { version = "0.3", features = ["std"] }
 hkdf = "0.12"
-# The exec-endpoint double's v1.4 sender: job-end callbacks over HTTPS that verify the server and
+# The exec-endpoint double's notify sender: job-end callbacks over HTTPS that verify the server and
 # never follow a redirect. rustls with `ring` and the OS trust store, as the agent's own client; the
 # provider is installed before the client is built (`rustls-no-provider` has no default).
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }

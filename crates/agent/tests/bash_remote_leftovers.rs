@@ -1,10 +1,10 @@
 //! What a remote command leaves running (`nohup server &`, `cmd &`) becomes a job, exactly as a local
 //! shell's leftovers do: adopted the moment the shell exits, waited for, and stopped with the session.
-//! Before, the far side's leftovers were never tracked: a v1.2 endpoint ended the stream with the
+//! Before, the far side's leftovers were never tracked: a streaming endpoint ended the stream with the
 //! shell, a template transport's wrapper stopped watching after `wait $!`, and `nohup server &` held
 //! its port until the sandbox died.
 //!
-//! Both transports, each on this host: the conforming v1.2 mock (`{"shell_exit": N}`, then the stream
+//! Both transports, each on this host: the conforming streaming mock (`{"shell_exit": N}`, then the stream
 //! stays open until the group is empty), and the template stand-in for `docker exec`, whose far
 //! command lives in its own session, out of reach of any local kill. The live suite
 //! (`exec_endpoint_live`) repeats this against a real container.

@@ -80,7 +80,7 @@ pub(crate) fn error_response(status: u16, msg: &str) -> Resp {
     json_response(status, &json!({ "error": msg }))
 }
 
-/// A v1.2 stream's response head, and the sender that feeds its body. The channel is bounded, so a
+/// A stream's response head, and the sender that feeds its body. The channel is bounded, so a
 /// slow client stalls whoever sends (the pipe readers) instead of growing memory.
 pub(crate) fn stream_response() -> (Resp, mpsc::Sender<Bytes>) {
     // Depth 1: the least that lets the producer build the next frame while hyper writes the last.
@@ -225,7 +225,7 @@ async fn connection(sock: tokio::net::TcpStream, ctx: Arc<Ctx>, stop: Cancellati
     let _ = sock.set_nodelay(true);
     // A peer that vanished without a FIN is dropped by the kernel once data it was sent has gone
     // unacknowledged this long: the spec's bound on a vanished client, two heartbeat intervals
-    // (v1.2 "Disconnect kills"). The heartbeat keeps data in flight on an idle stream.
+    // (streaming "Disconnect kills"). The heartbeat keeps data in flight on an idle stream.
     let user_timeout = u32::try_from((ctx.opts.heartbeat * 2).as_millis()).unwrap_or(u32::MAX);
     let _ = nix::sys::socket::setsockopt(
         &sock,

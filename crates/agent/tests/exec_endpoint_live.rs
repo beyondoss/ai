@@ -10,7 +10,7 @@
 //!
 //! ```sh
 //! # any transparent transport (docker, ssh, kubectl, podman …)
-//! AGENT_LIVE_EXEC_CMD='docker exec my-container {}' \
+//! AGENT_LIVE_EXEC_CMD='docker exec -i my-container {}' \
 //!   cargo nextest run -p beyond-agent -E 'test(/^exec_endpoint_live::/)' --no-capture
 //!
 //! # any HTTP endpoint speaking the exec protocol
@@ -189,9 +189,8 @@ fn bash_runs_on_the_target_not_this_host() {
 #[test]
 fn a_write_past_the_argv_limit_round_trips_through_the_target() {
     // A remote write used to ship the whole file as one argv entry, which Linux caps at 128 KiB, so
-    // anything over ~96 KiB failed. CI's `docker exec` has no `-i` — the far side gets no stdin, the
-    // probe sees that — so this runs the chunked fallback on busybox, the path most likely to trip on
-    // a shell difference. Behind `ssh` or `docker exec -i` it runs the stdin path instead.
+    // anything over ~96 KiB failed. The content now travels on stdin, so the transport must forward it
+    // (`docker exec -i`, as CI's does); busybox is the shell most likely to trip on a difference.
     use sha2::Digest as _;
     let flags = target_or_skip!();
     let dir = workdir();

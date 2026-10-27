@@ -186,6 +186,7 @@ async fn reference_agent_passes_every_scenario() {
             url: mock.as_ref().map(|m| m.url.clone()).unwrap_or_default(),
             bearer: profile.bearer.then(|| BEARER.to_string()),
             caps: profile.caps,
+            jobs_root: Some(work.join(".jobs")),
         };
         let mut be = Backend::open(
             profile.name,

@@ -249,7 +249,7 @@ fn garbage(headers: &[(String, String)]) -> Vec<(String, String)> {
 enum Outcome {
     /// The command ran: `200`, its marker in the output, a clean exit.
     Ran {
-        /// Request sent to the first frame (the whole answer, for a v1.1 envelope).
+        /// Request sent to the first frame (the whole answer, for a one-shot envelope).
         first: Duration,
         /// The longest gap between frames, the start counting as one.
         max_gap: Duration,
@@ -352,7 +352,7 @@ impl<H: Hooks> Kit<'_, H> {
         self.hooks.token(tenant, session).await
     }
 
-    /// Run a short command as `session`, v1.2-streamed. `extra` is merged into the request body.
+    /// Run a short command as `session`, streaming-streamed. `extra` is merged into the request body.
     async fn call(
         &self,
         session: &str,

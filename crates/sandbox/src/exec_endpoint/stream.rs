@@ -31,7 +31,7 @@ pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024;
 /// buffer while it waits for a newline.
 const MAX_LINE: usize = 1024 * 1024;
 
-/// One decoded line of a v1.2 stream.
+/// One decoded line of a stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     /// Bytes the command wrote to stdout.
@@ -167,7 +167,7 @@ impl FrameReader {
     }
 
     /// The next line of the body (without its `\n`), or `None` at the end — for a decoder of its
-    /// own (the v1.3 job streams, `jobs_native`). Errors as [`Self::next`].
+    /// own (the job streams, `jobs_native`). Errors as [`Self::next`].
     pub async fn next_line(&mut self, silence: Duration) -> Result<Option<Vec<u8>>, String> {
         loop {
             if let Some(nl) = self.buf[self.scanned..].iter().position(|&b| b == b'\n') {

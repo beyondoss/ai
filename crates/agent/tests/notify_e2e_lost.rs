@@ -1,4 +1,4 @@
-//! exec v1.4 end to end, ends no callback delivers: the one accepted difference. After a job is
+//! exec notify end to end, ends no callback delivers: the one accepted difference. After a job is
 //! let go of, an end whose callback is lost is noticed at the session's next real use of its
 //! sandbox or its next open, and reported once; a sandbox that dies is noticed the same way, and
 //! then takes today's error path. Native and baseline endpoints only: with no egress nothing is

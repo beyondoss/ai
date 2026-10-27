@@ -1,4 +1,4 @@
-//! exec v1.4 under randomized orderings, against the real code. Each seed is a plan: how long the
+//! exec notify under randomized orderings, against the real code. Each seed is a plan: how long the
 //! job runs, what the path does with its proof and with its end's callback (route it, hold it,
 //! lose one attempt, or refuse it so the sender stops), and a few actions at random moments
 //! (a real use of the sandbox, a duplicate or forged callback, killing the replica that has the
@@ -512,7 +512,7 @@ struct Outcome {
     /// The end needed the next open and use to be found.
     recovered: bool,
     /// The end was reported before a kill and again by the next owner: ARCHITECTURE.md's "a crash
-    /// can report a sandbox job's end twice", today's behaviour and not v1.4's.
+    /// can report a sandbox job's end twice", today's behaviour and not notify's.
     known_gap: bool,
 }
 

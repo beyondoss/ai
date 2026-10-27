@@ -151,13 +151,13 @@ killing one mid-drain is the outage the drain exists to avoid.
 
 A sandbox reports that a background job changed state by POSTing a `job_ended` command to the
 session's own address, `/_beyond/agent?session_id=<id>&tenant=<tenant>`, with
-`Authorization: Bearer bjn_v1.…`. The protocol is exec v1.4 ("Sandbox job notify (v1.4)" in
+`Authorization: Bearer bjn_v1.…`. The protocol is exec job notify ("Sandbox job notify" in
 `src/exec_endpoint.rs`). The callback is a hint: the replica re-reads the job from the sandbox, so a
 callback that is lost, repeated or forged can delay a report but cannot make one wrong. The sandbox
 retries a callback for at most 723 s. It stops on `2xx`, on `401`, `403`, `404`, `410`, or on a
 status it cannot fix by repeating itself, and retries `503`. A replica offers notify only when it
 runs with `--service` and `--notify-origin <origin>`, the origin the edge serves sessions at, which
-is what a sandbox's callbacks are sent to; without it every job is held as before v1.4.
+is what a sandbox's callbacks are sent to; without it every job is held as before notify.
 
 **The edge attaches, mints and verifies nothing for a callback.** There is no user behind it, and
 only replicas hold the token's key. A callback never opens a session either: a session that is not
@@ -167,7 +167,7 @@ verifies the token and answers `503`, as it answers any request for a session it
 the edge's usual retry and ring walk find the replica that has it. Each requirement is tagged (E1,
 E2, …) and names the check that tests it; `tests/fixtures/exec/notify-checks.json` lists them all.
 
-- **E1** The edge MUST classify a request with exactly the two rules of exec v1.4's N21: a request
+- **E1** The edge MUST classify a request with exactly the two rules of the exec spec's N21: a request
   is a callback when it has exactly one `Authorization` header and its value is `Bearer` (any case),
   one or more spaces, then `bjn_v1.`; it looks like a callback when any `Authorization` value is
   `bearer` (any case), any run of spaces and tabs, then `bjn_v1.`, read on the value's bytes, so a
@@ -227,9 +227,9 @@ The edge SHOULD rate-limit callbacks per source address. A replica already bound
 of valid callbacks can cause (one reconcile at a time per session, at most one a second, at most 16
 callbacks waiting), and refuses a forged one before it looks for the session.
 
-A replica that predates v1.4 answers a callback `401`, as it answers any request without a grant,
-and the sandbox stops that notification. That never loses an end: a pre-v1.4 replica holds its own
-jobs' streams, and a v1.4 owner whose callback went astray notices the end at its session's next
+A replica that predates notify answers a callback `401`, as it answers any request without a grant,
+and the sandbox stops that notification. That never loses an end: such a replica holds its own
+jobs' streams, and an owner whose callback went astray notices the end at its session's next
 use of the sandbox or next open. So the edge needs no rollout order.
 
 ## Operating a fleet

@@ -1,4 +1,4 @@
-//! Exec protocol v1.3 job answers (`jobs_native`): a stream line (`decode_job_frame`) and the JSON
+//! Exec protocol jobs job answers (`jobs_native`): a stream line (`decode_job_frame`) and the JSON
 //! answers to `read`, `list`, `kill`/`wipe` (`parse_read`, `parse_list`, `parse_survivors`).
 //!
 //! Properties: never a panic; an accepted line is blank or a JSON object whose output is canonical

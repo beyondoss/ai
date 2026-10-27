@@ -152,7 +152,7 @@ impl SandboxJobs for HttpJobs {
     }
 }
 
-/// The v1.3 client: every [`SandboxJobs`] operation is one request carrying `"job"`.
+/// The jobs client: every [`SandboxJobs`] operation is one request carrying `"job"`.
 pub struct NativeJobs<'a> {
     runner: &'a HttpExecRunner,
 }
@@ -475,7 +475,7 @@ struct WireJobFrame {
     error: Option<String>,
 }
 
-/// Decode one line of a v1.3 job stream. The frames are v1.2's (`stdout`, `stderr`, `{}`,
+/// Decode one line of a job stream. The frames are streaming's (`stdout`, `stderr`, `{}`,
 /// `shell_exit`, `exit_code`, `signal`, `error`) plus `started` and `gap`; both output streams are
 /// the job's combined output. Unknown fields are ignored, and a line with none known is a heartbeat.
 pub fn decode_job_frame(line: &[u8]) -> Result<JobFrame, String> {

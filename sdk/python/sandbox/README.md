@@ -34,7 +34,7 @@ backend next to the Rust, MCP and TypeScript clients.
 
 | layer       | what                                                                            | import                                     |
 | ----------- | ------------------------------------------------------------------------------- | ------------------------------------------ |
-| 1 Transport | raw exec: `run`, `stream`, and jobs                                    | `HttpTransport`, `AsyncHttpTransport`      |
+| 1 Transport | raw exec: `run`, `stream`, and jobs                                             | `HttpTransport`, `AsyncHttpTransport`      |
 | 2 Helpers   | `Files` (stat, read, write, write_if_unchanged, mkdir, list, search) and `Jobs` | `Files`, `Jobs`, `AsyncFiles`, `AsyncJobs` |
 | 3 Surface   | `Sandbox` gathers them and always keeps raw exec in reach                       | `Sandbox`, `AsyncSandbox`                  |
 

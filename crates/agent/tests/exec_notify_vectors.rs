@@ -163,7 +163,7 @@ enum Tracking {
     Proving,
     /// Its stream or a follow has it.
     Held,
-    /// v1.4's state: the stream closed after its proof. Not `JobShared::released`.
+    /// notify's state: the stream closed after its proof. Not `JobShared::released`.
     Unheld,
     /// A `bash_job` call in flight has it.
     Taken,
@@ -648,7 +648,7 @@ fn looks_like_callback(auth: &[String]) -> bool {
     })
 }
 
-/// A v1.3 job id: lowercase hex, 1 to 32 characters.
+/// A jobs job id: lowercase hex, 1 to 32 characters.
 fn is_job_id(id: &str) -> bool {
     (1..=32).contains(&id.len()) && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }

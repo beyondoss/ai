@@ -1,6 +1,6 @@
 //! Sandbox-owned jobs: a command that lives in the sandbox, not in the connection that started it.
 //!
-//! A v1.2 stream makes the connection a command's lifetime, which is right for a command someone is
+//! A stream makes the connection a command's lifetime, which is right for a command someone is
 //! waiting on and wrong for a job. A replica that is reaped, deployed or fails over closes every
 //! stream it holds, so a dev server started in the background died with whichever replica happened
 //! to be serving the session. A job here is owned by the **sandbox**: it runs until it exits, is
@@ -52,16 +52,16 @@
 //!
 //! **Held and kept.** A job starts **held**: `start` with `live` = 1 waits for the supervisor, and a
 //! `tee` between the job and the relay copies every byte to the start command's own stdout — so the
-//! stream that started it (v1.2, or a template transport's pipes) carries its output live, and the
+//! stream that started it (streaming, or a template transport's pipes) carries its output live, and the
 //! supervisor's markers (`\x1ejob-start:<pgid>`, `\x1ejob-shell-exit:<status>`, `\x1ejob-end:<status>`)
 //! arrive on its stderr. Nothing orders those two streams (and the supervisor writes `start` only
 //! after it spawned the job), so [`ShellJobs`] holds output that arrives before the start marker
 //! until the marker does: `Started` always comes first. If that stream's process dies — the endpoint kills it when the connection
 //! drops — the keeper kills the job: a command someone was waiting on dies with its caller, as over
-//! v1.2. **Keeping** it (`keep`, which records the job number) hands it to the sandbox: from then on
+//! streaming. **Keeping** it (`keep`, which records the job number) hands it to the sandbox: from then on
 //! a dropped stream costs only the live copy (`tee` ignores `SIGPIPE` and goes on feeding the relay),
 //! and the job runs until it exits or is killed. A job can also start kept (`live` = 0), for an
-//! endpoint that cannot stream (v1.1); its output is then read by polling ([`poll_follow`]).
+//! endpoint that cannot stream (one-shot); its output is then read by polling ([`poll_follow`]).
 //!
 //! **Kill** sends `SIGTERM` to every group named, waits up to the grace for them to go, sends
 //! `SIGKILL`, and reports any process still alive after a second more (one the sandbox user may not
@@ -71,7 +71,7 @@
 //! ## What is not covered
 //!
 //! A process that leaves the job's session (`setsid`, a daemon that double-forks) is not the job's,
-//! exactly as with a v1.2 endpoint. Its output, if it kept the job's stdout, is cut off two seconds
+//! exactly as with a streaming endpoint. Its output, if it kept the job's stdout, is cut off two seconds
 //! after the job's group empties. A template transport whose far side does not die with its client
 //! (`docker exec`, measured — see `far_kill`) never loses its holder when the agent dies abruptly, so
 //! a held job there runs until the next replica reattaches the session and kills it as stale.
@@ -95,7 +95,7 @@ pub const OUTPUT_CAP: u64 = 8 * 1024 * 1024;
 
 /// The most output one `read` returns. Base64'd it must fit the smallest answer a runner returns
 /// whole: a template transport and this host keep 256 KiB of each stream (`STREAM_HEAD` +
-/// `STREAM_TAIL`), a v1.1 endpoint 16 MiB.
+/// `STREAM_TAIL`), a one-shot endpoint 16 MiB.
 pub const READ_MAX: usize = 128 * 1024;
 
 /// How long an operation other than a held start may take: one round trip and a few forks.
@@ -277,7 +277,7 @@ pub enum JobEvent<'a> {
 /// Where a job's events go.
 pub type EventSink<'a> = &'a (dyn Fn(JobEvent<'_>) + Send + Sync);
 
-/// `keep`'s `notify` (v1.4): where the sandbox reports a kept job's state changes, and the token it
+/// `keep`'s `notify` (notify): where the sandbox reports a kept job's state changes, and the token it
 /// sends there. `Debug` never shows the token, so it cannot reach a log by way of a `{:?}`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct JobNotify {
@@ -355,13 +355,13 @@ pub trait SandboxJobs: Send + Sync {
         seen: u64,
     ) -> std::io::Result<()>;
 
-    /// Whether `keep` can carry `notify` here (v1.4): the endpoint offers it natively, or for the
+    /// Whether `keep` can carry `notify` here (notify): the endpoint offers it natively, or for the
     /// baseline. Probed with the rest of the job capability.
     async fn offers_notify(&self) -> bool {
         false
     }
 
-    /// [`Self::keep`] carrying `notify` (v1.4). A sandbox that refuses the `notify` (`400`: it fails
+    /// [`Self::keep`] carrying `notify` (notify). A sandbox that refuses the `notify` (`400`: it fails
     /// the spec's grammar, or this job cannot be notified about) records nothing, and the error's
     /// kind is [`std::io::ErrorKind::InvalidInput`]; the job is then kept with a plain `keep`, or not
     /// at all. A plain `keep` afterwards removes the job's `notify`.
@@ -376,7 +376,7 @@ pub trait SandboxJobs: Send + Sync {
     ) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "this sandbox does not offer job notify (v1.4)",
+            "this sandbox does not offer job notify (notify)",
         ))
     }
 

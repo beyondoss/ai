@@ -1,4 +1,4 @@
-//! exec v1.4 end to end, the release: a model starts a background job through a real `serve
+//! exec notify end to end, the release: a model starts a background job through a real `serve
 //! --service` replica behind the fleet's front; once `keep` and the job's proof are in, nothing
 //! crosses a replica-to-endpoint connection until the job ends (counted in bytes at the socket),
 //! and the end then produces exactly the notice, and the wake, that the held stream produces

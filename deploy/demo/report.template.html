@@ -148,7 +148,7 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
         <span><i style="background:var(--c-you)"></i>you / agent</span>
         <span><i style="background:var(--c-model)"></i>model call</span>
         <span><i style="background:var(--c-tool)"></i>tool call</span>
-        <span><i style="background:var(--c-job)"></i>job_ended (v1.4 notify)</span>
+        <span><i style="background:var(--c-job)"></i>job_ended (job notify)</span>
         <span><i style="background:var(--c-efs)"></i>sealed session on EFS</span>
         <span><i style="background:var(--c-bad)"></i>refused / killed</span>
       </div>
@@ -280,7 +280,7 @@ const NODES = {
   agent:   { x: 270, y: 180, w: 120, h: 62, label: "agent",        sub: "serve --service" },
   gateway: { x: 470, y: 70,  w: 112, h: 54, label: "gateway",      sub: "managed key, billing" },
   model:   { x: 590, y: 70,  w: 80,  h: 54, label: "model",        sub: run.model.requested },
-  sandbox: { x: 490, y: 260, w: 120, h: 62, label: E2B ? "E2B microVM × " + SB.vms.length : "sandbox", sub: E2B ? "one per session" : "exec v1.1 – v1.4" },
+  sandbox: { x: 490, y: 260, w: 120, h: 62, label: E2B ? "E2B microVM × " + SB.vms.length : "sandbox", sub: E2B ? "one per session" : "exec one-shot – notify" },
   efs:     { x: 270, y: 318, w: 120, h: 44, label: "EFS",          sub: "sealed sessions" },
 };
 const EDGES = [["you", "agent"], ["agent", "gateway"], ["gateway", "model"], ["agent", "sandbox"], ["agent", "efs"]];

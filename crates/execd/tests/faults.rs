@@ -5,7 +5,7 @@
 //! through `sudo -n` (a test that cannot mount says `SKIPPED`).
 //!
 //! The spec's rules these encode (`crates/sandbox/src/exec_endpoint.rs`): a command that cannot be
-//! spawned is an ordinary result (v1.1 `exit_code` 127, v1.2 a `stderr` frame then 127), a job that
+//! spawned is an ordinary result (one-shot `exit_code` 127, streaming a `stderr` frame then 127), a job that
 //! cannot be started is a non-2xx answer, offsets never move (dropped output is a gap, reported in
 //! `offset`), and a failure never ends a job that is running.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -94,7 +94,7 @@ async fn wipe(e: &Execd) {
     call(e, job_op(json!({ "op": "wipe", "grace_ms": 100 }))).await;
 }
 
-/// The final frame of a v1.2 stream.
+/// The final frame of a stream.
 fn final_frame(frames: &[Value]) -> &Value {
     frames.last().expect("a stream with no frames")
 }
@@ -110,31 +110,31 @@ async fn assert_spawn_fails_cleanly(e: &Execd, why: &str) {
     assert_eq!(
         a.status,
         200,
-        "v1.1 ({why}): {}",
+        "one-shot ({why}): {}",
         String::from_utf8_lossy(&a.body)
     );
     let v = a.json();
-    assert_eq!(v["exit_code"], 127, "v1.1 ({why}): {v}");
+    assert_eq!(v["exit_code"], 127, "one-shot ({why}): {v}");
     assert!(
         !v["stderr"].as_str().unwrap_or("").is_empty(),
-        "v1.1 ({why}): 127 with no reason: {v}"
+        "one-shot ({why}): 127 with no reason: {v}"
     );
 
     let a = call(e, stream("echo never")).await;
-    assert_eq!(a.status, 200, "v1.2 ({why})");
+    assert_eq!(a.status, 200, "streaming ({why})");
     let frames = a.frames();
     assert_eq!(
         final_frame(&frames)["exit_code"],
         127,
-        "v1.2 ({why}): {frames:?}"
+        "streaming ({why}): {frames:?}"
     );
     assert!(
         frames.iter().any(|f| f.get("stderr").is_some()),
-        "v1.2 ({why}): no reason given: {frames:?}"
+        "streaming ({why}): no reason given: {frames:?}"
     );
     assert!(
         !frames.iter().any(|f| f.get("stdout").is_some()),
-        "v1.2 ({why}): the command ran: {frames:?}"
+        "streaming ({why}): the command ran: {frames:?}"
     );
 
     let a = start_job(e, "refused", "echo never").await;
@@ -158,16 +158,16 @@ async fn assert_spawns_work(e: &Execd, why: &str) {
     assert_eq!(
         a.json()["exit_code"],
         0,
-        "v1.1 ({why}): {}",
+        "one-shot ({why}): {}",
         String::from_utf8_lossy(&a.body)
     );
-    assert_eq!(a.json()["stdout"], "b2s=", "v1.1 ({why})");
+    assert_eq!(a.json()["stdout"], "b2s=", "one-shot ({why})");
     let a = call(e, stream("printf ok")).await;
     let frames = a.frames();
     assert_eq!(
         final_frame(&frames)["exit_code"],
         0,
-        "v1.2 ({why}): {frames:?}"
+        "streaming ({why}): {frames:?}"
     );
     let id = format!("after-{}", why.replace(' ', "-"));
     let a = start_job(e, &id, "printf ok").await;
@@ -390,7 +390,7 @@ async fn a_full_jobs_disk_costs_the_output_and_nothing_else() {
     let r = read(&e, "w", 0).await;
     assert!(r.from > 0 && r.from <= r.end);
 
-    // Everything else still works: another job, v1.1, v1.2, a new job, /livez.
+    // Everything else still works: another job, one-shot, streaming, a new job, /livez.
     let calm = read(&e, "calm", 0).await;
     assert_eq!(
         (calm.state.as_str(), calm.data.as_slice()),

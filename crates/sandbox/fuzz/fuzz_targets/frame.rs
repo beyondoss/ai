@@ -1,4 +1,4 @@
-//! Exec protocol v1.2 stream frames (`stream::decode_line`).
+//! Exec protocol streams frames (`stream::decode_line`).
 //!
 //! * The golden vectors (`tests/fixtures/exec/frames.json`) still decode as specified.
 //! * Round trip: a frame built from the spec's table decodes to exactly its parts, output first, then
@@ -21,9 +21,8 @@ use serde_json::{Value, json};
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
 fn vectors() {
-    let doc: Value =
-        serde_json::from_str(include_str!("../../tests/fixtures/exec/frames.json"))
-            .expect("fixture is JSON");
+    let doc: Value = serde_json::from_str(include_str!("../../tests/fixtures/exec/frames.json"))
+        .expect("fixture is JSON");
     let b64 = |v: &Value| {
         B64.decode(v.as_str().unwrap_or(""))
             .expect("fixture base64")

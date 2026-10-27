@@ -1,5 +1,5 @@
-//! The v1.4 (job notify) checks of [`super::verify`]: the endpoint's half of "Sandbox job notify
-//! (v1.4)", measured from the outside. The verifier runs its own callback receiver (plain HTTP on
+//! The notify (job notify) checks of [`super::verify`]: the endpoint's half of "Sandbox job notify
+//! (notify)", measured from the outside. The verifier runs its own callback receiver (plain HTTP on
 //! loopback by default, and a TLS listener whose certificate nobody trusts), keeps jobs with
 //! `notify` pointing at it, and watches what arrives and when.
 //!
@@ -337,7 +337,7 @@ impl TlsTrap {
 // The checks.
 // ---------------------------------------------------------------------------------------------
 
-/// What the v1.4 run needs beyond the verifier itself.
+/// What the notify run needs beyond the verifier itself.
 struct Run<'a> {
     v: &'a Verifier,
     rx: Receiver,

@@ -123,15 +123,15 @@ situations.
 
 ### 3.2 From the transport
 
-| what happened                                                       | kind          |
-| ------------------------------------------------------------------- | ------------- |
-| connection refused, reset, DNS failure                              | `transport`   |
-| the request deadline passed                                         | `timeout`     |
-| HTTP 401 or 403                                                     | `auth`        |
-| HTTP 422 whose body says the output exceeded the cap, or client cap | `too_large`   |
-| any other non-2xx                                                   | `endpoint`    |
-| 200 whose body is not the expected JSON                             | `protocol`    |
-| a stream ends without its final frame, or a `{"error"}` frame      | `transport`   |
+| what happened                                                       | kind        |
+| ------------------------------------------------------------------- | ----------- |
+| connection refused, reset, DNS failure                              | `transport` |
+| the request deadline passed                                         | `timeout`   |
+| HTTP 401 or 403                                                     | `auth`      |
+| HTTP 422 whose body says the output exceeded the cap, or client cap | `too_large` |
+| any other non-2xx                                                   | `endpoint`  |
+| 200 whose body is not the expected JSON                             | `protocol`  |
+| a stream ends without its final frame, or a `{"error"}` frame       | `transport` |
 
 A transport-level failure is never a capability: see
 [probe errors](#42-probe-errors).
@@ -166,12 +166,12 @@ The result is cached per sandbox. The probe is a single `run` with a 10 s
 timeout of script F of the appendix, `sh -c PROBE_SCRIPT sh`, whose stdout has
 one line per capability the sandbox has:
 
-| line          | capability                                                                    | present when the script finds                   |
-| ------------- | ----------------------------------------------------------------------------- | ----------------------------------------------- |
-| `rg`          | ripgrep                                                                       | `rg --version` exits 0                          |
-| `grep_null`   | `grep -Z`                                                                     | `grep -rnZ -e __cap_probe__ -- /dev/null` exits 0 or 1 |
-| `find_printf` | `find -printf`                                                                | `find /dev/null -maxdepth 0 -printf %y` prints exactly `c` |
-| `read_window` | `dd iflag=skip_bytes,count_bytes` and `base64 -w0`                            | `printf abc \| dd ... \| base64 -w0` prints `Yg==` |
+| line          | capability                                         | present when the script finds                              |
+| ------------- | -------------------------------------------------- | ---------------------------------------------------------- |
+| `rg`          | ripgrep                                            | `rg --version` exits 0                                     |
+| `grep_null`   | `grep -Z`                                          | `grep -rnZ -e __cap_probe__ -- /dev/null` exits 0 or 1     |
+| `find_printf` | `find -printf`                                     | `find /dev/null -maxdepth 0 -printf %y` prints exactly `c` |
+| `read_window` | `dd iflag=skip_bytes,count_bytes` and `base64 -w0` | `printf abc \| dd ... \| base64 -w0` prints `Yg==`         |
 
 A capability whose line is absent is absent. Derived: the **search engine** is
 `rg` if `rg`; otherwise `grep` (GNU grep: `grep_null`); otherwise

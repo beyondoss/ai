@@ -639,7 +639,7 @@ impl Git {
             Self::Local => local_git_with_stdin(dir, args, stdin).await.map(|_| ()),
             Self::Remote { runner, .. } => {
                 let owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
-                // `run_with_stdin` is the v1.1 exec addition; a shim that predates it answers
+                // `run_with_stdin` is the one-shot exec addition; a shim that predates it answers
                 // `Unsupported`, which surfaces here as a task failure naming the endpoint rather
                 // than a silently empty patch.
                 let res = runner

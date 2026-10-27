@@ -771,13 +771,13 @@ struct ExecRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     cwd: Option<&'a str>,
     timeout_ms: u64,
-    /// v1.1: bytes for the command's stdin, standard base64. Absent means no stdin.
+    /// one-shot: bytes for the command's stdin, standard base64. Absent means no stdin.
     #[serde(skip_serializing_if = "Option::is_none")]
     stdin: Option<String>,
-    /// v1.2: answer with a stream of frames instead of one object. Absent means v1.1.
+    /// streaming: answer with a stream of frames instead of one object. Absent means one-shot.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
-    /// v1.3: a job operation (see "Sandbox jobs (v1.3)"). Absent means the command is run as ever.
+    /// jobs: a job operation (see "Sandbox jobs"). Absent means the command is run as ever.
     #[serde(skip_serializing_if = "Option::is_none")]
     job: Option<&'a serde_json::Value>,
 }
@@ -907,7 +907,7 @@ impl HttpExecRunner {
             client: {
                 crate::tls::ensure_provider();
                 // An idle connection to the endpoint is closed after 30 s and never probed with TCP
-                // keepalives: once a job is unheld (exec v1.4), nothing may keep the sandbox awake.
+                // keepalives: once a job is unheld (exec notify), nothing may keep the sandbox awake.
                 reqwest::Client::builder()
                     .pool_idle_timeout(Duration::from_secs(30))
                     .tcp_keepalive(None)
@@ -972,7 +972,7 @@ impl HttpExecRunner {
     }
 
     /// Send one request and return the response once its status is known to be a success. `stream`
-    /// asks for v1.2 frames; whether they came is the response's `Content-Type` to say.
+    /// asks for streaming frames; whether they came is the response's `Content-Type` to say.
     #[doc(hidden)]
     pub async fn send(
         &self,
@@ -987,7 +987,7 @@ impl HttpExecRunner {
             .await
     }
 
-    /// [`Self::send`], carrying a v1.3 job operation.
+    /// [`Self::send`], carrying a job operation.
     #[allow(clippy::too_many_arguments)]
     #[doc(hidden)]
     pub async fn send_job(
@@ -1081,7 +1081,7 @@ impl HttpExecRunner {
                 self.suspect();
             }
             let (body, _) = self.read_capped(resp).await?;
-            // A `400` refuses the request as written (v1.4's refused `notify` among others), which
+            // A `400` refuses the request as written (notify's refused `notify` among others), which
             // a caller may answer by sending another; anything else is an error of the endpoint's.
             let kind = if status == reqwest::StatusCode::BAD_REQUEST {
                 std::io::ErrorKind::InvalidInput
@@ -1101,7 +1101,7 @@ impl HttpExecRunner {
         Ok(resp)
     }
 
-    /// One request, one response: the whole v1.1 protocol.
+    /// One request, one response: the whole one-shot protocol.
     #[doc(hidden)]
     pub async fn post(
         &self,
@@ -1115,7 +1115,7 @@ impl HttpExecRunner {
         self.envelope(resp).await
     }
 
-    /// Read and parse a v1.1 response body: one JSON object, capped.
+    /// Read and parse a one-shot response body: one JSON object, capped.
     #[doc(hidden)]
     pub async fn envelope(&self, resp: reqwest::Response) -> std::io::Result<ExecResponse> {
         let (body, over_cap) = self
@@ -1133,7 +1133,7 @@ impl HttpExecRunner {
         })
     }
 
-    /// A v1.1 response, read and decoded.
+    /// A one-shot response, read and decoded.
     async fn answer(&self, resp: reqwest::Response) -> std::io::Result<ExecResult> {
         self.envelope(resp)
             .await?
@@ -1203,9 +1203,9 @@ impl CommandRunner for HttpExecRunner {
         self.answer(resp).await
     }
 
-    /// v1.2 when the endpoint has proved it streams; otherwise v1.1, which never calls the sink.
+    /// streaming when the endpoint has proved it streams; otherwise one-shot, which never calls the sink.
     ///
-    /// The sink gets *every* byte of *both* streams or none: a v1.1 answer (or a v1.2 endpoint that
+    /// The sink gets *every* byte of *both* streams or none: a one-shot answer (or a streaming endpoint that
     /// answers this request with one object anyway) goes back as `stdout`/`stderr` for `bash` to
     /// assemble. An earlier override fed the sink stdout alone, told `bash` the output had streamed,
     /// and every remote command that printed to stdout lost its stderr.
@@ -1227,7 +1227,7 @@ impl CommandRunner for HttpExecRunner {
     ///
     /// The job has no deadline of its own, but the wire needs a `timeout_ms`: a stream sends
     /// [`STREAM_DEADLINE`], so the connection (closed by a kill, a dropped job or the agent's exit) is
-    /// what ends it; a v1.1 endpoint gets [`UNTRACKED_DEADLINE`], the only thing that can end a
+    /// what ends it; a one-shot endpoint gets [`UNTRACKED_DEADLINE`], the only thing that can end a
     /// command it cannot stream or stop. See the module doc's "Timeouts".
     async fn run_streaming_tracked(
         &self,
@@ -1256,7 +1256,7 @@ impl CommandRunner for HttpExecRunner {
         true
     }
 
-    /// v1.2 only: stdout frames to `on_stdout`, stderr frames to `on_stderr`, until the final frame.
+    /// streaming only: stdout frames to `on_stdout`, stderr frames to `on_stderr`, until the final frame.
     /// Dropping the future drops the response, which closes the connection — and the endpoint kills
     /// the command's group ("Disconnect kills").
     async fn run_attached(
@@ -1323,7 +1323,7 @@ impl CommandRunner for HttpExecRunner {
         true
     }
 
-    /// Native (v1.3) when the endpoint offers it, the baseline over plain exec commands otherwise.
+    /// Native (jobs) when the endpoint offers it, the baseline over plain exec commands otherwise.
     fn sandbox_jobs(self: Arc<Self>) -> Option<Arc<dyn jobs::SandboxJobs>> {
         Some(Arc::new(jobs_native::HttpJobs::new(self)))
     }
@@ -1376,7 +1376,7 @@ impl Drop for Released {
 }
 
 impl HttpExecRunner {
-    /// The v1.2 exchange. Falls back to v1.1 when the endpoint has not proved it streams, or when it
+    /// The streaming exchange. Falls back to one-shot when the endpoint has not proved it streams, or when it
     /// answers this request with one JSON object after all (a fleet mid-rollout).
     #[allow(clippy::too_many_arguments)]
     async fn run_stream(
@@ -1471,7 +1471,7 @@ impl HttpExecRunner {
     }
 }
 
-/// Whether a response is a v1.2 stream rather than a v1.1 object.
+/// Whether a response is a stream rather than a one-shot object.
 pub fn is_ndjson(resp: &reqwest::Response) -> bool {
     resp.headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -1606,7 +1606,7 @@ impl CommandRunner for TemplateRunner {
     }
 
     /// The transport's two pipes, kept apart. No deadline; dropping the future kills the far side
-    /// (`TemplateKillGuard`), so the held start dies with it — as a v1.2 stream's does.
+    /// (`TemplateKillGuard`), so the held start dies with it — as a stream's does.
     async fn run_attached(
         &self,
         program: &str,

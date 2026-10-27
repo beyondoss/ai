@@ -81,14 +81,14 @@ A driver that cannot be started, or answers nothing to `hello`, fails its cell w
 
 A backend is a URL plus how to start and stop it. `Started` holds the guard; dropping it stops the backend.
 
-| name                                                                                    | what                                                                                                                                                                                                                                                 |
-| --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `local` (group)                                                                         | the `execd` binary on loopback, temp root: plain, with a bearer, and the forced profiles                                                                                                                                                             |
-| `local-grep`, `local-busybox-grep`                                                      | `CONFORMANCE_CAPS` forces the POSIX grep rung, the busybox rung                                                                                                                                                            |
-| `alpine`                                                                                | static `execd` in Alpine: real busybox tools                                                                                                                                                                                                         |
-| `debian-runas`                                                                          | static `execd` in Debian with `EXECD_RUN_AS=sandbox`                                                                                                                                                                                                 |
-| `readonly`                                                                              | Debian, run-as: `${RO}` a read-only mount, `${LOCKED}` a directory the user may not write                                                                                                                                                            |
-| `tinydisk`                                                                              | Debian, run-as: `${TINY}` a 1 MiB tmpfs that fills                                                                                                                                                                                                   |
+| name                               | what                                                                                      |
+| ---------------------------------- | ----------------------------------------------------------------------------------------- |
+| `local` (group)                    | the `execd` binary on loopback, temp root: plain, with a bearer, and the forced profiles  |
+| `local-grep`, `local-busybox-grep` | `CONFORMANCE_CAPS` forces the POSIX grep rung, the busybox rung                           |
+| `alpine`                           | static `execd` in Alpine: real busybox tools                                              |
+| `debian-runas`                     | static `execd` in Debian with `EXECD_RUN_AS=sandbox`                                      |
+| `readonly`                         | Debian, run-as: `${RO}` a read-only mount, `${LOCKED}` a directory the user may not write |
+| `tinydisk`                         | Debian, run-as: `${TINY}` a 1 MiB tmpfs that fills                                        |
 
 The container backends mount a static (musl) `execd` read-only into the image, so no image is built; the only network use is
 pulling `alpine:3.20` and `debian:12-slim`. Each container is named after the process and removed on drop. Readiness is

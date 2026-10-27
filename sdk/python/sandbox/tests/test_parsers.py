@@ -174,11 +174,11 @@ def test_a_newline_in_a_path_does_not_hide_the_os_error() -> None:
     )
     assert skipped.kind == "skipped" and skipped.note.startswith("2 path(s)")
     assert (
-        first_line(b"cat: a\nb: No such file or directory\n")
+        first_line("cat: a\nb: No such file or directory\n")
         == "cat: a\nb: No such file or directory"
     )
-    assert first_line(b"one\ntwo\n") == "one"
-    assert first_line(b"  \n") == "command failed"
+    assert first_line("one\ntwo\n") == "one"
+    assert first_line("  \n") == "command failed"
 
 
 def test_a_root_below_a_file_is_a_root_error() -> None:

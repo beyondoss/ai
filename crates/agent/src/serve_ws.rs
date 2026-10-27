@@ -459,7 +459,7 @@ struct ServiceSupervisor {
     /// The memoized `/readyz` shard probe. Only service mode has one: without `--shard` there is
     /// nothing readiness can check beyond the listener, which is already proven by the request.
     ready: ReadyCache,
-    /// The notify key and the sessions held here, for exec v1.4's `job_ended` callbacks
+    /// The notify key and the sessions held here, for exec notify's `job_ended` callbacks
     /// ([`job_ended`]). Shared with every session through [`ServeConfig::job_notify`].
     notify: Arc<crate::tools::job_notify::NotifyHub>,
 }
@@ -2310,7 +2310,7 @@ where
     let arrived = tokio::time::Instant::now();
     let head_ms = accepted.elapsed().as_secs_f64() * 1e3;
 
-    // exec v1.4's `job_ended` callbacks are told apart by their head alone, before any other check
+    // exec notify's `job_ended` callbacks are told apart by their head alone, before any other check
     // — the `Content-Length` rules and the grant included — and never reach the front door below.
     // A non-UTF-8 `Authorization` that reads, byte for byte, as a callback's is refused like a
     // look-alike: no token that is not UTF-8 can be one.
@@ -2903,7 +2903,7 @@ where
     if command.is_empty() {
         return Err(HttpError::BadRequest("missing `type`"));
     }
-    // exec v1.4: `job_ended` is accepted only as a sandbox's callback ([`job_ended`]), never under
+    // exec notify: `job_ended` is accepted only as a sandbox's callback ([`job_ended`]), never under
     // a session grant or on the loopback daemon.
     if command == "job_ended" {
         return Err(HttpError::Forbidden(

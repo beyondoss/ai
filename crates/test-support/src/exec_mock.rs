@@ -33,7 +33,7 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// The v1.4 notification kernel, which this endpoint drives, re-exported for the suites.
+/// The notify notification kernel, which this endpoint drives, re-exported for the suites.
 pub use exec_notify;
 
 /// One recorded request: its headers (lowercased names) and its JSON body.
@@ -88,17 +88,17 @@ pub struct MockOptions {
     /// The silence after which a stream gets a heartbeat frame. The spec's is 5 s; a suite that
     /// wants to prove heartbeats are not output makes it much shorter than its idle window.
     pub heartbeat: Duration,
-    /// Kill the command's process group when the client disconnects mid-stream — the v1.2 MUST.
+    /// Kill the command's process group when the client disconnects mid-stream — the streaming MUST.
     /// `false` is the non-conforming endpoint the conformance verifier has to catch.
     pub kills_on_disconnect: bool,
     /// When the shell exits leaving processes of its group running, send `{"shell_exit": N}` and
-    /// keep the stream open until the group is empty — the v1.2 MUST ("Leftover processes").
+    /// keep the stream open until the group is empty — the streaming MUST ("Leftover processes").
     /// `false` is an endpoint predating that rule: the stream ends with the shell and the leftovers
     /// run on, untracked.
     pub tracks_leftovers: bool,
     /// `HOME` for every command; `None` inherits this process's.
     pub home: Option<PathBuf>,
-    /// Kill a held job whose stream closes before it was kept — the v1.3 MUST. `false` is the
+    /// Kill a held job whose stream closes before it was kept — the jobs MUST. `false` is the
     /// non-conforming endpoint the conformance verifier has to catch.
     pub jobs_hold_kills: bool,
     /// How much of a job's output is kept; older bytes are dropped and read back as a gap.
@@ -116,7 +116,7 @@ pub struct MockOptions {
     /// How long `keep` waits to answer once it has recorded the keep and started its proof, so a
     /// callback can overtake the answer.
     pub keep_delay: Duration,
-    /// Ways to get v1.4 wrong, one per conformance check, for the suite that proves the verifier
+    /// Ways to get notify wrong, one per conformance check, for the suite that proves the verifier
     /// catches each. All off by default.
     pub faults: NotifyFaults,
     /// Answer 401 to any request that does not carry `Authorization: Bearer <this>`: an endpoint on
@@ -128,7 +128,7 @@ pub struct MockOptions {
     pub v11_timeout: bool,
 }
 
-/// One way per v1.4 conformance check for an endpoint to get the spec wrong. Each is a change to
+/// One way per notify conformance check for an endpoint to get the spec wrong. Each is a change to
 /// what the mock feeds the kernel, or to the request it makes, never to the kernel.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct NotifyFaults {
@@ -160,7 +160,7 @@ pub struct NotifyFaults {
     pub token_in_list: bool,
 }
 
-/// Which v1.4 notifications a [`MockOptions::lose_callbacks`] endpoint never sends.
+/// Which notify notifications a [`MockOptions::lose_callbacks`] endpoint never sends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoseCallbacks {
     /// None: every notification is sent.
@@ -384,7 +384,7 @@ impl ExecMock {
         self.requests().into_iter().map(|r| r.body).collect()
     }
 
-    /// Every v1.4 callback attempt so far, in the order they ended.
+    /// Every notify callback attempt so far, in the order they ended.
     pub fn callbacks(&self) -> Vec<CallbackAttempt> {
         self.callbacks.lock().unwrap().clone()
     }
@@ -618,7 +618,7 @@ fn command_for(req: &Value, shared: &Shared) -> tokio::process::Command {
     cmd
 }
 
-/// v1.1: run to completion, answer with one object.
+/// one-shot: run to completion, answer with one object.
 async fn serve_envelope(mut sock: tokio::net::TcpStream, req: Value, shared: Shared) {
     let stdin = req["stdin"]
         .as_str()
@@ -739,7 +739,7 @@ fn pump<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     })
 }
 
-/// v1.2: frames as the command produces them; the process group dies with the connection.
+/// streaming: frames as the command produces them; the process group dies with the connection.
 async fn serve_stream(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
     let (mut rd, mut wr) = sock.into_split();
     let head = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
@@ -903,7 +903,7 @@ async fn serve_stream(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// v1.3: sandbox jobs, natively.
+// jobs: sandbox jobs, natively.
 // ---------------------------------------------------------------------------------------------
 
 /// One job, as the endpoint keeps it.
@@ -921,7 +921,7 @@ struct MockJob {
     num: Option<u64>,
     kind: Option<String>,
     seen: u64,
-    /// The latest `keep`'s `notify` (v1.4), if it carried one.
+    /// The latest `keep`'s `notify` (notify), if it carried one.
     notify: Option<NotifyTarget>,
     /// When it calls back: the kernel's state, and the attempt or timer it has going.
     notifier: Notifier,
@@ -1079,7 +1079,7 @@ async fn serve_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
         }
         "keep" | "seen" => {
             let id = job["id"].as_str().unwrap_or("");
-            // v1.4: a `notify` that fails the grammar refuses the whole `keep`, before anything is
+            // notify: a `notify` that fails the grammar refuses the whole `keep`, before anything is
             // recorded. The reason never quotes the token.
             let notify = match job.get("notify") {
                 Some(n) if op == "keep" => match parse_notify(n) {
@@ -1307,7 +1307,7 @@ async fn start_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
                 .map(|s| s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0)))
                 .unwrap_or(-1);
             if !members(pgid).is_empty() {
-                // The moment a held stream would send `shell_exit`: v1.4 calls back.
+                // The moment a held stream would send `shell_exit`: notify calls back.
                 if let Some(j) = jobs.map.lock().unwrap().get_mut(&key) {
                     j.shell_exit = Some(code);
                     if !shared.opts.faults.no_shell_exit_callback {
@@ -1324,7 +1324,7 @@ async fn start_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
                 let _ = err_task.await;
             };
             let _ = tokio::time::timeout(Duration::from_millis(200), drained).await;
-            // The end is observable from here on: v1.4 calls back.
+            // The end is observable from here on: notify calls back.
             if let Some(j) = jobs.map.lock().unwrap().get_mut(&key) {
                 j.end = Some(code);
                 j.ended = epoch();
@@ -1453,11 +1453,11 @@ async fn stream_job(
 }
 
 // ---------------------------------------------------------------------------------------------
-// v1.4: job notify, natively. The sender is this process, and when it calls back is the kernel's
+// notify: job notify, natively. The sender is this process, and when it calls back is the kernel's
 // to say (`exec_notify::step`, the function every endpoint shares): this side makes the requests.
 // ---------------------------------------------------------------------------------------------
 
-// The pieces of v1.4 the endpoint and its observers share are execd's own, re-exported here.
+// The pieces of notify the endpoint and its observers share are execd's own, re-exported here.
 pub use execd::{
     ATTEMPT_TIMEOUT, CallbackAttempt, CallbackKind, NOTIFY_VERSION, NotifyTarget, StreamEnd,
     parse_notify,
