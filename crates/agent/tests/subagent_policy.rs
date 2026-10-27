@@ -50,7 +50,7 @@ fn a_child_cannot_run_a_bash_command_the_parents_deny_pattern_forbids() {
         turn_text("The runner could not complete the task."),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -118,7 +118,7 @@ fn a_child_can_run_a_bash_command_the_policy_permits() {
         turn_text("The runner completed the task."),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",

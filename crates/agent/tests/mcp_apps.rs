@@ -528,7 +528,7 @@ fn run_never_advertises_the_extension() {
         ),
         turn_text("done"),
     ]);
-    let output = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let output = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .env("HOME", &home.home)
         .env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0")
         .args([

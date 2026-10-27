@@ -22,7 +22,7 @@ data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_d
 
 fn run(base: &str, extra: &[&str]) -> std::process::Output {
     let dir = tempfile::tempdir().unwrap();
-    run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    run_cmd(env!("CARGO_BIN_EXE_agent"))
         .args([
             "run",
             "hi",

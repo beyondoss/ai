@@ -76,7 +76,7 @@ fn failed_child_result(input: Value) -> String {
         turn_text("I wrote half of it."),
         turn_text("Done."),
     ]);
-    let out = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let out = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .args([
             "run",
             "go",

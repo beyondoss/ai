@@ -488,14 +488,14 @@ mod tests {
 
     #[test]
     fn build_authorize_url_includes_all_required_params() {
-        let url = build_authorize_url("chal123", "state456", "beyond-ai-agent");
+        let url = build_authorize_url("chal123", "state456", "beyond-agent");
         assert!(url.starts_with(AUTHORIZE_URL));
         assert!(url.contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
         assert!(url.contains("code_challenge=chal123"));
         assert!(url.contains("state=state456"));
         assert!(url.contains("id_token_add_organizations=true"));
         assert!(url.contains("codex_cli_simplified_flow=true"));
-        assert!(url.contains("originator=beyond-ai-agent"));
+        assert!(url.contains("originator=beyond-agent"));
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"));
     }
 

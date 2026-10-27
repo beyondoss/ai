@@ -1,4 +1,4 @@
-//! End-to-end: real `beyond-ai` binary + real nats-server + mock upstream.
+//! End-to-end: real `gateway` binary + real nats-server + mock upstream.
 //! Run via `mise run test:integration:rs` (needs `nats-server` on PATH).
 //!
 //! Signing key + pool key come from the gateway's *config*; NATS carries the deny-set and the

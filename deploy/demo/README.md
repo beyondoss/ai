@@ -9,7 +9,7 @@ OPENAI_API_KEY=… ./deploy/demo/up.sh      # brings everything up, prints where
 ./deploy/demo/down.sh                     # deletes everything, then proves it is gone
 ```
 
-What runs is the real thing: `beyond-ai-agent serve --service` talking to a real model through the
+What runs is the real thing: `agent serve --service` talking to a real model through the
 real gateway (`crates/gateway`, with a managed `bai_v1` key, so every call is billed in an `ai.usage`
 row), running its tools in a sandbox over the exec protocol, keeping background jobs and learning they
 ended through v1.4 job-end notify, with sessions sealed on EFS that outlive the agent.

@@ -323,7 +323,7 @@ Further rules:
 - A file the caller may not write is refused with `permission_denied` and
   unchanged: the temp inherits the old file's mode (a read-only file gives a
   read-only temp that cannot be appended to).
-- A write onto a **directory** MUST fail and change nothing (D1).
+- A write onto a **directory** MUST fail and change nothing.
 - Two writers to one path leave one complete content, never a mixture.
 
 ### 5.4 write_if_unchanged
@@ -441,10 +441,18 @@ character is copied.
 
 #### Exit codes and errors
 
-Exit 0 (matches) and 1 (none) are success. Anything else is `invalid_query`
-with detail `bad regex: STDERR` (trimmed; `bad regex: PROGRAM rejected the
-pattern` if stderr is empty), whatever the cause (D4, D6). Exit 124 with the
-endpoint's timeout stderr SHOULD be `timeout` (no scenario exercises it).
+Exit 0 (matches) and 1 (none) are success. Exit 124, or the endpoint's own
+timeout, is `timeout`. Any other exit is told apart by stderr, since the cases
+share exit 2:
+
+- every stderr line is a per-path OS error (`PATH: No such file or directory`,
+  `Permission denied`, `Is a directory`, ...; `rg` adds `(os error N)`) and one
+  of them names the search root itself as missing: `not_found`;
+- every line is a per-path OS error otherwise: success. The hits on stdout are
+  returned and `note` says how many paths were skipped and names the first;
+- anything else (or empty stderr) is the engine rejecting the pattern:
+  `invalid_query` with detail `bad regex: STDERR` (trimmed; `bad regex: PROGRAM
+  rejected the pattern` if stderr is empty).
 
 #### Parsing
 
@@ -711,21 +719,10 @@ The reference (`ShellFs` as of this writing) behaves as follows where a client
 MUST do better. Each has an `xfail` check in the scenarios, marked for the
 reference driver, which turns into a plain pass when the reference is fixed.
 
-- **D1. Writing onto a directory.** The final `mv -f TEMP DIR` moves the temp
-  _into_ the directory and exits 0, so `write` reports success and leaves a
-  stray `DIR/DIR.tmp.SUFFIX`. A client MUST fail (and SHOULD test `[ -d "$t" ]`
-  before creating the temp). Scenario `files.write.onto-directory`.
 - **D3. Probe errors.** See section 4.2. Scenario `errors.auth.*` (the
   reference driver surfaces them itself, with a first request before probing).
-- **D4. Search on a missing root** is reported as `invalid_query` (`bad regex:
-  rg: ...No such file or directory`) because any exit above 1 is read as a bad
-  pattern. A client SHOULD report `not_found`; the scenario accepts either.
 - **D5. Context separator with `rg --crlf`.** The separator is `--` CR LF,
   which the reference parser does not recognise: the next hit's path becomes
   `--\r\n/real/path`, so it sorts and prints wrongly. Affects any search with
   context whose groups are not adjacent. Scenarios `files.search.context-lines`
   and `files.search.limit-counts-only-matches-and-drops-dangling-context`.
-- **D6. One unreadable path fails the search.** Both engines exit 2 when any
-  file cannot be read, so the matches found elsewhere are lost behind an
-  `invalid_query`. A client SHOULD return the hits with `note` set. Scenario
-  `files.search.unreadable-file`.

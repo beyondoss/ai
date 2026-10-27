@@ -51,7 +51,7 @@ fn repo(tools: &str) -> tempfile::TempDir {
 }
 
 fn run(dir: &Path, cache: &Path, base: &str) {
-    let out = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let out = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .args([
             "run",
             "go",

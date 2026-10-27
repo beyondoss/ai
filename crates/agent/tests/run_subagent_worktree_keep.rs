@@ -44,7 +44,7 @@ fn repo() -> tempfile::TempDir {
 
 fn run(dir: &Path, cache: &Path, script: Vec<String>) {
     let (base, _bodies) = spawn_model_server(script);
-    let out = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let out = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .args([
             "run",
             "go",

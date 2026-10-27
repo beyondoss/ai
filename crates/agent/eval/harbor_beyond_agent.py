@@ -1,4 +1,4 @@
-"""Harbor installed-agent adapter for `beyond-ai-agent`.
+"""Harbor installed-agent adapter for `agent`.
 
 Copies a host-built static musl binary into the task container and runs it
 headless. LLM calls go out during `agent.run()` only — pass Harbor
@@ -39,7 +39,7 @@ from token_price import list_usd
 _DONE_RE = re.compile(
     r"\[done in (\d+) step\(s\); (\d+) in / (\d+) out tokens\]"
 )
-_REMOTE_BIN = "/usr/local/bin/beyond-ai-agent"
+_REMOTE_BIN = "/usr/local/bin/agent"
 _REMOTE_AST_MCP = "/usr/local/lib/beyond-eval/mcp_ast.py"
 _OUTPUT_JSONL = "beyond.jsonl"
 _OUTPUT_STDERR = "beyond.stderr"
@@ -59,20 +59,20 @@ def resolve_agent_binary() -> Path:
 
     workspace = _workspace_root()
     candidates: list[Path] = []
-    which = shutil.which("beyond-ai-agent")
+    which = shutil.which("agent")
     if which:
         candidates.append(Path(which))
     candidates.extend(
         [
-            workspace / "target/x86_64-unknown-linux-musl/release/beyond-ai-agent",
-            workspace / "target/release/beyond-ai-agent",
+            workspace / "target/x86_64-unknown-linux-musl/release/agent",
+            workspace / "target/release/agent",
         ]
     )
     for path in candidates:
         if path.is_file():
             return path
     raise FileNotFoundError(
-        "beyond-ai-agent binary not found. Build a static musl release "
+        "agent binary not found. Build a static musl release "
         "(so it runs in any Terminal-Bench image):\n"
         "  cargo build -p beyond-agent --release --target x86_64-unknown-linux-musl\n"
         "or set BEYOND_AI_AGENT_BIN to an existing binary."
@@ -239,7 +239,7 @@ class BeyondAiAgent(BaseInstalledAgent):
         except NonZeroAgentExitCodeError as exc:
             # Leave the workspace for the verifier; a non-zero CLI exit is a
             # scored miss (or a transport error), not a Harbor infra exception.
-            self.logger.warning("beyond-ai-agent exited non-zero: %s", exc)
+            self.logger.warning("agent exited non-zero: %s", exc)
 
     @override
     def populate_context_post_run(self, context: AgentContext) -> None:

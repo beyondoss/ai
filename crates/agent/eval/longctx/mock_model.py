@@ -1,6 +1,6 @@
 """A scripted stand-in for the model, to run the background tasks end to end without a paid call.
 
-    mock_model.py --bin <beyond-ai-agent> --runs-dir <dir> [--tasks bg-…,…] [--jobs N]
+    mock_model.py --bin <agent> --runs-dir <dir> [--tasks bg-…,…] [--jobs N]
 
 Serves the OpenAI Responses API (`POST …/responses`, streamed) on localhost and runs `run.py` with
 `gpt-6-luna` pointed at it (`OPENAI_BASE_URL`), with every provider key in the environment replaced

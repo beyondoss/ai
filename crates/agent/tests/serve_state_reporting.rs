@@ -38,7 +38,7 @@ fn serve_get_session_stats_reports_the_same_field_set_idle_or_mid_turn() {
         ),
         turn_text("done"),
     ]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -106,7 +106,7 @@ fn serve_get_state_and_get_session_stats_answer_live_during_a_prompt() {
         &json!({ "command": "sleep 0.5" }).to_string(),
     );
     let (base, _bodies) = spawn_model_server(vec![turn1, turn_text("done")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -167,7 +167,7 @@ fn serve_get_tree_since_works_from_the_busy_loop_mid_prompt() {
     );
     let (base, _bodies) =
         spawn_model_server(vec![turn_text("first answer"), turn2, turn_text("done")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -241,7 +241,7 @@ fn serve_get_state_reports_pending_tool_ids_while_a_tool_is_running() {
         &json!({ "command": "sleep 0.5" }).to_string(),
     );
     let (base, _bodies) = spawn_model_server(vec![turn1, turn_text("done")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -295,7 +295,7 @@ fn serve_get_state_reports_runtime_settings_and_queue_depth() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -358,7 +358,7 @@ fn serve_steer_and_follow_up_expose_the_actual_queued_text_not_just_a_count() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -427,7 +427,7 @@ fn serve_reports_cwd_stale_false_for_a_freshly_created_session() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -465,7 +465,7 @@ fn serve_reports_cwd_stale_true_when_the_recorded_directory_no_longer_exists() {
     std::fs::write(&session_file, format!("{header}\n")).unwrap();
 
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file.to_string_lossy()).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -509,7 +509,7 @@ fn serve_switch_session_reports_cwd_stale_for_the_newly_active_session() {
     .unwrap();
 
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir.to_string_lossy()).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -562,7 +562,7 @@ fn serve_switch_session_restores_the_reopened_sessions_own_model() {
     // The server starts on `claude-test` (see `serve_dir_cmd`) — deliberately different from the
     // planted session's own `claude-test-restored`, so a successful restore is unambiguous.
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir.to_string_lossy()).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -609,7 +609,7 @@ fn serve_get_session_stats_reports_context_usage_after_a_real_turn() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![turn_text("hi there")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -651,7 +651,7 @@ fn serve_set_session_name_and_get_last_assistant_text() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![turn_text("the actual reply")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -738,7 +738,7 @@ fn serve_set_session_name_strips_newlines_and_pushes_a_session_info_changed_fram
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -802,7 +802,7 @@ fn get_state_reports_session_file_and_is_streaming_idle_vs_mid_run() {
         &json!({ "command": "sleep 1" }).to_string(),
     );
     let (base, _bodies) = spawn_model_server(vec![turn1, turn_text("done")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     // Idle, before any prompt: `is_streaming`/`is_compacting` must both already read `false`, and
     // `session_file` must already resolve to the real on-disk path (`Persistence::open` created it at

@@ -51,7 +51,7 @@ fn run_in(
 ) -> (bool, String, Vec<Value>) {
     write_settings(home);
     let (base, bodies) = spawn_model_server(responses);
-    let out = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let out = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .env("HOME", home)
         .current_dir(home)
         .args([

@@ -40,7 +40,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 #[derive(Parser)]
 #[command(
-    name = "beyond-ai",
+    name = "gateway",
     about = "Beyond AI gateway — egress proxy to LLM providers"
 )]
 struct Cli {
@@ -522,7 +522,7 @@ fn main() {
         grace_period_secs,
         runtime_timeout_secs,
         downstream_h2c,
-        "starting beyond-ai"
+        "starting gateway"
     );
     server.run(RunArgs {
         shutdown_signal: Box::new(DrainOnTerm {

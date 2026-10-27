@@ -191,7 +191,7 @@ scan_agent_oidc() { # needles-file -> the scan's stdout
   script=$({
     printf 'cat > /tmp/needles <<"EOF_NEEDLES"\n'
     cat "$1"
-    printf 'EOF_NEEDLES\ngrep -v "^control" /tmp/needles | cut -d" " -f2 > /tmp/needles.tails\nset -- /usr/local/bin/beyond-ai-agent /tmp/needles\n'
+    printf 'EOF_NEEDLES\ngrep -v "^control" /tmp/needles | cut -d" " -f2 > /tmp/needles.tails\nset -- /usr/local/bin/agent /tmp/needles\n'
     cat "$HERE/oidc/scan-memory.sh"
     cat <<'EOF'
 echo "SCAN-ENV needle_hits=$(tr '\0' '\n' < /proc/$pid/environ | grep -c -F -f /tmp/needles.tails) jwt_like=$(tr '\0' '\n' < /proc/$pid/environ | grep -c 'eyJ[A-Za-z0-9_-]\{8,\}\.')"

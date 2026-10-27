@@ -479,7 +479,7 @@ fi
 # SIGKILLed two seconds later, agent included, with no chance to seal its segment or release its
 # lock: the hard kill `demo.sh kill` is about, done with nothing but `aws ecs stop-task`.
 AGENT_SCRIPT='printf "%s" "$TLS_CERT" > /tmp/leaf.pem; printf "%s" "$TLS_KEY" > /tmp/leaf.key; ulimit -c 0 2>/dev/null || true
-/usr/local/bin/beyond-ai-agent serve --service --listen 0.0.0.0:8080 --tls-listen 0.0.0.0:8443 \
+/usr/local/bin/agent serve --service --listen 0.0.0.0:8080 --tls-listen 0.0.0.0:8443 \
   --tls-cert /tmp/leaf.pem --tls-key /tmp/leaf.key --gateway-url "$GATEWAY_URL" --model "$MODEL" \
   --notify-origin "$NOTIFY_ORIGIN" --grant-key "$GRANT_KEY_FLAG" --shard demo=/mnt/efs &
 wait $!'

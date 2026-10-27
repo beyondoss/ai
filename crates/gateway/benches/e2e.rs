@@ -1,7 +1,7 @@
 // Bench target: `.unwrap()`/`.expect()` set up the harness; not production code. See tests/e2e.rs.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-//! A-1 end-to-end bench: the real `beyond-ai` binary + real `nats-server` + a mock upstream,
+//! A-1 end-to-end bench: the real `gateway` binary + real `nats-server` + a mock upstream,
 //! driven over real HTTP. Run with `mise run bench:e2e` (needs `nats-server` on PATH — mise
 //! provides it). This is the macro counterpart to `unit.rs`: it measures the *whole* request path
 //! (TCP accept → Pingora filters → key verify → key swap → body stream → upstream → usage tap),

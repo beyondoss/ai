@@ -9,7 +9,7 @@
 //! tail → emit a usage fact. Whether the call is streaming is derived from the *response*
 //! Content-Type.
 //!
-//! Verified end-to-end (`tests/e2e.rs`): a real `beyond-ai` binary against real nats-server + a
+//! Verified end-to-end (`tests/e2e.rs`): a real `gateway` binary against real nats-server + a
 //! mock upstream — passthrough fidelity, key swap, usage metering (non-streaming + SSE), BYO
 //! passthrough, and deny-set propagation all pass.
 //!

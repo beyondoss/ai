@@ -10,7 +10,7 @@ use common::run_cmd;
 
 fn run(args: &[&str]) -> (bool, String) {
     let dir = tempfile::tempdir().unwrap();
-    let out = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let out = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .args(["run", "--key", "bai_v1.test", "--model", "claude-test"])
         .args(args)
         .arg("hi")

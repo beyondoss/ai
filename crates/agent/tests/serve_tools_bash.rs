@@ -26,7 +26,7 @@ fn serve_streams_tool_progress_from_a_running_bash() {
         turn_text("done"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -79,7 +79,7 @@ fn serve_exclude_tools_removes_a_tool_from_the_advertised_set() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
 
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.args(["--exclude-tools", "bash"]);
     let mut child = cmd.spawn_guarded();
@@ -114,7 +114,7 @@ fn serve_no_tools_sends_no_tools_field_at_all() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
 
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.args(["--no-tools"]);
     let mut child = cmd.spawn_guarded();
@@ -143,7 +143,7 @@ fn serve_bash_runs_a_host_command_independent_of_the_model() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -183,7 +183,7 @@ fn serve_bash_records_its_result_into_session_context_by_default() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -224,7 +224,7 @@ fn serve_bash_exclude_from_context_is_recorded_but_hidden_from_the_model() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let marker = "should-not-reach-the-model-but-must-be-recorded";
     let (base, bodies) = spawn_model_server(vec![turn_text("ack")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -302,7 +302,7 @@ fn serve_bash_is_rejected_when_the_tool_is_excluded() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.args(["--exclude-tools", "bash"]);
     let mut child = cmd.spawn_guarded();
@@ -343,7 +343,7 @@ fn serve_bash_rpc_command_is_blocked_by_deny_bash_pattern() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let marker = dir.path().join("should-not-exist.txt");
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.args(["--deny-bash-pattern", "touch"]);
     let mut child = cmd.spawn_guarded();
@@ -394,7 +394,7 @@ fn serve_bash_shell_path_overrides_the_auto_resolved_shell() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.args(["--bash-shell-path", "/bin/sh"]);
     let mut child = cmd.spawn_guarded();
@@ -427,7 +427,7 @@ fn serve_bash_command_prefix_flag_runs_before_the_given_command() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.args(["--bash-command-prefix", "export PREFIX_VAR=from-prefix"]);
     let mut child = cmd.spawn_guarded();
@@ -480,7 +480,7 @@ fn serve_sequential_tools_flag_is_accepted_and_both_calls_still_run() {
     ]);
     let (base, _bodies) = spawn_model_server(vec![two_bash_calls, turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.args(["--sequential-tools"]);
     let mut child = cmd.spawn_guarded();
@@ -509,7 +509,7 @@ fn serve_fails_fast_when_bash_shell_path_does_not_exist() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.args(["--bash-shell-path", "/no/such/shell-binary"]);
     cmd.stderr(Stdio::piped());
@@ -534,7 +534,7 @@ fn serve_abort_bash_cancels_a_running_host_command() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -585,7 +585,7 @@ fn serve_abort_bash_returns_the_partial_output_streamed_before_cancellation() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -661,7 +661,7 @@ fn serve_bash_terminal_response_carries_structured_exit_code_and_truncation_fiel
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -719,7 +719,7 @@ fn serve_deny_tool_flag_blocks_a_model_invoked_call_end_to_end() {
         turn_text("done"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file)
         .args(["--deny-tool", "bash"])
         .spawn_guarded();
@@ -775,7 +775,7 @@ fn serve_deny_path_flag_blocks_a_model_invoked_write_end_to_end() {
         turn_text("done"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file)
         .args(["--deny-path", "*.env"])
         .spawn_guarded();
@@ -836,7 +836,7 @@ fn serve_block_images_flag_forces_a_read_tool_image_to_a_text_placeholder() {
     );
     let (base, bodies) = spawn_model_server(vec![turn1, turn_text("described")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file)
         .args(["--block-images"])
         .current_dir(dir.path())
@@ -888,7 +888,7 @@ fn serve_no_image_auto_resize_flag_skips_downscaling_an_oversized_image() {
     let turn1 = turn_tool_use("toolu_1", "read", &json!({ "path": "big.png" }).to_string());
     let (base, bodies) = spawn_model_server(vec![turn1, turn_text("described")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file)
         .args(["--no-image-auto-resize"])
         .current_dir(dir.path())
@@ -976,7 +976,7 @@ fn serve_set_image_auto_resize_toggles_the_wire_layer_mid_session_without_a_rest
         turn_text("described (original)"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     // No `--no-image-auto-resize` here — starts at the on-by-default behavior.
     let mut child = serve_cmd(bin, &base, &session_file)
         .current_dir(dir.path())
