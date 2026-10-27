@@ -19,7 +19,6 @@ pub struct Config {
     pub bearer_file: Option<PathBuf>,
     pub insecure_no_auth: bool,
     pub run_as: Option<String>,
-    pub kept_jobs_survive_idle: bool,
     pub max_response_bytes: usize,
     pub jobs_dir: Option<PathBuf>,
     pub log_level: Level,
@@ -38,8 +37,7 @@ execd takes no arguments; it is configured by environment variables:
   EXECD_BEARER                    the bearer token itself, a weaker way than the file
   EXECD_INSECURE_NO_AUTH          1|true|0|false: serve with no bearer on a non-loopback address (default 0)
   EXECD_RUN_AS                    run every command as user, uid, user:group or uid:gid; execd must be root
-  EXECD_KEPT_JOBS_SURVIVE_IDLE    1|true|0|false: advertise v1.4 job-end notify (default 0)
-  EXECD_MAX_RESPONSE_BYTES        the most output one v1.1 answer carries (default 16777216)
+  EXECD_MAX_RESPONSE_BYTES        the most output one answer carries (default 16777216)
   EXECD_JOBS_DIR                  where a kept job's last 8 MiB of output is spooled (default $TMPDIR, else /tmp)
   EXECD_LOG                       off, error, warn, info, debug or trace (default info)
   EXECD_WORKER_THREADS            1 (default) one thread, 0 a worker per CPU, N workers
@@ -73,10 +71,6 @@ pub fn parse<E: Fn(&str) -> Option<String>>(env: E) -> Result<Config, String> {
         bearer_file: get("EXECD_BEARER_FILE").map(PathBuf::from),
         insecure_no_auth: boolean("EXECD_INSECURE_NO_AUTH", get("EXECD_INSECURE_NO_AUTH"))?,
         run_as: get("EXECD_RUN_AS"),
-        kept_jobs_survive_idle: boolean(
-            "EXECD_KEPT_JOBS_SURVIVE_IDLE",
-            get("EXECD_KEPT_JOBS_SURVIVE_IDLE"),
-        )?,
         max_response_bytes: number("EXECD_MAX_RESPONSE_BYTES", get("EXECD_MAX_RESPONSE_BYTES"))?
             .unwrap_or(execd::MAX_RESPONSE_BYTES),
         jobs_dir: get("EXECD_JOBS_DIR").map(PathBuf::from),
@@ -112,7 +106,7 @@ mod tests {
         assert_eq!(c.listen, "127.0.0.1:8080");
         assert!(c.root.is_none() && c.home.is_none() && c.bearer_file.is_none());
         assert!(c.run_as.is_none() && c.jobs_dir.is_none());
-        assert!(!c.insecure_no_auth && !c.kept_jobs_survive_idle);
+        assert!(!c.insecure_no_auth);
         assert_eq!(c.max_response_bytes, execd::MAX_RESPONSE_BYTES);
         assert_eq!(c.log_level, Level::Info);
         assert_eq!(c.worker_threads, 1);
@@ -128,7 +122,6 @@ mod tests {
             ("EXECD_BEARER_FILE", "/run/token"),
             ("EXECD_INSECURE_NO_AUTH", "true"),
             ("EXECD_RUN_AS", "nobody:nogroup"),
-            ("EXECD_KEPT_JOBS_SURVIVE_IDLE", "1"),
             ("EXECD_MAX_RESPONSE_BYTES", "1024"),
             ("EXECD_JOBS_DIR", "/var/jobs"),
             ("EXECD_LOG", "debug"),
@@ -140,7 +133,7 @@ mod tests {
         assert_eq!(c.root, Some("/work".into()));
         assert_eq!(c.home, Some("/home/x".into()));
         assert_eq!(c.bearer_file, Some("/run/token".into()));
-        assert!(c.insecure_no_auth && c.kept_jobs_survive_idle);
+        assert!(c.insecure_no_auth);
         assert_eq!(c.run_as.as_deref(), Some("nobody:nogroup"));
         assert_eq!(c.max_response_bytes, 1024);
         assert_eq!(c.jobs_dir, Some("/var/jobs".into()));
@@ -158,9 +151,9 @@ mod tests {
             assert_eq!(c.insecure_no_auth, want, "{v}");
         }
         for bad in ["yes", "on", "TRUE", "2"] {
-            let e = cfg(&[("EXECD_KEPT_JOBS_SURVIVE_IDLE", bad)]).unwrap_err();
+            let e = cfg(&[("EXECD_INSECURE_NO_AUTH", bad)]).unwrap_err();
             assert!(
-                e.contains("EXECD_KEPT_JOBS_SURVIVE_IDLE") && e.contains(bad),
+                e.contains("EXECD_INSECURE_NO_AUTH") && e.contains(bad),
                 "{e}"
             );
         }

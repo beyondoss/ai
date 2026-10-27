@@ -25,8 +25,7 @@ helpers    files, search, jobs, bulk copy      may use layer 1 only
 transport  exec: one-shot, stream, jobs        may use nothing of this spec
 ```
 
-1. **Transport.** A raw `exec` call: one-shot (v1.1), streaming (v1.2) and the
-   job calls (v1.3). It is a plain interface (command, args, cwd, timeout,
+1. **Transport.** A raw `exec` call: one-shot, streaming and the job calls. It is a plain interface (command, args, cwd, timeout,
    stdin in; exit status and bytes out) that a user MUST be able to replace
    with their own implementation (an SSH session, a vendor SDK, a test double).
    The HTTP implementation is the default, not the definition.
@@ -62,19 +61,19 @@ or fails with a transport-level error (section 3.2).
   inert argument.
 - Helpers send no `cwd`: relative paths are the endpoint's business, and
   helpers SHOULD be given absolute paths.
-- `stdin` is bytes. It is sent only by `write` and only after the stdin probe
-  proved the endpoint delivers it.
-- `stdout` and `stderr` are **text**. Over the one-shot envelope (v1.1) they are
-  JSON strings, so bytes that are not valid UTF-8 reach the client as U+FFFD,
-  decided by the endpoint. A helper that must move arbitrary bytes MUST encode
-  them (base64) inside the command.
-- `code` is the exit status. Over v1.1 a command killed by signal `S` has
+- `stdin` is bytes. It is sent by `write`, and the endpoint always delivers it.
+- `stdout` and `stderr` are **bytes**: exactly what the command wrote, carried
+  as standard base64 on the wire. A helper that wants text decodes the bytes in
+  one place (UTF-8, invalid sequences replaced by U+FFFD); a helper that must
+  move arbitrary bytes keeps them as bytes (the `read` script still encodes
+  its file in base64 inside the command, so its stdout is text by design).
+- `code` is the exit status. A command killed by signal `S` has
   `code` `128+S`, and a command that hit `timeout_ms` has `code` 124 with stderr
   ending `command exceeded its timeout`. A command that cannot be started (or
   whose `cwd` is missing) has `code` 127 and the reason on stderr. None of
   these is a transport error.
 - Timeouts: helpers use 120 s per command (`timeout_ms` 120000) and 10 s for
-  capability probes.
+  the environment probe.
 
 On the wire (the HTTP transport) a call is one `POST` of
 
@@ -83,15 +82,18 @@ On the wire (the HTTP transport) a call is one `POST` of
   "command": "sh",
   "args": ["-c", "...", "sh", "/a"],
   "timeout_ms": 120000,
-  "stdin_base64": "..."
+  "stdin": "..."
 }
 ```
 
-(`cwd` and `stdin_base64` only when present) with every configured header,
-among them `Authorization: Bearer <token>`, and the answer
-`{"exit_code": N, "stdout": "...", "stderr": "..."}`. The client reads the body
-incrementally and stops at a cap (default 16 MiB): over the cap the call fails
-with `too_large` and says the command ran. The request deadline is
+(`cwd` and `stdin` only when present; `stdin` is standard base64) with every
+configured header, among them `Authorization: Bearer <token>`, and the answer
+`{"exit_code": N, "stdout": "<base64>", "stderr": "<base64>"}` (standard base64
+with padding, the empty string for no output). The client reads the body
+incrementally and stops at a cap (default 16 MiB of decoded `stdout` plus
+`stderr`): over the cap the call fails with `too_large` and says the command ran.
+A `stdout` or `stderr` that is missing or not standard base64 is a `protocol`
+error, never empty output. The request deadline is
 `timeout_ms` plus 30 s of grace so that the endpoint's own timeout report wins.
 
 ## 3. Errors
@@ -117,31 +119,33 @@ situations.
 | `transport`         | the endpoint could not be reached, or a stream broke                        |
 | `protocol`          | the endpoint answered with something that is not the protocol               |
 | `endpoint`          | the endpoint refused the request with another status (`detail` names it)    |
-| `not_offered`       | the endpoint lacks the capability (it does not stream; it has no jobs)      |
 | `invalid_request`   | the caller's arguments cannot form a request; nothing was sent              |
 
 ### 3.2 From the transport
 
-| what happened                                                       | kind          |
-| ------------------------------------------------------------------- | ------------- |
-| connection refused, reset, DNS failure                              | `transport`   |
-| the request deadline passed                                         | `timeout`     |
-| HTTP 401 or 403                                                     | `auth`        |
-| HTTP 422 whose body says the output exceeded the cap, or client cap | `too_large`   |
-| any other non-2xx                                                   | `endpoint`    |
-| 200 whose body is not the expected JSON                             | `protocol`    |
-| a v1.2 stream ends without its final frame, or a `{"error"}` frame  | `transport`   |
-| a stream asked of an endpoint that did not prove v1.2               | `not_offered` |
+| what happened                                                       | kind        |
+| ------------------------------------------------------------------- | ----------- |
+| connection refused, reset, DNS failure                              | `transport` |
+| the request deadline passed                                         | `timeout`   |
+| HTTP 401 or 403                                                     | `auth`      |
+| HTTP 422 whose body says the output exceeded the cap, or client cap | `too_large` |
+| any other non-2xx                                                   | `endpoint`  |
+| 200 whose body is not the expected JSON                             | `protocol`  |
+| a stream ends without its final frame, or a `{"error"}` frame       | `transport` |
 
 A transport-level failure is never a capability: see
-[probe errors](#52-probe-errors).
+[probe errors](#42-probe-errors).
 
 ### 3.3 From a command that ran and failed
 
 A helper that gets a non-zero exit takes the **first line of trimmed stderr**
-(or `command failed` if there is none) as `detail`, prefixed as each operation
+(lines end at LF and at no other character: CR, VT, FF and U+2028 do not end
+one; or `command failed` if there is none) as `detail`, prefixed as each operation
 below says, and classifies it case-insensitively by the first rule that
-matches:
+matches. A path may contain a newline, which splits one message over two lines
+and leaves the OS error on a later one: when the first line contains none of the
+patterns below, `detail` runs through the first line that does (lines joined
+with LF), and if no line does it is the first line.
 
 | stderr contains                                                               | kind                |
 | ----------------------------------------------------------------------------- | ------------------- |
@@ -155,41 +159,36 @@ The patterns cover GNU coreutils, busybox, dash and bash. (The `read` script
 prints the three `(os error N)` wordings itself so the text does not depend on
 the sandbox's tools.)
 
-## 4. Capability probe
+## 4. Environment probe
 
-A helper client probes the sandbox once and records the results. Each probe is
-one `run` with a 10 s timeout.
+A helper client looks at the sandbox's tools once, in **one** round trip, the
+first time an operation needs to know (a write needs nothing and never probes).
+The result is cached per sandbox. The probe is a single `run` with a 10 s
+timeout of script F of the appendix, `sh -c PROBE_SCRIPT sh`, whose stdout has
+one line per capability the sandbox has:
 
-| capability    | command                                                                                                                  | present when                                   |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------- |
-| `rg`          | `rg --version`                                                                                                           | exit 0                                         |
-| `grep_null`   | `grep -rnZ -e __cap_probe__ -- /dev/null`                                                                                | exit 0 or 1                                    |
-| `find_printf` | `find /dev/null -maxdepth 0 -printf %y`                                                                                  | stdout is exactly `c`                          |
-| `stdin`       | `cat` with stdin `stdin-probe`                                                                                           | exit 0 **and** stdout is exactly `stdin-probe` |
-| `read_window` | `sh -c 'printf abc \| dd iflag=skip_bytes,count_bytes skip=1 count=1 status=none 2>/dev/null \| base64 -w0 2>/dev/null'` | exit 0 and stdout trimmed is `Yg==`            |
+| line          | capability                                         | present when the script finds                              |
+| ------------- | -------------------------------------------------- | ---------------------------------------------------------- |
+| `rg`          | ripgrep                                            | `rg --version` exits 0                                     |
+| `grep_null`   | `grep -Z`                                          | `grep -rnZ -e __cap_probe__ -- /dev/null` exits 0 or 1     |
+| `find_printf` | `find -printf`                                     | `find /dev/null -maxdepth 0 -printf %y` prints exactly `c` |
+| `read_window` | `dd iflag=skip_bytes,count_bytes` and `base64 -w0` | `printf abc \| dd ... \| base64 -w0` prints `Yg==`         |
 
-Derived: the **search engine** is `rg` if `rg`; otherwise `grep` (GNU grep:
-`grep_null`); otherwise `busybox-grep`.
-
-`stdin` is proven by an echo, never assumed. A v1 endpoint ignores
-`stdin_base64`, runs `cat` on empty input and answers with empty stdout, so the
-probe fails and writes fall back to chunks. Writing through such an endpoint as
-though stdin arrived would replace the file with an empty one.
+A capability whose line is absent is absent. Derived: the **search engine** is
+`rg` if `rg`; otherwise `grep` (GNU grep: `grep_null`); otherwise
+`busybox-grep`.
 
 ### 4.1 What a client reports
 
-`capabilities` (DRIVER.md) reports `stdin`, `stream`, `jobs`
-(`native`, `baseline` or `none`), `search_engine`, `find_printf` and
-`read_window`. `stream` is true only when the v1.2 probe of the exec spec
-succeeded.
+`capabilities` (DRIVER.md) reports `search_engine`, `find_printf` and
+`read_window`.
 
 ### 4.2 Probe errors
 
-If a probe request fails at the transport level (unreachable, `auth`,
+If the probe request fails at the transport level (unreachable, `auth`,
 `endpoint`, `timeout`), the client MUST report that error from the operation
-that needed the probe, and MUST NOT cache a capability set learned from failed
-probes. (The reference `ShellFs::connect` fails with the runner's error when a
-probe request fails; only a probe that ran and answered "absent" means absent.)
+that needed the probe, and MUST NOT cache a capability set learned from a failed
+request. Only a probe that ran and left a line out means absent.
 
 Probe overrides for testing are in DRIVER.md (`CONFORMANCE_CAPS`).
 
@@ -211,12 +210,17 @@ Runs `sh -c STAT_SCRIPT sh PATH` (script A). Parse stdout:
 - otherwise the first line is `W<TAB>T<TAB>SIZE<TAB>MTIME`: `W` is `w`
   (writable) or `-`; `T` is `f` file, `d` directory, `o` other (FIFO, socket,
   device); `SIZE` an integer (a line that does not parse is also "does not
-  exist"); `MTIME` is epoch seconds, optionally with a fractional part, of
-  which the **integer part** is kept (truncated, not rounded).
+  exist"); `MTIME` is `SECS.FRAC`: epoch seconds, a dot, and the fractional
+  digits `stat` reports (nine digits of nanoseconds on GNU coreutils and on
+  busybox; `0` if it reports none). A client keeps **all of it**, as a number
+  (a double is enough: it resolves 0.24 µs at present epochs, finer than any
+  filesystem records).
 
 `kind` follows symlinks (`[ -d ]`/`[ -f ]`), `writable` is a real access check
-for the calling user (`[ -w ]`), not mode bits. If `stat -c` itself fails the
-script prints `0<TAB>0`.
+for the calling user (`[ -w ]`), not mode bits. The script takes the whole
+seconds from `stat -c %Y` and the fraction from the part after the dot of
+`stat -c %y` (`YYYY-MM-DD HH:MM:SS.NNNNNNNNN ZONE` on both GNU and busybox;
+`%.9Y` is GNU-only). If `stat -c` itself fails the script prints `0<TAB>0`.
 
 A symlink's `size` and `mtime` are the target's, like `kind`: the script runs
 `stat -L -c` (GNU and busybox both accept it). A dangling link fails the
@@ -265,10 +269,15 @@ Rules:
 
 `write(path, bytes)`: replace the file's whole content, atomically.
 
-The write goes to a temp file `T.tmp.SUFFIX` **beside the file the path
-resolves to**, and is committed with `mv -f`. `SUFFIX` is chosen by the client
-per write, unpredictable (at least 64 bits of randomness, lowercase hex), so a
-preplanted name cannot redirect the write. The scripts (C and D below) do the
+The write goes to a temp file **in the directory of the file the path
+resolves to** (so the `mv` is a rename within one filesystem), named
+`.tmp.SUFFIX` whatever the target is called, and is committed with `mv -f`.
+`SUFFIX` is chosen by the client per write: **exactly 16 lowercase hex digits**
+(64 random bits, unpredictable), so a preplanted name cannot redirect the
+write. The name is therefore always 21 bytes, and a target whose own name is
+anything up to `NAME_MAX` (255 bytes) can be written; a name derived from the
+target's (`NAME.tmp.SUFFIX`) overflowed `NAME_MAX` for names over about 230
+bytes. The script (C below) does the
 resolution, in order:
 
 1. a path starting with `-` is prefixed with `./`;
@@ -286,15 +295,22 @@ resolution, in order:
 3. a target that is a directory is refused (`Is a directory (os error 21)`, exit
    1), before the temp exists, because `mv -f` would move the temp _into_ it
    and report success;
-   the temp is created empty with `set -C` (no-clobber: a preplanted temp is
-   refused, not followed);
-4. if the target exists, the temp gets its mode **before any content**:
-   `chmod --reference`, falling back to `chmod "$(stat -L -c %a TARGET)"`
-   (busybox); if neither works the write fails (`cannot give the new file the
-   mode of ...`) and the temp is removed;
+4. the temp is created empty with `set -C` (no-clobber: a preplanted temp is
+   refused, not followed) under `umask 077` (mode 0600), or
+   with the default mode when the target does not exist, so the size check in
+   step 5 can read it back whatever the file's mode is: **a write needs no
+   read permission on the file** (a mode 0200 file is replaced). Creating the
+   temp comes first, so a read-only filesystem reports its own
+   `Read-only file system` and a full one its own error. Then, if the target
+   exists and `[ -w TARGET ]` is false, the temp is removed and the write is
+   refused (`Permission denied (os error 13)`, exit 1);
 5. the content is appended; the temp's size is checked against the expected
    byte count; the directory check runs again (a directory created meanwhile
-   removes the temp and fails); only then `mv -f TEMP TARGET`.
+   removes the temp and fails); if the target exists the temp gets its mode
+   **now, just before the `mv`**: `chmod --reference`, falling back to
+   `chmod "$(stat -L -c %a TARGET)"` (busybox); if neither works the write fails
+   (`cannot give the new file the mode of ...`) and the temp is removed; only
+   then `mv -f TEMP TARGET`.
 
 A write is therefore atomic (a reader sees the old file or the new one), keeps
 the file's mode (a 0600 file stays 0600, a 0755 file stays executable), writes
@@ -302,38 +318,26 @@ through symlinks (the link stays a link; a dangling link's target is created),
 creates a new file with the default mode, and never leaves a temp behind on a
 failure the script sees.
 
-**With stdin** (the `stdin` probe passed): one command,
-`sh -c WRITE_STDIN_SCRIPT sh TARGET SUFFIX SIZE` with the whole content as
-stdin (script C). The size check is what turns a lost stdin into a failed
-write instead of an empty file: a probe is one sample, and an endpoint behind a
-load balancer mid-rollout can pass it on one replica and answer the write from
-another.
+One command, `sh -c WRITE_STDIN_SCRIPT sh TARGET SUFFIX SIZE` with the whole
+content as stdin (script C). The size check is what turns a lost stdin (a
+transport that closes the command's stdin, as `docker exec` does without `-i`)
+into a failed write instead of an empty file.
 
-**Without stdin**: one command per **48 KiB (49152 raw bytes)** chunk, each
-`sh -c WRITE_CHUNK_SCRIPT sh TARGET SUFFIX CHUNK_B64 MODE COMMIT SIZE` (script
-D) where `CHUNK_B64` is the chunk in standard base64 with padding (at most 64
-KiB of text, half of Linux's 128 KiB single-argument limit), `MODE` is `new`
-for the first chunk and `append` after, `COMMIT` is `commit` for the last chunk
-and the empty string otherwise, and `SIZE` the total byte count. The temp is
-created by the `new` command and the commit does the size check and the `mv`.
-An empty file is one empty chunk (so the temp is still created and committed).
-Chunks are sent sequentially.
-
-**On failure** (non-zero exit of any command, or a transport error part-way):
+**On failure** (a non-zero exit, or a transport error):
 the client sends one best-effort cleanup command,
-`sh -c REMOVE_TEMP_SCRIPT sh TARGET SUFFIX` (script E; its result is ignored),
+`sh -c REMOVE_TEMP_SCRIPT sh TARGET SUFFIX` (script D; its result is ignored),
 and then reports the failure: a transport error as it is, otherwise
-`write PATH: LINE` classified by section 3.3. Stdin and chunk scripts both
-remove the temp themselves on failures they see; the cleanup covers the ones
-they cannot (a timeout between chunks).
+`write PATH: LINE` classified by section 3.3. The script removes the temp itself on failures it sees; the cleanup covers the
+ones it cannot (a timeout).
 
 Further rules:
 
 - The parent directory must exist (`not_found`); `write` does not create
   directories.
 - A file the caller may not write is refused with `permission_denied` and
-  unchanged: the temp inherits the old file's mode (a read-only file gives a
-  read-only temp that cannot be appended to).
+  unchanged: the script tests `[ -w TARGET ]` once the temp exists, and only then.
+- A file the caller may write but not read (mode 0200, 0333) is replaced: the
+  temp is 0600 until the `mv`, so the size check can read it.
 - A write onto a **directory** MUST fail and change nothing.
 - Two writers to one path leave one complete content, never a mixture.
 
@@ -342,16 +346,20 @@ Further rules:
 `write_if_unchanged(path, bytes, expected_mtime: int | null)`
 
 1. `m = stat(path)` and take its `mtime` (absent if the path does not exist).
-2. Compare **whole epoch seconds**: they match when `m` and `expected_mtime`
-   are both absent, or both present and equal. Otherwise fail with `conflict`
-   and write nothing.
+2. Compare the mtimes **at full precision, as numbers**: they match when `m`
+   and `expected_mtime` are both absent, or both present and equal (the same
+   `SECS.FRAC` parsed to a double gives the same double, so the comparison a
+   client makes between two of its own `stat` results is exact). Otherwise fail
+   with `conflict` and write nothing.
 3. `write(path, bytes)`.
 
-So `expected_mtime` null means "the file must not exist". The key is required.
+So `expected_mtime` null means "the file must not exist". The key is required,
+and a number is the `mtime` of an earlier `stat`, fraction included: a value
+truncated to whole seconds does not match a file whose mtime has a fraction.
 The two steps are two round trips and the guard is not a lock: it catches a
-person or agent editing between a read and a write, and misses an edit that
-leaves the mtime second unchanged (a limit, with a scenario). Through a symlink
-the comparison MUST use the target's mtime.
+person or agent editing between a read and a write, including one in the same
+second, and misses an edit that restores the exact timestamp (a limit, with a
+scenario). Through a symlink the comparison MUST use the target's mtime.
 
 ### 5.5 mkdir
 
@@ -364,7 +372,7 @@ classified by section 3.3 (making a directory below a file is
 
 `list(path, include_hidden = false, limit = 10000) -> entries[{ name, kind, size }]`
 
-**With `find_printf`**: one command, `find PATH -mindepth 1 -maxdepth 1 -printf
+**With `find_printf`**: one command, `find -H PATH -mindepth 1 -maxdepth 1 -printf
 '%Y\t%s\t%f\0'` (the argument is the literal characters `%Y`, backslash, `t`,
 and so on; `find` expands the escapes). Fail with `ls PATH: LINE` when the exit
 is non-zero **and** stdout is empty; a non-zero exit with output is a partial
@@ -381,11 +389,16 @@ counting; map `TYPE` `f` to `file`, `d` to `dir`, `N` and `?` to **skipped**
 the link's own; callers needing it `stat`. Order is unspecified; clients MAY
 sort and the scenarios compare unordered.
 
-**Without `find_printf`** (busybox): two commands, `find PATH -mindepth 1
+**Without `find_printf`** (busybox): two commands, `find -H PATH -mindepth 1
 -maxdepth 1 -print0` (same failure rule) and the same with `-type d` added.
 Entries are the first listing; `name` is the last path component; an entry is
 `dir` if its full path is in the second listing, otherwise `file`; `size` is 0.
 (So FIFOs and links to directories are `file` there.)
+
+`-H` makes `find` follow `PATH` itself when it is a symlink (it does not by
+default): a link to a directory lists the directory it points to, and each
+entry is reported by its name under the link. A link to a file, or a broken
+one, lists nothing.
 
 Listing a **file** gives no entries and no error (`find` finds no children).
 A missing directory is `not_found`. Names that are not valid UTF-8 appear with
@@ -408,7 +421,8 @@ The command is `rg` or `grep`, with **no shell**, each item one argument.
 `rg` engine (in this order):
 
 ```text
---null --with-filename --line-number --no-heading --color=never --hidden --crlf
+--null --with-filename --line-number --column --no-heading --color=never
+--hidden --crlf
 [--no-require-git]            unless the root is inside a git repository (below)
 [--ignore-case] [--fixed-strings]
 [--glob G | --glob !G]        the caller's glob; the second form when excluding
@@ -440,7 +454,7 @@ where for a non-literal pattern `PATTERN` is rewritten for CRLF files (below).
 
 **Git root probe** (`rg` only): `--no-require-git` is added unless the root or
 an ancestor holds a `.git` entry, decided **in the sandbox** (never from the
-client's filesystem): `sh -c GIT_SCRIPT sh ROOT` (script F), exit 0 meaning
+client's filesystem): `sh -c GIT_SCRIPT sh ROOT` (script E), exit 0 meaning
 inside a repository, cached per root. A failed probe counts as "not inside".
 It makes `.gitignore` honored in a plain directory too.
 
@@ -457,21 +471,43 @@ character is copied.
 
 Exit 0 (matches) and 1 (none) are success. Exit 124, or the endpoint's own
 timeout, is `timeout`. Any other exit is told apart by stderr, since the cases
-share exit 2:
+share exit 2.
 
-- every stderr line is a per-path OS error (`PATH: No such file or directory`,
-  `Permission denied`, `Is a directory`, ...; `rg` adds `(os error N)`) and one
-  of them names the search root itself as missing: `not_found`;
-- every line is a per-path OS error otherwise: success. The hits on stdout are
-  returned and `note` says how many paths were skipped and names the first;
-- anything else (or empty stderr) is the engine rejecting the pattern:
+Read stderr as **records**, not lines, because a path may contain a newline: a
+record runs from the end of the previous one through the first line that ends
+in an OS error (`No such file or directory`, `Permission denied`, `Is a
+directory`, `Not a directory`, `Too many levels of symbolic links`, `Input/output error`, with a
+trailing `(os error N)` that `rg` adds ignored) or in
+`stream did not contain valid UTF-8` (`rg` reading a `.git` file, in or above
+the root, that is not text: the search itself ran, and no flag turns that read
+off without also turning off the `.gitignore` handling the helper promises).
+
+- stderr is non-empty, nothing is left after its last record (every record is a
+  per-path OS error), and one record is the search root's own error: it
+  contains `: ROOT:` and a space, immediately followed by `No such file or
+  directory` or `Not a directory`, optionally with `IO error for operation on
+  ROOT:` and a space before it, where `ROOT` is the exact root string given to
+  the engine, newlines included (a path under the root continues after `ROOT`,
+  so it does not match): `not_found` for `No such file or directory`,
+  `not_a_directory` for `Not a directory` (a root below a regular file);
+- every record is a per-path OS error otherwise: success. The hits on stdout
+  are returned and `note` says how many records were skipped and names the
+  first;
+- anything else (or empty stderr) is the engine rejecting the pattern, whatever
+  stdout holds (`rg: regex parse error:`, `rg: error parsing glob ...`,
+  `rg: compiled regex exceeds size limit ...` are such lines):
   `invalid_query` with detail `bad regex: STDERR` (trimmed; `bad regex: PROGRAM
   rejected the pattern` if stderr is empty).
 
 #### Parsing
 
 `rg` and `grep -Z` emit records `PATH<NUL>LINE<SEP>TEXT<LF>`, where `SEP` is `:`
-for a match and `-` for a context line. The command MUST turn off the group
+for a match and `-` for a context line. `rg --column` puts the byte column of the
+line's first match between the separator and the text of a **match** record:
+`PATH<NUL>LINE:COL:TEXT<LF>` (`COL` is 1-based, in bytes of the raw line, CRs
+included; a context record has none). GNU `grep -b` puts the byte offset of the
+line start there instead, in match **and** context records
+(`PATH<NUL>LINE:OFF:TEXT`, `PATH<NUL>LINE-OFF-TEXT`). The command MUST turn off the group
 separator: `rg --no-context-separator` (ripgrep 0.10 and later), GNU
 `grep --no-group-separator` (2.5.4 and later). The separator is the only record
 without a NUL, and a path may begin with `--` + LF (or `--` + CR LF under
@@ -479,9 +515,25 @@ without a NUL, and a path may begin with `--` + LF (or `--` + CR LF under
 the output is path records only. A client MUST NOT skip any `--` bytes. Parse by
 scanning for the **NUL**, not for newlines: a path may contain a newline. The
 path runs from the start of the record to the next NUL, the rest of the record
-to the next LF; `LINE` is one or more digits followed by `:` or `-`; a record
-that does not fit is dropped. A file named `--` or `--` LF `b` is an ordinary
+to the next LF; `LINE` is one or more digits followed by `:` or `-`, and under `rg` a match
+record then has `COL`, one or more digits followed by `:`; a record that does
+not fit is dropped. A file named `--` or `--` LF `b` is an ordinary
 path.
+
+`rg` also prints, after the records of a file it stopped searching at a NUL
+byte (a NUL after a match), one line `PATH: WARNING: stopped searching binary
+file after match (found "\0" byte around offset N)` on **stdout**, where `\0` is
+a backslash and a zero and `N` digits. It has no NUL, so it would read as the
+start of the next record's path. `rg --no-messages` does not suppress it,
+`--binary` only rewords it (still on stdout), and `--text` changes the results
+(binary files would be searched whole), so the client drops it: a line is that
+warning when it is exactly the **previous record's path** followed by the text
+above, and a record is parsed from the line after it. Requiring the previous
+record's path means a file merely named like the warning is still a path (the
+one ambiguity left is a file whose name is the previous record's path plus
+that text and a newline, listed right after it). GNU `grep -I` prints nothing
+for such a file, and busybox `grep` prints `Binary file PATH matches`, which has
+no `LINE:` field and is dropped by its parser.
 
 `busybox-grep` emits `PATH:LINE:TEXT` (match) or `PATH-LINE-TEXT` (context). A
 line equal to `--` is skipped. Otherwise split at the **first** position `i`
@@ -518,19 +570,31 @@ Context groups that overlap are merged by the engine.
 #### Clipping
 
 `MAX_LINE` is 500 **characters** (Unicode scalar values, not bytes or UTF-16
-units). A line of at most 500 characters is unchanged. For a **context** line
-longer than that: the first 500 characters followed by `… [truncated]`
-(U+2026, then `[truncated]`). For a **match** line longer than 500: find the
-first match of the query in the line (the pattern as a Rust-syntax regular
-expression, escaped when `literal`, case-insensitive when `ignore_case`; if
-that fails to compile or finds nothing, treat as a context line). With `cs` and
-`ce` its start and end character offsets and `total` the line's length: if
-`ce <= 500` clip as a context line. Otherwise
-`pad = (500 - (ce - cs)) / 2` (integer division, floored at 0),
-`start = max(0, cs - pad)`, `end = start + 500`; if `end > total` then
+units). A line of at most 500 characters is unchanged. A line longer than that
+is clipped at its **head** (the first 500 characters followed by `… [truncated]`,
+U+2026, space, `[truncated]`) if it is a context line, if the engine reported no
+column for it, or if its match starts early (below). A client never searches the
+line for the match itself: the position is what the engine reported, so clients
+cannot differ on pattern syntax.
+
+For a **match** line with a byte column `COL` (from `rg --column`; for GNU
+`grep`, below): `cs` is the number of characters
+of the line's UTF-8 encoding before byte `COL - 1`, not counting CRs (the text
+has none, see Parsing); a `COL` that is not a character boundary of the line
+(possible only when the line had bytes that are not UTF-8) counts as no column.
+`start = max(0, cs - 250)`. If `start` is 0, clip at the head. Otherwise
+`end = start + 500`; if `end > total` (the line's length in characters) then
 `end = total` and `start = total - 500`. The text is `…` + characters
 `[start, end)` + (`…` if `end < total`) + `[truncated; columns
 {start+1}-{end} of {total}]`.
+
+GNU `grep` has no column field. When the run returned a match line of more than
+500 characters, the client runs the same command once more with `-o` added and
+no context flags (`-o -b` prints `PATH<NUL>LINE:OFF:MATCH` per match, `OFF` the
+byte offset of the match in its file). For each such line the first record with
+its path and line number gives `COL = OFF - LINEOFF + 1`, where `LINEOFF` is the
+offset the first run printed for the line. A second run that fails, or has no
+record for the line, leaves the line clipped at its head.
 
 #### Engines differ; say which you used
 
@@ -538,7 +602,9 @@ that fails to compile or finds nothing, treat as a context line). With `cs` and
 regex syntax and searches hidden files. `grep` does none of the ignore
 handling, skips binary files with `-I` (in a UTF-8 locale also files with
 invalid UTF-8), and uses POSIX ERE; `\d` and non-greedy quantifiers are not
-available. `busybox-grep` additionally cannot represent some path names (above)
+available. `busybox-grep` reports no match position and clips every long line
+at its head.
+`busybox-grep` additionally cannot represent some path names (above)
 and may report binary files differently. A client MUST report the engine in use
 (`capabilities.search_engine`); scenarios that depend on one declare
 `requires.search_engine`.
@@ -554,11 +620,13 @@ and may report binary files differently. A client MUST report the engine in use
 
 ## 6. Jobs
 
-Jobs are layer 1, specified by the exec protocol (v1.3 natively; the
-**baseline** over plain commands where the endpoint has no native jobs; the
-baseline's layout and supervisor are in `crates/sandbox/src/exec_endpoint/jobs.rs`).
-A client MUST support native jobs and SHOULD support the baseline; the driver
-ops are in DRIVER.md. Behaviours the scenarios pin, for both:
+Jobs are layer 1, specified by the exec protocol ("Sandbox jobs" in the module
+doc of `crates/sandbox/src/exec_endpoint.rs`): the endpoint runs them, and a
+client calls the job operations. (A transport that is not an exec endpoint, a
+template such as `ssh` or `docker exec`, has no jobs of its own; the Rust crate
+builds them there from plain commands, in
+`crates/sandbox/src/exec_endpoint/jobs.rs`. That is not part of this contract.)
+The driver ops are in DRIVER.md. Behaviours the scenarios pin:
 
 - a job id is 1 to 32 characters of `[0-9a-z]`, chosen by the caller, unique
   within its scope; a client rejects anything else before sending (`invalid_request`);
@@ -591,7 +659,14 @@ else t=o
 fi
 if [ -w "$1" ]; then w=w; else w=-; fi
 printf '%s	%s	' "$w" "$t"
-stat -L -c '%s	%Y' -- "$1" 2>/dev/null || printf '0	0'
+if s=$(stat -L -c '%s %Y %y' -- "$1" 2>/dev/null); then
+  set -- $s
+  f=${4#*.}
+  [ "$f" = "$4" ] && f=0
+  printf '%s	%s.%s' "$1" "$2" "$f"
+else
+  printf '0	0'
+fi
 printf '
 '
 ```
@@ -633,14 +708,23 @@ if [ -L "$t" ]; then
   echo "Too many levels of symbolic links (os error 40)" >&2
   exit 1
 fi
-tmp="$t.tmp.$2"
+case "$t" in */*) tmp="${t%/*}/.tmp.$2" ;; *) tmp=".tmp.$2" ;; esac
 if [ -d "$t" ]; then
   echo "Is a directory (os error 21)" >&2
   exit 1
 fi
 set -C
-: > "$tmp" || exit 1
+if [ -e "$t" ]; then (umask 077; : > "$tmp") || exit 1; else : > "$tmp" || exit 1; fi
 set +C
+if [ -e "$t" ] && [ ! -w "$t" ]; then
+  echo "Permission denied (os error 13)" >&2
+  rm -f "$tmp"
+  exit 1
+fi
+if cat >> "$tmp"; then
+  n=$(wc -c < "$tmp")
+  if [ $n -eq "$3" ]; then
+    if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
 if [ -e "$t" ]; then
   chmod --reference="$t" "$tmp" 2>/dev/null || chmod "$(stat -L -c %a "$t")" "$tmp" || {
     echo "cannot give the new file the mode of $t" >&2
@@ -648,10 +732,6 @@ if [ -e "$t" ]; then
     exit 1
   }
 fi
-if cat >> "$tmp"; then
-  n=$(wc -c < "$tmp")
-  if [ $n -eq "$3" ]; then
-    if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
     mv -f "$tmp" "$t" && exit 0
   else
     echo "short write: $n of $3 bytes arrived on stdin" >&2
@@ -661,7 +741,7 @@ rm -f "$tmp"
 exit 1
 ```
 
-### D. WRITE_CHUNK_SCRIPT (`$1` target, `$2` suffix, `$3` chunk base64, `$4` new|append, `$5` commit or empty, `$6` size)
+### D. REMOVE_TEMP_SCRIPT (`$1` target, `$2` suffix)
 
 ```sh
 t="$1"
@@ -680,60 +760,11 @@ if [ -L "$t" ]; then
   echo "Too many levels of symbolic links (os error 40)" >&2
   exit 1
 fi
-tmp="$t.tmp.$2"
-if [ "$4" = new ]; then
-if [ -d "$t" ]; then
-  echo "Is a directory (os error 21)" >&2
-  exit 1
-fi
-set -C
-: > "$tmp" || exit 1
-set +C
-if [ -e "$t" ]; then
-  chmod --reference="$t" "$tmp" 2>/dev/null || chmod "$(stat -L -c %a "$t")" "$tmp" || {
-    echo "cannot give the new file the mode of $t" >&2
-    rm -f "$tmp"
-    exit 1
-  }
-fi
-fi
-printf %s "$3" | base64 -d >> "$tmp" || { rm -f "$tmp"; exit 1; }
-[ -z "$5" ] && exit 0
-n=$(wc -c < "$tmp")
-if [ $n -eq "$6" ]; then
-  if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
-  mv -f "$tmp" "$t" && exit 0
-else
-  echo "short write: $n of $6 bytes assembled" >&2
-fi
-rm -f "$tmp"
-exit 1
-```
-
-### E. REMOVE_TEMP_SCRIPT (`$1` target, `$2` suffix)
-
-```sh
-t="$1"
-case "$t" in -*) t="./$t" ;; esac
-n=0
-while [ -L "$t" ] && [ $n -lt 40 ]; do
-  l=$(readlink "$t") || exit 1
-  case "$l" in
-    /*) t="$l" ;;
-    *) case "$t" in */*) t="${t%/*}/$l" ;; *) t="$l" ;; esac ;;
-  esac
-  case "$t" in -*) t="./$t" ;; esac
-  n=$((n + 1))
-done
-if [ -L "$t" ]; then
-  echo "Too many levels of symbolic links (os error 40)" >&2
-  exit 1
-fi
-tmp="$t.tmp.$2"
+case "$t" in */*) tmp="${t%/*}/.tmp.$2" ;; *) tmp=".tmp.$2" ;; esac
 rm -f "$tmp"
 ```
 
-### F. GIT_SCRIPT (`$1` root)
+### E. GIT_SCRIPT (`$1` root)
 
 ```sh
 d="$1"
@@ -745,6 +776,18 @@ while [ -n "$d" ]; do
   d="$n"
 done
 exit 1
+```
+
+### F. PROBE_SCRIPT (no arguments)
+
+Prints one line per capability the sandbox has (section 4).
+
+```sh
+rg --version >/dev/null 2>&1 && echo rg
+grep -rnZ -e __cap_probe__ -- /dev/null >/dev/null 2>&1; [ $? -le 1 ] && echo grep_null
+[ "$(find /dev/null -maxdepth 0 -printf %y 2>/dev/null)" = c ] && echo find_printf
+[ "$(printf abc | dd iflag=skip_bytes,count_bytes skip=1 count=1 status=none 2>/dev/null | base64 -w0 2>/dev/null)" = Yg== ] && echo read_window
+true
 ```
 
 ## Known deviations from the reference implementation

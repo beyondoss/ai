@@ -1,4 +1,4 @@
-//! exec v1.4 under randomized orderings, against the real code. Each seed is a plan: how long the
+//! exec notify under randomized orderings, against the real code. Each seed is a plan: how long the
 //! job runs, what the path does with its proof and with its end's callback (route it, hold it,
 //! lose one attempt, or refuse it so the sender stops), and a few actions at random moments
 //! (a real use of the sandbox, a duplicate or forged callback, killing the replica that has the
@@ -163,15 +163,19 @@ impl Plan {
         // A refused proof leaves the job held, unless a duplicate (a real callback) arrives
         // inside the proof window and proves the path itself.
         let duplicated = self.acts.iter().any(|(_, a)| *a == Act::Duplicate);
-        let end_safe = self.mode == Mode::NoEgress
-            || (self.proof == Fate::Refuse && !duplicated)
-            || !matches!(self.end, Fate::Refuse);
+        // With no egress the sandbox never calls back, so only a duplicate the plan posts itself
+        // (with the job's real token, inside the proof window) can prove the path.
+        let end_safe = if self.mode == Mode::NoEgress {
+            !duplicated
+        } else {
+            (self.proof == Fate::Refuse && !duplicated) || !matches!(self.end, Fate::Refuse)
+        };
         !moved && end_safe
     }
 }
 
 fn mode_of(seed: u64) -> Mode {
-    Mode::ALL[(seed % 3) as usize]
+    Mode::ALL[(seed as usize) % Mode::ALL.len()]
 }
 
 // ---- one run
@@ -380,16 +384,6 @@ impl Run<'_> {
     /// Whether the job has ended in the sandbox: its held stream finished or its process group is
     /// gone (native), or its supervisor wrote its `end` (baseline).
     fn job_ended(&self) -> bool {
-        if self.plan.mode == Mode::Baseline {
-            let Some(id) = self.job_id() else {
-                return false;
-            };
-            return std::path::Path::new("/tmp/beyond-jobs")
-                .join(scope(&self.session))
-                .join(id)
-                .join("end")
-                .exists();
-        }
         let tag = &self.marker["fin-".len()..];
         self.f
             .svc
@@ -523,7 +517,7 @@ struct Outcome {
     /// The end needed the next open and use to be found.
     recovered: bool,
     /// The end was reported before a kill and again by the next owner: ARCHITECTURE.md's "a crash
-    /// can report a sandbox job's end twice", today's behaviour and not v1.4's.
+    /// can report a sandbox job's end twice", today's behaviour and not notify's.
     known_gap: bool,
 }
 
@@ -807,9 +801,6 @@ shards! {
     orderings_native_0: Mode::Native, 0;
     orderings_native_1: Mode::Native, 1;
     orderings_native_2: Mode::Native, 2;
-    orderings_baseline_0: Mode::Baseline, 0;
-    orderings_baseline_1: Mode::Baseline, 1;
-    orderings_baseline_2: Mode::Baseline, 2;
     orderings_no_egress_0: Mode::NoEgress, 0;
     orderings_no_egress_1: Mode::NoEgress, 1;
     orderings_no_egress_2: Mode::NoEgress, 2;

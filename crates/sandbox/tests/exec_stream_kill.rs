@@ -1,4 +1,4 @@
-//! Exec protocol v1.2: the connection is the command's lifetime. Hanging up mid-stream — by
+//! Exec protocol streaming: the connection is the command's lifetime. Hanging up mid-stream — by
 //! dropping the call, or through the [`Kill`] a tracked run hands out — must leave the endpoint
 //! killing the command's whole process group, a backgrounded grandchild included.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -22,7 +22,7 @@ fn long_command(tag: &str) -> Vec<String> {
 #[tokio::test]
 async fn dropping_the_call_mid_stream_kills_the_process_group() {
     let dir = tempfile::tempdir().unwrap();
-    let mock = ExecMock::start(dir.path(), true).await;
+    let mock = ExecMock::start(dir.path()).await;
     let runner = Arc::new(HttpExecRunner::new(&mock.url).unwrap());
     let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
     let task = {
@@ -66,7 +66,7 @@ async fn dropping_the_call_mid_stream_kills_the_process_group() {
 #[tokio::test]
 async fn a_tracked_runs_kill_closes_the_stream_and_returns_once_it_has() {
     let dir = tempfile::tempdir().unwrap();
-    let mock = ExecMock::start(dir.path(), true).await;
+    let mock = ExecMock::start(dir.path()).await;
     let runner = Arc::new(HttpExecRunner::new(&mock.url).unwrap());
     let kill: Arc<Mutex<Option<Kill>>> = Arc::default();
     let task = {
@@ -110,37 +110,4 @@ async fn a_tracked_runs_kill_closes_the_stream_and_returns_once_it_has() {
         Some(StreamEnd::Disconnected { killed: true })
     );
     assert!(wait_group_gone(s.pgid, Duration::from_secs(5)).await);
-}
-
-/// A v1.1 endpoint has nothing to kill and no live output to promise, so a tracked run reports no
-/// `Kill` — which is what tells `bash` to wait for the exit instead of yielding.
-#[tokio::test]
-async fn a_v11_tracked_run_reports_no_kill() {
-    let dir = tempfile::tempdir().unwrap();
-    let mock = ExecMock::start_with(
-        dir.path(),
-        beyond_test_support::exec_mock::MockOptions {
-            protocol: beyond_test_support::exec_mock::Protocol::V11,
-            ..Default::default()
-        },
-    )
-    .await;
-    let runner = HttpExecRunner::new(&mock.url).unwrap();
-    let reported = Arc::new(Mutex::new(false));
-    let r = reported.clone();
-    let res = runner
-        .run_streaming_tracked(
-            "sh",
-            &sh("printf hi"),
-            None,
-            &JobHooks {
-                on_chunk: &|_: &[u8]| {},
-                on_spawn: &move |_: Kill| *r.lock().unwrap() = true,
-                on_orphans: &|_: &ExecResult, _: String| {},
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.stdout, "hi");
-    assert!(!*reported.lock().unwrap());
 }

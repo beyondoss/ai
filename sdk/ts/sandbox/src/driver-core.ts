@@ -5,8 +5,7 @@
  *
  *   CONFORMANCE_URL       the exec endpoint's URL (required)
  *   CONFORMANCE_BEARER    the bearer token; absent or empty means none
- *   CONFORMANCE_JOBS_ROOT where the baseline keeps jobs; default /tmp/beyond-jobs
- *   CONFORMANCE_CAPS      JSON overriding probes: stdin, find_printf, search_engine
+ *   CONFORMANCE_CAPS      JSON overriding probes: find_printf, search_engine
  */
 import { fromBase64, toBase64 } from "./bytes.js";
 import { SandboxError } from "./errors.js";
@@ -45,7 +44,6 @@ export const OPS = [
 export interface DriverConfig {
   url: string;
   bearer?: string | undefined;
-  jobsRoot?: string | undefined;
   caps?: CapabilityOverrides | undefined;
 }
 
@@ -80,6 +78,15 @@ function optCount(req: Json, key: string): number | undefined {
   if (v === undefined || v === null) return undefined;
   if (typeof v !== "number" || !Number.isInteger(v) || v < 0) {
     throw invalid(`\`${key}\` must be a count`);
+  }
+  return v;
+}
+
+function optNumber(req: Json, key: string): number | undefined {
+  const v = req[key];
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+    throw invalid(`\`${key}\` must be a non-negative number`);
   }
   return v;
 }
@@ -142,10 +149,9 @@ export class Driver {
         token: this.cfg.bearer || undefined,
       });
       const files = new Files(transport, { overrides: this.cfg.caps });
-      const jobs = new Jobs(transport, { root: this.cfg.jobsRoot });
+      const jobs = new Jobs(transport);
       try {
         await files.capabilities();
-        await transport.offers();
       } catch (e) {
         return toError(e);
       }
@@ -190,14 +196,7 @@ export class Driver {
     switch (op) {
       case "capabilities": {
         const c = await files.capabilities();
-        const o = await transport.offers();
         return {
-          stdin: c.stdin,
-          stream: o.stream,
-          output_base64: o.outputBase64,
-          // Raw exec returns the command's bytes: over `output_base64`, else over a v1.2 stream.
-          exact_exec: o.outputBase64 || o.stream,
-          jobs: await jobs.capabilities(),
           search_engine: c.searchEngine,
           find_printf: c.findPrintf,
           read_window: c.readWindow,
@@ -221,7 +220,6 @@ export class Driver {
           exit_code: r.exitCode,
           stdout_b64: b64(r.stdout),
           stderr_b64: b64(r.stderr),
-          exact: r.exact ?? true,
         };
       }
       case "exec_stream": {
@@ -330,7 +328,7 @@ export class Driver {
         await files.writeIfUnchanged(
           path,
           data,
-          optCount(req, "expected_mtime") ?? null,
+          optNumber(req, "expected_mtime") ?? null,
         );
         return {};
       }
@@ -399,7 +397,6 @@ export function capsFromEnv(raw: string | undefined): CapabilityOverrides {
   if (!raw) return {};
   const v = JSON.parse(raw) as Json;
   const o: CapabilityOverrides = {};
-  if (typeof v.stdin === "boolean") o.stdin = v.stdin;
   if (typeof v.find_printf === "boolean") o.findPrintf = v.find_printf;
   if (
     v.search_engine === "rg"

@@ -199,7 +199,7 @@ description = "Process-level Tokio runtime A/B: current_thread vs multi_thread u
 run = "cargo bench -p beyond-agent --bench serve_runtime"
 
 [tasks."bench:execd"]
-description = "execd vs the baseline exec endpoint, A/B over HTTP on loopback (v1.1 round trip, stream throughput, first frame, RSS, kill-on-disconnect). Set EXEC_BENCH_A to a baseline `beyond-ai-demo` binary built from the commit before execd."
+description = "execd vs the baseline exec endpoint, A/B over HTTP on loopback (one-shot round trip, stream throughput, first frame, RSS, kill-on-disconnect). Set EXEC_BENCH_A to a baseline `beyond-ai-demo` binary built from the commit before execd."
 run = "cargo bench -p beyond-execd --bench exec_compare"
 
 [tasks."bench:execd:sandbox"]
@@ -297,16 +297,30 @@ env "$cc=musl-gcc" "$ln=musl-gcc" cargo build -q -p beyond-execd --target "$t"
 """
 
 [tasks."test:clients"]
-description = "The client conformance matrix: every driver in sdk/conformance/drivers.toml against every backend (local, alpine, debian-runas, readonly, tinydisk, fault). Needs docker for the container backends. BACKENDS overrides the list; extra arguments go to sandbox-matrix (e.g. --filter 'files.*', --verbose)."
+description = "The client conformance matrix: every driver in sdk/conformance/drivers.toml against every backend (local, alpine, debian-runas, readonly, tinydisk). Needs docker for the container backends. BACKENDS overrides the list; extra arguments go to sandbox-matrix (e.g. --filter 'files.*', --verbose)."
 depends = ["build:execd-static"]
 run = """
 set -e
 cargo build -q -p beyond-execd -p beyond-sandbox-conformance
 backends=""
-for b in ${BACKENDS:-local alpine debian-runas readonly tinydisk fault}; do backends="$backends --backend $b"; done
+for b in ${BACKENDS:-local alpine debian-runas readonly tinydisk}; do backends="$backends --backend $b"; done
 mkdir -p target/sandbox-matrix
 target/debug/sandbox-matrix --registry sdk/conformance/drivers.toml $backends \
   --report target/sandbox-matrix/report.json "$@"
+"""
+
+[tasks."test:differential"]
+description = "Randomized differential testing across every client: Hegel generates operation sequences, each runs through every driver in sdk/conformance/drivers.toml on its own fresh root, and the answers are compared with each other and (local backends) with the filesystem. Fixed seeds and case counts; widen with DIFFERENTIAL_CASES, DIFFERENTIAL_SEED, DIFFERENTIAL_STEPS, DIFFERENTIAL_BACKENDS, DIFFERENTIAL_DRIVERS, DIFFERENTIAL_SHRINK=0. The container backends run when docker is available."
+depends = ["build:execd-static"]
+run = """
+set -e
+cargo build -q -p beyond-execd -p beyond-sandbox-conformance -p beyond-sandbox-mcp
+if [ ! -f sdk/ts/sandbox/dist/driver.mjs ]; then
+  npm ci --prefix sdk/ts --silent && npm run build --prefix sdk/ts --silent
+fi
+export EXECD_BIN="$PWD/target/debug/execd"
+export EXECD_STATIC_BIN="$PWD/target/$(uname -m)-unknown-linux-musl/debug/execd"
+cargo test -q -p beyond-sandbox-conformance --test differential -- --include-ignored --nocapture "$@"
 """
 
 # ---- python client: beyond-sandbox (sdk/python/sandbox) ---------------------------------------------
@@ -341,7 +355,7 @@ description = "beyond-sandbox: the pytest suite. The loopback tests need execd (
 depends = ["install:py"]
 run = """
 set -e
-cargo build -q -p beyond-execd
+cargo build -q -p beyond-execd -p beyond-sandbox-conformance -p beyond-sandbox-mcp
 cd sdk/python/sandbox
 .venv/bin/pytest
 """

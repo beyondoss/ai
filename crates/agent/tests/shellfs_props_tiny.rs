@@ -8,7 +8,7 @@ use crate::shellfs_props::run_machine;
 use crate::shellfs_props_env::{self as env, Config, PLAIN};
 use hegel::TestCase;
 
-fn tiny(tc: TestCase, stdin: bool) {
+fn tiny(tc: TestCase) {
     if let Some(why) = env::tiny_unavailable() {
         eprintln!("skipping: no tiny filesystem here ({why})");
         return;
@@ -17,18 +17,12 @@ fn tiny(tc: TestCase, stdin: bool) {
         tc,
         Config {
             tiny_kib: Some(96),
-            stdin,
             ..PLAIN
         },
     );
 }
 
 #[hegel::test(env::settings(50, 0x5e11_f531))]
-fn a_filesystem_that_fills_up_stdin_writes(tc: TestCase) {
-    tiny(tc, true);
-}
-
-#[hegel::test(env::settings(50, 0x5e11_f532))]
-fn a_filesystem_that_fills_up_chunked_writes(tc: TestCase) {
-    tiny(tc, false);
+fn a_filesystem_that_fills_up(tc: TestCase) {
+    tiny(tc);
 }

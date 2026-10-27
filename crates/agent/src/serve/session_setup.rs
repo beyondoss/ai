@@ -353,7 +353,7 @@ async fn setup_exec(
         }
     }
     stop_survivors(&bash_jobs, persistence).await;
-    // exec v1.4: a sandbox's `job_ended` callback reaches this session only while this task holds
+    // exec notify: a sandbox's `job_ended` callback reaches this session only while this task holds
     // it, registered here for the task's life (dropped, it is unregistered). The job table answers
     // it. Service mode only: `job_notify` is never set anywhere else.
     let job_notify =

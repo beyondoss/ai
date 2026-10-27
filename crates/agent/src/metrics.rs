@@ -122,7 +122,7 @@ impl Refusal {
     }
 }
 
-/// How a `job_ended` callback (exec v1.4) was answered — the closed label set of
+/// How a `job_ended` callback (exec notify) was answered — the closed label set of
 /// `agent_job_callbacks_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobCallback {
@@ -166,7 +166,7 @@ impl JobCallback {
     }
 }
 
-/// Why a kept job stayed held by its stream rather than being let go of (exec v1.4's fallback) —
+/// Why a kept job stayed held by its stream rather than being let go of (exec notify's fallback) —
 /// the closed label set of `agent_job_notify_held_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobHeld {
@@ -260,7 +260,7 @@ pub struct Metrics {
 
     refusals: IntCounterVec,
 
-    /// exec v1.4 `job_ended` callbacks, by how they were answered.
+    /// exec notify `job_ended` callbacks, by how they were answered.
     job_callbacks: IntCounterVec,
     /// Kept jobs left held by their stream instead of let go of, by why.
     job_held: IntCounterVec,
@@ -338,7 +338,7 @@ impl Metrics {
         let job_callbacks = IntCounterVec::new(
             Opts::new(
                 "agent_job_callbacks_total",
-                "Sandbox job_ended callbacks (exec v1.4), by how they were answered.",
+                "Sandbox job_ended callbacks (exec notify), by how they were answered.",
             ),
             &["outcome"],
         )?;

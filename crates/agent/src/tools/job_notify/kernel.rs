@@ -1,4 +1,4 @@
-//! The decision logic of exec v1.4's job notify, as one pure state machine: what a session does
+//! The decision logic of exec notify's job notify, as one pure state machine: what a session does
 //! with each event about its kept jobs, its callbacks and its reconciles.
 //!
 //! [`Kernel::step`] takes an [`Event`] and returns the [`Action`]s to perform. It does no I/O, is
@@ -7,7 +7,7 @@
 //! Production ([`super::SessionNotify`], `tools::bash_sandbox`, the `serve` receiver) only feeds it
 //! events and performs its actions.
 //!
-//! What it owns is v1.4's own state, per sandbox job id ([`JobState`]): a job **proving** its path
+//! What it owns is notify's own state, per sandbox job id ([`JobState`]): a job **proving** its path
 //! (its proof window open), one whose stream is **closing** after its proof, and one **unheld** (no
 //! stream: only a callback, a use or a `bash_job` call brings news of it), or unheld and **taken**
 //! by a `bash_job` call. A job in none of these is as today, and what today's job table says of it
@@ -72,7 +72,7 @@ pub enum KeepOutcome {
     Failed,
 }
 
-/// v1.4's own state of one kept job. A job not in the kernel is held, or ended, as today.
+/// notify's own state of one kept job. A job not in the kernel is held, or ended, as today.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum JobState {
     /// Its proof window is open. `window_until` is `None` until `keep` is answered (the window
@@ -291,7 +291,7 @@ struct Running {
     waiters: Vec<CallId>,
 }
 
-/// One session's v1.4 state.
+/// One session's notify state.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Kernel {
     jobs: BTreeMap<String, JobState>,
@@ -317,12 +317,12 @@ impl Kernel {
         Self::default()
     }
 
-    /// v1.4's state of `job`, if it has one.
+    /// notify's state of `job`, if it has one.
     pub fn job(&self, job: &str) -> Option<&JobState> {
         self.jobs.get(job)
     }
 
-    /// Every job v1.4 has a state for.
+    /// Every job notify has a state for.
     pub fn jobs(&self) -> impl Iterator<Item = (&String, &JobState)> {
         self.jobs.iter()
     }

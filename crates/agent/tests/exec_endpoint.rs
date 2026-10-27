@@ -1,8 +1,7 @@
 //! The remote exec endpoint, end to end, against a mock server that stands in for **any** provider.
 //!
 //! The agent is handed a URL and POSTs commands to it. Nothing here — and nothing in the code under
-//! test — knows or cares what is behind that URL. The mock is deliberately ~30 lines: if standing up
-//! a fake provider took more than that, the protocol would be too big.
+//! test — knows or cares what is behind that URL.
 //!
 //! The assertion that matters most is [`bash_runs_on_the_endpoint_not_the_host`]: a toolset whose
 //! `edit` lands remotely while its `bash` runs locally is not partially sandboxed, it is broken —
@@ -11,8 +10,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::common::exec_mock::ExecMock;
 use beyond_agent::exec_endpoint::{HttpExecRunner, TemplateRunner};
 use beyond_agent::tools::exec::CommandRunner;
 use beyond_agent::tools::fs::FsBackend;
@@ -21,91 +20,10 @@ use beyond_agent::tools::{ToolConfig, default_registry_with_config};
 use serde_json::{Value, json};
 
 /// A stand-in exec provider: accepts the protocol, runs the command in `root`, answers the protocol.
-/// This is exactly the shim someone writes in front of Daytona, E2B, a container, or a CI runner.
-async fn mock_provider(
-    root: std::path::PathBuf,
-    seen: Arc<AtomicUsize>,
-) -> (String, Arc<AtomicUsize>) {
-    let listener = beyond_test_support::ports::tokio_listener().await;
-    let addr = listener.local_addr().unwrap();
-    let hits = seen.clone();
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut sock, _)) = listener.accept().await else {
-                return;
-            };
-            let root = root.clone();
-            let hits = hits.clone();
-            tokio::spawn(async move {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = Vec::new();
-                let mut chunk = [0u8; 8192];
-                // Read until the body is complete (headers, blank line, then Content-Length bytes).
-                let (mut need, mut head_end) = (0usize, None);
-                loop {
-                    let Ok(n) = sock.read(&mut chunk).await else {
-                        return;
-                    };
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                    if head_end.is_none()
-                        && let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n")
-                    {
-                        head_end = Some(p + 4);
-                        let head = String::from_utf8_lossy(&buf[..p]).to_lowercase();
-                        need = head
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length:"))
-                            .and_then(|v| v.trim().parse().ok())
-                            .unwrap_or(0);
-                    }
-                    if let Some(h) = head_end
-                        && buf.len() >= h + need
-                    {
-                        break;
-                    }
-                }
-                let body = &buf[head_end.unwrap_or(buf.len()).min(buf.len())..];
-                let req: Value = serde_json::from_slice(body).unwrap_or(json!({}));
-                hits.fetch_add(1, Ordering::Relaxed);
-
-                let program = req["command"].as_str().unwrap_or("true").to_string();
-                let args: Vec<String> = req["args"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let cwd = req["cwd"].as_str().map(str::to_string);
-
-                let out = tokio::process::Command::new(&program)
-                    .args(&args)
-                    .current_dir(cwd.unwrap_or_else(|| root.to_string_lossy().into_owned()))
-                    .output()
-                    .await;
-                let payload = match out {
-                    Ok(o) => json!({
-                        "exit_code": o.status.code().unwrap_or(-1),
-                        "stdout": String::from_utf8_lossy(&o.stdout),
-                        "stderr": String::from_utf8_lossy(&o.stderr),
-                    }),
-                    Err(e) => json!({ "exit_code": 127, "stdout": "", "stderr": e.to_string() }),
-                };
-                let body = payload.to_string();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
-                let _ = sock.shutdown().await;
-            });
-        }
-    });
-    (format!("http://{addr}/exec"), seen)
+/// This is the endpoint someone puts in front of Daytona, E2B, a container, or a CI runner.
+async fn mock_provider(root: &std::path::Path) -> (String, ExecMock) {
+    let mock = ExecMock::start(root).await;
+    (mock.url.clone(), mock)
 }
 
 async fn registry_over(runner: Arc<dyn CommandRunner>) -> agent_core::ToolRegistry {
@@ -130,7 +48,7 @@ async fn call(reg: &agent_core::ToolRegistry, tool: &str, input: Value) -> Strin
 async fn the_filesystem_tools_run_on_the_endpoint() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.rs"), "fn one() { NEEDLE }\n").unwrap();
-    let (url, hits) = mock_provider(dir.path().to_path_buf(), Arc::new(AtomicUsize::new(0))).await;
+    let (url, hits) = mock_provider(dir.path()).await;
 
     let reg = registry_over(Arc::new(HttpExecRunner::new(&url).unwrap())).await;
     let out = call(
@@ -140,10 +58,7 @@ async fn the_filesystem_tools_run_on_the_endpoint() {
     )
     .await;
     assert!(out.contains("a.rs"), "{out}");
-    assert!(
-        hits.load(Ordering::Relaxed) > 0,
-        "the endpoint was never called"
-    );
+    assert!(!hits.requests().is_empty(), "the endpoint was never called");
 }
 
 #[tokio::test]
@@ -154,10 +69,10 @@ async fn bash_runs_on_the_endpoint_not_the_host() {
     let dir = tempfile::tempdir().unwrap();
     let marker = "ENDPOINT-SIDE-ONLY-4c1f";
     std::fs::write(dir.path().join("marker.txt"), format!("{marker}\n")).unwrap();
-    let (url, hits) = mock_provider(dir.path().to_path_buf(), Arc::new(AtomicUsize::new(0))).await;
+    let (url, hits) = mock_provider(dir.path()).await;
 
     let reg = registry_over(Arc::new(HttpExecRunner::new(&url).unwrap())).await;
-    let before = hits.load(Ordering::Relaxed);
+    let before = hits.requests().len();
     let out = call(&reg, "bash", json!({ "command": "cat marker.txt" })).await;
 
     assert!(
@@ -165,7 +80,7 @@ async fn bash_runs_on_the_endpoint_not_the_host() {
         "`bash` did not run on the endpoint: {out}"
     );
     assert!(
-        hits.load(Ordering::Relaxed) > before,
+        hits.requests().len() > before,
         "`bash` never reached the endpoint — it ran locally"
     );
 }
@@ -176,7 +91,7 @@ async fn bash_over_the_endpoint_keeps_stderr_alongside_stdout() {
     // message, a `set -x` trace: all stderr, and all invisible to the model if only stdout survives —
     // which it used to, whenever the command also printed to stdout.
     let dir = tempfile::tempdir().unwrap();
-    let (url, _) = mock_provider(dir.path().to_path_buf(), Arc::new(AtomicUsize::new(0))).await;
+    let (url, _) = mock_provider(dir.path()).await;
     let reg = registry_over(Arc::new(HttpExecRunner::new(&url).unwrap())).await;
 
     let out = call(
@@ -193,7 +108,7 @@ async fn bash_over_the_endpoint_keeps_stderr_alongside_stdout() {
 async fn write_then_bash_see_the_same_filesystem() {
     // The coherence property: one machine, one filesystem. This is what a split toolset breaks.
     let dir = tempfile::tempdir().unwrap();
-    let (url, _) = mock_provider(dir.path().to_path_buf(), Arc::new(AtomicUsize::new(0))).await;
+    let (url, _) = mock_provider(dir.path()).await;
     let reg = registry_over(Arc::new(HttpExecRunner::new(&url).unwrap())).await;
 
     let path = dir.path().join("written-by-the-tool.txt");
@@ -217,13 +132,15 @@ async fn write_then_bash_see_the_same_filesystem() {
 
 #[tokio::test]
 async fn an_unreachable_endpoint_fails_loudly_rather_than_looking_empty() {
-    // Nothing listening. Connecting must report it (naming the endpoint), not build a backend that
+    // Nothing listening. The first probe must report it (naming the endpoint), not build a backend that
     // believes the box has no tools and returns plausible empty results later.
     let runner = Arc::new(HttpExecRunner::new("http://127.0.0.1:1/exec").unwrap());
     let err = ShellFs::connect(runner)
         .await
-        .err()
-        .expect("an unreachable endpoint must fail connect");
+        .unwrap()
+        .capabilities()
+        .await
+        .expect_err("an unreachable endpoint must fail the first probe");
     let msg = err.to_string();
     assert!(
         msg.contains("127.0.0.1:1"),
@@ -288,7 +205,7 @@ async fn a_command_template_reaches_a_target_with_no_http_surface() {
 #[tokio::test]
 async fn the_model_sees_the_same_toolset_over_an_endpoint_as_it_does_locally() {
     let dir = tempfile::tempdir().unwrap();
-    let (url, _) = mock_provider(dir.path().to_path_buf(), Arc::new(AtomicUsize::new(0))).await;
+    let (url, _) = mock_provider(dir.path()).await;
     let remote = registry_over(Arc::new(HttpExecRunner::new(&url).unwrap()))
         .await
         .definitions();

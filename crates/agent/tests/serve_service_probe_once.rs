@@ -1,9 +1,7 @@
 //! A service session probes its sandbox once, however often its tools are used or rebuilt.
 //!
-//! Every exec request the endpoint saw is counted, so "probed again" is a number. The endpoint here
-//! is a strict front: it refuses the protocol's optional extensions (`stream`, `job`) with a 400
-//! instead of ignoring them. A refusal of an extension is an answer, not a sign the sandbox was
-//! replaced; treating it as one made every call after it rebuild the target, probes and all.
+//! Every exec request the endpoint saw is counted, so "probed again" is a number: the home, the shell
+//! and the one command that checks the sandbox's tools are each sent once.
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -11,7 +9,6 @@ use crate::common;
 
 use std::collections::BTreeMap;
 
-use common::exec_mock::MockOptions;
 use common::service::{Options, Service};
 use common::{
     spawn_model_server, turn_text, turn_tool_use, ws_connect_with_headers, ws_read_until_response,
@@ -24,7 +21,7 @@ fn key(r: &common::exec_mock::ExecRequest) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_front_that_refuses_extensions_is_probed_once_not_per_call() {
+async fn a_service_session_is_probed_once_not_per_call() {
     let (base, _requests) = spawn_model_server(vec![
         turn_tool_use("t1", "bash", r#"{"command":"echo one"}"#),
         turn_text("a"),
@@ -33,18 +30,7 @@ async fn a_front_that_refuses_extensions_is_probed_once_not_per_call() {
         turn_tool_use("t3", "bash", r#"{"command":"echo three"}"#),
         turn_text("c"),
     ]);
-    let svc = Service::start_with(
-        &base,
-        &["s1"],
-        Options {
-            exec: Some(MockOptions {
-                refuses_extensions: true,
-                ..MockOptions::default()
-            }),
-            ..Options::default()
-        },
-    )
-    .await;
+    let svc = Service::start_with(&base, &["s1"], Options::default()).await;
     let token = svc.token("t1", "s1.alpha");
     let mut ws = ws_connect_with_headers(svc.port, Some("s1.alpha"), &svc.header(&token))
         .await
@@ -73,14 +59,7 @@ async fn a_front_that_refuses_extensions_is_probed_once_not_per_call() {
             *counts.entry(k).or_default() += 1;
         }
     }
-    for probe in [
-        r#"-c printf %s "$HOME""#,
-        "-c command -v bash",
-        "rg --version",
-        "cat",
-        "true",
-        "sh -c printf exec-v1.2",
-    ] {
+    for probe in [r#"-c printf %s "$HOME""#, "-c command -v bash"] {
         let n = counts.get(probe).copied().unwrap_or(0);
         assert!(n <= 1, "`{probe}` was sent {n} times: {counts:#?}");
     }
@@ -90,4 +69,11 @@ async fn a_front_that_refuses_extensions_is_probed_once_not_per_call() {
         .map(|(_, n)| n)
         .sum::<usize>();
     assert_eq!(homes, 1, "{counts:#?}");
+    let tool_checks = svc
+        .exec
+        .requests()
+        .iter()
+        .filter(|r| key(r).contains("__cap_probe__"))
+        .count();
+    assert_eq!(tool_checks, 1, "{counts:#?}");
 }

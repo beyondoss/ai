@@ -49,9 +49,6 @@ describe("driver without an endpoint", () => {
     const r = await ask(driver(), { id: 1, op: "capabilities" });
     expect(r).toMatchObject({
       ok: {
-        stdin: true,
-        stream: true,
-        jobs: "native",
         find_printf: true,
         read_window: true,
       },
@@ -59,11 +56,20 @@ describe("driver without an endpoint", () => {
     const forced = new Driver({
       url: execd!.url,
       bearer: execd!.token,
-      caps: { stdin: false, findPrintf: false, searchEngine: "busybox-grep" },
+      caps: { findPrintf: false, searchEngine: "busybox-grep" },
     });
     expect(await ask(forced, { id: 1, op: "capabilities" })).toMatchObject({
-      ok: { stdin: false, find_printf: false, search_engine: "busybox-grep" },
+      ok: { find_printf: false, search_engine: "busybox-grep" },
     });
+  });
+
+  it("reports bytes without an exactness flag and no probe-derived protocol capabilities", async () => {
+    const r = await ask(driver(), { id: 1, op: "capabilities" });
+    expect(Object.keys((r as { ok: object }).ok).sort()).toEqual([
+      "find_printf",
+      "read_window",
+      "search_engine",
+    ]);
   });
 
   it("maps a wrong bearer to auth for every op", async () => {
@@ -160,7 +166,6 @@ describe("driver without an endpoint", () => {
         exit_code: 2,
         stdout_b64: b64("x"),
         stderr_b64: "",
-        exact: true,
       },
     });
     const es = await ask(d, {

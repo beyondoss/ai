@@ -186,15 +186,15 @@ jobs:
           # run (196 tests, 228s), and as these two halves. Cause not found; the halves are the
           # measured-good grouping.
           - name: agent-exec
-            filter: package(beyond-agent) and binary(=it) and (test(/^[^:]*conformance[^:]*::/) or test(/^[^:]*exec_[^:]*::/)) and not test(/^[^:]*serve[^:]*::/) and not test(/^exec_endpoint_live::/) and not test(/^sandbox_jobs_notify::/) and not test(/^[^:]*notify_e2e[^:]*::/)
+            filter: package(beyond-agent) and binary(=it) and (test(/^[^:]*conformance[^:]*::/) or test(/^[^:]*exec_[^:]*::/)) and not test(/^[^:]*serve[^:]*::/) and not test(/^exec_endpoint_live::/) and not test(/^[^:]*notify_e2e[^:]*::/)
             extra: ""
           - name: agent-jobs
-            filter: package(beyond-agent) and binary(=it) and (test(/^[^:]*jobs[^:]*::/) or test(/^[^:]*notify[^:]*::/)) and not (test(/^[^:]*conformance[^:]*::/) or test(/^[^:]*exec_[^:]*::/)) and not test(/^[^:]*serve[^:]*::/) and not test(/^exec_endpoint_live::/) and not test(/^sandbox_jobs_notify::/) and not test(/^[^:]*notify_e2e[^:]*::/)
+            filter: package(beyond-agent) and binary(=it) and (test(/^[^:]*jobs[^:]*::/) or test(/^[^:]*notify[^:]*::/)) and not (test(/^[^:]*conformance[^:]*::/) or test(/^[^:]*exec_[^:]*::/)) and not test(/^[^:]*serve[^:]*::/) and not test(/^exec_endpoint_live::/) and not test(/^[^:]*notify_e2e[^:]*::/)
             extra: ""
           - name: agent-rest
-            filter: package(beyond-agent) and binary(=it) and not (test(/^[^:]*conformance[^:]*::/) or test(/^[^:]*exec_[^:]*::/) or test(/^[^:]*jobs[^:]*::/) or test(/^[^:]*notify[^:]*::/)) and not test(/^[^:]*serve[^:]*::/) and not test(/^exec_endpoint_live::/) and not test(/^sandbox_jobs_notify::/) and not test(/^[^:]*notify_e2e[^:]*::/)
+            filter: package(beyond-agent) and binary(=it) and not (test(/^[^:]*conformance[^:]*::/) or test(/^[^:]*exec_[^:]*::/) or test(/^[^:]*jobs[^:]*::/) or test(/^[^:]*notify[^:]*::/)) and not test(/^[^:]*serve[^:]*::/) and not test(/^exec_endpoint_live::/) and not test(/^[^:]*notify_e2e[^:]*::/)
             extra: ""
-          # exec v1.4's end-to-end matrix and randomized orderings: real replicas behind a ring,
+          # exec notify's end-to-end matrix and randomized orderings: real replicas behind a ring,
           # each case in three endpoint modes. Minutes of wall clock between them, so their own
           # shard rather than a slice of agent-rest's 10-minute budget.
           - name: agent-notify-e2e
@@ -220,7 +220,7 @@ jobs:
           # — and it is what a large share of real sandboxes actually are. Running against a
           # GNU-flavoured image would quietly skip the code path most likely to be wrong.
           - name: exec-live
-            filter: package(beyond-agent) and binary(=it) and (test(/^exec_endpoint_live::/) or test(/^sandbox_jobs_notify::/))
+            filter: package(beyond-agent) and binary(=it) and test(/^exec_endpoint_live::/)
             extra: ""
     steps:
       - uses: actions/checkout@v7
@@ -257,13 +257,6 @@ jobs:
         if: matrix.name == 'exec-live'
         run: |
           docker run -d --name agent-exec-target --rm alpine:latest sleep 900
-          # A second target for the baseline's job notify (v1.4): on the host network, so its
-          # callbacks reach the test's receiver on 127.0.0.1 (the only host plain `http` may name),
-          # with `curl` added (busybox has none). Never the first target: a container on the host
-          # network reports the host's name, which is exactly what the first one's tests must not
-          # see.
-          docker run -d --name agent-notify-target --rm --network host alpine:latest sleep 900
-          docker exec agent-notify-target apk add --no-cache curl >/dev/null
           docker exec agent-exec-target sh -c '
             mkdir -p /work
             printf "fn one() { NEEDLE }\n" > /work/a.rs
@@ -271,9 +264,8 @@ jobs:
           '
           # The asymmetry the assertions rely on: /work must NOT exist on the runner.
           test ! -e /work
-          echo "AGENT_LIVE_EXEC_CMD=docker exec agent-exec-target {}" >> "$GITHUB_ENV"
-          # The baseline's notify needs standard input to reach the target (`sandbox_jobs_notify`).
-          echo "AGENT_LIVE_EXEC_STDIN_CMD=docker exec -i agent-notify-target {}" >> "$GITHUB_ENV"
+          # `-i`: a write sends its content on stdin, so the transport must forward it.
+          echo "AGENT_LIVE_EXEC_CMD=docker exec -i agent-exec-target {}" >> "$GITHUB_ENV"
           echo "AGENT_LIVE_WORKDIR=/work" >> "$GITHUB_ENV"
       # A resource trend that outlives a wedge: memory, swap, PSI, load, pid count, disk and the
       # biggest processes every 5s, appended to a file by a transient *system* unit. It is outside the
@@ -559,14 +551,14 @@ jobs:
         run: ps -eo pid,etime,rss,args | grep -E "execd|agent|gateway" | grep -v grep || echo "  none"
   # The sandbox clients' conformance matrix: every registered driver (sdk/conformance/drivers.toml)
   # against execd on this runner, in Alpine (real busybox), in Debian under EXECD_RUN_AS, on a
-  # read-only mount, on a disk that fills, and against the fault-injecting endpoint. Only when the
+  # read-only mount, and on a disk that fills. Only when the
   # change touches the clients, the harness, the file helpers or execd (the `changes` job).
   clients:
     name: sandbox clients (matrix)
     needs: changes
     if: needs.changes.outputs.clients == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
@@ -578,6 +570,17 @@ jobs:
       - name: matrix
         run: mise run test:clients
         timeout-minutes: 20
+      # Randomized differential testing of the same drivers (fixed seeds and case counts).
+      - name: differential
+        run: mise run test:differential
+        timeout-minutes: 15
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: differential-found
+          path: target/differential
+          if-no-files-found: ignore
+          retention-days: 7
       - uses: actions/upload-artifact@v4
         if: always()
         with:

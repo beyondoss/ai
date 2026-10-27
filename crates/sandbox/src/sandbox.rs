@@ -13,8 +13,8 @@ use crate::token::TokenSource;
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Jobs over any [`Exec`](crate::Exec): commands that outlive the call that started them, are listed,
-/// read, followed and killed by id. An HTTP endpoint that offers them natively (v1.3) gets its own
-/// jobs; anything else gets the baseline built from plain exec calls. Derefs to [`SandboxJobs`],
+/// read, followed and killed by id. An HTTP endpoint runs them itself; any other exec (a template,
+/// this host) gets the baseline built from plain exec calls. Derefs to [`SandboxJobs`],
 /// whose methods are the operations.
 #[derive(Clone)]
 pub struct Jobs(Arc<dyn SandboxJobs>);
@@ -47,8 +47,8 @@ pub struct Sandbox {
 }
 
 impl Sandbox {
-    /// Connect to the exec endpoint at `url`, authenticating with `token`. Probes the sandbox once
-    /// for the tools the file helpers can use; fails if the endpoint cannot be reached.
+    /// Connect to the exec endpoint at `url`, authenticating with `token`. Sends nothing: the file helpers
+    /// look at the sandbox's tools once, in one command, when the first one needs to know.
     pub async fn connect(
         url: impl Into<String>,
         token: impl Into<TokenSource>,
@@ -129,35 +129,40 @@ impl Command<'_> {
         self
     }
 
-    /// Run to completion and return the captured output as **bytes**, with
-    /// [`exact`](ExecOutput::exact) saying whether they are all the command wrote: they are over an
-    /// endpoint that honours `output_base64` or streams, and not over a plain v1.1 endpoint, which
-    /// can only answer text.
+    /// Run to completion and return the exit code and the output as **bytes**: what the command wrote,
+    /// unaltered.
     pub async fn run(self) -> std::io::Result<ExecOutput> {
-        self.exec
-            .run_exact(
-                &self.program,
-                &self.args,
-                self.cwd.as_deref(),
-                self.timeout,
-                self.stdin.as_deref(),
-            )
-            .await
+        Ok(self.run_result().await?.into())
+    }
+
+    async fn run_result(self) -> std::io::Result<ExecResult> {
+        match self.stdin.as_deref() {
+            Some(stdin) => {
+                self.exec
+                    .run_with_stdin(
+                        &self.program,
+                        &self.args,
+                        self.cwd.as_deref(),
+                        self.timeout,
+                        stdin,
+                    )
+                    .await
+            }
+            None => {
+                self.exec
+                    .run(&self.program, &self.args, self.cwd.as_deref(), self.timeout)
+                    .await
+            }
+        }
     }
 
     /// Run to completion, handing `on_chunk` each chunk of output as it arrives. Over an exec that
-    /// streams (HTTP v1.2, the template transports) that is live; over one that does not, `on_chunk`
+    /// streams (HTTP streaming, the template transports) that is live; over one that does not, `on_chunk`
     /// is never called and the output is in the result. A command given [`stdin`](Self::stdin) is
     /// not streamed.
     pub async fn stream(self, on_chunk: ChunkSink<'_>) -> std::io::Result<ExecResult> {
         if self.stdin.is_some() {
-            let out = self.run().await?;
-            return Ok(ExecResult {
-                code: Some(out.code),
-                stdout: out.stdout_text().into_owned(),
-                stderr: out.stderr_text().into_owned(),
-                ..Default::default()
-            });
+            return self.run_result().await;
         }
         self.exec
             .run_streaming(

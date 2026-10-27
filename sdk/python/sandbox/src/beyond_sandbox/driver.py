@@ -23,7 +23,6 @@ from typing import Any, Callable, cast
 from . import AsyncSandbox, Exit, Sandbox, SandboxError, Signal, Stderr, Stdout, TimedOut
 from .errors import InvalidRequest
 from .files import CapsOverride
-from .jobs import JOBS_ROOT
 from .models import Stat
 
 Result = dict[str, Any]
@@ -65,6 +64,21 @@ def _count(req: dict[str, Any], key: str) -> int | None:
         return None
     if isinstance(v, bool) or not isinstance(v, int) or v < 0:
         raise InvalidRequest(f"`{key}` must be a count")
+    return v
+
+
+def _number(req: dict[str, Any], key: str) -> float | None:
+    v = req.get(key)
+    if v is None:
+        return None
+    if (
+        isinstance(v, bool)
+        or not isinstance(v, (int, float))
+        or v < 0
+        or v != v
+        or v == float("inf")
+    ):
+        raise InvalidRequest(f"`{key}` must be a non-negative number")
     return v
 
 
@@ -142,7 +156,6 @@ def plan(op: str, req: dict[str, Any]) -> Plan:
                 "exit_code": r.exit_code,
                 "stdout_b64": _b64(r.stdout),
                 "stderr_b64": _b64(r.stderr),
-                "exact": r.exact,
             },
         )
     if op == "exec_stream":
@@ -177,7 +190,7 @@ def plan(op: str, req: dict[str, Any]) -> Plan:
             raise InvalidRequest(
                 "`expected_mtime` is required (null means the file must not exist)"
             )
-        expected = _count(req, "expected_mtime")
+        expected = _number(req, "expected_mtime")
         return (lambda sb: sb.files.write_if_unchanged(path, data, expected), lambda _: {})
     if op == "mkdir":
         path = _str(req, "path")
@@ -315,7 +328,7 @@ def _override() -> CapsOverride | None:
         return None
     caps = json.loads(raw)
     out: dict[str, Any] = {}
-    for key in ("stdin", "find_printf", "search_engine"):
+    for key in ("find_printf", "search_engine"):
         if key in caps and caps[key] is not None:
             out[key] = caps[key]
     return cast(CapsOverride, out)
@@ -334,12 +347,11 @@ class Driver:
         self.name = "python-async" if use_async else "python"
         url = os.environ.get("CONFORMANCE_URL", "")
         token = os.environ.get("CONFORMANCE_BEARER") or None
-        root = os.environ.get("CONFORMANCE_JOBS_ROOT") or JOBS_ROOT
         override = _override()
         if use_async:
-            self.sb: Any = AsyncSandbox.connect(url, token, jobs_root=root, override=override)
+            self.sb: Any = AsyncSandbox.connect(url, token, override=override)
         else:
-            self.sb = Sandbox.connect(url, token, jobs_root=root, override=override)
+            self.sb = Sandbox.connect(url, token, override=override)
 
     def parse(self, line: str) -> tuple[Any, str, dict[str, Any]]:
         try:
@@ -359,12 +371,10 @@ class Driver:
     @staticmethod
     def caps_result(c: Any) -> Result:
         return {
-            "stdin": c.stdin, "stream": c.stream, "jobs": c.jobs, "search_engine": c.search_engine,
-            "find_printf": c.find_printf, "read_window": c.read_window,
-            "output_base64": c.output_base64,
-            # Raw exec returns the command's bytes: over `output_base64`, else over a v1.2 stream.
-            "exact_exec": c.output_base64 or c.stream,
-        }  # fmt: skip
+            "search_engine": c.search_engine,
+            "find_printf": c.find_printf,
+            "read_window": c.read_window,
+        }
 
     def handle(self, line: str) -> Result:
         id_: Any = None

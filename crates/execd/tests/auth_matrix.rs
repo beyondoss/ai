@@ -139,7 +139,7 @@ enum Proto {
     H2,
 }
 
-/// Whether the command of a case ran, which settles by the time its answer is in (a v1.1 answer
+/// Whether the command of a case ran, which settles by the time its answer is in (a one-shot answer
 /// follows the command's exit); a short wait covers a connection closed first.
 async fn ran(marker: &Path) -> bool {
     ran_within(marker, 100).await

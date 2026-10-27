@@ -28,7 +28,7 @@ pub struct Launch<'a> {
     pub max_live_sessions: Option<usize>,
     /// `--metrics-listen`, when the scenario reads the scrape.
     pub with_metrics: bool,
-    /// `--notify-origin`: where sandboxes send exec v1.4 job-end callbacks — the fleet's
+    /// `--notify-origin`: where sandboxes send exec notify job-end callbacks — the fleet's
     /// callback front ([`crate::front::Front`]).
     pub notify_origin: Option<&'a str>,
     /// `--session-idle-timeout`, when the scenario needs a detached session reaped sooner than the

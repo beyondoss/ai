@@ -1,11 +1,11 @@
-//! exec v1.4 job-end callbacks across a fleet (FLEET.md, "Job-end callbacks", E1–E7).
+//! exec notify job-end callbacks across a fleet (FLEET.md, "Job-end callbacks", E1–E7).
 //!
 //! Two kinds of scenario. The edge's own rules (E1, E2, E4, E5, E6) are graded against stand-in
 //! replicas that record every byte the front forwards and answer whatever the scenario asks, because
 //! a real replica cannot show that a request was forwarded unchanged, or answer `411` on demand.
 //! Everything about where a callback ends up (E3, E7, and the takeover, ring-change and
 //! closed-session scenarios) runs real `serve --service` replicas started with the front's origin
-//! as `--notify-origin`, over both kinds of v1.4 sandbox: one that keeps jobs natively and calls
+//! as `--notify-origin`, over both kinds of notify sandbox: one that keeps jobs natively and calls
 //! back itself, and the baseline, whose `setsid` supervisor calls back with `curl`.
 //!
 //! The job in every real-replica scenario waits on a flag file the scenario creates, so it ends
@@ -179,12 +179,8 @@ fn routes(flags: &Flags) -> Vec<(String, String)> {
     out
 }
 
-/// The two v1.4 sandboxes: one that keeps jobs natively and calls back itself, and one without
-/// native jobs whose notify is the baseline's (`curl` from the job's supervisor).
-const SANDBOXES: [(&str, bool); 2] = [
-    ("native (v1.3 + notify)", true),
-    ("baseline (v1.2 + notify)", false),
-];
+/// The sandbox: it keeps jobs natively and calls back itself.
+const SANDBOXES: [&str; 1] = ["execd"];
 
 type Sandboxes = Vec<(&'static str, ExecMock, tempfile::TempDir)>;
 
@@ -223,16 +219,9 @@ pub(super) async fn notify_fleet(
     )
     .await?;
     let mut sandboxes = Vec::new();
-    for (name, jobs) in SANDBOXES {
+    for name in SANDBOXES {
         let dir = tempfile::tempdir().map_err(|e| format!("sandbox: {e}"))?;
-        let mock = ExecMock::start_with(
-            dir.path(),
-            MockOptions {
-                jobs,
-                ..MockOptions::notifying()
-            },
-        )
-        .await;
+        let mock = ExecMock::start_with(dir.path(), MockOptions::default()).await;
         sandboxes.push((name, mock, dir));
     }
     Ok((fleet, sandboxes, flags))

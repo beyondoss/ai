@@ -5,7 +5,7 @@
 
 Prints JSON: (1) one job that has written 64 MiB (8 MiB retained): the speed of `read` with max 8 MiB
 from the oldest offset held and of an `attach` stream from there, in MB/s of decoded output;
-(2) the latency of `true` (v1.1, sequential) while 16 jobs each write 1 GiB as fast as they can,
+(2) the latency of `true` (one-shot, sequential) while 16 jobs each write 1 GiB as fast as they can,
 against the same request on an idle server. Standard library only.
 """
 import argparse

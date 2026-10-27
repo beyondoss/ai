@@ -44,7 +44,7 @@ impl Rng {
 /// Valid requests, each harmless if sent as written.
 const TEMPLATES: &[&str] = &[
     r#"{"command":"true","args":[],"timeout_ms":5000}"#,
-    r#"{"command":"true","args":["a","b"],"cwd":".","stdin_base64":"aGVsbG8=","stream":false}"#,
+    r#"{"command":"true","args":["a","b"],"cwd":".","stdin":"aGVsbG8=","stream":false}"#,
     r#"{"command":"true","job":{"op":"probe"}}"#,
     r#"{"command":"true","job":{"op":"list","scope":"s"}}"#,
     r#"{"command":"true","job":{"op":"read","scope":"s","id":"a1","offset":0,"max":4096}}"#,

@@ -70,6 +70,7 @@ export function rgArgs(q: SearchQuery, inGitRepo: boolean): string[] {
     "--null",
     "--with-filename",
     "--line-number",
+    "--column",
     "--no-heading",
     "--color=never",
     "--hidden",
@@ -94,7 +95,8 @@ export function rgArgs(q: SearchQuery, inGitRepo: boolean): string[] {
 export function grepArgs(q: SearchQuery, gnu: boolean): string[] {
   const r = withDefaults(q);
   const args = ["-r", "-n", "-H"];
-  if (gnu) args.push("-Z", "-I", "--color=never");
+  // `-b`: the offset of each line, which a second run's `-o -b` match offsets turn into a column.
+  if (gnu) args.push("-Z", "-I", "--color=never", "-b");
   args.push(r.literal ? "-F" : "-E");
   if (r.ignoreCase) args.push("-i");
   if (gnu && r.glob !== undefined) {
@@ -195,22 +197,62 @@ function lineNumber(digits: string): number | null {
  * group separator turned off. Scans for the NUL, not for newlines (a path may contain one), skips
  * no `--` bytes (a path may begin with them), and drops a record that does not fit.
  */
-export function parseRecords(stdout: string): SearchHit[] {
+export function parseRecords(
+  stdout: string,
+  columns: boolean | "gnu" = false,
+  longs: LongLine[] = [],
+): SearchHit[] {
   const hits: SearchHit[] = [];
   let i = 0;
+  let prev = "";
   while (i < stdout.length) {
+    // `rg` follows the records of a file it stopped searching at a NUL byte with a line of its own,
+    // which has no NUL and so must not be read as the start of a record.
+    let first = stdout.indexOf("\n", i);
+    if (first < 0) first = stdout.length;
+    if (isBinaryWarning(stdout.slice(i, first), prev)) {
+      i = first + 1;
+      continue;
+    }
     const nul = stdout.indexOf("\0", i);
     if (nul < 0) break;
     let nl = stdout.indexOf("\n", nul);
     if (nl < 0) nl = stdout.length;
-    const hit = parseBody(stdout.slice(i, nul), stdout.slice(nul + 1, nl));
+    prev = stdout.slice(i, nul);
+    const hit = parseBody(
+      stdout.slice(i, nul),
+      stdout.slice(nul + 1, nl),
+      columns,
+      longs,
+      hits.length,
+    );
     if (hit) hits.push(hit);
     i = nl + 1;
   }
   return hits;
 }
 
-function parseBody(path: string, rest: string): SearchHit | null {
+const BINARY_WARNING =
+  ": WARNING: stopped searching binary file after match (found \"\\0\" byte around offset ";
+
+/**
+ * `PATH: WARNING: stopped searching binary file after match (found "\0" byte around offset N)`,
+ * where PATH is the file of the record just before it: `rg` prints it after the matches it found
+ * ahead of a NUL byte. Matching the previous record's path, not only the text, keeps a file whose
+ * name happens to contain these words a path.
+ */
+export function isBinaryWarning(line: string, prev: string): boolean {
+  if (prev === "" || !line.startsWith(prev + BINARY_WARNING)) return false;
+  return /^\d+\)$/.test(line.slice(prev.length + BINARY_WARNING.length));
+}
+
+function parseBody(
+  path: string,
+  rest: string,
+  columns: boolean | "gnu",
+  longs: LongLine[],
+  index: number,
+): SearchHit | null {
   let d = 0;
   while (isDigit(rest[d])) d++;
   if (d === 0 || d >= rest.length) return null;
@@ -218,7 +260,38 @@ function parseBody(path: string, rest: string): SearchHit | null {
   if (line === null) return null;
   const sep = rest[d];
   if (sep !== ":" && sep !== "-") return null;
-  return { path, line, text: trimEol(rest.slice(d + 1)), isMatch: sep === ":" };
+  const isMatch = sep === ":";
+  let text = rest.slice(d + 1);
+  // `rg --column`: a match record is `LINE:COL:TEXT`, a context record `LINE-TEXT`. GNU `grep -b`:
+  // `LINE:OFFSET:TEXT` and `LINE-OFFSET-TEXT`, the offset of the line start.
+  let col: number | null = null;
+  if (columns === "gnu" || (columns && isMatch)) {
+    let c = 0;
+    while (isDigit(text[c])) c++;
+    if (c === 0 || text[c] !== sep) return null;
+    const n = lineNumber(text.slice(0, c));
+    text = text.slice(c + 1);
+    if (columns === "gnu") {
+      if (isMatch && n !== null && text.length > MAX_LINE) {
+        longs.push({ index, lineStart: n, raw: text });
+      }
+    } else {
+      col = n;
+    }
+  }
+  return {
+    path,
+    line,
+    text: clipAt(trimEol(text), matchOffset(text, col)),
+    isMatch,
+  };
+}
+
+/** A long match line of a GNU `grep` run, whose column the second run finds. */
+export interface LongLine {
+  index: number;
+  lineStart: number;
+  raw: string;
 }
 
 /**
@@ -244,7 +317,7 @@ export function parseColonRecords(stdout: string, q: SearchQuery): SearchHit[] {
     hits.push({
       path: rec.path,
       line: rec.line,
-      text: trimEol(rec.text),
+      text: clip(trimEol(rec.text)),
       isMatch: rec.isMatch,
     });
   }
@@ -282,20 +355,23 @@ const OS_ERRORS = [
   "No such file or directory",
   "Permission denied",
   "Is a directory",
+  "Not a directory",
   "Too many levels of symbolic links",
   "Input/output error",
+  // rg reading a `.git` file (a gitdir pointer) that is not text.
+  "stream did not contain valid UTF-8",
 ];
 
 /**
  * Exit 2 is shared by three situations: the engine rejecting the pattern, a missing root, and
- * per-path read errors. Every stderr line a per-path OS error means the hits are good.
+ * per-path read errors. A path may contain a newline, so stderr is read as records that end at an
+ * OS error, not as lines; the root's own error is found by its exact string (newlines included).
  */
 export function classifySearchFailure(
   stderr: string,
   root: string,
 ): SearchFailure {
-  const lines = stderr.split("\n").filter((l) => l.trim() !== "");
-  const pathError = (raw: string): boolean => {
+  const endsInOsError = (raw: string): boolean => {
     let l = raw.trimEnd();
     if (l.endsWith(")")) {
       const at = l.lastIndexOf(" (os error ");
@@ -303,21 +379,42 @@ export function classifySearchFailure(
     }
     return OS_ERRORS.some((e) => l.endsWith(e));
   };
-  if (lines.length === 0 || !lines.every(pathError)) {
+  const records: string[] = [];
+  let start = 0;
+  for (const m of stderr.matchAll(/[^\n]*\n|[^\n]+$/g)) {
+    const end = m.index! + m[0].length;
+    if (endsInOsError(m[0])) {
+      records.push(stderr.slice(start, end).trim());
+      start = end;
+    }
+  }
+  if (records.length === 0 || stderr.slice(start).trim() !== "") {
     return { kind: "bad_regex" };
   }
   const rootPrefix = `: ${root}: `;
-  const missing = lines.find(
-    (l) => l.includes(rootPrefix) && l.includes("No such file or directory"),
-  );
+  const ioPrefix = `IO error for operation on ${root}: `;
+  const missing = records.find((r) => {
+    for (
+      let at = r.indexOf(rootPrefix);
+      at >= 0;
+      at = r.indexOf(rootPrefix, at + 1)
+    ) {
+      let rest = r.slice(at + rootPrefix.length);
+      if (rest.startsWith(ioPrefix)) rest = rest.slice(ioPrefix.length);
+      if (
+        rest.startsWith("No such file or directory")
+        || rest.startsWith("Not a directory")
+      ) return true;
+    }
+    return false;
+  });
   if (missing !== undefined) {
-    return { kind: "missing_root", line: missing.trim() };
+    return { kind: "missing_root", line: missing };
   }
   return {
     kind: "skipped",
-    note: `${lines.length} path(s) could not be searched; first: ${
-      lines[0]!.trim()
-    }`,
+    note:
+      `${records.length} path(s) could not be searched; first: ${records[0]!}`,
   };
 }
 
@@ -331,32 +428,71 @@ export function clip(line: string): string {
   return chars.slice(0, MAX_LINE).join("") + TRUNCATED_SUFFIX;
 }
 
-/** A finder of a query's first match in a line; null when the pattern does not compile here. */
-export function matchFinder(q: SearchQuery): RegExp | null {
-  const r = withDefaults(q);
-  const src = r.literal
-    ? r.pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-    : r.pattern;
-  try {
-    return new RegExp(src, r.ignoreCase ? "iu" : "u");
-  } catch {
-    return null;
+/**
+ * Clip the long match lines of a GNU `grep` run (`longs`) from the output of a second run with
+ * `-o -b` and no context: the file offset of a line's first match less the line's offset is the byte
+ * column `rg --column` would have given.
+ */
+export function windowLongLines(
+  hits: SearchHit[],
+  longs: LongLine[],
+  stdout: string,
+): void {
+  const first = new Map<string, number>();
+  let i = 0;
+  while (i < stdout.length) {
+    const nul = stdout.indexOf("\0", i);
+    if (nul < 0) break;
+    let nl = stdout.indexOf("\n", nul);
+    if (nl < 0) nl = stdout.length;
+    const m = /^(\d+):(\d+):/.exec(stdout.slice(nul + 1, nl));
+    if (m) {
+      const key = `${stdout.slice(i, nul)}\0${m[1]}`;
+      if (!first.has(key)) first.set(key, Number(m[2]));
+    }
+    i = nl + 1;
+  }
+  for (const long of longs) {
+    const hit = hits[long.index]!;
+    const off = first.get(`${hit.path}\0${hit.line}`);
+    if (off === undefined || off < long.lineStart) continue;
+    const cs = matchOffset(long.raw, off - long.lineStart + 1);
+    if (cs !== null) hit.text = clipAt(trimEol(long.raw), cs);
   }
 }
 
-/** Clip a matched line to 500 characters around its first match. */
-export function clipMatch(line: string, finder: RegExp | null): string {
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+/**
+ * The character offset, in the normalized text, of rg's 1-based byte column `col` of the raw line:
+ * the characters before it, CRs not counted. The bytes are those of the UTF-8 encoding of the
+ * decoded line. Null when there is no column or it is not a character boundary.
+ */
+export function matchOffset(raw: string, col: number | null): number | null {
+  if (col === null || col < 1 || raw.length <= MAX_LINE) return null;
+  const bytes = encoder.encode(raw);
+  const at = col - 1;
+  if (at > bytes.length) return null;
+  if (at < bytes.length && (bytes[at]! & 0xc0) === 0x80) return null;
+  let n = 0;
+  for (const c of decoder.decode(bytes.subarray(0, at))) if (c !== "\r") n++;
+  return n;
+}
+
+/**
+ * Clip a line to 500 characters. With `cs`, the character offset of its first match as the engine
+ * reported it, the window starts 250 characters before the match (the head clip when that is the
+ * head); the match is never searched for again.
+ */
+export function clipAt(line: string, cs: number | null): string {
   if (line.length <= MAX_LINE) return line;
   const chars = Array.from(line);
   if (chars.length <= MAX_LINE) return line;
-  const m = finder?.exec(line);
-  if (!m) return clip(line);
-  const cs = Array.from(line.slice(0, m.index)).length;
-  const ce = cs + Array.from(m[0]).length;
-  if (ce <= MAX_LINE) return clip(line);
+  if (cs === null) return clip(line);
   const total = chars.length;
-  const pad = Math.max(0, Math.floor((MAX_LINE - (ce - cs)) / 2));
-  let start = Math.max(0, cs - pad);
+  let start = Math.max(0, cs - MAX_LINE / 2);
+  if (start === 0) return clip(line);
   let end = start + MAX_LINE;
   if (end > total) {
     end = total;
@@ -365,19 +501,6 @@ export function clipMatch(line: string, finder: RegExp | null): string {
   let out = WINDOW_PREFIX + chars.slice(start, end).join("");
   if (end < total) out += " …";
   return `${out}${WINDOW_MARK}${start + 1}-${end} of ${total}]`;
-}
-
-export function clipHits(hits: SearchHit[], finder: () => RegExp | null): void {
-  let cached: RegExp | null | undefined;
-  for (const h of hits) {
-    if (h.text.length <= MAX_LINE) continue;
-    if (h.isMatch) {
-      cached ??= finder();
-      h.text = clipMatch(h.text, cached);
-    } else {
-      h.text = clip(h.text);
-    }
-  }
 }
 
 // ---- paths -----------------------------------------------------------------------------------

@@ -1,0 +1,289 @@
+{
+  "suite": "differential-found",
+  "version": 1,
+  "description": "Divergences the randomized differential run (crates/sandbox-conformance/tests/differential.rs) found between clients or against the filesystem, each as a permanent check. A check marked xfail for a driver is a known defect of that client; a fix removes the mark and the matching entry in tests/differential/known.rs.",
+  "scenarios": [
+    {
+      "id": "differential-found.write.below-file-with-separator-in-name",
+      "description": "A write below a regular file fails with not_found or not_a_directory, whatever characters the name has. The failing command's stderr is `sh: N: cannot create PATH: Directory nonexistent`; the kind comes from the first line up to LF. A name containing CR, VT, FF or U+2028 must not move the OS message out of that line: the line ends at LF only.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; echo x > \"$1/f\"",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "cr",
+          "op": "write",
+          "path": "${ROOT}/f/cr\rname",
+          "data_b64": "",
+          "expect": {
+            "error": {
+              "kind": {
+                "$oneof": [
+                  "not_found",
+                  "not_a_directory"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "line-separator",
+          "op": "write",
+          "path": "${ROOT}/f/ls name",
+          "data_b64": "",
+          "expect": {
+            "error": {
+              "kind": {
+                "$oneof": [
+                  "not_found",
+                  "not_a_directory"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "form-feed",
+          "op": "write",
+          "path": "${ROOT}/f/ff\fname",
+          "data_b64": "",
+          "expect": {
+            "error": {
+              "kind": {
+                "$oneof": [
+                  "not_found",
+                  "not_a_directory"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "lf",
+          "op": "write",
+          "path": "${ROOT}/f/x\ny",
+          "data_b64": "",
+          "expect": {
+            "error": {
+              "kind": {
+                "$oneof": [
+                  "io",
+                  "not_found",
+                  "not_a_directory"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "differential-found.search.git-file-not-utf8",
+      "description": "A file called .git whose content is not UTF-8, in a directory above the search root, does not make the search fail. ripgrep reads the nearest .git as a gitdir pointer, complains on stderr (`stream did not contain valid UTF-8`) and exits 2; FILES-OVER-EXEC (search, exit codes) counts that line as a per-path error, so the search succeeds with a note and the matches are returned.",
+      "requires": {
+        "search_engine": "rg"
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir sub; printf 'nothing here\\n' > sub/x.txt; printf '\\377\\376 not utf8\\n' > .git",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "no-match",
+          "op": "search",
+          "root": "${ROOT}/sub",
+          "pattern": "needle",
+          "literal": true,
+          "expect": {
+            "ok": {
+              "hits": []
+            }
+          }
+        },
+        {
+          "id": "match",
+          "op": "search",
+          "root": "${ROOT}/sub",
+          "pattern": "nothing",
+          "literal": true,
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/sub/x.txt",
+                  "line": 1,
+                  "text": "nothing here",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "differential-found.search.clip-uses-rust-regex-syntax",
+      "description": "A match line longer than 500 characters is clipped around the column rg reports for its first match, never by searching the line again, so the pattern may use any Rust-syntax construct. The line here is 600 z, `needle`, 10 w; the window would start at character 350 and run past the end, so the text is `… ` + columns 117-616 and the `[truncated; columns 117-616 of 616]` suffix.",
+      "requires": {
+        "search_engine": "rg"
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; { head -c 600 /dev/zero | tr '\\000' z; printf 'needlewwwwwwwwww\\n'; } > long.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "plain",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "needle",
+          "literal": false,
+          "limit": 5,
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/long.txt",
+                  "line": 1,
+                  "is_match": true,
+                  "text": {
+                    "$contains": "[truncated; columns 117-616 of 616]"
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "inline-flag",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "(?i)NEEDLE",
+          "literal": false,
+          "limit": 5,
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/long.txt",
+                  "line": 1,
+                  "is_match": true,
+                  "text": {
+                    "$contains": "[truncated; columns 117-616 of 616]"
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "named-group",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "nee(?P<x>d)le",
+          "literal": false,
+          "limit": 5,
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/long.txt",
+                  "line": 1,
+                  "is_match": true,
+                  "text": {
+                    "$contains": "[truncated; columns 117-616 of 616]"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "differential-found.search.binary-file-warning-is-not-a-path",
+      "description": "A file with a NUL byte after a match is not a path. ripgrep searches it as far as the NUL and then prints `PATH: WARNING: stopped searching binary file after match (found \"\\\\0\" byte around offset N)` on stdout, a line with no NUL that follows the file's own records and names the file; a parser that scans for the NUL after the path would read it as the start of the next record. No hit's path may contain the warning, on any search engine (busybox grep prints `Binary file PATH matches`, GNU grep with -I prints nothing).",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir plain; i=10; while [ $i -lt 40 ]; do echo x1 > plain/f$i; i=$((i+1)); done; for b in bin1 bin2 bin3; do printf 'x1\\n\\000\\n' > $b; done",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "control",
+          "op": "search",
+          "root": "${ROOT}/plain",
+          "pattern": "x1",
+          "literal": true,
+          "limit": 100,
+          "expect": {
+            "ok": {
+              "hits": {
+                "$len": 30
+              }
+            }
+          }
+        },
+        {
+          "id": "paths",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "x1",
+          "literal": true,
+          "limit": 100,
+          "expect": {
+            "ok": {
+              "hits": {
+                "$not": {
+                  "$includes": [
+                    {
+                      "path": {
+                        "$contains": "WARNING"
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

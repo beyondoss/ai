@@ -7,7 +7,6 @@
 mod driver;
 
 use std::io::Write as _;
-use std::path::PathBuf;
 
 use driver::{CapsOverride, Config, Driver};
 use serde_json::{Value, json};
@@ -18,8 +17,6 @@ fn config() -> Config {
     let bearer = std::env::var("CONFORMANCE_BEARER")
         .ok()
         .filter(|b| !b.is_empty());
-    let jobs_root =
-        std::env::var("CONFORMANCE_JOBS_ROOT").unwrap_or_else(|_| "/tmp/beyond-jobs".to_string());
     let caps: Value = std::env::var("CONFORMANCE_CAPS")
         .ok()
         .filter(|c| !c.is_empty())
@@ -29,14 +26,13 @@ fn config() -> Config {
         url,
         bearer,
         caps: CapsOverride {
-            stdin: caps["stdin"].as_bool(),
             find_printf: caps["find_printf"].as_bool(),
             // Leaked once per process: the override is `'static` in the shared driver.
             search_engine: caps["search_engine"]
                 .as_str()
                 .map(|s| &*Box::leak(s.to_string().into_boxed_str())),
         },
-        jobs_root: PathBuf::from(jobs_root),
+        jobs_root: None,
     }
 }
 

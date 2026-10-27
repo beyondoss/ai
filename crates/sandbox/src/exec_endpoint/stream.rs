@@ -1,17 +1,14 @@
-//! Exec protocol **v1.2**: the streamed response, its frames, and the probe that adopts it.
+//! The streamed response and its frames.
 //!
-//! The normative spec is the parent module's doc ("Streaming (v1.2)"). This file is the client half:
-//! `FrameReader` turns an `application/x-ndjson` body into [`Frame`]s ([`decode_line`] is one line),
-//! and the probe (`observe_probe`) decides whether an endpoint has *proved* it streams before `bash`
-//! is allowed to treat its silence as the command's.
+//! The normative spec is the parent module's doc ("Streaming"). This file is the client half:
+//! `FrameReader` turns an `application/x-ndjson` body into [`Frame`]s ([`decode_line`] is one line).
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base64::Engine as _;
 use serde::Deserialize;
 
-/// The media type of a v1.2 streamed response. Anything else in answer to `"stream": true` is a
-/// v1.1 endpoint that ignored the field and sent the whole result as one JSON object.
+/// The media type of a streamed response.
 pub const NDJSON: &str = "application/x-ndjson";
 
 /// The longest gap the endpoint may leave between frames: it sends a heartbeat (`{}`) whenever the
@@ -34,7 +31,7 @@ pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024;
 /// buffer while it waits for a newline.
 const MAX_LINE: usize = 1024 * 1024;
 
-/// One decoded line of a v1.2 stream.
+/// One decoded line of a stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     /// Bytes the command wrote to stdout.
@@ -170,7 +167,7 @@ impl FrameReader {
     }
 
     /// The next line of the body (without its `\n`), or `None` at the end — for a decoder of its
-    /// own (the v1.3 job streams, `jobs_native`). Errors as [`Self::next`].
+    /// own (the job streams, `jobs_native`). Errors as [`Self::next`].
     pub async fn next_line(&mut self, silence: Duration) -> Result<Option<Vec<u8>>, String> {
         loop {
             if let Some(nl) = self.buf[self.scanned..].iter().position(|&b| b == b'\n') {
@@ -224,100 +221,6 @@ impl FrameReader {
     }
 }
 
-/// The probe's script: output, a pause, more output. Only a stream that delivers the first part a
-/// clear interval before the end proves it is incremental; a buffering endpoint or proxy delivers
-/// everything at once. `sleep 0.3` is not POSIX (busybox has it, some minimal `sleep`s do not), so
-/// it falls back to a whole second rather than failing the probe.
-pub const PROBE_SCRIPT: &str = "printf a; sleep 0.3 2>/dev/null || sleep 1; printf b";
-
-/// The least gap between the probe's first output frame and its final frame that counts as
-/// incremental delivery. A third of the script's pause: wide enough to absorb scheduling noise on a
-/// loaded host, far above the ~0 a buffered body shows.
-pub const PROBE_MIN_GAP: Duration = Duration::from_millis(100);
-
-/// What a probe saw, for the verdict and for the conformance report.
-#[derive(Debug, Default)]
-pub struct ProbeSeen {
-    pub ndjson: bool,
-    pub output_frames: usize,
-    pub stdout: Vec<u8>,
-    pub end: Option<Frame>,
-    /// From the first output frame to the final frame.
-    pub gap: Option<Duration>,
-}
-
-impl ProbeSeen {
-    /// The probe's verdict: streaming is adopted only on this.
-    pub fn streams(&self) -> bool {
-        self.ndjson
-            && self.output_frames >= 2
-            && self.stdout == b"ab"
-            && self.end == Some(Frame::Exit(0))
-            && self.gap.is_some_and(|g| g >= PROBE_MIN_GAP)
-    }
-
-    /// Why the verdict is what it is, in a sentence.
-    pub fn explain(&self) -> String {
-        if !self.ndjson {
-            return "answered `\"stream\": true` with a single JSON object (a v1.1 endpoint)"
-                .into();
-        }
-        if self.end != Some(Frame::Exit(0)) || self.stdout != b"ab" {
-            return format!(
-                "the probe did not complete as `ab` + exit 0 (stdout {:?}, end {:?})",
-                String::from_utf8_lossy(&self.stdout),
-                self.end
-            );
-        }
-        if self.output_frames < 2 {
-            return "sent the probe's output as one frame: it buffered the output until exit"
-                .into();
-        }
-        match self.gap {
-            Some(g) if g >= PROBE_MIN_GAP => format!(
-                "streamed incrementally ({} output frames, first {} ms before the end)",
-                self.output_frames,
-                g.as_millis()
-            ),
-            g => format!(
-                "delivered every frame at once ({} ms apart): something buffers the stream",
-                g.unwrap_or_default().as_millis()
-            ),
-        }
-    }
-}
-
-/// Read a probe's stream to its end, timing it.
-pub async fn observe_probe(resp: reqwest::Response) -> Result<ProbeSeen, String> {
-    let mut seen = ProbeSeen {
-        ndjson: true,
-        ..ProbeSeen::default()
-    };
-    let mut reader = FrameReader::new(resp);
-    let mut first_output: Option<Instant> = None;
-    while let Some(frame) = reader.next(FRAME_SILENCE_LIMIT).await? {
-        match frame {
-            Frame::Stdout(b) => {
-                first_output.get_or_insert_with(Instant::now);
-                seen.output_frames += 1;
-                seen.stdout.extend_from_slice(&b);
-            }
-            Frame::Stderr(_) => {
-                first_output.get_or_insert_with(Instant::now);
-                seen.output_frames += 1;
-            }
-            Frame::Heartbeat => {}
-            end => {
-                seen.gap = first_output.map(|t| t.elapsed());
-                seen.end = Some(end);
-                reader.finish().await;
-                return Ok(seen);
-            }
-        }
-    }
-    Ok(seen)
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
@@ -327,7 +230,7 @@ mod tests {
     /// run their encoder's output through the same cases.
     #[test]
     fn the_frame_vectors_decode_as_specified() {
-        let raw = include_str!("../../tests/fixtures/exec/v1.2-frames.json");
+        let raw = include_str!("../../tests/fixtures/exec/frames.json");
         let doc: serde_json::Value = serde_json::from_str(raw).unwrap();
         let b64 = |v: &serde_json::Value| {
             base64::engine::general_purpose::STANDARD
@@ -395,43 +298,6 @@ mod tests {
                 _ => None,
             };
             assert_eq!(end, want_end, "{name}: final frame");
-        }
-    }
-
-    #[test]
-    fn a_probe_is_adopted_only_on_incremental_delivery() {
-        let good = ProbeSeen {
-            ndjson: true,
-            output_frames: 2,
-            stdout: b"ab".to_vec(),
-            end: Some(Frame::Exit(0)),
-            gap: Some(Duration::from_millis(300)),
-        };
-        assert!(good.streams(), "{}", good.explain());
-        let v11 = ProbeSeen::default();
-        assert!(!v11.streams());
-        assert!(v11.explain().contains("v1.1"));
-        let one_frame = ProbeSeen {
-            output_frames: 1,
-            ..clone(&good)
-        };
-        assert!(!one_frame.streams());
-        assert!(one_frame.explain().contains("one frame"));
-        let buffered = ProbeSeen {
-            gap: Some(Duration::from_millis(2)),
-            ..clone(&good)
-        };
-        assert!(!buffered.streams());
-        assert!(buffered.explain().contains("buffers"));
-    }
-
-    fn clone(p: &ProbeSeen) -> ProbeSeen {
-        ProbeSeen {
-            ndjson: p.ndjson,
-            output_frames: p.output_frames,
-            stdout: p.stdout.clone(),
-            end: p.end.clone(),
-            gap: p.gap,
         }
     }
 }

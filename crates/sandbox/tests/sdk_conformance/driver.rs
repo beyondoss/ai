@@ -28,13 +28,12 @@ pub struct Config {
     pub bearer: Option<String>,
     /// `CONFORMANCE_CAPS`: overrides of what the probes found.
     pub caps: CapsOverride,
-    /// Where a baseline job lives, standing in for `/tmp/beyond-jobs`.
-    pub jobs_root: PathBuf,
+    /// Where a job lives when the jobs run over plain commands, standing in for `/tmp/beyond-jobs`.
+    pub jobs_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CapsOverride {
-    pub stdin: Option<bool>,
     pub find_printf: Option<bool>,
     pub search_engine: Option<&'static str>,
 }
@@ -43,15 +42,11 @@ pub struct Driver {
     runner: Arc<dyn CommandRunner>,
     jobs: beyond_sandbox::Jobs,
     fs: ShellFs,
-    jobs_root: PathBuf,
     /// The error every op returns when the endpoint could not be reached or refused the first
     /// request: probes that fail at that level are not capabilities, they are an outage.
+    jobs_root: Option<PathBuf>,
     connect_error: Option<Value>,
     caps: Capabilities,
-    streams: bool,
-    /// The endpoint honours `output_base64` (probed).
-    output_base64: bool,
-    native_jobs: bool,
 }
 
 /// One op's outcome in the contract's terms.
@@ -188,8 +183,8 @@ fn kind_name(k: FileKind) -> &'static str {
     }
 }
 
-fn epoch_secs(t: SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+fn epoch_secs(t: SystemTime) -> f64 {
+    beyond_sandbox::fs::epoch_f64(t)
 }
 
 fn state_of(s: JobStatus) -> (&'static str, Option<i32>) {
@@ -210,20 +205,15 @@ impl Driver {
             runner = runner.with_header("Authorization", format!("Bearer {token}"));
         }
         let runner = Arc::new(runner);
-        Self::build(runner.clone(), cfg, Some(runner)).await
+        Self::build(runner, cfg).await
     }
 
     /// The same driver over any other [`CommandRunner`]: the layers above the transport, unchanged.
-    /// There is no native jobs, and streaming is whatever the runner says it attaches.
     pub async fn over(runner: Arc<dyn CommandRunner>, cfg: &Config) -> Self {
-        Self::build(runner, cfg, None).await
+        Self::build(runner, cfg).await
     }
 
-    async fn build(
-        runner: Arc<dyn CommandRunner>,
-        cfg: &Config,
-        http: Option<Arc<HttpExecRunner>>,
-    ) -> Self {
+    async fn build(runner: Arc<dyn CommandRunner>, cfg: &Config) -> Self {
         // ShellFs itself decides: a probe whose request failed (unreachable, `401`) fails connect, and
         // that error is what every op reports. The exec/stream/jobs paths then fail the same way
         // on their own first request.
@@ -231,9 +221,6 @@ impl Driver {
             Ok(caps) => (caps, None),
             Err(e) => (Capabilities::default(), Some(io_err(&e))),
         };
-        if let Some(s) = cfg.caps.stdin {
-            caps.stdin = s;
-        }
         if let Some(f) = cfg.caps.find_printf {
             caps.find_printf = f;
         }
@@ -253,17 +240,6 @@ impl Driver {
             _ => {}
         }
         let fs = ShellFs::with_capabilities(runner.clone(), caps);
-        let (streams, native_jobs) = match &http {
-            Some(http) => (
-                connect_error.is_none() && http.streams().await,
-                connect_error.is_none() && http.offers_jobs().await,
-            ),
-            None => (connect_error.is_none() && runner.attaches().await, false),
-        };
-        let output_base64 = match &http {
-            Some(http) => connect_error.is_none() && http.outputs_base64().await,
-            None => false,
-        };
         let jobs = beyond_sandbox::Jobs::over(runner.clone());
         Self {
             runner,
@@ -272,15 +248,15 @@ impl Driver {
             jobs_root: cfg.jobs_root.clone(),
             connect_error,
             caps,
-            streams,
-            output_base64,
-            native_jobs,
         }
     }
 
     fn scope(&self, req: &Value) -> Result<JobScope, Value> {
         let name = str_arg(req, "scope")?;
-        Ok(JobScope::under(self.jobs_root.to_string_lossy(), name))
+        Ok(match &self.jobs_root {
+            Some(root) => JobScope::under(root.to_string_lossy(), name),
+            None => JobScope::under(beyond_sandbox::exec_endpoint::jobs::JOBS_ROOT, name),
+        })
     }
 
     fn job_id(req: &Value, key: &str) -> Result<JobId, Value> {
@@ -346,20 +322,7 @@ impl Driver {
             SearchEngine::PosixGrep => "grep",
             SearchEngine::BusyboxGrep => "busybox-grep",
         };
-        let jobs = if self.native_jobs {
-            "native"
-        } else if self.jobs.available().await {
-            "baseline"
-        } else {
-            "none"
-        };
         Ok(json!({
-            "stdin": self.caps.stdin,
-            "stream": self.streams,
-            "output_base64": self.output_base64,
-            // Raw exec returns the command's bytes: over `output_base64`, else over a v1.2 stream.
-            "exact_exec": self.output_base64 || self.streams,
-            "jobs": jobs,
             "search_engine": engine,
             "find_printf": self.caps.find_printf,
             "read_window": !self.caps.no_read_window,
@@ -400,16 +363,20 @@ impl Driver {
         } else {
             Some(bytes_arg(req, "stdin_b64")?)
         };
-        let r = self
-            .runner
-            .run_exact(command, &args, cwd, timeout, stdin.as_deref())
-            .await
-            .map_err(|e| io_err(&e))?;
+        let r = match stdin.as_deref() {
+            Some(stdin) => {
+                self.runner
+                    .run_with_stdin(command, &args, cwd, timeout, stdin)
+                    .await
+            }
+            None => self.runner.run(command, &args, cwd, timeout).await,
+        }
+        .map_err(|e| io_err(&e))?;
+        let r = beyond_sandbox::ExecOutput::from(r);
         Ok(json!({
             "exit_code": r.code,
             "stdout_b64": b64(&r.stdout),
             "stderr_b64": b64(&r.stderr),
-            "exact": r.exact,
         }))
     }
 
@@ -422,12 +389,6 @@ impl Driver {
         // `run_attached` keeps the two streams apart but has no deadline of its own; a request that
         // carries `timeout_ms` goes through `run_streaming`, which has one and merges the streams.
         let result = if let Some(ms) = u64_arg(req, "timeout_ms")? {
-            if !self.streams {
-                return Err(err(
-                    "not_offered",
-                    "this exec endpoint does not stream (protocol v1.1)",
-                ));
-            }
             self.runner
                 .run_streaming(command, &args, cwd, Duration::from_millis(ms), &|b| {
                     out.lock().unwrap().extend_from_slice(b)
@@ -624,7 +585,19 @@ impl Driver {
                 "`expected_mtime` is required (null means the file must not exist)",
             ));
         }
-        let expected = u64_arg(req, "expected_mtime")?.map(|s| UNIX_EPOCH + Duration::from_secs(s));
+        let expected = match &req["expected_mtime"] {
+            Value::Null => None,
+            v => v
+                .as_f64()
+                .filter(|s| s.is_finite() && *s >= 0.0)
+                .map(|s| UNIX_EPOCH + Duration::from_secs_f64(s)),
+        };
+        if expected.is_none() && !req["expected_mtime"].is_null() {
+            return Err(err(
+                "invalid_request",
+                "`expected_mtime` must be a non-negative number or null",
+            ));
+        }
         let wrote = self
             .fs
             .write_if_unchanged(Path::new(path), data, expected)

@@ -61,7 +61,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 /// of the group still reaches them. Liveness is `kill -0 -<pgid>`, then `/proc` to skip zombies: a
 /// container whose pid 1 is not an init (`sleep infinity`) never reaps the orphans it inherits, and
 /// a group of zombies is not running. Polled every 500 ms with shell builtins only (no fork per
-/// process). A process that leaves the group (`setsid`) is not seen, as with a v1.2 endpoint.
+/// process). A process that leaves the group (`setsid`) is not seen, as with a streaming endpoint.
 pub(crate) const WRAPPER: &str = r#"l=$1; d=$2; shift 2
 if [ -n "$d" ]; then cd "$d" || exit 1; fi
 if command -v setsid >/dev/null 2>&1; then

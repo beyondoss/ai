@@ -38,7 +38,7 @@ async fn run(cmd: String) -> sandbox_conformance::report::Cell {
             cmd,
         }],
         // execd's own library behind a loopback listener, with the shipped endpoint's behaviour.
-        backends: vec!["fault-baseline-jobs".into()],
+        backends: vec!["embedded".into()],
         scenarios: Arc::new(matrix::load(&dir).unwrap()),
         filter: Some("files.*".into()),
         bins: Binaries::default(),

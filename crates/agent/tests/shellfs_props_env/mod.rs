@@ -43,8 +43,6 @@ use truth::{Kind, Node, Plan, Snap, classify, secs, snapshot, temps};
 pub struct Config {
     /// The runner's response cap. `None` is the default 16 MiB, which no generated file reaches.
     pub cap: Option<usize>,
-    /// Whether writes use stdin (one command) or 48 KiB argv chunks (the rung for a v1 endpoint).
-    pub stdin: bool,
     /// Percent of requests a fault hits. 0 is a clean transport.
     pub fault_pct: u64,
     /// Start with a read-only directory and read-only files in the tree.
@@ -58,7 +56,6 @@ pub struct Config {
 
 pub const PLAIN: Config = Config {
     cap: None,
-    stdin: true,
     fault_pct: 0,
     readonly_start: false,
     tiny_kib: None,
@@ -131,24 +128,8 @@ pub fn http_runner(cap: Option<usize>) -> Arc<HttpExecRunner> {
         .clone()
 }
 
-/// `ShellFs::connect` returns the backend on `main` and a `Result` once a failed probe fails connect
-/// (D3). This test compiles against both.
-pub trait IntoFs {
-    fn into_fs(self) -> Option<ShellFs>;
-}
-impl IntoFs for ShellFs {
-    fn into_fs(self) -> Option<ShellFs> {
-        Some(self)
-    }
-}
-impl<E> IntoFs for Result<ShellFs, E> {
-    fn into_fs(self) -> Option<ShellFs> {
-        self.ok()
-    }
-}
-
 pub async fn connect(r: Arc<dyn CommandRunner>) -> Option<ShellFs> {
-    ShellFs::connect(r).await.into_fs()
+    ShellFs::connect(r).await.ok()
 }
 
 fn capabilities(cap: Option<usize>) -> Capabilities {
@@ -160,7 +141,7 @@ fn capabilities(cap: Option<usize>) -> Capabilities {
     let fs = rt()
         .block_on(connect(http_runner(cap)))
         .expect("the loopback execd answers the probe");
-    let caps = fs.capabilities();
+    let caps = rt().block_on(fs.capabilities()).unwrap();
     C.get().unwrap().lock().unwrap().insert(key, caps);
     caps
 }
@@ -178,7 +159,7 @@ pub struct Machine {
     faults: Arc<FaultRunner>,
     engine: Engine,
     known: Vec<PathBuf>,
-    stats: HashMap<PathBuf, Option<u64>>,
+    stats: HashMap<PathBuf, Option<f64>>,
 }
 
 impl Drop for Machine {
@@ -329,8 +310,8 @@ impl NsRunner {
         let out = out?;
         Ok(beyond_agent::tools::exec::ExecResult {
             code: out.status.code(),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned().into(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned().into(),
             ..Default::default()
         })
     }
@@ -350,8 +331,7 @@ pub fn machine(tc: &TestCase, cfg: Config) -> Machine {
         None => (host_root.clone(), None),
     };
     let seed = tc.draw_silent(gs::integers::<u64>());
-    let mut caps = capabilities(cfg.cap);
-    caps.stdin &= cfg.stdin;
+    let caps = capabilities(cfg.cap);
     let http: Arc<dyn CommandRunner> = match &tiny {
         Some(t) => Arc::new(NsRunner { pid: t.pid }),
         None => http_runner(cfg.cap),
@@ -362,6 +342,7 @@ pub fn machine(tc: &TestCase, cfg: Config) -> Machine {
     faults.enable(cfg.fault_pct > 0);
     let engine = match caps.search_engine() {
         SearchEngine::Ripgrep => Engine::Rg,
+        SearchEngine::BusyboxGrep => Engine::Busybox,
         _ => Engine::Grep,
     };
     let mut m = Machine {
@@ -406,12 +387,6 @@ pub fn machine(tc: &TestCase, cfg: Config) -> Machine {
             .extend([ro.clone(), ro.join("kept.txt"), root.join("locked.txt")]);
     }
     m
-}
-
-/// A path with a newline in it splits the shell's one-line error: the OS message is on a line the spec's
-/// "first line of stderr" rule never reads, so the kind falls back to `io`. Allowed, and reported.
-fn kind_ok(kinds: &[Kind], k: Kind, p: &Path) -> bool {
-    kinds.contains(&k) || (k == Kind::Io && p.to_string_lossy().contains('\n'))
 }
 
 /// An open bug this test found: tolerated (and counted, and printed) until its fix lands, then removed
@@ -571,6 +546,33 @@ impl Machine {
         p
     }
 
+    /// Whether `target`, as a symlink at `link`, resolves (lexically, `..` popping a component) to a
+    /// path inside the test root.
+    fn stays_inside(&self, link: &Path, target: &Path) -> bool {
+        use std::path::Component;
+        let Ok(root) = std::fs::canonicalize(&self.root) else {
+            return false;
+        };
+        let mut cur = if target.is_absolute() {
+            PathBuf::from("/")
+        } else {
+            match link.parent().map(std::fs::canonicalize) {
+                Some(Ok(d)) => d,
+                _ => return false,
+            }
+        };
+        for c in target.components() {
+            match c {
+                Component::Normal(n) => cur.push(n),
+                Component::ParentDir => {
+                    cur.pop();
+                }
+                _ => {}
+            }
+        }
+        cur.starts_with(&root) || cur.starts_with(&self.root)
+    }
+
     fn pick_dir(&mut self, tc: &TestCase) -> PathBuf {
         let mut dirs = vec![self.root.clone(); 2];
         dirs.extend(self.known.iter().filter(|k| k.is_dir()).cloned());
@@ -599,12 +601,12 @@ impl Machine {
         snapshot(&self.root)
     }
 
-    fn do_write(&mut self, tc: &TestCase, p: PathBuf, data: Vec<u8>, guard: Option<Option<u64>>) {
+    fn do_write(&mut self, tc: &TestCase, p: PathBuf, data: Vec<u8>, guard: Option<Option<f64>>) {
         let before = snapshot(&self.root);
         let cur = std::fs::metadata(&p)
             .ok()
             .and_then(|m| m.modified().ok())
-            .map(secs);
+            .map(truth::fsecs);
         let plan = self.with_space(truth::plan_write(&p), data.len());
         let res: Result<bool, FsError> = self.block(async {
             match guard {
@@ -614,7 +616,7 @@ impl Machine {
                     .await
                     .map(|_| true),
                 Some(e) => {
-                    let exp = e.map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs(s));
+                    let exp = e.map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs_f64(s));
                     self.fs
                         .write_if_unchanged(&self.c(&p), data.clone(), exp)
                         .await
@@ -719,29 +721,12 @@ impl Machine {
                 } else {
                     // The command itself failed (a fault may still have hit its cleanup).
                     match &plan {
-                        Plan::Succeed
-                            if kind == Kind::PermissionDenied
-                                && std::fs::metadata(&target).is_ok_and(|m| m.is_file())
-                                && !truth::can(&target, 4) =>
-                        {
-                            // The size check reads the temp back, and the temp has the file's mode.
-                            known(
-                                "N4",
-                                format!(
-                                    "{op} {p:?} refused: the file is writable but not readable by its owner: {e}"
-                                ),
-                            );
-                        }
                         Plan::Succeed => fail(format!(
                             "{op} {p:?} must succeed but failed ({kind:?}): {e}"
                         )),
-                        Plan::Fail(kinds)
-                            if !kind_ok(kinds, kind, &p) && !kind_ok(kinds, kind, &target) =>
-                        {
-                            fail(format!(
-                                "{op} {p:?} failed as {kind:?} ({e}), spec allows {kinds:?}"
-                            ))
-                        }
+                        Plan::Fail(kinds) if !kinds.contains(&kind) => fail(format!(
+                            "{op} {p:?} failed as {kind:?} ({e}), spec allows {kinds:?}"
+                        )),
                         _ => {}
                     }
                     check_unchanged("a failed write");
@@ -809,14 +794,16 @@ impl Machine {
         let truth_now = std::fs::metadata(&p)
             .ok()
             .and_then(|m| m.modified().ok())
-            .map(secs);
+            .map(truth::fsecs);
         let remembered = self.stats.get(&p).copied();
-        let expected = match tc.draw(gs::integers::<u8>().max_value(4)) {
+        let expected = match tc.draw(gs::integers::<u8>().max_value(5)) {
             0 => None,
             1 => remembered.unwrap_or(None),
             2 => truth_now,
-            3 => truth_now.map(|s| s + 1),
-            _ => Some(secs(SystemTime::now())),
+            3 => truth_now.map(|s| s + 1.0),
+            // The same second, a different fraction: the guard compares nanoseconds, not seconds.
+            4 => truth_now.map(|s| s + 0.25),
+            _ => Some(truth::fsecs(SystemTime::now())),
         };
         tc.note(&format!(
             "write_if_unchanged {:?} expected={expected:?} (mtime now {truth_now:?})",
@@ -871,11 +858,11 @@ impl Machine {
                         m.len()
                     ));
                 }
-                let ts = m.modified().map(secs).unwrap();
-                if meta.mtime.map(secs) != Some(ts) {
+                let ts = m.modified().map(truth::fsecs).unwrap();
+                if meta.mtime.map(truth::fsecs) != Some(ts) {
                     fail(format!(
                         "stat mtime {:?} != {ts} for {p:?} (following symlinks)",
-                        meta.mtime.map(secs)
+                        meta.mtime.map(truth::fsecs)
                     ));
                 }
                 if meta.writable != truth::can(&p, 2) {
@@ -885,7 +872,7 @@ impl Machine {
                         truth::can(&p, 2)
                     ));
                 }
-                self.stats.insert(p.clone(), meta.mtime.map(secs));
+                self.stats.insert(p.clone(), meta.mtime.map(truth::fsecs));
             }
         }
         read_only_ops_unchanged(self, &before, "stat");
@@ -969,7 +956,7 @@ impl Machine {
             )),
             (Err(e), Err(kinds)) => {
                 let k = self.kind(&e, &p);
-                if !kind_ok(&kinds, k, &p) {
+                if !kinds.contains(&k) {
                     fail(format!(
                         "read {p:?} failed as {k:?} ({e}); spec allows {kinds:?}"
                     ));
@@ -1028,7 +1015,8 @@ impl Machine {
         match got {
             Err(e) => {
                 let k = self.kind(&e, &p);
-                if report.errored {
+                // A listing larger than the configured response cap is refused, as a search is.
+                if report.errored || (self.cfg.cap.is_some() && k == Kind::TooLarge) {
                     return;
                 }
                 let ok = match &meta {
@@ -1052,20 +1040,6 @@ impl Machine {
                         "list of the missing {p:?} succeeded with {} entries",
                         entries.len()
                     ));
-                }
-                let via_link = std::fs::symlink_metadata(&p)
-                    .is_ok_and(|m| m.file_type().is_symlink())
-                    && matches!(&meta, Ok(m) if m.is_dir());
-                if via_link && entries.is_empty() && !want.is_empty() && cap > 0 {
-                    known(
-                        "N1",
-                        format!(
-                            "list of the symlinked directory {p:?} returned no entries, its target holds {}",
-                            want.len()
-                        ),
-                    );
-                    read_only_ops_unchanged(self, &before, "list");
-                    return;
                 }
                 if matches!(&meta, Ok(m) if !m.is_dir()) && !entries.is_empty() {
                     fail(format!("list of the file {p:?} returned entries"));
@@ -1176,33 +1150,16 @@ impl Machine {
             Err(e) => {
                 let k = self.kind(&e, &root);
                 let tolerated = report.errored || (self.cfg.cap.is_some() && k == Kind::TooLarge);
-                let multiline = k == Kind::InvalidQuery
-                    && (want.root_missing || want.unreadable)
-                    && (root.to_string_lossy().contains('\n')
-                        || snapshot(&self.root)
-                            .keys()
-                            .any(|p| p.to_string_lossy().contains('\n')));
-                if multiline && !tolerated {
-                    known(
-                        "N2",
-                        format!(
-                            "search answered a missing/unreadable path as a bad regex because a path contains a newline: {e}"
-                        ),
-                    );
-                } else if !tolerated {
-                    if want.root_below_file && k == Kind::InvalidQuery {
-                        known(
-                            "N3",
-                            format!(
-                                "search of a root below a regular file answered as a bad regex: {e}"
-                            ),
-                        );
-                    } else if want.root_missing {
-                        if !(k == Kind::NotFound
-                            || (want.root_below_file && k == Kind::NotADirectory))
-                        {
+                if !tolerated {
+                    if want.root_missing {
+                        let expect = if want.root_below_file {
+                            Kind::NotADirectory
+                        } else {
+                            Kind::NotFound
+                        };
+                        if k != expect {
                             fail(format!(
-                                "search of the missing root {root:?} must fail as not_found, got {k:?}: {e}"
+                                "search of the missing root {root:?} must fail as {expect:?}, got {k:?}: {e}"
                             ));
                         }
                     } else if want.unreadable {
@@ -1342,7 +1299,7 @@ impl Machine {
                         Plan::Succeed => fail(format!(
                             "mkdir -p {p:?} must succeed but failed ({k:?}): {e}"
                         )),
-                        Plan::Fail(ks) if !kind_ok(&ks, k, &p) => fail(format!(
+                        Plan::Fail(ks) if !ks.contains(&k) => fail(format!(
                             "mkdir -p {p:?} failed as {k:?}, spec allows {ks:?}"
                         )),
                         _ => {}
@@ -1470,9 +1427,9 @@ impl Machine {
     fn env_write(&mut self, tc: TestCase) {
         let p = self.pick_path(&tc);
         let data = fixtures::content(&tc, self.cfg.cap, self.fill());
-        // `keep` re-sets the previous mtime: a same-second edit the guard cannot see (a documented
-        // limit); the others move the mtime to a different second.
-        let how = tc.draw(gs::integers::<u8>().max_value(3));
+        // `keep` re-sets the previous mtime: an edit the guard cannot see (a documented limit); the
+        // others move the mtime, mode 4 by a millisecond inside the same second.
+        let how = tc.draw(gs::integers::<u8>().max_value(4));
         tc.note(&format!(
             "env: write {:?} {}B mtime-mode {how}",
             p.strip_prefix(&self.root).unwrap(),
@@ -1486,6 +1443,7 @@ impl Machine {
                 0 => prev.unwrap_or_else(SystemTime::now),
                 1 => SystemTime::now() + Duration::from_secs(3),
                 2 => SystemTime::now() - Duration::from_secs(3600),
+                4 => prev.map_or_else(SystemTime::now, |t| t + Duration::from_millis(1)),
                 _ => SystemTime::now(),
             };
             let _ = f.set_modified(t);
@@ -1512,6 +1470,12 @@ impl Machine {
             2 => PathBuf::from(fixtures::name(&tc)).with_extension("lnk"),
             _ => self.pick_path(&tc),
         };
+        // A link must never lead out of the test root: `list` follows it, and the oracle and the
+        // client would then read a live, shared directory (`/tmp`) at different moments. A link to a
+        // file outside (`/dev/null`) is harmless; a dangling one inside is fine.
+        if target != Path::new("/dev/null") && !self.stays_inside(&link, &target) {
+            return;
+        }
         tc.note(&format!(
             "env: symlink {:?} -> {:?}",
             link.strip_prefix(&self.root).unwrap(),

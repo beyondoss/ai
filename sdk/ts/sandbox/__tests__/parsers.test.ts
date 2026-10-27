@@ -1,17 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { classifyFailure } from "../src/errors.js";
+import { classifyFailure, errorDetail } from "../src/errors.js";
 import { parseDirEntries, parseStat } from "../src/files.js";
 import { compileGlob } from "../src/glob.js";
-import { parseListLine, parseRead } from "../src/jobs.js";
 import {
   classifySearchFailure,
   clip,
-  clipMatch,
   crlfTolerantEre,
   finalize,
   grepArgs,
   isUnderGitDir,
-  matchFinder,
   parseColonRecords,
   parseRecords,
   rgArgs,
@@ -142,6 +139,7 @@ describe("argument builders", () => {
       "--null",
       "--with-filename",
       "--line-number",
+      "--column",
       "--no-heading",
       "--color=never",
       "--hidden",
@@ -242,6 +240,57 @@ describe("crlfTolerantEre", () => {
   });
 });
 
+describe("a newline in a path", () => {
+  it("does not hide the OS error", () => {
+    const root = "/work/no\nwhere";
+    for (
+      const missing of [
+        "rg: /work/no\nwhere: No such file or directory (os error 2)\n",
+        "rg: /work/no\nwhere: IO error for operation on /work/no\nwhere: No such file or directory (os error 2)\n",
+        "grep: /work/no\nwhere: No such file or directory\n",
+      ]
+    ) {
+      expect(classifySearchFailure(missing, root).kind).toBe("missing_root");
+    }
+    const f = classifySearchFailure(
+      "rg: /p/a\nb: Permission denied (os error 13)\nrg: /p/c: Permission denied (os error 13)\n",
+      "/p",
+    );
+    expect((f as { note: string }).note.startsWith("2 path(s)")).toBe(true);
+    expect(
+      classifyFailure("cat x", "cat: a\nb: No such file or directory\n").kind,
+    )
+      .toBe("not_found");
+    expect(errorDetail("one\ntwo\n")).toBe("one");
+  });
+});
+
+describe("stat mtime", () => {
+  it("keeps the fraction", () => {
+    expect(parseStat("w\tf\t3\t1793127211.536029123\n")?.mtime).toBe(
+      1793127211.536029123,
+    );
+    expect(parseStat("w\tf\t3\t981173106.000000000\n")?.mtime).toBe(
+      981173106,
+    );
+    expect(parseStat("w\tf\t3\t981173106\n")?.mtime).toBe(981173106);
+  });
+});
+
+describe("a root below a file", () => {
+  it("is a root error", () => {
+    const f = classifySearchFailure(
+      "rg: /w/file/sub: IO error for operation on /w/file/sub: Not a directory (os error 20)\n",
+      "/w/file/sub",
+    );
+    expect(f.kind).toBe("missing_root");
+    expect(
+      classifySearchFailure("grep: /w/file/sub: Not a directory", "/w/file")
+        .kind,
+    ).toBe("skipped");
+  });
+});
+
 describe("classifySearchFailure (exit 2)", () => {
   const root = "/work/proj";
   it("reads an engine complaint, or silence, as a rejected pattern", () => {
@@ -313,12 +362,12 @@ describe("classifyFailure (a command that ran and failed)", () => {
 });
 
 describe("parseStat", () => {
-  it("parses the line, keeping the integer part of the mtime", () => {
+  it("parses the line, keeping the fraction of the mtime", () => {
     expect(parseStat("w\tf\t12\t1700000000.9876\n")).toEqual({
       writable: true,
       kind: "file",
       size: 12,
-      mtime: 1700000000,
+      mtime: 1700000000.9876,
     });
     expect(parseStat("-\td\t4096\t5\n")).toMatchObject({
       writable: false,
@@ -445,50 +494,59 @@ describe("clipping", () => {
     );
   });
 
-  it("windows a long match line around its first match", () => {
+  it("windows a long match line around the column rg reported", () => {
     const line = "a".repeat(1000) + "NEEDLE" + "b".repeat(1000);
-    const out = clipMatch(line, matchFinder({ pattern: "NEEDLE", root: "." }));
-    expect(out.startsWith("… ")).toBe(true);
-    expect(out).toContain("NEEDLE");
-    // total = 2006; pad = (500 - 6) / 2 = 247; start = 1000 - 247 = 753; end = 1253
-    expect(out.endsWith(" … [truncated; columns 754-1253 of 2006]")).toBe(true);
-    expect(Array.from(out.slice(2, out.indexOf(" … [")))).toHaveLength(500);
-  });
-
-  it("clips the head when the match ends inside the first 500 characters", () => {
-    const line = "NEEDLE" + "b".repeat(1000);
-    expect(clipMatch(line, matchFinder({ pattern: "NEEDLE", root: "." }))).toBe(
-      line.slice(0, 500) + "… [truncated]",
-    );
-  });
-
-  it("anchors the window to the end of a line when the match is near it", () => {
-    const line = "a".repeat(1000) + "NEEDLE";
-    const out = clipMatch(line, matchFinder({ pattern: "NEEDLE", root: "." }));
-    expect(out.endsWith("NEEDLE [truncated; columns 507-1006 of 1006]")).toBe(
+    const [hit] = parseRecords(`f\x001:1001:${line}\n`, true);
+    // total = 2006; start = 1000 - 250 = 750; end = 1250
+    expect(hit!.text.startsWith("… ")).toBe(true);
+    expect(hit!.text).toContain("NEEDLE");
+    expect(hit!.text.endsWith(" … [truncated; columns 751-1250 of 2006]")).toBe(
       true,
     );
   });
 
-  it("falls back to the head when the pattern finds nothing or does not compile", () => {
-    const line = "a".repeat(1000);
-    expect(clipMatch(line, matchFinder({ pattern: "zzz", root: "." }))).toBe(
-      clip(line),
-    );
-    expect(clipMatch(line, matchFinder({ pattern: "(", root: "." }))).toBe(
-      clip(line),
+  it("clips the head when the match starts in the first 250 characters", () => {
+    const line = "NEEDLE" + "b".repeat(1000);
+    const [hit] = parseRecords(`f\x001:1:${line}\n`, true);
+    expect(hit!.text).toBe(line.slice(0, 500) + "… [truncated]");
+  });
+
+  it("anchors the window to the end of a line when the match is near it", () => {
+    const line = "a".repeat(1000) + "NEEDLE";
+    const [hit] = parseRecords(`f\x001:1001:${line}\n`, true);
+    expect(hit!.text.endsWith("NEEDLE [truncated; columns 507-1006 of 1006]"))
+      .toBe(true);
+  });
+
+  it("counts the column in bytes, the offset in characters, and ignores CRs", () => {
+    // 600 two-byte characters, a CR, then the match at byte column 1202.
+    const line = "é".repeat(600) + "\r" + "x".repeat(600);
+    const [hit] = parseRecords(`f\x001:1202:${line}\n`, true);
+    expect(hit!.text.endsWith("[truncated; columns 351-850 of 1200]")).toBe(
+      true,
     );
   });
 
-  it("escapes a literal pattern and honors ignore_case", () => {
-    const line = "x".repeat(900) + "A.B(C)" + "y".repeat(100);
-    const lit = matchFinder({
-      pattern: "a.b(c)",
-      root: ".",
-      literal: true,
-      ignoreCase: true,
-    });
-    expect(clipMatch(line, lit)).toContain("A.B(C)");
+  it("falls back to the head with no column or one inside a character", () => {
+    const line = "é".repeat(1000);
+    expect(parseRecords(`f\x001:2:${line}\n`, true)[0]!.text).toBe(clip(line));
+    expect(parseRecords(`f\x001:${line}\n`)[0]!.text).toBe(clip(line));
+  });
+});
+
+describe("rg binary-file warning", () => {
+  const w =
+    ": WARNING: stopped searching binary file after match (found \"\\0\" byte around offset 3)";
+  it("is not the start of a record", () => {
+    const out = `a\x001:1:x\nb\x001:1:y\nb${w}\nc\x001:1:z\n`;
+    expect(parseRecords(out, true).map((h) => h.path)).toEqual(["a", "b", "c"]);
+  });
+  it("is a path when it is not the previous record's file", () => {
+    const out = `a\x001:1:x\nb${w}\nc\x001:1:z\n`;
+    expect(parseRecords(out, true).map((h) => h.path)).toEqual([
+      "a",
+      `b${w}\nc`,
+    ]);
   });
 });
 
@@ -521,54 +579,5 @@ describe("compileGlob (globset semantics)", () => {
     for (const bad of ["[a", "{a,b", "a}", "a**b"]) {
       expect(() => compileGlob(bad, false), bad).toThrow(/bad glob/);
     }
-  });
-});
-
-describe("jobs parsers", () => {
-  it("parses the baseline's read answer", () => {
-    const r = parseRead("running - 0 5\naGVsbG8=\n");
-    expect(r).toMatchObject({
-      state: "running",
-      code: null,
-      offset: 0,
-      end: 5,
-    });
-    expect(new TextDecoder().decode(r.data)).toBe("hello");
-    expect(parseRead("ended 3 10 20\n\n")).toMatchObject({
-      state: "ended",
-      code: 3,
-      offset: 10,
-      end: 20,
-    });
-    expect(parseRead("gone\n")).toMatchObject({ state: "gone", end: 0 });
-    expect(() => parseRead("bogus")).toThrow(/unreadable/);
-    expect(() => parseRead("running - 0 5\n***\n")).toThrow(/unreadable/);
-  });
-
-  it("parses a list line, label with spaces whole", () => {
-    expect(
-      parseListLine(
-        "0123ab ended 0 7 background 120 1700000000 1700000009 sleep 1 && echo hi",
-      ),
-    ).toEqual({
-      id: "0123ab",
-      state: "ended",
-      code: 0,
-      kept: true,
-      num: 7,
-      kind: "background",
-      seen: 120,
-      started: 1700000000,
-      ended: 1700000009,
-      label: "sleep 1 && echo hi",
-    });
-    expect(parseListLine("abc running - - - 0 5 0 ")).toMatchObject({
-      kept: false,
-      num: null,
-      kind: null,
-      label: "",
-    });
-    expect(parseListLine("ABC running - - - 0 5 0 x")).toBeNull();
-    expect(parseListLine("")).toBeNull();
   });
 });

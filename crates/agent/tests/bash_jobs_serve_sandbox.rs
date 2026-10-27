@@ -98,7 +98,7 @@ impl Drop for Reap {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_background_job_outlives_its_serve_process_and_the_next_one_reports_it_running() {
     let dir = tempfile::tempdir().unwrap();
-    let exec = ExecMock::start(dir.path(), true).await;
+    let exec = ExecMock::start(dir.path()).await;
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let url = exec.url.clone();
     let first = {
@@ -177,7 +177,7 @@ async fn a_background_job_outlives_its_serve_process_and_the_next_one_reports_it
 #[tokio::test(flavor = "multi_thread")]
 async fn a_job_that_ended_while_no_process_served_the_session_is_noticed_once() {
     let dir = tempfile::tempdir().unwrap();
-    let exec = ExecMock::start(dir.path(), true).await;
+    let exec = ExecMock::start(dir.path()).await;
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let url = exec.url.clone();
     {

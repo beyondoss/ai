@@ -3,7 +3,7 @@
 use super::*;
 use serde_json::Value;
 
-const RETRY: &str = include_str!("../../sandbox/tests/fixtures/exec/v1.4-retry.json");
+const RETRY: &str = include_str!("../../sandbox/tests/fixtures/exec/notify-retry.json");
 
 fn outcome(v: &Value) -> Outcome {
     match v.as_u64() {
@@ -45,7 +45,7 @@ fn the_status_table_is_the_vectors() {
     }
 }
 
-/// Every timeline of `v1.4-retry.json`, driven through [`step`] as an endpoint drives it: the keep
+/// Every timeline of `notify-retry.json`, driven through [`step`] as an endpoint drives it: the keep
 /// owes the proof, each attempt ends after its duration, and the kernel says when the next begins.
 #[test]
 fn every_retry_timeline_is_what_step_does() {
@@ -270,7 +270,7 @@ fn every_short_sequence_keeps_the_invariants() {
 #[test]
 fn the_body_is_the_vector() {
     let file: Value = serde_json::from_str(include_str!(
-        "../../sandbox/tests/fixtures/exec/v1.4-callback.json"
+        "../../sandbox/tests/fixtures/exec/notify-callback.json"
     ))
     .unwrap();
     assert_eq!(
@@ -286,12 +286,12 @@ fn the_body_is_the_vector() {
     );
 }
 
-/// Every `v1.4-keep.json` case whose `url` and `token` are strings: the grammar accepts exactly the
+/// Every `notify-keep.json` case whose `url` and `token` are strings: the grammar accepts exactly the
 /// accepted ones. (A member of the wrong type, or missing, is the caller's to refuse.)
 #[test]
 fn the_notify_grammar_is_the_vectors() {
     let file: Value = serde_json::from_str(include_str!(
-        "../../sandbox/tests/fixtures/exec/v1.4-keep.json"
+        "../../sandbox/tests/fixtures/exec/notify-keep.json"
     ))
     .unwrap();
     let mut checked = 0;

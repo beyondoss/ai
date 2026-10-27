@@ -18,7 +18,7 @@
 #   gateway task               the real gateway (crates/gateway) + a NATS sidecar its allowance set needs;
 #                              the ONLY task that references the provider key (SSM -> `secrets`)
 #   agent task                 `serve --service`, grants verified, sessions on EFS, https callback listener
-#   sandbox task               the reference exec endpoint (v1.1-v1.4) running commands for real
+#   sandbox task               the reference exec endpoint (one-shot-notify) running commands for real
 #
 # Keys never touch the repo: provider keys are read from the environment and stored only as SSM
 # SecureStrings under /beyond-ai-demo/<name>/; the signing keys are generated here, once, and stored

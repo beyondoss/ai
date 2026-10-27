@@ -68,7 +68,8 @@ pub(crate) async fn git_branch_in(
     if result.code != Some(0) {
         return None;
     }
-    let branch = result.stdout.trim();
+    let stdout = result.stdout_text();
+    let branch = stdout.trim();
     (!branch.is_empty()).then(|| branch.to_string())
 }
 

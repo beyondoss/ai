@@ -108,13 +108,14 @@ def substrate(state, session, bearer):
             job = req.get("job")
             if not isinstance(req.get("stream", False), bool) or (job is not None and not isinstance(job, dict)):
                 return self.answer(400, {"error": "unsupported extension"})
-            if job is not None and (job.get("op") not in ("probe", "start", "keep") or not isinstance(job.get("notify", {}), dict)):
+            if job is not None and (job.get("op") not in ("start", "keep") or not isinstance(job.get("notify", {}), dict)):
                 return self.answer(422, {"error": "unsupported extension"})
             r = subprocess.run([req["command"]] + req["args"], capture_output=True)
             if req.get("stream"):
                 frames = [{"stdout": __import__("base64").b64encode(r.stdout).decode()}, {"exit_code": r.returncode}]
                 return self.answer(200, "".join(json.dumps(f) + "\n" for f in frames).encode(), "application/x-ndjson")
-            self.answer(200, {"exit_code": r.returncode, "stdout": r.stdout.decode(), "stderr": r.stderr.decode()})
+            b64 = __import__("base64").b64encode
+            self.answer(200, {"exit_code": r.returncode, "stdout": b64(r.stdout).decode(), "stderr": b64(r.stderr).decode()})
 
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Exec)
     srv.daemon_threads = True

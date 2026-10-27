@@ -242,12 +242,21 @@ async fn get_state_reports_the_sandbox_workspace_and_no_host_paths() {
 #[tokio::test]
 async fn get_state_mid_run_is_never_cwd_stale() {
     const WORKSPACE: &str = "/sandbox/workspace-not-on-the-replica";
+    // The sandbox has no such directory either, so the tool fails at once; the run stays busy
+    // because the model's answer to that takes two seconds.
     let turn1 = turn_tool_use(
         "toolu_gs",
         "bash",
         &json!({ "command": "sleep 2" }).to_string(),
     );
-    let (base, _requests) = spawn_model_server(vec![turn1, turn_text("done")]);
+    let (base, _requests) = beyond_test_support::spawn_model_server_fn(move |req: &str| {
+        if req.contains("tool_result") {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            turn_text("done")
+        } else {
+            turn1.clone()
+        }
+    });
     let svc = Service::start(&base, &["s1"]).await;
     let token = svc.token_with("00tenant1", "s1.alpha", |c| {
         c.workspace_root = WORKSPACE.into()

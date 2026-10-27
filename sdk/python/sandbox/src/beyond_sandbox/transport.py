@@ -2,8 +2,7 @@
 
 A transport is anything with ``run`` and ``stream``: an HTTP endpoint, an SSH session, a vendor SDK,
 a test double. Everything above (files, jobs, the :class:`~beyond_sandbox.Sandbox`) is built on
-these calls alone. A transport that also has the ``job_*`` methods of :class:`JobTransport` offers
-v1.3 jobs natively; without them jobs run on plain commands.
+these calls alone. Jobs need the ``job_*`` methods of :class:`JobTransport` on top.
 """
 
 from __future__ import annotations
@@ -17,16 +16,8 @@ from collections import deque
 from typing import Any, Callable, Iterator, Protocol, Sequence, Union, runtime_checkable
 
 from . import _http, _wire
-from .errors import (
-    EndpointError,
-    NotOffered,
-    ProtocolError,
-    SandboxError,
-    Timeout,
-    TooLarge,
-    TransportError,
-)
-from .models import ExecResult, Exit, Frame, JobFrame, Stderr, Stdout
+from .errors import ProtocolError, SandboxError, Timeout, TooLarge, TransportError
+from .models import ExecResult, Frame, JobFrame
 
 DEFAULT_TIMEOUT_MS = 120_000
 
@@ -34,7 +25,7 @@ Token = Union[str, Callable[[], str], None]
 
 
 class FrameStream(Protocol):
-    """An iterator of v1.2 frames. ``close()`` ends it early; closing kills the command."""
+    """An iterator of stream frames. ``close()`` ends it early; closing kills the command."""
 
     def __iter__(self) -> Iterator[Frame]: ...
     def __next__(self) -> Frame: ...
@@ -70,19 +61,13 @@ class Transport(Protocol):
         cwd: str | None = None,
         timeout_ms: int | None = None,
     ) -> FrameStream:
-        """Run a command and yield its frames as they arrive (v1.2).
-
-        Raises :class:`~beyond_sandbox.NotOffered` if the endpoint cannot stream, rather than
-        running the command one-shot. Closing the iterator kills the command.
-        """
+        """Run a command and yield its frames as they arrive. Closing the iterator kills it."""
         ...
 
 
 @runtime_checkable
 class JobTransport(Transport, Protocol):
-    """Optional: native sandbox jobs (v1.3)."""
-
-    def job_offer(self) -> _wire.JobOffer: ...
+    """A transport that also keeps jobs in the sandbox."""
 
     def job_call(
         self,
@@ -173,13 +158,11 @@ class _Response:
 
 
 class _Frames:
-    """Items of an NDJSON stream (v1.2 frames, or a job stream's). ``close()`` drops the connection."""
+    """Items of an NDJSON stream (command frames, or a job stream's). ``close()`` drops the connection."""
 
-    def __init__(
-        self, resp: _Response, decoder: _wire.StreamDecoder[Any], first: list[Any]
-    ) -> None:
+    def __init__(self, resp: _Response, decoder: _wire.StreamDecoder[Any]) -> None:
         self._resp, self._decoder = resp, decoder
-        self._pending: deque[Any] = deque(first)
+        self._pending: deque[Any] = deque()
         self._closed = False
 
     def __iter__(self) -> _Frames:
@@ -217,7 +200,7 @@ class _Frames:
 
 
 class HttpTransport:
-    """The exec protocol over HTTP (v1.1 to v1.3), on the standard library alone.
+    """The exec protocol over HTTP, on the standard library alone.
 
     ``token`` is a bearer token, or a callable returning one: it is called on first use, and once
     more if the endpoint answers 401, after which that one request is sent again. That is the only
@@ -241,9 +224,6 @@ class HttpTransport:
         self._cap = max_response_bytes
         self._ssl = ssl_context
         self._lock = threading.Lock()
-        self._streams: bool | None = None
-        self._output: bool | None = None
-        self._offer: _wire.JobOffer | None = None
 
     # ---- the wire ---------------------------------------------------------------------------
 
@@ -319,121 +299,10 @@ class HttpTransport:
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
         stdin: bytes | None = None,
     ) -> ExecResult:
-        """Run one command; its output is the **bytes** the command wrote (``exact``): over
-        ``output_base64`` when the endpoint honours it, else over a v1.2 stream's base64 frames. A
-        plain v1.1 endpoint (or a call with stdin on one without ``output_base64``) can only answer
-        text, which is returned as UTF-8 with ``exact=False``. A probe that failed raises."""
-        if self.outputs_base64():
-            body = _wire.request_body(
-                command, args, cwd=cwd, timeout_ms=timeout_ms, stdin=stdin, output_base64=True
-            )
-            raw = self._post(body, timeout_ms, _wire.body_cap(self._cap))
-            return _wire.decode_output(self.url, raw, self._cap)
-        # A stream has no stdin in the spec: a call with stdin is a v1.1 call, whose text it is.
-        if stdin is None and self.streams():
-            return self._run_over_stream(command, args, cwd, timeout_ms)
-        return self.run_text(command, args, cwd=cwd, timeout_ms=timeout_ms, stdin=stdin)
-
-    def run_text(
-        self,
-        command: str,
-        args: Sequence[str] = (),
-        *,
-        cwd: str | None = None,
-        timeout_ms: int = DEFAULT_TIMEOUT_MS,
-        stdin: bytes | None = None,
-    ) -> ExecResult:
-        """:meth:`run` the plain v1.1 way: the output is the endpoint's text, ``exact=False``. For
-        the helpers, which read text (or base64 they asked the shell for) and need neither the
-        probe nor the stream; a transport without this method is called through ``run``."""
+        """Run one command; its output is the **bytes** the command wrote."""
         body = _wire.request_body(command, args, cwd=cwd, timeout_ms=timeout_ms, stdin=stdin)
-        return _wire.parse_envelope(self.url, self._post(body, timeout_ms))
-
-    def outputs_base64(self) -> bool:
-        """Whether the endpoint honours ``output_base64`` (exec v1.1), probing once:
-        ``printf '\\377\\000\\n'`` must come back as ``stdout_base64`` decoding to ``ff 00 0a``. A
-        ``400`` is a strict front refusing the field: no. A request that failed raises; it is never
-        read as "no"."""
-        if self._output is None:
-            body = _wire.request_body(
-                "sh",
-                ["-c", _wire.OUTPUT_PROBE_SCRIPT],
-                cwd=None,
-                timeout_ms=10_000,
-                output_base64=True,
-            )
-            try:
-                raw = self._post(body, 10_000, _wire.body_cap(len(_wire.OUTPUT_PROBE_BYTES)))
-            except EndpointError as e:
-                if e.status != 400:
-                    raise
-                self._output = False
-                return False
-            obj = _wire.parse_json(self.url, raw)
-            if not isinstance(obj, dict) or not isinstance(obj.get("exit_code"), int):
-                raise ProtocolError(
-                    f"exec endpoint {self.url} returned unparseable JSON (no exit_code)"
-                )
-            self._output = _wire.probe_honoured(obj)
-        return self._output
-
-    def _run_over_stream(
-        self, command: str, args: Sequence[str], cwd: str | None, timeout_ms: int
-    ) -> ExecResult:
-        """A one-shot call over a v1.2 stream: the frames are base64 already."""
-        body = _wire.request_body(command, args, cwd=cwd, timeout_ms=timeout_ms, stream=True)
-        resp = self._open(body, timeout_ms)
-        try:
-            if not resp.headers.get("content-type", "").lower().startswith("application/x-ndjson"):
-                # One object after all (a fleet mid-rollout): text.
-                return _wire.parse_envelope(self.url, resp.read_capped(self._cap))
-            decoder, fold = _wire.frame_decoder(), _wire.OneShot()
-            while True:
-                data = resp.next_chunk(_wire.SILENCE_S)
-                if not data:
-                    decoder.eof()
-                for frame in decoder.feed(data):
-                    done = fold.feed(frame)
-                    if done is not None:
-                        return done
-                    if fold.size > self._cap:
-                        raise _wire.too_large(self.url, self._cap)
-        finally:
-            resp.close()
-
-    # ---- stream (v1.2) -----------------------------------------------------------------------
-
-    def streams(self) -> bool:
-        """Whether the endpoint has proved it streams, probing once. An outage is not an answer."""
-        if self._streams is None:
-            self._streams = self._probe_streams()
-        return self._streams
-
-    def _probe_streams(self) -> bool:
-        body = _wire.request_body(
-            "sh", ["-c", _wire.STREAM_PROBE_SCRIPT], cwd=None, timeout_ms=10_000, stream=True
-        )
-        try:
-            resp = self._open(body, 10_000)
-        except EndpointError as e:
-            if e.status in (400, 422):  # a strict front refusing the field has answered
-                return False
-            raise
-        try:
-            if not resp.headers.get("content-type", "").lower().startswith("application/x-ndjson"):
-                return False
-            decoder, seen = _wire.frame_decoder(), _wire.ProbeObserver()
-            while not decoder.finished:
-                data = resp.next_chunk(_wire.SILENCE_S)
-                if not data:
-                    return False
-                for frame in decoder.feed(data):
-                    seen.see(frame)
-            return seen.streams()
-        except ProtocolError:
-            return False
-        finally:
-            resp.close()
+        raw = self._post(body, timeout_ms, _wire.body_cap(self._cap))
+        return _wire.parse_envelope(self.url, raw, self._cap)
 
     def stream(
         self,
@@ -443,44 +312,11 @@ class HttpTransport:
         cwd: str | None = None,
         timeout_ms: int | None = None,
     ) -> FrameStream:
-        if not self.streams():
-            raise NotOffered("this exec endpoint does not stream (protocol v1.1)")
         ms = _wire.STREAM_DEADLINE_MS if timeout_ms is None else timeout_ms
         body = _wire.request_body(command, args, cwd=cwd, timeout_ms=ms, stream=True)
-        resp = self._open(body, ms)
-        if resp.headers.get("content-type", "").lower().startswith("application/x-ndjson"):
-            return _Frames(resp, _wire.frame_decoder(), [])
-        # One object after all (a fleet mid-rollout): everything arrives at once, at the end.
-        try:
-            result = _wire.parse_envelope(self.url, resp.read_capped(self._cap))
-        finally:
-            resp.close()
-        frames: list[Frame] = []
-        if result.stdout:
-            frames.append(Stdout(result.stdout))
-        if result.stderr:
-            frames.append(Stderr(result.stderr))
-        frames.append(Exit(result.exit_code))
-        return iter_frames(frames)
+        return _Frames(self._open(body, ms), _wire.frame_decoder())
 
-    # ---- jobs (v1.3) -------------------------------------------------------------------------
-
-    def job_offer(self) -> _wire.JobOffer:
-        """What the endpoint offers for jobs, probing once."""
-        if self._offer is None:
-            body = _wire.request_body(
-                "sh", ["-c", "printf exec-v1.2"], cwd=None, timeout_ms=10_000, job={"op": "probe"}
-            )
-            try:
-                answer = _wire.parse_json(self.url, self._post(body, 10_000))
-                self._offer = _wire.parse_offer(answer)
-            except EndpointError as e:
-                if e.status != 400:
-                    raise
-                self._offer = _wire.JobOffer()
-            except ProtocolError:
-                self._offer = _wire.JobOffer()
-        return self._offer
+    # ---- jobs --------------------------------------------------------------------------------
 
     def job_call(
         self,
@@ -499,7 +335,7 @@ class HttpTransport:
         body = _wire.request_body(
             "true", [], cwd=None, timeout_ms=_wire.STREAM_DEADLINE_MS, stream=True, job=job
         )
-        return _Frames(self._open(body, _wire.STREAM_DEADLINE_MS), _wire.job_decoder(), [])
+        return _Frames(self._open(body, _wire.STREAM_DEADLINE_MS), _wire.job_decoder())
 
     def close(self) -> None:
         """Nothing is held between requests; present so a transport can be used as a context."""
@@ -509,22 +345,3 @@ class HttpTransport:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
-
-
-def iter_frames(frames: list[Frame]) -> FrameStream:
-    """A :class:`FrameStream` over frames already in hand."""
-    return _Prebuilt(frames)
-
-
-class _Prebuilt:
-    def __init__(self, frames: list[Frame]) -> None:
-        self._it = iter(frames)
-
-    def __iter__(self) -> _Prebuilt:
-        return self
-
-    def __next__(self) -> Frame:
-        return next(self._it)
-
-    def close(self) -> None:
-        self._it = iter(())

@@ -17,7 +17,6 @@ from .transport import Transport
 class CapsOverride(TypedDict, total=False):
     """Probe results to override after probing, so one sandbox can walk every fallback rung."""
 
-    stdin: bool
     find_printf: bool
     search_engine: str  # "rg" | "grep" | "busybox-grep"
 
@@ -31,11 +30,7 @@ def apply_override(caps: Capabilities, override: CapsOverride | None) -> Capabil
             raise InvalidRequest(f"unknown search engine {engine!r}")
         caps = _fs.with_engine(caps, engine)
     return _fs.capabilities(
-        caps.rg,
-        caps.grep_null,
-        override.get("find_printf", caps.find_printf),
-        override.get("stdin", caps.stdin),
-        caps.read_window,
+        caps.rg, caps.grep_null, override.get("find_printf", caps.find_printf), caps.read_window
     )
 
 
@@ -63,8 +58,9 @@ def _query(
 class Files:
     """Files over a :class:`~beyond_sandbox.Transport`: ``run`` is all it needs.
 
-    Probes the sandbox once (on first use) and picks the best rung of each fallback ladder. A probe
-    that fails at the transport level raises from the operation that needed it and is not cached.
+    Probes the sandbox environment once, in one round trip on first need, and picks the best rung of
+    each fallback ladder (writes need no probe). A probe that fails at the transport level raises
+    from the operation that needed it and is not cached.
     """
 
     def __init__(self, transport: Transport, *, override: CapsOverride | None = None) -> None:
@@ -88,14 +84,14 @@ class Files:
 
     def write(self, path: str, data: bytes) -> None:
         """Replace the file's content atomically, keeping its mode and writing through symlinks."""
-        drive(_fs.write(path, data, self.capabilities()), self._t)
+        drive(_fs.write(path, data), self._t)
 
-    def write_if_unchanged(self, path: str, data: bytes, expected_mtime: int | None) -> None:
-        """Write unless the file's mtime (whole seconds) differs; ``None`` means "must not exist".
+    def write_if_unchanged(self, path: str, data: bytes, expected_mtime: float | None) -> None:
+        """Write unless the file's mtime (epoch seconds, with the fraction) differs; ``None`` means "must not exist".
 
         Raises :class:`~beyond_sandbox.Conflict` on a mismatch. Two round trips: not a lock.
         """
-        drive(_fs.write_if_unchanged(path, data, expected_mtime, self.capabilities()), self._t)
+        drive(_fs.write_if_unchanged(path, data, expected_mtime), self._t)
 
     def mkdir(self, path: str) -> None:
         """``mkdir -p``: idempotent."""
@@ -149,11 +145,12 @@ class AsyncFiles:
         return await adrive(_fs.read(path, offset, max, await self.capabilities()), self._t)
 
     async def write(self, path: str, data: bytes) -> None:
-        await adrive(_fs.write(path, data, await self.capabilities()), self._t)
+        await adrive(_fs.write(path, data), self._t)
 
-    async def write_if_unchanged(self, path: str, data: bytes, expected_mtime: int | None) -> None:
-        op = _fs.write_if_unchanged(path, data, expected_mtime, await self.capabilities())
-        await adrive(op, self._t)
+    async def write_if_unchanged(
+        self, path: str, data: bytes, expected_mtime: float | None
+    ) -> None:
+        await adrive(_fs.write_if_unchanged(path, data, expected_mtime), self._t)
 
     async def mkdir(self, path: str) -> None:
         await adrive(_fs.mkdir(path), self._t)

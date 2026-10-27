@@ -1,5 +1,5 @@
 //! The `bjn_v1` notify token as the crate makes and checks it (`beyond_agent::notify_token`),
-//! held to `tests/fixtures/exec/v1.4-token.json` and to the spec's token requirements.
+//! held to `tests/fixtures/exec/notify-token.json` and to the spec's token requirements.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -9,7 +9,7 @@ use beyond_agent::exec_endpoint::jobs::{JobId, JobScope};
 use beyond_agent::notify_token::{NotifyKey, Verdict};
 use serde_json::Value;
 
-const FIXTURE: &str = include_str!("../../sandbox/tests/fixtures/exec/v1.4-token.json");
+const FIXTURE: &str = include_str!("../../sandbox/tests/fixtures/exec/notify-token.json");
 
 fn fixture() -> Value {
     serde_json::from_str(FIXTURE).unwrap()

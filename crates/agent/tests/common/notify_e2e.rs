@@ -1,15 +1,14 @@
-//! The end-to-end fleet for exec v1.4's proof suites: real `serve --service` replicas, a fleet
+//! The end-to-end fleet for the job notify proof suites: real `serve --service` replicas, a fleet
 //! front that routes by session id over a hash ring (retrying and walking on `503`, attaching
 //! nothing), the reference endpoint behind a proxy that counts every byte crossing a
 //! replica-to-endpoint connection, and a model that answers by each request's last message.
 //!
-//! Every suite runs in three endpoint modes:
+//! Every suite runs in two endpoint modes, both on the one protocol:
 //!
-//! - [`Mode::Native`]: the endpoint keeps jobs itself (v1.3) and calls back natively (v1.4);
-//! - [`Mode::Baseline`]: the endpoint has no native jobs, so the agent runs its baseline
-//!   (`ShellJobs`), whose `setsid` supervisor calls back with `curl`;
-//! - [`Mode::NoEgress`]: the sandbox cannot reach the network, so the endpoint does not offer
-//!   notify, and every job is held as before v1.4.
+//! - [`Mode::Native`]: the endpoint keeps jobs itself and calls back;
+//! - [`Mode::NoEgress`]: the sandbox cannot reach the network, so no callback ever arrives. The
+//!   replica sends `notify` all the same (nothing is advertised), never gets the first notice, and so
+//!   never releases a stream: every job is held to its end, as before notify.
 
 #![allow(dead_code)]
 
@@ -30,36 +29,23 @@ use super::{TestWs, turn_text, turn_tool_use, ws_connect_with_headers, ws_send};
 
 pub const TENANT: &str = "00tenant1";
 
-/// How the sandbox's endpoint offers jobs and notify.
+/// How the sandbox's endpoint is set up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Native,
-    Baseline,
     NoEgress,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 3] = [Mode::Native, Mode::Baseline, Mode::NoEgress];
+    pub const ALL: [Mode; 2] = [Mode::Native, Mode::NoEgress];
 
-    /// The endpoint for this mode; `notify` off is the same endpoint whose deployment does not
-    /// say kept jobs survive idling, so it never offers notify: today's behaviour, to compare with.
-    pub fn mock(self, notify: bool) -> MockOptions {
-        let base = MockOptions {
-            kept_jobs_survive_idle: notify,
+    /// The endpoint for this mode.
+    pub fn mock(self, _notify: bool) -> MockOptions {
+        MockOptions {
             // A heartbeat often enough that a held stream is plainly not silent.
             heartbeat: Duration::from_secs(1),
+            egress: self == Mode::Native,
             ..MockOptions::default()
-        };
-        match self {
-            Mode::Native => base,
-            Mode::Baseline => MockOptions {
-                jobs: false,
-                ..base
-            },
-            Mode::NoEgress => MockOptions {
-                egress: false,
-                ..base
-            },
         }
     }
 
@@ -71,7 +57,6 @@ impl Mode {
     pub fn name(self) -> &'static str {
         match self {
             Mode::Native => "native",
-            Mode::Baseline => "baseline",
             Mode::NoEgress => "no-egress",
         }
     }
@@ -564,7 +549,8 @@ pub struct Setup {
     pub mode: Mode,
     /// Replica slots on the ring.
     pub replicas: usize,
-    /// Whether the endpoint's deployment offers notify (off: today's behaviour).
+    /// Whether the replicas are told the edge's origin, which makes notify available (off: today's
+    /// behaviour).
     pub notify: bool,
     /// A detached session's idle timeout, in seconds.
     pub idle_timeout: Option<u64>,
@@ -604,7 +590,11 @@ impl E2e {
     pub async fn start(setup: Setup) -> Self {
         let (base, requests) = beyond_test_support::spawn_model_server_fn(answer);
         let (front, listener) = Front::bind(setup.replicas).await;
-        let mut replica_args = vec!["--notify-origin".to_string(), front.origin.clone()];
+        // Notify is available when the operator configured the origin the edge serves sessions at.
+        let mut replica_args = Vec::new();
+        if setup.notify {
+            replica_args.extend(["--notify-origin".to_string(), front.origin.clone()]);
+        }
         if let Some(secs) = setup.idle_timeout {
             replica_args.extend(["--session-idle-timeout".to_string(), secs.to_string()]);
         }
@@ -994,8 +984,7 @@ pub async fn wait_reaped(svc: &Service, ports: &[u16], session: &str) {
     }
 }
 
-/// One test per endpoint mode, `case::native`, `case::baseline`, `case::no_egress`, each running
-/// `case(Mode)`; the modes run in parallel.
+/// One test per endpoint mode, `case::native` and `case::no_egress`, each running `case(Mode)`.
 #[allow(unused_macros)]
 macro_rules! in_every_mode {
     ($($case:ident),* $(,)?) => {$(
@@ -1004,10 +993,6 @@ macro_rules! in_every_mode {
             #[tokio::test(flavor = "multi_thread")]
             async fn native() {
                 super::$case(Mode::Native).await;
-            }
-            #[tokio::test(flavor = "multi_thread")]
-            async fn baseline() {
-                super::$case(Mode::Baseline).await;
             }
             #[tokio::test(flavor = "multi_thread")]
             async fn no_egress() {
@@ -1019,7 +1004,7 @@ macro_rules! in_every_mode {
 #[allow(unused_imports)]
 pub(crate) use in_every_mode;
 
-/// As [`in_every_mode`], for a case that needs a callback path: native and baseline only.
+/// As [`in_every_mode`], for a case that needs a callback path.
 #[allow(unused_macros)]
 macro_rules! in_notify_modes {
     ($($case:ident),* $(,)?) => {$(
@@ -1029,10 +1014,7 @@ macro_rules! in_notify_modes {
             async fn native() {
                 super::$case(Mode::Native).await;
             }
-            #[tokio::test(flavor = "multi_thread")]
-            async fn baseline() {
-                super::$case(Mode::Baseline).await;
-            }
+
         }
     )*};
 }

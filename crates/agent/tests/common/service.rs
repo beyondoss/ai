@@ -70,7 +70,7 @@ pub struct Options {
     /// Pass the seal key as `AI_AGENT_SEAL_KEY_B64` (the key itself) instead of `--seal-key`.
     pub seal_key_from_env: bool,
     /// How the sandbox's exec endpoint behaves (its root and `HOME` are set here); the default
-    /// is a conforming v1.3 endpoint that does not advertise notify.
+    /// is a conforming jobs endpoint that does not advertise notify.
     pub exec: Option<super::exec_mock::MockOptions>,
     /// Capture the replica's stdout to [`Service::stdout_log`] (it is discarded otherwise).
     pub capture_stdout: bool,
@@ -93,7 +93,7 @@ impl Service {
                 mock.home = Some(sandbox_home.clone());
                 ExecMock::start_with(&workspace, mock).await
             }
-            None => ExecMock::start_with_home(&workspace, Some(&sandbox_home), true).await,
+            None => ExecMock::start_with_home(&workspace, Some(&sandbox_home)).await,
         };
 
         let shards: Vec<(String, PathBuf)> = shard_names

@@ -1,5 +1,5 @@
 //! Randomized differential testing: a command run directly on the host vs the same command through
-//! a real `execd`, over v1.1 (one JSON answer) and v1.2 (ndjson frames).
+//! a real `execd`, over one-shot (one JSON answer) and streaming (ndjson frames).
 //!
 //! The example tests and the conformance verifier check the cases somebody thought of. This file
 //! generates shell programs that lean on the edges instead (arbitrary bytes on both streams, sizes
@@ -13,16 +13,16 @@
 //!
 //! ## What is compared, and what the spec lets differ
 //!
-//! - **Per stream, not across.** The order of stdout against stderr is best-effort (v1.2
+//! - **Per stream, not across.** The order of stdout against stderr is best-effort (streaming
 //!   "Ordering"), so each stream is compared on its own.
-//! - **v1.1 strings are UTF-8.** The answer is JSON, so its `stdout`/`stderr` are the command's
-//!   bytes decoded lossily; the direct bytes are decoded the same way. v1.2 is base64 and exact.
-//! - **v1.1 signals are `128 + S`** (the convention `shell_exit` documents); the direct run's signal
-//!   is mapped the same way. v1.2 carries `{"signal": S}` and is compared exactly.
-//! - **stdin is v1.1 only.** A v1.2 command has no stdin, so it is compared against a direct run
+//! - **Output is bytes.** A one-shot answer's `stdout`/`stderr` are base64, like a stream's frames, so
+//!   both are compared with the direct bytes exactly.
+//! - **one-shot signals are `128 + S`** (the convention `shell_exit` documents); the direct run's signal
+//!   is mapped the same way. streaming carries `{"signal": S}` and is compared exactly.
+//! - **stdin is one-shot only.** A streaming command has no stdin, so it is compared against a direct run
 //!   with `/dev/null`.
-//! - **Background children that outlive the shell.** v1.2 holds the stream open until the group is
-//!   empty, so the final output is exact. v1.1 answers when the shell exits, reading pipes for a
+//! - **Background children that outlive the shell.** streaming holds the stream open until the group is
+//!   empty, so the final output is exact. one-shot answers when the shell exits, reading pipes for a
 //!   100 ms grace, so a late write of a child it did not wait for may be dropped: the answer must
 //!   be a prefix of the direct output that is missing at most the background children's bytes.
 //! - **Framing** is checked too: no empty output frame, none over 64 KiB decoded, exactly one final
@@ -354,29 +354,35 @@ fn request(script: &str) -> Value {
     json!({ "command": "sh", "args": ["-c", script], "timeout_ms": 60_000 })
 }
 
-/// v1.1: one JSON answer. `128 + S` stands for a signal here, so it is reported as an exit code.
+fn decode(v: &Value) -> Vec<u8> {
+    base64::engine::general_purpose::STANDARD
+        .decode(v.as_str().expect("base64 output"))
+        .expect("standard base64")
+}
+
+/// One-shot: one JSON answer. `128 + S` stands for a signal here, so it is reported as an exit code.
 async fn via_v11(addr: SocketAddr, script: &str, stdin: Option<&[u8]>) -> Outcome {
     let mut req = request(script);
     if let Some(b) = stdin {
-        req["stdin_base64"] = json!(base64::engine::general_purpose::STANDARD.encode(b));
+        req["stdin"] = json!(base64::engine::general_purpose::STANDARD.encode(b));
     }
     let a = post(addr, &[], &req).await;
-    assert_eq!(a.status, 200, "v1.1 status");
+    assert_eq!(a.status, 200, "one-shot status");
     let j = a.json();
     Outcome {
-        stdout: j["stdout"].as_str().expect("stdout").as_bytes().to_vec(),
-        stderr: j["stderr"].as_str().expect("stderr").as_bytes().to_vec(),
+        stdout: decode(&j["stdout"]),
+        stderr: decode(&j["stderr"]),
         ended: Ended::Exit(j["exit_code"].as_i64().expect("exit_code") as i32),
     }
 }
 
-/// v1.2: frames, decoded and concatenated per stream, with the framing rules checked.
+/// streaming: frames, decoded and concatenated per stream, with the framing rules checked.
 async fn via_v12(addr: SocketAddr, script: &str) -> Result<Outcome, String> {
     let mut req = request(script);
     req["stream"] = json!(true);
     let a = post(addr, &[], &req).await;
     if a.status != 200 {
-        return Err(format!("v1.2 status {}", a.status));
+        return Err(format!("streaming status {}", a.status));
     }
     let mut o = Outcome {
         stdout: Vec::new(),
@@ -432,23 +438,23 @@ fn first_diff(a: &[u8], b: &[u8]) -> String {
 async fn check(addr: SocketAddr, root: &Path, home: &Path, p: &Program) -> Result<(), String> {
     let script = p.script();
 
-    // v1.2: no stdin on either side.
+    // streaming: no stdin on either side.
     let want = direct_async(root, home, &script, None).await;
     let got = via_v12(addr, &script).await?;
     for (name, on, g, w) in [
         ("stdout", Stream::Out, &got.stdout, &want.stdout),
         ("stderr", Stream::Err, &got.stderr, &want.stderr),
     ] {
-        same(g, w, p.loose_bytes(on), true).map_err(|e| format!("v1.2 {name}: {e}"))?;
+        same(g, w, p.loose_bytes(on), true).map_err(|e| format!("streaming {name}: {e}"))?;
     }
     if got.ended != want.ended {
         return Err(format!(
-            "v1.2 end: {:?} vs direct {:?}",
+            "streaming end: {:?} vs direct {:?}",
             got.ended, want.ended
         ));
     }
 
-    // v1.1, with the stdin the program carries.
+    // one-shot, with the stdin the program carries.
     let want = direct_async(root, home, &script, p.stdin.clone()).await;
     let got = via_v11(addr, &script, p.stdin.as_deref()).await;
     let want_code = match want.ended {
@@ -457,7 +463,7 @@ async fn check(addr: SocketAddr, root: &Path, home: &Path, p: &Program) -> Resul
     };
     if got.ended != Ended::Exit(want_code) {
         return Err(format!(
-            "v1.1 exit_code: {:?} vs direct {want_code}",
+            "one-shot exit_code: {:?} vs direct {want_code}",
             got.ended
         ));
     }
@@ -465,15 +471,14 @@ async fn check(addr: SocketAddr, root: &Path, home: &Path, p: &Program) -> Resul
         ("stdout", Stream::Out, &got.stdout, &want.stdout),
         ("stderr", Stream::Err, &got.stderr, &want.stderr),
     ] {
-        let w = String::from_utf8_lossy(w).into_owned().into_bytes();
-        same(g, &w, p.loose_bytes(on), false).map_err(|e| format!("v1.1 {name}: {e}"))?;
+        same(g, w, p.loose_bytes(on), false).map_err(|e| format!("one-shot {name}: {e}"))?;
     }
     Ok(())
 }
 
 /// `got` is `want`, except that its last `loose` bytes belong to background children the shell did
 /// not wait for. Those arrive in whatever order the scheduler gives them, so only their multiset
-/// is compared; and when the endpoint may answer before they write (`exact` is false: v1.1) some
+/// is compared; and when the endpoint may answer before they write (`exact` is false: one-shot) some
 /// may be missing.
 fn same(got: &[u8], want: &[u8], loose: usize, exact: bool) -> Result<(), String> {
     let head = want.len().saturating_sub(loose);

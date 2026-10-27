@@ -1,18 +1,18 @@
-//! The exec v1.4 (sandbox job notify) vectors, `tests/fixtures/exec/v1.4-*.json`, and the rule that
+//! The exec sandbox job notify vectors, `tests/fixtures/exec/notify-*.json`, and the rule that
 //! every requirement of the spec has a check.
 //!
-//! The spec is the module doc of `exec_endpoint` ("Sandbox job notify (v1.4)"), plus FLEET.md's
+//! The spec is the module doc of `exec_endpoint` ("Sandbox job notify"), plus FLEET.md's
 //! "Job-end callbacks" for the edge. Each requirement there is tagged (`**N1**`, `**E1**`, …) and
-//! names its checks. `v1.4-checks.json` lists the same checks per tag, and this file holds the two
+//! names its checks. `notify-checks.json` lists the same checks per tag, and this file holds the two
 //! to each other.
 //!
 //! Nothing here exercises an implementation; there is none yet. What it does:
 //!
-//! - loads every v1.4 fixture into a strict schema (`deny_unknown_fields`), so a malformed or
+//! - loads every notify fixture into a strict schema (`deny_unknown_fields`), so a malformed or
 //!   misspelled fixture fails here rather than silently testing nothing later;
 //! - recomputes everything in the fixtures that follows from their own inputs: the token's key, kid,
 //!   MAC input, tag and token, each token vector's verdict under a reference verifier written from
-//!   the spec, the retry timelines from the schedule, the probe answers' meaning, and the callback
+//!   the spec, the retry timelines from the schedule, and the callback
 //!   body's exact bytes. A vector that disagrees with the spec fails here, before any
 //!   implementation is held to it;
 //! - fails when a tag in the spec has no check, when the doc and the registry name different
@@ -28,53 +28,24 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const PROBE: &str = include_str!("../../sandbox/tests/fixtures/exec/v1.4-probe.json");
-const KEEP: &str = include_str!("../../sandbox/tests/fixtures/exec/v1.4-keep.json");
-const CALLBACK: &str = include_str!("../../sandbox/tests/fixtures/exec/v1.4-callback.json");
-const TOKEN: &str = include_str!("../../sandbox/tests/fixtures/exec/v1.4-token.json");
-const RETRY: &str = include_str!("../../sandbox/tests/fixtures/exec/v1.4-retry.json");
-const CHECKS: &str = include_str!("../../sandbox/tests/fixtures/exec/v1.4-checks.json");
+const KEEP: &str = include_str!("../../sandbox/tests/fixtures/exec/notify-keep.json");
+const CALLBACK: &str = include_str!("../../sandbox/tests/fixtures/exec/notify-callback.json");
+const TOKEN: &str = include_str!("../../sandbox/tests/fixtures/exec/notify-token.json");
+const RETRY: &str = include_str!("../../sandbox/tests/fixtures/exec/notify-retry.json");
+const CHECKS: &str = include_str!("../../sandbox/tests/fixtures/exec/notify-checks.json");
 const SPEC_DOC: &str = include_str!("../../sandbox/src/exec_endpoint.rs");
 const FLEET_DOC: &str = include_str!("../FLEET.md");
 
-/// Every v1.4 fixture, by file name, so one added to the directory without a loader fails.
-const FIXTURES: [(&str, &str); 6] = [
-    ("v1.4-probe.json", PROBE),
-    ("v1.4-keep.json", KEEP),
-    ("v1.4-callback.json", CALLBACK),
-    ("v1.4-token.json", TOKEN),
-    ("v1.4-retry.json", RETRY),
-    ("v1.4-checks.json", CHECKS),
+/// Every notify fixture, by file name, so one added to the directory without a loader fails.
+const FIXTURES: [(&str, &str); 5] = [
+    ("notify-keep.json", KEEP),
+    ("notify-callback.json", CALLBACK),
+    ("notify-token.json", TOKEN),
+    ("notify-retry.json", RETRY),
+    ("notify-checks.json", CHECKS),
 ];
 
 // ---- schemas
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProbeFile {
-    spec: String,
-    notes: Vec<String>,
-    answers: Vec<ProbeCase>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProbeCase {
-    name: String,
-    answer: Value,
-    expect: ProbeExpect,
-    covers: Vec<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProbeExpect {
-    native_jobs: bool,
-    /// Notify offered natively.
-    notify: bool,
-    /// Notify offered for the baseline.
-    baseline_notify: bool,
-}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -192,7 +163,7 @@ enum Tracking {
     Proving,
     /// Its stream or a follow has it.
     Held,
-    /// v1.4's state: the stream closed after its proof. Not `JobShared::released`.
+    /// notify's state: the stream closed after its proof. Not `JobShared::released`.
     Unheld,
     /// A `bash_job` call in flight has it.
     Taken,
@@ -470,37 +441,32 @@ fn parse<T: serde::de::DeserializeOwned>(name: &str, raw: &str) -> T {
     serde_json::from_str(raw).unwrap_or_else(|e| panic!("{name} is malformed: {e}"))
 }
 
-fn probe() -> ProbeFile {
-    parse("v1.4-probe.json", PROBE)
-}
 fn keep() -> KeepFile {
-    parse("v1.4-keep.json", KEEP)
+    parse("notify-keep.json", KEEP)
 }
 fn callback() -> CallbackFile {
-    parse("v1.4-callback.json", CALLBACK)
+    parse("notify-callback.json", CALLBACK)
 }
 fn token() -> TokenFile {
-    parse("v1.4-token.json", TOKEN)
+    parse("notify-token.json", TOKEN)
 }
 fn retry() -> RetryFile {
-    parse("v1.4-retry.json", RETRY)
+    parse("notify-retry.json", RETRY)
 }
 fn checks() -> ChecksFile {
-    parse("v1.4-checks.json", CHECKS)
+    parse("notify-checks.json", CHECKS)
 }
 
 // ---- loading
 
 #[test]
-fn every_v14_fixture_loads_into_its_schema() {
-    let p = probe();
+fn every_notify_fixture_loads_into_its_schema() {
     let k = keep();
     let c = callback();
     let t = token();
     let r = retry();
     let ch = checks();
     for (name, spec, notes, cases) in [
-        ("probe", &p.spec, &p.notes, p.answers.len()),
         ("keep", &k.spec, &k.notes, k.cases.len()),
         (
             "callback",
@@ -517,16 +483,15 @@ fn every_v14_fixture_loads_into_its_schema() {
         ),
         ("checks", &ch.spec, &ch.notes, ch.requirements.len()),
     ] {
-        assert!(spec.contains("v1.4"), "{name}: spec names v1.4");
+        assert!(spec.contains("notify"), "{name}: spec names notify");
         assert!(!notes.is_empty(), "{name}: has notes");
         assert!(cases > 0, "{name}: has cases");
     }
     // Every case says which requirements it exercises.
-    let covers = p
-        .answers
+    let covers = k
+        .cases
         .iter()
         .map(|x| &x.covers)
-        .chain(k.cases.iter().map(|x| &x.covers))
         .chain(c.requests.iter().map(|x| &x.covers))
         .chain(c.receiver.iter().map(|x| &x.covers))
         .chain(c.edge.iter().map(|x| &x.covers))
@@ -556,7 +521,7 @@ fn every_v14_fixture_in_the_directory_is_loaded_here() {
     let on_disk: BTreeSet<String> = std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .filter(|n| n.starts_with("v1.4-"))
+        .filter(|n| n.starts_with("notify-"))
         .collect();
     let loaded: BTreeSet<String> = FIXTURES.iter().map(|(n, _)| n.to_string()).collect();
     assert_eq!(on_disk, loaded);
@@ -578,19 +543,6 @@ fn collect_names<'a>(v: &'a Value, out: &mut Vec<&'a String>) {
 }
 
 // ---- consistency with the spec
-
-#[test]
-fn probe_answers_mean_what_the_spec_says() {
-    for case in probe().answers {
-        let jobs = case.answer.get("jobs").and_then(Value::as_str);
-        let native = jobs == Some("v1.3");
-        let v14 = case.answer.get("notify").and_then(Value::as_str) == Some("v1.4");
-        let baseline = case.answer.get("jobs").is_none() && v14;
-        assert_eq!(case.expect.native_jobs, native, "{}", case.name);
-        assert_eq!(case.expect.notify, native && v14, "{}", case.name);
-        assert_eq!(case.expect.baseline_notify, baseline, "{}", case.name);
-    }
-}
 
 #[test]
 fn keep_cases_are_consistent() {
@@ -696,7 +648,7 @@ fn looks_like_callback(auth: &[String]) -> bool {
     })
 }
 
-/// A v1.3 job id: lowercase hex, 1 to 32 characters.
+/// A jobs job id: lowercase hex, 1 to 32 characters.
 fn is_job_id(id: &str) -> bool {
     (1..=32).contains(&id.len()) && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
@@ -983,7 +935,7 @@ fn parse_token(token: &str) -> Option<(&str, Vec<u8>)> {
     (tag.len() == 32 && URL_SAFE_NO_PAD.encode(&tag) == *mac).then_some((kid, tag))
 }
 
-/// The verifier's keys, as `v1.4-token.json`'s `verifier_keys` names them.
+/// The verifier's keys, as `notify-token.json`'s `verifier_keys` names them.
 fn verifier_keys(t: &TokenFile) -> Vec<([u8; 32], String)> {
     t.verifier_keys
         .iter()
@@ -1264,7 +1216,8 @@ fn covers_in(v: &Value, out: &mut BTreeSet<String>) {
 #[test]
 fn every_requirement_has_a_check() {
     let spec = spec_requirements();
-    // Tags run N1, N2, … and E1, E2, … with no gap or repeat.
+    // Tags run in increasing order, N… and E…, none repeated. (N2, N3 and N9 belonged to the version
+    // negotiation and the baseline's sender, and are gone; numbers are never reused.)
     for tag in ['N', 'E'] {
         let ids: Vec<&String> = spec
             .iter()
@@ -1272,13 +1225,11 @@ fn every_requirement_has_a_check() {
             .filter(|id| id.starts_with(tag))
             .collect();
         assert!(!ids.is_empty(), "no {tag} requirements found");
-        for (i, id) in ids.iter().enumerate() {
-            assert_eq!(
-                **id,
-                format!("{tag}{}", i + 1),
-                "requirement tags are sequential"
-            );
-        }
+        let numbers: Vec<u32> = ids.iter().map(|id| id[1..].parse().unwrap()).collect();
+        assert!(
+            numbers.windows(2).all(|w| w[0] < w[1]),
+            "requirement tags increase: {numbers:?}"
+        );
     }
     let defined: BTreeSet<&String> = spec.iter().map(|(id, _)| id).collect();
     for (id, text) in &spec {
@@ -1306,7 +1257,7 @@ fn every_requirement_has_a_check() {
     assert_eq!(
         listed,
         spec.iter().map(|(id, _)| id).collect::<Vec<_>>(),
-        "v1.4-checks.json lists exactly the spec's requirements, in order"
+        "notify-checks.json lists exactly the spec's requirements, in order"
     );
     for (req, (id, text)) in registry.requirements.iter().zip(&spec) {
         let named = named_checks(id, text);
@@ -1317,7 +1268,7 @@ fn every_requirement_has_a_check() {
             .collect();
         assert_eq!(
             in_registry, named,
-            "{id}: the doc and v1.4-checks.json name different checks"
+            "{id}: the doc and notify-checks.json name different checks"
         );
         for c in &req.checks {
             match c.kind {

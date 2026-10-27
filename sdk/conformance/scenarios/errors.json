@@ -650,41 +650,6 @@
       ]
     },
     {
-      "id": "errors.not-offered.stream-on-a-v11-endpoint",
-      "description": "An endpoint that answers a stream request with one JSON object has not proved v1.2: exec_stream is not_offered, and the command is not run as a one-shot instead.",
-      "requires": {
-        "stream": false
-      },
-      "steps": [
-        {
-          "id": "a",
-          "op": "exec_stream",
-          "command": "sh",
-          "args": [
-            "-c",
-            "echo ran > \"$1/ran\"",
-            "sh",
-            "${ROOT}"
-          ],
-          "expect": {
-            "error": {
-              "kind": "not_offered"
-            }
-          }
-        },
-        {
-          "id": "did-not-run",
-          "op": "stat",
-          "path": "${ROOT}/ran",
-          "expect": {
-            "ok": {
-              "exists": false
-            }
-          }
-        }
-      ]
-    },
-    {
       "id": "errors.kinds.file-helpers-use-one-vocabulary",
       "description": "The kinds the file helpers produce for a command that ran and failed: not_found, is_directory, not_a_directory, permission_denied; a failure the vocabulary does not name is io.",
       "setup": [

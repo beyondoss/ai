@@ -1,4 +1,4 @@
-//! Stateright model of exec v1.4's job-end notify: "Sandbox job notify (v1.4)" in
+//! Stateright model of exec notify's job-end notify: "Sandbox job notify" in
 //! `src/exec_endpoint.rs` (N…) and FLEET.md's "Job-end callbacks" (E…).
 //!
 //! It checks every interleaving of one session's kept jobs across a ring of two replicas, within
@@ -25,7 +25,7 @@
 //!
 //! ## The faithfulness contract
 //!
-//! Every v1.4 decision is made by the REAL kernels, the functions production calls:
+//! Every notify decision is made by the REAL kernels, the functions production calls:
 //!
 //! - the endpoint's notifier, `exec_endpoint::notify_kernel::step` (one notification per job,
 //!   what is owed and settled, retry or stop by status, the schedule, abandon on a new `keep`);
@@ -55,8 +55,8 @@
 //! - **Today's code is modelled, not called.** The stream and today's follow deliver a job's
 //!   `shell_exit` and end; `JobShared`'s once-record keeps a session task from reporting either
 //!   twice; a report commits to the transcript through the epoch fence and then removes the job's
-//!   record from the sandbox. These are pre-v1.4 behaviour with their own tests. S1 and S5 hold
-//!   because of them; their mutations show the properties are not vacuous and that v1.4's new
+//!   record from the sandbox. These are pre-notify behaviour with their own tests. S1 and S5 hold
+//!   because of them; their mutations show the properties are not vacuous and that notify's new
 //!   sources really lean on them.
 //! - **The receiver's checks before the kernel** (N21–N24: classify, verify the token, look up the
 //!   session) are modelled as their outcome: a forged token is refused `401` before the session is

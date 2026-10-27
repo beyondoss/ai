@@ -189,14 +189,12 @@ fn walk(p: &Path, out: &mut Snap) {
     }
 }
 
-/// A name ShellFs's write temp would have: `<name>.tmp.<hex>`.
+/// A name ShellFs's write temp would have (spec 5.3): `.tmp.` and exactly 16 lowercase hex digits.
 pub fn looks_like_temp(name: &std::ffi::OsStr) -> bool {
     let b = name.to_os_string().into_vec();
-    let s = String::from_utf8_lossy(&b);
-    match s.rsplit_once(".tmp.") {
-        Some((_, hex)) => hex.len() >= 8 && hex.bytes().all(|c| c.is_ascii_hexdigit()),
-        None => false,
-    }
+    b.strip_prefix(b".tmp.").is_some_and(|hex| {
+        hex.len() == 16 && hex.iter().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 pub fn temps(s: &Snap) -> Vec<PathBuf> {
@@ -256,10 +254,6 @@ pub enum Plan {
     Either,
 }
 
-/// Longest temp suffix `temp_suffix()` makes: 16 hex digits of salt plus a hex counter.
-const SUFFIX_MAX: usize = 22;
-const SUFFIX_MIN: usize = 5;
-
 pub fn plan_write(path: &Path) -> Plan {
     let Some(t) = resolve_leaf(path) else {
         return Plan::Either;
@@ -287,14 +281,10 @@ pub fn plan_write(path: &Path) -> Plan {
         Ok(m) if !m.is_dir() => return Plan::Fail(vec![Kind::NotADirectory, Kind::NotFound]),
         Ok(_) => {}
     }
-    // A temp name past NAME_MAX fails at lookup, before the permission to create it is asked.
-    let name_len = t.file_name().map_or(0, |n| n.len());
-    if name_len + SUFFIX_MAX + 5 > 255 {
-        return if name_len + SUFFIX_MIN + 5 > 255 {
-            Plan::Fail(vec![Kind::Io, Kind::PermissionDenied])
-        } else {
-            Plan::Either
-        };
+    // The temp is `.tmp.` plus 16 hex digits whatever the target is called, so only a target whose
+    // own name is past NAME_MAX fails (at lookup, before the permission to create it is asked).
+    if t.file_name().map_or(0, |n| n.len()) > 255 {
+        return Plan::Fail(vec![Kind::Io, Kind::PermissionDenied]);
     }
     if !can(parent, 0o3) {
         return Plan::Fail(vec![Kind::PermissionDenied]);
@@ -339,6 +329,11 @@ pub fn plan_mkdir(path: &Path) -> Plan {
         }
     }
     Plan::Either
+}
+
+/// Epoch seconds with the nanoseconds, as a double: what the guard compares (spec 5.4).
+pub fn fsecs(t: SystemTime) -> f64 {
+    beyond_sandbox::fs::epoch_f64(t)
 }
 
 pub fn secs(t: SystemTime) -> u64 {

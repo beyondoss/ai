@@ -9,10 +9,10 @@ from beyond_sandbox._fs import (
     Query,
     classify_search_failure,
     clip,
-    clip_match,
     compile_glob,
     crlf_tolerant_ere,
     finalize,
+    first_line,
     is_under_git_dir,
     parse_colon_records,
     parse_dir_entries,
@@ -23,7 +23,7 @@ from beyond_sandbox._fs import (
     split_colon_record,
 )
 from beyond_sandbox.errors import classify_stderr
-from beyond_sandbox.models import Hit
+from beyond_sandbox.models import ExecResult, Hit
 
 
 def q(pattern: str = "x", root: str = ".", **kw: object) -> Query:
@@ -114,9 +114,9 @@ def test_stat_parses_the_one_line() -> None:
     assert (st.kind, st.size, st.mtime, st.writable) == ("file", 12, 1700000000, True)
 
 
-def test_stat_truncates_a_fractional_mtime() -> None:
+def test_stat_keeps_a_fractional_mtime() -> None:
     st = parse_stat("-\td\t4096\t1700000000.987654321\n")
-    assert st is not None and (st.kind, st.mtime, st.writable) == ("dir", 1700000000, False)
+    assert st is not None and (st.kind, st.mtime, st.writable) == ("dir", 1700000000.9876542, False)
 
 
 def test_stat_of_other_and_garbage() -> None:
@@ -129,7 +129,7 @@ def test_stat_of_other_and_garbage() -> None:
 
 def test_stat_mtime_overflow_is_not_a_crash() -> None:
     st = parse_stat("w\tf\t1\t99999999999999999999999\n")
-    assert st is not None and st.mtime == 99999999999999999999999
+    assert st is not None and st.mtime == float(99999999999999999999999)
 
 
 # ---- listing ---------------------------------------------------------------------------------------
@@ -157,6 +157,44 @@ def test_an_unparseable_size_is_zero() -> None:
 
 
 # ---- search ----------------------------------------------------------------------------------------
+
+
+def test_a_newline_in_a_path_does_not_hide_the_os_error() -> None:
+    root = "/work/no\nwhere"
+    for missing in [
+        "rg: /work/no\nwhere: No such file or directory (os error 2)\n",
+        "rg: /work/no\nwhere: IO error for operation on /work/no\nwhere: No such file or directory (os error 2)\n",
+        "grep: /work/no\nwhere: No such file or directory\n",
+    ]:
+        assert classify_search_failure(missing, root).kind == "missing_root", missing
+    skipped = classify_search_failure(
+        "rg: /p/a\nb: Permission denied (os error 13)\nrg: /p/c: Permission denied (os error 13)\n",
+        "/p",
+    )
+    assert skipped.kind == "skipped" and skipped.note.startswith("2 path(s)")
+    assert (
+        first_line("cat: a\nb: No such file or directory\n")
+        == "cat: a\nb: No such file or directory"
+    )
+    assert first_line("one\ntwo\n") == "one"
+    assert first_line("  \n") == "command failed"
+
+
+def test_stat_keeps_the_fraction_of_the_mtime() -> None:
+    assert _fs.parse_stat("w\tf\t3\t1793127211.536029123\n").mtime == 1793127211.536029123  # type: ignore[union-attr]
+    assert _fs.parse_stat("w\tf\t3\t981173106.000000000\n").mtime == 981173106  # type: ignore[union-attr]
+    assert _fs.parse_stat("w\tf\t3\t981173106\n").mtime == 981173106  # type: ignore[union-attr]
+
+
+def test_a_root_below_a_file_is_a_root_error() -> None:
+    f = classify_search_failure(
+        "rg: /w/file/sub: IO error for operation on /w/file/sub: Not a directory (os error 20)\n",
+        "/w/file/sub",
+    )
+    assert f.kind == "missing_root" and "Not a directory" in f.note
+    assert (
+        classify_search_failure("grep: /w/file/sub: Not a directory", "/w/file").kind == "skipped"
+    )
 
 
 def test_search_exit_two_is_told_apart_by_stderr() -> None:
@@ -202,7 +240,7 @@ def test_rg_args_put_the_pattern_behind_dash_e_and_the_path_behind_dash_dash() -
     args = rg_args(q("-v", "-weird-dir"), False)
     assert args[args.index("-e") + 1] == "-v"
     assert args[args.index("--") + 1] == "-weird-dir"
-    assert args[:7] == ["--null", "--with-filename", "--line-number", "--no-heading",
+    assert args[:8] == ["--null", "--with-filename", "--line-number", "--column", "--no-heading",
                         "--color=never", "--hidden", "--crlf"]  # fmt: skip
 
 
@@ -324,28 +362,39 @@ def test_clip_counts_characters_not_bytes() -> None:
     assert clip("é" * 501) == "é" * 500 + "… [truncated]"
 
 
-def test_a_match_deep_in_a_long_line_is_windowed() -> None:
+def _rec(col: int, line: str) -> str:
+    return f"f\x001:{col}:{line}\n"
+
+
+def test_a_match_deep_in_a_long_line_is_windowed_around_rgs_column() -> None:
     line = "a" * 2000 + "NEEDLE" + "b" * 2000
-    out = clip_match(line, q("NEEDLE"))
-    assert out.startswith("… ") and out.endswith("]") and "NEEDLE" in out
-    assert "[truncated; columns " in out and "of 4006]" in out
-    assert out.count("…") == 2  # both cuts marked
+    [hit] = parse_records(_rec(2001, line), True)
+    assert hit.text.startswith("… ") and "NEEDLE" in hit.text
+    assert hit.text.endswith(" … [truncated; columns 1751-2250 of 4006]")
 
 
 def test_a_match_near_the_end_shows_the_last_window() -> None:
     line = "a" * 2000 + "NEEDLE"
-    out = clip_match(line, q("NEEDLE"))
-    assert out == "… " + line[-500:] + " [truncated; columns 1507-2006 of 2006]"
+    [hit] = parse_records(_rec(2001, line), True)
+    assert hit.text == "… " + line[-500:] + " [truncated; columns 1507-2006 of 2006]"
 
 
-def test_a_match_inside_the_first_window_keeps_the_head_clip() -> None:
+def test_a_match_in_the_first_250_characters_keeps_the_head_clip() -> None:
     line = "NEEDLE" + "b" * 1000
-    assert clip_match(line, q("NEEDLE")) == line[:500] + "… [truncated]"
+    [hit] = parse_records(_rec(1, line), True)
+    assert hit.text == line[:500] + "… [truncated]"
 
 
-def test_an_unusable_pattern_clips_the_head() -> None:
-    line = "b" * 1000
-    assert clip_match(line, q("(")) == line[:500] + "… [truncated]"
+def test_the_column_is_bytes_the_offset_characters_and_crs_do_not_count() -> None:
+    line = "é" * 600 + "\r" + "x" * 600
+    [hit] = parse_records(_rec(1202, line), True)
+    assert hit.text.endswith("[truncated; columns 351-850 of 1200]")
+
+
+def test_no_column_or_one_inside_a_character_clips_the_head() -> None:
+    line = "é" * 1000
+    assert parse_records(_rec(2, line), True)[0].text == clip(line)
+    assert parse_records(f"f\x001:{line}\n")[0].text == clip(line)
 
 
 # ---- error classification --------------------------------------------------------------------------
@@ -368,6 +417,17 @@ def test_stderr_classification(stderr: str, kind: str) -> None:
 
 
 def test_the_classifier_reads_the_stderr_line_not_the_path() -> None:
-    err = _fs.fail("read /tmp/is a directory/x", b"Permission denied (os error 13)\n")
+    err = _fs.fail(
+        "read /tmp/is a directory/x", ExecResult(1, b"", b"Permission denied (os error 13)\n")
+    )
     assert err.kind == "permission_denied"
     assert str(err.detail) == "read /tmp/is a directory/x: Permission denied (os error 13)"
+
+
+def test_rgs_binary_file_warning_is_not_the_start_of_a_record() -> None:
+    w = ': WARNING: stopped searching binary file after match (found "\\0" byte around offset 3)'
+    out = f"a\x001:1:x\nb\x001:1:y\nb{w}\nc\x001:1:z\n"
+    assert [h.path for h in parse_records(out, True)] == ["a", "b", "c"]
+    # Not the previous record's file: a path that merely contains the words.
+    out = f"a\x001:1:x\nb{w}\nc\x001:1:z\n"
+    assert [h.path for h in parse_records(out, True)] == ["a", f"b{w}\nc"]

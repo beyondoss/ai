@@ -1,4 +1,4 @@
-//! `Activity::callbacks_owed`: a v1.4 callback is owed from the moment it becomes owed until it is
+//! `Activity::callbacks_owed`: a notify callback is owed from the moment it becomes owed until it is
 //! settled, abandoned at the attempt limit, or its job is removed.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -88,8 +88,7 @@ async fn until(what: &str, mut cond: impl FnMut() -> bool) {
 
 async fn start() -> (execd::Handle, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let mut o = execd::Options::new(dir.path());
-    o.kept_jobs_survive_idle = true;
+    let o = execd::Options::new(dir.path());
     let server = execd::serve(ports::tokio_listener().await, o).unwrap();
     (server, dir)
 }

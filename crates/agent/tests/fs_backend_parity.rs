@@ -122,7 +122,7 @@ fn local_backend() -> Arc<dyn FsBackend> {
 /// GitHub's runner image ships no ripgrep, this assertion caught it, and `mise.toml` now installs it.
 async fn rg_backend() -> Option<Arc<dyn FsBackend>> {
     let backend = ShellFs::connect(Arc::new(RealRunner)).await.unwrap();
-    if backend.capabilities().search_engine() == SearchEngine::Ripgrep {
+    if backend.capabilities().await.unwrap().search_engine() == SearchEngine::Ripgrep {
         return Some(Arc::new(backend));
     }
     assert!(
@@ -145,10 +145,6 @@ fn shell_posix_backend() -> Arc<dyn FsBackend> {
             // here would only test the flag plumbing, not the tool it stands in for.
             grep_null: true,
             find_printf: true,
-            // The chunked write fallback — what a v1 endpoint or `docker exec` without `-i` gets —
-            // so every `write`/`edit` parity case covers it too. The ripgrep rung is `connect`ed and
-            // probes stdin as present, so between them both write paths are diffed against `LocalFs`.
-            stdin: false,
             no_read_window: false,
         },
     ))
@@ -699,7 +695,7 @@ async fn a_match_deep_in_a_long_line_is_windowed_identically_on_every_backend() 
         let out = run_tool(Some(backend), "grep", input.clone()).await;
         assert!(out.contains("é NEEDLE ü"), "{name}: {out}");
         assert!(
-            out.contains("columns 19756-20255 of 25010]"),
+            out.contains("columns 19753-20252 of 25010]"),
             "{name}: {out}"
         );
         outs.push((name, out));

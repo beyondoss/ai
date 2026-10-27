@@ -139,9 +139,10 @@ async fn a_declared_oversized_length_fails_without_reading_the_body() {
 #[tokio::test]
 async fn a_large_response_under_the_default_cap_is_returned_whole() {
     // 4 MiB of stdout: past anything a single read returns, well under the 16 MiB default.
-    let stdout = "B".repeat(4 * MIB);
+    use base64::Engine as _;
+    let stdout = base64::engine::general_purpose::STANDARD.encode(vec![b'B'; 4 * MIB]);
     let url = server(move |mut sock| {
-        let body = json!({ "exit_code": 3, "stdout": stdout, "stderr": "tail" }).to_string();
+        let body = json!({ "exit_code": 3, "stdout": stdout, "stderr": "dGFpbA==" }).to_string();
         async move {
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -159,7 +160,7 @@ async fn a_large_response_under_the_default_cap_is_returned_whole() {
     const { assert!(4 * MIB < DEFAULT_MAX_RESPONSE_BYTES) };
     assert_eq!(res.code, Some(3));
     assert_eq!(res.stdout.len(), 4 * MIB);
-    assert_eq!(res.stderr, "tail");
+    assert_eq!(res.stderr, b"tail");
     assert!(!res.truncated, "nothing was dropped");
 }
 
@@ -193,7 +194,11 @@ async fn run_applies_the_exec_max_response_bytes_flag() {
     // the one the model's `bash` result reports.
     let url = endless(Arc::new(AtomicUsize::new(0))).await;
     let (base, _bodies) = common::spawn_model_server(vec![
-        common::turn_tool_use("t1", "bash", &json!({ "command": "yes" }).to_string()),
+        common::turn_tool_use(
+            "t1",
+            "write",
+            &json!({ "path": "/work/big", "content": "x" }).to_string(),
+        ),
         common::turn_text("done"),
     ]);
     let mut cmd = common::run_cmd(env!("CARGO_BIN_EXE_agent"));

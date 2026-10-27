@@ -45,12 +45,19 @@ async fn sh(execd: &Execd, bearer: Option<&String>, script: &str) -> Value {
     answer.json()
 }
 
-fn out(v: &Value) -> String {
-    format!(
-        "{}{}",
-        v["stdout"].as_str().unwrap_or(""),
-        v["stderr"].as_str().unwrap_or("")
+/// What a one-shot answer carries in `stdout` or `stderr`, decoded from base64 and read as text.
+fn text(v: &Value, key: &str) -> String {
+    use base64::Engine as _;
+    String::from_utf8_lossy(
+        &base64::engine::general_purpose::STANDARD
+            .decode(v[key].as_str().unwrap_or(""))
+            .unwrap_or_default(),
     )
+    .into_owned()
+}
+
+fn out(v: &Value) -> String {
+    format!("{}{}", text(v, "stdout"), text(v, "stderr"))
 }
 
 /// Everything a command can learn about the environment of execd and of every process it can see:
@@ -135,7 +142,7 @@ async fn a_command_never_sees_the_bearer_delivered_in_a_file() {
     );
 }
 
-/// The same for every way a command is started: a stream and a job, not only v1.1.
+/// The same for every way a command is started: a stream and a job, not only one-shot.
 #[tokio::test]
 async fn a_streamed_command_and_a_job_do_not_see_the_bearer_either() {
     let bearer = token("a_streamed_c");
@@ -495,16 +502,16 @@ async fn under_run_as_the_envelope_behaves() {
     let run = |v: Value| async move { post(addr, &[], &v).await };
     // gid is the named group.
     let a = run(json!({ "command": "id", "args": ["-g"] })).await.json();
-    assert_eq!(a["stdout"], "1\n", "{a}");
+    assert_eq!(text(&a, "stdout"), "1\n", "{a}");
     // stdin, and an exit status.
     use base64::Engine as _;
     let a = run(json!({ "command": "sh", "args": ["-c", "cat; exit 7"],
-                        "stdin_base64": base64::engine::general_purpose::STANDARD.encode("hi") }))
+                        "stdin": base64::engine::general_purpose::STANDARD.encode("hi") }))
     .await
     .json();
     assert_eq!(
-        (a["exit_code"].as_i64(), a["stdout"].as_str()),
-        (Some(7), Some("hi")),
+        (a["exit_code"].as_i64(), text(&a, "stdout")),
+        (Some(7), "hi".to_string()),
         "{a}"
     );
     // A missing program is exit 127 with the reason.
@@ -512,19 +519,13 @@ async fn under_run_as_the_envelope_behaves() {
         .await
         .json();
     assert_eq!(a["exit_code"], 127, "{a}");
-    assert!(
-        a["stderr"].as_str().unwrap().contains("No such file"),
-        "{a}"
-    );
+    assert!(text(&a, "stderr").contains("No such file"), "{a}");
     // A directory the user cannot enter is refused as that user, not entered as root.
     let a = run(json!({ "command": "pwd", "cwd": "/root" }))
         .await
         .json();
     assert_eq!(a["exit_code"], 127, "{a}");
-    assert!(
-        a["stderr"].as_str().unwrap().contains("Permission denied"),
-        "{a}"
-    );
+    assert!(text(&a, "stderr").contains("Permission denied"), "{a}");
     // A stream ends with its status too, and the group is the command's.
     let s =
         run(json!({ "command": "sh", "args": ["-c", "echo hi; exit 3"], "stream": true })).await;

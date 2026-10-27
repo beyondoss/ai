@@ -1,4 +1,4 @@
-//! The edge's front for exec v1.4 job-end callbacks, as a double (FLEET.md, "Job-end callbacks",
+//! The edge's front for exec notify job-end callbacks, as a double (FLEET.md, "Job-end callbacks",
 //! E1–E7).
 //!
 //! A sandbox reports a kept job's end by POSTing `job_ended` to the session's own address, with a
@@ -47,7 +47,7 @@ const PAUSE: Duration = Duration::from_millis(250);
 /// The most attempts one log entry lists; the rest are only counted.
 const LOGGED_ATTEMPTS: usize = 32;
 
-/// What a request is, by its `Authorization` headers alone: exec v1.4's N21, which E1 applies at
+/// What a request is, by its `Authorization` headers alone: exec notify's N21, which E1 applies at
 /// the edge.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Class {

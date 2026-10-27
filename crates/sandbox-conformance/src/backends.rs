@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use beyond_test_support::exec_mock::{ExecMock, MockOptions, Protocol};
+use beyond_test_support::exec_mock::{ExecMock, MockOptions};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::process::Command;
@@ -20,27 +20,15 @@ const BEARER: &str = "conformance-secret";
 const READY_WITHIN: Duration = Duration::from_secs(60);
 
 /// Every backend name, and the groups that expand to several.
-pub const GROUPS: &[(&str, &[&str])] = &[
-    (
-        "local",
-        &[
-            "local-plain",
-            "local-bearer",
-            "local-no-stdin",
-            "local-grep",
-            "local-busybox-grep",
-        ],
-    ),
-    (
-        "fault",
-        &[
-            "fault-no-stdin",
-            "fault-v11",
-            "fault-v12-text",
-            "fault-baseline-jobs",
-        ],
-    ),
-];
+pub const GROUPS: &[(&str, &[&str])] = &[(
+    "local",
+    &[
+        "local-plain",
+        "local-bearer",
+        "local-grep",
+        "local-busybox-grep",
+    ],
+)];
 pub const SINGLES: &[&str] = &["alpine", "debian-runas", "readonly", "tinydisk"];
 
 /// Expand group names and `*` globs to backend names, in a stable order, without duplicates.
@@ -80,7 +68,6 @@ pub struct Started {
     pub url: String,
     pub bearer: Option<String>,
     pub work: String,
-    pub jobs_root: String,
     /// `CONFORMANCE_CAPS`: probe results the driver is told to believe.
     pub caps: Option<Value>,
     /// The suites this backend runs; `None` is all of them.
@@ -144,7 +131,6 @@ pub async fn start(name: &str, bins: &Binaries) -> Result<Started, String> {
     match name {
         "local-plain" => local(name, bins, false, None).await,
         "local-bearer" => local(name, bins, true, None).await,
-        "local-no-stdin" => local(name, bins, false, Some(json!({"stdin": false}))).await,
         "local-grep" => local(name, bins, false, Some(json!({"search_engine": "grep"}))).await,
         "local-busybox-grep" => {
             local(
@@ -155,56 +141,9 @@ pub async fn start(name: &str, bins: &Binaries) -> Result<Started, String> {
             )
             .await
         }
-        "fault-no-stdin" => {
-            // A v1 endpoint: ignores `stdin_base64`, so the probe finds no stdin by itself.
-            fault(
-                name,
-                MockOptions {
-                    honors_stdin: false,
-                    honors_output_base64: false,
-                    ..MockOptions::default()
-                },
-                Some(&["files", "errors", "helpers", "exec-bytes"]),
-            )
-            .await
-        }
-        "fault-v11" => {
-            // An endpoint that never learned streaming: `stream` is an unknown field to it.
-            fault(
-                name,
-                MockOptions {
-                    protocol: Protocol::V11,
-                    honors_output_base64: false,
-                    ..MockOptions::default()
-                },
-                Some(&["files", "errors", "helpers", "exec-bytes"]),
-            )
-            .await
-        }
-        "fault-v12-text" => {
-            // Streams, but predates `output_base64`: raw exec is exact over a stream.
-            fault(
-                name,
-                MockOptions {
-                    honors_output_base64: false,
-                    ..MockOptions::default()
-                },
-                Some(&["exec-bytes"]),
-            )
-            .await
-        }
-        "fault-baseline-jobs" => {
-            // Native jobs off: plain exec only, so jobs are the baseline.
-            fault(
-                name,
-                MockOptions {
-                    jobs: false,
-                    ..MockOptions::default()
-                },
-                None,
-            )
-            .await
-        }
+        // execd's own library behind a loopback listener, in this process: for the harness's own tests,
+        // which need no binary. Not part of any group.
+        "embedded" => embedded(name).await,
         "alpine" => {
             docker(
                 name,
@@ -248,6 +187,7 @@ pub async fn start(name: &str, bins: &Binaries) -> Result<Started, String> {
 // ---- local execd -------------------------------------------------------------------------------
 
 struct Local {
+    _leader: Option<crate::reaper::Leader>,
     _child: tokio::process::Child,
     _dir: tempfile::TempDir,
 }
@@ -270,22 +210,24 @@ async fn local(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .kill_on_drop(true)
+        .process_group(0);
     if bearer {
         c.env("EXECD_BEARER", BEARER);
     }
     let mut child = c.spawn().map_err(|e| format!("start execd: {e}"))?;
+    let leader = crate::reaper::Leader::new(&child);
     let addr = listening(child.stderr.take().expect("piped")).await?;
     Ok(Started {
         name: name.into(),
         url: format!("http://{addr}/exec"),
         bearer: bearer.then(|| BEARER.to_string()),
         work: work.to_string_lossy().into_owned(),
-        jobs_root: work.join(".jobs").to_string_lossy().into_owned(),
         caps,
         suites: None,
         vars: BTreeMap::new(),
         _guard: Box::new(Local {
+            _leader: leader,
             _child: child,
             _dir: dir,
         }),
@@ -314,24 +256,19 @@ async fn listening(stderr: tokio::process::ChildStderr) -> Result<String, String
     }
 }
 
-// ---- in-process fault-injecting endpoint -------------------------------------------------------
+// ---- execd in this process ---------------------------------------------------------------------
 
-async fn fault(
-    name: &str,
-    options: MockOptions,
-    suites: Option<&'static [&'static str]>,
-) -> Result<Started, String> {
+async fn embedded(name: &str) -> Result<Started, String> {
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let work = dir.path().canonicalize().map_err(|e| e.to_string())?;
-    let mock = ExecMock::start_with(&work, options).await;
+    let mock = ExecMock::start_with(&work, MockOptions::default()).await;
     Ok(Started {
         name: name.into(),
         url: mock.url.clone(),
         bearer: None,
         work: work.to_string_lossy().into_owned(),
-        jobs_root: work.join(".jobs").to_string_lossy().into_owned(),
         caps: None,
-        suites,
+        suites: None,
         vars: BTreeMap::new(),
         _guard: Box::new((mock, dir)),
     })
@@ -371,6 +308,7 @@ impl Container {
 /// Removes the container when the backend is dropped.
 struct Removal {
     id: String,
+    name: String,
     _keep: Option<Box<dyn Any + Send + Sync>>,
 }
 
@@ -381,6 +319,7 @@ impl Drop for Removal {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        crate::reaper::forget_container(&self.name);
     }
 }
 
@@ -416,6 +355,7 @@ async fn docker(name: &str, bins: &Binaries, image: &str, c: Container) -> Resul
         },
     );
     let container = format!("matrix-{name}-{}-{}", std::process::id(), nonce());
+    crate::reaper::watch_container(&container);
     let mut args: Vec<String> = [
         "run",
         "-d",
@@ -444,9 +384,16 @@ async fn docker(name: &str, bins: &Binaries, image: &str, c: Container) -> Resul
     args.extend(c.args.clone());
     args.extend([image.to_string(), "sh".into(), "-c".into(), script]);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    let id = docker_out(&argv).await?;
+    let id = match docker_out(&argv).await {
+        Ok(id) => id,
+        Err(e) => {
+            crate::reaper::forget_container(&container);
+            return Err(e);
+        }
+    };
     let guard = Removal {
         id: id.clone(),
+        name: container.clone(),
         _keep: c.keep,
     };
 
@@ -490,7 +437,6 @@ async fn docker(name: &str, bins: &Binaries, image: &str, c: Container) -> Resul
         url: format!("http://{addr}/exec"),
         bearer: Some(BEARER.into()),
         work: "/work".into(),
-        jobs_root: "/tmp/beyond-jobs".into(),
         caps: None,
         suites: None,
         vars: c.vars,

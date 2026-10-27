@@ -619,7 +619,7 @@ enum Command {
         #[usage(long, env = "AI_AGENT_METRICS_LISTEN")]
         metrics_listen: Option<String>,
         /// With --service, the origin the fleet's edge serves sessions at: sandboxes that offer
-        /// job notify (exec v1.4) report a kept job's end to `<origin>/_beyond/agent`.
+        /// job notify (exec notify) report a kept job's end to `<origin>/_beyond/agent`.
         #[usage(long, env = "AI_AGENT_NOTIFY_ORIGIN")]
         notify_origin: Option<String>,
         /// On shutdown, wait up to this many seconds for running prompts to finish. Default 0.
@@ -1435,7 +1435,7 @@ fn raise_open_file_limit() {
 
 /// Stop `run`'s jobs with `how` off the runtime thread. Each kill blocks until its processes are
 /// gone, and a remote job's kill waits for its stream's future to let the connection go — a future
-/// on this (current-thread) runtime, which a kill run inline would starve: every v1.2 job would cost
+/// on this (current-thread) runtime, which a kill run inline would starve: every streaming job would cost
 /// its kill's full bound, and its stream would close only at the process exit.
 async fn stop_jobs(
     jobs: &std::sync::Arc<tools::bash_jobs::BashJobs>,

@@ -196,7 +196,6 @@ async fn run(cli: Config, inherited: Option<String>) -> Result<(), Box<dyn std::
     let mut opts = execd::Options::new(root);
     opts.home = home;
     opts.max_response_bytes = cli.max_response_bytes;
-    opts.kept_jobs_survive_idle = cli.kept_jobs_survive_idle;
     opts.jobs_dir = cli.jobs_dir.clone();
     let secured = bearer.is_some();
     opts.bearer = bearer;
@@ -208,10 +207,9 @@ async fn run(cli: Config, inherited: Option<String>) -> Result<(), Box<dyn std::
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     let server = execd::serve(listener, opts)?;
     execd::log_info!(
-        "execd {} listening listen={} bearer={secured} run_as={switched} notify={}",
+        "execd {} listening listen={} bearer={secured} run_as={switched}",
         env!("CARGO_PKG_VERSION"),
-        server.local_addr(),
-        cli.kept_jobs_survive_idle
+        server.local_addr()
     );
     // Off the serving path: it reads the whole of the jobs directory's parent (39 ms for a /tmp of
     // 9,500 entries), and a client that finds the port open expects the server to be ready.

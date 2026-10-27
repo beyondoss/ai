@@ -16,95 +16,43 @@
 //! requires the agent to sit on the compute node beside the workloads it is meant to be isolated from,
 //! which is backwards.
 //!
-//! ## The protocol (v1.1)
+//! ## The protocol
 //!
 //! One `POST` to the configured URL:
 //!
 //! ```jsonc
 //! // request
 //! { "command": "rg", "args": ["--files"], "cwd": "/work", "timeout_ms": 120000 }
-//! // request carrying stdin (v1.1, optional) — standard base64, fed to the command, then closed
-//! { "command": "cat", "args": [], "timeout_ms": 10000, "stdin_base64": "c3RkaW4tcHJvYmU=" }
-//! // response — 200
-//! { "exit_code": 0, "stdout": "…", "stderr": "…" }
+//! // request carrying stdin — standard base64, fed to the command, then closed
+//! { "command": "cat", "args": [], "timeout_ms": 10000, "stdin": "c3RkaW4=" }
+//! // response — 200: stdout and stderr are standard base64, the empty string for no output
+//! { "exit_code": 0, "stdout": "aGkK", "stderr": "" }
 //! ```
 //!
-//! **Timeouts over v1.1.** `timeout_ms` is the endpoint's to enforce over v1.1 too: at the deadline it
-//! MUST kill the command's whole process group and SHOULD answer 200 with `exit_code` 124 and stderr
-//! ending in `command exceeded its timeout`. A request without `timeout_ms` has no deadline but the
-//! connection. (The agent sends [`UNTRACKED_DEADLINE`] over v1.1 for exactly this reason.)
+//! The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
+//!
+//! **Bytes.** `stdout` and `stderr` are the bytes the command wrote, as **standard base64 with
+//! padding** (RFC 4648 section 4), the empty string when there is none, both present on every `200`
+//! answer. There is one shape and no flag: the endpoint MUST NOT apply a lossy conversion (UTF-8
+//! replacement, newline translation, trimming, truncation) to what they carry, and the decoded bytes
+//! are the bytes the command wrote. A client reports an error for an answer whose `stdout` or
+//! `stderr` is missing or is not standard base64, never reads it as empty. `stdin` is standard
+//! base64 too; an endpoint answers `400` to one that is not. Everything else in the answer is as
+//! ever: `exit_code` is the command's, `128 + S` for a command killed by signal `S`, `124` for one
+//! that hit its deadline (with a note, below), `127` for one that could not be started, with the
+//! reason as its stderr; none of these is an error. [`stream`] frames carry their output as base64
+//! alike, so every path moves the same bytes. `tests/fixtures/exec/output.json` holds the answer
+//! vectors every client decodes.
+//!
+//! **Timeouts.** `timeout_ms` is the endpoint's to enforce: at the deadline it MUST kill the
+//! command's whole process group and SHOULD answer 200 with `exit_code` 124 and the note
+//! `command exceeded its timeout` appended to the stderr bytes (a newline first if stderr did not
+//! end in one). A request without `timeout_ms` has no deadline but the connection.
 //!
 //! Deliberately the smallest thing that can carry a command and its result. Putting an adapter in
 //! front of a vendor's SDK is a few dozen lines on their side, and that seam is where vendor
-//! specifics belong — not in here.
-//!
-//! **v1.1 is backward compatible.** `stdin_base64` and `output_base64` (below) are the only
-//! additions. Only `ShellFs`'s file writes send `stdin_base64`, after a probe (`cat` must echo
-//! `stdin-probe`) has shown the endpoint honors it. A v1 endpoint ignores the unknown field and answers the probe with empty stdout, so writes fall back
-//! to argv-sized chunks. The field is never trusted blindly: writing through an endpoint that dropped
-//! it would silently produce *empty files*.
-//!
-//! ## Exact output (v1.1 `output_base64`)
-//!
-//! The answer above carries stdout and stderr as JSON strings, and a string is text: a command that
-//! writes `ff 00 0a` (a `tar`, a `gzip`, a compiled artifact, `cat` of any binary) cannot be
-//! answered with its bytes, only with a rendering of them, and a rendering is a different value.
-//! An endpoint that converts invalid UTF-8 to U+FFFD answers *successfully* with corrupt data.
-//! `output_base64` asks for the bytes. The key words MUST, MUST NOT, SHOULD and MAY are used as in
-//! RFC 2119.
-//!
-//! ```jsonc
-//! // request: the v1.1 request plus the flag (mirrors stdin_base64)
-//! { "command": "cat", "args": ["/bin/ls"], "timeout_ms": 10000, "output_base64": true }
-//! // response — 200, from an endpoint that honours it
-//! { "exit_code": 0, "stdout_base64": "f0VMRg…", "stderr_base64": "" }
-//! ```
-//!
-//! - **Request.** `"output_base64": true`. Only the JSON value `true` asks; any other value, or the
-//!   field absent, is a request for text, and the endpoint answers exactly as before.
-//! - **An endpoint that honours it** MUST answer with `stdout_base64` and `stderr_base64`, both
-//!   present on every `200` answer (the empty string for no output), **instead of** `stdout` and
-//!   `stderr`, and MUST NOT apply a lossy conversion (UTF-8 replacement, newline translation,
-//!   trimming, truncation) to what they carry: the decoded bytes are the bytes the command wrote.
-//!   The values are standard base64 with padding (RFC 4648 section 4). It MUST NOT also send
-//!   `stdout`/`stderr`, and a client that finds both reads the base64 and ignores the text. An answer
-//!   with only one of the two base64 fields is malformed: a client reports an error rather than read
-//!   the missing stream as empty. Everything else (`exit_code`, the deadline's `124` and the note
-//!   ending stderr, a command that cannot be started answered `127` with its reason as stderr,
-//!   status codes, `timeout_ms`, `stdin_base64`) is as without the field.
-//!   A timeout note is appended to the decoded stderr bytes, a newline first if stderr did not end
-//!   in one.
-//! - **An endpoint that does not** ignores the field, like any unknown field, and answers with
-//!   `stdout`/`stderr` text. Nothing changes for it.
-//! - **The cap** (see below) applies to the **decoded** bytes: `len(stdout) + len(stderr)` after
-//!   decoding, together, must be at most the cap, whatever the base64 or the JSON around it
-//!   weighs. An endpoint with a cap MUST answer a command that wrote more as it answers an
-//!   oversized text response (`422`, naming the cap, saying the command ran), never with a prefix.
-//!   A client reading the body incrementally MAY stop at `4 * ceil(cap / 3) + 4096` body bytes
-//!   (the base64 of a cap's worth of output and the envelope around it) and treats that as over the
-//!   cap; it checks the decoded sum once it has the answer.
-//! - **Probe.** Support is learned, never assumed, once per connection: a request with
-//!   `"output_base64": true` running `sh -c "printf '\377\000\n'"` (the bytes `ff 00 0a`) is
-//!   answered by an endpoint that honours the field with `stdout_base64` decoding to exactly those
-//!   three bytes; anything else (text, no `stdout_base64`, other bytes) means it does not. A probe
-//!   whose *request* failed (unreachable, a non-2xx status other than `400`, an unparseable answer)
-//!   is an error and is asked again later, never "not supported". A `400` is the answer of a strict
-//!   front that refuses the unknown field: not supported.
-//! - **Clients.** The raw one-shot call returns **bytes**, with an `exact` flag. If the endpoint
-//!   honours `output_base64` the client always sends it. Otherwise, if the endpoint streams (v1.2)
-//!   the client runs the call over the stream, whose frames are base64, answering at the command's
-//!   exit (a `shell_exit` frame ends the call and the client closes the stream) and building the
-//!   v1.1 shape from the final frame: `exit_code` N, `128 + S` for a `signal` frame, `124` with the
-//!   note for `timed_out`. Otherwise (a plain v1.1 endpoint, or a call with stdin) the text the
-//!   endpoint gave is returned encoded as UTF-8, with `exact: false`: the client did not get the
-//!   bytes and says so. A client that sent the field and received no `stdout_base64`/`stderr_base64`
-//!   (one replica of a fleet in rollout) treats that answer as text, `exact: false`. Helpers that
-//!   parse text (file listings, search, jobs) are not affected.
-//! - **Conformance.** [`conformance::verify`] sends the probe to every endpoint. One that answers
-//!   with either field is held to the whole of the above (both fields, no text fields, all 256 byte
-//!   values intact on each stream, the exit code and the deadline unchanged); one that answers
-//!   text is a plain v1.1 endpoint, and the check is skipped. `tests/fixtures/exec/v1.1-output.json`
-//!   holds the response vectors every client decodes.
+//! specifics belong — not in here. An endpoint implements the whole of this document: the one-shot
+//! call, streaming, jobs and job notify. A client sends what it needs and probes nothing.
 //!
 //! **The response is capped** ([`DEFAULT_MAX_RESPONSE_BYTES`], `--exec-max-response-bytes`). The body
 //! is read incrementally and reading stops at the cap; an oversized response is an **error**, never a
@@ -112,21 +60,24 @@
 //! honest partial `ExecResult` to return (not even the exit code, which may come after the output),
 //! and presenting whatever fit as the command's output would be a confident wrong answer. The error
 //! says the command *did run*, so the caller narrows its output instead of blindly repeating a
-//! command that may not be idempotent. With `output_base64` the cap is on the decoded bytes (see
-//! "Exact output"). The cap applies to v1.1 objects only; a v1.2 stream is read
-//! a frame at a time and never buffered whole.
+//! command that may not be idempotent. The cap is on the **decoded** bytes, `len(stdout) +
+//! len(stderr)` together, whatever the base64 or the JSON around it weighs: an endpoint with a cap
+//! MUST answer a command that wrote more as `422`, naming the cap and saying the command ran, never
+//! with a prefix. A client reading the body incrementally MAY stop at `4 * ceil(cap / 3) + 4096`
+//! body bytes (the base64 of a cap's worth of output and the envelope around it) and treats that as
+//! over the cap; it checks the decoded sum once it has the answer. The cap applies to one-shot
+//! answers only; a stream is read a frame at a time and never buffered whole.
 //!
-//! ## Streaming (v1.2)
+//! ## Streaming
 //!
-//! A tool that behaves differently depending on where it runs is a broken API. Over v1.1, `bash`
-//! cannot see a remote command's output until it exits, so it cannot tell a silent build from a hung
-//! one (the idle yield never fires: a hung command burns its whole timeout), cannot show progress,
-//! and cannot kill a command it has given up on. v1.2 streams the output and makes **the connection
-//! the command's lifetime**, so the endpoint stays stateless — no job ids, no poll or kill routes.
+//! A tool that behaves differently depending on where it runs is a broken API. Over a one-shot
+//! call, `bash` cannot see a remote command's output until it exits, so it cannot tell a silent
+//! build from a hung one (the idle yield never fires: a hung command burns its whole timeout),
+//! cannot show progress, and cannot kill a command it has given up on. A stream sends the output
+//! as it is produced and makes **the connection the command's lifetime**, so the endpoint stays
+//! stateless — no job ids, no poll or kill routes.
 //!
-//! The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
-//!
-//! **Request.** The v1.1 request plus `"stream": true`:
+//! **Request.** The request plus `"stream": true`:
 //!
 //! ```jsonc
 //! { "command": "sh", "args": ["-c", "cargo build"], "cwd": "/work", "timeout_ms": 2147483647, "stream": true }
@@ -152,7 +103,7 @@
 //!   64 KiB of decoded bytes ([`stream::MAX_FRAME_PAYLOAD`]); split anything longer.
 //! - **Exactly one final frame, last.** After it the endpoint MUST end the body. A body that ends
 //!   without one is a broken stream, never a success. Failures *before* answering are non-2xx
-//!   statuses exactly as in v1.1; a command that cannot be spawned is an ordinary result (`stderr`
+//!   statuses exactly as for a one-shot call; a command that cannot be spawned is an ordinary result (`stderr`
 //!   frame, then `{"exit_code": 127}`), as a shell reports it.
 //! - **Ordering.** Frames of one stream are in the order the bytes were read; the relative order of
 //!   stdout and stderr is best-effort, as between two local pipes. The final frame comes after all
@@ -162,7 +113,7 @@
 //! - **Flushing.** Each frame MUST reach the connection without buffering: the endpoint MAY coalesce
 //!   output read within 100 ms into one frame, and MUST NOT hold any longer. Anything between the
 //!   endpoint and the client must not buffer either (send `Cache-Control: no-store`, and e.g.
-//!   `X-Accel-Buffering: no` behind nginx) — the probe below refuses an endpoint whose frames arrive
+//!   `X-Accel-Buffering: no` behind nginx) — the conformance verifier refuses an endpoint whose frames arrive
 //!   all at once.
 //! - **Heartbeat.** When no frame has been written for [`stream::HEARTBEAT_INTERVAL`] (5 s), the
 //!   endpoint MUST write `{}`. It keeps a silent command's connection alive through proxies (whose
@@ -171,15 +122,13 @@
 //!   frames only — and this client treats 30 s with no frame at all as a dead connection.
 //! - **Unknown fields are ignored**, and a frame with no known field is a heartbeat, so a later
 //!   version can add fields (a sequence number, timings) without breaking this client.
-//! - **Timeouts.** (Over v1.1 see "Timeouts over v1.1" above.) `timeout_ms` is the endpoint's to enforce: at the deadline it MUST kill the
+//! - **Timeouts.** `timeout_ms` is the endpoint's to enforce: at the deadline it MUST kill the
 //!   command's whole process group and send `{"timed_out": true}`. The client's own deadline is
 //!   `timeout_ms` + 30 s for the whole exchange, so the endpoint's verdict normally wins. `bash`
 //!   jobs have no deadline — they end with the turn, the run or the session, or a `bash_job` kill,
 //!   all of which close the stream — so a streamed job sends [`STREAM_DEADLINE`] (`i32::MAX` ms,
 //!   ~24.8 days, the most a Node endpoint's `setTimeout` can hold): the connection is the lifetime,
-//!   and the deadline only bounds one that outlives every session. Over v1.1 nothing streams and
-//!   nothing can be killed, so a `bash` command there sends [`UNTRACKED_DEADLINE`] (30 minutes): the
-//!   only thing that ends a command that hangs.
+//!   and the deadline only bounds one that outlives every session.
 //!
 //! **Disconnect kills — normative.** Every streamed command MUST run in its own process group (or an
 //! equivalent the endpoint can kill as a unit, such as a cgroup). **If the connection closes before
@@ -208,62 +157,45 @@
 //! unless the endpoint tracks a cgroup (it MAY). The client adopts the leftovers as a job at
 //! `shell_exit` (`on_orphans`), and closes the stream to stop them, like any job. A call that is not
 //! a job (nothing tracks it) returns at `shell_exit` and closes the stream, so the endpoint kills
-//! the leftovers. Compatible both ways: an endpoint predating this rule ends the stream with the
-//! shell (its leftovers run on, untracked), and a client predating it reads `shell_exit` as a
-//! heartbeat (an unknown field) and keeps the job until the group ends.
+//! the leftovers.
 //!
-//! **Over v1.1 leftovers are untracked.** One request, one response: the endpoint answers when the
-//! command exits, and nothing the agent can do afterwards reaches what it left running. A v1.1
+//! **A one-shot call's leftovers are untracked.** One request, one response: the endpoint answers
+//! when the command exits, and nothing the agent can do afterwards reaches what it left running. An
 //! endpoint SHOULD kill the command's process group once it has answered; one that does not leaves
 //! `server &` running until the sandbox ends.
 //!
-//! **The probe.** Streaming is adopted only after the endpoint proves it, once per runner, on the
-//! first streaming call ([`HttpExecRunner::streams`]): `sh -c 'printf a; sleep 0.3; printf b'` with
-//! `"stream": true` must come back as `application/x-ndjson` with at least two output frames, `ab`,
-//! `{"exit_code": 0}`, and the first output frame at least 100 ms before the final one. A v1.1
-//! endpoint answers with one JSON object (it ignores the unknown field); a buffering endpoint or proxy
-//! sends one frame, or every frame at once. Either way the runner stays on v1.1 for good, and `bash`
-//! keeps v1.1's behavior exactly: no yield, no live progress, and its description says so. A probe
-//! that could not reach the endpoint is not an answer and is retried on the next call. Only `bash`
-//! streams: the filesystem backend's commands stay v1.1, whose single object they need anyway.
+//! **Incremental delivery.** A stream whose frames arrive all at once is no stream: `bash` measures a
+//! command's silence on them. The conformance verifier runs `sh -c 'printf a; sleep 0.3; printf b'`
+//! with `"stream": true` and requires `application/x-ndjson` with at least two output frames, `ab`,
+//! `{"exit_code": 0}`, and the first output frame at least 100 ms before the final one; an endpoint
+//! or proxy that buffers sends one frame, or every frame at once, and fails it.
 //!
 //! **Conformance.** [`conformance::verify`] checks an endpoint against all of the above — framing,
-//! the probe, exit/signal/timeout frames, heartbeats, the 64 KiB frame cap, kill on disconnect
+//! incremental delivery, exit/signal/timeout frames, heartbeats, the 64 KiB frame cap, kill on disconnect
 //! measured against a grandchild's marker file, and leftover processes (`shell_exit`, the stream
 //! held until they exit, killed on a disconnect after it) — and `tests/exec_conformance.rs` runs it against any
-//! URL. `tests/fixtures/exec/v1.2-frames.json` holds the decoding vectors.
+//! URL. `tests/fixtures/exec/frames.json` holds the decoding vectors.
 //!
-//! ## Sandbox jobs (v1.3)
+//! ## Sandbox jobs
 //!
 //! A stream is the right owner for a command someone is waiting on and the wrong one for a job: a
 //! replica that is reaped, redeployed or failed over closes every stream it holds. So a `bash` job
 //! the model meant to keep (`run_in_background`, an adopted `cmd &`) is owned by the **sandbox**: it
 //! runs until it exits, is killed, or its session ends, and any replica serving the session can
-//! list it, read its output from an offset, and kill it. Every endpoint gets this without doing
-//! anything: the agent builds it from plain exec commands ([`jobs::ShellJobs`], "the baseline" — a
-//! directory per job under `/tmp/beyond-jobs/`, a `setsid` supervisor, a relay that writes the
-//! output as offset-named chunks; see [`jobs`]). v1.3 is the same contract offered **natively**, for
-//! an endpoint that would rather keep jobs its own way (a vendor's background commands, the
-//! platform's own guest). [`jobs_native`] is the client.
+//! list it, read its output from an offset, and kill it. The endpoint keeps them: a vendor's
+//! background commands, the platform's own guest, `execd`. [`jobs_native`] is the client.
 //!
-//! **Adoption.** Optional and probed, like stdin and streaming: the first job operation sends a
-//! valid v1.1 request — `sh -c 'printf exec-v1.2'` — carrying `"job": {"op": "probe"}`. An endpoint
-//! without the capability ignores the unknown field and runs the command; one with it MUST answer
-//! `{"jobs": "v1.3"}`. A probe that could not reach the endpoint is retried later. A v1.3 endpoint
-//! MUST also be a conforming v1.2 endpoint.
-//!
-//! **Requests.** Every job operation is a v1.1 request (the same URL, headers and envelope) plus a
+//! **Requests.** Every job operation is a request (the same URL, headers and envelope) plus a
 //! `"job"` object naming `op` and `scope`. A **scope** is an opaque name for one session's jobs
 //! (the agent sends a digest of tenant and session); an operation MUST only ever see the jobs of
 //! its own scope. A job **id** is chosen by the agent (lowercase hex, at most 32 characters) and is
 //! unique within its scope. A **status** is a job's exit code, or 128 + N for signal N. Except for
 //! `start`, the request's `command` is `true` with no arguments: harmless if run. Unknown fields are
 //! ignored. A refusal before answering (an unknown job for `attach`, a bad request) is a non-2xx
-//! status, as in v1.1.
+//! status, as for a one-shot call.
 //!
 //! | op | `job` fields | answer |
 //! |---|---|---|
-//! | `probe` | | `{"jobs": "v1.3"}` |
 //! | `start` | `id`, `hold`, `label` — the command is the request's `command`/`args`/`cwd` | `hold: true` (with `"stream": true`): a job stream; `hold: false`: `{"started": pgid}` |
 //! | `attach` | `id`, `offset` (with `"stream": true`) | a job stream from `offset` |
 //! | `read` | `id`, `offset`, `max` | `{"state", "code", "offset", "end", "data"}` |
@@ -283,10 +215,10 @@
 //!   job. `started` is the job's epoch second, `label` what `start` sent.
 //! - **Held.** A job started with `hold: true` lives as long as its stream unless it is **kept**: if
 //!   the connection closes before the job's final frame and no `keep` arrived, the endpoint MUST kill
-//!   its whole group, exactly as v1.2's "Disconnect kills". `keep` hands it to the endpoint for good
+//!   its whole group, exactly as "Disconnect kills". `keep` hands it to the endpoint for good
 //!   (recording `num`, `kind` and `seen` for `list`); after it a closed stream kills nothing. A job
 //!   started with `hold: false` is kept from the start. Closing an `attach` never kills.
-//! - **A job stream** is a v1.2 stream (`application/x-ndjson`, heartbeats, frame size, flushing,
+//! - **A job stream** is a stream (`application/x-ndjson`, heartbeats, frame size, flushing,
 //!   unknown fields) with two more frames: `{"started": pgid}` first on a held start, and
 //!   `{"gap": n}` when `n` bytes of output from the requested offset are no longer kept. Output
 //!   frames (`stdout`; `stderr` is accepted too) carry the combined output in order. `{"shell_exit":
@@ -310,45 +242,47 @@
 //! `run_async`, `get_session_command` for the exit code, `get_session_command_logs` to stream logs;
 //! its docs name no kill for one command, so an adapter kills the process group itself).
 //!
-//! [`conformance::verify`] checks the capability when the probe says it is offered: a held job's
+//! [`conformance::verify`] checks it: a held job's
 //! live output and end, a dropped hold killing an unkept job (measured on the far side), a kept job
 //! surviving its hold and reading back from an offset (read and attach), `kill` reaching a job that
-//! ignores `SIGTERM`, and `list`/`wipe` staying inside their scope. `tests/fixtures/exec/v1.3-jobs.json`
+//! ignores `SIGTERM`, and `list`/`wipe` staying inside their scope. `tests/fixtures/exec/jobs.json`
 //! holds the decoding vectors.
 //!
 //! For targets that have no HTTP surface at all (`ssh`, `docker exec`, `kubectl exec`, any CLI), see
 //! [`TemplateRunner`], which is the same idea expressed as an argv template. Its transport is a local
-//! process, so its output streams natively; killing it is the hard part — see `far_kill`.
+//! process, so its output streams natively; killing it is the hard part — see `far_kill`. Such a
+//! target has no job operations of its own: the client builds jobs there from plain commands
+//! ([`jobs::ShellJobs`]), without notify.
 //!
-//! ## Sandbox job notify (v1.4)
+//! ## Sandbox job notify
 //!
-//! A replica holds a v1.2 stream to every kept job it serves, and the endpoint writes a heartbeat
+//! A replica holds a stream to every kept job it serves, and the endpoint writes a heartbeat
 //! on it at least every 5 s for as long as the job runs. That traffic keeps the connection open,
 //! and it keeps awake a sandbox that would otherwise sleep: an idle dev server holds its sandbox up
 //! for as long as its session stays open (a client attached, or kept alive; a detached session in
-//! service mode is reaped after 60 s, which drops its streams). v1.4 has the sandbox report when a
+//! service mode is reaped after 60 s, which drops its streams). Notify has the sandbox report when a
 //! kept job's state changes, so the replica can let go of the stream and send nothing about the job
 //! until then.
 //!
-//! **v1.4 changes how a replica learns of a job's end, and nothing else.** What a session does with
-//! an end, or with leftover processes, is exactly what it does today when a held stream or a follow
-//! tells it: the same notice, through the same path, starting or joining a turn exactly as today,
-//! whether or not a client is attached. Notify is only ever available in service mode (N36), so
-//! everywhere else nothing changes at all.
+//! **Notify changes how a replica learns of a job's end, and nothing else.** What a session does
+//! with an end, or with leftover processes, is exactly what it does when a held stream or a follow
+//! tells it: the same notice, through the same path, starting or joining a turn, whether or not a
+//! client is attached. Notify is only ever available in service mode (N36), so everywhere else
+//! nothing changes at all.
 //!
 //! **The one accepted difference.** After a job is unheld, an end that no callback delivers (the
 //! sandbox died, stopped or was replaced, every attempt failed, or a superseded owner that has not
 //! yet noticed took the callback) is noticed at the session's next real use of its sandbox (N29), a
-//! `bash_job` call about the job, or the session's next open, where today's heartbeat would have
-//! noticed it within seconds. Then it takes today's path, today's error notice included. Until then
-//! the session still counts the job as running: a `bash` start that today's limit on running jobs
-//! refuses names it among them. Nothing in v1.4 contacts a sandbox in the background to notice
-//! sooner: any periodic contact would keep the sandbox awake, which is the cost v1.4 exists to
+//! `bash_job` call about the job, or the session's next open, where a heartbeat would have noticed
+//! it within seconds. Then it takes the held stream's path, its error notice included. Until then
+//! the session still counts the job as running: a `bash` start that the limit on running jobs
+//! refuses names it among them. Nothing here contacts a sandbox in the background to notice
+//! sooner: any periodic contact would keep the sandbox awake, which is the cost notify exists to
 //! remove.
 //!
 //! Every requirement in this section is tagged in bold (N1, N2, …) and names the check that tests
 //! it: a conformance check ([`conformance::verify`], against any endpoint), a test in this repo, or
-//! vectors in `tests/fixtures/exec/v1.4-*.json`. `tests/fixtures/exec/v1.4-checks.json` maps every
+//! vectors in `tests/fixtures/exec/notify-*.json`. `tests/fixtures/exec/notify-checks.json` maps every
 //! tag to its check and `tests/exec_notify_vectors.rs` fails when a tag has none. The edge's half
 //! is FLEET.md's "Job-end callbacks", tagged E1, E2, ….
 //!
@@ -367,49 +301,28 @@
 //! each one HTTP request. A job's *state* is what `read` and `list` report (`running`, `exited`,
 //! `ended`, `lost`, `gone`). *Observable* means that a `read` or `list` of the job that starts after
 //! that moment reports it. A job is *proving*, *held* or *unheld* as the release table says
-//! ("Release"). *Unheld* is v1.4's own state, a kept job whose stream the replica closed after its
+//! ("Release"). *Unheld* is notify's own state, a kept job whose stream the replica closed after its
 //! proof; it is not `JobShared::released`, which today marks every kept job, held or not. A job is
 //! *taken* while a tool call in flight (`bash_job`) has it out of the session's job table. *Today's
-//! follow* is what a v1.3 replica does when a kept job's held stream breaks (`tools::bash_sandbox`'s
-//! `follow`: an `attach` natively, polling `read` in the baseline, with its own failure policy and
-//! error notice). The *session id* is the one the session is routed by, which the URL names.
+//! follow* is what a replica does when a kept job's held stream breaks (`tools::bash_sandbox`'s
+//! `follow`: an `attach`, with its own failure policy and error notice). The *session id* is the one the session is routed by, which the URL names.
 //!
-//! ### Adoption
+//! ### The endpoint's guarantee
 //!
-//! Advertising notify is an endpoint's promise that a kept job survives its sandbox going idle:
-//! it keeps running, or is paused and resumed intact. Releasing a job removes the heartbeat that
-//! kept the sandbox busy, so a sandbox that stops or kills idle processes (a vendor's auto-stop)
-//! would lose the job because of v1.4. Whether that holds is the endpoint's deployment's to say: a
-//! setting of the endpoint, off unless its operator turns it on (on for the platform's own native
-//! endpoint). An endpoint whose setting is off does not advertise, and its jobs are held as today.
-//! The baseline has no way around it: its only path to notify is the endpoint's advertisement (N3).
+//! Notify is part of the protocol, not an option an endpoint advertises, so the guarantee is a fact
+//! of it: a kept job survives its sandbox going idle (it keeps running, or is paused and resumed
+//! intact). Releasing a job removes the heartbeat that kept the sandbox busy, so a sandbox that
+//! stops or kills idle processes (a vendor's auto-stop) would lose the job. An adapter for such a
+//! sandbox either keeps it awake itself or does not implement this contract.
 //!
-//! - **N1** An endpoint MUST NOT advertise notify unless its deployment says a kept job survives
-//!   its sandbox going idle. An endpoint that keeps native jobs advertises by answering the v1.3
-//!   probe with `{"jobs": "v1.3", "notify": "v1.4"}`, and MUST be a conforming v1.3 endpoint; `jobs`
-//!   stays `"v1.3"`, because a client that predates v1.4 compares it exactly and would otherwise lose
-//!   native jobs. An endpoint without native jobs advertises notify for the baseline by answering the
-//!   same probe with `{"notify": "v1.4"}` and no `jobs`, which a client that predates v1.4 reads as no
-//!   native jobs, as before. (check: conformance `notify offered (v1.4)`; conformance `a kept job
-//!   survives idling`; fixture `v1.4-probe.json`)
-//! - **N2** A client MUST treat notify as offered natively only when `jobs` is exactly `"v1.3"` and
-//!   `notify` is exactly `"v1.4"`, and for the baseline only when `jobs` is absent and `notify` is
-//!   exactly `"v1.4"`. Any other answer means no notify, and the client sends `keep` without it.
-//!   (check: fixture `v1.4-probe.json`)
-//! - **N3** The baseline ([`jobs::ShellJobs`]) MUST offer notify only when the endpoint offers it
-//!   for the baseline (N2), its probe finds `curl`, and the endpoint honours v1.1 `stdin_base64`;
-//!   nothing else enables it. Its `keep` MUST receive `notify` on standard input and store it in a
-//!   file of mode 0600 in the job's directory, as a curl config holding the `url`, the
-//!   `Authorization` and `Content-Type` headers and the body, each as a double-quoted value with `\`
-//!   and `"` escaped. Every attempt MUST be exactly `curl -q -sS -K <that file> -o /dev/null -w
-//!   '%{http_code}' --max-time 30 --proto =http,https`: no `-L`, no `--retry`, nothing secret in the
-//!   arguments, and the status read from the output (`000` is a connection error). curl honours the
-//!   proxy variables of the supervisor's environment, as any command in the sandbox does. (check:
-//!   `sandbox_jobs_notify::baseline_offers_notify_only_with_curl`)
+//! **A replica never relies on reachability.** It sends `notify` with every `keep` it can
+//! name an origin for, and releases the job's stream only when the first notice has actually
+//! arrived (N35). A sandbox that cannot dial out, or an origin that is wrong, sends no first notice,
+//! so the stream stays held and the job's end is observed over it, as before notify (N38).
 //!
-//! An endpoint SHOULD NOT advertise notify when it knows it has no outbound network. No client
-//! relies on the advertisement for reachability: nothing is unheld until a callback has actually
-//! arrived (N35).
+//! - **N1** A kept job MUST survive its sandbox going idle, with nothing sent to the endpoint for
+//!   a window of the verifier's choosing (30 s by default). (check: conformance `a kept job
+//!   survives idling`)
 //!
 //! ### `keep` with `notify`
 //!
@@ -428,10 +341,10 @@
 //!   `https`, or `http` when its host is `localhost`, an address in `127.0.0.0/8`, or `[::1]`, for
 //!   tests. `token` is 1 to 512 bytes of RFC 7235 `token68` (`A-Z a-z 0-9 - . _ ~ + /`, then any
 //!   `=`). Unknown members of `notify` are ignored. The `url` is opaque past these checks. (check:
-//!   conformance `keep refuses an invalid notify`; fixture `v1.4-keep.json`)
+//!   conformance `keep refuses an invalid notify`; fixture `notify-keep.json`)
 //! - **N5** A refused `notify` is a `400` answer, and the endpoint MUST then record nothing: the
 //!   job is not kept, and no notify is stored. A `list` after it reports the job exactly as before
-//!   the request. (check: conformance `keep refuses an invalid notify`; fixture `v1.4-keep.json`)
+//!   the request. (check: conformance `keep refuses an invalid notify`; fixture `notify-keep.json`)
 //! - **N6** An accepted `keep` MUST record the keep and its notify together, and the latest `keep`
 //!   governs: one with `notify` replaces the job's notify, and one without it removes it. An
 //!   accepted `keep` MUST abandon the job's attempt in flight, if any, and every attempt that
@@ -439,24 +352,15 @@
 //!   follows the latest keep`)
 //! - **N7** The token is opaque. An endpoint MUST send it byte for byte as it was given, and MUST
 //!   NOT parse, check or rewrite it. (check: conformance `callback request shape`; fixture
-//!   `v1.4-callback.json`)
+//!   `notify-callback.json`)
 //! - **N8** One sender. An endpoint MUST make a job's proof (N11) and its state-change callbacks
 //!   (N12) from the same component, over the same network path, so that a proof that arrives shows
 //!   the job's end can arrive by the same way. An endpoint that cannot notify about a particular job
 //!   (it started the job before it could) MUST refuse a `notify` for that job (N5), so the job is
 //!   held as today. (check: conformance `the proof and the end reach the same url`)
-//! - **N9** The baseline's sender is the job's `setsid` supervisor. A supervisor that carries the
-//!   notifier MUST record so in the job's directory when it starts; `keep` MUST refuse `notify`
-//!   (`400`) for a job whose directory has no such record, as one started by an older agent has
-//!   not; and every attempt, the proof's included, MUST be made by the supervisor's notifier, which
-//!   `keep` signals by writing the `notify` file, never by the `keep` command itself. A notifier
-//!   that dies before the job ends MUST be started again; it owes the latest keep's callback anew.
-//!   (check: `sandbox_jobs_notify::the_supervisor_sends_the_proof`;
-//!   `sandbox_jobs_notify::an_older_supervisor_refuses_notify`;
-//!   `sandbox_jobs_notify::a_notifier_that_dies_is_started_again`)
 //! - **N10** `keep` does not wait. The endpoint MUST answer `keep` without waiting for any attempt,
 //!   and every attempt MUST be made by a process that outlives the `keep` request: never one in the
-//!   process group that v1.1 kills once a command has answered. (check: conformance `keep does not
+//!   process group that is killed once a command has answered. (check: conformance `keep does not
 //!   wait for its callback`)
 //!
 //! ### When the endpoint calls back
@@ -468,7 +372,7 @@
 //!   reports the job kept) and no later than 2 s after the `keep` is answered. (check: conformance
 //!   `first callback at keep`)
 //! - **N12** State changes. While a job's latest `keep` carries `notify`, the endpoint MUST owe the
-//!   job a callback at each moment a held v1.3 stream of the job would send `shell_exit` (the shell
+//!   job a callback at each moment a held stream of the job would send `shell_exit` (the shell
 //!   exited and a live member of its group was found), and when the job's end becomes observable
 //!   (`ended`, once its group is empty, or `lost`). An attempt for an owed callback begins after the
 //!   change and no later than 2 s after it, or, when an attempt for the job is in flight then, as soon
@@ -486,20 +390,20 @@
 //!   `Transfer-Encoding`, no cookies, and the body
 //!   `{"type":"job_ended","scope":"<scope>","id":"<id>"}`: exactly these three members, `scope` and
 //!   `id` byte for byte as the `keep` named them, at most 512 bytes, whatever the job's state.
-//!   (check: conformance `callback request shape`; fixture `v1.4-callback.json`)
+//!   (check: conformance `callback request shape`; fixture `notify-callback.json`)
 //! - **N15** The endpoint MUST NOT follow a redirect: a redirect would carry the token to an origin
 //!   `keep` did not name. Over `https` it MUST verify the server's certificate and name; a
 //!   connection that fails verification sends no request and counts as a connection error. (check:
 //!   conformance `callback does not follow redirects`; conformance `callback verifies TLS`)
 //! - **N16** An attempt that has no complete answer 30 s after it began counts as a connection
 //!   error, and the endpoint MUST abandon it. The endpoint MUST NOT have more than one attempt for a
-//!   job in flight at a time. (check: fixture `v1.4-retry.json`; conformance `callback retry and
+//!   job in flight at a time. (check: fixture `notify-retry.json`; conformance `callback retry and
 //!   stop`)
 //!
 //! ### The answer, and retries
 //!
 //! - **N17** The endpoint MUST act on the status as this table says. (check: fixture
-//!   `v1.4-retry.json`; conformance `callback retry and stop`)
+//!   `notify-retry.json`; conformance `callback retry and stop`)
 //!
 //! | answer | meaning | the endpoint |
 //! |---|---|---|
@@ -514,7 +418,7 @@
 //!   endpoint MUST wait `d(n) · (1 − u/2)` before attempt *n* + 1, where `d(n) = min(2^(n−1), 60)`
 //!   seconds, `u` is drawn uniformly from `[0, 1)` afresh for every wait, and the wait starts when
 //!   attempt *n* ended. After the twelfth failed attempt what it carried is given up. (check:
-//!   fixture `v1.4-retry.json`; conformance `callback retry and stop`)
+//!   fixture `notify-retry.json`; conformance `callback retry and stop`)
 //!
 //! So the waits are `1, 2, 4, 8, 16, 32, 60, 60, 60, 60, 60` s at most and half that at least, and a
 //! count is over within 723 s. A storage-lease takeover after a hard kill took at most 102.5 s in
@@ -530,13 +434,12 @@
 //!   output, an error). A model that runs `ps` there would otherwise copy it into a transcript.
 //!   (check: conformance `the token never reaches argv, environment or answers`)
 //! - **N20** The token MUST NOT be written to a log. A verifier cannot see an external endpoint's
-//!   logs, so this repo tests it for the endpoints it ships: the baseline writes the token only to
-//!   its 0600 `notify` file, and `exec_mock` never prints it. (check:
-//!   `sandbox_jobs_notify::the_token_is_never_logged`)
+//!   logs, so this repo tests it for the endpoints it ships: `execd` never prints it, and
+//!   neither does `exec_mock`. (check: `security::notify_tokens_and_callback_urls_never_reach_the_log`)
 //!
 //! These keep the token out of transcripts by accident. They do not hide it from a program that
-//! looks: the baseline runs the model's commands as the same user as the supervisor, so they can
-//! read the `notify` file. What such a program gains is small by construction: it can start a live
+//! looks: a sandbox that runs the model's commands as the same user as the endpoint lets them
+//! read the token. What such a program gains is small by construction: it can start a live
 //! reconcile of one job of one session, at most one a second (N30), or fake its own job's proof and
 //! then break the path, which delays only that job's report to the next use. It cannot open a
 //! session, run a command, read anything, or reach another session or tenant (N23, N24, N44).
@@ -549,7 +452,7 @@
 //! verifies nothing: the replica verifies the token itself.
 //!
 //! **A callback never opens a session.** Today a session that is closed, reaped or moved learns of
-//! a job's end only when it next opens and reads its sandbox's jobs back, and v1.4 changes nothing
+//! a job's end only when it next opens and reads its sandbox's jobs back, and notify changes nothing
 //! about that. So a callback matters only to a session open in some replica's process right now. A
 //! replica that does not have the session open answers `503`, as it answers any request for a
 //! session it does not hold, and the edge goes on to the replica that does (FLEET.md, Requirement
@@ -570,11 +473,11 @@
 //!   grant check, pinning or reply-picking, and ignoring any grant it carries; and MUST answer
 //!   `400` a request that looks like a callback but is not one. The edge classifies with these
 //!   same two rules (E1). (check: `serve_job_ended::the_token_header_is_read_exactly`; fixture
-//!   `v1.4-callback.json`)
+//!   `notify-callback.json`)
 //! - **N22** `job_ended` MUST be accepted only in a callback. Sent any other way (under a session
 //!   grant, over a WebSocket, on stdio) it is refused: `403` over HTTP, a failed `response`
 //!   otherwise. (check: `serve_job_ended::job_ended_is_only_a_callback`; fixture
-//!   `v1.4-callback.json`)
+//!   `notify-callback.json`)
 //! - **N23** The receiver MUST check a callback in this order, and answer at the first failure. (1)
 //!   Its path is `/_beyond/agent` (`404`, as for any other path today) and it is a `POST` (`403`).
 //!   (2) Its query names `session_id` and `tenant` exactly once each, keys and values decoded as
@@ -582,18 +485,18 @@
 //!   parameters are ignored. (3) The body: exactly one `Content-Length` and no `Transfer-Encoding`
 //!   (`411` with none, `400` with two, with a `Transfer-Encoding`, or with one that is not a number),
 //!   at most 4096 bytes (`413`), all of it within 10 s (`400`), a JSON object (`400`) whose `type`
-//!   is `job_ended` (`403`), with exactly the members `type`, `scope` and `id`, `id` a v1.3 job id
+//!   is `job_ended` (`403`), with exactly the members `type`, `scope` and `id`, `id` a job id
 //!   and `scope` a string of at most 64 bytes (`400`). (4) The replica is in service mode (`403`).
 //!   (5) The token (N43–N47): `401` when it is `malformed` or `bad_mac`, `503` when its kid is
 //!   unknown (N47). (6) `scope` is the session's own, [`jobs::JobScope::for_session`] of the URL's
 //!   tenant and session (`401`: a replica mints only for that scope, N46, so a token for any other
 //!   is as forged as a bad tag). Only a callback that passes all of them may look for the session,
 //!   or cause anything to be sent to the sandbox. (check:
-//!   `serve_job_ended::a_forged_callback_reaches_nothing`; fixture `v1.4-callback.json`)
+//!   `serve_job_ended::a_forged_callback_reaches_nothing`; fixture `notify-callback.json`)
 //! - **N24** A callback MUST NOT open, create, start or load a session, and MUST NOT write to
 //!   storage. When no session task in this process holds the URL's session for the URL's tenant, a
 //!   callback that passes N23 MUST be answered `503`, and nothing else happens. (check:
-//!   `serve_job_ended::a_callback_never_opens_a_session`; fixture `v1.4-callback.json`)
+//!   `serve_job_ended::a_callback_never_opens_a_session`; fixture `notify-callback.json`)
 //! - **N25** Every refusal of a callback, those of N21 and N23 included, MUST have a fixed body for
 //!   its status that says nothing about which check failed beyond the status. (check:
 //!   `serve_job_ended::refusals_say_nothing`)
@@ -616,7 +519,7 @@
 //! The *open reconcile* is today's read-back when a transcript opens (`tools::bash_sandbox`'s
 //! reattach): it runs when the session opens with its sandbox attached, or else at its first use of
 //! it, lists the scope, adopts each kept job with a number, reads what ended, and kills what nobody
-//! kept. A failed one leaves the session's jobs untracked, as today. v1.4 adds only N42 to it. It
+//! kept. A failed one leaves the session's jobs untracked, as today. Notify adds only N42 to it. It
 //! never runs because of a callback, so a callback never wakes or changes a session that has not
 //! used its sandbox since it opened.
 //!
@@ -654,13 +557,13 @@
 //!   to the session; reading the output is left to today's follow and is not waited for. It MUST be
 //!   answered `503` when that reconcile could not list the sandbox, or when no answer is ready 20 s
 //!   after it arrived. (check: `serve_job_ended::answers_after_the_list`; fixture
-//!   `v1.4-callback.json`)
+//!   `notify-callback.json`)
 //! - **N32** Any other callback for an open session MUST be answered without contacting the sandbox:
 //!   `200` when the session's open reconcile has not succeeded yet, when the job is proving or held,
 //!   or when its end is recorded; `503` when the job is taken, so the sandbox asks again once the
 //!   call has recorded the end or put the job back; `410` when the session neither tracks the job nor
 //!   has recorded its end. (check: `serve_job_ended::repeats_are_free`; fixture
-//!   `v1.4-callback.json`)
+//!   `notify-callback.json`)
 //!
 //! **What the session does with what it learns.**
 //!
@@ -714,11 +617,11 @@
 //!
 //! - **N35** The replica MUST release a job's stream only by the release row: `keep` with `notify`
 //!   succeeded, and a verified callback for that job arrived inside its proof window. Nothing else
-//!   releases a stream: not the probe's answer, not a `keep` alone, not a callback after the window.
+//!   releases a stream: not a `keep` alone, not a callback after the window.
 //!   (check: `job_notify::release_waits_for_the_first_callback`)
 //! - **N36** The replica MUST treat notify as available only when all of these hold: it is in
-//!   service mode, the operator has configured the origin the fleet's edge serves sessions at, and
-//!   the endpoint offers notify (N2) or the baseline does (N3). The `url` the replica sends is
+//!   service mode and the operator has configured the origin the fleet's edge serves sessions at.
+//!   The `url` the replica sends is
 //!   that origin's `/_beyond/agent?session_id=<session id>&tenant=<tenant>`, and the `token` is
 //!   minted for this session and job (N46). (check: `job_notify::keep_without_notify_when_unavailable`)
 //! - **N37** The proof window MUST open before `keep` is sent, so a callback that overtakes `keep`'s
@@ -748,7 +651,7 @@
 //! - **N41** A token MUST be a function of the key and of (tenant, session, scope, job id) alone,
 //!   with no time, nonce or replica in it (N44), so every replica that holds the key mints the same
 //!   token for the same job, and a session that moves has nothing to hand over. (check: fixture
-//!   `v1.4-token.json`)
+//!   `notify-token.json`)
 //! - **N42** A replica MUST keep a job again only when its open reconcile adopts it, kept and not
 //!   ended, while notify is available: it sends `keep` with the `num`, `kind` and `seen` its listing
 //!   reported and `notify`, and treats the job as `proving`, its follow standing for the stream in
@@ -787,21 +690,21 @@
 //!   or version, a field count other than three, a kid that is not eight lowercase hex digits, a
 //!   `mac` that is not 43 characters of the base64url alphabet, or one whose final character
 //!   carries non-zero padding bits (it would not re-encode to itself). (check: fixture
-//!   `v1.4-token.json`)
+//!   `notify-token.json`)
 //! - **N44** The verifier MUST compute `m` from the URL's tenant and session id, the body's `scope`
 //!   and `id`, and the constant purpose, and MUST take none of them from the token. So a token
 //!   verifies only for the tenant, session, scope, job and purpose it was minted for. (check:
-//!   fixture `v1.4-token.json`)
+//!   fixture `notify-token.json`)
 //! - **N45** The tag MUST be compared in constant time (`hmac::Mac::verify_slice`), and in full: no
 //!   truncated tags. (check: `notify_token::the_tag_is_compared_in_constant_time`; fixture
-//!   `v1.4-token.json`)
+//!   `notify-token.json`)
 //! - **N46** A replica MUST mint and verify under exactly one key, the one derived from its seal
 //!   secret, and MUST mint only for the session's own scope ([`jobs::JobScope::for_session`] of its
-//!   tenant and session) and for a job of that session. (check: fixture `v1.4-token.json`;
+//!   tenant and session) and for a job of that session. (check: fixture `notify-token.json`;
 //!   `notify_token::mints_only_its_own_scope`)
 //! - **N47** The verdicts are `valid`, `malformed`, `unknown_kid` and `bad_mac`. A replica MUST
 //!   answer `malformed` and `bad_mac` with `401`, and `unknown_kid` with `503`. (check: fixture
-//!   `v1.4-token.json`; fixture `v1.4-callback.json`)
+//!   `notify-token.json`; fixture `notify-callback.json`)
 //!
 //! **Why this key.** The only secret that every replica of a fleet already holds and that no one
 //! else holds is the fleet's X25519 seal secret. A replica holds only the public halves of the
@@ -851,11 +754,10 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::exec::{
-    ChunkSink, CommandRunner, ExecOutput, ExecResult, JobHooks, Kill, STREAM_HEAD, STREAM_TAIL,
-    SpawnSink, UNTRACKED_DEADLINE, drain_capped, feed_stdin,
+    ChunkSink, CommandRunner, ExecResult, JobHooks, Kill, STREAM_HEAD, STREAM_TAIL, SpawnSink,
+    drain_capped, feed_stdin,
 };
 
-mod exact;
 mod far_kill;
 pub mod jobs;
 pub mod jobs_native;
@@ -871,18 +773,15 @@ struct ExecRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     cwd: Option<&'a str>,
     timeout_ms: u64,
-    /// v1.1: bytes for the command's stdin, standard base64. Absent means no stdin — v1 behavior.
+    /// one-shot: bytes for the command's stdin, standard base64. Absent means no stdin.
     #[serde(skip_serializing_if = "Option::is_none")]
-    stdin_base64: Option<String>,
-    /// v1.2: answer with a stream of frames instead of one object. Absent means v1.1.
+    stdin: Option<String>,
+    /// streaming: answer with a stream of frames instead of one object. Absent means one-shot.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
-    /// v1.3: a job operation (see "Sandbox jobs (v1.3)"). Absent means the command is run as ever.
+    /// jobs: a job operation (see "Sandbox jobs"). Absent means the command is run as ever.
     #[serde(skip_serializing_if = "Option::is_none")]
     job: Option<&'a serde_json::Value>,
-    /// v1.1: answer with `stdout_base64`/`stderr_base64` (see "Exact output"). Absent means text.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    output_base64: bool,
 }
 
 /// What the agent expects back. Extra fields are ignored, so an endpoint may return more.
@@ -890,15 +789,62 @@ struct ExecRequest<'a> {
 #[doc(hidden)]
 pub struct ExecResponse {
     pub exit_code: i32,
-    #[serde(default)]
+    /// Standard base64 of what the command wrote: the empty string for no output.
     pub stdout: String,
-    #[serde(default)]
     pub stderr: String,
-    /// v1.1 `output_base64`: the bytes, standard base64. Present only on an endpoint that honours it.
-    #[serde(default)]
-    pub stdout_base64: Option<String>,
-    #[serde(default)]
-    pub stderr_base64: Option<String>,
+}
+
+impl ExecResponse {
+    /// The answer as a result, the base64 decoded. An answer whose `stdout` or `stderr` is not
+    /// standard base64 is an error, never read as empty.
+    pub fn into_result(self, url: &str, cap: usize) -> std::io::Result<ExecResult> {
+        let decode = |field: &str, b: &str| {
+            base64::engine::general_purpose::STANDARD
+                .decode(b)
+                .map_err(|e| {
+                    std::io::Error::other(format!(
+                        "exec endpoint {url}: `{field}` is not standard base64 ({e})"
+                    ))
+                })
+        };
+        let (stdout, stderr) = (
+            decode("stdout", &self.stdout)?,
+            decode("stderr", &self.stderr)?,
+        );
+        if stdout.len().saturating_add(stderr.len()) > cap {
+            return Err(too_large(url, cap));
+        }
+        Ok(ExecResult {
+            code: Some(self.exit_code),
+            stdout,
+            stderr,
+            ..Default::default()
+        })
+    }
+}
+
+/// Room for the JSON around two base64 strings (the keys, the exit code).
+const ENVELOPE_SLACK: usize = 4096;
+
+/// The most body a client reads for an answer under response cap `cap`: the base64 of `cap` decoded
+/// bytes, plus the envelope. The cap itself is on the decoded bytes.
+fn body_cap(cap: usize) -> usize {
+    cap.div_ceil(3)
+        .saturating_mul(4)
+        .saturating_add(ENVELOPE_SLACK)
+}
+
+/// The error for an answer past the response cap: the command ran. `FileTooLarge`, so a probe reads
+/// it as an answer (not a transport failure) and a caller handles one kind.
+fn too_large(url: &str, cap: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::FileTooLarge,
+        format!(
+            "exec endpoint {url}: the response exceeded the {cap}-byte cap and was discarded — the \
+             command ran, but its output is too large to return; narrow it (e.g. pipe through \
+             `head`) rather than re-running it unchanged"
+        ),
+    )
 }
 
 /// The `timeout_ms` a streamed `bash` job sends: `i32::MAX` ms (~24.8 days), the longest deadline
@@ -938,17 +884,6 @@ pub struct HttpExecRunner {
     /// Where the `Authorization: Bearer` token comes from, when the endpoint wants one.
     auth: Option<crate::token::Bearer>,
     max_response_bytes: usize,
-    /// Whether the endpoint has proved it streams (v1.2) — probed once, on the first streaming call,
-    /// and cached. A probe that could not reach the endpoint is not cached: that is an outage, not
-    /// an answer.
-    streams: tokio::sync::OnceCell<bool>,
-    /// Whether the endpoint honours `output_base64` (v1.1, "Exact output") — probed once, the same way.
-    output_probe: tokio::sync::OnceCell<bool>,
-    /// Whether the sandbox can run jobs of its own ([`jobs::ShellJobs`]) — probed once, the same way.
-    jobs_probe: Arc<tokio::sync::OnceCell<jobs::Baseline>>,
-    /// What the endpoint offers for jobs: natively (v1.3, [`jobs_native`]), and `notify` (v1.4) —
-    /// probed once, the same way.
-    job_offer: tokio::sync::OnceCell<jobs_native::JobOffer>,
     /// Raised when the endpoint could not be reached or refused a request: a sign the sandbox
     /// behind it may have been replaced, so whatever was learned about it (the probe, the
     /// capabilities above) should be learned again. Read by the [`ExecTarget`] that shares it.
@@ -974,7 +909,7 @@ impl HttpExecRunner {
             client: {
                 crate::tls::ensure_provider();
                 // An idle connection to the endpoint is closed after 30 s and never probed with TCP
-                // keepalives: once a job is unheld (exec v1.4), nothing may keep the sandbox awake.
+                // keepalives: once a job is unheld (exec notify), nothing may keep the sandbox awake.
                 reqwest::Client::builder()
                     .pool_idle_timeout(Duration::from_secs(30))
                     .tcp_keepalive(None)
@@ -984,10 +919,6 @@ impl HttpExecRunner {
             headers: Vec::new(),
             auth: None,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
-            streams: tokio::sync::OnceCell::new(),
-            output_probe: tokio::sync::OnceCell::new(),
-            jobs_probe: Arc::default(),
-            job_offer: tokio::sync::OnceCell::new(),
             suspect: None,
         })
     }
@@ -1043,7 +974,7 @@ impl HttpExecRunner {
     }
 
     /// Send one request and return the response once its status is known to be a success. `stream`
-    /// asks for v1.2 frames; whether they came is the response's `Content-Type` to say.
+    /// asks for streaming frames; whether they came is the response's `Content-Type` to say.
     #[doc(hidden)]
     pub async fn send(
         &self,
@@ -1058,7 +989,7 @@ impl HttpExecRunner {
             .await
     }
 
-    /// [`Self::send`], carrying a v1.3 job operation.
+    /// [`Self::send`], carrying a job operation.
     #[allow(clippy::too_many_arguments)]
     #[doc(hidden)]
     pub async fn send_job(
@@ -1076,10 +1007,9 @@ impl HttpExecRunner {
             args,
             cwd,
             timeout_ms: timeout.as_millis().min(u64::MAX as u128) as u64,
-            stdin_base64: stdin.map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
+            stdin: stdin.map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
             stream,
             job,
-            output_base64: false,
         };
         self.send_request(timeout, &body).await
     }
@@ -1153,7 +1083,7 @@ impl HttpExecRunner {
                 self.suspect();
             }
             let (body, _) = self.read_capped(resp).await?;
-            // A `400` refuses the request as written (v1.4's refused `notify` among others), which
+            // A `400` refuses the request as written (notify's refused `notify` among others), which
             // a caller may answer by sending another; anything else is an error of the endpoint's.
             let kind = if status == reqwest::StatusCode::BAD_REQUEST {
                 std::io::ErrorKind::InvalidInput
@@ -1173,7 +1103,7 @@ impl HttpExecRunner {
         Ok(resp)
     }
 
-    /// One request, one response: the whole v1.1 protocol.
+    /// One request, one response: the whole one-shot protocol.
     #[doc(hidden)]
     pub async fn post(
         &self,
@@ -1187,31 +1117,14 @@ impl HttpExecRunner {
         self.envelope(resp).await
     }
 
-    /// Read and parse a v1.1 response body: one JSON object, capped.
+    /// Read and parse a one-shot response body: one JSON object, capped.
     #[doc(hidden)]
     pub async fn envelope(&self, resp: reqwest::Response) -> std::io::Result<ExecResponse> {
-        self.envelope_to(resp, self.max_response_bytes).await
-    }
-
-    /// [`Self::envelope`] reading at most `cap` bytes of body.
-    async fn envelope_to(
-        &self,
-        resp: reqwest::Response,
-        cap: usize,
-    ) -> std::io::Result<ExecResponse> {
-        let (body, over_cap) = self.read_capped_to(resp, cap).await?;
+        let (body, over_cap) = self
+            .read_capped_to(resp, body_cap(self.max_response_bytes))
+            .await?;
         if over_cap {
-            // `FileTooLarge`, not `Other`: the command ran and the endpoint answered, so a probe
-            // reads this as its answer (not a transport failure); see `Capabilities::probe`.
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::FileTooLarge,
-                format!(
-                    "exec endpoint {}: the response exceeded the {}-byte cap and was discarded — the \
-                 command ran, but its output is too large to return; narrow it (e.g. pipe through \
-                 `head`) rather than re-running it unchanged",
-                    self.url, self.max_response_bytes
-                ),
-            ));
+            return Err(too_large(&self.url, self.max_response_bytes));
         }
         serde_json::from_slice(&body).map_err(|e| {
             std::io::Error::other(format!(
@@ -1220,6 +1133,13 @@ impl HttpExecRunner {
                 excerpt(&body)
             ))
         })
+    }
+
+    /// A one-shot response, read and decoded.
+    async fn answer(&self, resp: reqwest::Response) -> std::io::Result<ExecResult> {
+        self.envelope(resp)
+            .await?
+            .into_result(&self.url, self.max_response_bytes)
     }
 
     /// Read the body incrementally, stopping at the cap instead of buffering whatever the endpoint
@@ -1266,29 +1186,12 @@ impl CommandRunner for HttpExecRunner {
         timeout: Duration,
         stdin: &[u8],
     ) -> std::io::Result<ExecResult> {
-        // Sent as `stdin_base64`. A v1 endpoint ignores it and runs the command with no input, so an
+        // An endpoint that predates `stdin` ignores it and runs the command with no input, so an
         // `Ok` here is not proof of delivery — see the module doc on the probe.
-        let parsed = self.post(program, args, cwd, timeout, Some(stdin)).await?;
-        Ok(ExecResult {
-            code: Some(parsed.exit_code),
-            stdout: parsed.stdout,
-            stderr: parsed.stderr,
-            ..Default::default()
-        })
-    }
-
-    /// The command's bytes, never a lossy conversion of them: `output_base64` when the endpoint
-    /// honours it, else a v1.2 stream's base64 frames, else (a plain v1.1 endpoint) the text it
-    /// gave, said to be inexact. See the module doc's "Exact output".
-    async fn run_exact(
-        &self,
-        program: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        timeout: Duration,
-        stdin: Option<&[u8]>,
-    ) -> std::io::Result<ExecOutput> {
-        self.exact(program, args, cwd, timeout, stdin).await
+        let resp = self
+            .send(program, args, cwd, timeout, Some(stdin), false)
+            .await?;
+        self.answer(resp).await
     }
 
     async fn run(
@@ -1298,20 +1201,13 @@ impl CommandRunner for HttpExecRunner {
         cwd: Option<&str>,
         timeout: Duration,
     ) -> std::io::Result<ExecResult> {
-        let parsed = self.post(program, args, cwd, timeout, None).await?;
-        Ok(ExecResult {
-            code: Some(parsed.exit_code),
-            signal: None,
-            stdout: parsed.stdout,
-            stderr: parsed.stderr,
-            timed_out: false,
-            truncated: false,
-        })
+        let resp = self.send(program, args, cwd, timeout, None, false).await?;
+        self.answer(resp).await
     }
 
-    /// v1.2 when the endpoint has proved it streams; otherwise v1.1, which never calls the sink.
+    /// streaming when the endpoint has proved it streams; otherwise one-shot, which never calls the sink.
     ///
-    /// The sink gets *every* byte of *both* streams or none: a v1.1 answer (or a v1.2 endpoint that
+    /// The sink gets *every* byte of *both* streams or none: a one-shot answer (or a streaming endpoint that
     /// answers this request with one object anyway) goes back as `stdout`/`stderr` for `bash` to
     /// assemble. An earlier override fed the sink stdout alone, told `bash` the output had streamed,
     /// and every remote command that printed to stdout lost its stderr.
@@ -1333,7 +1229,7 @@ impl CommandRunner for HttpExecRunner {
     ///
     /// The job has no deadline of its own, but the wire needs a `timeout_ms`: a stream sends
     /// [`STREAM_DEADLINE`], so the connection (closed by a kill, a dropped job or the agent's exit) is
-    /// what ends it; a v1.1 endpoint gets [`UNTRACKED_DEADLINE`], the only thing that can end a
+    /// what ends it; a one-shot endpoint gets [`UNTRACKED_DEADLINE`], the only thing that can end a
     /// command it cannot stream or stop. See the module doc's "Timeouts".
     async fn run_streaming_tracked(
         &self,
@@ -1342,11 +1238,7 @@ impl CommandRunner for HttpExecRunner {
         cwd: Option<&str>,
         hooks: &JobHooks<'_>,
     ) -> std::io::Result<ExecResult> {
-        let deadline = if self.streams().await {
-            STREAM_DEADLINE
-        } else {
-            UNTRACKED_DEADLINE
-        };
+        let deadline = STREAM_DEADLINE;
         // The endpoint owns the command's process group: it says when the shell exits leaving some
         // of it running (`shell_exit`), and keeps the stream — and so the job — open until the group
         // is empty. See the module doc's "Leftover processes".
@@ -1363,10 +1255,10 @@ impl CommandRunner for HttpExecRunner {
     }
 
     async fn tracks_jobs(&self) -> bool {
-        self.streams().await
+        true
     }
 
-    /// v1.2 only: stdout frames to `on_stdout`, stderr frames to `on_stderr`, until the final frame.
+    /// streaming only: stdout frames to `on_stdout`, stderr frames to `on_stderr`, until the final frame.
     /// Dropping the future drops the response, which closes the connection — and the endpoint kills
     /// the command's group ("Disconnect kills").
     async fn run_attached(
@@ -1377,22 +1269,16 @@ impl CommandRunner for HttpExecRunner {
         on_stdout: ChunkSink<'_>,
         on_stderr: ChunkSink<'_>,
     ) -> std::io::Result<ExecResult> {
-        if !self.streams().await {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "this exec endpoint does not stream (protocol v1.1)",
-            ));
-        }
         let resp = self
             .send(program, args, cwd, STREAM_DEADLINE, None, true)
             .await?;
         if !is_ndjson(&resp) {
             // One object after all (a fleet mid-rollout): everything arrives at once, at the end.
-            let parsed = self.envelope(resp).await?;
-            on_stdout(parsed.stdout.as_bytes());
-            on_stderr(parsed.stderr.as_bytes());
+            let done = self.answer(resp).await?;
+            on_stdout(&done.stdout);
+            on_stderr(&done.stderr);
             return Ok(ExecResult {
-                code: Some(parsed.exit_code),
+                code: done.code,
                 ..Default::default()
             });
         }
@@ -1436,47 +1322,12 @@ impl CommandRunner for HttpExecRunner {
     }
 
     async fn attaches(&self) -> bool {
-        self.streams().await
+        true
     }
 
-    /// Native (v1.3) when the endpoint offers it, the baseline over plain exec commands otherwise.
+    /// Native (jobs) when the endpoint offers it, the baseline over plain exec commands otherwise.
     fn sandbox_jobs(self: Arc<Self>) -> Option<Arc<dyn jobs::SandboxJobs>> {
-        let shell = jobs::ShellJobs::over_endpoint(self.clone(), self.jobs_probe.clone());
-        Some(Arc::new(jobs_native::HttpJobs::new(self, shell)))
-    }
-}
-
-impl HttpExecRunner {
-    /// Whether the endpoint offers sandbox jobs natively (v1.3), probing it the first time. See the
-    /// module doc's "Sandbox jobs (v1.3)".
-    pub async fn offers_jobs(&self) -> bool {
-        self.job_offer().await.native_jobs
-    }
-
-    /// What the endpoint offers for jobs — natively (v1.3), and `notify` (v1.4) natively or for the
-    /// baseline — probing it the first time. A probe that could not reach it offers nothing this
-    /// time and is retried next time.
-    pub async fn job_offer(&self) -> jobs_native::JobOffer {
-        self.job_offer
-            .get_or_try_init(|| async {
-                let offer = match jobs_native::probe(self).await {
-                    Ok(offer) => offer,
-                    // A front that refuses the `job` field has answered: it offers nothing.
-                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
-                        jobs_native::JobOffer::default()
-                    }
-                    Err(e) => return Err(e),
-                };
-                if offer.native_jobs {
-                    tracing::info!(url = %self.url, notify = offer.notify, "exec endpoint offers sandbox jobs (v1.3)");
-                } else if offer.baseline_notify {
-                    tracing::info!(url = %self.url, "exec endpoint offers job notify (v1.4) for the baseline");
-                }
-                Ok::<_, std::io::Error>(offer)
-            })
-            .await
-            .copied()
-            .unwrap_or_default()
+        Some(Arc::new(jobs_native::HttpJobs::new(self)))
     }
 }
 
@@ -1527,53 +1378,7 @@ impl Drop for Released {
 }
 
 impl HttpExecRunner {
-    /// Whether this endpoint streams (v1.2), probing it the first time. See the module doc's "The
-    /// probe".
-    pub async fn streams(&self) -> bool {
-        self.try_streams().await.unwrap_or(false)
-    }
-
-    /// [`Self::streams`], but a probe that could not reach the endpoint is an error, not "no": for
-    /// the caller whose answer depends on it (`run_exact`). Not cached, so the next call asks again.
-    pub async fn try_streams(&self) -> std::io::Result<bool> {
-        self.streams
-            .get_or_try_init(|| async {
-                let resp = match self
-                    .send(
-                        "sh",
-                        &["-c".to_string(), stream::PROBE_SCRIPT.to_string()],
-                        None,
-                        Duration::from_secs(10),
-                        None,
-                        true,
-                    )
-                    .await
-                {
-                    Ok(resp) => resp,
-                    // A front that refuses `stream` has answered: it does not stream. Only a probe
-                    // that could not reach it is asked again.
-                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
-                        return Ok::<bool, std::io::Error>(false);
-                    }
-                    Err(e) => return Err(e),
-                };
-                if !is_ndjson(&resp) {
-                    return Ok::<bool, std::io::Error>(false);
-                }
-                let seen = stream::observe_probe(resp)
-                    .await
-                    .map_err(std::io::Error::other)?;
-                let streams = seen.streams();
-                if !streams {
-                    tracing::info!(url = %self.url, why = %seen.explain(), "exec endpoint does not stream; `bash` waits for each command to exit");
-                }
-                Ok(streams)
-            })
-            .await
-            .copied()
-    }
-
-    /// The v1.2 exchange. Falls back to v1.1 when the endpoint has not proved it streams, or when it
+    /// The streaming exchange. Falls back to one-shot when the endpoint has not proved it streams, or when it
     /// answers this request with one JSON object after all (a fleet mid-rollout).
     #[allow(clippy::too_many_arguments)]
     async fn run_stream(
@@ -1586,22 +1391,13 @@ impl HttpExecRunner {
         on_spawn: Option<SpawnSink<'_>>,
         on_orphans: Option<OrphanSink<'_>>,
     ) -> std::io::Result<ExecResult> {
-        if !self.streams().await {
-            return self.run(program, args, cwd, timeout).await;
-        }
         let stop = Arc::new(StreamStop::default());
         // Declared before the response: dropped after it, so "released" is only ever set once the
         // connection has been let go.
         let _released = Released(stop.clone());
         let resp = self.send(program, args, cwd, timeout, None, true).await?;
         if !is_ndjson(&resp) {
-            let parsed = self.envelope(resp).await?;
-            return Ok(ExecResult {
-                code: Some(parsed.exit_code),
-                stdout: parsed.stdout,
-                stderr: parsed.stderr,
-                ..Default::default()
-            });
+            return self.answer(resp).await;
         }
         if let Some(report) = on_spawn {
             let stop = stop.clone();
@@ -1660,7 +1456,7 @@ impl HttpExecRunner {
                     frames.finish().await;
                     return Ok(ExecResult {
                         timed_out: true,
-                        stderr: "command exceeded its timeout".into(),
+                        stderr: b"command exceeded its timeout".to_vec(),
                         ..Default::default()
                     });
                 }
@@ -1677,7 +1473,7 @@ impl HttpExecRunner {
     }
 }
 
-/// Whether a response is a v1.2 stream rather than a v1.1 object.
+/// Whether a response is a stream rather than a one-shot object.
 pub fn is_ndjson(resp: &reqwest::Response) -> bool {
     resp.headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -1812,7 +1608,7 @@ impl CommandRunner for TemplateRunner {
     }
 
     /// The transport's two pipes, kept apart. No deadline; dropping the future kills the far side
-    /// (`TemplateKillGuard`), so the held start dies with it — as a v1.2 stream's does.
+    /// (`TemplateKillGuard`), so the held start dies with it — as a stream's does.
     async fn run_attached(
         &self,
         program: &str,
@@ -2097,8 +1893,8 @@ impl TemplateRunner {
                     // remote signal as an exit code, and a local `docker exec` killed by one says
                     // nothing about what ran inside. Left `None` rather than guessing.
                     signal: None,
-                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                    stdout,
+                    stderr,
                     timed_out: false,
                     truncated: out_truncated || err_truncated,
                 })
@@ -2112,11 +1908,12 @@ impl TemplateRunner {
                 Ok(ExecResult {
                     code: None,
                     signal: None,
-                    stdout: String::new(),
+                    stdout: Vec::new(),
                     stderr: format!(
                         "exec template timed out after {:?}",
                         timeout.unwrap_or_default()
-                    ),
+                    )
+                    .into_bytes(),
                     timed_out: true,
                     truncated: false,
                 })
@@ -2129,6 +1926,64 @@ impl TemplateRunner {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    /// Every answer in `output.json` decodes as the vectors say: the bytes, or an error.
+    #[test]
+    fn the_answer_vectors_decode_as_specified() {
+        let doc: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/exec/output.json")).unwrap();
+        let b64 = |v: &serde_json::Value| {
+            base64::engine::general_purpose::STANDARD
+                .decode(v.as_str().unwrap())
+                .unwrap()
+        };
+        for case in doc["answers"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let got = serde_json::from_value::<ExecResponse>(case["answer"].clone())
+                .map_err(|e| e.to_string())
+                .and_then(|r| {
+                    r.into_result("http://x", 1 << 20)
+                        .map_err(|e| e.to_string())
+                });
+            let want = &case["expect"];
+            if want["invalid"] == true {
+                assert!(got.is_err(), "{name}: a conforming client reports an error");
+                continue;
+            }
+            let got = got.unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(
+                got.code,
+                Some(want["exit_code"].as_i64().unwrap() as i32),
+                "{name}"
+            );
+            assert_eq!(got.stdout, b64(&want["stdout_base64"]), "{name}: stdout");
+            assert_eq!(got.stderr, b64(&want["stderr_base64"]), "{name}: stderr");
+        }
+    }
+
+    #[test]
+    fn the_cap_is_on_the_decoded_bytes_of_both_streams_together() {
+        let answer = |cap| {
+            ExecResponse {
+                exit_code: 0,
+                stdout: "AAAA".into(),
+                stderr: "AAAA".into(),
+            }
+            .into_result("http://x", cap)
+        };
+        assert!(answer(6).is_ok(), "3 + 3 decoded bytes fit a cap of 6");
+        let over = answer(5).unwrap_err();
+        assert_eq!(over.kind(), std::io::ErrorKind::FileTooLarge);
+        assert!(over.to_string().contains("the command ran"), "{over}");
+    }
+
+    #[test]
+    fn the_body_cap_holds_the_base64_of_a_cap_of_output() {
+        // 16 MiB of output is 21_845_334 base64 characters (4 per 3 bytes, padded up).
+        assert!(body_cap(16 * 1024 * 1024) >= 22_369_620);
+        assert_eq!(body_cap(3), 4 + ENVELOPE_SLACK);
+        assert_eq!(body_cap(4), 8 + ENVELOPE_SLACK);
+    }
 
     #[test]
     fn a_url_must_be_http_or_https() {
@@ -2193,7 +2048,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.code, Some(0));
-        assert_eq!(out.stdout, "hello");
+        assert_eq!(out.stdout, b"hello");
     }
 
     #[tokio::test]
@@ -2206,7 +2061,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.code, Some(0));
-        assert!(out.stdout.contains("marker.txt"), "{out:?}");
+        assert!(out.stdout_text().contains("marker.txt"), "{out:?}");
     }
 
     /// The transport's output is bounded by the capture window and truncation is reported honestly.
@@ -2256,8 +2111,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(out.stdout, "hello\n");
-        assert_eq!(out.stderr, "oops\n");
+        assert_eq!(out.stdout, b"hello\n");
+        assert_eq!(out.stderr, b"oops\n");
         assert!(!out.truncated, "{out:?}");
     }
 }

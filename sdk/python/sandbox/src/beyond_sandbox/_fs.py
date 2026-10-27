@@ -12,7 +12,7 @@ import binascii
 import contextlib
 import re
 import secrets
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Sequence
 
 from . import _scripts
@@ -21,23 +21,21 @@ from .errors import (
     Conflict,
     InvalidQuery,
     IoError,
+    NotADirectory,
     NotFound,
-    NotOffered,
     SandboxError,
     Timeout,
-    TooLarge,
     classify_stderr,
 )
 from .models import Capabilities, Entry, ExecResult, Hit, Kind, SearchResult, Stat
 
 PROBE_TIMEOUT_MS = 10_000
-STDIN_PROBE = b"stdin-probe"
-READ_WINDOW_PROBE = (
-    "printf abc | dd iflag=skip_bytes,count_bytes skip=1 count=1 status=none 2>/dev/null"
-    " | base64 -w0 2>/dev/null"
-)
-#: Raw bytes per write command without stdin: 48 KiB, which is 64 KiB of base64.
-WRITE_CHUNK = 48 * 1024
+#: The whole environment probe: one ``sh -c`` round trip, one line per capability the sandbox has.
+PROBE_SCRIPT = r"""rg --version >/dev/null 2>&1 && echo rg
+grep -rnZ -e __cap_probe__ -- /dev/null >/dev/null 2>&1; [ $? -le 1 ] && echo grep_null
+[ "$(find /dev/null -maxdepth 0 -printf %y 2>/dev/null)" = c ] && echo find_printf
+[ "$(printf abc | dd iflag=skip_bytes,count_bytes skip=1 count=1 status=none 2>/dev/null | base64 -w0 2>/dev/null)" = Yg== ] && echo read_window
+true"""
 #: Raw bytes per read command: 96 KiB, which is 128 KiB of base64.
 READ_CHUNK = 96 * 1024
 #: Context lines asked of the engine are clamped to this.
@@ -52,7 +50,7 @@ DEFAULT_SEARCH_LIMIT = 100
 
 @dataclass(slots=True)
 class FsState:
-    """What a :class:`~beyond_sandbox.Files` learns about its sandbox: probes and git roots."""
+    """What a :class:`~beyond_sandbox.Files` learns about its sandbox: the probe and git roots."""
 
     caps: Capabilities | None = None
     git_roots: dict[str, bool] = field(default_factory=dict)
@@ -63,18 +61,33 @@ def sh(script: str, *args: str) -> list[str]:
     return ["-c", script, "sh", *args]
 
 
-def text(b: bytes) -> str:
-    return b.decode("utf-8", "replace")
+_OS_ERROR_NAMES = (
+    "no such file or directory",
+    "directory nonexistent",
+    "nonexistent directory",
+    "is a directory",
+    "not a directory",
+    "permission denied",
+)
 
 
-def first_line(stderr: bytes, fallback: str = "command failed") -> str:
-    lines = text(stderr).strip().splitlines()
-    return lines[0] if lines else fallback
+def first_line(stderr: str, fallback: str = "command failed") -> str:
+    """The detail of a failed command (3.3): the first line of trimmed stderr; when that line names
+    no OS error, the lines through the first one that does (a path containing a newline splits the
+    message)."""
+    lines = stderr.strip().split("\n")
+    if lines == [""]:
+        return fallback
+    for i, ln in enumerate(lines):
+        low = ln.lower()
+        if any(n in low for n in _OS_ERROR_NAMES):
+            return "\n".join(lines[: i + 1]).rstrip()
+    return lines[0].rstrip()
 
 
-def fail(prefix: str, stderr: bytes) -> SandboxError:
-    """A command that ran and failed (3.3): ``prefix: first line``, classified by that line."""
-    line = first_line(stderr)
+def fail(prefix: str, r: ExecResult) -> SandboxError:
+    """A command that ran and failed (3.3): ``prefix: first line``, classified by it."""
+    line = first_line(r.stderr_text)
     err = classify_stderr(line)
     return type(err)(f"{prefix}: {line}")
 
@@ -83,40 +96,18 @@ def fail(prefix: str, stderr: bytes) -> SandboxError:
 
 
 def probe() -> Op[Capabilities]:
-    """FILES-OVER-EXEC.md 4. A probe that fails at the transport level raises; only one that ran
-    and answered "absent" means absent."""
-
-    def attempt(run: Run) -> Op[ExecResult | None]:
-        try:
-            r: ExecResult = yield run
-            return r
-        except (NotFound, NotOffered, TooLarge):
-            return None  # the command could not run on the target at all: that is the answer
-
-    r = yield from attempt(Run("rg", ["--version"], timeout_ms=PROBE_TIMEOUT_MS))
-    rg = r is not None and r.exit_code == 0
-    r = yield from attempt(
-        Run("grep", ["-rnZ", "-e", "__cap_probe__", "--", "/dev/null"], timeout_ms=PROBE_TIMEOUT_MS)
+    """FILES-OVER-EXEC.md 4: every environment check in one round trip. A request that fails
+    raises; only a script that ran and answered "absent" means absent."""
+    r: ExecResult = yield Run("sh", ["-c", PROBE_SCRIPT], timeout_ms=PROBE_TIMEOUT_MS)
+    found = {line.strip() for line in r.stdout_text.splitlines()}
+    return capabilities(
+        "rg" in found, "grep_null" in found, "find_printf" in found, "read_window" in found
     )
-    grep_null = r is not None and r.exit_code in (0, 1)
-    r = yield from attempt(
-        Run("find", ["/dev/null", "-maxdepth", "0", "-printf", "%y"], timeout_ms=PROBE_TIMEOUT_MS)
-    )
-    # busybox find has no -printf, prints its usage and exits 1, the code of "found nothing":
-    # only GNU's answer (the type of /dev/null, a character device) proves the flag
-    find_printf = r is not None and r.exit_code in (0, 1) and r.stdout == b"c"
-    r = yield from attempt(Run("cat", [], stdin=STDIN_PROBE, timeout_ms=PROBE_TIMEOUT_MS))
-    stdin = r is not None and r.exit_code == 0 and r.stdout == STDIN_PROBE
-    r = yield from attempt(Run("sh", ["-c", READ_WINDOW_PROBE], timeout_ms=PROBE_TIMEOUT_MS))
-    read_window = r is not None and r.exit_code == 0 and r.stdout.strip() == b"Yg=="
-    return capabilities(rg, grep_null, find_printf, stdin, read_window)
 
 
-def capabilities(
-    rg: bool, grep_null: bool, find_printf: bool, stdin: bool, read_window: bool
-) -> Capabilities:
+def capabilities(rg: bool, grep_null: bool, find_printf: bool, read_window: bool) -> Capabilities:
     engine = "rg" if rg else "grep" if grep_null else "busybox-grep"
-    return Capabilities(stdin, find_printf, engine, read_window, rg, grep_null)
+    return Capabilities(find_printf, engine, read_window, rg, grep_null)
 
 
 def with_engine(caps: Capabilities, engine: str) -> Capabilities:
@@ -124,7 +115,7 @@ def with_engine(caps: Capabilities, engine: str) -> Capabilities:
     rg, grep_null = {"rg": (True, True), "grep": (False, True), "busybox-grep": (False, False)}[
         engine
     ]
-    return capabilities(rg, grep_null, caps.find_printf, caps.stdin, caps.read_window)
+    return capabilities(rg, grep_null, caps.find_printf, caps.read_window)
 
 
 # ---- stat ------------------------------------------------------------------------------------------
@@ -133,7 +124,7 @@ _KINDS: dict[str, Kind] = {"f": "file", "d": "dir"}
 
 
 def parse_stat(stdout: str) -> Stat | None:
-    """``W<TAB>T<TAB>SIZE<TAB>MTIME``; anything else is "does not exist"."""
+    """``W<TAB>T<TAB>SIZE<TAB>MTIME`` (``MTIME`` is ``SECS.FRAC``); anything else is "does not exist"."""
     line = stdout.split("\n", 1)[0]
     parts = line.split("\t")
     if len(parts) < 3:
@@ -143,8 +134,9 @@ def parse_stat(stdout: str) -> Stat | None:
     size = _uint(parts[2].strip())
     if size is None:
         return None
-    mtime = _uint(parts[3].split(".")[0].strip()) if len(parts) > 3 else None
-    return Stat(kind, size, mtime or 0, writable)
+    raw = parts[3].strip() if len(parts) > 3 else ""
+    mtime = float(raw) if re.fullmatch(r"\d+(\.\d+)?", raw) else 0.0
+    return Stat(kind, size, mtime, writable)
 
 
 def _uint(s: str) -> int | None:
@@ -153,7 +145,7 @@ def _uint(s: str) -> int | None:
 
 def stat(path: str) -> Op[Stat | None]:
     r = yield Run("sh", sh(_scripts.STAT, path))
-    out = text(r.stdout)
+    out = r.stdout_text
     if r.exit_code != 0 or not out.strip():
         return None
     return parse_stat(out)
@@ -185,7 +177,7 @@ def read(path: str, offset: int, max_bytes: int | None, caps: Capabilities) -> O
         want = min(limit - len(out), READ_CHUNK)
         r = yield Run("sh", sh(_scripts.READ_WINDOW, path, str(offset + len(out)), str(want)))
         if r.exit_code != 0:
-            raise fail(f"read {path}", r.stderr)
+            raise fail(f"read {path}", r)
         try:
             chunk = decode_base64(r.stdout.strip())
         except ValueError as e:
@@ -206,43 +198,16 @@ def new_suffix() -> str:
     return secrets.token_hex(8)
 
 
-def write(path: str, data: bytes, caps: Capabilities, suffix: str | None = None) -> Op[None]:
+def write(path: str, data: bytes, suffix: str | None = None) -> Op[None]:
     suffix = suffix or new_suffix()
     try:
-        if caps.stdin:
-            r = yield Run("sh", sh(_scripts.WRITE_STDIN, path, suffix, str(len(data))), stdin=data)
-        else:
-            r = yield from _write_chunks(path, suffix, data)
+        r = yield Run("sh", sh(_scripts.WRITE_STDIN, path, suffix, str(len(data))), stdin=data)
     except SandboxError:
         yield from _cleanup(path, suffix)
         raise
     if r.exit_code != 0:
         yield from _cleanup(path, suffix)
-        raise fail(f"write {path}", r.stderr)
-
-
-def _write_chunks(path: str, suffix: str, data: bytes) -> Op[ExecResult]:
-    """One command per 48 KiB; the first creates the temp, the last commits. An empty file is one
-    empty chunk. Returns the first failed command's result, or the committing one's."""
-    size = str(len(data))
-    pieces = [data[i : i + WRITE_CHUNK] for i in range(0, len(data), WRITE_CHUNK)] or [b""]
-    for n, piece in enumerate(pieces):
-        last = n == len(pieces) - 1
-        r: ExecResult = yield Run(
-            "sh",
-            sh(
-                _scripts.WRITE_CHUNK,
-                path,
-                suffix,
-                base64.b64encode(piece).decode("ascii"),
-                "new" if n == 0 else "append",
-                "commit" if last else "",
-                size,
-            ),
-        )
-        if r.exit_code != 0 or last:
-            return r
-    raise AssertionError("unreachable")
+        raise fail(f"write {path}", r)
 
 
 def _cleanup(path: str, suffix: str) -> Op[None]:
@@ -251,14 +216,12 @@ def _cleanup(path: str, suffix: str) -> Op[None]:
         yield Run("sh", sh(_scripts.REMOVE_TEMP, path, suffix))
 
 
-def write_if_unchanged(
-    path: str, data: bytes, expected_mtime: int | None, caps: Capabilities
-) -> Op[None]:
-    """Compare whole epoch seconds, then write. Two round trips; the guard is not a lock."""
+def write_if_unchanged(path: str, data: bytes, expected_mtime: float | None) -> Op[None]:
+    """Compare the mtimes (epoch seconds with the fraction, as ``stat`` gave it), then write. Two round trips; the guard is not a lock."""
     current = yield from stat(path)
     if (current.mtime if current else None) != expected_mtime:
         raise Conflict("the file changed since it was read")
-    yield from write(path, data, caps)
+    yield from write(path, data)
 
 
 # ---- mkdir -----------------------------------------------------------------------------------------
@@ -267,7 +230,7 @@ def write_if_unchanged(
 def mkdir(path: str) -> Op[None]:
     r = yield Run("mkdir", ["-p", "--", path])
     if r.exit_code != 0:
-        raise fail(f"create {path}", r.stderr)
+        raise fail(f"create {path}", r)
 
 
 # ---- list ------------------------------------------------------------------------------------------
@@ -295,23 +258,23 @@ def parse_dir_entries(stdout: str, limit: int, include_hidden: bool) -> list[Ent
 
 
 def _find_children(path: str, *tail: str) -> Run:
-    return Run("find", [path, "-mindepth", "1", "-maxdepth", "1", *tail])
+    return Run("find", ["-H", path, "-mindepth", "1", "-maxdepth", "1", *tail])
 
 
 def list_dir(path: str, limit: int, include_hidden: bool, caps: Capabilities) -> Op[list[Entry]]:
     if caps.find_printf:
         r = yield _find_children(path, "-printf", "%Y\\t%s\\t%f\\0")
         if r.exit_code != 0 and not r.stdout:
-            raise fail(f"ls {path}", r.stderr)
-        return parse_dir_entries(text(r.stdout), limit, include_hidden)
+            raise fail(f"ls {path}", r)
+        return parse_dir_entries(r.stdout_text, limit, include_hidden)
     # busybox: no -printf, so the type comes from a second pass restricted to directories
     listing = yield _find_children(path, "-print0")
     if listing.exit_code != 0 and not listing.stdout:
-        raise fail(f"ls {path}", listing.stderr)
+        raise fail(f"ls {path}", listing)
     dirs = yield _find_children(path, "-type", "d", "-print0")
-    dir_set = {r for r in text(dirs.stdout).split("\0") if r}
+    dir_set = {r for r in dirs.stdout_text.split("\0") if r}
     entries: list[Entry] = []
-    for raw in text(listing.stdout).split("\0"):
+    for raw in listing.stdout_text.split("\0"):
         if not raw or len(entries) >= limit:
             continue
         name = raw.rstrip("/").rsplit("/", 1)[-1] if raw.rstrip("/") else ""
@@ -352,6 +315,7 @@ def rg_args(q: Query, in_git_repo: bool) -> list[str]:
         "--null",
         "--with-filename",
         "--line-number",
+        "--column",
         "--no-heading",
         "--color=never",
         "--hidden",
@@ -375,7 +339,8 @@ def rg_args(q: Query, in_git_repo: bool) -> list[str]:
 def posix_grep_args(q: Query, gnu: bool) -> list[str]:
     args = ["-r", "-n", "-H"]
     if gnu:
-        args += ["-Z", "-I", "--color=never"]
+        # -b: the offset of each line, which a second run's ``-o -b`` match offsets turn into a column.
+        args += ["-Z", "-I", "--color=never", "-b"]
     args.append("-F" if q.literal else "-E")
     if q.ignore_case:
         args.append("-i")
@@ -431,8 +396,11 @@ _OS_ERRORS = (
     "No such file or directory",
     "Permission denied",
     "Is a directory",
+    "Not a directory",
     "Too many levels of symbolic links",
     "Input/output error",
+    # rg reading a `.git` file (a gitdir pointer) that is not text.
+    "stream did not contain valid UTF-8",
 )
 
 
@@ -445,24 +413,49 @@ class SearchFailure:
 
 
 def classify_search_failure(stderr: str, root: str) -> SearchFailure:
-    """The three causes share exit 2; only stderr tells them apart."""
-    lines = [ln for ln in stderr.split("\n") if ln.strip()]
+    """The three causes share exit 2; only stderr tells them apart.
 
-    def path_error(line: str) -> bool:
+    A path may contain a newline, so stderr is read as records that end at an OS error, not as
+    lines; the root's own error is found by its exact string (newlines included).
+    """
+
+    def ends_in_os_error(line: str) -> bool:
         line = line.rstrip()
         if line.endswith(")") and " (os error " in line:
             line = line[: line.rindex(" (os error ")]
         return any(line.endswith(e) for e in _OS_ERRORS)
 
-    if not lines or not all(path_error(ln) for ln in lines):
+    records: list[str] = []
+    start = 0
+    end = 0
+    for line in _split_lf(stderr):
+        end += len(line)
+        if ends_in_os_error(line):
+            records.append(stderr[start:end].strip())
+            start = end
+    if not records or stderr[start:].strip():
         return SearchFailure("bad_regex")
     marker = f": {root}: "
-    for ln in lines:
-        if marker in ln and "No such file or directory" in ln:
-            return SearchFailure("missing_root", ln.strip())
+    io_prefix = f"IO error for operation on {root}: "
+    for rec in records:
+        at = rec.find(marker)
+        while at >= 0:
+            rest = rec[at + len(marker) :].removeprefix(io_prefix)
+            if rest.startswith(("No such file or directory", "Not a directory")):
+                return SearchFailure("missing_root", rec)
+            at = rec.find(marker, at + 1)
     return SearchFailure(
-        "skipped", f"{len(lines)} path(s) could not be searched; first: {lines[0].strip()}"
+        "skipped", f"{len(records)} path(s) could not be searched; first: {records[0]}"
     )
+
+
+def _split_lf(s: str) -> list[str]:
+    """Lines split on LF alone, each keeping its LF."""
+    parts = s.split("\n")
+    out = [p + "\n" for p in parts[:-1]]
+    if parts[-1]:
+        out.append(parts[-1])
+    return out
 
 
 def _eol(s: str) -> str:
@@ -471,7 +464,34 @@ def _eol(s: str) -> str:
     return s.replace("\r", "") if "\r" in s else s
 
 
-def parse_records(stdout: str) -> list[Hit]:
+@dataclass(slots=True)
+class LongLine:
+    """A long match line of a GNU ``grep`` run, whose column the second run finds."""
+
+    index: int
+    line_start: int
+    raw: str
+
+
+_BINARY_WARNING = (
+    ': WARNING: stopped searching binary file after match (found "\\0" byte around offset '
+)
+
+
+def is_binary_warning(line: str, prev: str) -> bool:
+    """``PATH: WARNING: stopped searching binary file after match (found "\\0" byte around offset N)``,
+    where PATH is the file of the record just before it: ``rg`` prints it after the matches it found
+    ahead of a NUL byte. Matching the previous record's path, not only the text, keeps a file whose
+    name happens to contain these words a path."""
+    if not prev or not line.startswith(prev + _BINARY_WARNING):
+        return False
+    rest = line[len(prev) + len(_BINARY_WARNING) :]
+    return rest.endswith(")") and rest[:-1].isascii() and rest[:-1].isdigit()
+
+
+def parse_records(
+    stdout: str, columns: bool | str = False, longs: list[LongLine] | None = None
+) -> list[Hit]:
     """``PATH NUL LINE SEP TEXT LF`` records of ``rg --null`` and ``grep -Z``.
 
     Scans for the NUL, not for newlines: a path may contain a newline. The group separator is
@@ -480,7 +500,16 @@ def parse_records(stdout: str) -> list[Hit]:
     """
     hits: list[Hit] = []
     i, n = 0, len(stdout)
+    prev = ""
     while i < n:
+        # ``rg`` follows the records of a file it stopped searching at a NUL byte with a line of its
+        # own, which has no NUL and so must not be read as the start of a record.
+        first = stdout.find("\n", i)
+        if first < 0:
+            first = n
+        if is_binary_warning(stdout[i:first], prev):
+            i = first + 1
+            continue
         if stdout.startswith("--\n", i):
             i += 3
             continue
@@ -495,7 +524,8 @@ def parse_records(stdout: str) -> list[Hit]:
         nl = stdout.find("\n", nul)
         if nl < 0:
             nl = n
-        hit = _parse_body(stdout[i:nul], stdout[nul + 1 : nl])
+        prev = stdout[i:nul]
+        hit = _parse_body(prev, stdout[nul + 1 : nl], columns, longs, len(hits))
         if hit is not None:
             hits.append(hit)
         i = nl + 1
@@ -505,11 +535,60 @@ def parse_records(stdout: str) -> list[Hit]:
 _BODY = re.compile(r"([0-9]+)([:-])", re.S)
 
 
-def _parse_body(path: str, rest: str) -> Hit | None:
+_NUM = re.compile(r"([0-9]+)", re.S)
+
+
+def _parse_body(
+    path: str, rest: str, columns: bool | str, longs: list[LongLine] | None, index: int
+) -> Hit | None:
     m = _BODY.match(rest)
     if m is None:
         return None
-    return Hit(path, int(m.group(1)), _eol(rest[m.end() :]), m.group(2) == ":")
+    sep = m.group(2)
+    is_match = sep == ":"
+    text_ = rest[m.end() :]
+    col = None
+    # ``rg --column``: a match record is ``LINE:COL:TEXT``, a context record ``LINE-TEXT``. GNU
+    # ``grep -b`` ("gnu"): ``LINE:OFFSET:TEXT`` and ``LINE-OFFSET-TEXT``, the offset of the line start.
+    if columns == "gnu" or (columns and is_match):
+        c = _NUM.match(text_)
+        if c is None or text_[c.end() : c.end() + 1] != sep:
+            return None
+        n = int(c.group(1))
+        text_ = text_[c.end() + 1 :]
+        if columns == "gnu":
+            if is_match and longs is not None and len(text_) > MAX_LINE:
+                longs.append(LongLine(index, n, text_))
+        else:
+            col = n
+    return Hit(path, int(m.group(1)), clip_at(_eol(text_), match_offset(text_, col)), is_match)
+
+
+def window_long_lines(hits: list[Hit], longs: list[LongLine], stdout: str) -> None:
+    """Clip the long match lines of a GNU ``grep`` run from a second run with ``-o -b`` and no
+    context: the file offset of a line's first match less the line's offset is the byte column
+    ``rg --column`` would have given."""
+    first: dict[tuple[str, int], int] = {}
+    i, n = 0, len(stdout)
+    while i < n:
+        nul = stdout.find("\0", i)
+        if nul < 0:
+            break
+        nl = stdout.find("\n", nul)
+        if nl < 0:
+            nl = n
+        m = re.match(r"([0-9]+):([0-9]+):", stdout[nul + 1 : nl])
+        if m:
+            first.setdefault((stdout[i:nul], int(m.group(1))), int(m.group(2)))
+        i = nl + 1
+    for long in longs:
+        hit = hits[long.index]
+        off = first.get((hit.path, hit.line))
+        if off is None or off < long.line_start:
+            continue
+        cs = match_offset(long.raw, off - long.line_start + 1)
+        if cs is not None:
+            hits[long.index] = replace(hit, text=clip_at(_eol(long.raw), cs))
 
 
 def split_colon_record(line: str) -> tuple[str, int, bool, str] | None:
@@ -546,7 +625,7 @@ def parse_colon_records(stdout: str, q: Query) -> list[Hit]:
         path, line_no, is_match, body = rec
         if matcher is not None and (matcher.fullmatch(path) is not None) == q.glob_exclude:
             continue
-        hits.append(Hit(path, line_no, _eol(body), is_match))
+        hits.append(Hit(path, line_no, clip(_eol(body)), is_match))
     return hits
 
 
@@ -664,25 +743,34 @@ def clip(line: str) -> str:
     return line[:MAX_LINE] + LINE_TRUNCATED_SUFFIX
 
 
-def clip_match(line: str, q: Query) -> str:
-    """A long match line is cut to the window around its first match."""
+def match_offset(raw: str, col: int | None) -> int | None:
+    """The character offset, in the normalized text, of rg's 1-based byte column ``col`` of the raw
+    line: the characters before it, CRs not counted. The bytes are those of the UTF-8 encoding of the
+    decoded line. None when there is no column or it is not a character boundary."""
+    if col is None or col < 1 or len(raw) <= MAX_LINE:
+        return None
+    data = raw.encode("utf-8")
+    if col - 1 > len(data):
+        return None
+    try:
+        before = data[: col - 1].decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return len(before) - before.count("\r")
+
+
+def clip_at(line: str, cs: int | None) -> str:
+    """Clip a line to 500 characters. With ``cs``, the character offset of its first match as the
+    engine reported it, the window starts 250 characters before the match (the head clip when that
+    is the head); the match is never searched for again."""
     if len(line) <= MAX_LINE:
         return line
-    try:
-        rx = re.compile(
-            re.escape(q.pattern) if q.literal else q.pattern, re.I if q.ignore_case else 0
-        )
-    except re.error:
+    if cs is None:
         return clip(line)
-    m = rx.search(line)
-    if m is None:
-        return clip(line)
-    cs, ce = m.start(), m.end()
-    if ce <= MAX_LINE:
+    start = max(cs - MAX_LINE // 2, 0)
+    if start == 0:
         return clip(line)
     total = len(line)
-    pad = max(MAX_LINE - (ce - cs), 0) // 2
-    start = max(cs - pad, 0)
     end = start + MAX_LINE
     if end > total:
         end = total
@@ -730,7 +818,7 @@ def search(q: Query, state: FsState, caps: Capabilities) -> Op[SearchResult]:
     else:
         args, program = posix_grep_args(q, engine == "grep"), "grep"
     r = yield Run(program, args)
-    stderr = text(r.stderr)
+    stderr = r.stderr_text
     note: str | None = None
     if r.exit_code in (0, 1):
         pass
@@ -742,15 +830,20 @@ def search(q: Query, state: FsState, caps: Capabilities) -> Op[SearchResult]:
             detail = stderr.strip()
             raise InvalidQuery(f"bad regex: {detail or program + ' rejected the pattern'}")
         if failure.kind == "missing_root":
-            raise NotFound(failure.note)
+            raise (NotADirectory if "Not a directory" in failure.note else NotFound)(failure.note)
         note = failure.note
-    stdout = text(r.stdout)
-    hits = parse_colon_records(stdout, q) if engine == "busybox-grep" else parse_records(stdout)
+    stdout = r.stdout_text
+    longs: list[LongLine] = []
+    hits = (
+        parse_colon_records(stdout, q)
+        if engine == "busybox-grep"
+        else parse_records(stdout, True if engine == "rg" else "gnu", longs)
+    )
+    if longs:
+        second = yield Run("grep", ["-o", *posix_grep_args(replace(q, before=0, after=0), True)])
+        if second.exit_code in (0, 1, 2):
+            window_long_lines(hits, longs, second.stdout_text)
     hits = [h for h in hits if not is_under_git_dir(q.root, h.path)]
-    hits = [
-        Hit(h.path, h.line, clip_match(h.text, q) if h.is_match else clip(h.text), h.is_match)
-        for h in hits
-    ]
     hits, truncated = finalize(hits, q.limit)
     if note is None:
         detail = stderr.strip()

@@ -32,18 +32,43 @@ use super::{
 };
 use crate::exec::{CommandRunner, ExecResult};
 
+/// A command's result with its output read as text: invalid UTF-8 becomes U+FFFD. The one place the
+/// file helpers turn the bytes a command wrote into text.
+struct Text {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    truncated: bool,
+    timed_out: bool,
+}
+
+impl From<ExecResult> for Text {
+    fn from(r: ExecResult) -> Self {
+        Self {
+            code: r.code,
+            stdout: String::from_utf8_lossy(&r.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&r.stderr).into_owned(),
+            truncated: r.truncated,
+            timed_out: r.timed_out,
+        }
+    }
+}
+
 /// How long a single backend command may run before it is reaped.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Capability probes answer in milliseconds or not at all; they must never hold up an attach.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-/// What the stdin probe feeds `cat`, and must read back.
-const STDIN_PROBE: &str = "stdin-probe";
-/// The read pipeline on a known input; see [`Capabilities::no_read_window`].
-const READ_WINDOW_PROBE: &str = "printf abc | dd iflag=skip_bytes,count_bytes skip=1 count=1 status=none 2>/dev/null | base64 -w0 2>/dev/null";
-/// Raw bytes per argv chunk when stdin is unavailable: 48 KiB, which base64s to exactly 64 KiB — half
-/// of Linux's 128 KiB cap on a single argv string (`MAX_ARG_STRLEN`), leaving the whole argv far under
-/// the kernel's total `ARG_MAX` as well.
-const WRITE_CHUNK: usize = 48 * 1024;
+/// The one probe: every check in a single `sh -c`, one line of output per capability the target has.
+/// Each check is a flag test, not a search: exit 1 from `grep` means "ran fine, found nothing" and only a
+/// usage error (2 on GNU and busybox alike) means the flag is unsupported; busybox `find` has no
+/// `-printf` and answers usage, so only the exact `c` (the type of `/dev/null`) proves it; the read
+/// pipeline is the one `READ_WINDOW_SCRIPT` ends in, on three bytes, where `Yg==` is "b" and nothing
+/// else (judged on stdout, because the pipeline's exit status is `base64`'s alone).
+const PROBE_SCRIPT: &str = r#"rg --version >/dev/null 2>&1 && echo rg
+grep -rnZ -e __cap_probe__ -- /dev/null >/dev/null 2>&1; [ $? -le 1 ] && echo grep_null
+[ "$(find /dev/null -maxdepth 0 -printf %y 2>/dev/null)" = c ] && echo find_printf
+[ "$(printf abc | dd iflag=skip_bytes,count_bytes skip=1 count=1 status=none 2>/dev/null | base64 -w0 2>/dev/null)" = Yg== ] && echo read_window
+true"#;
 /// Raw bytes per `read_bytes` command: 96 KiB, which base64s to exactly 128 KiB — the head a runner's
 /// capture keeps whole ([`crate::tools::exec`]'s `STREAM_HEAD`), so a chunk is never cut.
 const READ_CHUNK: usize = 96 * 1024;
@@ -66,14 +91,6 @@ pub struct Capabilities {
     pub grep_null: bool,
     /// `find -printf` — type and size in one pass. GNU find and `bfs` have it; **busybox does not**.
     pub find_printf: bool,
-    /// The runner demonstrably delivers stdin: `cat` echoed a probe string back. File writes then send
-    /// their content on stdin in one call. Without it they go as argv-sized chunks, because an argv
-    /// entry is capped at 128 KiB and a whole file does not fit in one.
-    ///
-    /// **Proven, never assumed.** A v1 exec endpoint ignores the stdin field it does not know and
-    /// runs `cat` on empty input; `docker exec` without `-i` does the same. Writing through either as
-    /// though stdin arrived would replace the file with an *empty* one.
-    pub stdin: bool,
     /// The target's `dd` or `base64` lacks the flags a read leans on (`dd iflag=skip_bytes,count_bytes`,
     /// `base64 -w0`): older busybox, for one. Negative so an unprobed [`Capabilities::default`] reads
     /// as capable.
@@ -99,103 +116,46 @@ pub enum SearchEngine {
 }
 
 impl Capabilities {
-    /// Probe the target. Each check is one argv-only command with a short timeout. A probe that *ran*
-    /// and gave the "absent" answer (non-zero exit, a command that cannot be started, a runner with
-    /// no stdin) is read as absent rather than failing the attach, because a missing optional tool
-    /// is a degraded search, not a broken box. A probe whose *request* failed (unreachable, `401`,
-    /// a timeout, a protocol error) says nothing about the box and is returned: caching it as "no
-    /// stdin, no `dd`" would turn an outage or a wrong bearer into a misleading failure later.
+    /// Probe the target: one command, [`PROBE_SCRIPT`]. A probe that *ran* gives its answer, and a
+    /// capability it did not name is absent: a missing optional tool is a degraded search, not a
+    /// broken box. A probe whose *request* failed (unreachable, `401`, a timeout, a protocol error)
+    /// says nothing about the box and is returned: caching it as "no `dd`" would turn an outage or a
+    /// wrong bearer into a misleading failure later.
     pub async fn probe(runner: &dyn CommandRunner) -> std::io::Result<Self> {
-        /// `Ok(None)`: the probe could not run on the target at all, which is its answer.
-        fn settle(r: std::io::Result<ExecResult>) -> std::io::Result<Option<ExecResult>> {
-            match r {
-                Ok(r) => Ok(Some(r)),
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::NotFound
-                            | std::io::ErrorKind::Unsupported
-                            // The command ran and the endpoint answered; the answer was too big.
-                            | std::io::ErrorKind::FileTooLarge
-                    ) =>
-                {
-                    Ok(None)
-                }
-                Err(e) => Err(e),
+        let r = match runner
+            .run(
+                "sh",
+                &["-c".to_string(), PROBE_SCRIPT.to_string()],
+                None,
+                PROBE_TIMEOUT,
+            )
+            .await
+        {
+            Ok(r) => r,
+            // The command ran and the endpoint answered; the answer was too big or cannot be run:
+            // nothing is known to be present.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::Unsupported
+                        | std::io::ErrorKind::FileTooLarge
+                ) =>
+            {
+                return Ok(Self {
+                    no_read_window: true,
+                    ..Self::default()
+                });
             }
-        }
-        async fn ok(
-            runner: &dyn CommandRunner,
-            program: &str,
-            args: &[&str],
-        ) -> std::io::Result<bool> {
-            Ok(settle(
-                runner
-                    .run(
-                        program,
-                        &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
-                        None,
-                        PROBE_TIMEOUT,
-                    )
-                    .await,
-            )?
-            // Exit 1 means "ran fine, found nothing" for grep/find; only a usage error (2 on GNU
-            // and busybox alike) means the flag is unsupported.
-            .is_some_and(|r| matches!(r.code, Some(0) | Some(1))))
-        }
-        let rg = settle(
-            runner
-                .run("rg", &["--version".to_string()], None, PROBE_TIMEOUT)
-                .await,
-        )?
-        .is_some_and(|r| r.code == Some(0));
-        // Probed against `/` because it exists everywhere; the pattern matches nothing, so this is a
-        // flag check rather than a search.
-        let grep_null = ok(
-            runner,
-            "grep",
-            &["-rnZ", "-e", "__cap_probe__", "--", "/dev/null"],
-        )
-        .await?;
-        // Busybox `find` has no `-printf`: it prints usage and exits 1, so only the exact `c` (the
-        // type of `/dev/null`) proves the flag works.
-        let find_printf = settle(
-            runner
-                .run(
-                    "find",
-                    &["/dev/null", "-maxdepth", "0", "-printf", "%y"].map(String::from),
-                    None,
-                    PROBE_TIMEOUT,
-                )
-                .await,
-        )?
-        .is_some_and(|r| r.stdout == "c");
-        // An echo, not an `Ok`: only the bytes coming back prove they went in. See `Self::stdin`.
-        let stdin = settle(
-            runner
-                .run_with_stdin("cat", &[], None, PROBE_TIMEOUT, STDIN_PROBE.as_bytes())
-                .await,
-        )?
-        .is_some_and(|r| r.code == Some(0) && r.stdout == STDIN_PROBE);
-        // The exact pipeline `READ_WINDOW_SCRIPT` ends in, on three bytes: `Yg==` is "b" and nothing
-        // else. Judged on stdout, because the pipeline's exit status is `base64`'s alone.
-        let no_read_window = !settle(
-            runner
-                .run(
-                    "sh",
-                    &["-c".to_string(), READ_WINDOW_PROBE.to_string()],
-                    None,
-                    PROBE_TIMEOUT,
-                )
-                .await,
-        )?
-        .is_some_and(|r| r.code == Some(0) && r.stdout.trim() == "Yg==");
+            Err(e) => return Err(e),
+        };
+        let out = r.stdout_text();
+        let has = |name: &str| out.lines().any(|l| l.trim() == name);
         Ok(Self {
-            rg,
-            grep_null,
-            find_printf,
-            stdin,
-            no_read_window,
+            rg: has("rg"),
+            grep_null: has("grep_null"),
+            find_printf: has("find_printf"),
+            no_read_window: !has("read_window"),
         })
     }
 
@@ -212,7 +172,8 @@ impl Capabilities {
 /// A filesystem reached by running commands on it.
 pub struct ShellFs {
     runner: Arc<dyn CommandRunner>,
-    caps: Capabilities,
+    /// What the target has, probed on the first operation that needs it (never by a write).
+    caps: tokio::sync::OnceCell<Capabilities>,
     timeout: Duration,
     /// The target's `$HOME`, for expanding a leading `~`. `None` leaves `~` untouched rather than
     /// guessing — a wrong home silently produces a plausible path for the wrong user.
@@ -232,26 +193,29 @@ impl ShellFs {
         Self::connect(exec).await
     }
 
-    /// Build a backend over `runner`, probing the target for what it has.
-    ///
-    /// Fails with the runner's own error when a probe request fails (see [`Capabilities::probe`]);
-    /// nothing is learned from a probe that did not run.
+    /// Build a backend over `runner`. Nothing is sent: the target is probed, once and in one round
+    /// trip, by the first operation that needs to know what it has.
     pub async fn connect(runner: Arc<dyn CommandRunner>) -> std::io::Result<Self> {
-        let caps = Capabilities::probe(runner.as_ref()).await?;
-        Ok(Self::with_capabilities(runner, caps))
+        Ok(Self::new(runner))
+    }
+
+    fn new(runner: Arc<dyn CommandRunner>) -> Self {
+        Self {
+            runner,
+            caps: tokio::sync::OnceCell::new(),
+            timeout: DEFAULT_TIMEOUT,
+            home: None,
+            git_roots: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     }
 
     /// Build with capabilities already known — used by tests to exercise a specific rung of the
     /// fallback ladder (notably: pretending `rg` is absent on a box that has it, which is how the
     /// POSIX path gets real coverage instead of only running where nobody installed ripgrep).
     pub fn with_capabilities(runner: Arc<dyn CommandRunner>, caps: Capabilities) -> Self {
-        Self {
-            runner,
-            caps,
-            timeout: DEFAULT_TIMEOUT,
-            home: None,
-            git_roots: std::sync::Mutex::new(std::collections::HashMap::new()),
-        }
+        let me = Self::new(runner);
+        let _ = me.caps.set(caps);
+        me
     }
 
     /// Tell this backend the target's `$HOME`, so a model-supplied `~/notes.md` expands against the
@@ -261,8 +225,19 @@ impl ShellFs {
         self
     }
 
-    pub fn capabilities(&self) -> Capabilities {
+    /// What the target has, probing it the first time. A probe whose request failed is the runner's
+    /// error and is asked again next time.
+    pub async fn capabilities(&self) -> std::io::Result<Capabilities> {
         self.caps
+            .get_or_try_init(|| Capabilities::probe(self.runner.as_ref()))
+            .await
+            .copied()
+    }
+
+    async fn caps(&self) -> Result<Capabilities, FsError> {
+        self.capabilities()
+            .await
+            .map_err(|e| FsError::Backend(format!("probing the target: {e}")))
     }
 
     /// [`FsBackend::write_bytes`] over borrowed bytes, which `write_if_unchanged` also writes
@@ -273,19 +248,17 @@ impl ShellFs {
         // spans several shells, and unpredictable for the reason `LocalFs`'s is: a preplanted name
         // cannot redirect the write. Every script resolves the target the same way (`RESOLVE_TARGET`)
         // and names the temp beside the file it resolves to.
-        let suffix = super::temp_suffix();
-        let outcome = if self.caps.stdin {
-            let args = sh_script(
-                WRITE_STDIN_SCRIPT,
-                &[target.clone(), suffix.clone(), bytes.len().to_string()],
-            );
-            self.runner
-                .run_with_stdin("sh", &args, None, self.timeout, bytes)
-                .await
-                .map_err(|e| FsError::Backend(format!("sh: {e}")))
-        } else {
-            self.write_chunks(&target, &suffix, bytes).await
-        };
+        let suffix = super::shell_temp_suffix();
+        let args = sh_script(
+            WRITE_STDIN_SCRIPT,
+            &[target.clone(), suffix.clone(), bytes.len().to_string()],
+        );
+        let outcome = self
+            .runner
+            .run_with_stdin("sh", &args, None, self.timeout, bytes)
+            .await
+            .map(Text::from)
+            .map_err(|e| FsError::Backend(format!("sh: {e}")));
         match outcome {
             Ok(result) if result.code == Some(0) => Ok(()),
             failed => {
@@ -307,6 +280,56 @@ impl ShellFs {
     }
 }
 
+impl ShellFs {
+    /// GNU `grep` reports no match column, so the long match lines of a run (`longs`) are found a
+    /// second time, with `-o -b` and no context: the file offset of each match less the line's
+    /// offset (`-b` of the first run) is the byte column `rg --column` would have given. Only lines
+    /// that need it cost the run; a run that fails leaves them clipped at their head.
+    async fn window_long_lines(&self, hits: &mut [Hit], longs: &[Long], q: &SearchQuery) {
+        let mut q2 = q.clone();
+        q2.before = 0;
+        q2.after = 0;
+        let mut args = posix_grep_args(&q2, true);
+        args.insert(0, "-o".to_string());
+        let Ok(result) = self.runner.run("grep", &args, None, self.timeout).await else {
+            return;
+        };
+        let result = Text::from(result);
+        // Exit 2 is per-path read errors here too (the first run already reported them).
+        if !matches!(result.code, Some(0..=2)) {
+            return;
+        }
+        // The first match of each line: `PATH NUL LINE:OFFSET:MATCH`.
+        let mut first: std::collections::HashMap<(&str, usize), usize> = Default::default();
+        let out = &result.stdout;
+        let mut i = 0;
+        while let Some(nul) = memchr_from(out.as_bytes(), i, b'\0') {
+            let nl = memchr_from(out.as_bytes(), nul, b'\n').unwrap_or(out.len());
+            let mut it = out[nul + 1..nl].splitn(3, ':');
+            if let (Some(l), Some(o)) = (it.next(), it.next())
+                && let (Ok(l), Ok(o)) = (l.parse::<usize>(), o.parse::<usize>())
+            {
+                first.entry((&out[i..nul], l)).or_insert(o);
+            }
+            i = nl + 1;
+        }
+        for long in longs {
+            let hit = &mut hits[long.index];
+            let Some(off) = hit
+                .path
+                .to_str()
+                .and_then(|p| first.get(&(p, hit.line)))
+                .and_then(|o| o.checked_sub(long.line_start))
+            else {
+                continue;
+            };
+            if let Some(cs) = super::match_offset(&long.raw, off + 1) {
+                hit.text = super::clip_at(&trim_eol(&long.raw), cs);
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl FsBackend for ShellFs {
     /// Never [`PathWorld::Local`], even when the runner happens to be `RealRunner` and the files
@@ -323,7 +346,7 @@ impl FsBackend for ShellFs {
     }
 
     async fn search(&self, q: &SearchQuery) -> Result<SearchOutcome, FsError> {
-        let engine = self.caps.search_engine();
+        let engine = self.caps().await?.search_engine();
         let args = match engine {
             // The git-repo question is asked only on the rung that can act on it: `--no-require-git`
             // is a ripgrep flag, and the POSIX rungs honor no `.gitignore` at all.
@@ -336,11 +359,7 @@ impl FsBackend for ShellFs {
             SearchEngine::PosixGrep | SearchEngine::BusyboxGrep => "grep",
         };
 
-        let result: ExecResult = self
-            .runner
-            .run(program, &args, None, self.timeout)
-            .await
-            .map_err(|e| FsError::Backend(format!("{program}: {e}")))?;
+        let result = self.exec(program, &args).await?;
 
         // Both `rg` and `grep` use exit 1 for "no matches" — a perfectly ordinary outcome, not a
         // failure. Exit 2 is shared by three different situations that must not be conflated: a
@@ -372,20 +391,26 @@ impl FsBackend for ShellFs {
             },
         }
 
+        let mut longs = Vec::new();
         let mut hits = if engine == SearchEngine::BusyboxGrep {
             // No `-Z`, so records are `path:line:text` with no unambiguous path terminator, and no
             // `--include`, so the glob is applied here instead.
             parse_colon_records(&result.stdout, q)
         } else {
-            parse_records(&result.stdout)
+            let cols = match engine {
+                SearchEngine::Ripgrep => Cols::Rg,
+                _ => Cols::Gnu,
+            };
+            parse_core(&result.stdout, cols, &mut longs)
         };
+        if !longs.is_empty() {
+            self.window_long_lines(&mut hits, &longs, q).await;
+        }
         // The engine was asked to skip `.git` where it can; this is the guarantee for the rungs that
         // can't (busybox `grep`, and a `.git` *file* GNU `--exclude-dir` does not cover).
         hits.retain(|h| !super::is_under_git_dir(&q.root, &h.path));
-        // A long match line is cut to the window around its match, the same way `LocalFs` cuts it.
         // (A line longer than the runner's 128 KiB capture arrives already cut, which is flagged as
         // truncation below.)
-        super::clip_hits(&mut hits, &super::MatchFinder::new(q));
         // `ExecResult` keeps only the first and last 128 KiB of each stream and drops the middle. On a
         // large result set that silently removes records from the middle of the output — so the flag
         // must reach the outcome, or this backend would report a confidently incomplete result as
@@ -418,7 +443,7 @@ impl FsBackend for ShellFs {
     /// a stream and drops the middle, and base64 of a glued head and tail still decodes, into a file
     /// that never existed. A short chunk is end-of-file and ends the loop.
     async fn read_bytes(&self, path: &Path, offset: u64, max: usize) -> Result<Vec<u8>, FsError> {
-        if self.caps.no_read_window {
+        if self.caps().await?.no_read_window {
             return Err(FsError::Backend(format!(
                 "read {}: this target's dd or base64 does not support iflag=skip_bytes,count_bytes / -w0, so files cannot be read",
                 path.display()
@@ -468,8 +493,8 @@ impl FsBackend for ShellFs {
     /// Write-temp-then-`mv`, the same shape [`crate::tools::write_atomic`] uses locally, so a reader or
     /// a crash sees the old file or the new one and never a partial. The scripts keep the rest of the
     /// [`FsBackend::write_bytes`] contract too: the target is resolved through a symlink first
-    /// (`resolve_target!`), and the temp is given the existing file's mode before content goes in
-    /// (`new_temp!`). A bare `mv` would replace a link with a regular file and give the file the temp's
+    /// (`resolve_target!`), and the temp is given the existing file's mode just before the `mv`
+    /// (`copy_mode!`; until then it is 0600, so the size check can read it). A bare `mv` would replace a link with a regular file and give the file the temp's
     /// default mode — 0600 became 0644, 0755 lost its execute bits. The content travels on stdin when
     /// the target has proven it delivers stdin ([`Capabilities::stdin`]) and as argv-sized base64
     /// chunks otherwise — never as one argv entry, which Linux caps at 128 KiB.
@@ -527,7 +552,7 @@ impl FsBackend for ShellFs {
         include_hidden: bool,
     ) -> Result<Vec<DirEntry>, FsError> {
         let root = path.to_string_lossy().into_owned();
-        if self.caps.find_printf {
+        if self.caps().await?.find_printf {
             // `%Y` is the type *after* following a symlink, so a link to a directory lists as a
             // directory — matching `LocalFs`'s use of `metadata` rather than `symlink_metadata`. A
             // broken link reports `N`/`?` and is skipped, matching the local `metadata().ok()` skip.
@@ -536,6 +561,7 @@ impl FsBackend for ShellFs {
                 .exec(
                     "find",
                     &[
+                        "-H".into(),
                         root.clone(),
                         "-mindepth".into(),
                         "1".into(),
@@ -563,6 +589,7 @@ impl FsBackend for ShellFs {
             .exec(
                 "find",
                 &[
+                    "-H".into(),
                     root.clone(),
                     "-mindepth".into(),
                     "1".into(),
@@ -583,6 +610,7 @@ impl FsBackend for ShellFs {
             .exec(
                 "find",
                 &[
+                    "-H".into(),
                     root,
                     "-mindepth".into(),
                     "1".into(),
@@ -632,7 +660,7 @@ impl FsBackend for ShellFs {
         let mut entries: Vec<(PathBuf, bool)> = Vec::new();
         let stderr_note;
 
-        match self.caps.search_engine() {
+        match self.caps().await?.search_engine() {
             SearchEngine::Ripgrep => {
                 // Pass 1: `rg --files` — a `.gitignore`-aware listing of *files*, the same set
                 // `LocalFs`'s walk yields. `--null` for the reason the search parser scans for NUL:
@@ -706,7 +734,7 @@ impl FsBackend for ShellFs {
                 // nothing to derive, so every entry is enumerated directly *with its type* — which is
                 // also how a directory keeps its trailing slash in the rendered output. Busybox has
                 // no `-printf`, so it takes two `-print0` passes instead (all, then directories).
-                if !self.caps.find_printf {
+                if !self.caps().await?.find_printf {
                     let all = self.exec("find", &[root.clone(), "-print0".into()]).await?;
                     if all.code != Some(0) && all.stdout.is_empty() && !all.stderr.trim().is_empty()
                     {
@@ -776,7 +804,7 @@ impl FsBackend for ShellFs {
         // Derive the non-empty directories from the listed files' ancestors (ripgrep rung only — the
         // POSIX rung already enumerated them). Bounded by the root, and dedup'd against what is
         // already present so an empty directory found above is not added twice.
-        if matches!(self.caps.search_engine(), SearchEngine::Ripgrep) {
+        if matches!(self.caps().await?.search_engine(), SearchEngine::Ripgrep) {
             let known: std::collections::BTreeSet<PathBuf> =
                 entries.iter().map(|(p, _)| p.clone()).collect();
             let mut derived: std::collections::BTreeSet<PathBuf> = Default::default();
@@ -859,48 +887,12 @@ impl ShellFs {
     }
 
     /// One command, one place: every operation's timeout, error wrapping and argv discipline.
-    async fn exec(&self, program: &str, args: &[String]) -> Result<ExecResult, FsError> {
+    async fn exec(&self, program: &str, args: &[String]) -> Result<Text, FsError> {
         self.runner
             .run(program, args, None, self.timeout)
             .await
+            .map(Text::from)
             .map_err(|e| FsError::Backend(format!("{program}: {e}")))
-    }
-
-    /// Assemble `bytes` into the temp named by `suffix` one argv-sized chunk per command, committing
-    /// to `target` with the last. Returns the first failed command's result, or the committing one's.
-    ///
-    /// The fallback for a target without stdin: `WRITE_CHUNK` raw bytes per round trip, so a file
-    /// costs one command per 48 KiB — the same single command as before for anything smaller.
-    async fn write_chunks(
-        &self,
-        target: &str,
-        suffix: &str,
-        bytes: &[u8],
-    ) -> Result<ExecResult, FsError> {
-        let size = bytes.len().to_string();
-        let mut chunks = bytes.chunks(WRITE_CHUNK).peekable();
-        let mut first = true;
-        loop {
-            // An empty file is one empty chunk: the temp must still be created and committed.
-            let chunk = chunks.next().unwrap_or_default();
-            let last = chunks.peek().is_none();
-            let args = sh_script(
-                WRITE_CHUNK_SCRIPT,
-                &[
-                    target.to_string(),
-                    suffix.to_string(),
-                    encode_base64(chunk),
-                    if first { "new" } else { "append" }.to_string(),
-                    if last { "commit" } else { "" }.to_string(),
-                    size.clone(),
-                ],
-            );
-            let result = self.exec("sh", &args).await?;
-            if result.code != Some(0) || last {
-                return Ok(result);
-            }
-            first = false;
-        }
     }
 }
 
@@ -914,6 +906,20 @@ fn compile_glob_matcher(q: &GlobQuery) -> Result<globset::GlobMatcher, FsError> 
         .map_err(|e| FsError::InvalidQuery(format!("bad glob: {e}")))
 }
 
+/// `SECS` or `SECS.FRAC` to whole seconds and nanoseconds; the fraction is padded or cut to nine digits.
+fn parse_mtime(s: &str) -> (u64, u32) {
+    let (secs, frac) = s.split_once('.').unwrap_or((s, ""));
+    let nanos = frac
+        .bytes()
+        .chain(std::iter::repeat(b'0'))
+        .take(9)
+        .try_fold(0u32, |n, c| {
+            c.is_ascii_digit().then(|| n * 10 + u32::from(c - b'0'))
+        })
+        .unwrap_or(0);
+    (secs.parse().unwrap_or(0), nanos)
+}
+
 /// Parse `w|-` + `\t<type>\t<size>\t<mtime>` from the one-shot stat command.
 fn parse_stat(stdout: &str) -> Option<Meta> {
     let line = stdout.lines().next()?;
@@ -925,15 +931,14 @@ fn parse_stat(stdout: &str) -> Option<Meta> {
         _ => FileKind::Other,
     };
     let len: u64 = parts.next()?.trim().parse().ok()?;
-    // `%T@` is fractional seconds; only the whole-second part is comparable to a `SystemTime` built
-    // from the same source on a later call, which is all `write_if_unchanged` needs.
-    let secs: u64 = parts
+    // `SECS.FRAC`: the script prints the fraction `stat` reports (nine digits of nanoseconds on GNU and
+    // busybox), `0` where it reports none.
+    let (secs, nanos) = parts
         .next()
-        .and_then(|s| s.split('.').next())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
+        .map(|s| parse_mtime(s.trim()))
+        .unwrap_or((0, 0));
     // `SystemTime + Duration` panics past what the platform can hold; an out-of-range mtime is unknown.
-    let mtime = std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs));
+    let mtime = std::time::UNIX_EPOCH.checked_add(std::time::Duration::new(secs, nanos));
     Some(Meta {
         kind,
         len,
@@ -979,7 +984,7 @@ fn parse_colon_records(stdout: &str, q: &SearchQuery) -> Vec<Hit> {
         hits.push(Hit {
             path: Arc::from(Path::new(path)),
             line: line_no,
-            text: trim_eol(text).into_owned(),
+            text: super::clip(&trim_eol(text)),
             is_match,
         });
     }
@@ -1055,24 +1060,41 @@ fn parse_dir_entries(stdout: &str, cap: usize, include_hidden: bool) -> Vec<DirE
     out
 }
 
-/// Compare two mtimes at whole-second granularity.
-///
-/// The remote path can only report whole seconds (`%T@`'s fractional part is not reliably
-/// round-trippable), so comparing at finer resolution would make every guarded write spuriously
-/// report "changed". Coarser comparison can only ever *miss* a change made within the same second as
-/// the read — which for `edit`'s guard means falling back to the behavior of not having a guard, not
-/// to a wrong answer.
+/// Compare two mtimes as doubles of epoch seconds, which keeps the nanoseconds `stat` reports (a
+/// double resolves 0.24 µs at present epochs, finer than any filesystem records) and is what a client
+/// whose numbers are doubles (TypeScript, Python, the JSON driver protocol) compares, so every client
+/// agrees. A change made within the same second as the read is therefore caught.
 fn mtimes_match(a: Option<std::time::SystemTime>, b: Option<std::time::SystemTime>) -> bool {
-    fn secs(t: Option<std::time::SystemTime>) -> Option<u64> {
-        t?.duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|d| d.as_secs())
-    }
-    secs(a) == secs(b)
+    a.map(super::epoch_f64) == b.map(super::epoch_f64)
 }
 
+/// The `detail` of a failed command (spec 3.3): the first line of trimmed stderr; and when that line
+/// names no OS error, the lines through the first one that does, because a path containing a newline
+/// splits the message and the OS error is on a later line. Always a slice of `stderr`.
 fn first_line_or<'a>(stderr: &'a str, fallback: &'a str) -> &'a str {
-    stderr.trim().lines().next().unwrap_or(fallback)
+    const NAMES: [&str; 6] = [
+        "no such file or directory",
+        "directory nonexistent",
+        "nonexistent directory",
+        "is a directory",
+        "not a directory",
+        "permission denied",
+    ];
+    let t = stderr.trim();
+    let mut end = None;
+    for line in t.split_inclusive('\n') {
+        let line_end = (line.as_ptr() as usize - t.as_ptr() as usize) + line.len();
+        let end_of_line = line.trim_end().len() + (line_end - line.len());
+        let low = line.to_ascii_lowercase();
+        if NAMES.iter().any(|n| low.contains(n)) {
+            return &t[..end_of_line];
+        }
+        end.get_or_insert(end_of_line);
+    }
+    match end {
+        Some(e) => &t[..e],
+        None => fallback,
+    }
 }
 
 /// Minimal base64, both directions. Written here rather than pulled in as a dependency: the crate
@@ -1184,7 +1206,14 @@ else t=o
 fi
 if [ -w "$1" ]; then w=w; else w=-; fi
 printf '%s	%s	' "$w" "$t"
-stat -L -c '%s	%Y' -- "$1" 2>/dev/null || printf '0	0'
+if s=$(stat -L -c '%s %Y %y' -- "$1" 2>/dev/null); then
+  set -- $s
+  f=${4#*.}
+  [ "$f" = "$4" ] && f=0
+  printf '%s	%s.%s' "$1" "$2" "$f"
+else
+  printf '0	0'
+fi
 printf '
 '"#;
 
@@ -1264,14 +1293,14 @@ if [ -L "$t" ]; then
   echo "Too many levels of symbolic links (os error 40)" >&2
   exit 1
 fi
-tmp="$t.tmp.$2"
+case "$t" in */*) tmp="${t%/*}/.tmp.$2" ;; *) tmp=".tmp.$2" ;; esac
 "#
     };
 }
 
 /// Refuse a target that is a directory, with the message `std` gives (so both backends read alike).
 /// Without it the final `mv -f "$tmp" "$t"` moves the temp *into* the directory and exits 0: a write
-/// that reports success and leaves `DIR/DIR.tmp.SUFFIX` behind. `mv -T` would refuse atomically, but
+/// that reports success and leaves `DIR/.tmp.SUFFIX` inside the directory. `mv -T` would refuse atomically, but
 /// it is GNU-only; busybox has no such flag. So the check runs twice, before the temp exists and
 /// again immediately before the `mv`; a directory created at the target inside that last instant is
 /// the one remaining window, the same width as any check-then-rename on a shell.
@@ -1285,11 +1314,13 @@ fi
     };
 }
 
-/// Create the empty temp `$tmp`, with `$t`'s mode when `$t` exists, before any content goes in, so
-/// the replacement keeps the file's mode and a 0600 file's bytes are never in a world-readable temp.
-/// `chmod --reference` is GNU; busybox, which Alpine ships, has no `--reference`, so its fallback is
-/// the octal mode from `stat -L -c %a`. A mode that cannot be copied fails the write: committing would
-/// change the file's permissions, which is exactly what this exists to prevent.
+/// Create the empty temp `$tmp`, mode 0600 when `$t` exists (a new file's temp gets the default mode,
+/// which is the file's mode), then refuse a target the caller may not write, by `[ -w ]`, with the
+/// message `std` gives. The refusal comes after the temp is created so that a read-only or full
+/// filesystem reports its own error (`Read-only file system`), not `Permission denied`. The write needs
+/// no read permission on the file. The temp is 0600 so the size check can read it back whatever the file's mode is (a
+/// file its owner may write but not read, mode 0200, is replaced); [`copy_mode!`] gives it the file's
+/// mode just before the `mv`, and a 0600 file's bytes are never in a world-readable temp.
 ///
 /// `set -C` is the shell's `create_new`: the temp is refused, not followed, if anything was preplanted
 /// at its name.
@@ -1298,9 +1329,26 @@ macro_rules! new_temp {
         concat!(
             not_a_directory!(),
             r#"set -C
-: > "$tmp" || exit 1
+if [ -e "$t" ]; then (umask 077; : > "$tmp") || exit 1; else : > "$tmp" || exit 1; fi
 set +C
-if [ -e "$t" ]; then
+if [ -e "$t" ] && [ ! -w "$t" ]; then
+  echo "Permission denied (os error 13)" >&2
+  rm -f "$tmp"
+  exit 1
+fi
+"#
+        )
+    };
+}
+
+/// Give the finished temp `$tmp` the mode of `$t`, when `$t` exists, just before the `mv`: so the
+/// replacement keeps the file's mode. `chmod --reference` is GNU; busybox, which Alpine ships, has no
+/// `--reference`, so its fallback is the octal mode from `stat -L -c %a`. A mode that cannot be
+/// copied fails the write: committing would change the file's permissions, which is exactly what
+/// this exists to prevent.
+macro_rules! copy_mode {
+    () => {
+        r#"if [ -e "$t" ]; then
   chmod --reference="$t" "$tmp" 2>/dev/null || chmod "$(stat -L -c %a "$t")" "$tmp" || {
     echo "cannot give the new file the mode of $t" >&2
     rm -f "$tmp"
@@ -1308,7 +1356,6 @@ if [ -e "$t" ]; then
   }
 fi
 "#
-        )
     };
 }
 
@@ -1326,35 +1373,12 @@ const WRITE_STDIN_SCRIPT: &str = concat!(
   n=$(wc -c < "$tmp")
   if [ $n -eq "$3" ]; then
     if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
-    mv -f "$tmp" "$t" && exit 0
+"#,
+    copy_mode!(),
+    r#"    mv -f "$tmp" "$t" && exit 0
   else
     echo "short write: $n of $3 bytes arrived on stdin" >&2
   fi
-fi
-rm -f "$tmp"
-exit 1"#
-);
-
-/// One argv-sized piece of a write, for a target without stdin: decode base64 `$3` onto the temp (`new`
-/// in `$4` creates it first). `$1` is the target and `$2` the temp's suffix (see
-/// [`resolve_target!`]). When `$5` is set this is the last piece: check the temp holds exactly `$6`
-/// bytes and `mv` it into place. The temp is removed on any failure; the target is untouched until the
-/// `mv`, so a reader never sees a partial file. POSIX `sh` and busybox alike — this is the path Alpine
-/// targets without `-i` take.
-const WRITE_CHUNK_SCRIPT: &str = concat!(
-    resolve_target!(),
-    r#"if [ "$4" = new ]; then
-"#,
-    new_temp!(),
-    r#"fi
-printf %s "$3" | base64 -d >> "$tmp" || { rm -f "$tmp"; exit 1; }
-[ -z "$5" ] && exit 0
-n=$(wc -c < "$tmp")
-if [ $n -eq "$6" ]; then
-  if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
-  mv -f "$tmp" "$t" && exit 0
-else
-  echo "short write: $n of $6 bytes assembled" >&2
 fi
 rm -f "$tmp"
 exit 1"#
@@ -1368,7 +1392,8 @@ const REMOVE_TEMP_SCRIPT: &str = concat!(resolve_target!(), r#"rm -f "$tmp""#);
 enum SearchFailure {
     /// The engine rejected the pattern.
     BadRegex,
-    /// The search root itself does not exist; carries the engine's message.
+    /// The search root itself does not exist, or lies below a file (`Not a directory`); carries the
+    /// engine's message, whose wording decides `not_found` or `not_a_directory`.
     MissingRoot(String),
     /// Only per-path read errors: the hits on stdout are still valid. Carries the note.
     Skipped(String),
@@ -1376,16 +1401,23 @@ enum SearchFailure {
 
 /// Per-path read errors name the path and end in the OS message (`rg` appends ` (os error N)`).
 /// Anything else on stderr is the engine complaining about the pattern.
+///
+/// A path may contain a newline, which splits one error over two lines, so stderr is read as
+/// *records* that end at an OS error, not as lines: a record runs from where the previous one ended
+/// through the first line that ends in an OS message. The search root is known, so its own error is
+/// found by looking for that exact string, newlines and all.
 fn classify_search_failure(stderr: &str, root: &str) -> SearchFailure {
-    const OS_ERRORS: [&str; 5] = [
+    const OS_ERRORS: [&str; 7] = [
         "No such file or directory",
         "Permission denied",
         "Is a directory",
+        "Not a directory",
         "Too many levels of symbolic links",
         "Input/output error",
+        // rg reading a `.git` file (a gitdir pointer) that is not text.
+        "stream did not contain valid UTF-8",
     ];
-    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
-    let path_error = |l: &str| {
+    let ends_in_os_error = |l: &str| {
         let l = l.trim_end();
         let l = l
             .strip_suffix(')')
@@ -1393,29 +1425,42 @@ fn classify_search_failure(stderr: &str, root: &str) -> SearchFailure {
             .unwrap_or(l);
         OS_ERRORS.iter().any(|e| l.ends_with(e))
     };
-    if lines.is_empty() || !lines.iter().all(|l| path_error(l)) {
+    let mut records: Vec<&str> = Vec::new();
+    let mut start = 0;
+    for line in stderr.split_inclusive('\n') {
+        let end = (line.as_ptr() as usize - stderr.as_ptr() as usize) + line.len();
+        if ends_in_os_error(line) {
+            records.push(stderr[start..end].trim());
+            start = end;
+        }
+    }
+    if records.is_empty() || !stderr[start..].trim().is_empty() {
         return SearchFailure::BadRegex;
     }
     // The root's own error is `PROGRAM: ROOT: [IO error for operation on ROOT: ]No such file or
     // directory`; a path under the root carries more path after ROOT, so matching the exact
     // `: ROOT: ` form tells them apart.
     let root_prefix = format!(": {root}: ");
-    if let Some(l) = lines
-        .iter()
-        .find(|l| l.contains(&root_prefix) && l.contains("No such file or directory"))
-    {
-        return SearchFailure::MissingRoot(l.trim().to_string());
+    let io_prefix = format!("IO error for operation on {root}: ");
+    if let Some(r) = records.iter().find(|r| {
+        r.match_indices(&root_prefix).any(|(at, _)| {
+            let rest = &r[at + root_prefix.len()..];
+            let rest = rest.strip_prefix(&io_prefix).unwrap_or(rest);
+            rest.starts_with("No such file or directory") || rest.starts_with("Not a directory")
+        })
+    }) {
+        return SearchFailure::MissingRoot((*r).to_string());
     }
-    let first = lines[0].trim();
     SearchFailure::Skipped(format!(
-        "{} path(s) could not be searched; first: {first}",
-        lines.len()
+        "{} path(s) could not be searched; first: {}",
+        records.len(),
+        records[0]
     ))
 }
 
 /// stderr from a *successful* search — an unreadable path, typically. Empty stderr means nothing to
 /// report, which is the common case.
-fn incomplete_note(result: &ExecResult) -> Option<String> {
+fn incomplete_note(result: &Text) -> Option<String> {
     let detail = result.stderr.trim();
     if detail.is_empty() {
         return None;
@@ -1439,6 +1484,8 @@ fn rg_args(q: &SearchQuery, in_git_repo: bool) -> Vec<String> {
         // Like `grep -H`: a single-file root otherwise prints no path, and the record parser needs one.
         "--with-filename".to_string(),
         "--line-number".to_string(),
+        // The byte column of a match line's first match: what the long-line clip is centred on.
+        "--column".to_string(),
         "--no-heading".to_string(),
         "--color=never".to_string(),
         "--hidden".to_string(),
@@ -1495,6 +1542,9 @@ fn posix_grep_args(q: &SearchQuery, gnu: bool) -> Vec<String> {
         // rejects `--color` outright.
         args.push("-Z".to_string());
         args.push("-I".to_string());
+        // The byte offset of each line: with a second run's `-o -b` match offsets it gives a long
+        // line's match column (`window_long_lines`).
+        args.push("-b".to_string());
         args.push("--color=never".to_string());
     }
     if q.literal {
@@ -1624,11 +1674,48 @@ fn push_context(args: &mut Vec<String>, q: &SearchQuery) {
 /// There is no group-separator line to skip: the engines are run with it turned off (see `rg_args` and
 /// `posix_grep_args`), because `--` + newline is also a legal start of a path. Every record is
 /// `PATH NUL ...`, so a path beginning with `--` + newline round-trips.
-fn parse_records(stdout: &str) -> Vec<Hit> {
+/// What follows the line number in a `PATH NUL` record.
+#[derive(Clone, Copy, PartialEq)]
+enum Cols {
+    /// Nothing.
+    None,
+    /// `rg --column`: a match record is `LINE:COL:TEXT`, a context record `LINE-TEXT`.
+    Rg,
+    /// GNU `grep -b`: `LINE:OFFSET:TEXT` and `LINE-OFFSET-TEXT`, the byte offset of the line start.
+    Gnu,
+}
+
+/// A long match line of a GNU `grep` run, whose column the second run finds.
+struct Long {
+    /// Index into the hits.
+    index: usize,
+    /// Byte offset of the line start in its file.
+    line_start: usize,
+    /// The text as printed, CRs included.
+    raw: String,
+}
+
+fn parse_records(stdout: &str, columns: bool) -> Vec<Hit> {
+    parse_core(
+        stdout,
+        if columns { Cols::Rg } else { Cols::None },
+        &mut Vec::new(),
+    )
+}
+
+fn parse_core(stdout: &str, cols: Cols, longs: &mut Vec<Long>) -> Vec<Hit> {
     let bytes = stdout.as_bytes();
     let mut hits = Vec::new();
     let mut i = 0usize;
+    let mut prev_path = "";
     while i < bytes.len() {
+        // `rg` follows the records of a file it stopped searching at a NUL byte with a line of its
+        // own on stdout, which has no NUL and so must not be read as the start of a record.
+        let first_nl = memchr_from(bytes, i, b'\n').unwrap_or(bytes.len());
+        if is_binary_warning(&stdout[i..first_nl], prev_path) {
+            i = first_nl + 1;
+            continue;
+        }
         let Some(nul) = memchr_from(bytes, i, b'\0') else {
             break; // no NUL anywhere in the remainder — nothing parseable is left
         };
@@ -1636,8 +1723,16 @@ fn parse_records(stdout: &str) -> Vec<Hit> {
         // may contain newlines, so only the terminator *after* the path ends this record.
         let nl = memchr_from(bytes, nul, b'\n').unwrap_or(bytes.len());
         let path = &stdout[i..nul];
+        prev_path = path;
         let rest = &stdout[nul + 1..nl];
-        if let Some(hit) = parse_body(path, rest) {
+        if let Some((hit, long)) = parse_body(path, rest, cols) {
+            if let Some((line_start, raw)) = long {
+                longs.push(Long {
+                    index: hits.len(),
+                    line_start,
+                    raw,
+                });
+            }
             hits.push(hit);
         }
         i = nl + 1;
@@ -1645,10 +1740,31 @@ fn parse_records(stdout: &str) -> Vec<Hit> {
     hits
 }
 
+/// `PATH: WARNING: stopped searching binary file after match (found "\0" byte around offset N)`,
+/// where PATH is the file of the record just before it: `rg` prints it after the matches it found
+/// ahead of a NUL byte. Matching the previous record's path (not just the text) is what keeps a
+/// file whose name happens to contain these words a path.
+fn is_binary_warning(line: &str, prev_path: &str) -> bool {
+    const MID: &str =
+        ": WARNING: stopped searching binary file after match (found \"\\0\" byte around offset ";
+    let Some(rest) = line
+        .strip_prefix(prev_path)
+        .filter(|_| !prev_path.is_empty())
+    else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix(MID) else {
+        return false;
+    };
+    rest.strip_suffix(')')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Split `<line><sep><text>` into its parts. Returns `None` for a record whose line number isn't
 /// digits — malformed output from an implementation we didn't anticipate, dropped rather than
-/// surfaced as a bogus hit at line 0.
-fn parse_body(path: &str, rest: &str) -> Option<Hit> {
+/// surfaced as a bogus hit at line 0. The second part is a GNU long match line left for the second
+/// run: its line-start offset and raw text.
+fn parse_body(path: &str, rest: &str, cols: Cols) -> Option<(Hit, Option<(usize, String)>)> {
     let digits_end = rest.find(|c: char| !c.is_ascii_digit())?;
     if digits_end == 0 {
         return None;
@@ -1660,15 +1776,48 @@ fn parse_body(path: &str, rest: &str) -> Option<Hit> {
         b'-' => false,
         _ => return None,
     };
-    let text = &rest[digits_end + 1..];
-    Some(Hit {
-        path: Arc::from(Path::new(path)),
-        line,
-        // The same normalization `LocalFs`'s sink applies, from the same functions — see `super`.
-        // Clipped by `search` once parsed (`clip_hits`), where the query is in hand to find the match.
-        text: trim_eol(text).into_owned(),
-        is_match,
-    })
+    let mut text = &rest[digits_end + 1..];
+    let mut col = None;
+    let mut line_start = None;
+    if cols == Cols::Gnu || (cols == Cols::Rg && is_match) {
+        let n_end = text.find(|c: char| !c.is_ascii_digit())?;
+        // The number ends in `:` (rg's column; GNU's offset of a match line) or `-` (GNU, context).
+        if n_end == 0 || text.as_bytes()[n_end] != sep {
+            return None;
+        }
+        let n = text[..n_end].parse::<usize>().ok();
+        if cols == Cols::Rg {
+            col = n;
+        } else {
+            line_start = n;
+        }
+        text = &text[n_end + 1..];
+    }
+    let normalized = trim_eol(text);
+    let mut long = None;
+    // The same normalization and clip `LocalFs`'s sink applies, from the same functions — see
+    // `super`. A match line is clipped around the column the engine reported.
+    let text = if is_match && text.len() > super::MAX_LINE && line_start.is_some() {
+        long = line_start.map(|s| (s, text.to_string()));
+        super::clip(&normalized)
+    } else {
+        match col
+            .filter(|_| text.len() > super::MAX_LINE)
+            .and_then(|c| super::match_offset(text, c))
+        {
+            Some(cs) => super::clip_at(&normalized, cs),
+            None => super::clip(&normalized),
+        }
+    };
+    Some((
+        Hit {
+            path: Arc::from(Path::new(path)),
+            line,
+            text,
+            is_match,
+        },
+        long,
+    ))
 }
 
 /// `bytes[from..]`-relative byte search returning an absolute index. A tiny helper rather than pulling
@@ -1697,7 +1846,7 @@ pub mod __fuzz {
 
     /// `rg --null` / `grep -Z` records.
     pub fn records(stdout: &str) -> Vec<Hit> {
-        super::parse_records(stdout)
+        super::parse_records(stdout, false)
     }
 
     /// busybox `grep -rn` records (no glob).
@@ -1755,9 +1904,9 @@ mod appendix_tests {
             ('A', super::STAT_SCRIPT),
             ('B', super::READ_WINDOW_SCRIPT),
             ('C', super::WRITE_STDIN_SCRIPT),
-            ('D', super::WRITE_CHUNK_SCRIPT),
-            ('E', super::REMOVE_TEMP_SCRIPT),
-            ('F', super::GIT_REPO_SCRIPT),
+            ('D', super::REMOVE_TEMP_SCRIPT),
+            ('E', super::GIT_REPO_SCRIPT),
+            ('F', super::PROBE_SCRIPT),
         ];
         let mut wrong = Vec::new();
         for (letter, code) in scripts {
@@ -1778,6 +1927,39 @@ mod appendix_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stat_keeps_the_nanoseconds_and_the_guard_compares_them() {
+        let a = parse_stat("w\tf\t3\t1793127211.536029123\n").unwrap().mtime;
+        let b = parse_stat("w\tf\t3\t1793127211.536029999\n").unwrap().mtime;
+        let c = parse_stat("w\tf\t3\t1793127211.5\n").unwrap().mtime;
+        let whole = parse_stat("w\tf\t3\t1793127211\n").unwrap().mtime;
+        assert_eq!(parse_mtime("5.25"), (5, 250_000_000));
+        assert_eq!(parse_mtime("5.1234567891"), (5, 123_456_789));
+        assert!(mtimes_match(a, a));
+        assert!(!mtimes_match(a, c), "same second, other fraction");
+        assert!(!mtimes_match(c, whole), "a truncated second does not match");
+        // 876 ns apart: above a double's 0.24 us resolution, so a change that small is caught.
+        assert!(!mtimes_match(a, b));
+    }
+
+    #[test]
+    fn rgs_binary_file_warning_is_not_the_start_of_a_record() {
+        let w = ": WARNING: stopped searching binary file after match (found \"\\0\" byte around offset 3)";
+        let out = format!("a\u{0}1:1:x\nb\u{0}1:1:y\nb{w}\nc\u{0}1:1:z\n");
+        let paths: Vec<_> = parse_records(&out, true)
+            .iter()
+            .map(|h| h.path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(paths, ["a", "b", "c"]);
+        // Not the previous record's file: a path that merely contains the words.
+        let out = format!("a\u{0}1:1:x\nb{w}\nc\u{0}1:1:z\n");
+        let paths: Vec<_> = parse_records(&out, true)
+            .iter()
+            .map(|h| h.path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(paths, ["a".to_string(), format!("b{w}\nc")]);
+    }
 
     #[test]
     fn stat_mtime_past_systemtime_range_is_unknown_not_a_panic() {
@@ -1863,6 +2045,8 @@ mod tests {
             );
         }
         for missing in [
+            "rg: /work/proj: IO error for operation on /work/proj: Not a directory (os error 20)",
+            "grep: /work/proj: Not a directory",
             "rg: /work/proj: No such file or directory (os error 2)",
             "rg: /work/proj: IO error for operation on /work/proj: No such file or directory (os error 2)",
             "grep: /work/proj: No such file or directory",
@@ -1886,6 +2070,38 @@ mod tests {
             classify_search_failure("grep: /work/proj/x: No such file or directory", root),
             SearchFailure::Skipped(_)
         ));
+    }
+
+    #[test]
+    fn a_path_with_a_newline_does_not_hide_the_os_error() {
+        let root = "/work/no\nwhere";
+        for missing in [
+            "rg: /work/no\nwhere: No such file or directory (os error 2)\n",
+            "rg: /work/no\nwhere: IO error for operation on /work/no\nwhere: No such file or directory (os error 2)\n",
+            "grep: /work/no\nwhere: No such file or directory\n",
+        ] {
+            assert!(
+                matches!(
+                    classify_search_failure(missing, root),
+                    SearchFailure::MissingRoot(_)
+                ),
+                "{missing:?}"
+            );
+        }
+        let SearchFailure::Skipped(note) = classify_search_failure(
+            "rg: /work/proj/a\nb: Permission denied (os error 13)\nrg: /work/proj/c: Permission denied (os error 13)\n",
+            "/work/proj",
+        ) else {
+            panic!("per-file errors must keep the matches");
+        };
+        assert!(note.starts_with("2 path(s)"), "{note}");
+        // The detail of a failed command is cut at the OS error, not at the first newline.
+        assert_eq!(
+            first_line_or("cat: a\nb: No such file or directory\n", "x"),
+            "cat: a\nb: No such file or directory"
+        );
+        assert_eq!(first_line_or("one\ntwo\n", "x"), "one");
+        assert_eq!(first_line_or("  \n", "x"), "x");
     }
 
     /// This host's `sh`, with a prelude run before every script. A `PATH` shim, not a shell function,
@@ -1946,14 +2162,14 @@ mod tests {
         let fs = ShellFs::connect(Arc::new(shim(dir.path(), "dd")))
             .await
             .unwrap();
-        assert!(fs.capabilities().no_read_window);
+        assert!(fs.capabilities().await.unwrap().no_read_window);
         let err = fs.read_bytes(&path, 0, 1024).await.unwrap_err();
         assert!(err.to_string().contains("cannot be read"), "{err}");
         // A target with the flags reads it, and the probe agrees.
         let fs = ShellFs::connect(Arc::new(Prelude(":".into())))
             .await
             .unwrap();
-        assert!(!fs.capabilities().no_read_window);
+        assert!(!fs.capabilities().await.unwrap().no_read_window);
         assert_eq!(fs.read_bytes(&path, 0, 1024).await.unwrap(), b"keep me\n");
     }
 
@@ -1966,46 +2182,15 @@ mod tests {
         assert!(caps.no_read_window);
     }
 
-    /// A runner that answers only the `find` probe, with the result it holds; every other command reads as absent.
-    struct FindAnswers(ExecResult);
-
-    #[async_trait]
-    impl CommandRunner for FindAnswers {
-        async fn run(
-            &self,
-            program: &str,
-            _: &[String],
-            _: Option<&str>,
-            _: Duration,
-        ) -> std::io::Result<ExecResult> {
-            if program == "find" {
-                Ok(self.0.clone())
-            } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    program.to_string(),
-                ))
-            }
-        }
-    }
-
     #[tokio::test]
     async fn busybox_find_usage_and_exit_one_is_probed_as_no_printf() {
-        // Busybox prints its usage and exits 1 for an unknown `-printf`, on stdout or stderr.
-        let usage = ExecResult {
-            code: Some(1),
-            stdout: "BusyBox v1.36 multi-call binary\nUsage: find [-HL] [PATH]...\n".into(),
-            stderr: "find: unrecognized: -printf\n".into(),
-            ..Default::default()
-        };
-        let caps = Capabilities::probe(&FindAnswers(usage)).await.unwrap();
+        // Busybox prints its usage and exits 1 for an unknown `-printf`: only the exact `c` proves it.
+        let dir = tempfile::tempdir().unwrap();
+        let caps = Capabilities::probe(&shim(dir.path(), "find"))
+            .await
+            .unwrap();
         assert!(!caps.find_printf);
-        let c = ExecResult {
-            code: Some(0),
-            stdout: "c".into(),
-            ..Default::default()
-        };
-        let caps = Capabilities::probe(&FindAnswers(c)).await.unwrap();
+        let caps = Capabilities::probe(&Prelude(":".into())).await.unwrap();
         assert!(caps.find_printf);
     }
 
@@ -2049,13 +2234,16 @@ mod tests {
     #[tokio::test]
     async fn a_probe_that_ran_but_answered_too_much_reads_as_absent() {
         let fs = ShellFs::connect(Arc::new(TooBig)).await.unwrap();
-        assert!(!fs.capabilities().rg && !fs.capabilities().stdin);
+        assert!(!fs.capabilities().await.unwrap().rg);
     }
 
     #[tokio::test]
-    async fn a_probe_whose_request_failed_fails_connect_instead_of_reading_as_absent() {
-        let err = ShellFs::connect(Arc::new(Refused)).await.err().unwrap();
+    async fn a_probe_whose_request_failed_is_an_error_instead_of_reading_as_absent() {
+        let fs = ShellFs::connect(Arc::new(Refused)).await.unwrap();
+        let err = fs.capabilities().await.unwrap_err();
         assert!(err.to_string().contains("returned 401"), "got: {err}");
+        // Nothing is cached: the next operation asks again.
+        assert!(fs.capabilities().await.is_err());
     }
 
     #[tokio::test]
@@ -2063,28 +2251,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().join("d");
         std::fs::create_dir(&d).unwrap();
-        let probed = ShellFs::connect(Arc::new(Prelude(":".into())))
+        let fs = ShellFs::connect(Arc::new(Prelude(":".into())))
             .await
             .unwrap();
-        for stdin in [true, false] {
-            let mut caps = probed.capabilities();
-            caps.stdin = stdin;
-            let fs = ShellFs::with_capabilities(Arc::new(Prelude(":".into())), caps);
-            let err = fs.write_bytes(&d, b"x".to_vec()).await.unwrap_err();
-            assert!(err.to_string().contains("Is a directory"), "{err}");
-            let err = fs
-                .write_if_unchanged(&d, b"x".to_vec(), fs.stat(&d).await.unwrap().unwrap().mtime)
-                .await
-                .unwrap_err();
-            assert!(err.to_string().contains("Is a directory"), "{err}");
-            assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0, "stdin={stdin}");
-            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
-        }
+        let err = fs.write_bytes(&d, b"x".to_vec()).await.unwrap_err();
+        assert!(err.to_string().contains("Is a directory"), "{err}");
+        let err = fs
+            .write_if_unchanged(&d, b"x".to_vec(), fs.stat(&d).await.unwrap().unwrap().mtime)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Is a directory"), "{err}");
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
     fn parses_a_match_record() {
-        let hits = parse_records("src/a.rs\u{0}12:let x = 1;\n");
+        let hits = parse_records("src/a.rs\u{0}12:let x = 1;\n", false);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path.to_string_lossy(), "src/a.rs");
         assert_eq!(hits[0].line, 12);
@@ -2094,7 +2277,10 @@ mod tests {
 
     #[test]
     fn distinguishes_context_lines_from_matches() {
-        let hits = parse_records("a.rs\u{0}1-before\na.rs\u{0}2:hit\na.rs\u{0}3-after\n");
+        let hits = parse_records(
+            "a.rs\u{0}1-before\na.rs\u{0}2:hit\na.rs\u{0}3-after\n",
+            false,
+        );
         let flags: Vec<bool> = hits.iter().map(|h| h.is_match).collect();
         assert_eq!(flags, vec![false, true, false]);
     }
@@ -2102,7 +2288,7 @@ mod tests {
     #[test]
     fn a_path_starting_with_dashes_and_a_newline_is_not_a_group_separator() {
         // The engines are run without a group separator, so `--` + newline can only be a path.
-        let hits = parse_records("--\nb\u{0}2-y\n--\r\nc\u{0}3:z\r\n");
+        let hits = parse_records("--\nb\u{0}2-y\n--\r\nc\u{0}3:z\r\n", false);
         let got: Vec<_> = hits
             .iter()
             .map(|h| (h.path.to_string_lossy().into_owned(), h.line))
@@ -2132,7 +2318,7 @@ mod tests {
 
     #[test]
     fn files_named_like_a_separator_are_not_skipped() {
-        let hits = parse_records("--\u{0}1:x\n--\r\u{0}2:y\n--\u{0}3:--\n");
+        let hits = parse_records("--\u{0}1:x\n--\r\u{0}2:y\n--\u{0}3:--\n", false);
         let got: Vec<_> = hits
             .iter()
             .map(|h| (h.path.to_string_lossy().into_owned(), h.line))
@@ -2149,7 +2335,7 @@ mod tests {
         // The reason this parser scans for NUL rather than splitting on newlines. A path containing a
         // newline is legal on every Unix filesystem, and line-splitting would attribute "9:two" to a
         // path of "line2" that never existed.
-        let hits = parse_records("we\nird.rs\u{0}9:two\n");
+        let hits = parse_records("we\nird.rs\u{0}9:two\n", false);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path.to_string_lossy(), "we\nird.rs");
         assert_eq!(hits[0].line, 9);
@@ -2160,7 +2346,7 @@ mod tests {
     fn a_colon_in_the_path_is_not_mistaken_for_the_separator() {
         // The NUL, not the first colon, ends the path — otherwise `odd:name.rs` would parse as a path
         // of "odd" with an unparseable line number.
-        let hits = parse_records("odd:name.rs\u{0}3:body\n");
+        let hits = parse_records("odd:name.rs\u{0}3:body\n", false);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path.to_string_lossy(), "odd:name.rs");
         assert_eq!(hits[0].text, "body");
@@ -2168,7 +2354,7 @@ mod tests {
 
     #[test]
     fn strips_carriage_returns_the_same_way_the_local_backend_does() {
-        let hits = parse_records("a.rs\u{0}1:crlf line\r\n");
+        let hits = parse_records("a.rs\u{0}1:crlf line\r\n", false);
         assert_eq!(hits[0].text, "crlf line");
     }
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """PGO training workload for `execd`: python3 .github/pgo-train-execd.py <instrumented execd> <profdir>
 
-Drives a PGO-instrumented build through what a sandbox's execd does: v1.1 commands (with and
-without stdin), a v1.2 stream, a kept v1.3 job (start, read, list, kill), a command that leaves a
+Drives a PGO-instrumented build through what a sandbox's execd does: one-shot commands (with and
+without stdin), a stream, a kept job (start, read, list, kill), a command that leaves a
 process behind, and a client that disconnects. The point is the layout of the code that runs, which
 decides resident text (see `.github/workflows/release-agent.yml`).
 
@@ -83,10 +83,10 @@ def main():
             call(port, req("true", [], root))  # warm
             for _ in range(200):
                 call(port, req("cat", ["f"], root))
-                call(port, req("cat", [], root, stdin_base64=base64.b64encode(b"hello").decode()))
+                call(port, req("cat", [], root, stdin=base64.b64encode(b"hello").decode()))
             call(port, req("sh", ["-c", "echo err >&2; exit 3"], root))
             call(port, req("no-such-command", [], root))
-            # v1.2 streams, finishing and abandoned.
+            # streams, finishing and abandoned.
             for _ in range(20):
                 call(port, req("head", ["-c", "1048576", "/dev/zero"], root, stream=True))
             call(port, req("sh", ["-c", "printf a; sleep 30"], root, stream=True), wait=b'"a"')

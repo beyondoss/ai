@@ -1,9 +1,9 @@
-//! `run_in_background` and `timeout_ms` over a remote exec endpoint. On a streaming (v1.2) endpoint
+//! `run_in_background` and `timeout_ms` over a remote exec endpoint. On a streaming endpoint
 //! both behave as on this host: a background start returns with a job whose stream is its lifetime,
-//! and a `timeout_ms` returns the call while the command keeps running. A v1.1 endpoint can neither
+//! and a `timeout_ms` returns the call while the command keeps running. A one-shot endpoint can neither
 //! stream nor stop a command, so `run_in_background` is refused before anything runs, and a
 //! `timeout_ms` it outlived is said to have had no effect. The wire carries the deadlines `bash`
-//! derives: `i32::MAX` ms on a stream, 30 minutes on v1.1.
+//! derives: `i32::MAX` ms on a stream, 30 minutes on one-shot.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use crate::common;
@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 
 use agent_core::Background;
 use beyond_agent::exec_endpoint::{HttpExecRunner, STREAM_DEADLINE};
-use beyond_agent::tools::exec::UNTRACKED_DEADLINE;
 use common::exec_mock::{ExecMock, MockOptions, Protocol, StreamEnd, wait_group_gone};
 use common::remote_bash::{call, job_number, kill_job, remote_bash};
 use serde_json::{Value, json};
@@ -131,60 +130,4 @@ async fn a_v12_timeout_returns_the_call_and_the_exit_is_noticed() {
         "{notice}"
     );
     assert!(notice.contains("to-done"), "{notice}");
-}
-
-#[tokio::test]
-async fn a_v11_endpoint_refuses_run_in_background_before_running_anything() {
-    let (mock, _dir) = endpoint(Protocol::V11).await;
-    let (bash, _jobs) = remote_bash(runner(&mock), Duration::from_secs(30));
-    let err = call(
-        bash.as_ref(),
-        json!({ "command": "echo never-ran-tag; sleep 60", "run_in_background": true }),
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        err.contains("`run_in_background` is unavailable here"),
-        "{err}"
-    );
-    assert!(err.contains("(protocol v1.1)"), "{err}");
-    assert!(
-        wire_timeout(&mock, "never-ran-tag").is_none(),
-        "only the stream probe reached the endpoint: {:?}",
-        mock.bodies()
-    );
-}
-
-#[tokio::test]
-async fn a_v11_endpoint_cannot_hand_back_control_and_the_result_says_so() {
-    let (mock, _dir) = endpoint(Protocol::V11).await;
-    let (bash, _jobs) = remote_bash(runner(&mock), Duration::from_secs(30));
-    let out = call(
-        bash.as_ref(),
-        json!({ "command": "echo v11-tag; sleep 1; echo after", "timeout_ms": 200 }),
-    )
-    .await
-    .unwrap();
-    assert!(out.contains("v11-tag") && out.contains("after"), "{out}");
-    assert!(job_number(&out).is_none(), "no job: {out}");
-    assert!(
-        out.ends_with(
-            "This sandbox's exec endpoint cannot return before a command exits, so `timeout_ms` \
-             had no effect."
-        ),
-        "{out}"
-    );
-    assert_eq!(
-        wire_timeout(&mock, "v11-tag"),
-        Some(UNTRACKED_DEADLINE.as_millis() as u64),
-        "v1.1 carries the internal deadline, not the model's timeout_ms"
-    );
-    // A command that finished inside its timeout_ms needs no such note.
-    let quick = call(
-        bash.as_ref(),
-        json!({ "command": "echo quick", "timeout_ms": 60_000 }),
-    )
-    .await
-    .unwrap();
-    assert_eq!(quick, "quick\n");
 }

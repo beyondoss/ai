@@ -23,7 +23,6 @@ from beyond_sandbox import (
     EndpointError,
     Exit,
     HttpTransport,
-    NotOffered,
     ProtocolError,
     Stdout,
     TooLarge,
@@ -98,48 +97,41 @@ def ep() -> Iterator[Endpoint]:
     e.server.shutdown()
 
 
-def probe_streaming(h: BaseHTTPRequestHandler) -> None:
-    ndjson_head(h)
-    chunk(h, {"stdout": b64(b"a")})
-    time.sleep(0.25)
-    chunk(h, {"stdout": b64(b"b")})
-    chunk(h, {"exit_code": 0})
-    h.wfile.write(b"0\r\n\r\n")
-
-
 # ---- run -------------------------------------------------------------------------------------------
 
 
-def test_run_sends_the_v11_request_and_the_bearer(ep: Endpoint) -> None:
-    ep.handler = lambda h, b: reply(h, 200, {"exit_code": 3, "stdout": "o", "stderr": "e"})
+def test_run_sends_the_request_and_the_bearer(ep: Endpoint) -> None:
+    ep.handler = lambda h, b: reply(
+        h, 200, {"exit_code": 3, "stdout": b64(b"o"), "stderr": b64(b"e")}
+    )
     t = HttpTransport(ep.url, "tok", headers={"X-Tenant": "acme"})
-    r = t.run_text("sh", ["-c", "x"], cwd="/w", timeout_ms=5000, stdin=b"in")
+    r = t.run("sh", ["-c", "x"], cwd="/w", timeout_ms=5000, stdin=b"in")
     assert (r.exit_code, r.stdout, r.stderr) == (3, b"o", b"e")
     assert ep.requests[0] == {
         "command": "sh", "args": ["-c", "x"], "cwd": "/w", "timeout_ms": 5000,
-        "stdin_base64": b64(b"in"),
+        "stdin": b64(b"in"),
     }  # fmt: skip
     assert ep.auth == ["Bearer tok"]
 
 
 def test_no_token_sends_no_authorization(ep: Endpoint) -> None:
-    HttpTransport(ep.url).run_text("true")
+    HttpTransport(ep.url).run("true")
     assert ep.auth == [None]
 
 
 def test_a_401_refreshes_the_token_once_and_retries_that_request_once(ep: Endpoint) -> None:
     def handler(h: BaseHTTPRequestHandler, body: dict[str, Any]) -> None:
         if h.headers.get("Authorization") == "Bearer fresh":
-            reply(h, 200, {"exit_code": 0, "stdout": "ok", "stderr": ""})
+            reply(h, 200, {"exit_code": 0, "stdout": b64(b"ok"), "stderr": ""})
         else:
             reply(h, 401, {"error": "expired"})
 
     ep.handler = handler
     tokens = iter(["stale", "fresh", "never"])
     t = HttpTransport(ep.url, lambda: next(tokens))
-    assert t.run_text("true").stdout == b"ok"
+    assert t.run("true").stdout == b"ok"
     assert ep.auth == ["Bearer stale", "Bearer fresh"]
-    assert t.run_text("true").stdout == b"ok"  # the fresh token is kept, not fetched again
+    assert t.run("true").stdout == b"ok"  # the fresh token is kept, not fetched again
     assert ep.auth[2:] == ["Bearer fresh"]
 
 
@@ -186,7 +178,9 @@ def test_a_200_that_is_not_json_is_a_protocol_error(ep: Endpoint) -> None:
 
 
 def test_the_response_cap_stops_reading_and_says_the_command_ran(ep: Endpoint) -> None:
-    ep.handler = lambda h, b: reply(h, 200, {"exit_code": 0, "stdout": "x" * 5000, "stderr": ""})
+    ep.handler = lambda h, b: reply(
+        h, 200, {"exit_code": 0, "stdout": b64(b"x" * 20000), "stderr": ""}
+    )
     with pytest.raises(TooLarge) as e:
         HttpTransport(ep.url, max_response_bytes=1000).run("true")
     assert "the command ran" in e.value.detail
@@ -197,7 +191,7 @@ def test_the_cap_applies_to_a_chunked_body_with_no_length(ep: Endpoint) -> None:
         h.send_response(200)
         h.send_header("Transfer-Encoding", "chunked")
         h.end_headers()
-        data = b'{"exit_code":0,"stdout":"' + b"x" * 5000 + b'","stderr":""}'
+        data = b'{"exit_code":0,"stdout":"' + b"eA==" * 5000 + b'","stderr":""}'
         h.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n0\r\n\r\n")
 
     ep.handler = handler
@@ -219,7 +213,7 @@ def test_the_request_deadline_is_timeout_plus_grace(
     ep.handler = lambda h, b: time.sleep(2)
     t0 = time.monotonic()
     with pytest.raises(Timeout):
-        HttpTransport(ep.url).run_text("true", timeout_ms=100)
+        HttpTransport(ep.url).run("true", timeout_ms=100)
     assert 0.3 <= time.monotonic() - t0 < 1.5
 
 
@@ -228,10 +222,6 @@ def test_the_request_deadline_is_timeout_plus_grace(
 
 def streaming_endpoint(ep: Endpoint, frames: list[dict[str, Any]], final: bool = True) -> None:
     def handler(h: BaseHTTPRequestHandler, body: dict[str, Any]) -> None:
-        if not body.get("stream"):
-            return reply(h, 200, {"exit_code": 0, "stdout": "", "stderr": ""})
-        if body["args"][:1] == ["-c"] and "sleep 0.3" in body["args"][1]:
-            return probe_streaming(h)
         ndjson_head(h)
         for f in frames:
             chunk(h, f)
@@ -250,9 +240,8 @@ def test_stream_yields_frames_and_stops_after_the_final_one(ep: Endpoint) -> Non
     streaming_endpoint(ep, [{"stdout": b64(b"hi")}, {}, {"exit_code": 4}])
     t = HttpTransport(ep.url)
     assert list(t.stream("echo")) == [Stdout(b"hi"), Exit(4)]
-    assert t.streams() is True
-    assert [r.get("stream") for r in ep.requests] == [True, True]  # the probe, then the call
-    assert ep.requests[1]["timeout_ms"] == 2**31 - 1
+    assert [r.get("stream") for r in ep.requests] == [True]  # no probe first
+    assert ep.requests[0]["timeout_ms"] == 2**31 - 1
 
 
 def test_a_stream_that_ends_without_a_final_frame_is_a_transport_error(ep: Endpoint) -> None:
@@ -275,60 +264,13 @@ def test_closing_the_stream_closes_the_connection(ep: Endpoint) -> None:
     assert ep.disconnected.wait(5), "the endpoint never saw the connection close"
 
 
-def test_an_endpoint_that_does_not_stream_is_not_offered(ep: Endpoint) -> None:
-    ep.handler = lambda h, b: reply(h, 200, {"exit_code": 0, "stdout": "ab", "stderr": ""})
-    t = HttpTransport(ep.url)
-    assert t.streams() is False
-    with pytest.raises(NotOffered):
-        t.stream("echo")
-    assert len(ep.requests) == 1  # nothing was run one-shot instead
-
-
-def test_an_endpoint_that_buffers_is_not_streaming(ep: Endpoint) -> None:
-    def handler(h: BaseHTTPRequestHandler, body: dict[str, Any]) -> None:
-        ndjson_head(h)
-        for f in ({"stdout": b64(b"a")}, {"stdout": b64(b"b")}, {"exit_code": 0}):
-            chunk(h, f)  # all at once
-        h.wfile.write(b"0\r\n\r\n")
-
-    ep.handler = handler
-    assert HttpTransport(ep.url).streams() is False
-
-
-def test_a_refused_stream_field_means_no_streaming_but_an_outage_is_not_an_answer(
-    ep: Endpoint,
-) -> None:
-    ep.handler = lambda h, b: reply(h, 400, {"error": "unknown field"})
-    assert HttpTransport(ep.url).streams() is False
-    ep.handler = lambda h, b: reply(h, 502, {})
-    t = HttpTransport(ep.url)
-    with pytest.raises(EndpointError):
-        t.streams()
-    ep.handler = lambda h, b: probe_streaming(h)
-    assert t.streams() is True  # the failed probe was not cached
-
-
-# ---- jobs probe ------------------------------------------------------------------------------------
-
-
-def test_the_job_probe(ep: Endpoint) -> None:
-    ep.handler = lambda h, b: reply(h, 200, {"jobs": "v1.3", "notify": "v1.4"})
-    offer = HttpTransport(ep.url).job_offer()
-    assert (offer.native, offer.notify) == (True, True)
-    assert ep.requests[0]["job"] == {"op": "probe"}
-    ep.handler = lambda h, b: reply(h, 200, {"exit_code": 0, "stdout": "exec-v1.2", "stderr": ""})
-    assert HttpTransport(ep.url).job_offer().native is False
-    ep.handler = lambda h, b: reply(h, 400, {})
-    assert HttpTransport(ep.url).job_offer().native is False
-
-
 # ---- async -----------------------------------------------------------------------------------------
 
 
 def test_async_run_refresh_and_errors(ep: Endpoint) -> None:
     def handler(h: BaseHTTPRequestHandler, body: dict[str, Any]) -> None:
         if h.headers.get("Authorization") == "Bearer fresh":
-            reply(h, 200, {"exit_code": 0, "stdout": "ok", "stderr": ""})
+            reply(h, 200, {"exit_code": 0, "stdout": b64(b"ok"), "stderr": ""})
         else:
             reply(h, 401, {})
 
@@ -341,10 +283,10 @@ def test_async_run_refresh_and_errors(ep: Endpoint) -> None:
             return next(tokens)
 
         t = AsyncHttpTransport(ep.url, token)
-        assert (await t.run_text("true")).stdout == b"ok"
+        assert (await t.run("true")).stdout == b"ok"
         assert ep.auth == ["Bearer stale", "Bearer fresh"]
         ep.handler = lambda h, b: reply(
-            h, 200, {"exit_code": 0, "stdout": "x" * 5000, "stderr": ""}
+            h, 200, {"exit_code": 0, "stdout": b64(b"x" * 20000), "stderr": ""}
         )
         with pytest.raises(TooLarge):
             await AsyncHttpTransport(ep.url, max_response_bytes=1000).run("true")
@@ -395,7 +337,9 @@ def tls_endpoint(tmp_path: Path) -> Iterator[tuple[Endpoint, ssl.SSLContext]]:
 
 def test_https_sync_and_async(tls_endpoint: tuple[Endpoint, ssl.SSLContext]) -> None:
     ep, ctx = tls_endpoint
-    ep.handler = lambda h, b: reply(h, 200, {"exit_code": 0, "stdout": "secure", "stderr": ""})
+    ep.handler = lambda h, b: reply(
+        h, 200, {"exit_code": 0, "stdout": b64(b"secure"), "stderr": ""}
+    )
     assert HttpTransport(ep.url, ssl_context=ctx).run("true").stdout == b"secure"
 
     async def main() -> None:

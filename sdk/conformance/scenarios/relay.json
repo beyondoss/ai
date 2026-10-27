@@ -480,23 +480,6 @@
           }
         },
         {
-          "id": "age",
-          "op": "exec",
-          "command": "sh",
-          "args": [
-            "-c",
-            "TZ=UTC touch -t 200102030405.06 \"$1\"",
-            "sh",
-            "${ROOT}/f"
-          ],
-          "expect": {
-            "ok": {
-              "exit_code": 0
-            }
-          },
-          "via": "A"
-        },
-        {
           "id": "stat",
           "via": "A",
           "op": "stat",
@@ -506,7 +489,7 @@
           },
           "expect": {
             "ok": {
-              "mtime": 981173106
+              "exists": true
             }
           }
         },
@@ -533,23 +516,6 @@
           }
         },
         {
-          "id": "age-again",
-          "op": "exec",
-          "command": "sh",
-          "args": [
-            "-c",
-            "TZ=UTC touch -t 200102030405.06 \"$1\"",
-            "sh",
-            "${ROOT}/f"
-          ],
-          "expect": {
-            "ok": {
-              "exit_code": 0
-            }
-          },
-          "via": "A"
-        },
-        {
           "id": "b-stat",
           "via": "B",
           "op": "stat",
@@ -559,9 +525,24 @@
           },
           "expect": {
             "ok": {
-              "mtime": 981173106
+              "exists": true
             }
           }
+        },
+        {
+          "id": "tick",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 0.05 2>/dev/null || sleep 1"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          },
+          "via": "A"
         },
         {
           "id": "a-writes",
@@ -863,9 +844,6 @@
     {
       "id": "relay.jobs.live-job-from-the-other-client",
       "description": "A starts a long job; B lists it (with A's label), reads its output from offset 0 and from an offset, and kills it with no survivors; A sees the job ended. Native and baseline jobs alike.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -997,9 +975,6 @@
     {
       "id": "relay.jobs.ended-job-is-shared",
       "description": "A runs a job to its end; B lists it with its exit code, attaches from an offset, then removes it; A finds it gone.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",
@@ -1111,9 +1086,6 @@
     {
       "id": "relay.jobs.kill-takes-the-whole-group",
       "description": "A starts a job whose child would write a marker later; B kills it with survivors []; the marker never appears.",
-      "requires": {
-        "jobs": "any"
-      },
       "steps": [
         {
           "id": "start",

@@ -3,8 +3,7 @@
 //!
 //! "A replica" here is a job table: dropping it is what a reaped, redeployed or crashed replica does
 //! to its jobs, and a fresh table over the same sandbox scope, reattached, is the next replica. The
-//! sandbox is real processes on this host behind the v1.2 mock, the v1.1 mock (nothing streams: jobs
-//! start kept and are polled) and a template transport whose far side lives in its own session.
+//! sandbox is real processes on this host behind the mock and a template transport whose far side lives in its own session.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use crate::common;
@@ -21,26 +20,18 @@ use beyond_agent::tools::bash_sandbox::{Reattached, reattach, reattach_later};
 use beyond_agent::tools::exec::CommandRunner;
 use beyond_agent::tools::fs::FsBackend;
 use beyond_agent::tools::fs::shell::{Capabilities, ShellFs};
-use common::exec_mock::{ExecMock, MockOptions, Protocol};
+use common::exec_mock::{ExecMock, MockOptions};
 use common::remote_bash::{call, job_number, kill_job};
 use serde_json::json;
 
 #[derive(Clone, Copy, Debug)]
 enum Transport {
-    /// A v1.2-only endpoint: jobs run on plain exec commands.
-    Stream,
-    /// The v1.3 endpoint: it runs the jobs itself.
+    /// The endpoint runs the jobs itself.
     Native,
-    V11,
     Template,
 }
 
-const ALL: [Transport; 4] = [
-    Transport::Stream,
-    Transport::V11,
-    Transport::Template,
-    Transport::Native,
-];
+const ALL: [Transport; 2] = [Transport::Template, Transport::Native];
 
 /// A sandbox, and the scope one session's jobs live under in it.
 struct Sandbox {
@@ -54,17 +45,11 @@ impl Sandbox {
     async fn new(t: Transport) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let (runner, mock): (Arc<dyn CommandRunner>, _) = match t {
-            Transport::Stream | Transport::V11 | Transport::Native => {
+            Transport::Native => {
                 let mock = ExecMock::start_with(
                     dir.path(),
                     MockOptions {
-                        protocol: if matches!(t, Transport::V11) {
-                            Protocol::V11
-                        } else {
-                            Protocol::Streaming
-                        },
                         heartbeat: Duration::from_millis(500),
-                        jobs: matches!(t, Transport::Native),
                         ..MockOptions::default()
                     },
                 )
@@ -300,7 +285,7 @@ async fn a_deferred_reattach_reads_the_jobs_back_when_one_is_asked_about() {
 
 #[tokio::test]
 async fn a_foreground_command_dies_with_its_replica() {
-    for t in [Transport::Stream, Transport::Template, Transport::Native] {
+    for t in [Transport::Template, Transport::Native] {
         let sb = Sandbox::new(t).await;
         let a = sb.replica(EndPolicy::KeepRunning);
         let out = call(
@@ -331,7 +316,7 @@ async fn a_foreground_command_dies_with_its_replica() {
 
 #[tokio::test]
 async fn an_adopted_leftover_outlives_its_replica() {
-    for t in [Transport::Stream, Transport::Template, Transport::Native] {
+    for t in [Transport::Template, Transport::Native] {
         let sb = Sandbox::new(t).await;
         let a = sb.replica(EndPolicy::KeepRunning);
         let out = call(
@@ -409,7 +394,7 @@ async fn a_job_that_ends_while_detached_is_noticed_once_on_the_next_attach() {
 
 #[tokio::test]
 async fn a_replica_that_dies_before_persisting_a_notice_leaves_it_for_the_next() {
-    for t in [Transport::Stream, Transport::Native] {
+    for t in [Transport::Native] {
         let sb = Sandbox::new(t).await;
         let a = sb.replica(EndPolicy::KeepRunning);
         call(
@@ -440,7 +425,7 @@ async fn a_replica_that_dies_before_persisting_a_notice_leaves_it_for_the_next()
 
 #[tokio::test]
 async fn a_run_stops_what_an_earlier_run_of_its_session_left_in_the_sandbox() {
-    for t in [Transport::Stream, Transport::Native] {
+    for t in [Transport::Native] {
         let sb = Sandbox::new(t).await;
         let a = sb.replica(EndPolicy::StopAtEnd);
         let out = call(
@@ -468,29 +453,8 @@ async fn a_run_stops_what_an_earlier_run_of_its_session_left_in_the_sandbox() {
 }
 
 #[tokio::test]
-async fn a_v11_sandbox_can_now_run_a_job_in_the_background() {
-    let sb = Sandbox::new(Transport::V11).await;
-    let a = sb.replica(EndPolicy::KeepRunning);
-    let out = call(
-        a.bash.as_ref(),
-        json!({ "command": "echo up; sleep 3; echo later", "run_in_background": true }),
-    )
-    .await
-    .unwrap();
-    assert!(
-        out.contains("up"),
-        "the start's output arrives by polling: {out}"
-    );
-    assert!(out.contains("Running in the background as job 1"), "{out}");
-    let n = notice(&a.jobs).await;
-    assert!(n.starts_with("[job 1 exited with code 0"), "{n}");
-    assert!(n.contains("later"), "{n}");
-    sb.wipe().await;
-}
-
-#[tokio::test]
 async fn ending_the_transcript_stops_kept_jobs_and_wipes_the_scope() {
-    for t in [Transport::Stream, Transport::Native] {
+    for t in [Transport::Native] {
         let sb = Sandbox::new(t).await;
         let a = sb.replica(EndPolicy::KeepRunning);
         let out = call(
@@ -514,7 +478,7 @@ async fn ending_the_transcript_stops_kept_jobs_and_wipes_the_scope() {
 
 #[tokio::test]
 async fn release_lets_go_of_kept_jobs_and_stops_the_rest() {
-    for t in [Transport::Stream, Transport::Native] {
+    for t in [Transport::Native] {
         let sb = Sandbox::new(t).await;
         let a = sb.replica(EndPolicy::KeepRunning);
         let kept = call(
@@ -546,7 +510,7 @@ async fn release_lets_go_of_kept_jobs_and_stops_the_rest() {
 
 #[tokio::test]
 async fn the_reopen_note_says_a_job_the_sandbox_kept_is_still_running() {
-    for t in [Transport::Stream, Transport::Native] {
+    for t in [Transport::Native] {
         let sb = Sandbox::new(t).await;
         let a = sb.replica(EndPolicy::KeepRunning);
         let started = call(

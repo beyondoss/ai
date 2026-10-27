@@ -44,8 +44,9 @@ curl localhost:8080/v1/chat/completions \
 | [`crates/agent`](crates/agent)             | `beyond-agent`        | The agent: `run`, `serve`, `serve --service` (binary `agent`).                          |
 | [`crates/agent-core`](crates/agent-core)   | `beyond-agent-core`   | The agent loop as a library: messages, tool dispatch, compaction, three provider wires. |
 | [`crates/providers`](crates/providers)     | `beyond-providers`    | Provider table, model catalog and the pricing contract. No dependencies.                |
-| [`crates/exec-notify`](crates/exec-notify) | `beyond-exec-notify`  | Exec protocol v1.4 job-end callback rules as a pure function. No dependencies.          |
-| [`crates/execd`](crates/execd)             | `beyond-execd`        | The exec endpoint for a sandbox: exec protocol v1.1 to v1.4 in one static binary.       |
+| [`crates/exec-notify`](crates/exec-notify) | `beyond-exec-notify`  | Exec protocol job-end callback rules as a pure function. No dependencies.               |
+| [`crates/execd`](crates/execd)             | `beyond-execd`        | The exec endpoint for a sandbox: the whole exec protocol in one static binary.          |
+| [`crates/sandbox-mcp`](crates/sandbox-mcp) | `beyond-sandbox-mcp`  | An MCP server that gives any agent exec, files, search and jobs in a sandbox.           |
 | `crates/demo`                              | `beyond-demo`         | Sandbox exec endpoint, key and grant minters, chat client for `deploy/demo`.            |
 | `crates/fleet-sim`                         | `beyond-fleet-sim`    | Runs a replica set against a shared filesystem and checks the fleet design's claims.    |
 | `crates/test-support`                      | `beyond-test-support` | Test doubles shared by the agent's tests and the simulator.                             |
@@ -70,7 +71,7 @@ configured. Together, the agent holds a gateway-issued `bai_v1` virtual key and
 never sees a provider key.
 
 To run the agent's tools in a sandbox, put [`execd`](crates/execd/README.md)
-in the image (one 5 MB static binary, v1.1 to v1.4 conformance 32/32 live on
+in the image (one 5 MB static binary, exec conformance 32/32 live on
 AWS Fargate and E2B) and pass `--exec-url`. The recipes are in
 [Run the tools somewhere else](crates/agent/README.md#run-the-tools-somewhere-else).
 

@@ -6,8 +6,6 @@ import base64
 import binascii
 import json
 import re
-import time
-from dataclasses import dataclass
 from typing import Any, Callable, Generic, Sequence, TypeVar
 
 from .errors import AuthError, EndpointError, ProtocolError, SandboxError, TooLarge, TransportError
@@ -41,17 +39,8 @@ SILENCE_S = 30.0
 STREAM_DEADLINE_MS = 2**31 - 1
 #: The longest NDJSON line accepted: a full 64 KiB frame is about 87 KiB of base64.
 MAX_FRAME_LINE = 1024 * 1024
-#: The probe's script (exec v1.2).
-STREAM_PROBE_SCRIPT = "printf a; sleep 0.3 2>/dev/null || sleep 1; printf b"
-#: The ``output_base64`` probe (exec v1.1): the bytes ``ff 00 0a``, which no text round trip keeps.
-OUTPUT_PROBE_SCRIPT = "printf '\\377\\000\\n'"
-OUTPUT_PROBE_BYTES = b"\xff\x00\n"
-#: What a v1.1 endpoint puts at the end of stderr for a command it killed at its deadline.
-TIMEOUT_NOTE = b"command exceeded its timeout"
 #: Room for the JSON around two base64 strings.
 ENVELOPE_SLACK = 4096
-#: The least gap between the first output frame and the final one that counts as incremental.
-PROBE_MIN_GAP_S = 0.1
 
 
 def request_body(
@@ -63,20 +52,17 @@ def request_body(
     stdin: bytes | None = None,
     stream: bool = False,
     job: dict[str, Any] | None = None,
-    output_base64: bool = False,
 ) -> bytes:
     body: dict[str, Any] = {"command": command, "args": list(args)}
     if cwd is not None:
         body["cwd"] = cwd
     body["timeout_ms"] = timeout_ms
     if stdin is not None:
-        body["stdin_base64"] = base64.b64encode(stdin).decode("ascii")
+        body["stdin"] = base64.b64encode(stdin).decode("ascii")
     if stream:
         body["stream"] = True
     if job is not None:
         body["job"] = job
-    if output_base64:
-        body["output_base64"] = True
     return json.dumps(body, separators=(",", ":")).encode("utf-8")
 
 
@@ -112,111 +98,29 @@ def parse_json(url: str, body: bytes) -> Any:
         ) from None
 
 
-def parse_envelope(url: str, body: bytes) -> ExecResult:
-    """A v1.1 answer: ``{"exit_code", "stdout", "stderr"}``."""
-    obj = parse_json(url, body)
-    code = obj.get("exit_code") if isinstance(obj, dict) else None
-    if not isinstance(code, int) or isinstance(code, bool):
-        raise ProtocolError(
-            f"exec endpoint {url} returned unparseable JSON (no exit_code): {excerpt(body)}"
-        )
-    out, err = obj.get("stdout", ""), obj.get("stderr", "")
-    if not isinstance(out, str) or not isinstance(err, str):
-        raise ProtocolError(f"exec endpoint {url} returned unparseable JSON: {excerpt(body)}")
-    return ExecResult(
-        code, out.encode("utf-8", "replace"), err.encode("utf-8", "replace"), exact=False
-    )
-
-
 def body_cap(cap: int) -> int:
-    """The most body a client reads for an ``output_base64`` answer under response cap ``cap``: the
-    base64 of ``cap`` decoded bytes plus the envelope. The cap itself is on the decoded bytes."""
+    """The most body a client reads for a one-shot answer under response cap ``cap``: the base64 of
+    ``cap`` decoded bytes plus the envelope. The cap itself is on the decoded bytes."""
     return -(-cap // 3) * 4 + ENVELOPE_SLACK
 
 
-def _standard_b64(field: str, value: Any) -> bytes:
-    if not isinstance(value, str):
-        raise ProtocolError(f"`{field}` is not standard base64")
-    try:
-        return base64.b64decode(value, validate=True)
-    except (binascii.Error, ValueError):
-        raise ProtocolError(f"`{field}` is not standard base64") from None
-
-
-def probe_honoured(obj: Any) -> bool:
-    """Whether a probe's answer shows ``output_base64`` honoured: ``stdout_base64`` decoding to
-    exactly ``ff 00 0a``."""
-    if not isinstance(obj, dict) or not isinstance(obj.get("stdout_base64"), str):
-        return False
-    try:
-        return base64.b64decode(obj["stdout_base64"], validate=True) == OUTPUT_PROBE_BYTES
-    except (binascii.Error, ValueError):
-        return False
-
-
-def decode_output(url: str, body: bytes, cap: int) -> ExecResult:
-    """An ``output_base64`` answer. Both ``stdout_base64`` and ``stderr_base64``: the bytes, exact
-    (text fields beside them are ignored). Neither: the endpoint did not honour the field this time
-    (one replica of a fleet in rollout), so it is a text answer and says so. One without the other
-    is malformed, and an error: reading the missing stream as empty would lose output without a
-    word. The cap is on the decoded bytes of both streams together."""
+def parse_envelope(url: str, body: bytes, cap: int) -> ExecResult:
+    """A one-shot answer: ``{"exit_code", "stdout", "stderr"}``, both streams standard base64. The
+    cap is on the decoded bytes of both together."""
     obj = parse_json(url, body)
     code = obj.get("exit_code") if isinstance(obj, dict) else None
     if not isinstance(code, int) or isinstance(code, bool):
         raise ProtocolError(
             f"exec endpoint {url} returned unparseable JSON (no exit_code): {excerpt(body)}"
         )
-    has_out, has_err = "stdout_base64" in obj, "stderr_base64" in obj
-    if not has_out and not has_err:
-        return parse_envelope(url, body)
-    if has_out != has_err:
-        raise ProtocolError(
-            f"exec endpoint {url}: the answer has only one of `stdout_base64` and `stderr_base64`"
-        )
-    out = _standard_b64("stdout_base64", obj["stdout_base64"])
-    err = _standard_b64("stderr_base64", obj["stderr_base64"])
+    out = _b64("stdout", obj.get("stdout"))
+    err = _b64("stderr", obj.get("stderr"))
     if len(out) + len(err) > cap:
         raise too_large(url, cap)
-    return ExecResult(code, out, err, exact=True)
+    return ExecResult(code, out, err)
 
 
-class OneShot:
-    """Frames of a one-shot call made over a v1.2 stream, folded into the v1.1 shape of its result.
-
-    A one-shot call is answered when the command exits, so ``shell_exit`` ends it too: what the
-    command left running is not its business (closing the stream has the endpoint kill it)."""
-
-    def __init__(self) -> None:
-        self.stdout = bytearray()
-        self.stderr = bytearray()
-
-    @property
-    def size(self) -> int:
-        return len(self.stdout) + len(self.stderr)
-
-    def feed(self, frame: Frame) -> ExecResult | None:
-        """The finished result at the frame that ends the call, ``None`` before it."""
-        if isinstance(frame, Stdout):
-            self.stdout += frame.data
-            return None
-        if isinstance(frame, Stderr):
-            self.stderr += frame.data
-            return None
-        if isinstance(frame, (ShellExit, Exit)):
-            code = frame.code
-        elif isinstance(frame, Signal):
-            code = 128 + frame.signal
-        elif isinstance(frame, TimedOut):
-            code = 124
-            if self.stderr and not self.stderr.endswith(b"\n"):
-                self.stderr += b"\n"
-            self.stderr += TIMEOUT_NOTE
-        else:
-            return None
-        return ExecResult(code, bytes(self.stdout), bytes(self.stderr), exact=True)
-
-
-# ---- v1.2 frames ---------------------------------------------------------------------------------
+# ---- stream frames ---------------------------------------------------------------------------------
 
 
 def _b64(field: str, value: Any) -> bytes:
@@ -287,21 +191,7 @@ class LineSplitter:
         return bool(self._buf)
 
 
-# ---- v1.3 jobs -----------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class JobOffer:
-    native: bool = False
-    notify: bool = False
-
-
-def parse_offer(answer: Any) -> JobOffer:
-    """Only the spec's exact answers offer anything (FILES-OVER-EXEC.md / exec v1.3, N2)."""
-    if not isinstance(answer, dict):
-        return JobOffer()
-    native = answer.get("jobs") == "v1.3"
-    return JobOffer(native, native and answer.get("notify") == "v1.4")
+# ---- jobs -----------------------------------------------------------------------------------
 
 
 def job_op(op: str, scope: str, **extra: Any) -> dict[str, Any]:
@@ -457,32 +347,3 @@ def frame_decoder() -> StreamDecoder[Frame]:
 
 def job_decoder() -> StreamDecoder[JobFrame]:
     return StreamDecoder(decode_job_line, lambda f: isinstance(f, JobEnd))
-
-
-class ProbeObserver:
-    """Judges the v1.2 probe: incremental delivery of ``a`` then ``b``, then exit 0."""
-
-    def __init__(self) -> None:
-        self.stdout = bytearray()
-        self.output_frames = 0
-        self.first: float | None = None
-        self.gap = 0.0
-        self.end: Frame | None = None
-
-    def see(self, frame: Frame) -> None:
-        if isinstance(frame, (Stdout, Stderr)):
-            self.first = self.first if self.first is not None else time.monotonic()
-            self.output_frames += 1
-            if isinstance(frame, Stdout):
-                self.stdout += frame.data
-        elif isinstance(frame, (Exit, Signal, TimedOut)):
-            self.end = frame
-            self.gap = time.monotonic() - self.first if self.first is not None else 0.0
-
-    def streams(self) -> bool:
-        return (
-            self.output_frames >= 2
-            and bytes(self.stdout) == b"ab"
-            and self.end == Exit(0)
-            and self.gap >= PROBE_MIN_GAP_S
-        )

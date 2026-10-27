@@ -1,0 +1,181 @@
+{
+  "spec": "exec protocol one-shot answer (crates/sandbox/src/exec_endpoint.rs, \"Bytes\")",
+  "notes": [
+    "answers are 200 bodies to a one-shot request. stdout and stderr are always standard base64 with padding (RFC 4648 section 4), the empty string for no output; expect.stdout_base64 / stderr_base64 are the bytes a conforming client returns.",
+    "expect.invalid means a conforming client MUST report an error: a missing field, or a value that is not standard base64, is never read as empty output.",
+    "Unknown fields are ignored."
+  ],
+  "answers": [
+    {
+      "name": "empty output",
+      "answer": {
+        "exit_code": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expect": {
+        "exit_code": 0,
+        "stdout_base64": "",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "name": "text",
+      "answer": {
+        "exit_code": 0,
+        "stdout": "aGkK",
+        "stderr": ""
+      },
+      "expect": {
+        "exit_code": 0,
+        "stdout_base64": "aGkK",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "name": "both streams and an exit code",
+      "answer": {
+        "exit_code": 3,
+        "stdout": "/wAB",
+        "stderr": "/gAC"
+      },
+      "expect": {
+        "exit_code": 3,
+        "stdout_base64": "/wAB",
+        "stderr_base64": "/gAC"
+      }
+    },
+    {
+      "name": "every byte value on stdout",
+      "answer": {
+        "exit_code": 0,
+        "stdout": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==",
+        "stderr": ""
+      },
+      "expect": {
+        "exit_code": 0,
+        "stdout_base64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "name": "every byte value on stderr",
+      "answer": {
+        "exit_code": 0,
+        "stdout": "",
+        "stderr": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w=="
+      },
+      "expect": {
+        "exit_code": 0,
+        "stdout_base64": "",
+        "stderr_base64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w=="
+      }
+    },
+    {
+      "name": "a signal is 128 plus the number",
+      "answer": {
+        "exit_code": 137,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expect": {
+        "exit_code": 137,
+        "stdout_base64": "",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "name": "a deadline is 124 with the note ending stderr",
+      "answer": {
+        "exit_code": 124,
+        "stdout": "cGFydGlhbA==",
+        "stderr": "b29wcwpjb21tYW5kIGV4Y2VlZGVkIGl0cyB0aW1lb3V0"
+      },
+      "expect": {
+        "exit_code": 124,
+        "stdout_base64": "cGFydGlhbA==",
+        "stderr_base64": "b29wcwpjb21tYW5kIGV4Y2VlZGVkIGl0cyB0aW1lb3V0"
+      }
+    },
+    {
+      "name": "a command that could not be started is 127 with the reason as stderr",
+      "answer": {
+        "exit_code": 127,
+        "stdout": "",
+        "stderr": "Tm8gc3VjaCBmaWxlIG9yIGRpcmVjdG9yeQ=="
+      },
+      "expect": {
+        "exit_code": 127,
+        "stdout_base64": "",
+        "stderr_base64": "Tm8gc3VjaCBmaWxlIG9yIGRpcmVjdG9yeQ=="
+      }
+    },
+    {
+      "name": "a field this client does not know is ignored",
+      "answer": {
+        "exit_code": 0,
+        "stdout": "eA==",
+        "stderr": "",
+        "seq": 1
+      },
+      "expect": {
+        "exit_code": 0,
+        "stdout_base64": "eA==",
+        "stderr_base64": ""
+      }
+    },
+    {
+      "name": "unpadded base64 is not standard base64",
+      "answer": {
+        "exit_code": 0,
+        "stdout": "/wA",
+        "stderr": ""
+      },
+      "expect": {
+        "invalid": true
+      }
+    },
+    {
+      "name": "URL-safe base64 is not standard base64",
+      "answer": {
+        "exit_code": 0,
+        "stdout": "_-8=",
+        "stderr": ""
+      },
+      "expect": {
+        "invalid": true
+      }
+    },
+    {
+      "name": "text is not base64",
+      "answer": {
+        "exit_code": 0,
+        "stdout": "hello!",
+        "stderr": ""
+      },
+      "expect": {
+        "invalid": true
+      }
+    },
+    {
+      "name": "no stdout",
+      "answer": {
+        "exit_code": 0,
+        "stderr": ""
+      },
+      "expect": {
+        "invalid": true
+      }
+    },
+    {
+      "name": "no stderr",
+      "answer": {
+        "exit_code": 0,
+        "stdout": ""
+      },
+      "expect": {
+        "invalid": true
+      }
+    }
+  ]
+}

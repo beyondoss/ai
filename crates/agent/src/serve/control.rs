@@ -107,7 +107,7 @@ impl SessionLoop {
                     .await
                     .unwrap_or_default()
             };
-            // v1.4's state of the old transcript's jobs goes with them; a reconcile that began on
+            // notify's state of the old transcript's jobs goes with them; a reconcile that began on
             // it hands nothing over.
             if let Some(n) = &self.job_notify {
                 n.feed(crate::tools::job_notify::kernel::Event::TranscriptSwitched);

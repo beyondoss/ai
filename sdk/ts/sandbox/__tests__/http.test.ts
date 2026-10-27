@@ -35,7 +35,6 @@ describe("HttpTransport.run", () => {
       cwd: "/w",
       timeoutMs: 5000,
       stdin: utf8("in"),
-      text: true,
     });
     expect(r.exitCode).toBe(3);
     expect(text(r.stdout)).toBe("héllo");
@@ -48,13 +47,13 @@ describe("HttpTransport.run", () => {
       args: ["a", "b"],
       cwd: "/w",
       timeout_ms: 5000,
-      stdin_base64: "aW4=",
+      stdin: "aW4=",
     });
   });
 
   it("sends no Authorization without a token, and no cwd or stdin unless given", async () => {
     const e = await endpoint((_, res) => json(res, 200, ok()));
-    await new HttpTransport({ url: e.url }).run("true", [], { text: true });
+    await new HttpTransport({ url: e.url }).run("true", []);
     expect(e.requests[0]!.headers.authorization).toBeUndefined();
     expect(e.requests[0]!.body).toEqual({
       command: "true",
@@ -74,14 +73,14 @@ describe("HttpTransport.run", () => {
       url: e.url,
       token: async () => `t${++calls}`,
     });
-    expect(text((await t.run("x", [], { text: true })).stdout)).toBe("fine");
+    expect(text((await t.run("x", [])).stdout)).toBe("fine");
     expect(calls).toBe(2);
     expect(e.requests.map((r) => r.headers.authorization)).toEqual([
       "Bearer t1",
       "Bearer t2",
     ]);
     // The refreshed token is kept: no second refresh for the next request.
-    await t.run("x", [], { text: true });
+    await t.run("x", []);
     expect(calls).toBe(2);
   });
 
@@ -146,7 +145,17 @@ describe("HttpTransport.run", () => {
   });
 
   it("answers protocol for a 200 that is not the envelope", async () => {
-    for (const body of ["<html>", "[]", "{\"stdout\":\"x\"}", "null"]) {
+    for (
+      const body of [
+        "<html>",
+        "[]",
+        "{\"stdout\":\"x\"}",
+        "null",
+        "{\"exit_code\":0}",
+        "{\"exit_code\":0,\"stdout\":\"***\",\"stderr\":\"\"}",
+        "{\"exit_code\":0,\"stdout\":\"\"}",
+      ]
+    ) {
       const f = await endpoint((_, res) => {
         res.writeHead(200);
         res.end(body);
@@ -169,7 +178,7 @@ describe("HttpTransport.run", () => {
       /* never answers */
     });
     const t = new HttpTransport({ url: e.url, deadlineGraceMs: 50 });
-    expect(await kindOf(t.run("x", [], { timeoutMs: 50, text: true }))).toBe(
+    expect(await kindOf(t.run("x", [], { timeoutMs: 50 }))).toBe(
       "timeout",
     );
   });
@@ -208,102 +217,65 @@ describe("HttpTransport.run", () => {
   });
 });
 
-describe("probes", () => {
-  it("a v1.1 endpoint offers neither stream nor jobs, and stream() is not_offered without running the command", async () => {
-    const e = await endpoint((seen, res) =>
-      json(res, 200, ok(seen.body.job ? "exec-v1.2" : "a"))
+describe("HttpTransport.run bytes", () => {
+  it("returns the exact bytes of both streams, however they look as text", async () => {
+    const stdout = Uint8Array.of(0xff, 0x00, 0x0a, 0xc3);
+    const stderr = Uint8Array.of(0xfe);
+    const e = await endpoint((_, res) => json(res, 200, ok(stdout, 0, stderr)));
+    const r = await new HttpTransport({ url: e.url }).run("x", []);
+    expect(Array.from(r.stdout)).toEqual(Array.from(stdout));
+    expect(Array.from(r.stderr)).toEqual(Array.from(stderr));
+    expect(Object.keys(r).sort()).toEqual(["exitCode", "stderr", "stdout"]);
+  });
+
+  it("reads no output as empty strings", async () => {
+    const e = await endpoint((_, res) => json(res, 200, ok()));
+    const r = await new HttpTransport({ url: e.url }).run("true", []);
+    expect(r.stdout).toHaveLength(0);
+    expect(r.stderr).toHaveLength(0);
+  });
+
+  it("counts the cap on decoded bytes of both streams together", async () => {
+    const e = await endpoint((_, res) =>
+      json(res, 200, ok(new Uint8Array(60), 0, new Uint8Array(50)))
     );
-    const t = new HttpTransport({ url: e.url });
-    expect(await t.offers()).toEqual({
-      stream: false,
-      nativeJobs: false,
-      outputBase64: false,
-    });
-    const before = e.requests.length;
-    const it = t.stream("echo", ["hi"]);
-    expect(await kindOf(it.next())).toBe("not_offered");
-    expect(e.requests.length).toBe(before);
+    const at = (n: number) =>
+      new HttpTransport({ url: e.url, maxResponseBytes: n }).run("x", []);
+    expect((await at(110)).stdout).toHaveLength(60);
+    expect(await kindOf(at(109))).toBe("too_large");
   });
 
-  it("a front that refuses the extensions with 400 has answered: no offers, and it is cached", async () => {
-    const e = await endpoint((_, res) => {
-      res.writeHead(400);
-      res.end("unknown field");
-    });
-    const t = new HttpTransport({ url: e.url });
-    expect(await t.offers()).toEqual({
-      stream: false,
-      nativeJobs: false,
-      outputBase64: false,
-    });
-    const n = e.requests.length;
-    await t.offers();
-    expect(e.requests.length).toBe(n);
-  });
-
-  it("a probe that could not reach the endpoint throws and is retried next time", async () => {
-    const f = await fakeEndpoint(() => {});
-    await f.close();
-    const t = new HttpTransport({ url: f.url });
-    expect(await kindOf(t.offers())).toBe("transport");
-    const g = await endpoint((seen, res) =>
-      json(res, 200, ok(seen.body.job ? "exec-v1.2" : ""))
+  it("is a protocol error when an output field is not standard base64, never empty", async () => {
+    const e = await endpoint((_, res) =>
+      json(res, 200, { exit_code: 0, stdout: "***", stderr: "" })
     );
-    const t2 = new HttpTransport({ url: g.url });
-    expect((await t2.offers()).nativeJobs).toBe(false);
+    await expect(new HttpTransport({ url: e.url }).run("x", [])).rejects
+      .toMatchObject({
+        kind: "protocol",
+        detail: expect.stringContaining("base64"),
+      });
   });
 
-  it("native jobs are offered only for exactly {jobs: v1.3}", async () => {
-    for (
-      const [answer, want] of [
-        [{ jobs: "v1.3" }, true],
-        [{ jobs: "v1.3", notify: "v1.4" }, true],
-        [{ jobs: "v1.4" }, false],
-        [{ jobs: true }, false],
-        [{ notify: "v1.4" }, false],
-        [{ exit_code: 0, stdout: "exec-v1.2", stderr: "" }, false],
-      ] as const
-    ) {
-      const e = await endpoint((seen, res) =>
-        seen.body.job ? json(res, 200, answer) : json(res, 200, ok(""))
-      );
-      expect(
-        (await new HttpTransport({ url: e.url }).offers()).nativeJobs,
-        JSON.stringify(answer),
-      ).toBe(want);
-    }
+  it("never sends the removed request fields", async () => {
+    const e = await endpoint((_, res) => json(res, 200, ok()));
+    await new HttpTransport({ url: e.url }).run("x", [], { stdin: utf8("i") });
+    expect(Object.keys(e.requests[0]!.body).sort()).toEqual([
+      "args",
+      "command",
+      "stdin",
+      "timeout_ms",
+    ]);
   });
 });
 
 const b64 = (s: string) => Buffer.from(s).toString("base64");
 
-/** An endpoint that streams: answers the probe like execd does, then runs `script` for a real stream. */
+/** An endpoint that streams: answers every stream request by running `script`. */
 async function streamingEndpoint(
   script: (res: import("node:http").ServerResponse) => void,
 ) {
-  return endpoint((seen, res, req) => {
-    if (seen.body.output_base64) {
-      json(res, 200, ok(""));
-      return;
-    }
-    const probe = Array.isArray(seen.body.args)
-      && String(seen.body.args[1]).startsWith("printf a;");
-    if (seen.body.job) {
-      json(res, 200, {});
-      return;
-    }
+  return endpoint((_seen, res, req) => {
     res.writeHead(200, { "content-type": "application/x-ndjson" });
-    if (probe) {
-      res.write(JSON.stringify({ stdout: b64("a") }) + "\n");
-      setTimeout(
-        () =>
-          res.end(
-            JSON.stringify({ stdout: b64("b") }) + "\n" + "{\"exit_code\":0}\n",
-          ),
-        200,
-      );
-      return;
-    }
     req.on("close", () => closed.push(Date.now()));
     script(res);
   });
@@ -311,7 +283,7 @@ async function streamingEndpoint(
 const closed: number[] = [];
 
 describe("HttpTransport.stream", () => {
-  it("proves streaming with the spec's probe, then yields frames in order", async () => {
+  it("yields frames in order", async () => {
     const e = await streamingEndpoint((res) => {
       res.write(JSON.stringify({ stdout: b64("out") }) + "\n");
       res.write("{}\n");
@@ -330,30 +302,18 @@ describe("HttpTransport.stream", () => {
       "shell_exit",
       "exit",
     ]);
-    expect((await t.offers()).stream).toBe(true);
-    const req = e.requests.find((r) =>
-      r.body.stream && !String(r.body.args).includes("printf a")
-    )!;
-    expect(req.body.stream).toBe(true);
+    expect(e.requests).toHaveLength(1);
+    expect(e.requests[0]!.body.stream).toBe(true);
   });
 
-  it("refuses an endpoint that buffers: all frames at once is not streaming", async () => {
-    const e = await endpoint((seen, res) => {
-      if (seen.body.job || seen.body.output_base64) {
-        return json(res, 200, ok(""));
+  it("is a protocol error when the endpoint answers a stream request with one object", async () => {
+    const e = await endpoint((_, res) => json(res, 200, ok("x")));
+    const run = async () => {
+      for await (const f of new HttpTransport({ url: e.url }).stream("x", [])) {
+        void f;
       }
-      res.writeHead(200, { "content-type": "application/x-ndjson" });
-      res.end(
-        JSON.stringify({ stdout: b64("a") })
-          + "\n"
-          + JSON.stringify({ stdout: b64("b") })
-          + "\n"
-          + "{\"exit_code\":0}\n",
-      );
-    });
-    expect((await new HttpTransport({ url: e.url }).offers()).stream).toBe(
-      false,
-    );
+    };
+    expect(await kindOf(run())).toBe("protocol");
   });
 
   it("closes the connection when the consumer stops", async () => {

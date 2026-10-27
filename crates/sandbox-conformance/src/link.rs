@@ -24,6 +24,7 @@ struct Io {
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,
     _child: Child,
+    _leader: Option<crate::reaper::Leader>,
 }
 
 pub struct ProcessLink {
@@ -41,7 +42,8 @@ impl ProcessLink {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(stderr.try_clone()?))
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            .process_group(0);
         for (k, v) in env {
             match v {
                 Some(v) => c.env(k, v),
@@ -55,6 +57,7 @@ impl ProcessLink {
             io: Mutex::new(Some(Io {
                 stdin,
                 stdout,
+                _leader: crate::reaper::Leader::new(&child),
                 _child: child,
             })),
             stderr,
@@ -128,7 +131,6 @@ pub struct ProcessConnector {
     pub cmd: String,
     pub url: String,
     pub bearer: Option<String>,
-    pub jobs_root: String,
     pub caps: Option<Value>,
 }
 
@@ -143,10 +145,6 @@ impl Connector for ProcessConnector {
         env.insert(
             "CONFORMANCE_BEARER".to_string(),
             bearer.unwrap_or_else(|| self.bearer.clone()),
-        );
-        env.insert(
-            "CONFORMANCE_JOBS_ROOT".to_string(),
-            Some(self.jobs_root.clone()),
         );
         env.insert(
             "CONFORMANCE_CAPS".to_string(),

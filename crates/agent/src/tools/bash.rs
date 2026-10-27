@@ -461,7 +461,7 @@ impl Bash {
             if sandbox.is_none() && !self.runner.tracks_jobs().await {
                 return Err(ToolError::InvalidInput(
                     "`run_in_background` is unavailable here: this sandbox's exec endpoint (protocol \
-                     v1.1) cannot stream a command's output or stop it, so nothing can keep running \
+                     one-shot) cannot stream a command's output or stop it, so nothing can keep running \
                      past the call. Run the command without it; the call then waits for the command \
                      to exit."
                         .into(),
@@ -600,7 +600,7 @@ impl Bash {
         };
         let started = job.started;
         let result = self.attach(job, progress, hold).await;
-        // A runner that streams nothing (an exec endpoint on protocol v1.1) cannot hand control
+        // A runner that streams nothing (an exec endpoint on protocol one-shot) cannot hand control
         // back before the command exits; a `timeout_ms` it outlived must not look honored.
         match timeout_unheard(&shared, &start, started) {
             Some(note) => match result {
@@ -742,8 +742,8 @@ impl Bash {
     /// hung commands" in `ARCHITECTURE.md`.
     ///
     /// `None` (never yield) when the command runs somewhere this host sees no output from as it
-    /// happens: a v1.1 request/response exec endpoint streams nothing, so its silence says nothing
-    /// about the command. A remote runner whose output is live (exec protocol v1.2, a template
+    /// happens: a one-shot request/response exec endpoint streams nothing, so its silence says nothing
+    /// about the command. A remote runner whose output is live (exec protocol streaming, a template
     /// transport) says so by reporting a [`Kill`], and from then on yields exactly as local does.
     fn idle_window(&self, job: &Job) -> Option<Duration> {
         if job.shared.remote && !job.shared.live.load(std::sync::atomic::Ordering::Relaxed) {
@@ -965,12 +965,12 @@ impl Bash {
             // A non-streaming runner (a test double, a remote endpoint) delivered nothing through the
             // sink; its captured output is the whole story.
             if !out.streamed {
-                out.acc.append(result.stdout.as_bytes());
+                out.acc.append(&result.stdout);
                 if !result.stderr.is_empty() {
                     if !result.stdout.is_empty() {
                         out.acc.append(b"\n");
                     }
-                    out.acc.append(result.stderr.as_bytes());
+                    out.acc.append(&result.stderr);
                 }
             }
             out.acc.finish();
@@ -1037,7 +1037,7 @@ impl Bash {
                  survive a restart of the agent)"
             )));
         };
-        // exec v1.4: the call has the job now; an unheld one is read in and followed for it.
+        // exec notify: the call has the job now; an unheld one is read in and followed for it.
         super::bash_sandbox::taken(&job.shared).await;
         let shared = job.shared.clone();
         if input.get("kill").and_then(Value::as_bool) != Some(true) || job.shared.ended() {
@@ -1131,7 +1131,7 @@ enum Yield {
 const INTENDED_JOBS: &str = "jobs started in the background or left running by a command";
 
 /// The note for a foreground call whose `timeout_ms` passed while a runner that streams nothing (an
-/// exec endpoint on protocol v1.1) held it until the command exited — see [`Bash::idle_window`].
+/// exec endpoint on protocol one-shot) held it until the command exited — see [`Bash::idle_window`].
 fn timeout_unheard(shared: &JobShared, start: &Start, started: Instant) -> Option<String> {
     let Start::Foreground(Some(ms)) = *start else {
         return None;
@@ -1722,7 +1722,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_ms_never_reaches_the_runner_as_a_kill_deadline() {
         // `timeout_ms` only decides when the call returns. A runner that cannot track a job (no
-        // live output, no kill: here a test double, in production a v1.1 exec endpoint) gets the
+        // live output, no kill: here a test double, in production a one-shot exec endpoint) gets the
         // one internal deadline that ends a hung command, whatever the model asked for.
         for input in [
             json!({ "command": "echo hi" }),
@@ -1780,12 +1780,12 @@ mod tests {
             desc.contains("after its `timeout_ms` returns early"),
             "{desc}"
         );
-        // Over v1.1 a background job is the sandbox's (it starts kept and is polled); only a
+        // Over one-shot a background job is the sandbox's (it starts kept and is polled); only a
         // foreground call still has to wait for its command.
         assert!(
             desc.contains("a call waits for its command to exit")
                 && !desc.contains("`run_in_background` is unavailable"),
-            "the v1.1 exception: {desc}"
+            "the one-shot exception: {desc}"
         );
         assert!(
             desc.contains(&DEFAULT_MAX_LINES.to_string())
@@ -2058,7 +2058,7 @@ mod tests {
             .join("\n");
         let runner = recording(ExecResult {
             code: Some(0),
-            stdout: body,
+            stdout: body.into(),
             ..Default::default()
         });
         let out = Bash::with_runner(runner)
@@ -2107,7 +2107,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let runner = recording(ExecResult {
-            stdout: body.clone(),
+            stdout: body.clone().into(),
             timed_out: true,
             ..Default::default()
         });
@@ -2439,8 +2439,8 @@ mod tests {
         // interrupted one.
         let runner = recording(ExecResult {
             timed_out: true,
-            stdout: String::new(),
-            stderr: String::new(),
+            stdout: String::new().into(),
+            stderr: String::new().into(),
             ..Default::default()
         });
         let err = Bash::with_runner(runner)
@@ -2476,8 +2476,8 @@ mod tests {
             Ok(ExecResult {
                 code: Some(0),
                 signal: None,
-                stdout: String::new(),
-                stderr: String::new(),
+                stdout: String::new().into(),
+                stderr: String::new().into(),
                 timed_out: false,
                 truncated: false,
             })

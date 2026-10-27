@@ -80,8 +80,8 @@ impl CommandRunner for Recorder {
         Ok(ExecResult {
             code: Some(0),
             signal: None,
-            stdout: self.stdout.clone(),
-            stderr: String::new(),
+            stdout: self.stdout.clone().into(),
+            stderr: String::new().into(),
             timed_out: false,
             truncated: false,
         })

@@ -60,7 +60,6 @@ async fn the_hook_answers_an_unknown_op_and_only_that() {
     assert_eq!(a.status, 400);
     // Known ops never reach it.
     for op in [
-        json!({ "op": "probe" }),
         json!({ "op": "list", "scope": "s" }),
         json!({ "op": "read", "scope": "s", "id": "x", "offset": 0, "max": 1 }),
         json!({ "op": "start", "scope": "s", "id": "k", "hold": false, "label": "" }),

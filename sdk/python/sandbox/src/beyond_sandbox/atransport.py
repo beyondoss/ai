@@ -23,23 +23,15 @@ from typing import (
 )
 
 from . import _http, _wire
-from .errors import (
-    EndpointError,
-    NotOffered,
-    ProtocolError,
-    SandboxError,
-    Timeout,
-    TooLarge,
-    TransportError,
-)
-from .models import ExecResult, Exit, Frame, JobFrame, Stderr, Stdout
+from .errors import ProtocolError, SandboxError, Timeout, TooLarge, TransportError
+from .models import ExecResult, Frame, JobFrame
 from .transport import DEFAULT_TIMEOUT_MS
 
 AsyncToken = Union[str, Callable[[], Union[str, Awaitable[str]]], None]
 
 
 class AsyncFrameStream(Protocol):
-    """An async iterator of v1.2 frames. ``aclose()`` ends it early; closing kills the command."""
+    """An async iterator of stream frames. ``aclose()`` ends it early; closing kills the command."""
 
     def __aiter__(self) -> AsyncIterator[Frame]: ...
     async def __anext__(self) -> Frame: ...
@@ -73,15 +65,13 @@ class AsyncTransport(Protocol):
         cwd: str | None = None,
         timeout_ms: int | None = None,
     ) -> AsyncFrameStream:
-        """As :meth:`Transport.stream`: raises ``NotOffered`` if the endpoint cannot stream."""
+        """As :meth:`Transport.stream`."""
         ...
 
 
 @runtime_checkable
 class AsyncJobTransport(AsyncTransport, Protocol):
-    """Optional: native sandbox jobs (v1.3)."""
-
-    async def job_offer(self) -> _wire.JobOffer: ...
+    """A transport that also keeps jobs in the sandbox."""
 
     async def job_call(
         self,
@@ -165,11 +155,9 @@ class _Response:
 
 
 class _Frames:
-    def __init__(
-        self, resp: _Response, decoder: _wire.StreamDecoder[Any], first: list[Any]
-    ) -> None:
+    def __init__(self, resp: _Response, decoder: _wire.StreamDecoder[Any]) -> None:
         self._resp, self._decoder = resp, decoder
-        self._pending: deque[Any] = deque(first)
+        self._pending: deque[Any] = deque()
         self._closed = False
 
     def __aiter__(self) -> _Frames:
@@ -203,23 +191,6 @@ class _Frames:
         await self.aclose()
 
 
-class _Prebuilt:
-    def __init__(self, frames: list[Frame]) -> None:
-        self._it = iter(frames)
-
-    def __aiter__(self) -> _Prebuilt:
-        return self
-
-    async def __anext__(self) -> Frame:
-        try:
-            return next(self._it)
-        except StopIteration:
-            raise StopAsyncIteration from None
-
-    async def aclose(self) -> None:
-        self._it = iter(())
-
-
 class AsyncHttpTransport:
     """The exec protocol over HTTP, on asyncio alone. See :class:`~beyond_sandbox.HttpTransport`.
 
@@ -243,9 +214,6 @@ class AsyncHttpTransport:
         self._cap = max_response_bytes
         self._ssl = ssl_context
         self._lock = asyncio.Lock()
-        self._streams: bool | None = None
-        self._output: bool | None = None
-        self._offer: _wire.JobOffer | None = None
 
     async def _bearer(self, refresh: bool) -> list[tuple[str, str]]:
         async with self._lock:
@@ -316,107 +284,10 @@ class AsyncHttpTransport:
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
         stdin: bytes | None = None,
     ) -> ExecResult:
-        """As :meth:`HttpTransport.run`: the command's bytes, ``exact`` or said not to be."""
-        if await self.outputs_base64():
-            body = _wire.request_body(
-                command, args, cwd=cwd, timeout_ms=timeout_ms, stdin=stdin, output_base64=True
-            )
-            raw = await self._post(body, timeout_ms, _wire.body_cap(self._cap))
-            return _wire.decode_output(self.url, raw, self._cap)
-        if stdin is None and await self.streams():
-            return await self._run_over_stream(command, args, cwd, timeout_ms)
-        return await self.run_text(command, args, cwd=cwd, timeout_ms=timeout_ms, stdin=stdin)
-
-    async def run_text(
-        self,
-        command: str,
-        args: Sequence[str] = (),
-        *,
-        cwd: str | None = None,
-        timeout_ms: int = DEFAULT_TIMEOUT_MS,
-        stdin: bytes | None = None,
-    ) -> ExecResult:
-        """:meth:`run` the plain v1.1 way (``exact=False``), for the helpers."""
+        """As :meth:`HttpTransport.run`: the command's bytes."""
         body = _wire.request_body(command, args, cwd=cwd, timeout_ms=timeout_ms, stdin=stdin)
-        return _wire.parse_envelope(self.url, await self._post(body, timeout_ms))
-
-    async def outputs_base64(self) -> bool:
-        """As :meth:`HttpTransport.outputs_base64`."""
-        if self._output is None:
-            body = _wire.request_body(
-                "sh",
-                ["-c", _wire.OUTPUT_PROBE_SCRIPT],
-                cwd=None,
-                timeout_ms=10_000,
-                output_base64=True,
-            )
-            try:
-                raw = await self._post(body, 10_000, _wire.body_cap(len(_wire.OUTPUT_PROBE_BYTES)))
-            except EndpointError as e:
-                if e.status != 400:
-                    raise
-                self._output = False
-                return False
-            obj = _wire.parse_json(self.url, raw)
-            if not isinstance(obj, dict) or not isinstance(obj.get("exit_code"), int):
-                raise ProtocolError(
-                    f"exec endpoint {self.url} returned unparseable JSON (no exit_code)"
-                )
-            self._output = _wire.probe_honoured(obj)
-        return self._output
-
-    async def _run_over_stream(
-        self, command: str, args: Sequence[str], cwd: str | None, timeout_ms: int
-    ) -> ExecResult:
-        body = _wire.request_body(command, args, cwd=cwd, timeout_ms=timeout_ms, stream=True)
-        resp = await self._open(body, timeout_ms)
-        try:
-            if not resp.headers.get("content-type", "").lower().startswith("application/x-ndjson"):
-                return _wire.parse_envelope(self.url, await resp.read_capped(self._cap))
-            decoder, fold = _wire.frame_decoder(), _wire.OneShot()
-            while True:
-                data = await resp.next_chunk(_wire.SILENCE_S)
-                if not data:
-                    decoder.eof()
-                for frame in decoder.feed(data):
-                    done = fold.feed(frame)
-                    if done is not None:
-                        return done
-                    if fold.size > self._cap:
-                        raise _wire.too_large(self.url, self._cap)
-        finally:
-            await resp.close()
-
-    async def streams(self) -> bool:
-        if self._streams is None:
-            self._streams = await self._probe_streams()
-        return self._streams
-
-    async def _probe_streams(self) -> bool:
-        body = _wire.request_body(
-            "sh", ["-c", _wire.STREAM_PROBE_SCRIPT], cwd=None, timeout_ms=10_000, stream=True
-        )
-        try:
-            resp = await self._open(body, 10_000)
-        except EndpointError as e:
-            if e.status in (400, 422):
-                return False
-            raise
-        try:
-            if not resp.headers.get("content-type", "").lower().startswith("application/x-ndjson"):
-                return False
-            decoder, seen = _wire.frame_decoder(), _wire.ProbeObserver()
-            while not decoder.finished:
-                data = await resp.next_chunk(_wire.SILENCE_S)
-                if not data:
-                    return False
-                for frame in decoder.feed(data):
-                    seen.see(frame)
-            return seen.streams()
-        except ProtocolError:
-            return False
-        finally:
-            await resp.close()
+        raw = await self._post(body, timeout_ms, _wire.body_cap(self._cap))
+        return _wire.parse_envelope(self.url, raw, self._cap)
 
     async def stream(
         self,
@@ -426,40 +297,9 @@ class AsyncHttpTransport:
         cwd: str | None = None,
         timeout_ms: int | None = None,
     ) -> AsyncFrameStream:
-        if not await self.streams():
-            raise NotOffered("this exec endpoint does not stream (protocol v1.1)")
         ms = _wire.STREAM_DEADLINE_MS if timeout_ms is None else timeout_ms
         body = _wire.request_body(command, args, cwd=cwd, timeout_ms=ms, stream=True)
-        resp = await self._open(body, ms)
-        if resp.headers.get("content-type", "").lower().startswith("application/x-ndjson"):
-            return _Frames(resp, _wire.frame_decoder(), [])
-        try:
-            result = _wire.parse_envelope(self.url, await resp.read_capped(self._cap))
-        finally:
-            await resp.close()
-        frames: list[Frame] = []
-        if result.stdout:
-            frames.append(Stdout(result.stdout))
-        if result.stderr:
-            frames.append(Stderr(result.stderr))
-        frames.append(Exit(result.exit_code))
-        return _Prebuilt(frames)
-
-    async def job_offer(self) -> _wire.JobOffer:
-        if self._offer is None:
-            body = _wire.request_body(
-                "sh", ["-c", "printf exec-v1.2"], cwd=None, timeout_ms=10_000, job={"op": "probe"}
-            )
-            try:
-                answer = _wire.parse_json(self.url, await self._post(body, 10_000))
-                self._offer = _wire.parse_offer(answer)
-            except EndpointError as e:
-                if e.status != 400:
-                    raise
-                self._offer = _wire.JobOffer()
-            except ProtocolError:
-                self._offer = _wire.JobOffer()
-        return self._offer
+        return _Frames(await self._open(body, ms), _wire.frame_decoder())
 
     async def job_call(
         self,
@@ -479,7 +319,7 @@ class AsyncHttpTransport:
             "true", [], cwd=None, timeout_ms=_wire.STREAM_DEADLINE_MS, stream=True, job=job
         )
         resp = await self._open(body, _wire.STREAM_DEADLINE_MS)
-        return _Frames(resp, _wire.job_decoder(), [])
+        return _Frames(resp, _wire.job_decoder())
 
     async def aclose(self) -> None:
         """Nothing is held between requests; present so a transport can be used as a context."""

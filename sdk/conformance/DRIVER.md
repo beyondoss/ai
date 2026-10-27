@@ -18,12 +18,11 @@ talks to it over its stdin and stdout. The driver:
 
 - MUST read its configuration from the environment:
 
-| variable                | meaning                                                                                                                             |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `CONFORMANCE_URL`       | the exec endpoint's URL (required)                                                                                                  |
-| `CONFORMANCE_BEARER`    | the bearer token; absent or empty means no `Authorization` header                                                                   |
-| `CONFORMANCE_JOBS_ROOT` | where the baseline keeps jobs in the sandbox; default `/tmp/beyond-jobs`                                                            |
-| `CONFORMANCE_CAPS`      | optional JSON object overriding probe results: `stdin` (bool), `find_printf` (bool), `search_engine` (`rg`, `grep`, `busybox-grep`) |
+| variable             | meaning                                                                                                             |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `CONFORMANCE_URL`    | the exec endpoint's URL (required)                                                                                  |
+| `CONFORMANCE_BEARER` | the bearer token; absent or empty means no `Authorization` header                                                   |
+| `CONFORMANCE_CAPS`   | optional JSON object overriding probe results: `find_printf` (bool), `search_engine` (`rg`, `grep`, `busybox-grep`) |
 
 - MUST read requests one line at a time, answer each with exactly one line on
   stdout, **in order**, and never have two requests in flight. stdout carries
@@ -31,9 +30,8 @@ talks to it over its stdin and stdout. The driver:
 - MUST connect (and probe) on the first request that needs it, and MUST exit
   cleanly when stdin closes.
 - MUST apply `CONFORMANCE_CAPS` after probing, so that one sandbox can walk
-  every rung of the fallback ladder (`stdin: false` forces the 48 KiB chunked
-  write, `search_engine: "grep"` the POSIX rung, `find_printf: false` the
-  two-pass listing). A harness that cannot force a rung runs only the scenarios
+  every rung of the search ladder (`search_engine: "grep"` the POSIX rung,
+  `find_printf: false` the two-pass listing). A harness that cannot force a rung runs only the scenarios
   whose `requires` the real backend meets.
 - MUST NOT retry failed requests or hide an error.
 
@@ -70,40 +68,29 @@ absent or `null`.
 
 ### Meta
 
-| op             | request | result                                                                                                                  |
-| -------------- | ------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `hello`        |         | `{driver, protocol: 1, ops: [names]}`: the ops this driver implements                                                   |
-| `capabilities` |         | `{stdin, stream, jobs: "native"/"baseline"/"none", search_engine, find_printf, read_window, output_base64, exact_exec}` |
+| op             | request | result                                                                |
+| -------------- | ------- | --------------------------------------------------------------------- |
+| `hello`        |         | `{driver, protocol: 1, ops: [names]}`: the ops this driver implements |
+| `capabilities` |         | `{search_engine, find_printf, read_window}`                           |
 
 `hello` MUST succeed without reaching the endpoint. `capabilities` reports what
-the probes found (after `CONFORMANCE_CAPS`), or the connection error if the
-endpoint cannot be used (for example `auth`). `output_base64` is whether the
-endpoint honours the v1.1 `output_base64` request field (probed), and
-`exact_exec` whether raw `exec` returns the command's bytes: `output_base64`, or
-a stream the client can run the one-shot call over. Both `false` means the
-endpoint can only answer text.
+the environment probe found (after `CONFORMANCE_CAPS`), or the connection error
+if the endpoint cannot be used (for example `auth`).
 
 ### Exec (layer 1)
 
 | op            | request                                                                                | result                                                                                  |
 | ------------- | -------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| `exec`        | `command`, `args` (default `[]`), `cwd?`, `timeout_ms?` (default 120000), `stdin_b64?` | `{exit_code, stdout_b64, stderr_b64, exact}`                                            |
+| `exec`        | `command`, `args` (default `[]`), `cwd?`, `timeout_ms?` (default 120000), `stdin_b64?` | `{exit_code, stdout_b64, stderr_b64}`                                                   |
 | `exec_stream` | `command`, `args`, `cwd?`, `timeout_ms?`                                               | `{stdout_b64, stderr_b64}` plus exactly one of `exit_code`, `signal`, `timed_out: true` |
 
-`exec` is the one-shot call (v1.1): a non-zero `exit_code` is a normal result;
-a timeout is `exit_code` 124 (stderr ending `command exceeded its timeout`), a
+`exec` is the one-shot call: a non-zero `exit_code` is a normal result; a
+timeout is `exit_code` 124 (stderr ending `command exceeded its timeout`), a
 command killed by signal N is `128 + N`. `stdout_b64` and `stderr_b64` are the
-**bytes** the command wrote. `exact` says whether they are all of those bytes,
-unaltered: `true` when the driver's client got them from an endpoint that
-honours `output_base64` or over a v1.2 stream; `false` only when the endpoint
-could answer nothing but text (a plain v1.1 endpoint, which has already replaced
-invalid UTF-8 with U+FFFD), in which case the bytes are the UTF-8 of that text. A
-client MUST NOT report `true` for text. A call with `stdin_b64` on an endpoint
-without `output_base64` is text, `exact: false`. `exec_stream` is v1.2: output is collected until
-the final frame. Without `timeout_ms` the stream has no deadline of its own.
-`not_offered` if the endpoint did not prove it streams; the command is not run
-as a one-shot instead. (The reference driver puts both streams in `stdout_b64`
-when `timeout_ms` is given, because the call it uses then merges them.)
+**bytes** the command wrote, unaltered. `exec_stream` collects output until the
+final frame. Without `timeout_ms` the stream has no deadline of its own. (The
+reference driver puts both streams in `stdout_b64` when `timeout_ms` is given,
+because the call it uses then merges them.)
 
 ### Jobs (layer 1)
 
@@ -123,43 +110,41 @@ naming one session's jobs; the harness sends a scope unique to the scenario.
 
 `state` is `running`, `exited` (the shell exited, its group runs on), `ended`,
 `lost` or `gone`; `code` is null unless `exited` or `ended`. An invalid job id
-is `invalid_request` without sending anything. A driver whose endpoint offers no
-jobs at all answers `not_offered`.
+is `invalid_request` without sending anything.
 
 ### Files (layer 2)
 
-| op                   | request                                                                                                      | result                                                                                                                  |
-| -------------------- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
-| `stat`               | `path`                                                                                                       | `{exists: false}` or `{exists: true, kind, size, mtime, writable}` (`kind` `file`/`dir`/`other`; `mtime` epoch seconds) |
-| `read`               | `path`, `offset?` (0), `max?` (to end of file)                                                               | `{data_b64}`                                                                                                            |
-| `write`              | `path`, `data_b64`                                                                                           | `{}`                                                                                                                    |
-| `write_if_unchanged` | `path`, `data_b64`, `expected_mtime` (**required**; integer or null for "must not exist")                    | `{}`, or error `conflict`                                                                                               |
-| `mkdir`              | `path`                                                                                                       | `{}`                                                                                                                    |
-| `list`               | `path`, `include_hidden?` (false), `limit?` (10000)                                                          | `{entries: [{name, kind, size}]}` (order unspecified)                                                                   |
-| `search`             | `pattern`, `root`, `literal?`, `ignore_case?`, `glob?`, `glob_exclude?`, `limit?` (100), `before?`, `after?` | `{hits: [{path, line, text, is_match}], truncated, note}`                                                               |
-| `remove`             | `path`                                                                                                       | planned: no counterpart in the reference                                                                                |
-| `upload_dir`         | `path`, `tar_b64`                                                                                            | **planned, T7**                                                                                                         |
-| `download_dir`       | `path`                                                                                                       | **planned, T7**: `{tar_b64}`                                                                                            |
+| op                   | request                                                                                                                          | result                                                                                                                                                                    |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `stat`               | `path`                                                                                                                           | `{exists: false}` or `{exists: true, kind, size, mtime, writable}` (`kind` `file`/`dir`/`other`; `mtime` epoch seconds, fractional: a JSON number such as `981173106.25`) |
+| `read`               | `path`, `offset?` (0), `max?` (to end of file)                                                                                   | `{data_b64}`                                                                                                                                                              |
+| `write`              | `path`, `data_b64`                                                                                                               | `{}`                                                                                                                                                                      |
+| `write_if_unchanged` | `path`, `data_b64`, `expected_mtime` (**required**; a number as `stat` gave it, fraction included, or null for "must not exist") | `{}`, or error `conflict`                                                                                                                                                 |
+| `mkdir`              | `path`                                                                                                                           | `{}`                                                                                                                                                                      |
+| `list`               | `path`, `include_hidden?` (false), `limit?` (10000)                                                                              | `{entries: [{name, kind, size}]}` (order unspecified)                                                                                                                     |
+| `search`             | `pattern`, `root`, `literal?`, `ignore_case?`, `glob?`, `glob_exclude?`, `limit?` (100), `before?`, `after?`                     | `{hits: [{path, line, text, is_match}], truncated, note}`                                                                                                                 |
+| `remove`             | `path`                                                                                                                           | planned: no counterpart in the reference                                                                                                                                  |
+| `upload_dir`         | `path`, `tar_b64`                                                                                                                | **planned, T7**                                                                                                                                                           |
+| `download_dir`       | `path`                                                                                                                           | **planned, T7**: `{tar_b64}`                                                                                                                                              |
 
 A write that fails its precondition is an error, never `{written: false}`: the
 reference returns a boolean, and the driver turns `false` into `conflict`.
 
 ## 4. Errors
 
-| kind                                                                      | when                                                          |
-| ------------------------------------------------------------------------- | ------------------------------------------------------------- |
-| `not_found`, `is_directory`, `not_a_directory`, `permission_denied`, `io` | a command ran and failed (FILES-OVER-EXEC section 3.3)        |
-| `invalid_query`                                                           | the search pattern or glob was rejected                       |
-| `conflict`                                                                | `write_if_unchanged`: the mtime is not the expected one       |
-| `too_large`                                                               | the endpoint's answer exceeded the response cap               |
-| `auth`                                                                    | HTTP 401 or 403                                               |
-| `timeout`                                                                 | the request deadline passed                                   |
-| `transport`                                                               | unreachable, reset, or a stream that broke                    |
-| `protocol`                                                                | the answer is not the protocol                                |
-| `endpoint`                                                                | any other non-2xx status                                      |
-| `not_offered`                                                             | the **endpoint** lacks the capability (no streaming, no jobs) |
-| `invalid_request`                                                         | the **request** cannot be formed; nothing was sent            |
-| `unsupported`                                                             | the **driver** does not implement the op                      |
+| kind                                                                      | when                                                    |
+| ------------------------------------------------------------------------- | ------------------------------------------------------- |
+| `not_found`, `is_directory`, `not_a_directory`, `permission_denied`, `io` | a command ran and failed (FILES-OVER-EXEC section 3.3)  |
+| `invalid_query`                                                           | the search pattern or glob was rejected                 |
+| `conflict`                                                                | `write_if_unchanged`: the mtime is not the expected one |
+| `too_large`                                                               | the endpoint's answer exceeded the response cap         |
+| `auth`                                                                    | HTTP 401 or 403                                         |
+| `timeout`                                                                 | the request deadline passed                             |
+| `transport`                                                               | unreachable, reset, or a stream that broke              |
+| `protocol`                                                                | the answer is not the protocol                          |
+| `endpoint`                                                                | any other non-2xx status                                |
+| `invalid_request`                                                         | the **request** cannot be formed; nothing was sent      |
+| `unsupported`                                                             | the **driver** does not implement the op                |
 
 `unsupported` is how a driver reports a capability it does not have. It is never
 a pass: see section 6.
@@ -173,7 +158,7 @@ named `<suite>.json`. A scenario:
 {
   "id": "files.write.through-symlink",
   "description": "...",
-  "requires": {"stdin": true},
+  "requires": {"find_printf": true},
   "planned": "T7",
   "connect": {"bearer": "wrong"},
   "setup": [ {step}, ... ],
@@ -257,8 +242,7 @@ failure). Used for job state.
 
 ### requires
 
-All of: `stdin`, `stream`, `find_printf`, `read_window`, `output_base64`,
-`exact_exec` (booleans, compared with `capabilities`); `jobs` (`native`, `baseline`, `any` meaning either);
+All of: `find_printf`, `read_window` (booleans, compared with `capabilities`);
 `search_engine` (a value or a list of acceptable values); `auth` (true when the
 backend demands a bearer); `not_root` (the sandbox user is not uid 0, so
 permission checks mean something); `commands` (a list that `command -v` finds in
@@ -316,6 +300,6 @@ it does not implement yet; any other `unsupported` fails the run.
 
 A backend is a URL (and optionally a bearer) of an exec endpoint, plus a way for
 the harness to make a writable directory in it (`${WORK}`). `execd`, started
-anywhere, is the reference backend; any endpoint that speaks v1.1 to v1.3 can be
-tested, and `requires` skips what it cannot do. A backend's own probes decide
-`stdin`, `stream`, `jobs` and the rest.
+anywhere, is the reference backend; any endpoint that speaks the protocol can be
+tested, and `requires` skips what its sandbox cannot do (the environment probe
+decides `find_printf`, `search_engine` and the rest).
