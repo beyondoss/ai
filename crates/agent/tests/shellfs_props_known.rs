@@ -78,3 +78,27 @@ fn n4_a_write_only_file_can_be_written() {
     assert_eq!(mode, 0o200);
     assert_eq!(std::fs::read(&p).unwrap(), b"new");
 }
+
+/// N5 (fixed): the temp's name does not depend on the target's, so a name up to NAME_MAX can be
+/// written, existing or new, and no temp survives.
+#[test]
+fn n5_a_name_near_name_max_can_be_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = fs();
+    for len in [229usize, 250, 255] {
+        let p = dir.path().join("n".repeat(len));
+        for round in 0..2 {
+            let body = format!("v{round}").into_bytes();
+            env::rt()
+                .block_on(fs.write_bytes(&p, body.clone()))
+                .unwrap_or_else(|e| panic!("{len}-byte name, round {round}: {e}"));
+            assert_eq!(std::fs::read(&p).unwrap(), body);
+        }
+    }
+    let temps: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|n| env::truth::looks_like_temp(n))
+        .collect();
+    assert!(temps.is_empty(), "{temps:?}");
+}

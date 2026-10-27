@@ -596,6 +596,20 @@ pub fn query(pattern: &str, root: PathBuf, limit: usize) -> SearchQuery {
     }
 }
 
+/// The temp suffix of a ShellFs write: exactly 16 lowercase hex digits (64 random bits), the format
+/// `FILES-OVER-EXEC.md` section 5.3 pins so every client names the temp `.tmp.SUFFIX` alike. Each
+/// `RandomState` is seeded from OS entropy, so no two calls collide in practice and none is
+/// predictable.
+pub fn shell_temp_suffix() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{:016x}", RandomState::new().hash_one(seq))
+}
+
 /// An unpredictable per-call suffix for a temp file name, so it can't be preplanted under a symlink
 /// before the call happens. A process-wide salt (`RandomState` draws OS entropy once) plus a
 /// monotonic counter keeps same-process calls distinct — no `rand`/`uuid` dependency needed.
@@ -615,6 +629,18 @@ pub fn temp_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_shell_temp_suffix_is_16_lowercase_hex_digits_and_distinct() {
+        let a = shell_temp_suffix();
+        let b = shell_temp_suffix();
+        assert_eq!(a.len(), 16, "{a}");
+        assert!(
+            a.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')),
+            "{a}"
+        );
+        assert_ne!(a, b);
+    }
 
     // ---- trim_eol / clip: moved verbatim from `tools::grep`'s own test module along with the
     // functions they cover. Assertions are unchanged; only their address is.
