@@ -9,8 +9,8 @@
 //! 2. on a local backend, against the filesystem itself (`oracle`): `std::fs` snapshots and a
 //!    brute-force search, never another client.
 //!
-//! A difference is shrunk by Hegel to a minimal sequence and printed as a scenario file. The four
-//! defects already known (N1..N4) are tolerated by id, as the `ShellFs` property test does.
+//! A difference is shrunk by Hegel to a minimal sequence and printed as a scenario file. Defects with a
+//! scenario of their own are tolerated by id (`known.rs`, `oracle.rs`).
 //!
 //! CI runs fixed seeds and case counts. Locally: `DIFFERENTIAL_CASES=N`, `DIFFERENTIAL_SEED=S`,
 //! `DIFFERENTIAL_STEPS=N` (ops per sequence), `DIFFERENTIAL_BACKENDS=a,b` and
