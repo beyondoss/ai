@@ -164,7 +164,7 @@ one `run` with a 10 s timeout.
 | ------------- | ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------- |
 | `rg`          | `rg --version`                                                                                                           | exit 0                                         |
 | `grep_null`   | `grep -rnZ -e __cap_probe__ -- /dev/null`                                                                                | exit 0 or 1                                    |
-| `find_printf` | `find /dev/null -maxdepth 0 -printf %y`                                                                                  | exit 0 or 1                                    |
+| `find_printf` | `find /dev/null -maxdepth 0 -printf %y`                                                                                  | exit 0 or 1 **and** stdout is `c`              |
 | `stdin`       | `cat` with stdin `stdin-probe`                                                                                           | exit 0 **and** stdout is exactly `stdin-probe` |
 | `read_window` | `sh -c 'printf abc \| dd iflag=skip_bytes,count_bytes skip=1 count=1 status=none 2>/dev/null \| base64 -w0 2>/dev/null'` | exit 0 and stdout trimmed is `Yg==`            |
 
@@ -272,17 +272,24 @@ preplanted name cannot redirect the write. The scripts (C and D below) do the
 resolution, in order:
 
 1. a path starting with `-` is prefixed with `./`;
-2. if it is a symlink, resolve it: `readlink -f`, and if that yields nothing
-   (a dangling link) one `readlink` hop, joined to the link's directory when
-   relative; the prefix rule of 1 is applied again;
-3. the temp is created empty with `set -C` (no-clobber: a preplanted temp is
+2. if it is a symlink, resolve it: `readlink -f` when the target exists; for
+   a dangling link (or if that yields nothing) follow the chain one `readlink`
+   hop at a time, each relative target joined to the directory of the link it
+   came from, for at most 40 hops. A dangling link is never given to
+   `readlink -f`: busybox resolves its relative target against the working
+   directory instead of the link's. The prefix rule of 1 is applied again;
+3. a target that is a directory is refused (`Is a directory (os error 21)`, exit
+   1), before the temp exists, because `mv -f` would move the temp _into_ it
+   and report success;
+   the temp is created empty with `set -C` (no-clobber: a preplanted temp is
    refused, not followed);
 4. if the target exists, the temp gets its mode **before any content**:
    `chmod --reference`, falling back to `chmod "$(stat -L -c %a TARGET)"`
    (busybox); if neither works the write fails (`cannot give the new file the
    mode of ...`) and the temp is removed;
 5. the content is appended; the temp's size is checked against the expected
-   byte count; only then `mv -f TEMP TARGET`.
+   byte count; the directory check runs again (a directory created meanwhile
+   removes the temp and fails); only then `mv -f TEMP TARGET`.
 
 A write is therefore atomic (a reader sees the old file or the new one), keeps
 the file's mode (a 0600 file stays 0600, a 0755 file stays executable), writes
@@ -579,7 +586,7 @@ else t=o
 fi
 if [ -w "$1" ]; then w=w; else w=-; fi
 printf '%s	%s	' "$w" "$t"
-stat -c '%s	%Y' -- "$1" 2>/dev/null || printf '0	0'
+stat -L -c '%s	%Y' -- "$1" 2>/dev/null || printf '0	0'
 printf '
 '
 ```
@@ -608,18 +615,27 @@ exec dd if="$1" iflag=skip_bytes,count_bytes skip="$2" count="$3" status=none | 
 t="$1"
 case "$t" in -*) t="./$t" ;; esac
 if [ -L "$t" ]; then
-  r=$(readlink -f "$t" 2>/dev/null) || r=
+  r=
+  [ -e "$t" ] && r=$(readlink -f "$t" 2>/dev/null)
   if [ -z "$r" ]; then
-    r=$(readlink "$t") || exit 1
-    case "$r" in
-      /*) ;;
-      *) case "$t" in */*) r="${t%/*}/$r" ;; esac ;;
-    esac
+    r="$t" n=0
+    while [ -L "$r" ] && [ $n -lt 40 ]; do
+      l=$(readlink "$r") || exit 1
+      case "$l" in
+        /*) r="$l" ;;
+        *) case "$r" in */*) r="${r%/*}/$l" ;; *) r="$l" ;; esac ;;
+      esac
+      n=$((n + 1))
+    done
   fi
   t="$r"
   case "$t" in -*) t="./$t" ;; esac
 fi
 tmp="$t.tmp.$2"
+if [ -d "$t" ]; then
+  echo "Is a directory (os error 21)" >&2
+  exit 1
+fi
 set -C
 : > "$tmp" || exit 1
 set +C
@@ -633,6 +649,7 @@ fi
 if cat >> "$tmp"; then
   n=$(wc -c < "$tmp")
   if [ $n -eq "$3" ]; then
+    if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
     mv -f "$tmp" "$t" && exit 0
   else
     echo "short write: $n of $3 bytes arrived on stdin" >&2
@@ -648,19 +665,28 @@ exit 1
 t="$1"
 case "$t" in -*) t="./$t" ;; esac
 if [ -L "$t" ]; then
-  r=$(readlink -f "$t" 2>/dev/null) || r=
+  r=
+  [ -e "$t" ] && r=$(readlink -f "$t" 2>/dev/null)
   if [ -z "$r" ]; then
-    r=$(readlink "$t") || exit 1
-    case "$r" in
-      /*) ;;
-      *) case "$t" in */*) r="${t%/*}/$r" ;; esac ;;
-    esac
+    r="$t" n=0
+    while [ -L "$r" ] && [ $n -lt 40 ]; do
+      l=$(readlink "$r") || exit 1
+      case "$l" in
+        /*) r="$l" ;;
+        *) case "$r" in */*) r="${r%/*}/$l" ;; *) r="$l" ;; esac ;;
+      esac
+      n=$((n + 1))
+    done
   fi
   t="$r"
   case "$t" in -*) t="./$t" ;; esac
 fi
 tmp="$t.tmp.$2"
 if [ "$4" = new ]; then
+if [ -d "$t" ]; then
+  echo "Is a directory (os error 21)" >&2
+  exit 1
+fi
 set -C
 : > "$tmp" || exit 1
 set +C
@@ -676,6 +702,7 @@ printf %s "$3" | base64 -d >> "$tmp" || { rm -f "$tmp"; exit 1; }
 [ -z "$5" ] && exit 0
 n=$(wc -c < "$tmp")
 if [ $n -eq "$6" ]; then
+  if [ -d "$t" ]; then echo "Is a directory (os error 21)" >&2; rm -f "$tmp"; exit 1; fi
   mv -f "$tmp" "$t" && exit 0
 else
   echo "short write: $n of $6 bytes assembled" >&2
@@ -690,13 +717,18 @@ exit 1
 t="$1"
 case "$t" in -*) t="./$t" ;; esac
 if [ -L "$t" ]; then
-  r=$(readlink -f "$t" 2>/dev/null) || r=
+  r=
+  [ -e "$t" ] && r=$(readlink -f "$t" 2>/dev/null)
   if [ -z "$r" ]; then
-    r=$(readlink "$t") || exit 1
-    case "$r" in
-      /*) ;;
-      *) case "$t" in */*) r="${t%/*}/$r" ;; esac ;;
-    esac
+    r="$t" n=0
+    while [ -L "$r" ] && [ $n -lt 40 ]; do
+      l=$(readlink "$r") || exit 1
+      case "$l" in
+        /*) r="$l" ;;
+        *) case "$r" in */*) r="${r%/*}/$l" ;; *) r="$l" ;; esac ;;
+      esac
+      n=$((n + 1))
+    done
   fi
   t="$r"
   case "$t" in -*) t="./$t" ;; esac
@@ -721,24 +753,18 @@ exit 1
 
 ## Known deviations from the reference implementation
 
-Found by the first run on real busybox (Alpine). Both are in the reference
-and, as written, in this document; the scenarios carry an `xfail` mark for the
-reference driver on exactly the checks that show them, on a backend whose
-probes found `find_printf` and a busybox `grep` (a real busybox sandbox).
+Found by the first run on real busybox (Alpine). This document says what is
+right; the reference still does the old thing until its fix lands. The
+scenarios carry an `xfail` mark for the reference driver on exactly the checks
+that show them, on a backend whose probes found `find_printf` and a busybox
+`grep` (a real busybox sandbox).
 
-1. **The `find_printf` probe (section 4) accepts busybox.** busybox `find` has
-   no `-printf`: it prints its usage and exits 1, and "exit 0 or 1" counts that
-   as present, so `list` runs `find -printf` and fails with `io`
-   (`find: unrecognized: -printf`). A client MUST count `find_printf` present
-   only when the probe's stdout is `c` (GNU prints the type of `/dev/null`, a
-   character device). Shown by every `list` check on busybox (19 checks in
-   `files`, `errors` and `helpers`).
-2. **A write through a dangling symlink lands in the wrong directory on
-   busybox.** busybox `readlink -f` of a dangling relative link resolves its
-   target against the working directory, not the link's directory, so the
-   resolve step of section 5.3 names `CWD/made` instead of `DIR/made`. Not yet
-   specified: a resolve that does not depend on `readlink -f` for a dangling
-   link. Shown by `files.write.dangling-symlink-creates-target/check`.
+1. **The reference's `find_printf` probe accepts busybox.** busybox `find` has
+   no `-printf`: it prints its usage and exits 1, and the reference counts
+   "exit 0 or 1" as present, so `list` runs `find -printf` and fails with `io`
+   (`find: unrecognized: -printf`). Section 4 requires stdout `c` as well.
+   Shown by every `list` check on busybox (19 checks in `files`, `errors` and
+   `helpers`).
 
 When the reference (`ShellFs`) behaves differently from this spec, the
 difference is listed here, and the scenarios carry an `xfail` mark for the

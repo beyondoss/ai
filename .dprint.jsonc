@@ -12,6 +12,9 @@
     // table generated from them: formatting either would break `rates_generated_from_sources`.
     "verify/rates_sources/**",
     "crates/providers/src/rates/generated.rs",
+    // The shell scripts the TypeScript client sends byte for byte, generated from the spec
+    // (sdk/ts/sandbox/scripts/gen-scripts.mjs); a formatter must not requote them.
+    "sdk/ts/sandbox/src/scripts.ts",
   ],
   "exec": {
     "commands": [

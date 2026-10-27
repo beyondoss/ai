@@ -1778,15 +1778,140 @@
               "exit_code": 0,
               "stdout_utf8": "made\n"
             }
-          },
-          "xfail": {
-            "drivers": [
-              "agent-reference"
-            ],
-            "reason": "busybox `readlink -f` of a dangling link resolves the target against the working directory, not the link's directory, so the write lands in the wrong place (see Known deviations)",
-            "when": {
-              "find_printf": true,
-              "search_engine": "busybox-grep"
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.dangling-symlink-chain-creates-final-target",
+      "description": "Writing through a chain of dangling links creates the last link's target, each hop relative to the directory of the link it came from.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir -p a/b a/c; ln -s b/m a/l1; ln -s ../l1 a/c/l2; ln -s ../c/l2 a/b/l3; ln -s b/l3 a/l4",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/a/l4",
+          "data_b64": "bWFkZQo=",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "check",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "cd \"$1\"; [ -L a/l4 ] && [ -L a/b/l3 ] && [ -L a/c/l2 ] && [ -L a/l1 ] && cat a/b/m",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "made\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.dangling-symlink-absolute-target-creates-target",
+      "description": "Writing through a dangling link with an absolute target creates that absolute path.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir sub other; ln -s \"$1/other/made\" sub/l",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/sub/l",
+          "data_b64": "bWFkZQo=",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "check",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "cd \"$1\"; [ -L sub/l ] && cat other/made",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "made\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "files.write.dangling-symlink-via-live-link-creates-target",
+      "description": "Writing through a dangling link whose directory is itself reached through a live link to a directory creates the target beside the real link.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir real; ln -s made real/l; ln -s real alias",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "w",
+          "op": "write",
+          "path": "${ROOT}/alias/l",
+          "data_b64": "bWFkZQo=",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "check",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "cd \"$1\"; [ -L real/l ] && cat real/made",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "made\n"
             }
           }
         }

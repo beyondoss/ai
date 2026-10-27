@@ -7,3 +7,8 @@
 name = "rust"
 build = "cargo build -q -p beyond-sandbox-conformance --bin sandbox-driver-rust"
 run = "target/debug/sandbox-driver-rust"
+
+[[driver]]
+name = "ts"
+build = "npm ci --prefix sdk/ts --silent && npm run build --prefix sdk/ts --silent"
+run = "node sdk/ts/sandbox/dist/driver.mjs"
