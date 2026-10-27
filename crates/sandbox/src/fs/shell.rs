@@ -1717,6 +1717,59 @@ pub mod __fuzz {
     }
 }
 
+/// The scripts printed in the appendix of `sdk/conformance/FILES-OVER-EXEC.md` are the ones this file
+/// sends, byte for byte. Other clients test their scripts against the same appendix.
+#[cfg(test)]
+mod appendix_tests {
+    const SPEC: &str = include_str!("../../../../sdk/conformance/FILES-OVER-EXEC.md");
+
+    /// The `sh` block under the heading that starts with `### {letter}. `.
+    fn appendix(letter: char) -> String {
+        let head = format!("### {letter}. ");
+        let rest = &SPEC[SPEC
+            .find(&head)
+            .unwrap_or_else(|| panic!("no appendix {letter}"))..];
+        let rest = &rest[rest.find("```sh\n").unwrap() + 6..];
+        rest[..rest.find("\n```").unwrap()].to_string()
+    }
+
+    /// Scripts known to differ from the appendix until the pending fixes land; each names its fix.
+    /// An entry here that now matches fails the test, so it cannot outlive its fix.
+    const KNOWN_DIFFERENT: &[(char, &str)] = &[
+        // The code is ahead: `stat -L` (#564) and the directory refusal in C/D. The appendix is
+        // brought level by #574, and the dangling-link resolve and stdout-`c` probe it adds to
+        // C/D/E by B1/B2; then this list is empty.
+        ('A', "appendix lacks `stat -L`, #574"),
+        ('C', "appendix lacks the directory refusal, #574, B1/B2"),
+        ('D', "appendix lacks the directory refusal, #574, B1/B2"),
+    ];
+
+    #[test]
+    fn the_appendix_scripts_are_the_scripts_sent() {
+        let scripts: [(char, &str); 6] = [
+            ('A', super::STAT_SCRIPT),
+            ('B', super::READ_WINDOW_SCRIPT),
+            ('C', super::WRITE_STDIN_SCRIPT),
+            ('D', super::WRITE_CHUNK_SCRIPT),
+            ('E', super::REMOVE_TEMP_SCRIPT),
+            ('F', super::GIT_REPO_SCRIPT),
+        ];
+        let mut wrong = Vec::new();
+        for (letter, code) in scripts {
+            let same = appendix(letter) == code.trim_end_matches('\n');
+            let known = KNOWN_DIFFERENT.iter().find(|(l, _)| *l == letter);
+            match (same, known) {
+                (false, None) => wrong.push(format!("{letter} differs from the appendix")),
+                (true, Some((_, why))) => wrong.push(format!(
+                    "{letter} now matches ({why}); remove it from KNOWN_DIFFERENT"
+                )),
+                _ => {}
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
