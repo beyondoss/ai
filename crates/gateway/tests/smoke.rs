@@ -17,7 +17,7 @@
 //! Run them:
 //!   ANTHROPIC_API_KEY=sk-ant-… mise run test:smoke
 //!   # or directly:
-//!   ANTHROPIC_API_KEY=sk-ant-… cargo test -p beyond-ai --test smoke -- --ignored --nocapture
+//!   ANTHROPIC_API_KEY=sk-ant-… cargo test -p beyond-gateway --test smoke -- --ignored --nocapture
 //!
 //! Model ids are the cheapest small model per provider as of 2026-05; adjust if a provider retires
 //! one (a model-not-found is a stale id here, not a gateway bug).
@@ -27,7 +27,7 @@
 
 mod common;
 
-use beyond_ai::__test::key::{VirtualKey, mint};
+use beyond_gateway::__test::key::{VirtualKey, mint};
 use common::*;
 
 /// The provider's API key from the environment, or `None` (→ the test logs a skip and returns).

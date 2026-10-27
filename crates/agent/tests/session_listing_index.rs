@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use agent_core::Message;
-use beyond_ai_agent::session_store::{Layout, RepoOptions, SessionMeta, SessionRepo};
+use beyond_agent::session_store::{Layout, RepoOptions, SessionMeta, SessionRepo};
 use tempfile::TempDir;
 
 const INDEX: &str = ".listings.json";

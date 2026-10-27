@@ -1,4 +1,4 @@
-# beyond-ai-providers — Architecture
+# beyond-providers — Architecture
 
 A pure library with no I/O, below both the gateway and the agent. It holds three tables and the
 lookups over them:

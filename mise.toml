@@ -24,27 +24,27 @@ run = "crates/agent/scripts/scan-release-seams.sh $(find target/release -maxdept
 
 [tasks."ai:mint-dev-key"]
 description = "Mint a deterministic DEV-ONLY signing pubkey + bai_v1 token (fixed seed) for wiring up the dev config. Not for production."
-run = "cargo run -p beyond-ai --example mint_dev_key"
+run = "cargo run -p beyond-gateway --example mint_dev_key"
 
 [tasks."build:agent"]
-run = "cargo build -p beyond-ai-agent"
+run = "cargo build -p beyond-agent"
 
 [tasks."run:agent"]
 description = "Run the agent harness CLI (e.g. `mise run run:agent -- tools`)."
-run = "cargo run -p beyond-ai-agent --"
+run = "cargo run -p beyond-agent --"
 
 [tasks."test:unit:agent"]
 description = "Unit tests for the agent harness core (messages, tool registry, session)."
-run = "cargo test -p beyond-ai-agent-core"
+run = "cargo test -p beyond-agent-core"
 
 [tasks."test:code-mode"]
 description = "Code Mode evals: catalog-token A/B + execute composition (needs --features code-mode). Live Grok/OpenRouter: OPENROUTER_API_KEY and pass -- --ignored."
-run = "cargo test -p beyond-ai-agent --features code-mode --test code_mode_eval -- --nocapture"
+run = "cargo test -p beyond-agent --features code-mode --test code_mode_eval -- --nocapture"
 
 [tasks."eval:longctx"]
 description = "Long-context compaction sweep (crates/agent/eval/longctx): multi-bug repair tasks in 11 real Python repos × model × compaction trigger, headless, graded by each repo's own tests. Spends real money: `-- --estimate` first, `--budget-usd` caps it. Reads keys from .env. Args go to run.py (--models, --arms 100k,200k,default,model or any <n>k, --tasks, --attempts, --jobs)."
 run = """
-cargo build -q --release -p beyond-ai-agent
+cargo build -q --release -p beyond-agent
 python3 crates/agent/eval/longctx/run.py --bin target/release/beyond-ai-agent "$@"
 python3 crates/agent/eval/longctx/report.py
 """
@@ -101,7 +101,7 @@ run = "cargo test --lib"
 # Integration tests (gateway driven against a mock upstream + NATS) — to be added; see ARCHITECTURE.md.
 [tasks."test:loom"]
 description = "Loom permutation models of the gateway's lock-free code (circuit breaker, tenant slot, body budget). Own cfg name: a global `--cfg loom` breaks event-listener in the dependency tree."
-run = 'RUSTFLAGS="--cfg beyond_loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p beyond-ai --release --lib loom'
+run = 'RUSTFLAGS="--cfg beyond_loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p beyond-gateway --release --lib loom'
 
 [tasks."test:integration:rs"]
 description = "End-to-end gateway tests against a mock provider + docker-compose NATS (TODO)."
@@ -112,57 +112,57 @@ description = "Live smoke tests against REAL providers. Auto-loads .env if prese
 run = """
 # Auto-load .env if it exists (export every assignment), so the keys reach the test process.
 if [ -f .env ]; then set -a; . ./.env; set +a; fi
-cargo test -p beyond-ai --test smoke -- --ignored --nocapture
+cargo test -p beyond-gateway --test smoke -- --ignored --nocapture
 """
 
 [tasks."test:smoke:agent"]
 description = "Live agent smoke: the real agent binary → real gateway → REAL Anthropic. Auto-loads .env; needs ANTHROPIC_API_KEY. Skips if unset. Bills a tiny real request."
 run = """
 if [ -f .env ]; then set -a; . ./.env; set +a; fi
-cargo nextest run -p beyond-ai-agent -E 'test(/^smoke::/)' --run-ignored only --no-capture
+cargo nextest run -p beyond-agent -E 'test(/^smoke::/)' --run-ignored only --no-capture
 """
 
 [tasks."rates:sync"]
 description = "Re-fetch every primary pricing source into verify/rates_sources/ and regenerate the rate table (crates/providers/src/rates/generated.rs), printing what moved. Auto-loads .env: TOGETHER_API_KEY and XAI_API_KEY are required, every other source is public. See crates/providers/ARCHITECTURE.md."
 run = """
 if [ -f .env ]; then set -a; . ./.env; set +a; fi
-cargo run -q -p beyond-ai-rates-sync -- sync
-cargo run -q -p beyond-ai-rates-sync -- rate-version
+cargo run -q -p beyond-rates-sync -- sync
+cargo run -q -p beyond-rates-sync -- rate-version
 mkdir -p target
-cargo run -q -p beyond-ai-rates-sync -- dump --json > target/rate-table.json
+cargo run -q -p beyond-rates-sync -- dump --json > target/rate-table.json
 python3 -I verify/pricing_reference.py target/rate-table.json verify/pricing_vectors.json --write
 """
 
 [tasks."rates:generate"]
 description = "Regenerate the rate table from the committed snapshots and verify/catalog_truth.toml. Offline and byte-reproducible."
-run = "cargo run -q -p beyond-ai-rates-sync -- generate"
+run = "cargo run -q -p beyond-rates-sync -- generate"
 
 [tasks."rates:drift"]
 description = "Re-fetch every pricing source into a scratch copy and fail, listing the diff, if any vendor price moved. Auto-loads .env."
 run = """
 if [ -f .env ]; then set -a; . ./.env; set +a; fi
-cargo run -q -p beyond-ai-rates-sync -- drift
+cargo run -q -p beyond-rates-sync -- drift
 """
 
 [tasks."rates:classify"]
 description = "Re-fetch every pricing source into a scratch copy and print, as JSON, whether the change is none (exit 0), routine (2), review (3) or broken (4). Writes nothing. What the daily rates-drift workflow runs (with --apply). Auto-loads .env."
 run = """
 if [ -f .env ]; then set -a; . ./.env; set +a; fi
-cargo run -q -p beyond-ai-rates-sync -- classify
+cargo run -q -p beyond-rates-sync -- classify
 """
 
 [tasks."catalog:drift"]
 description = "New models and retirements against the catalog (crates/rates-sync/src/catalog_drift.rs): fetch every listing, deprecation page and rate source, and print each finding (successor, retirement or needs-human) as JSON. Writes nothing to the tree. `-- --save DIR` keeps the inputs; `-- --inputs DIR` replays them offline. What the daily catalog-drift workflow runs. Auto-loads .env."
 run = """
 if [ -f .env ]; then set -a; . ./.env; set +a; fi
-cargo run -q -p beyond-ai-rates-sync -- catalog-drift "$@"
+cargo run -q -p beyond-rates-sync -- catalog-drift "$@"
 """
 
 [tasks."pricing:vectors"]
 description = "Recompute every golden vector's expect in verify/pricing_vectors.json with the independent exact-rational reference pricer (verify/pricing_reference.py) against the compiled rate table, printing what changed. Add a vector as a {name, why, row} entry and run this. CI checks the file reproduces (crates/rates-sync/tests/pricing_reference.rs)."
 run = """
 mkdir -p target
-cargo run -q -p beyond-ai-rates-sync -- dump --json > target/rate-table.json
+cargo run -q -p beyond-rates-sync -- dump --json > target/rate-table.json
 python3 -I verify/pricing_reference.py target/rate-table.json verify/pricing_vectors.json --write
 """
 
@@ -170,7 +170,7 @@ python3 -I verify/pricing_reference.py target/rate-table.json verify/pricing_vec
 description = "Second opinions on the rate table: LiteLLM and models.dev disagreements (leads, never corrections), and the vendors' own invoices (OpenAI/Anthropic admin cost APIs) checked line by line against the cards. Auto-loads .env; the invoice check needs OPENAI_ADMIN_KEY / ANTHROPIC_ADMIN_KEY."
 run = """
 if [ -f .env ]; then set -a; . ./.env; set +a; fi
-cargo run -q -p beyond-ai-rates-sync -- audit
+cargo run -q -p beyond-rates-sync -- audit
 """
 
 [tasks."bench:unit"]
@@ -183,27 +183,27 @@ run = "cargo bench --bench e2e"
 
 [tasks."bench:decode"]
 description = "divan micro-bench of the SSE decode hot path (framing + per-dialect decode + pipeline): timing + native allocation counts."
-run = "cargo bench -p beyond-ai-agent-core --bench decode"
+run = "cargo bench -p beyond-agent-core --bench decode"
 
 [tasks."bench:decode:concurrent"]
 description = "Decode concurrency-scaling probe (allocator-contention evidence gate). Add `--features bench-mimalloc` for the control run on a sharded allocator."
-run = "cargo bench -p beyond-ai-agent-core --bench decode_concurrent"
+run = "cargo bench -p beyond-agent-core --bench decode_concurrent"
 
 [tasks."bench:persistence"]
 description = "Session listing scan + durable append micro-bench (timing + allocs)."
-run = "cargo bench -p beyond-ai-agent --bench persistence"
+run = "cargo bench -p beyond-agent --bench persistence"
 
 [tasks."bench:serve-runtime"]
 description = "Process-level Tokio runtime A/B: current_thread vs multi_thread under concurrent serve WebSocket load (RSS, throughput, p95, CPU)."
-run = "cargo bench -p beyond-ai-agent --bench serve_runtime"
+run = "cargo bench -p beyond-agent --bench serve_runtime"
 
 [tasks."bench:execd"]
 description = "execd vs the baseline exec endpoint, A/B over HTTP on loopback (v1.1 round trip, stream throughput, first frame, RSS, kill-on-disconnect). Set EXEC_BENCH_A to a baseline `beyond-ai-demo` binary built from the commit before execd."
-run = "cargo bench -p beyond-ai-execd --bench exec_compare"
+run = "cargo bench -p beyond-execd --bench exec_compare"
 
 [tasks."bench:execd:sandbox"]
 description = "bench:execd inside a fresh PID namespace, where /proc holds a handful of processes like a sandbox's does (a busy host's thousands of processes slow execd's orphan reaper)."
-run = "unshare -Urpf --mount-proc bash -c 'EXEC_BENCH_LABEL=sandbox cargo bench -p beyond-ai-execd --bench exec_compare & wait'"
+run = "unshare -Urpf --mount-proc bash -c 'EXEC_BENCH_LABEL=sandbox cargo bench -p beyond-execd --bench exec_compare & wait'"
 
 [tasks."bench"]
 description = "Run both bench harnesses (unit micro + e2e macro)."
@@ -211,30 +211,30 @@ depends = ["bench:unit", "bench:e2e"]
 
 [tasks."sim:matrix"]
 description = "Fleet simulator conformance matrix. `--substrate nfs` needs root + nfs-kernel-server; the default local-dir substrate skips the claims that only a shared mount can show."
-run = "cargo run -q -p beyond-ai-fleet-sim --bin fleet-sim -- matrix"
+run = "cargo run -q -p beyond-fleet-sim --bin fleet-sim -- matrix"
 
 [tasks."sim:list"]
 description = "List the fleet simulator's scenarios and which substrate each one needs."
-run = "cargo run -q -p beyond-ai-fleet-sim --bin fleet-sim -- list"
+run = "cargo run -q -p beyond-fleet-sim --bin fleet-sim -- list"
 
 [tasks."verify:status"]
 description = "Run every claim/defect-tagged test (ignored reproductions included) and print each claim's computed status. See verify/README.md."
 run = """
 set -e
 # Live cells (VERIFY_LIVE=1) drive the gateway binary from this tree; build it first.
-if [ "${VERIFY_LIVE:-}" = 1 ]; then cargo build -q -p beyond-ai; fi
-expr=$(cargo run -q -p beyond-ai-verify -- filter)
+if [ "${VERIFY_LIVE:-}" = 1 ]; then cargo build -q -p beyond-gateway; fi
+expr=$(cargo run -q -p beyond-verify -- filter)
 cargo nextest run --workspace --profile verify --run-ignored all --no-tests=pass -E "$expr" || true
 # Reconciled live cells (BIL-5) run last, alone: a provider's usage report holds every request
 # on the key and model, so no other suite may be sending. See verify/README.md.
 rm -f target/nextest/verify-isolated/junit.xml
 reports="--junit target/nextest/verify/junit.xml"
 if [ "${VERIFY_LIVE:-}" = 1 ]; then
-  expr=$(cargo run -q -p beyond-ai-verify -- filter --isolated)
+  expr=$(cargo run -q -p beyond-verify -- filter --isolated)
   cargo nextest run --workspace --profile verify-isolated --no-tests=pass -E "$expr" || true
   if [ -f target/nextest/verify-isolated/junit.xml ]; then reports="$reports --junit target/nextest/verify-isolated/junit.xml"; fi
 fi
-cargo run -q -p beyond-ai-verify -- status $reports "$@"
+cargo run -q -p beyond-verify -- status $reports "$@"
 """
 
 [tasks."verify:live"]
@@ -247,10 +247,10 @@ description = "Live catalog sweep only (crates/verify/tests/catalog_live.rs): ev
 env = { VERIFY_LIVE = "1" }
 run = """
 set -e
-cargo build -q -p beyond-ai
-cargo nextest run -p beyond-ai-verify --test catalog_live --profile verify --no-fail-fast "$@" || true
-VERIFY_CATALOG_SUMMARY=1 cargo test -q -p beyond-ai-verify --test catalog_live
-VERIFY_CATALOG_GAPS=1 cargo test -q -p beyond-ai-verify --test catalog_live
+cargo build -q -p beyond-gateway
+cargo nextest run -p beyond-verify --test catalog_live --profile verify --no-fail-fast "$@" || true
+VERIFY_CATALOG_SUMMARY=1 cargo test -q -p beyond-verify --test catalog_live
+VERIFY_CATALOG_GAPS=1 cargo test -q -p beyond-verify --test catalog_live
 """
 
 [tasks."verify:gate"]
@@ -258,5 +258,5 @@ description = "Fail on any inconsistency between verify/claims.toml, verify/defe
 run = """
 reports="--junit target/nextest/verify/junit.xml"
 if [ -f target/nextest/verify-isolated/junit.xml ]; then reports="$reports --junit target/nextest/verify-isolated/junit.xml"; fi
-cargo run -q -p beyond-ai-verify -- gate $reports
+cargo run -q -p beyond-verify -- gate $reports
 """

@@ -238,8 +238,8 @@ Other vendors are covered differently:
   Their costs are held by the rate table and its sources (`verify/catalog_truth.toml`).
 
 ```sh
-VERIFY_LIVE=1 cargo nextest run -p beyond-ai-verify --test pricing_live --profile verify
-VERIFY_INVOICE_ROWS=$PWD/target/rows.jsonl VERIFY_LIVE=1 cargo test -p beyond-ai-verify --test pricing_live -- BIL-25
+VERIFY_LIVE=1 cargo nextest run -p beyond-verify --test pricing_live --profile verify
+VERIFY_INVOICE_ROWS=$PWD/target/rows.jsonl VERIFY_LIVE=1 cargo test -p beyond-verify --test pricing_live -- BIL-25
 ```
 
 ## Live cells
@@ -272,7 +272,7 @@ claim's `client_note` says why a client it would name can't exercise it, or what
 it can.
 
 ```sh
-VERIFY_LIVE=1 cargo nextest run -p beyond-ai-verify --test live -E 'test(/::stream_abort$/)'
+VERIFY_LIVE=1 cargo nextest run -p beyond-verify --test live -E 'test(/::stream_abort$/)'
 VERIFY_ROWS_OUT=$PWD/target/rows.jsonl VERIFY_LIVE=1 cargo nextest run ...  # also keep every row
 ```
 
@@ -308,8 +308,8 @@ effort `none` (its lowest) where a case asks for no reasoning. A run costs about
 estimate first and the measured cost last.
 
 ```sh
-VERIFY_LIVE=1 cargo test -p beyond-ai-verify --test parity_live              # one process, shared gateways
-PARITY_DUMP=1 VERIFY_LIVE=1 cargo test -p beyond-ai-verify --test parity_live -- chat-to-claude --nocapture
+VERIFY_LIVE=1 cargo test -p beyond-verify --test parity_live              # one process, shared gateways
+PARITY_DUMP=1 VERIFY_LIVE=1 cargo test -p beyond-verify --test parity_live -- chat-to-claude --nocapture
 ```
 
 ## Catalog sweep
@@ -367,11 +367,11 @@ named by a `retired` entry. For a recorded `retires` date it prints a warning na
 date from 14 days before that date, and fails only under `CATALOG_RETIREMENT_STRICT=1`: the weekly
 `deep.yml` job sets it, so a scheduled retirement is acted on before the vendor's 404 while the
 calendar never fails an unrelated PR. Run it strict locally with
-`CATALOG_RETIREMENT_STRICT=1 cargo test -p beyond-ai-providers --lib no_catalog_row_outlives_its_retirement -- --nocapture`.
+`CATALOG_RETIREMENT_STRICT=1 cargo test -p beyond-providers --lib no_catalog_row_outlives_its_retirement -- --nocapture`.
 
 ```sh
-VERIFY_LIVE=1 cargo nextest run -p beyond-ai-verify --test catalog_live --profile verify -E 'test(/^CAT-16::/)'
-VERIFY_CATALOG_GAPS=1 cargo test -q -p beyond-ai-verify --test catalog_live
+VERIFY_LIVE=1 cargo nextest run -p beyond-verify --test catalog_live --profile verify -E 'test(/^CAT-16::/)'
+VERIFY_CATALOG_GAPS=1 cargo test -q -p beyond-verify --test catalog_live
 ```
 
 ## Tenancy sessions (TEN-1, TEN-2)
@@ -400,7 +400,7 @@ no row is unaccounted for.
 A run costs about $0.10.
 
 ```sh
-VERIFY_LIVE=1 cargo test -p beyond-ai-verify --test tenancy_live -- --nocapture --test-threads=4
+VERIFY_LIVE=1 cargo test -p beyond-verify --test tenancy_live -- --nocapture --test-threads=4
 ```
 
 ## Faults in front of real providers (FLT-1)
@@ -432,7 +432,7 @@ any head is not billed: the gateway reads a bare reset as the peer declining to 
 these trials (default 600) so a stall costs seconds.
 
 ```sh
-VERIFY_LIVE=1 cargo nextest run -p beyond-ai-verify --test fault_live -j 12
+VERIFY_LIVE=1 cargo nextest run -p beyond-verify --test fault_live -j 12
 VERIFY_FAULT_VERBOSE=1 VERIFY_LIVE=1 cargo nextest run ... --no-capture  # print every witness
 ```
 
@@ -466,7 +466,7 @@ keeps them (with every call and its response tail) and each gateway log under
 `target/verify-long/`.
 
 ```sh
-VERIFY_LIVE=1 cargo nextest run -p beyond-ai-verify --test long_live --profile verify
+VERIFY_LIVE=1 cargo nextest run -p beyond-verify --test long_live --profile verify
 ```
 
 `STALE` status will land with the run ledger.
@@ -490,5 +490,5 @@ codename from turn 1, so a turn that lost its history fails. `VERIFY_SESSION_TRA
 passing trial saw (rows, proxy request logs, the client's detail).
 
 ```sh
-VERIFY_LIVE=1 cargo test -p beyond-ai-verify --test session_live -- SES-1
+VERIFY_LIVE=1 cargo test -p beyond-verify --test session_live -- SES-1
 ```

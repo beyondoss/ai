@@ -78,7 +78,7 @@ pub fn spawn_http_mcp_fixture_slow_discover(delay: Duration) -> HttpMcpFixture {
 }
 
 fn spawn(slow_discover: Option<Duration>, reject_discover: bool) -> HttpMcpFixture {
-    let listener = beyond_ai_test_support::ports::listener();
+    let listener = beyond_test_support::ports::listener();
     let addr = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorder = requests.clone();

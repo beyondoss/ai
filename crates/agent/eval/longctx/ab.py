@@ -56,7 +56,7 @@ def build(sha: str, code_mode: bool = False) -> Path:
         archive = subprocess.run(["git", "-C", str(ROOT), "archive", full], capture_output=True, check=True).stdout
         subprocess.run(["tar", "-x", "-C", str(src)], input=archive, check=True)
     target = tasks.work_dir() / f"target-{label}"
-    cmd = ["cargo", "build", "--release", "-p", "beyond-ai-agent"] + (["--features", "code-mode"] if code_mode else [])
+    cmd = ["cargo", "build", "--release", "-p", "beyond-agent"] + (["--features", "code-mode"] if code_mode else [])
     subprocess.run(cmd, cwd=src, env={**os.environ, "CARGO_TARGET_DIR": str(target)}, check=True)
     out.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(target / "release" / "beyond-ai-agent", out)

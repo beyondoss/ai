@@ -1575,7 +1575,7 @@ mod tests {
     }
 
     /// The pricer runs once per `ai.usage` row, after the response. Measured, not assumed: run
-    /// with `cargo test --release -p beyond-ai-providers --lib -- --ignored price_cost --nocapture`.
+    /// with `cargo test --release -p beyond-providers --lib -- --ignored price_cost --nocapture`.
     #[test]
     #[ignore = "timing probe"]
     fn price_cost() {

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 pub mod baseline;
 pub mod http;
 
-use beyond_ai_test_support::ports;
+use beyond_test_support::ports;
 
 /// The binary under test.
 pub const BIN: &str = env!("CARGO_BIN_EXE_execd");

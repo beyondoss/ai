@@ -16,7 +16,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use beyond_ai::__test::key::{Keyring, VirtualKey, mint, mint_v2, mint_v3};
+use beyond_gateway::__test::key::{Keyring, VirtualKey, mint, mint_v2, mint_v3};
 use libfuzzer_sys::fuzz_target;
 use std::sync::OnceLock;
 

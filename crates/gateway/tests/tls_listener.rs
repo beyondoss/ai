@@ -7,8 +7,8 @@
 
 mod common;
 
-use beyond_ai::__test::key::{VirtualKey, mint};
-use beyond_ai_test_support::ports::{GATEWAY_TLS_LISTEN, gateway_tls_port};
+use beyond_gateway::__test::key::{VirtualKey, mint};
+use beyond_test_support::ports::{GATEWAY_TLS_LISTEN, gateway_tls_port};
 use common::*;
 use std::path::PathBuf;
 use std::time::Duration;

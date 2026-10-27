@@ -4,9 +4,9 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use beyond_ai_agent::grant::{GrantError, GrantVerifier, SealKeySource};
-use beyond_ai_demo::keys::{GrantKeys, MintArgs, mint_grant};
-use beyond_ai_test_support::grant::Minter;
+use beyond_agent::grant::{GrantError, GrantVerifier, SealKeySource};
+use beyond_demo::keys::{GrantKeys, MintArgs, mint_grant};
+use beyond_test_support::grant::Minter;
 
 fn keys() -> GrantKeys {
     GrantKeys {
@@ -112,10 +112,10 @@ fn a_grant_from_other_keys_is_refused() {
 #[cfg(feature = "gateway-key")]
 #[test]
 fn generated_gateway_key_verifies_under_its_public_key() {
-    use beyond_ai::__test::key::Keyring;
+    use beyond_gateway::__test::key::Keyring;
     use ed25519_dalek::VerifyingKey;
 
-    let v = beyond_ai_demo::keys::generate().unwrap();
+    let v = beyond_demo::keys::generate().unwrap();
     let pubkey: [u8; 32] = STANDARD
         .decode(v["gateway_signing_pub"].as_str().unwrap())
         .unwrap()
@@ -142,15 +142,15 @@ fn generated_gateway_key_verifies_under_its_public_key() {
 #[cfg(feature = "agent-lib")]
 #[test]
 fn a_forged_notify_token_fails_on_its_tag_and_a_real_one_verifies() {
-    use beyond_ai_agent::notify_token::{NotifyKey, Verdict};
+    use beyond_agent::notify_token::{NotifyKey, Verdict};
 
     let k = keys();
     // SAFETY-free: the minter reads the secret from the environment, so give it one through the
     // key type it wraps instead.
     let key = NotifyKey::from_secret_bytes(&k.fleet_secret);
     let (tenant, session, job) = ("demo-tenant", "demo.abc", "0123456789abcdef");
-    let scope = beyond_ai_agent::exec_endpoint::jobs::JobScope::for_session(Some(tenant), session);
-    let id = beyond_ai_agent::exec_endpoint::jobs::JobId::parse(job).unwrap();
+    let scope = beyond_agent::exec_endpoint::jobs::JobScope::for_session(Some(tenant), session);
+    let id = beyond_agent::exec_endpoint::jobs::JobId::parse(job).unwrap();
     let real = key.mint(tenant, session, &id);
     assert!(matches!(
         key.verify(&real, tenant, session, scope.name(), job),
@@ -165,8 +165,8 @@ fn a_forged_notify_token_fails_on_its_tag_and_a_real_one_verifies() {
     ));
 }
 
-fn connector(name: &str, url: &str) -> beyond_ai_demo::keys::Connector {
-    beyond_ai_demo::keys::Connector {
+fn connector(name: &str, url: &str) -> beyond_demo::keys::Connector {
+    beyond_demo::keys::Connector {
         name: name.into(),
         url: url.into(),
         ..Default::default()
@@ -182,17 +182,17 @@ fn connectors_limits_and_a_managed_token_are_accepted_by_the_agents_verifier() {
     let a = MintArgs {
         connectors: vec![
             connector("deepwiki", "https://mcp.deepwiki.com/mcp"),
-            beyond_ai_demo::keys::Connector {
+            beyond_demo::keys::Connector {
                 sandbox: true,
                 headers: vec![("e2b-traffic-access-token".into(), "tt".into())],
                 ..connector("browser", "https://8931-x.e2b.app/mcp")
             },
-            beyond_ai_demo::keys::Connector {
+            beyond_demo::keys::Connector {
                 managed: true,
                 ..connector("vault", "http://1.2.3.4:8082/managed/vault/mcp")
             },
         ],
-        limits: Some(beyond_ai_demo::keys::Limits {
+        limits: Some(beyond_demo::keys::Limits {
             models: Some(vec!["gpt-5-mini".into()]),
             tools: Some(vec!["read".into()]),
             max_steps: Some(9),
@@ -238,7 +238,7 @@ fn a_managed_connector_without_the_shared_secret_is_not_minted() {
         ..keys()
     };
     let a = MintArgs {
-        connectors: vec![beyond_ai_demo::keys::Connector {
+        connectors: vec![beyond_demo::keys::Connector {
             managed: true,
             ..connector("vault", "http://x/managed/vault/mcp")
         }],
@@ -253,11 +253,11 @@ fn a_managed_connector_without_the_shared_secret_is_not_minted() {
 #[cfg(feature = "agent-lib")]
 #[test]
 fn inspecting_a_managed_grant_finds_the_token_and_not_a_third_party_key() {
-    use beyond_ai_demo::keys::inspect_grant;
+    use beyond_demo::keys::inspect_grant;
 
     let k = keys();
     let a = MintArgs {
-        connectors: vec![beyond_ai_demo::keys::Connector {
+        connectors: vec![beyond_demo::keys::Connector {
             managed: true,
             ..connector("vault", "http://1.2.3.4:8082/managed/vault/mcp")
         }],
@@ -284,7 +284,7 @@ fn inspecting_a_managed_grant_finds_the_token_and_not_a_third_party_key() {
 #[cfg(feature = "agent-lib")]
 #[test]
 fn inspecting_a_bundle_grant_shows_no_exec_endpoint_and_the_bundles_hash() {
-    use beyond_ai_demo::keys::{Bundle, inspect_grant};
+    use beyond_demo::keys::{Bundle, inspect_grant};
 
     let k = keys();
     let sha = "ab".repeat(32);

@@ -7,7 +7,7 @@
 //! Do not fix anything here. A deliberate change of behaviour changes both sides in one commit.
 #![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
-use beyond_ai::__test::peek;
+use beyond_gateway::__test::peek;
 
 /// The old buffered path's edits, in its order, offsets adjusted by hand: the clamp, then (on a
 /// native OpenAI Chat attempt) the `max_tokens` rename, each re-scanning when it changed the body;
@@ -88,7 +88,7 @@ pub fn clamp_output_limits(
 }
 
 /// Respell a root `max_tokens` as `max_completion_tokens`, in place. `keys` is
-/// [`beyond_ai::peek::BufferedScan::limit_keys`]. When both are present the explicit `max_completion_tokens`
+/// [`beyond_gateway::peek::BufferedScan::limit_keys`]. When both are present the explicit `max_completion_tokens`
 /// wins and the `max_tokens` member is removed. `true` when the body changed, so the caller
 /// re-scans the moved bytes.
 pub fn rename_max_tokens(body: &mut Vec<u8>, keys: &[Option<usize>; 3]) -> bool {
@@ -141,7 +141,7 @@ pub fn rename_max_tokens(body: &mut Vec<u8>, keys: &[Option<usize>; 3]) -> bool 
 
 /// Overwrite the `model` value's bytes with the id the chosen candidate uses.
 ///
-/// `span` comes from [`beyond_ai::peek::BufferedScan::model_span`] and covers the raw value, quotes excluded.
+/// `span` comes from [`beyond_gateway::peek::BufferedScan::model_span`] and covers the raw value, quotes excluded.
 /// The replacement is a catalog string, so it needs no JSON escaping — the catalog charset test
 /// (`model_names_are_lowercase_and_log_safe`, plus the same shape for `upstream_model`) is what
 /// makes a raw byte copy safe here.

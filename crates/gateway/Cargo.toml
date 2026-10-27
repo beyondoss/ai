@@ -1,5 +1,5 @@
 [package]
-name = "beyond-ai"
+name = "beyond-gateway"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,7 @@ rust-version.workspace = true
 description = "Beyond AI gateway — egress L7 proxy to LLM providers"
 
 [lib]
-name = "beyond_ai"
+name = "beyond_gateway"
 path = "src/lib.rs"
 
 [[bin]]
@@ -35,7 +35,7 @@ store = { package = "beyond-slipstream", version = "0.8.0" }
 # so the gateway's proxy routing and the agent's direct routing can never disagree about a provider's
 # host, wire format, or auth header. In-workspace and zero-dependency: it adds nothing to the build
 # graph or the release image.
-providers = { package = "beyond-ai-providers", path = "../providers" }
+providers = { package = "beyond-providers", path = "../providers" }
 
 pingora = { version = "0.9", default-features = false, features = ["rustls"] }
 # `drain`: the no-op storage that keeps pingora reading a cancelled stream's upstream (already in
@@ -86,9 +86,9 @@ zeroize = "1"
 [dev-dependencies]
 # This crate, with the minter: every dev target mints the keys it presents. A dev-dependency only, so
 # `cargo build` of the binary never unifies the feature in.
-beyond-ai = { path = ".", features = ["mint"] }
+beyond-gateway = { path = ".", features = ["mint"] }
 # Port read-back for test subprocesses (`ports`): no port is picked free, released and rebound.
-beyond-ai-test-support = { path = "../test-support" }
+beyond-test-support = { path = "../test-support" }
 # Bench harnesses. Best tool per job: `divan` for the unit micro-bench (it measures allocations
 # natively via AllocProfiler, alongside timing); `criterion` for the e2e macro-bench (`async_tokio`
 # drives the round-trips, and its saved-baseline comparison tracks latency/RPS over time).

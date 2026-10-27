@@ -6,7 +6,7 @@ use crate::common;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 
-use beyond_ai_agent::session_store::{SessionMeta, SessionRepo};
+use beyond_agent::session_store::{SessionMeta, SessionRepo};
 use common::{
     ISOLATED_HOME, SpawnGuarded, message_ids, read_until_event, read_until_response, serve_cmd,
     serve_dir_cmd, spawn_model_server, turn_text, turn_tool_use,

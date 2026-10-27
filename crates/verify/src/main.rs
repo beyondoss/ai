@@ -325,15 +325,15 @@ const RECONCILED: &str = r"test(/^([^:]*\+)?BIL-5(\+[^:]*)?::/)";
 /// pricing reconciled against what vendors bill (`tests/pricing_live.rs`). Every test in them is
 /// named `CLAIMS::client::...`.
 const LIVE_BINARIES: &[&str] = &[
-    "beyond-ai-verify::live",
-    "beyond-ai-verify::reconcile_live",
-    "beyond-ai-verify::parity_live",
-    "beyond-ai-verify::catalog_live",
-    "beyond-ai-verify::tenancy_live",
-    "beyond-ai-verify::session_live",
-    "beyond-ai-verify::fault_live",
-    "beyond-ai-verify::long_live",
-    "beyond-ai-verify::pricing_live",
+    "beyond-verify::live",
+    "beyond-verify::reconcile_live",
+    "beyond-verify::parity_live",
+    "beyond-verify::catalog_live",
+    "beyond-verify::tenancy_live",
+    "beyond-verify::session_live",
+    "beyond-verify::fault_live",
+    "beyond-verify::long_live",
+    "beyond-verify::pricing_live",
 ];
 
 /// One live cell's result, parsed from its name `CLAIMS::client::route::probe`.

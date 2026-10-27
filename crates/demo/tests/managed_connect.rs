@@ -8,13 +8,13 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use beyond_ai_agent::grant::{GrantVerifier, SealKeySource};
-use beyond_ai_agent::tools::mcp::{self, McpEgress};
-use beyond_ai_agent::tools::web::ssrf::EgressPolicy;
-use beyond_ai_demo::keys::{Connector, GrantKeys, MintArgs, mint_grant};
-use beyond_ai_demo::managed::Standin;
-use beyond_ai_test_support::grant::Minter;
-use beyond_ai_test_support::ports;
+use beyond_agent::grant::{GrantVerifier, SealKeySource};
+use beyond_agent::tools::mcp::{self, McpEgress};
+use beyond_agent::tools::web::ssrf::EgressPolicy;
+use beyond_demo::keys::{Connector, GrantKeys, MintArgs, mint_grant};
+use beyond_demo::managed::Standin;
+use beyond_test_support::grant::Minter;
+use beyond_test_support::ports;
 use serde_json::json;
 
 const REAL_SECRET: &str = "psk_live_must_never_reach_the_agent";

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use beyond_ai_test_support::ports;
+use beyond_test_support::ports;
 use serde_json::{Value, json};
 use support::http::{post, send};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

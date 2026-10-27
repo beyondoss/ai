@@ -19,7 +19,7 @@ struct Gateway {
 }
 
 fn gateway() -> Gateway {
-    let listener = beyond_ai_test_support::ports::listener();
+    let listener = beyond_test_support::ports::listener();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let hits = Arc::new(AtomicUsize::new(0));
     let seen = hits.clone();

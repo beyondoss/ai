@@ -8,12 +8,12 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use beyond_ai_agent::grant::{GrantVerifier, SealKeySource};
-use beyond_ai_agent::managed_mcp_token::{Claims, ManagedKey};
-use beyond_ai_agent::tools::mcp::{self, McpEgress, McpTools};
-use beyond_ai_agent::tools::web::ssrf::EgressPolicy;
-use beyond_ai_test_support::grant::Minter;
-use beyond_ai_test_support::ports;
+use beyond_agent::grant::{GrantVerifier, SealKeySource};
+use beyond_agent::managed_mcp_token::{Claims, ManagedKey};
+use beyond_agent::tools::mcp::{self, McpEgress, McpTools};
+use beyond_agent::tools::web::ssrf::EgressPolicy;
+use beyond_test_support::grant::Minter;
+use beyond_test_support::ports;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 

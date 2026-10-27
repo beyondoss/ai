@@ -1324,7 +1324,7 @@ mod tests {
     /// reads an entry's `created_at` and drops the rest, so no handshake or peer is needed — but the
     /// type is concrete, so *some* socket is.
     async fn parked_socket() -> WsSocket {
-        let listener = beyond_ai_test_support::ports::tokio_listener().await;
+        let listener = beyond_test_support::ports::tokio_listener().await;
         let addr = listener.local_addr().expect("bound port");
         let client = tokio::net::TcpStream::connect(addr).await.expect("connect");
         listener.accept().await.expect("accept");

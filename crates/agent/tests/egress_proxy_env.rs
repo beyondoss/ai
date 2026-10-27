@@ -22,7 +22,7 @@ use serde_json::json;
 
 /// A listener standing in for a proxy: it counts connections and answers none of them.
 fn spawn_proxy() -> (String, Arc<AtomicUsize>) {
-    let listener = beyond_ai_test_support::ports::listener();
+    let listener = beyond_test_support::ports::listener();
     let addr = listener.local_addr().unwrap();
     let hits = Arc::new(AtomicUsize::new(0));
     let counter = hits.clone();
@@ -108,7 +108,7 @@ async fn a_proxy_in_the_environment_does_not_carry_a_grant_connector_past_the_ss
 #[test]
 fn a_proxy_in_the_environment_does_not_carry_a_web_fetch_past_the_ssrf_guard() {
     let (proxy, hits) = spawn_proxy();
-    let target = beyond_ai_test_support::ports::listener();
+    let target = beyond_test_support::ports::listener();
     let port = target.local_addr().unwrap().port();
     let (base, bodies) = spawn_model_server(vec![
         turn_tool_use(

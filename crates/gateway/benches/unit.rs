@@ -39,15 +39,15 @@ fn main() {
 /// always goes first — would panic in `reject` with "registered once". The provider child
 /// series are materialised here too: that cross-product is what makes a scrape body tens of KiB
 /// from the first sample, and it has to happen exactly once regardless of which module runs first.
-fn bench_metrics() -> &'static std::sync::Arc<beyond_ai::__bench::metrics::Metrics> {
+fn bench_metrics() -> &'static std::sync::Arc<beyond_gateway::__bench::metrics::Metrics> {
     use std::sync::{Arc, OnceLock};
 
-    use beyond_ai::__bench::metrics::{Metrics, ProviderMetrics};
+    use beyond_gateway::__bench::metrics::{Metrics, ProviderMetrics};
 
     static M: OnceLock<Arc<Metrics>> = OnceLock::new();
     M.get_or_init(|| {
         let m = Metrics::new().expect("register metrics once");
-        for spec in beyond_ai::__bench::route::known_providers() {
+        for spec in beyond_gateway::__bench::route::known_providers() {
             let pm = ProviderMetrics::resolve(&m, spec.name);
             // Non-zero observations so the histogram buckets encode realistic values, not zeros.
             pm.ttft_seconds.observe(0.42);
@@ -61,7 +61,7 @@ fn bench_metrics() -> &'static std::sync::Arc<beyond_ai::__bench::metrics::Metri
 
 mod key {
     use super::*;
-    use beyond_ai::__bench::key::{Keyring, VirtualKey, mint, mint_v2};
+    use beyond_gateway::__bench::key::{Keyring, VirtualKey, mint, mint_v2};
     use ed25519_dalek::SigningKey;
 
     const ID: VirtualKey = VirtualKey {
@@ -99,9 +99,9 @@ mod key {
 
 mod admin {
     use super::*;
-    use beyond_ai::__bench::admin::{AdminApp, HEALTH_OK};
+    use beyond_gateway::__bench::admin::{AdminApp, HEALTH_OK};
 
-    fn registry() -> &'static std::sync::Arc<beyond_ai::__bench::metrics::Metrics> {
+    fn registry() -> &'static std::sync::Arc<beyond_gateway::__bench::metrics::Metrics> {
         bench_metrics()
     }
 
@@ -127,10 +127,10 @@ mod admin {
 
 mod reject {
     use super::*;
-    use beyond_ai::__bench::metrics::Rejection;
-    use beyond_ai::__bench::refusal::Refusal;
+    use beyond_gateway::__bench::metrics::Rejection;
+    use beyond_gateway::__bench::refusal::Refusal;
 
-    fn metrics() -> &'static std::sync::Arc<beyond_ai::__bench::metrics::Metrics> {
+    fn metrics() -> &'static std::sync::Arc<beyond_gateway::__bench::metrics::Metrics> {
         bench_metrics()
     }
 
@@ -160,7 +160,7 @@ mod reject {
     #[divan::bench]
     fn record_tokens_guarded(bencher: Bencher) {
         let m = metrics();
-        let usage = beyond_ai::__bench::usage::Usage {
+        let usage = beyond_gateway::__bench::usage::Usage {
             input_tokens: black_box(5000),
             output_tokens: black_box(2500),
             cache_read_tokens: 0,
@@ -207,7 +207,7 @@ mod reject {
 
 mod route {
     use super::*;
-    use beyond_ai::__bench::route::{Dialect, dialect_default};
+    use beyond_gateway::__bench::route::{Dialect, dialect_default};
 
     // Dialect → default provider name: the per-request routing decision (sans override). 0-alloc.
     #[divan::bench(args = [Dialect::OpenAi, Dialect::Anthropic])]
@@ -338,8 +338,8 @@ mod resp_tail {
 
 mod state {
     use super::*;
-    use beyond_ai::AiConfig;
-    use beyond_ai::GatewayState;
+    use beyond_gateway::AiConfig;
+    use beyond_gateway::GatewayState;
     use std::sync::{Arc, OnceLock};
 
     fn state() -> &'static Arc<GatewayState> {
@@ -365,17 +365,17 @@ mod state {
 
 mod deny {
     use super::*;
-    use beyond_ai::__bench::deny::{self, DenyReason, DenySet};
+    use beyond_gateway::__bench::deny::{self, DenyReason, DenySet};
 
     // --- ingest path: parse a watched NATS key/value into the set (off the request hot path) ---
 
     #[divan::bench]
-    fn parse_key() -> Option<beyond_ai::__bench::deny::DenyTarget> {
+    fn parse_key() -> Option<beyond_gateway::__bench::deny::DenyTarget> {
         deny::parse_key(black_box("blackhole.123456789"))
     }
 
     #[divan::bench]
-    fn parse_reason_bare() -> beyond_ai::__bench::deny::DenyReason {
+    fn parse_reason_bare() -> beyond_gateway::__bench::deny::DenyReason {
         deny::parse_reason(black_box(b"spend"))
     }
 
@@ -384,7 +384,7 @@ mod deny {
     /// `Cow` borrowed straight out of the input. A non-zero alloc column here means someone
     /// reintroduced an owning parse — on a seed/rescan this runs once per entry.
     #[divan::bench]
-    fn parse_reason_json() -> beyond_ai::__bench::deny::DenyReason {
+    fn parse_reason_json() -> beyond_gateway::__bench::deny::DenyReason {
         deny::parse_reason(black_box(br#"{"reason":"fraud","exp":123}"#))
     }
 
@@ -396,7 +396,7 @@ mod deny {
     /// `String` (5 B). The control plane doesn't write escapes, so this is the rare path; it is
     /// benched to keep the borrowed case above honest about what it is avoiding.
     #[divan::bench]
-    fn parse_reason_json_escaped() -> beyond_ai::__bench::deny::DenyReason {
+    fn parse_reason_json_escaped() -> beyond_gateway::__bench::deny::DenyReason {
         deny::parse_reason(black_box(br#"{"reason":"\u0066raud","exp":123}"#))
     }
 
@@ -431,8 +431,8 @@ mod deny {
 /// almost every request pays and the only number that has to be free.
 mod capture {
     use super::*;
-    use beyond_ai::__bench::capture::{CaptureBufs, CaptureRule, CaptureSet};
-    use beyond_ai::__bench::control::Control;
+    use beyond_gateway::__bench::capture::{CaptureBufs, CaptureRule, CaptureSet};
+    use beyond_gateway::__bench::control::Control;
     use pingora::http::RequestHeader;
 
     const DEFAULTS: CaptureRule = CaptureRule {
@@ -506,7 +506,7 @@ mod capture {
 
 mod ratelimit {
     use super::*;
-    use beyond_ai::__bench::ratelimit::RateLimit;
+    use beyond_gateway::__bench::ratelimit::RateLimit;
     use std::cell::Cell;
     use std::sync::LazyLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -620,7 +620,7 @@ mod ratelimit {
 
 mod circuit_breaker {
     use super::*;
-    use beyond_ai::__bench::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+    use beyond_gateway::__bench::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
     use std::time::Duration;
 
     /// Production shape: the windowed policy `config.rs` always builds, with the default threshold.
@@ -657,7 +657,7 @@ mod circuit_breaker {
 
 mod usage {
     use super::*;
-    use beyond_ai::__bench::usage::{self, Usage};
+    use beyond_gateway::__bench::usage::{self, Usage};
 
     const OAI: &[u8] = br#"{"usage":{"prompt_tokens":12,"completion_tokens":34,"prompt_tokens_details":{"cached_tokens":4}}}"#;
     const ANT: &[u8] = br#"{"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":10,"cache_creation_input_tokens":7}}"#;
@@ -796,7 +796,7 @@ mod usage {
 
 mod peek {
     use super::*;
-    use beyond_ai::__bench::peek::ModelScanner;
+    use beyond_gateway::__bench::peek::ModelScanner;
 
     /// A realistic chat body with `padding` bytes of message content, the root `model` placed
     /// **last** so the scanner must walk the whole body (worst case for the streaming scan).
@@ -873,7 +873,7 @@ mod peek {
             .into_bytes()
     }
 
-    use beyond_ai::__bench::peek::scan_buffered;
+    use beyond_gateway::__bench::peek::scan_buffered;
 
     /// Both answers a managed OpenAI chat request needs (the root `model`, and where
     /// `stream_options` goes) from one pass over the buffered body.
@@ -939,7 +939,7 @@ mod peek {
             let b = black_box(&body);
             let mut buf = Vec::with_capacity(b.len() + FRAG.len());
             buf.extend_from_slice(b);
-            beyond_ai::__bench::ScannedBody::new(buf)
+            beyond_gateway::__bench::ScannedBody::new(buf)
                 .clamp_output_limits(16_384)
                 .into_upstream(true, Some(b"gpt-4o"))
         });
@@ -948,8 +948,8 @@ mod peek {
 
 mod store_watch {
     use super::*;
-    use beyond_ai::__bench::deny::{DenyReason, DenySet};
-    use beyond_ai::__bench::store_watch::apply_batch;
+    use beyond_gateway::__bench::deny::{DenyReason, DenySet};
+    use beyond_gateway::__bench::store_watch::apply_batch;
     use store::{KvEntry, KvUpdate, VersionToken};
 
     /// A realistically-sized live deny-set. The set is O(denied), not O(tenants), so a few thousand
@@ -1045,7 +1045,7 @@ mod store_watch {
 /// two lookups (key, then tenant); v1 pays the tenant lookup only.
 mod allowance {
     use super::*;
-    use beyond_ai::__bench::allowance::{AllowanceSet, AllowanceTarget};
+    use beyond_gateway::__bench::allowance::{AllowanceSet, AllowanceTarget};
 
     /// `n` exhausted tenants and `n` exhausted keys. Built outside the timed closure.
     fn populated(n: u64) -> AllowanceSet {
@@ -1084,8 +1084,8 @@ mod allowance {
 /// (rendezvous hash of the first-party lead, usable first). No allocation, no lock, no state.
 mod pin_order {
     use super::*;
-    use beyond_ai::__bench::control::Walk;
-    use beyond_ai::__bench::pin::{affinity, order};
+    use beyond_gateway::__bench::control::Walk;
+    use beyond_gateway::__bench::pin::{affinity, order};
 
     #[divan::bench]
     fn order_pinned(bencher: Bencher) {
@@ -1111,8 +1111,8 @@ mod response_cache {
     use std::sync::LazyLock;
     use std::time::Duration;
 
-    use beyond_ai::__bench::cache::{self, CacheKey, CachedResponse, ResponseCache};
-    use beyond_ai::__bench::usage::Usage;
+    use beyond_gateway::__bench::cache::{self, CacheKey, CachedResponse, ResponseCache};
+    use beyond_gateway::__bench::usage::Usage;
     use bytes::Bytes;
 
     fn entry(body: &[u8]) -> CachedResponse {
@@ -1220,8 +1220,8 @@ mod response_cache {
 /// actually sit next to `key/verify`.
 mod translate {
     use super::*;
-    use beyond_ai::__bench::route::Endpoint;
-    use beyond_ai::__bench::translate::{self, SseBridge};
+    use beyond_gateway::__bench::route::Endpoint;
+    use beyond_gateway::__bench::translate::{self, SseBridge};
 
     fn chat_request(padding: usize) -> Vec<u8> {
         let content = "x".repeat(padding);
@@ -1347,7 +1347,7 @@ mod translate {
 /// row needs it).
 mod input_tally {
     use super::*;
-    use beyond_ai::__bench::usage::InputTally;
+    use beyond_gateway::__bench::usage::InputTally;
 
     /// The proxy module's source, one text: the kind of file a coding agent sends.
     const PROXY_SRC: [&str; 10] = [
@@ -1442,7 +1442,7 @@ mod input_tally {
 /// id is copied after one `memmem`.
 mod signed_id {
     use super::*;
-    use beyond_ai::__bench::signed_id::{Relay, Signer};
+    use beyond_gateway::__bench::signed_id::{Relay, Signer};
 
     const RESP: &str = "resp_0750331520328311006abeeacfb62c87d0bdb6cbe1c41eea26";
     const MSG: &str = "msg_0750331520328311006abeead0270c87d0b8128a81f8474fea";
@@ -1562,8 +1562,8 @@ fn prose_body(len: usize) -> Vec<u8> {
 /// size (`BytesCount`). Run with `cargo bench --bench unit -- translate_heap`.
 mod translate_heap {
     use super::*;
-    use beyond_ai::__bench::route::Endpoint;
-    use beyond_ai::__bench::translate;
+    use beyond_gateway::__bench::route::Endpoint;
+    use beyond_gateway::__bench::translate;
 
     const N: usize = 4 << 20;
 
@@ -1772,7 +1772,7 @@ mod translate_heap {
 /// `translate::responses_session_field`) and the same-wire Claude relay's reasoning gate.
 mod body_gates {
     use super::*;
-    use beyond_ai::__bench::{route, translate};
+    use beyond_gateway::__bench::{route, translate};
     use providers::catalog::{IN_IMAGE, MODEL_ROUTES, serves_file_input};
 
     fn no_image_row() -> &'static route::ModelRoute {
@@ -1840,8 +1840,8 @@ mod body_gates {
 /// relay, which drops the identity fields OpenRouter repeats on every chunk).
 mod chat_relay {
     use super::*;
-    use beyond_ai::__bench::route::Endpoint;
-    use beyond_ai::__bench::translate::SseBridge;
+    use beyond_gateway::__bench::route::Endpoint;
+    use beyond_gateway::__bench::translate::SseBridge;
 
     const FIRST: &[u8] = b"data: {\"id\":\"gen-1\",\"provider\":\"Anthropic\",\"model\":\"anthropic/claude-sonnet-4.5\",\"object\":\"chat.completion.chunk\",\"created\":1790000000,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null,\"native_finish_reason\":null,\"logprobs\":null}]}\n\n";
 
@@ -1874,8 +1874,8 @@ mod chat_relay {
 /// fell behind): the buffer is compacted once per chunk, not drained per event.
 mod sse_feed {
     use super::*;
-    use beyond_ai::__bench::route::Endpoint;
-    use beyond_ai::__bench::translate::SseBridge;
+    use beyond_gateway::__bench::route::Endpoint;
+    use beyond_gateway::__bench::translate::SseBridge;
 
     #[divan::bench(args = [16, 1024])]
     fn messages_to_chat_batch(bencher: Bencher, n: usize) {

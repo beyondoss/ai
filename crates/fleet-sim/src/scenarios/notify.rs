@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use beyond_ai_test_support::exec_mock::{ExecMock, MockOptions};
-use beyond_ai_test_support::{spawn_model_server_routed, turn_text, turn_tool_use};
+use beyond_test_support::exec_mock::{ExecMock, MockOptions};
+use beyond_test_support::{spawn_model_server_routed, turn_text, turn_tool_use};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

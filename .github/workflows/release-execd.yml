@@ -1,5 +1,5 @@
 name: Release execd
-# Builds beyond-ai-execd (the in-sandbox exec endpoint) as a fully static musl binary for linux/amd64
+# Builds beyond-execd (the in-sandbox exec endpoint) as a fully static musl binary for linux/amd64
 # and linux/arm64 and attaches execd-<tag>-linux-<arch>.tar.gz (+ .sha256) and install-execd.sh to
 # the tag's GitHub Release. Sibling of release-agent.yml, same reasoning: native musl-gcc on a native
 # runner per arch (no cross-linker), and `relocation-model=static` because a static-pie musl binary
@@ -55,7 +55,7 @@ jobs:
           test -x "$profdata" || { echo "llvm-profdata missing at $profdata"; exit 1; }
 
           RUSTFLAGS="-Cprofile-generate=$PROFDIR/raw -C relocation-model=static" \
-            cargo build --release --locked -p beyond-ai-execd --target ${{ matrix.target }}
+            cargo build --release --locked -p beyond-execd --target ${{ matrix.target }}
           python3 .github/pgo-train-execd.py \
             "target/${{ matrix.target }}/release/execd" "$PROFDIR/raw"
           "$profdata" merge -o "$PROFDIR/merged.profdata" "$PROFDIR"/raw/*.profraw
@@ -63,7 +63,7 @@ jobs:
           # Never let the shipped binary inherit instrumentation.
           rm -rf "target/${{ matrix.target }}/release"
           RUSTFLAGS="-Cprofile-use=$PROFDIR/merged.profdata -C relocation-model=static" \
-            cargo build --release --locked -p beyond-ai-execd --target ${{ matrix.target }}
+            cargo build --release --locked -p beyond-execd --target ${{ matrix.target }}
       - name: Verify the binary is static
         run: |
           bin="target/${{ matrix.target }}/release/execd"

@@ -17,13 +17,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
-use beyond_ai_agent::exec_endpoint::jobs::{JobId, JobScope};
-use beyond_ai_agent::notify_token::NotifyKey;
-use beyond_ai_agent::serve_ws::job_ended;
-use beyond_ai_agent::tools::job_notify::kernel::{
+use beyond_agent::exec_endpoint::jobs::{JobId, JobScope};
+use beyond_agent::notify_token::NotifyKey;
+use beyond_agent::serve_ws::job_ended;
+use beyond_agent::tools::job_notify::kernel::{
     Action, Event, Facts, JobState, KeepOutcome, Listed, TableJob,
 };
-use beyond_ai_agent::tools::job_notify::{JobTracker, NotifyHub, SessionNotify};
+use beyond_agent::tools::job_notify::{JobTracker, NotifyHub, SessionNotify};
 use common::service::Service;
 use common::{spawn_model_server, ws_connect_with_headers, ws_read_until_response, ws_send};
 use futures::future::BoxFuture;
@@ -1062,7 +1062,7 @@ async fn one_report_per_end() {
 /// for a session not held here.
 #[tokio::test]
 async fn the_receiver_counts_what_it_answers() {
-    let metrics = beyond_ai_agent::metrics::Metrics::new().unwrap();
+    let metrics = beyond_agent::metrics::Metrics::new().unwrap();
     let hub = NotifyHub::with_metrics(fixture_key(), Some(metrics.clone()));
     let (tenant, session) = fx_url_session();
     let scope = JobScope::for_session(Some(&tenant), &session);

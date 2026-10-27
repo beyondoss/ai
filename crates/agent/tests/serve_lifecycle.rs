@@ -66,7 +66,7 @@ impl Collector {
     }
 
     fn spawn_tcp(held: bool) -> Self {
-        let listener = beyond_ai_test_support::ports::listener();
+        let listener = beyond_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let posts = Arc::new(Mutex::new(Vec::new()));
         let hold = Arc::new(Hold {
@@ -721,7 +721,7 @@ fn new_session_on_an_addressed_session_posts_session_archived_and_the_slot_is_na
     let bodies = collector.wait_until(|b| of_type(b, "session_archived").len() == 1);
     let ev = of_type(&bodies, "session_archived")[0];
 
-    let sibling = beyond_ai_agent::session_store::SessionRepo::open(dir.path())
+    let sibling = beyond_agent::session_store::SessionRepo::open(dir.path())
         .unwrap()
         .list()
         .unwrap()

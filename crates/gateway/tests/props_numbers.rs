@@ -11,8 +11,8 @@
 
 mod props_support;
 
-use beyond_ai::__test::route::Endpoint;
-use beyond_ai::__test::translate;
+use beyond_gateway::__test::route::Endpoint;
+use beyond_gateway::__test::translate;
 use props_support::*;
 use proptest::prelude::*;
 use serde_json::{Value, json};

@@ -19,10 +19,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use beyond_ai_agent::tools::exec::{CommandRunner, ExecResult};
-use beyond_ai_agent::tools::fs::FsBackend;
-use beyond_ai_agent::tools::fs::shell::{Capabilities, ShellFs};
-use beyond_ai_agent::tools::{ToolConfig, default_registry_with_config};
+use beyond_agent::tools::exec::{CommandRunner, ExecResult};
+use beyond_agent::tools::fs::FsBackend;
+use beyond_agent::tools::fs::shell::{Capabilities, ShellFs};
+use beyond_agent::tools::{ToolConfig, default_registry_with_config};
 use serde_json::{Value, json};
 
 /// The sandbox's home. Nothing like any real `$HOME`, so an expansion against the wrong one is

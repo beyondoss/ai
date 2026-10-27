@@ -24,7 +24,7 @@ SIM=${SIM:-/home/jared/ai/target/debug/fleet-sim}
 MOCK=${MOCK:-127.0.0.1:19000}
 OCTET=$((66 + RANDOM % 60))
 
-[ -x "$BIN" ] || { echo "no agent binary at $BIN (cargo build -p beyond-ai-agent)" >&2; exit 1; }
+[ -x "$BIN" ] || { echo "no agent binary at $BIN (cargo build -p beyond-agent)" >&2; exit 1; }
 
 # Refuse to start on top of a previous fleet, loudly.
 #

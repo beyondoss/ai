@@ -4,8 +4,8 @@
 The numbers in crates/agent/ARCHITECTURE.md ("Deferred MCP tools") come from this script. Every
 subcommand drives the real release binaries; keys come from the environment or the repo's `.env`.
 
-    cargo build --release -p beyond-ai-agent
-    CARGO_TARGET_DIR=target/code-mode cargo build --release -p beyond-ai-agent --features code-mode
+    cargo build --release -p beyond-agent
+    CARGO_TARGET_DIR=target/code-mode cargo build --release -p beyond-agent --features code-mode
 
     python3 crates/agent/eval/mcp_loading.py first-request   # first-request tokens, real usage
     python3 crates/agent/eval/mcp_loading.py session         # cache over a multi-turn session

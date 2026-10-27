@@ -27,10 +27,10 @@ the repo, and you can run them: `mise run verify:status`,
 
 ```sh
 # the agent, with your own provider key
-ANTHROPIC_API_KEY=sk-ant-... cargo run -p beyond-ai-agent -- run "add a CHANGELOG entry"
+ANTHROPIC_API_KEY=sk-ant-... cargo run -p beyond-agent -- run "add a CHANGELOG entry"
 
 # the gateway, in front of any OpenAI client (BYO keys need no config)
-cargo run -p beyond-ai --release &
+cargo run -p beyond-gateway --release &
 curl localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $OPENAI_API_KEY" -H 'Content-Type: application/json' \
   -d '{"model":"gpt-5-mini","messages":[{"role":"user","content":"hi"}]}'
@@ -38,19 +38,19 @@ curl localhost:8080/v1/chat/completions \
 
 ## Packages
 
-| Path                                       | Package                  | What it is                                                                              |
-| ------------------------------------------ | ------------------------ | --------------------------------------------------------------------------------------- |
-| [`crates/gateway`](crates/gateway)         | `beyond-ai`              | The LLM egress proxy (binary `beyond-ai`).                                              |
-| [`crates/agent`](crates/agent)             | `beyond-ai-agent`        | The agent: `run`, `serve`, `serve --service` (binary `beyond-ai-agent`).                |
-| [`crates/agent-core`](crates/agent-core)   | `beyond-ai-agent-core`   | The agent loop as a library: messages, tool dispatch, compaction, three provider wires. |
-| [`crates/providers`](crates/providers)     | `beyond-ai-providers`    | Provider table, model catalog and the pricing contract. No dependencies.                |
-| [`crates/exec-notify`](crates/exec-notify) | `beyond-ai-exec-notify`  | Exec protocol v1.4 job-end callback rules as a pure function. No dependencies.          |
-| [`crates/execd`](crates/execd)             | `beyond-ai-execd`        | The exec endpoint for a sandbox: exec protocol v1.1 to v1.4 in one static binary.       |
-| `crates/demo`                              | `beyond-ai-demo`         | Sandbox exec endpoint, key and grant minters, chat client for `deploy/demo`.            |
-| `crates/fleet-sim`                         | `beyond-ai-fleet-sim`    | Runs a replica set against a shared filesystem and checks the fleet design's claims.    |
-| `crates/test-support`                      | `beyond-ai-test-support` | Test doubles shared by the agent's tests and the simulator.                             |
-| `crates/verify`                            | `beyond-ai-verify`       | Claim registry and defect ledger for the gateway ([`verify/`](verify/README.md)).       |
-| `crates/rates-sync`                        | `beyond-ai-rates-sync`   | Fetches vendors' pricing sources and generates the rate table.                          |
+| Path                                       | Package               | What it is                                                                              |
+| ------------------------------------------ | --------------------- | --------------------------------------------------------------------------------------- |
+| [`crates/gateway`](crates/gateway)         | `beyond-gateway`      | The LLM egress proxy (binary `beyond-ai`).                                              |
+| [`crates/agent`](crates/agent)             | `beyond-agent`        | The agent: `run`, `serve`, `serve --service` (binary `beyond-ai-agent`).                |
+| [`crates/agent-core`](crates/agent-core)   | `beyond-agent-core`   | The agent loop as a library: messages, tool dispatch, compaction, three provider wires. |
+| [`crates/providers`](crates/providers)     | `beyond-providers`    | Provider table, model catalog and the pricing contract. No dependencies.                |
+| [`crates/exec-notify`](crates/exec-notify) | `beyond-exec-notify`  | Exec protocol v1.4 job-end callback rules as a pure function. No dependencies.          |
+| [`crates/execd`](crates/execd)             | `beyond-execd`        | The exec endpoint for a sandbox: exec protocol v1.1 to v1.4 in one static binary.       |
+| `crates/demo`                              | `beyond-demo`         | Sandbox exec endpoint, key and grant minters, chat client for `deploy/demo`.            |
+| `crates/fleet-sim`                         | `beyond-fleet-sim`    | Runs a replica set against a shared filesystem and checks the fleet design's claims.    |
+| `crates/test-support`                      | `beyond-test-support` | Test doubles shared by the agent's tests and the simulator.                             |
+| `crates/verify`                            | `beyond-verify`       | Claim registry and defect ledger for the gateway ([`verify/`](verify/README.md)).       |
+| `crates/rates-sync`                        | `beyond-rates-sync`   | Fetches vendors' pricing sources and generates the rate table.                          |
 
 The last five are not published.
 
@@ -88,7 +88,7 @@ gateway:
   breakers.
 
 ```sh
-cargo run -p beyond-ai --release     # BYO keys need no config; listens on :8080
+cargo run -p beyond-gateway --release     # BYO keys need no config; listens on :8080
 curl localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $OPENAI_API_KEY" -H 'Content-Type: application/json' \
   -d '{"model":"gpt-5-mini","messages":[{"role":"user","content":"hi"}]}'
@@ -103,7 +103,7 @@ Managed keys, the catalog and configuration: [`crates/gateway`](crates/gateway/R
 done.
 
 ```sh
-ANTHROPIC_API_KEY=sk-ant-... cargo run -p beyond-ai-agent -- run "add a CHANGELOG entry"
+ANTHROPIC_API_KEY=sk-ant-... cargo run -p beyond-agent -- run "add a CHANGELOG entry"
 ```
 
 | Mode              | What you get                                                                                              |
@@ -145,7 +145,7 @@ Tasks run with [mise](https://mise.jdx.dev); `mise tasks` lists them.
 mise run ai:mint-dev-key     # a dev-only signing key and bai_v1 token for the gateway
 mise run test:unit:rs        # unit tests
 mise run bench               # micro-benchmarks and end-to-end throughput
-cargo nextest run -p beyond-ai-agent -E 'test(/^serve_approval::/)'   # one test module
+cargo nextest run -p beyond-agent -E 'test(/^serve_approval::/)'   # one test module
 ```
 
 CI runs on Linux only, the only platform the project supports. Markdown is

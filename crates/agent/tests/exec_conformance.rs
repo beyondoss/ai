@@ -6,7 +6,7 @@
 //! ```sh
 //! AGENT_CONFORMANCE_EXEC_URL=https://exec.example/run \
 //! AGENT_CONFORMANCE_EXEC_HEADER='Authorization: Bearer …' \
-//!   cargo nextest run -p beyond-ai-agent -E 'test(/^exec_conformance::/)' --no-capture
+//!   cargo nextest run -p beyond-agent -E 'test(/^exec_conformance::/)' --no-capture
 //! ```
 //!
 //! It requires v1.2; set `AGENT_CONFORMANCE_ALLOW_V11=1` to accept a v1.1 endpoint (whose streaming
@@ -28,7 +28,7 @@ use crate::common;
 
 use std::time::Duration;
 
-use beyond_ai_agent::exec_endpoint::conformance::{self, Expectations, Verdict, verify};
+use beyond_agent::exec_endpoint::conformance::{self, Expectations, Verdict, verify};
 use common::exec_mock::{ExecMock, MockOptions, NotifyFaults, Protocol};
 
 /// The mocks heartbeat fast so the verifier's silent command need not wait out the spec's 5 s.
@@ -467,7 +467,7 @@ async fn a_live_endpoint_conforms() {
     let headers: Vec<(String, String)> = std::env::var("AGENT_CONFORMANCE_EXEC_HEADER")
         .ok()
         .filter(|h| !h.is_empty())
-        .map(|h| beyond_ai_agent::exec_endpoint::HttpExecRunner::parse_header(&h).unwrap())
+        .map(|h| beyond_agent::exec_endpoint::HttpExecRunner::parse_header(&h).unwrap())
         .into_iter()
         .collect();
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());

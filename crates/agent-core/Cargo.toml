@@ -1,5 +1,5 @@
 [package]
-name = "beyond-ai-agent-core"
+name = "beyond-agent-core"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,7 @@ description = "Beyond agent harness — runtime-agnostic core: messages, tools, 
 
 [lib]
 # Short, ergonomic extern name (`use agent_core::…`); the published/depended-on package stays
-# `beyond-ai-agent-core`. Same split the gateway uses (package `beyond-ai` / lib `beyond_ai`).
+# `beyond-agent-core`. Same split the gateway uses (package `beyond-gateway` / lib `beyond_gateway`).
 name = "agent_core"
 path = "src/lib.rs"
 
@@ -31,7 +31,7 @@ memchr = "2"
 # The shared provider table — `AggregatorHost` (re-exported from `models`) and the wire/auth facts that
 # let `Dialect::for_model_via_provider` know an OpenRouter-served `anthropic/claude-…` is an *OpenAI*-wire
 # request. Same rows the gateway routes on, so the two can't disagree. Zero-dependency, in-workspace.
-providers = { package = "beyond-ai-providers", path = "../providers" }
+providers = { package = "beyond-providers", path = "../providers" }
 # `rc` enables `#[derive(Serialize, Deserialize)]` for the `Arc<str>` payloads on `ContentBlock` /
 # `ImageSource` (M8/[T4-F8]). An `Arc<str>` still (de)serializes as a plain JSON string — each block
 # deserializes its payload into its own allocation, so the on-disk/wire format is byte-identical; the
@@ -93,7 +93,7 @@ zstd = "0.14"
 
 [dev-dependencies]
 # Loopback listeners for the socket tests (`ports`): the one place a test binds port 0.
-beyond-ai-test-support = { path = "../test-support" }
+beyond-test-support = { path = "../test-support" }
 # Bench harness for the streaming decode hot path. `divan` (the workspace's `bench:unit` pin, matching
 # gateway/agent) measures **allocations** natively via its `AllocProfiler` global allocator alongside
 # timing — so the per-SSE-event allocation cost the decode findings target is visible, not inferred.
@@ -106,7 +106,7 @@ mimalloc = "0.1"
 
 [features]
 # Install mimalloc as the global allocator in `decode_concurrent` — the allocator-contention control
-# run: `cargo bench -p beyond-ai-agent-core --bench decode_concurrent --features bench-mimalloc`.
+# run: `cargo bench -p beyond-agent-core --bench decode_concurrent --features bench-mimalloc`.
 bench-mimalloc = []
 
 [[bench]]

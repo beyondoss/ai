@@ -7,7 +7,7 @@
 //! per call. `divan`'s `AllocProfiler` (installed below) reports alloc count + bytes per sample beside
 //! ns/iter, so those copies are visible directly, not inferred.
 //!
-//! Run with `cargo bench -p beyond-ai-agent-core --bench dispatch`.
+//! Run with `cargo bench -p beyond-agent-core --bench dispatch`.
 //!
 //! Three groups:
 //! - `coerce` — the real public [`coerce_tool_arguments`] API over a realistic `write` argument

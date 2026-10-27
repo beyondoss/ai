@@ -13,7 +13,7 @@
 //!
 //! ```sh
 //! AI_PROVIDER=openrouter OPENROUTER_API_KEY=… \
-//!   cargo test -p beyond-ai-agent --features code-mode --test code_mode_eval -- --ignored --nocapture
+//!   cargo test -p beyond-agent --features code-mode --test code_mode_eval -- --ignored --nocapture
 //! ```
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

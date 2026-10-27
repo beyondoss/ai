@@ -23,7 +23,7 @@ fn job(secs: u32, marker: &str) -> String {
 
 /// The spacing between a session's reconciles below which a real use starts none (N29).
 const USE_SPACING: Duration =
-    Duration::from_millis(beyond_ai_agent::tools::job_notify::kernel::USE_SPACING);
+    Duration::from_millis(beyond_agent::tools::job_notify::kernel::USE_SPACING);
 
 /// A fleet whose path loses every callback after the job's proof: the native endpoint's own
 /// sender drops them, and the baseline's are refused at the front (the supervisor stops).

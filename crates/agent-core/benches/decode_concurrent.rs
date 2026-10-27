@@ -23,7 +23,7 @@
 //! themselves a global contention point — installing it here would manufacture the very signal we're
 //! trying to measure. Allocation *counts* come from the sibling `decode` bench instead.
 //!
-//! Run with `mise run bench:decode:concurrent` (or `cargo bench -p beyond-ai-agent-core --bench
+//! Run with `mise run bench:decode:concurrent` (or `cargo bench -p beyond-agent-core --bench
 //! decode_concurrent`).
 
 use std::hint::black_box;

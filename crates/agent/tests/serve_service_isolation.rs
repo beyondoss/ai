@@ -10,7 +10,7 @@ use crate::common;
 
 use std::path::Path;
 
-use beyond_ai_agent::memory::{MemPath, MemoryBackend, View};
+use beyond_agent::memory::{MemPath, MemoryBackend, View};
 use common::service::{EXEC_HEADER, GATEWAY_KEY, Options, Service, files_under};
 use common::{
     spawn_model_server, turn_text, turn_tool_use, ws_connect_with_headers, ws_next_frame,

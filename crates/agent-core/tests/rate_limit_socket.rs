@@ -17,7 +17,7 @@ use agent_core::{Agent, AgentEvent, GatewayClient, Session};
 /// Serve one canned HTTP response per connection, in order; returns the base URL and a connection
 /// counter.
 fn serve(responses: Vec<String>) -> (String, Arc<AtomicUsize>) {
-    let listener = beyond_ai_test_support::ports::listener();
+    let listener = beyond_test_support::ports::listener();
     let addr = listener.local_addr().expect("addr");
     let count = Arc::new(AtomicUsize::new(0));
     let seen = count.clone();

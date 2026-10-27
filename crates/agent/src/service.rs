@@ -1358,7 +1358,7 @@ mod tests {
             .success();
         assert!(has_bash, "the test host has no bash");
         let dir = tempfile::tempdir().unwrap();
-        let mock = beyond_ai_test_support::exec_mock::ExecMock::start(dir.path(), true).await;
+        let mock = beyond_test_support::exec_mock::ExecMock::start(dir.path(), true).await;
         let mut s = session(&[("a", "/mnt/efs/a")], "a.x");
         Arc::get_mut(&mut s.grant).unwrap().exec_url = mock.url.clone();
         s.connect_exec(1 << 20).await.unwrap();

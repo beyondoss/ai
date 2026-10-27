@@ -272,7 +272,7 @@ mod tests {
     }
 
     /// The golden vectors, regenerated from their inputs: `UPDATE_FIXTURES=1 cargo test -p
-    /// beyond-ai-agent managed_mcp_token::` rewrites the file (then run `dprint fmt`). Only for a
+    /// beyond-agent managed_mcp_token::` rewrites the file (then run `dprint fmt`). Only for a
     /// deliberate change: the control plane's minter and the managed endpoint have to match.
     fn build() -> serde_json::Value {
         let k = key();

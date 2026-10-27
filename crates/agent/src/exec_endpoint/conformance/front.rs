@@ -9,7 +9,7 @@
 //! AGENT_CONFORMANCE_FRONT_URL='https://front.example/exec/{session}' \
 //! AGENT_CONFORMANCE_FRONT_HOOK=/path/to/operator-hook \
 //! AGENT_CONFORMANCE_FRONT_TENANT_CAP=3 \
-//!   cargo nextest run -p beyond-ai-agent -E 'test(/^exec_front_conformance::/)' --no-capture
+//!   cargo nextest run -p beyond-agent -E 'test(/^exec_front_conformance::/)' --no-capture
 //! ```
 //!
 //! - `AGENT_CONFORMANCE_FRONT_URL`: the exec URL of one session, `{session}` standing for its id

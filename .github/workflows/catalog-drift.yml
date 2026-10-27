@@ -65,7 +65,7 @@ jobs:
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
         run: |
           set -euo pipefail
-          cargo run -q -p beyond-ai-rates-sync -- catalog-drift --save "$RUNNER_TEMP/inputs" \
+          cargo run -q -p beyond-rates-sync -- catalog-drift --save "$RUNNER_TEMP/inputs" \
             >"$RUNNER_TEMP/findings.json" </dev/null
           {
             echo "### Catalog drift"

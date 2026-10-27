@@ -10,7 +10,7 @@ use crate::common;
 
 use std::time::{Duration, Instant};
 
-use beyond_ai_agent::exec_endpoint::jobs::JobId;
+use beyond_agent::exec_endpoint::jobs::JobId;
 use common::notify_e2e::{E2e, Mode, Setup, TENANT, in_every_mode, key, scope, unique};
 
 fn job(secs: u32, marker: &str) -> String {

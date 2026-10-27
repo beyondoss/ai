@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
-use beyond_ai_agent::managed_mcp_token::ManagedKey;
+use beyond_agent::managed_mcp_token::ManagedKey;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::http::{Headers, Req, Res, read_request, respond};

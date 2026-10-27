@@ -1037,7 +1037,7 @@ fn model_calls_on_a_resumed_session(args: &[&str], env: &[(&str, &str)]) -> usiz
     let dir = tempfile::tempdir().unwrap();
     let session_file = {
         use agent_core::{ContentBlock, Message, Session};
-        use beyond_ai_agent::session_store::{SessionMeta, SessionRepo};
+        use beyond_agent::session_store::{SessionMeta, SessionRepo};
 
         let repo = SessionRepo::open(dir.path()).unwrap();
         let mut store = repo.create(SessionMeta::new("/w", "claude-test")).unwrap();
@@ -1121,7 +1121,7 @@ fn run_binary_context_window_flag_forces_proactive_compaction_on_a_resumed_sessi
 
     let session_file = {
         use agent_core::{ContentBlock, Message, Session};
-        use beyond_ai_agent::session_store::{SessionMeta, SessionRepo};
+        use beyond_agent::session_store::{SessionMeta, SessionRepo};
 
         let repo = SessionRepo::open(dir.path()).unwrap();
         let mut store = repo.create(SessionMeta::new("/w", "claude-test")).unwrap();
@@ -1208,7 +1208,7 @@ fn run_binary_no_compaction_flag_suppresses_proactive_compaction_on_a_resumed_se
 
     let session_file = {
         use agent_core::{ContentBlock, Message, Session};
-        use beyond_ai_agent::session_store::{SessionMeta, SessionRepo};
+        use beyond_agent::session_store::{SessionMeta, SessionRepo};
 
         let repo = SessionRepo::open(dir.path()).unwrap();
         let mut store = repo.create(SessionMeta::new("/w", "claude-test")).unwrap();
@@ -2663,7 +2663,7 @@ fn run_binary_idle_timeout_ms_flag_causes_a_stalled_response_to_fail_quickly() {
     // Task #19 (pi-parity feature): `with_idle_timeout` previously had zero callers. A server that
     // answers headers plus one partial event, then goes silent well past a deliberately shrunk
     // `--idle-timeout-ms`, must fail quickly instead of hanging on the default (~600s) read timeout.
-    let listener = beyond_ai_test_support::ports::listener();
+    let listener = beyond_test_support::ports::listener();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
         use std::io::{Read as _, Write as _};
@@ -2729,7 +2729,7 @@ fn run_binary_retry_max_backoff_ms_flag_caps_the_exponential_backoff_between_ret
     // third succeeds. With `--retry-base-delay-ms` deliberately large (500ms) but
     // `--retry-max-backoff-ms` deliberately small (20ms), both waits between attempts must be capped
     // at ~20ms — total elapsed well under the ~1500ms (500ms + 1000ms) the uncapped schedule would take.
-    let listener = beyond_ai_test_support::ports::listener();
+    let listener = beyond_test_support::ports::listener();
     let addr = listener.local_addr().unwrap();
     let success_body = turn_text("ok");
     std::thread::spawn(move || {

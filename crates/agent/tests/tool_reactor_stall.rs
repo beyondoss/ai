@@ -24,7 +24,7 @@
 //!   into before. What is left is time the thread ran, or blocked, without returning to the
 //!   executor; it must stay under [`MAX_UNRESPONSIVE`].
 //!
-//! Every tool in `beyond_ai_agent::tools` that runs without an external service is put through the
+//! Every tool in `beyond_agent::tools` that runs without an external service is put through the
 //! responsiveness probe with a workload large enough that inline work would show
 //! (`*_keeps_the_runtime_responsive`); the CPU probe covers the file tools. MCP tools are
 //! network clients over rmcp's async transports, and `subagent` runs a nested agent loop on the same
@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use agent_core::Tool;
-use beyond_ai_agent::tools::{bash, edit, find, grep, ls, memory, read, todo, web, write};
+use beyond_agent::tools::{bash, edit, find, grep, ls, memory, read, todo, web, write};
 use serde_json::json;
 
 /// The longest the runtime may go without polling anything else while a tool runs, preemption
@@ -556,7 +556,7 @@ async fn memory_keeps_the_runtime_responsive() {
         )
         .unwrap();
     }
-    let backend = Arc::new(beyond_ai_agent::memory::file::FileBackend::at(
+    let backend = Arc::new(beyond_agent::memory::file::FileBackend::at(
         dir.path().to_path_buf(),
     ));
     std::fs::write(dir.path().join("big.md"), big_ascii_source(80_000)).unwrap();
@@ -583,7 +583,7 @@ async fn memory_keeps_the_runtime_responsive() {
 
 /// A local HTTP server answering every request with `body` as HTML.
 async fn html_server(body: String) -> String {
-    let listener = beyond_ai_test_support::ports::listener();
+    let listener = beyond_test_support::ports::listener();
     listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
@@ -662,7 +662,7 @@ async fn web_keeps_the_runtime_responsive() {
 #[tokio::test(flavor = "current_thread")]
 async fn code_mode_keeps_the_runtime_responsive_while_a_script_spins() {
     let _serial = one_at_a_time().await;
-    let tool = beyond_ai_agent::tools::code_mode::Execute::new(vec![]);
+    let tool = beyond_agent::tools::code_mode::Execute::new(vec![]);
     let spin_of = |n: u64| json!({ "code": format!("let x = 0; for (let i = 0; i < {n}; i++) {{ x += i % 7; }} return x;") });
     // Long enough to show, whatever this build's QuickJS speed: doubled until a run takes 200 ms.
     let mut n = 100_000u64;
@@ -698,7 +698,7 @@ async fn code_mode_keeps_the_runtime_responsive_while_a_script_spins() {
 async fn code_mode_abort_interrupts_a_spinning_script_promptly() {
     use agent_core::tool::ToolProgress;
     let _serial = one_at_a_time().await;
-    let tool = beyond_ai_agent::tools::code_mode::Execute::new(vec![]);
+    let tool = beyond_agent::tools::code_mode::Execute::new(vec![]);
     let forever = json!({ "code": "while (true) {}" });
     let quick = json!({ "code": "return 'next';" });
 

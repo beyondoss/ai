@@ -10,7 +10,7 @@ use std::fs;
 use std::path::Path;
 
 use agent_core::{ContentBlock, Message, Session};
-use beyond_ai_agent::session_store::{SessionMeta, SessionStore};
+use beyond_agent::session_store::{SessionMeta, SessionStore};
 use tempfile::TempDir;
 
 fn turn(s: &mut Session, i: usize) {

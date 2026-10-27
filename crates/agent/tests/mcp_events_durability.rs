@@ -43,7 +43,7 @@ async fn a_follow_up_held_during_a_run_survives_sigterm_and_reaches_the_model_on
     // A long run is in flight, so the follow-up is held — not yet seen by the model.
     ws_send(
         &mut ws,
-        json!({ "type": "prompt", "id": "long", "message": beyond_ai_test_support::stall_prompt(5000) }),
+        json!({ "type": "prompt", "id": "long", "message": beyond_test_support::stall_prompt(5000) }),
     )
     .await;
     ws_next(
@@ -119,7 +119,7 @@ fn poll_does_not_advance_its_cursor_past_events_it_could_not_accept() {
             "events": [{
                 "name": "ticket.updated", "delivery": "poll", "action": "follow_up",
                 // Every injected run stalls, so the one pending slot stays taken a while.
-                "instructions": beyond_ai_test_support::stall_prompt(1200),
+                "instructions": beyond_test_support::stall_prompt(1200),
             }],
         }]),
     );
@@ -278,7 +278,7 @@ fn a_steered_event_an_abort_drops_is_injected_again() {
         polling_serve(home.path(), &mcp_url, "steer", vec![]);
     send(
         &mut stdin,
-        json!({ "type": "prompt", "id": "long", "message": beyond_ai_test_support::stall_prompt(30_000) }),
+        json!({ "type": "prompt", "id": "long", "message": beyond_test_support::stall_prompt(30_000) }),
     );
     frames.wait(Duration::from_secs(10), "the long run's ack", |f| {
         f["type"] == "ack" && f["id"] == "long"
@@ -397,7 +397,7 @@ fn a_steered_batch_summarized_away_by_a_mid_run_compaction_is_not_injected_again
     // host cannot close it (2.5 s did, once).
     send(
         &mut stdin,
-        json!({ "type": "prompt", "id": "long", "message": beyond_ai_test_support::stall_prompt(6000) }),
+        json!({ "type": "prompt", "id": "long", "message": beyond_test_support::stall_prompt(6000) }),
     );
     frames.wait(Duration::from_secs(10), "the run's ack", |f| {
         f["type"] == "ack" && f["id"] == "long"

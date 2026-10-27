@@ -39,7 +39,7 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use base64::Engine as _;
-use beyond_ai_test_support::ports;
+use beyond_test_support::ports;
 use serde_json::{Value, json};
 use support::http::post;
 

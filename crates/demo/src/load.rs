@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
-use beyond_ai_test_support::bundle::{dir, file, sha256_hex, tar};
+use beyond_test_support::bundle::{dir, file, sha256_hex, tar};
 use futures::{SinkExt as _, StreamExt as _};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};

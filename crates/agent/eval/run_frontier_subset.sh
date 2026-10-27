@@ -39,7 +39,7 @@
 # harness baseline. This is not the 30-task FrontierHarness board.
 #
 # Prerequisites: docker, harbor (`uv tool install harbor`), OPENROUTER_API_KEY.
-# beyond:        cargo build -p beyond-ai-agent --release --target x86_64-unknown-linux-musl
+# beyond:        cargo build -p beyond-agent --release --target x86_64-unknown-linux-musl
 # beyond-code-mode: same plus --features code-mode, then copy the artifact to
 #   target/x86_64-unknown-linux-musl/release/beyond-ai-agent-code-mode
 #   (cargo overwrites the same filename).
@@ -99,7 +99,7 @@ case "${HARNESS}" in
   beyond)
     export BEYOND_AI_AGENT_BIN="${BEYOND_AI_AGENT_BIN:-${DEFAULT_BIN}}"
     require_bin "${BEYOND_AI_AGENT_BIN}" \
-      "build: cargo build -p beyond-ai-agent --release --target x86_64-unknown-linux-musl"
+      "build: cargo build -p beyond-agent --release --target x86_64-unknown-linux-musl"
     exec harbor run \
       "${common[@]}" \
       --agent harbor_beyond_agent:BeyondAiAgent \
@@ -114,7 +114,7 @@ case "${HARNESS}" in
     # binary, and `--code-mode` on a default build is a hard CLI error.
     export BEYOND_AI_AGENT_BIN="${CODE_MODE_BIN}"
     require_bin "${BEYOND_AI_AGENT_BIN}" \
-      "build: cargo build -p beyond-ai-agent --release --target x86_64-unknown-linux-musl --features code-mode && cp target/x86_64-unknown-linux-musl/release/beyond-ai-agent ${CODE_MODE_BIN}"
+      "build: cargo build -p beyond-agent --release --target x86_64-unknown-linux-musl --features code-mode && cp target/x86_64-unknown-linux-musl/release/beyond-ai-agent ${CODE_MODE_BIN}"
     exec harbor run \
       "${common[@]}" \
       --agent harbor_beyond_agent:BeyondAiAgentCodeMode \
@@ -149,7 +149,7 @@ case "${HARNESS}" in
     if [[ "${HARNESS}" == "beyond-mcp-code-mode" ]]; then
       export BEYOND_AI_AGENT_BIN="${CODE_MODE_BIN}"
       require_bin "${BEYOND_AI_AGENT_BIN}" \
-        "build: cargo build -p beyond-ai-agent --release --target x86_64-unknown-linux-musl --features code-mode && cp target/x86_64-unknown-linux-musl/release/beyond-ai-agent ${CODE_MODE_BIN}"
+        "build: cargo build -p beyond-agent --release --target x86_64-unknown-linux-musl --features code-mode && cp target/x86_64-unknown-linux-musl/release/beyond-ai-agent ${CODE_MODE_BIN}"
       exec harbor run \
         "${mcp_common[@]}" \
         --agent harbor_beyond_agent:BeyondAiAgentCodeMode \
@@ -163,7 +163,7 @@ case "${HARNESS}" in
     fi
     export BEYOND_AI_AGENT_BIN="${BEYOND_AI_AGENT_BIN:-${DEFAULT_BIN}}"
     require_bin "${BEYOND_AI_AGENT_BIN}" \
-      "build: cargo build -p beyond-ai-agent --release --target x86_64-unknown-linux-musl"
+      "build: cargo build -p beyond-agent --release --target x86_64-unknown-linux-musl"
     loading=eager
     [[ "${HARNESS}" == "beyond-mcp-search" ]] && loading=search
     exec harbor run \

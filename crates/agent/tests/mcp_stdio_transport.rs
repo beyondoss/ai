@@ -237,7 +237,7 @@ fn a_run_stopped_mid_turn_still_sweeps_its_stdio_servers() {
     let mut child = common::run_cmd(BIN)
         .args([
             "run",
-            &beyond_ai_test_support::stall_prompt(60_000),
+            &beyond_test_support::stall_prompt(60_000),
             "--gateway-url",
             &base,
             "--key",

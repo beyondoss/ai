@@ -11,9 +11,9 @@
 
 mod common;
 
-use beyond_ai::__test::key::{VirtualKey, mint};
-use beyond_ai::__test::route::Endpoint;
-use beyond_ai::__test::translate::{SseBridge, request, response_json_status};
+use beyond_gateway::__test::key::{VirtualKey, mint};
+use beyond_gateway::__test::route::Endpoint;
+use beyond_gateway::__test::translate::{SseBridge, request, response_json_status};
 use common::*;
 use serde_json::{Value, json};
 

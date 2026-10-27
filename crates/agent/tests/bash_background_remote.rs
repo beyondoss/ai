@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_core::Background;
-use beyond_ai_agent::exec_endpoint::{HttpExecRunner, STREAM_DEADLINE};
-use beyond_ai_agent::tools::exec::UNTRACKED_DEADLINE;
+use beyond_agent::exec_endpoint::{HttpExecRunner, STREAM_DEADLINE};
+use beyond_agent::tools::exec::UNTRACKED_DEADLINE;
 use common::exec_mock::{ExecMock, MockOptions, Protocol, StreamEnd, wait_group_gone};
 use common::remote_bash::{call, job_number, kill_job, remote_bash};
 use serde_json::{Value, json};

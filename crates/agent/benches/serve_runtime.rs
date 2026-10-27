@@ -16,7 +16,7 @@
 //! `divan::AllocProfiler` of the bench itself.
 //!
 //! ```text
-//! cargo bench -p beyond-ai-agent --bench serve_runtime
+//! cargo bench -p beyond-agent --bench serve_runtime
 //! ```
 //!
 //! Overrides (optional): `SERVE_RUNTIME_BENCH_CONCURRENCY` (default 32),
@@ -478,7 +478,7 @@ fn parse_listen_port(line: &str) -> Option<u16> {
 /// Unbounded Anthropic-SSE mock: every request gets the same one-turn text reply, concurrently.
 /// Prompt load would serialize behind a FIFO mock and measure the mock, not `serve`.
 fn spawn_mock_gateway() -> String {
-    let listener = beyond_ai_test_support::ports::listener();
+    let listener = beyond_test_support::ports::listener();
     listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
     let body = anthropic_text_turn("ok");

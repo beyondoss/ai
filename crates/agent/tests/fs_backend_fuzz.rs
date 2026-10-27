@@ -24,11 +24,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use beyond_ai_agent::tools::exec::RealRunner;
-use beyond_ai_agent::tools::fs::FsBackend;
-use beyond_ai_agent::tools::fs::local::LocalFs;
-use beyond_ai_agent::tools::fs::shell::{SearchEngine, ShellFs};
-use beyond_ai_agent::tools::{ToolConfig, default_registry_with_config};
+use beyond_agent::tools::exec::RealRunner;
+use beyond_agent::tools::fs::FsBackend;
+use beyond_agent::tools::fs::local::LocalFs;
+use beyond_agent::tools::fs::shell::{SearchEngine, ShellFs};
+use beyond_agent::tools::{ToolConfig, default_registry_with_config};
 use serde_json::{Value, json};
 
 /// xorshift64*, so a seed reproduces a run exactly on any machine.

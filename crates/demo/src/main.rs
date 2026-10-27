@@ -4,7 +4,7 @@
 //! - `mint-grant`: mint one `bsg_v1` session grant from those keys.
 //! - `chat`: one conversation step over the agent's WebSocket.
 
-use beyond_ai_demo::{chat, keys, load, load_host};
+use beyond_demo::{chat, keys, load, load_host};
 
 use std::path::PathBuf;
 
@@ -316,7 +316,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             listen,
             provider_listen,
         } => {
-            beyond_ai_demo::managed::run(beyond_ai_demo::managed::Args {
+            beyond_demo::managed::run(beyond_demo::managed::Args {
                 listen,
                 provider_listen,
             })
@@ -348,7 +348,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             redirect_uri,
             data_dir,
         } => {
-            beyond_ai_demo::oidc::run(beyond_ai_demo::oidc::Args {
+            beyond_demo::oidc::run(beyond_demo::oidc::Args {
                 managed_listen,
                 control_listen,
                 resource_listen,

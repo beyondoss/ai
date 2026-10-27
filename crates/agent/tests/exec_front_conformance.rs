@@ -6,7 +6,7 @@
 //! AGENT_CONFORMANCE_FRONT_URL='https://front.example/exec/{session}' \
 //! AGENT_CONFORMANCE_FRONT_HOOK=/path/to/operator-hook \
 //! AGENT_CONFORMANCE_FRONT_TENANT_CAP=3 \
-//!   cargo nextest run -p beyond-ai-agent -E 'test(/^exec_front_conformance::/)' --no-capture
+//!   cargo nextest run -p beyond-agent -E 'test(/^exec_front_conformance::/)' --no-capture
 //! ```
 //!
 //! The module doc of `exec_endpoint::conformance::front` lists every variable and the hook's ops.
@@ -21,8 +21,8 @@ use crate::common;
 
 use std::time::Duration;
 
-use beyond_ai_agent::exec_endpoint::conformance::Verdict;
-use beyond_ai_agent::exec_endpoint::conformance::front::{self, CommandHooks, FrontTarget, verify};
+use beyond_agent::exec_endpoint::conformance::Verdict;
+use beyond_agent::exec_endpoint::conformance::front::{self, CommandHooks, FrontTarget, verify};
 use common::front_mock::{Fault, FrontMock};
 
 const CAP: usize = 2;

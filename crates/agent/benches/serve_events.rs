@@ -10,7 +10,7 @@
 //! (they're private — deliberately so, `serve` is a CLI implementation, not a library surface). This
 //! replicates both serialization strategies against the same public `agent_core::AgentEvent` type
 //! instead, so the comparison is honest without widening `serve/`'s API just to make it benchable.
-//! Run: `cargo bench -p beyond-ai-agent --bench serve_events`.
+//! Run: `cargo bench -p beyond-agent --bench serve_events`.
 
 use std::hint::black_box;
 

@@ -7,7 +7,7 @@
 //! unset rather than failing. Run with whatever keys you have:
 //!
 //!   mise run test:smoke:agent          # auto-loads .env (ANTHROPIC_API_KEY, OPENAI_API_KEY, …)
-//!   ANTHROPIC_API_KEY=… OPENAI_API_KEY=… cargo nextest run -p beyond-ai-agent -E 'test(/^smoke::/)' --run-ignored only --no-capture
+//!   ANTHROPIC_API_KEY=… OPENAI_API_KEY=… cargo nextest run -p beyond-agent -E 'test(/^smoke::/)' --run-ignored only --no-capture
 //!
 //! These validate the dialect decoders against *real* provider SSE: the gateway boots with the
 //! caller's key as the managed pool key (and the dev signing key), then the agent — holding only a
@@ -1974,7 +1974,7 @@ fn smoke_split_turn_compaction_fires_mid_turn_live() {
 /// the proxy's own base URL. Blocking/threaded, matching this file's existing synchronous style (no
 /// tokio runtime is otherwise running in this test binary).
 fn spawn_flaky_proxy(real_target: &str, fail_first_n: usize) -> String {
-    let listener = beyond_ai_test_support::ports::listener();
+    let listener = beyond_test_support::ports::listener();
     let addr = listener.local_addr().unwrap();
     let real_addr = real_target
         .trim_start_matches("http://")

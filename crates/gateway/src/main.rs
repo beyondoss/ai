@@ -9,8 +9,8 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use beyond_ai::doctor;
-use beyond_ai::{
+use beyond_gateway::doctor;
+use beyond_gateway::{
     AdminApp, AiConfig, AiProxy, Allowance, Capture, CaptureDrain, CaptureSink, Deny, GatewayState,
     Metrics, SigningKeys, USAGE_TARGET, UsageFiles, UsageRow, ValidConfig, WatcherService,
     usage_log_filter,

@@ -298,8 +298,8 @@ fn pinned_provider(tenant: u64, vpc: u64, key_id: Option<u64>, model: &str) -> &
 /// reads it as this tagged test, not as a live cell.
 /// claim: TEN-2
 fn pin_matches_the_gateway() -> Result<(), Failed> {
-    use beyond_ai::__test::control::Walk;
-    use beyond_ai::__test::pin::{affinity, order};
+    use beyond_gateway::__test::control::Walk;
+    use beyond_gateway::__test::pin::{affinity, order};
     let pooled = MODEL_ROUTES.iter().filter(|r| {
         r.candidates
             .iter()

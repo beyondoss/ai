@@ -9,7 +9,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use agent_core::{ContentBlock, Message, Role, Session};
-use beyond_ai_agent::session_store::{SessionMeta, SessionRepo, SessionStore};
+use beyond_agent::session_store::{SessionMeta, SessionRepo, SessionStore};
 use common::{
     ISOLATED_HOME, SpawnGuarded, spawn_model_server_with_stalled_response, turn_text, turn_tool_use,
 };

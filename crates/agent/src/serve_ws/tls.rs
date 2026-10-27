@@ -83,7 +83,7 @@ mod tests {
         std::fs::write(&key, ck.key_pair.serialize_pem()).unwrap();
         let acceptor = load_acceptor(&cert, &key).unwrap();
 
-        let listener = beyond_ai_test_support::ports::tokio_listener().await;
+        let listener = beyond_test_support::ports::tokio_listener().await;
         let _silent = TcpStream::connect(listener.local_addr().unwrap())
             .await
             .unwrap();

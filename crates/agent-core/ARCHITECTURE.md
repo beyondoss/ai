@@ -1,6 +1,6 @@
 # agent-core Architecture
 
-`agent_core` (package `beyond-ai-agent-core`) takes a [`Session`](src/session.rs) (message history)
+`agent_core` (package `beyond-agent-core`) takes a [`Session`](src/session.rs) (message history)
 and an [`Agent`](src/agent.rs) config (model, tools, transport) and drives the model-turn / tool-call
 loop to completion, mutating the session in place and emitting an [`AgentEvent`](src/agent.rs) per
 streamed token, tool boundary, and turn boundary. It contains no HTTP server and no provider SDK — its

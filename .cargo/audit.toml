@@ -36,7 +36,7 @@ ignore = [
   # zstd 0.13.3 / zstd-safe 7.2.4: RUSTSEC-2026-0391 and 0395..0406. Pulled ONLY by pingora 0.9
   # (pingora-core, pingora-header-serde; pingora-cache and pingora-proxy through them), which pins
   # `zstd ^0.13` and `zstd-safe ^7.1`; the patched lines are zstd >= 0.14.3 and zstd-safe >= 8.2.0.
-  # beyond-ai-agent-core is already on zstd 0.14.3, and zstd-sys is at 2.1.2 (RUSTSEC-2026-0410
+  # beyond-agent-core is already on zstd 0.14.3, and zstd-sys is at 2.1.2 (RUSTSEC-2026-0410
   # fixed, no ignore). Upstream: https://github.com/cloudflare/pingora/issues/1072 and
   # https://github.com/cloudflare/pingora/pull/1073 (open, unreleased). REMOVE every entry in this
   # block when pingora releases with zstd >= 0.14.3 / zstd-safe >= 8.2.0, and bump pingora.
@@ -107,7 +107,7 @@ ignore = [
   # Unmaintained-crate warnings (no known vulnerability):
   "RUSTSEC-2025-0134", # rustls-pemfile (via rustls-native-certs <- pingora-rustls / async-nats)
   "RUSTSEC-2024-0388", # derivative (proc-macro, build time only; via pingora-core 0.9)
-  "RUSTSEC-2024-0449", # unsafe-libyaml (via serde_yaml 0.9, used by beyond-ai-agent and pingora-core 0.9)
+  "RUSTSEC-2024-0449", # unsafe-libyaml (via serde_yaml 0.9, used by beyond-agent and pingora-core 0.9)
 ]
 
 # Unsound advisories (a safe API that can cause UB) are not vulnerabilities, so `cargo audit` would

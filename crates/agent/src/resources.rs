@@ -1030,7 +1030,7 @@ mod tests {
         assert_eq!(cached_local_utc_offset(now), local_utc_offset(now));
     }
 
-    // Micro-bench (T8-F1): run with `cargo test -p beyond-ai-agent --lib -- --ignored --nocapture
+    // Micro-bench (T8-F1): run with `cargo test -p beyond-agent --lib -- --ignored --nocapture
     // offset_micro_bench` to see ns/call for the uncached disk+TZif path vs the cached path.
     #[test]
     #[ignore = "micro-bench, prints timings; not an assertion"]

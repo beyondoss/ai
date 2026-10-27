@@ -11,8 +11,8 @@ use crate::common;
 
 use std::sync::atomic::Ordering;
 
-use beyond_ai_agent::grant::{GrantVerifier, SealKeySource};
-use beyond_ai_agent::managed_mcp_token::{Claims, ManagedKey};
+use beyond_agent::grant::{GrantVerifier, SealKeySource};
+use beyond_agent::managed_mcp_token::{Claims, ManagedKey};
 use common::managed_mcp::{process_memory_contains, spawn_endpoint, spawn_provider};
 use common::service::{Options, Service, far_future, files_under};
 use common::{

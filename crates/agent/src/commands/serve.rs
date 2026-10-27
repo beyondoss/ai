@@ -7,10 +7,10 @@
 
 use std::sync::Arc;
 
-use beyond_ai_agent::mode::Mode;
-use beyond_ai_agent::policy::ToolPolicy;
-use beyond_ai_agent::session_store::canonical_cwd;
-use beyond_ai_agent::{serve, serve_ws, tools};
+use beyond_agent::mode::Mode;
+use beyond_agent::policy::ToolPolicy;
+use beyond_agent::session_store::canonical_cwd;
+use beyond_agent::{serve, serve_ws, tools};
 
 use crate::{
     CacheTtl, Command, DEFAULT_GATEWAY, DEFAULT_MODEL, exit_process, is_valid_session_id,
@@ -20,8 +20,8 @@ use crate::{
 /// What `validate` hands to `build_config`: the process mode and the session-grant trust it checked.
 struct ServeTrust {
     mode: Mode,
-    grant_verifier: Option<Arc<beyond_ai_agent::grant::GrantVerifier>>,
-    shards: Arc<beyond_ai_agent::service::Shards>,
+    grant_verifier: Option<Arc<beyond_agent::grant::GrantVerifier>>,
+    shards: Arc<beyond_agent::service::Shards>,
 }
 
 /// What `validate` hands to `run_transport`: the listeners and scrape endpoint it parsed.
@@ -29,7 +29,7 @@ struct ServeTransport {
     tls: Option<serve_ws::TlsListen>,
     systemd_activated: bool,
     metrics_addr: Option<std::net::SocketAddr>,
-    metrics: Option<Arc<beyond_ai_agent::metrics::Metrics>>,
+    metrics: Option<Arc<beyond_agent::metrics::Metrics>>,
 }
 
 /// Every setting `resolve` settled (flag, then stored default, then built-in default), for
@@ -37,7 +37,7 @@ struct ServeTransport {
 struct ServeResolved {
     system: String,
     append_system_prompt: Option<String>,
-    stored_settings: beyond_ai_agent::settings::Settings,
+    stored_settings: beyond_agent::settings::Settings,
     bash_shell_path: Option<String>,
     bash_command_prefix: Option<String>,
     compaction_reserve_tokens: Option<u32>,
@@ -165,8 +165,8 @@ fn validate(cmd: Command) -> Result<(ServeTrust, ServeTransport), Box<dyn std::e
         &deny_tool,
         no_tools,
     )?;
-    beyond_ai_agent::skills::check_paths("--skill", &extra_skill_paths)?;
-    beyond_ai_agent::skills::check_paths("--prompt-template", &extra_prompt_template_paths)?;
+    beyond_agent::skills::check_paths("--skill", &extra_skill_paths)?;
+    beyond_agent::skills::check_paths("--prompt-template", &extra_prompt_template_paths)?;
     // Same filesystem-path-injection concern as `run`'s identical check (`--session-id` becomes
     // part of a persisted session's filename) — see `is_valid_session_id`'s doc comment.
     if let Some(id) = &session_id
@@ -183,21 +183,19 @@ fn validate(cmd: Command) -> Result<(ServeTrust, ServeTransport), Box<dyn std::e
     //
     // The inline seal key is read straight from the environment, not declared as a flag: a
     // flag would put the secret in argv, readable by every process on the host.
-    let seal_b64 = match std::env::var_os(beyond_ai_agent::grant::SEAL_KEY_B64_ENV) {
+    let seal_b64 = match std::env::var_os(beyond_agent::grant::SEAL_KEY_B64_ENV) {
         None => None,
         Some(v) => match v.into_string() {
             Ok(v) if v.is_empty() => None,
             Ok(v) => Some(zeroize::Zeroizing::new(v)),
             Err(_) => {
-                return Err(format!(
-                    "{}: not valid UTF-8",
-                    beyond_ai_agent::grant::SEAL_KEY_B64_ENV
-                )
-                .into());
+                return Err(
+                    format!("{}: not valid UTF-8", beyond_agent::grant::SEAL_KEY_B64_ENV).into(),
+                );
             }
         },
     };
-    let seal_source = beyond_ai_agent::grant::SealKeySource::pick(
+    let seal_source = beyond_agent::grant::SealKeySource::pick(
         seal_key.as_deref(),
         seal_b64.as_deref().map(String::as_str),
     )?;
@@ -207,20 +205,20 @@ fn validate(cmd: Command) -> Result<(ServeTrust, ServeTransport), Box<dyn std::e
         Err(_) => {
             return Err(format!(
                 "{}: not valid UTF-8",
-                beyond_ai_agent::grant::SEAL_KEY_PREVIOUS_B64_ENV
+                beyond_agent::grant::SEAL_KEY_PREVIOUS_B64_ENV
             )
             .into());
         }
     };
-    let previous_seal = beyond_ai_agent::grant::load_previous_seal_key(
+    let previous_seal = beyond_agent::grant::load_previous_seal_key(
         seal_key_previous.as_deref(),
         previous_b64.as_deref().map(String::as_str),
     )?;
     if previous_seal.is_some() && seal_source.is_none() {
         return Err("--seal-key-previous needs --seal-key".into());
     }
-    let grant_verifier =
-        beyond_ai_agent::grant::GrantVerifier::from_flags(&grant_key, seal_source)?.map(|v| {
+    let grant_verifier = beyond_agent::grant::GrantVerifier::from_flags(&grant_key, seal_source)?
+        .map(|v| {
             Arc::new(match previous_seal {
                 Some(previous) => v.with_previous_seal(previous),
                 None => v,
@@ -232,16 +230,16 @@ fn validate(cmd: Command) -> Result<(ServeTrust, ServeTransport), Box<dyn std::e
     // of these is a way for the replica to reach a tenant (or the reverse). A refusal names
     // the flag, so an operator fixes the deployment rather than discovering at runtime that
     // a flag was silently ignored.
-    let shards = Arc::new(beyond_ai_agent::service::Shards::parse(&shard)?);
+    let shards = Arc::new(beyond_agent::service::Shards::parse(&shard)?);
     // Parsed before anything is bound or opened, like the shard list: a refusal names the
     // flag so an operator fixes the deployment rather than discovering at runtime that the
     // scrape never came up.
     let metrics_addr = match metrics_listen.as_deref() {
-        Some(s) => Some(beyond_ai_agent::metrics::parse_listen_addr(s)?),
+        Some(s) => Some(beyond_agent::metrics::parse_listen_addr(s)?),
         None => None,
     };
     let metrics = match metrics_addr {
-        Some(_) => Some(beyond_ai_agent::metrics::Metrics::new()?),
+        Some(_) => Some(beyond_agent::metrics::Metrics::new()?),
         None => None,
     };
     // All three or none, before anything is bound; the files themselves are checked by
@@ -282,7 +280,7 @@ fn validate(cmd: Command) -> Result<(ServeTrust, ServeTransport), Box<dyn std::e
                     .into(),
             );
         }
-        beyond_ai_agent::tools::job_notify::check_origin(origin)?;
+        beyond_agent::tools::job_notify::check_origin(origin)?;
     }
     if mode.refuses_host_resources() {
         if grant_verifier.is_none() {
@@ -302,7 +300,7 @@ fn validate(cmd: Command) -> Result<(ServeTrust, ServeTransport), Box<dyn std::e
         // The session epoch fence trusts the NFS client's caches to expire within one
         // lease; a mount that keeps them longer (`nocto`, a large `acdirmax`/`actimeo`)
         // could lose acknowledged writes, so it is refused before anything is served.
-        beyond_ai_agent::shard_mount::check_shards(&shards)?;
+        beyond_agent::shard_mount::check_shards(&shards)?;
         if listen.is_none() && tls.is_none() && listen_uds.is_none() && !systemd_activated {
             return Err(
                 "--service requires --listen, --listen-uds, or systemd socket activation: \
@@ -420,7 +418,7 @@ async fn resolve(cmd: Command, mode: &Mode) -> Result<ServeResolved, Box<dyn std
                 exclude_tools.as_deref(),
                 no_tools,
             );
-            beyond_ai_agent::resources::default_system_prompt(&reg, &prompt_guidelines)
+            beyond_agent::resources::default_system_prompt(&reg, &prompt_guidelines)
         });
     // `--append-system-prompt` is repeatable (pi-parity fix: previously a second occurrence
     // silently clobbered the first instead of accumulating) — each occurrence is resolved
@@ -446,9 +444,9 @@ async fn resolve(cmd: Command, mode: &Mode) -> Result<ServeResolved, Box<dyn std
     // built-in default, exactly as it does on a machine with no settings file.
     let cwd = canonical_cwd(&std::env::current_dir().unwrap_or_default());
     let stored_settings = if mode.reads_operator_settings() {
-        beyond_ai_agent::settings::effective_settings_for_cwd(&cwd)
+        beyond_agent::settings::effective_settings_for_cwd(&cwd)
     } else {
-        beyond_ai_agent::settings::Settings::default()
+        beyond_agent::settings::Settings::default()
     };
     // Round 3 (pi-parity fix): same "explicit flag/env, then stored setting, then built-in
     // default" precedence as every other `stored_settings`-backed fallback here — see
@@ -607,7 +605,7 @@ async fn resolve(cmd: Command, mode: &Mode) -> Result<ServeResolved, Box<dyn std
     // time, which is why it is a process flag rather than anything a grant can ask for.
     let mcp_http = mode.session_mcp_egress(mcp_allow_private)?;
     if let Some(mb) = bundle_cache_mb {
-        beyond_ai_agent::bundle::set_budget(mb.saturating_mul(1024 * 1024));
+        beyond_agent::bundle::set_budget(mb.saturating_mul(1024 * 1024));
     }
     // Parse the UDS socket mode from its octal string (`0o660`, `660`, `0660` all work) up
     // front so a bad value fails fast with a clear message rather than deep in the listener.
@@ -661,7 +659,7 @@ async fn resolve(cmd: Command, mode: &Mode) -> Result<ServeResolved, Box<dyn std
 /// Connects the operator's configured MCP servers once, process-wide; none in service mode.
 async fn connect_operator_mcp(
     mode: &Mode,
-    stored_settings: &beyond_ai_agent::settings::Settings,
+    stored_settings: &beyond_agent::settings::Settings,
 ) -> (
     tools::mcp::McpTools,
     tools::mcp::McpCatalog,
@@ -914,11 +912,11 @@ fn build_config(
         exec_url,
         exec_header,
         exec_max_response_bytes: exec_max_response_bytes.map_or(
-            beyond_ai_agent::exec_endpoint::DEFAULT_MAX_RESPONSE_BYTES,
+            beyond_agent::exec_endpoint::DEFAULT_MAX_RESPONSE_BYTES,
             |n| usize::try_from(n).unwrap_or(usize::MAX),
         ),
         exec_cmd,
-        lifecycle: beyond_ai_agent::lifecycle::open(lifecycle_url.as_deref(), &lifecycle_header)
+        lifecycle: beyond_agent::lifecycle::open(lifecycle_url.as_deref(), &lifecycle_header)
             .unwrap_or_else(|e| {
                 eprintln!("{e}");
                 exit_process(2);
@@ -942,7 +940,7 @@ fn build_config(
         deny_path,
         // Fail fast on an unrecognized value, before any session is opened — the same discipline
         // `ToolPolicy::validate_deny_path_patterns` uses for a malformed `--deny-path` glob.
-        approve: beyond_ai_agent::approval::GatedSet::parse(&approve).unwrap_or_else(|e| {
+        approve: beyond_agent::approval::GatedSet::parse(&approve).unwrap_or_else(|e| {
             eprintln!("{e}");
             exit_process(2);
         }),
@@ -1002,8 +1000,8 @@ async fn run_transport(
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .map_err(|e| format!("--metrics-listen {addr}: {e}"))?;
-            tokio::spawn(beyond_ai_agent::metrics::serve_metrics(listener, metrics));
-            beyond_ai_agent::blocking::spawn_lag_probe();
+            tokio::spawn(beyond_agent::metrics::serve_metrics(listener, metrics));
+            beyond_agent::blocking::spawn_lag_probe();
         }
         let listeners = serve_ws::ServeListeners {
             tcp: serve_cfg.listen,

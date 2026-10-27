@@ -1,5 +1,5 @@
 [package]
-name = "beyond-ai-execd"
+name = "beyond-execd"
 version = "0.1.14"
 edition.workspace = true
 license.workspace = true
@@ -27,7 +27,7 @@ mimalloc = ["dep:mimalloc"]
 base64.workspace = true
 # The v1.4 timing kernel: when a callback is owed, retried or given up. Every endpoint drives the
 # same pure function.
-beyond-ai-exec-notify = { path = "../exec-notify", version = "0.1.0" }
+beyond-exec-notify = { path = "../exec-notify", version = "0.1.0" }
 bytes.workspace = true
 # The jitter draw for a retry's wait (one u32 per failed attempt).
 getrandom = { version = "0.3", features = ["std"] }
@@ -56,8 +56,8 @@ tokio-util.workspace = true
 [dev-dependencies]
 # The conformance verifier lives in the agent, the only client of the protocol; the test runs it
 # against the real binary. A dev-dependency only: execd itself links neither.
-beyond-ai-agent = { path = "../agent" }
-beyond-ai-test-support = { path = "../test-support" }
+beyond-agent = { path = "../agent" }
+beyond-test-support = { path = "../test-support" }
 hyper = { version = "1", features = ["client", "http2"] }
 memchr = "2"
 tempfile = "3"
