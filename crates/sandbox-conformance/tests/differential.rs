@@ -14,7 +14,9 @@
 //!
 //! CI runs fixed seeds and case counts. Locally: `DIFFERENTIAL_CASES=N`, `DIFFERENTIAL_SEED=S`,
 //! `DIFFERENTIAL_STEPS=N` (ops per sequence), `DIFFERENTIAL_BACKENDS=a,b` and
-//! `DIFFERENTIAL_DRIVERS=rust,ts` widen, move or narrow the search. `mise run test:differential`.
+//! `DIFFERENTIAL_DRIVERS=rust,ts` widen, move or narrow the search. `mise run test:differential`. The tests are `#[ignore]`d so the
+//! workspace test shards, which have no drivers built, leave them to the clients job, which runs them with
+//! `--include-ignored`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, dead_code)]
 
 mod differential {
@@ -64,6 +66,16 @@ fn drive(backend: &str, default_cases: u64, seed: u64) {
         eprintln!("differential {backend}: skipped, docker is not available");
         return;
     }
+    // A deadline for the whole backend run. Aborting skips every destructor on purpose: the
+    // harness's watchdog (`sandbox_conformance::reaper`) sees the process gone and kills what is left.
+    let deadline =
+        std::time::Duration::from_secs(env_u64("DIFFERENTIAL_DEADLINE_SECS").unwrap_or(1800));
+    let name = backend.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(deadline);
+        eprintln!("differential {name}: deadline of {deadline:?} passed, aborting");
+        std::process::abort();
+    });
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -101,31 +113,37 @@ fn drive(backend: &str, default_cases: u64, seed: u64) {
 }
 
 #[test]
+#[ignore = "needs built drivers and execd; run by `mise run test:differential` (the clients job)"]
 fn local_plain() {
     drive("local-plain", 80, 0xd1ff_0001);
 }
 
 #[test]
+#[ignore = "needs built drivers and execd; run by `mise run test:differential` (the clients job)"]
 fn local_without_stdin() {
     drive("local-no-stdin", 60, 0xd1ff_0002);
 }
 
 #[test]
+#[ignore = "needs built drivers and execd; run by `mise run test:differential` (the clients job)"]
 fn local_posix_grep() {
     drive("local-grep", 60, 0xd1ff_0003);
 }
 
 #[test]
+#[ignore = "needs built drivers and execd; run by `mise run test:differential` (the clients job)"]
 fn local_busybox_rungs() {
     drive("local-busybox-grep", 60, 0xd1ff_0004);
 }
 
 #[test]
+#[ignore = "needs built drivers and execd; run by `mise run test:differential` (the clients job)"]
 fn alpine() {
     drive("alpine", 40, 0xd1ff_0005);
 }
 
 #[test]
+#[ignore = "needs built drivers and execd; run by `mise run test:differential` (the clients job)"]
 fn debian_runas() {
     drive("debian-runas", 40, 0xd1ff_0006);
 }
