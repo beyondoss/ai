@@ -138,6 +138,56 @@ async fn without_its_proof_the_stream_stays_held(mode: Mode) {
     assert_eq!(f.reports(&mut ws, &format!("fin-{marker}")).await, 1);
 }
 
+/// The fallback, on the one protocol: the replica offers `notify`, the sandbox cannot reach the
+/// origin, so the first notice never arrives. The stream is never released (it is released only on
+/// that notice, N35), the job is held to its end, and the end is reported once through the stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_origin_the_sandbox_cannot_reach_falls_back_to_the_held_stream() {
+    let marker = "m9";
+    let f = E2e::start(Setup::new(Mode::NoEgress)).await;
+    let session = &unique("alpha");
+    let mut ws = f.start_job(session, &job(6, marker)).await;
+    let pgid = f.stream(&job(6, marker)).await;
+    // `notify` was offered: the keep carried it, and the sandbox tried to call back and could not.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let keeps = f
+            .svc
+            .exec
+            .bodies()
+            .iter()
+            .filter(|b| b["job"]["op"] == "keep" && b["job"].get("notify").is_some())
+            .count();
+        if keeps > 0 && !f.svc.exec.callbacks().is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no keep with notify, or no attempt"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        f.svc.exec.callbacks().iter().all(|a| a.status.is_none()),
+        "no callback can have been delivered"
+    );
+    assert!(f.front.seen().is_empty(), "nothing reached the replica");
+    assert!(
+        f.svc
+            .exec
+            .wait_for_end(pgid, Duration::from_secs(3))
+            .await
+            .is_none(),
+        "no first notice, no release"
+    );
+    let wake = f
+        .wake_with(&format!("fin-{marker}"), Duration::from_secs(30))
+        .await
+        .expect("the end through the held stream");
+    assert!(notice(&wake, &format!("fin-{marker}")).contains("exited with code 0"));
+    assert_eq!(f.reports(&mut ws, &format!("fin-{marker}")).await, 1);
+}
+
 in_every_mode!(
     a_released_job_is_silent_until_its_end,
     without_its_proof_the_stream_stays_held

@@ -307,20 +307,22 @@
 //! follow* is what a replica does when a kept job's held stream breaks (`tools::bash_sandbox`'s
 //! `follow`: an `attach`, with its own failure policy and error notice). The *session id* is the one the session is routed by, which the URL names.
 //!
-//! ### The endpoint's promise
+//! ### The endpoint's guarantee
 //!
-//! Every endpoint offers notify, so every endpoint promises that a kept job survives its sandbox
-//! going idle: it keeps running, or is paused and resumed intact. Releasing a job removes the
-//! heartbeat that kept the sandbox busy, so a sandbox that stops or kills idle processes (a
-//! vendor's auto-stop) would lose the job. An adapter for such a sandbox either keeps it awake
-//! itself or does not implement this contract.
+//! Notify is part of the protocol, not an option an endpoint advertises, so the guarantee is a fact
+//! of it: a kept job survives its sandbox going idle (it keeps running, or is paused and resumed
+//! intact). Releasing a job removes the heartbeat that kept the sandbox busy, so a sandbox that
+//! stops or kills idle processes (a vendor's auto-stop) would lose the job. An adapter for such a
+//! sandbox either keeps it awake itself or does not implement this contract.
+//!
+//! **A replica never relies on reachability.** It sends `notify` with every `keep` it can
+//! name an origin for, and releases the job's stream only when the first notice has actually
+//! arrived (N35). A sandbox that cannot dial out, or an origin that is wrong, sends no first notice,
+//! so the stream stays held and the job's end is observed over it, as before notify (N38).
 //!
 //! - **N1** A kept job MUST survive its sandbox going idle, with nothing sent to the endpoint for
 //!   a window of the verifier's choosing (30 s by default). (check: conformance `a kept job
 //!   survives idling`)
-//!
-//! An endpoint SHOULD refuse a `notify` (N5) when it knows it has no outbound network. No client
-//! relies on that for reachability: nothing is unheld until a callback has actually arrived (N35).
 //!
 //! ### `keep` with `notify`
 //!

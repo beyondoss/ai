@@ -73,7 +73,7 @@
     },
     {
       "id": "files.stat.file",
-      "description": "A regular file: kind, exact size, mtime in whole epoch seconds, and whether this caller can write it.",
+      "description": "A regular file: kind, exact size, mtime in epoch seconds (fractional where the sandbox records it), and whether this caller can write it.",
       "setup": [
         {
           "id": "setup",
@@ -159,8 +159,8 @@
       ]
     },
     {
-      "id": "files.stat.mtime-is-whole-seconds",
-      "description": "mtime is the epoch second: a fractional modification time is truncated, not rounded.",
+      "id": "files.stat.mtime-keeps-the-fraction",
+      "description": "mtime keeps the fractional part the sandbox's stat reports (nanoseconds on GNU and busybox): a file at 1000000000.9 reads back as 1000000000.9. (Where touch cannot set a fraction the fallback timestamp is the whole second.)",
       "requires": {
         "commands": [
           "stat"
@@ -186,7 +186,12 @@
           "path": "${ROOT}/f",
           "expect": {
             "ok": {
-              "mtime": 1000000000
+              "mtime": {
+                "$oneof": [
+                  1000000000,
+                  1000000000.9
+                ]
+              }
             }
           }
         }
@@ -2557,8 +2562,76 @@
       ]
     },
     {
+      "id": "files.write-if-unchanged.same-second-edit-conflicts",
+      "description": "A change made within the same second as the stat is detected: mtimes are compared at the precision the sandbox offers (nanoseconds), not in whole seconds. (The other writer sleeps 50 ms, or 1 s where sleep has no fractions, so the timestamp moves past the kernel's clock tick; if the second also rolls over the write conflicts all the same.)",
+      "steps": [
+        {
+          "id": "v1",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf \"v1\\n\" > \"$1\"",
+            "sh",
+            "${ROOT}/f"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          }
+        },
+        {
+          "id": "stat",
+          "op": "stat",
+          "path": "${ROOT}/f",
+          "save": {
+            "m": "mtime"
+          }
+        },
+        {
+          "id": "other",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 0.05 2>/dev/null || sleep 1; printf \"other\\n\" > \"$1\"",
+            "sh",
+            "${ROOT}/f"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          }
+        },
+        {
+          "id": "w",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/f",
+          "data_b64": "bWluZQo=",
+          "expected_mtime": "${m}",
+          "expect": {
+            "error": {
+              "kind": "conflict"
+            }
+          }
+        },
+        {
+          "id": "r",
+          "op": "read",
+          "path": "${ROOT}/f",
+          "expect": {
+            "ok": {
+              "data_utf8": "other\n"
+            }
+          }
+        }
+      ]
+    },
+    {
       "id": "files.write-if-unchanged.same-second-edit-is-missed",
-      "description": "The comparison is on whole seconds only: an edit that leaves the mtime second unchanged is not detected. This is the guard's stated limit; it is a guard against a person or agent editing in the gap between a read and a write, not a lock.",
+      "description": "An edit that restores the exact timestamp (touch -t) is not detected: the guard compares mtimes, not contents. This is the guard's stated limit; it is a guard against a person or agent editing in the gap between a read and a write, not a lock.",
       "setup": [
         {
           "id": "setup",

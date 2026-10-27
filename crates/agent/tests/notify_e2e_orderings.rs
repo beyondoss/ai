@@ -163,8 +163,13 @@ impl Plan {
         // A refused proof leaves the job held, unless a duplicate (a real callback) arrives
         // inside the proof window and proves the path itself.
         let duplicated = self.acts.iter().any(|(_, a)| *a == Act::Duplicate);
-        let end_safe =
-            (self.proof == Fate::Refuse && !duplicated) || !matches!(self.end, Fate::Refuse);
+        // With no egress the sandbox never calls back, so only a duplicate the plan posts itself
+        // (with the job's real token, inside the proof window) can prove the path.
+        let end_safe = if self.mode == Mode::NoEgress {
+            !duplicated
+        } else {
+            (self.proof == Fate::Refuse && !duplicated) || !matches!(self.end, Fate::Refuse)
+        };
         !moved && end_safe
     }
 }
@@ -796,6 +801,9 @@ shards! {
     orderings_native_0: Mode::Native, 0;
     orderings_native_1: Mode::Native, 1;
     orderings_native_2: Mode::Native, 2;
+    orderings_no_egress_0: Mode::NoEgress, 0;
+    orderings_no_egress_1: Mode::NoEgress, 1;
+    orderings_no_egress_2: Mode::NoEgress, 2;
 }
 
 /// Replay one seed alone (`NOTIFY_E2E_SEED`), printing its plan; without the variable, nothing.

@@ -906,6 +906,20 @@ fn compile_glob_matcher(q: &GlobQuery) -> Result<globset::GlobMatcher, FsError> 
         .map_err(|e| FsError::InvalidQuery(format!("bad glob: {e}")))
 }
 
+/// `SECS` or `SECS.FRAC` to whole seconds and nanoseconds; the fraction is padded or cut to nine digits.
+fn parse_mtime(s: &str) -> (u64, u32) {
+    let (secs, frac) = s.split_once('.').unwrap_or((s, ""));
+    let nanos = frac
+        .bytes()
+        .chain(std::iter::repeat(b'0'))
+        .take(9)
+        .try_fold(0u32, |n, c| {
+            c.is_ascii_digit().then(|| n * 10 + u32::from(c - b'0'))
+        })
+        .unwrap_or(0);
+    (secs.parse().unwrap_or(0), nanos)
+}
+
 /// Parse `w|-` + `\t<type>\t<size>\t<mtime>` from the one-shot stat command.
 fn parse_stat(stdout: &str) -> Option<Meta> {
     let line = stdout.lines().next()?;
@@ -917,15 +931,14 @@ fn parse_stat(stdout: &str) -> Option<Meta> {
         _ => FileKind::Other,
     };
     let len: u64 = parts.next()?.trim().parse().ok()?;
-    // `%T@` is fractional seconds; only the whole-second part is comparable to a `SystemTime` built
-    // from the same source on a later call, which is all `write_if_unchanged` needs.
-    let secs: u64 = parts
+    // `SECS.FRAC`: the script prints the fraction `stat` reports (nine digits of nanoseconds on GNU and
+    // busybox), `0` where it reports none.
+    let (secs, nanos) = parts
         .next()
-        .and_then(|s| s.split('.').next())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
+        .map(|s| parse_mtime(s.trim()))
+        .unwrap_or((0, 0));
     // `SystemTime + Duration` panics past what the platform can hold; an out-of-range mtime is unknown.
-    let mtime = std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs));
+    let mtime = std::time::UNIX_EPOCH.checked_add(std::time::Duration::new(secs, nanos));
     Some(Meta {
         kind,
         len,
@@ -1047,20 +1060,12 @@ fn parse_dir_entries(stdout: &str, cap: usize, include_hidden: bool) -> Vec<DirE
     out
 }
 
-/// Compare two mtimes at whole-second granularity.
-///
-/// The remote path can only report whole seconds (`%T@`'s fractional part is not reliably
-/// round-trippable), so comparing at finer resolution would make every guarded write spuriously
-/// report "changed". Coarser comparison can only ever *miss* a change made within the same second as
-/// the read — which for `edit`'s guard means falling back to the behavior of not having a guard, not
-/// to a wrong answer.
+/// Compare two mtimes as doubles of epoch seconds, which keeps the nanoseconds `stat` reports (a
+/// double resolves 0.24 µs at present epochs, finer than any filesystem records) and is what a client
+/// whose numbers are doubles (TypeScript, Python, the JSON driver protocol) compares, so every client
+/// agrees. A change made within the same second as the read is therefore caught.
 fn mtimes_match(a: Option<std::time::SystemTime>, b: Option<std::time::SystemTime>) -> bool {
-    fn secs(t: Option<std::time::SystemTime>) -> Option<u64> {
-        t?.duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|d| d.as_secs())
-    }
-    secs(a) == secs(b)
+    a.map(super::epoch_f64) == b.map(super::epoch_f64)
 }
 
 /// The `detail` of a failed command (spec 3.3): the first line of trimmed stderr; and when that line
@@ -1201,7 +1206,14 @@ else t=o
 fi
 if [ -w "$1" ]; then w=w; else w=-; fi
 printf '%s	%s	' "$w" "$t"
-stat -L -c '%s	%Y' -- "$1" 2>/dev/null || printf '0	0'
+if s=$(stat -L -c '%s %Y %y' -- "$1" 2>/dev/null); then
+  set -- $s
+  f=${4#*.}
+  [ "$f" = "$4" ] && f=0
+  printf '%s	%s.%s' "$1" "$2" "$f"
+else
+  printf '0	0'
+fi
 printf '
 '"#;
 
@@ -1915,6 +1927,21 @@ mod appendix_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stat_keeps_the_nanoseconds_and_the_guard_compares_them() {
+        let a = parse_stat("w\tf\t3\t1793127211.536029123\n").unwrap().mtime;
+        let b = parse_stat("w\tf\t3\t1793127211.536029999\n").unwrap().mtime;
+        let c = parse_stat("w\tf\t3\t1793127211.5\n").unwrap().mtime;
+        let whole = parse_stat("w\tf\t3\t1793127211\n").unwrap().mtime;
+        assert_eq!(parse_mtime("5.25"), (5, 250_000_000));
+        assert_eq!(parse_mtime("5.1234567891"), (5, 123_456_789));
+        assert!(mtimes_match(a, a));
+        assert!(!mtimes_match(a, c), "same second, other fraction");
+        assert!(!mtimes_match(c, whole), "a truncated second does not match");
+        // 876 ns apart: above a double's 0.24 us resolution, so a change that small is caught.
+        assert!(!mtimes_match(a, b));
+    }
 
     #[test]
     fn rgs_binary_file_warning_is_not_the_start_of_a_record() {

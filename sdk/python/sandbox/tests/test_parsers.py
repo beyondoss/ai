@@ -114,9 +114,9 @@ def test_stat_parses_the_one_line() -> None:
     assert (st.kind, st.size, st.mtime, st.writable) == ("file", 12, 1700000000, True)
 
 
-def test_stat_truncates_a_fractional_mtime() -> None:
+def test_stat_keeps_a_fractional_mtime() -> None:
     st = parse_stat("-\td\t4096\t1700000000.987654321\n")
-    assert st is not None and (st.kind, st.mtime, st.writable) == ("dir", 1700000000, False)
+    assert st is not None and (st.kind, st.mtime, st.writable) == ("dir", 1700000000.9876542, False)
 
 
 def test_stat_of_other_and_garbage() -> None:
@@ -129,7 +129,7 @@ def test_stat_of_other_and_garbage() -> None:
 
 def test_stat_mtime_overflow_is_not_a_crash() -> None:
     st = parse_stat("w\tf\t1\t99999999999999999999999\n")
-    assert st is not None and st.mtime == 99999999999999999999999
+    assert st is not None and st.mtime == float(99999999999999999999999)
 
 
 # ---- listing ---------------------------------------------------------------------------------------
@@ -178,6 +178,12 @@ def test_a_newline_in_a_path_does_not_hide_the_os_error() -> None:
     )
     assert first_line("one\ntwo\n") == "one"
     assert first_line("  \n") == "command failed"
+
+
+def test_stat_keeps_the_fraction_of_the_mtime() -> None:
+    assert _fs.parse_stat("w\tf\t3\t1793127211.536029123\n").mtime == 1793127211.536029123  # type: ignore[union-attr]
+    assert _fs.parse_stat("w\tf\t3\t981173106.000000000\n").mtime == 981173106  # type: ignore[union-attr]
+    assert _fs.parse_stat("w\tf\t3\t981173106\n").mtime == 981173106  # type: ignore[union-attr]
 
 
 def test_a_root_below_a_file_is_a_root_error() -> None:

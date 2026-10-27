@@ -2709,7 +2709,7 @@ puts the job back still running, the kernel closes that follow and the job is un
 (`put_back`); one whose end the call recorded is held, as today, and one it killed is forgotten.
 `tests/job_notify.rs` runs a real replica against the reference endpoint (`exec_mock`, which makes
 the callbacks) through a stand-in for the edge. The end-to-end matrix (`tests/notify_e2e_*.rs`, on
-`tests/common/notify_e2e.rs`) runs every case against the native endpoint: one or two real replicas on a hash ring behind a front
+`tests/common/notify_e2e.rs`) runs every case in two endpoint modes, native and no egress (the sandbox cannot reach the origin: no first notice ever arrives, so the stream stays held and the end comes through it): one or two real replicas on a hash ring behind a front
 that routes clients and callbacks by session id (retrying and walking on `503`, attaching nothing),
 the endpoint behind a proxy that counts every byte at the socket, and a model that answers by each
 request's last message. It proves silence after release in bytes, a notified end's notice and wake

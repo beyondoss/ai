@@ -183,8 +183,8 @@ fn kind_name(k: FileKind) -> &'static str {
     }
 }
 
-fn epoch_secs(t: SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+fn epoch_secs(t: SystemTime) -> f64 {
+    beyond_sandbox::fs::epoch_f64(t)
 }
 
 fn state_of(s: JobStatus) -> (&'static str, Option<i32>) {
@@ -585,7 +585,19 @@ impl Driver {
                 "`expected_mtime` is required (null means the file must not exist)",
             ));
         }
-        let expected = u64_arg(req, "expected_mtime")?.map(|s| UNIX_EPOCH + Duration::from_secs(s));
+        let expected = match &req["expected_mtime"] {
+            Value::Null => None,
+            v => v
+                .as_f64()
+                .filter(|s| s.is_finite() && *s >= 0.0)
+                .map(|s| UNIX_EPOCH + Duration::from_secs_f64(s)),
+        };
+        if expected.is_none() && !req["expected_mtime"].is_null() {
+            return Err(err(
+                "invalid_request",
+                "`expected_mtime` must be a non-negative number or null",
+            ));
+        }
         let wrote = self
             .fs
             .write_if_unchanged(Path::new(path), data, expected)

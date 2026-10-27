@@ -3,7 +3,12 @@
 //! nothing), the reference endpoint behind a proxy that counts every byte crossing a
 //! replica-to-endpoint connection, and a model that answers by each request's last message.
 //!
-//! Every suite runs against the endpoint in [`Mode::Native`]: it keeps jobs itself and calls back.
+//! Every suite runs in two endpoint modes, both on the one protocol:
+//!
+//! - [`Mode::Native`]: the endpoint keeps jobs itself and calls back;
+//! - [`Mode::NoEgress`]: the sandbox cannot reach the network, so no callback ever arrives. The
+//!   replica sends `notify` all the same (nothing is advertised), never gets the first notice, and so
+//!   never releases a stream: every job is held to its end, as before notify.
 
 #![allow(dead_code)]
 
@@ -28,28 +33,31 @@ pub const TENANT: &str = "00tenant1";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Native,
+    NoEgress,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 1] = [Mode::Native];
+    pub const ALL: [Mode; 2] = [Mode::Native, Mode::NoEgress];
 
     /// The endpoint for this mode.
     pub fn mock(self, _notify: bool) -> MockOptions {
         MockOptions {
             // A heartbeat often enough that a held stream is plainly not silent.
             heartbeat: Duration::from_secs(1),
+            egress: self == Mode::Native,
             ..MockOptions::default()
         }
     }
 
     /// Whether a kept job is let go of (`false`: held to its end, as today).
     pub fn releases(self) -> bool {
-        true
+        self != Mode::NoEgress
     }
 
     pub fn name(self) -> &'static str {
         match self {
             Mode::Native => "native",
+            Mode::NoEgress => "no-egress",
         }
     }
 }
@@ -976,7 +984,7 @@ pub async fn wait_reaped(svc: &Service, ports: &[u16], session: &str) {
     }
 }
 
-/// One test per endpoint mode, `case::native`, each running `case(Mode)`.
+/// One test per endpoint mode, `case::native` and `case::no_egress`, each running `case(Mode)`.
 #[allow(unused_macros)]
 macro_rules! in_every_mode {
     ($($case:ident),* $(,)?) => {$(
@@ -986,7 +994,10 @@ macro_rules! in_every_mode {
             async fn native() {
                 super::$case(Mode::Native).await;
             }
-
+            #[tokio::test(flavor = "multi_thread")]
+            async fn no_egress() {
+                super::$case(Mode::NoEgress).await;
+            }
         }
     )*};
 }
