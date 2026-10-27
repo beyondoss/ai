@@ -21,6 +21,7 @@ from .errors import (
     Conflict,
     InvalidQuery,
     IoError,
+    NotADirectory,
     NotFound,
     NotOffered,
     SandboxError,
@@ -67,13 +68,32 @@ def text(b: bytes) -> str:
     return b.decode("utf-8", "replace")
 
 
+_OS_ERROR_NAMES = (
+    "no such file or directory",
+    "directory nonexistent",
+    "nonexistent directory",
+    "is a directory",
+    "not a directory",
+    "permission denied",
+)
+
+
 def first_line(stderr: bytes, fallback: str = "command failed") -> str:
-    lines = text(stderr).strip().splitlines()
-    return lines[0] if lines else fallback
+    """The detail of a failed command (3.3): the first line of trimmed stderr; when that line names
+    no OS error, the lines through the first one that does (a path containing a newline splits the
+    message)."""
+    lines = text(stderr).strip().split("\n")
+    if lines == [""]:
+        return fallback
+    for i, ln in enumerate(lines):
+        low = ln.lower()
+        if any(n in low for n in _OS_ERROR_NAMES):
+            return "\n".join(lines[: i + 1]).rstrip()
+    return lines[0].rstrip()
 
 
 def fail(prefix: str, stderr: bytes) -> SandboxError:
-    """A command that ran and failed (3.3): ``prefix: first line``, classified by that line."""
+    """A command that ran and failed (3.3): ``prefix: first line``, classified by it."""
     line = first_line(stderr)
     err = classify_stderr(line)
     return type(err)(f"{prefix}: {line}")
@@ -431,6 +451,7 @@ _OS_ERRORS = (
     "No such file or directory",
     "Permission denied",
     "Is a directory",
+    "Not a directory",
     "Too many levels of symbolic links",
     "Input/output error",
 )
@@ -445,24 +466,49 @@ class SearchFailure:
 
 
 def classify_search_failure(stderr: str, root: str) -> SearchFailure:
-    """The three causes share exit 2; only stderr tells them apart."""
-    lines = [ln for ln in stderr.split("\n") if ln.strip()]
+    """The three causes share exit 2; only stderr tells them apart.
 
-    def path_error(line: str) -> bool:
+    A path may contain a newline, so stderr is read as records that end at an OS error, not as
+    lines; the root's own error is found by its exact string (newlines included).
+    """
+
+    def ends_in_os_error(line: str) -> bool:
         line = line.rstrip()
         if line.endswith(")") and " (os error " in line:
             line = line[: line.rindex(" (os error ")]
         return any(line.endswith(e) for e in _OS_ERRORS)
 
-    if not lines or not all(path_error(ln) for ln in lines):
+    records: list[str] = []
+    start = 0
+    end = 0
+    for line in _split_lf(stderr):
+        end += len(line)
+        if ends_in_os_error(line):
+            records.append(stderr[start:end].strip())
+            start = end
+    if not records or stderr[start:].strip():
         return SearchFailure("bad_regex")
     marker = f": {root}: "
-    for ln in lines:
-        if marker in ln and "No such file or directory" in ln:
-            return SearchFailure("missing_root", ln.strip())
+    io_prefix = f"IO error for operation on {root}: "
+    for rec in records:
+        at = rec.find(marker)
+        while at >= 0:
+            rest = rec[at + len(marker) :].removeprefix(io_prefix)
+            if rest.startswith(("No such file or directory", "Not a directory")):
+                return SearchFailure("missing_root", rec)
+            at = rec.find(marker, at + 1)
     return SearchFailure(
-        "skipped", f"{len(lines)} path(s) could not be searched; first: {lines[0].strip()}"
+        "skipped", f"{len(records)} path(s) could not be searched; first: {records[0]}"
     )
+
+
+def _split_lf(s: str) -> list[str]:
+    """Lines split on LF alone, each keeping its LF."""
+    parts = s.split("\n")
+    out = [p + "\n" for p in parts[:-1]]
+    if parts[-1]:
+        out.append(parts[-1])
+    return out
 
 
 def _eol(s: str) -> str:
@@ -742,7 +788,7 @@ def search(q: Query, state: FsState, caps: Capabilities) -> Op[SearchResult]:
             detail = stderr.strip()
             raise InvalidQuery(f"bad regex: {detail or program + ' rejected the pattern'}")
         if failure.kind == "missing_root":
-            raise NotFound(failure.note)
+            raise (NotADirectory if "Not a directory" in failure.note else NotFound)(failure.note)
         note = failure.note
     stdout = text(r.stdout)
     hits = parse_colon_records(stdout, q) if engine == "busybox-grep" else parse_records(stdout)
