@@ -4,7 +4,7 @@ import { fromBase64 } from "../src/bytes.js";
 import { decodeOutput } from "../src/http.js";
 
 const file = new URL(
-  "../../../crates/sandbox/tests/fixtures/exec/output.json",
+  "../../../../crates/sandbox/tests/fixtures/exec/output.json",
   import.meta.url,
 );
 const vectors = JSON.parse(readFileSync(file, "utf8")) as {
