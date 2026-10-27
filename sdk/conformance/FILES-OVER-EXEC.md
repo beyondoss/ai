@@ -414,7 +414,8 @@ The command is `rg` or `grep`, with **no shell**, each item one argument.
 `rg` engine (in this order):
 
 ```text
---null --with-filename --line-number --no-heading --color=never --hidden --crlf
+--null --with-filename --line-number --column --no-heading --color=never
+--hidden --crlf
 [--no-require-git]            unless the root is inside a git repository (below)
 [--ignore-case] [--fixed-strings]
 [--glob G | --glob !G]        the caller's glob; the second form when excluding
@@ -485,7 +486,10 @@ off without also turning off the `.gitignore` handling the helper promises). The
 #### Parsing
 
 `rg` and `grep -Z` emit records `PATH<NUL>LINE<SEP>TEXT<LF>`, where `SEP` is `:`
-for a match and `-` for a context line. The command MUST turn off the group
+for a match and `-` for a context line. `rg --column` puts the byte column of the
+line's first match between the separator and the text of a **match** record:
+`PATH<NUL>LINE:COL:TEXT<LF>` (`COL` is 1-based, in bytes of the raw line, CRs
+included; a context record has none). `grep -Z` has no such field. The command MUST turn off the group
 separator: `rg --no-context-separator` (ripgrep 0.10 and later), GNU
 `grep --no-group-separator` (2.5.4 and later). The separator is the only record
 without a NUL, and a path may begin with `--` + LF (or `--` + CR LF under
@@ -493,8 +497,9 @@ without a NUL, and a path may begin with `--` + LF (or `--` + CR LF under
 the output is path records only. A client MUST NOT skip any `--` bytes. Parse by
 scanning for the **NUL**, not for newlines: a path may contain a newline. The
 path runs from the start of the record to the next NUL, the rest of the record
-to the next LF; `LINE` is one or more digits followed by `:` or `-`; a record
-that does not fit is dropped. A file named `--` or `--` LF `b` is an ordinary
+to the next LF; `LINE` is one or more digits followed by `:` or `-`, and under `rg` a match
+record then has `COL`, one or more digits followed by `:`; a record that does
+not fit is dropped. A file named `--` or `--` LF `b` is an ordinary
 path.
 
 `busybox-grep` emits `PATH:LINE:TEXT` (match) or `PATH-LINE-TEXT` (context). A
@@ -532,16 +537,19 @@ Context groups that overlap are merged by the engine.
 #### Clipping
 
 `MAX_LINE` is 500 **characters** (Unicode scalar values, not bytes or UTF-16
-units). A line of at most 500 characters is unchanged. For a **context** line
-longer than that: the first 500 characters followed by `… [truncated]`
-(U+2026, then `[truncated]`). For a **match** line longer than 500: find the
-first match of the query in the line (the pattern as a Rust-syntax regular
-expression, escaped when `literal`, case-insensitive when `ignore_case`; if
-that fails to compile or finds nothing, treat as a context line). With `cs` and
-`ce` its start and end character offsets and `total` the line's length: if
-`ce <= 500` clip as a context line. Otherwise
-`pad = (500 - (ce - cs)) / 2` (integer division, floored at 0),
-`start = max(0, cs - pad)`, `end = start + 500`; if `end > total` then
+units). A line of at most 500 characters is unchanged. A line longer than that
+is clipped at its **head** (the first 500 characters followed by `… [truncated]`,
+U+2026, space, `[truncated]`) if it is a context line, if the engine reported no
+column for it, or if its match starts early (below). A client never searches the
+line for the match itself: the position is what the engine reported, so clients
+cannot differ on pattern syntax.
+
+For a **match** line with an `rg` column `COL`: `cs` is the number of characters
+of the line's UTF-8 encoding before byte `COL - 1`, not counting CRs (the text
+has none, see Parsing); a `COL` that is not a character boundary of the line
+(possible only when the line had bytes that are not UTF-8) counts as no column.
+`start = max(0, cs - 250)`. If `start` is 0, clip at the head. Otherwise
+`end = start + 500`; if `end > total` (the line's length in characters) then
 `end = total` and `start = total - 500`. The text is `…` + characters
 `[start, end)` + (`…` if `end < total`) + `[truncated; columns
 {start+1}-{end} of {total}]`.
@@ -552,7 +560,8 @@ that fails to compile or finds nothing, treat as a context line). With `cs` and
 regex syntax and searches hidden files. `grep` does none of the ignore
 handling, skips binary files with `-I` (in a UTF-8 locale also files with
 invalid UTF-8), and uses POSIX ERE; `\d` and non-greedy quantifiers are not
-available. `busybox-grep` additionally cannot represent some path names (above)
+available; having no match column, they clip every long line at its head.
+`busybox-grep` additionally cannot represent some path names (above)
 and may report binary files differently. A client MUST report the engine in use
 (`capabilities.search_engine`); scenarios that depend on one declare
 `requires.search_engine`.

@@ -377,15 +377,13 @@ impl FsBackend for ShellFs {
             // `--include`, so the glob is applied here instead.
             parse_colon_records(&result.stdout, q)
         } else {
-            parse_records(&result.stdout)
+            parse_records(&result.stdout, engine == SearchEngine::Ripgrep)
         };
         // The engine was asked to skip `.git` where it can; this is the guarantee for the rungs that
         // can't (busybox `grep`, and a `.git` *file* GNU `--exclude-dir` does not cover).
         hits.retain(|h| !super::is_under_git_dir(&q.root, &h.path));
-        // A long match line is cut to the window around its match, the same way `LocalFs` cuts it.
         // (A line longer than the runner's 128 KiB capture arrives already cut, which is flagged as
         // truncation below.)
-        super::clip_hits(&mut hits, &super::MatchFinder::new(q));
         // `ExecResult` keeps only the first and last 128 KiB of each stream and drops the middle. On a
         // large result set that silently removes records from the middle of the output — so the flag
         // must reach the outcome, or this backend would report a confidently incomplete result as
@@ -982,7 +980,7 @@ fn parse_colon_records(stdout: &str, q: &SearchQuery) -> Vec<Hit> {
         hits.push(Hit {
             path: Arc::from(Path::new(path)),
             line: line_no,
-            text: trim_eol(text).into_owned(),
+            text: super::clip(&trim_eol(text)),
             is_match,
         });
     }
@@ -1444,6 +1442,8 @@ fn rg_args(q: &SearchQuery, in_git_repo: bool) -> Vec<String> {
         // Like `grep -H`: a single-file root otherwise prints no path, and the record parser needs one.
         "--with-filename".to_string(),
         "--line-number".to_string(),
+        // The byte column of a match line's first match: what the long-line clip is centred on.
+        "--column".to_string(),
         "--no-heading".to_string(),
         "--color=never".to_string(),
         "--hidden".to_string(),
@@ -1629,7 +1629,7 @@ fn push_context(args: &mut Vec<String>, q: &SearchQuery) {
 /// There is no group-separator line to skip: the engines are run with it turned off (see `rg_args` and
 /// `posix_grep_args`), because `--` + newline is also a legal start of a path. Every record is
 /// `PATH NUL ...`, so a path beginning with `--` + newline round-trips.
-fn parse_records(stdout: &str) -> Vec<Hit> {
+fn parse_records(stdout: &str, columns: bool) -> Vec<Hit> {
     let bytes = stdout.as_bytes();
     let mut hits = Vec::new();
     let mut i = 0usize;
@@ -1642,7 +1642,7 @@ fn parse_records(stdout: &str) -> Vec<Hit> {
         let nl = memchr_from(bytes, nul, b'\n').unwrap_or(bytes.len());
         let path = &stdout[i..nul];
         let rest = &stdout[nul + 1..nl];
-        if let Some(hit) = parse_body(path, rest) {
+        if let Some(hit) = parse_body(path, rest, columns) {
             hits.push(hit);
         }
         i = nl + 1;
@@ -1653,7 +1653,7 @@ fn parse_records(stdout: &str) -> Vec<Hit> {
 /// Split `<line><sep><text>` into its parts. Returns `None` for a record whose line number isn't
 /// digits — malformed output from an implementation we didn't anticipate, dropped rather than
 /// surfaced as a bogus hit at line 0.
-fn parse_body(path: &str, rest: &str) -> Option<Hit> {
+fn parse_body(path: &str, rest: &str, columns: bool) -> Option<Hit> {
     let digits_end = rest.find(|c: char| !c.is_ascii_digit())?;
     if digits_end == 0 {
         return None;
@@ -1665,13 +1665,31 @@ fn parse_body(path: &str, rest: &str) -> Option<Hit> {
         b'-' => false,
         _ => return None,
     };
-    let text = &rest[digits_end + 1..];
+    let mut text = &rest[digits_end + 1..];
+    // `rg --column`: a match record is `LINE:COL:TEXT`, a context record `LINE-TEXT`.
+    let mut col = None;
+    if columns && is_match {
+        let c_end = text.find(|c: char| !c.is_ascii_digit())?;
+        if c_end == 0 || text.as_bytes()[c_end] != b':' {
+            return None;
+        }
+        col = text[..c_end].parse::<usize>().ok();
+        text = &text[c_end + 1..];
+    }
+    let normalized = trim_eol(text);
+    // The same normalization and clip `LocalFs`'s sink applies, from the same functions — see
+    // `super`. A match line is clipped around the column the engine reported.
+    let text = match col
+        .filter(|_| text.len() > super::MAX_LINE)
+        .and_then(|c| super::match_offset(text, c))
+    {
+        Some(cs) => super::clip_at(&normalized, cs),
+        None => super::clip(&normalized),
+    };
     Some(Hit {
         path: Arc::from(Path::new(path)),
         line,
-        // The same normalization `LocalFs`'s sink applies, from the same functions — see `super`.
-        // Clipped by `search` once parsed (`clip_hits`), where the query is in hand to find the match.
-        text: trim_eol(text).into_owned(),
+        text,
         is_match,
     })
 }
@@ -1702,7 +1720,7 @@ pub mod __fuzz {
 
     /// `rg --null` / `grep -Z` records.
     pub fn records(stdout: &str) -> Vec<Hit> {
-        super::parse_records(stdout)
+        super::parse_records(stdout, false)
     }
 
     /// busybox `grep -rn` records (no glob).
@@ -2089,7 +2107,7 @@ mod tests {
 
     #[test]
     fn parses_a_match_record() {
-        let hits = parse_records("src/a.rs\u{0}12:let x = 1;\n");
+        let hits = parse_records("src/a.rs\u{0}12:let x = 1;\n", false);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path.to_string_lossy(), "src/a.rs");
         assert_eq!(hits[0].line, 12);
@@ -2099,7 +2117,10 @@ mod tests {
 
     #[test]
     fn distinguishes_context_lines_from_matches() {
-        let hits = parse_records("a.rs\u{0}1-before\na.rs\u{0}2:hit\na.rs\u{0}3-after\n");
+        let hits = parse_records(
+            "a.rs\u{0}1-before\na.rs\u{0}2:hit\na.rs\u{0}3-after\n",
+            false,
+        );
         let flags: Vec<bool> = hits.iter().map(|h| h.is_match).collect();
         assert_eq!(flags, vec![false, true, false]);
     }
@@ -2107,7 +2128,7 @@ mod tests {
     #[test]
     fn a_path_starting_with_dashes_and_a_newline_is_not_a_group_separator() {
         // The engines are run without a group separator, so `--` + newline can only be a path.
-        let hits = parse_records("--\nb\u{0}2-y\n--\r\nc\u{0}3:z\r\n");
+        let hits = parse_records("--\nb\u{0}2-y\n--\r\nc\u{0}3:z\r\n", false);
         let got: Vec<_> = hits
             .iter()
             .map(|h| (h.path.to_string_lossy().into_owned(), h.line))
@@ -2137,7 +2158,7 @@ mod tests {
 
     #[test]
     fn files_named_like_a_separator_are_not_skipped() {
-        let hits = parse_records("--\u{0}1:x\n--\r\u{0}2:y\n--\u{0}3:--\n");
+        let hits = parse_records("--\u{0}1:x\n--\r\u{0}2:y\n--\u{0}3:--\n", false);
         let got: Vec<_> = hits
             .iter()
             .map(|h| (h.path.to_string_lossy().into_owned(), h.line))
@@ -2154,7 +2175,7 @@ mod tests {
         // The reason this parser scans for NUL rather than splitting on newlines. A path containing a
         // newline is legal on every Unix filesystem, and line-splitting would attribute "9:two" to a
         // path of "line2" that never existed.
-        let hits = parse_records("we\nird.rs\u{0}9:two\n");
+        let hits = parse_records("we\nird.rs\u{0}9:two\n", false);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path.to_string_lossy(), "we\nird.rs");
         assert_eq!(hits[0].line, 9);
@@ -2165,7 +2186,7 @@ mod tests {
     fn a_colon_in_the_path_is_not_mistaken_for_the_separator() {
         // The NUL, not the first colon, ends the path — otherwise `odd:name.rs` would parse as a path
         // of "odd" with an unparseable line number.
-        let hits = parse_records("odd:name.rs\u{0}3:body\n");
+        let hits = parse_records("odd:name.rs\u{0}3:body\n", false);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path.to_string_lossy(), "odd:name.rs");
         assert_eq!(hits[0].text, "body");
@@ -2173,7 +2194,7 @@ mod tests {
 
     #[test]
     fn strips_carriage_returns_the_same_way_the_local_backend_does() {
-        let hits = parse_records("a.rs\u{0}1:crlf line\r\n");
+        let hits = parse_records("a.rs\u{0}1:crlf line\r\n", false);
         assert_eq!(hits[0].text, "crlf line");
     }
 

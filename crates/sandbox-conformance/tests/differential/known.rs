@@ -24,16 +24,6 @@ pub fn divergence(step: &Value, differing: &[&str], answers: &[Value]) -> Option
     let mut text = vec![];
     strings(step, &mut text);
     let only = |names: &[&str]| differing.iter().all(|d| names.contains(d));
-    // D3: the TypeScript client compiles the pattern of a non-literal query with a JavaScript
-    // RegExp to find the match it clips a long line around; the spec says Rust syntax, so
-    // `(?i)`, `(?P<name>..)` and the like do not compile and the line is clipped as a context line.
-    if step["op"] == "search"
-        && step["literal"] == false
-        && step["pattern"].as_str().is_some_and(|p| p.contains("(?"))
-        && only(&["ts"])
-    {
-        return Some("D3");
-    }
     // D5: ripgrep prints `PATH: WARNING: stopped searching binary file after match ...` on stdout
     // when a NUL follows a match. The line has no NUL, so the parser (which scans for the NUL after
     // the path) takes it as the start of the next record's path; which record that is depends on

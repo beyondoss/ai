@@ -353,6 +353,7 @@ def rg_args(q: Query, in_git_repo: bool) -> list[str]:
         "--null",
         "--with-filename",
         "--line-number",
+        "--column",
         "--no-heading",
         "--color=never",
         "--hidden",
@@ -474,7 +475,7 @@ def _eol(s: str) -> str:
     return s.replace("\r", "") if "\r" in s else s
 
 
-def parse_records(stdout: str) -> list[Hit]:
+def parse_records(stdout: str, columns: bool = False) -> list[Hit]:
     """``PATH NUL LINE SEP TEXT LF`` records of ``rg --null`` and ``grep -Z``.
 
     Scans for the NUL, not for newlines: a path may contain a newline. The group separator is
@@ -498,7 +499,7 @@ def parse_records(stdout: str) -> list[Hit]:
         nl = stdout.find("\n", nul)
         if nl < 0:
             nl = n
-        hit = _parse_body(stdout[i:nul], stdout[nul + 1 : nl])
+        hit = _parse_body(stdout[i:nul], stdout[nul + 1 : nl], columns)
         if hit is not None:
             hits.append(hit)
         i = nl + 1
@@ -508,11 +509,24 @@ def parse_records(stdout: str) -> list[Hit]:
 _BODY = re.compile(r"([0-9]+)([:-])", re.S)
 
 
-def _parse_body(path: str, rest: str) -> Hit | None:
+_COLUMN = re.compile(r"([0-9]+):", re.S)
+
+
+def _parse_body(path: str, rest: str, columns: bool) -> Hit | None:
     m = _BODY.match(rest)
     if m is None:
         return None
-    return Hit(path, int(m.group(1)), _eol(rest[m.end() :]), m.group(2) == ":")
+    is_match = m.group(2) == ":"
+    text_ = rest[m.end() :]
+    col = None
+    # ``rg --column``: a match record is ``LINE:COL:TEXT``, a context record ``LINE-TEXT``.
+    if columns and is_match:
+        c = _COLUMN.match(text_)
+        if c is None:
+            return None
+        col = int(c.group(1))
+        text_ = text_[c.end() :]
+    return Hit(path, int(m.group(1)), clip_at(_eol(text_), match_offset(text_, col)), is_match)
 
 
 def split_colon_record(line: str) -> tuple[str, int, bool, str] | None:
@@ -549,7 +563,7 @@ def parse_colon_records(stdout: str, q: Query) -> list[Hit]:
         path, line_no, is_match, body = rec
         if matcher is not None and (matcher.fullmatch(path) is not None) == q.glob_exclude:
             continue
-        hits.append(Hit(path, line_no, _eol(body), is_match))
+        hits.append(Hit(path, line_no, clip(_eol(body)), is_match))
     return hits
 
 
@@ -667,25 +681,34 @@ def clip(line: str) -> str:
     return line[:MAX_LINE] + LINE_TRUNCATED_SUFFIX
 
 
-def clip_match(line: str, q: Query) -> str:
-    """A long match line is cut to the window around its first match."""
+def match_offset(raw: str, col: int | None) -> int | None:
+    """The character offset, in the normalized text, of rg's 1-based byte column ``col`` of the raw
+    line: the characters before it, CRs not counted. The bytes are those of the UTF-8 encoding of the
+    decoded line. None when there is no column or it is not a character boundary."""
+    if col is None or col < 1 or len(raw) <= MAX_LINE:
+        return None
+    data = raw.encode("utf-8")
+    if col - 1 > len(data):
+        return None
+    try:
+        before = data[: col - 1].decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return len(before) - before.count("\r")
+
+
+def clip_at(line: str, cs: int | None) -> str:
+    """Clip a line to 500 characters. With ``cs``, the character offset of its first match as the
+    engine reported it, the window starts 250 characters before the match (the head clip when that
+    is the head); the match is never searched for again."""
     if len(line) <= MAX_LINE:
         return line
-    try:
-        rx = re.compile(
-            re.escape(q.pattern) if q.literal else q.pattern, re.I if q.ignore_case else 0
-        )
-    except re.error:
+    if cs is None:
         return clip(line)
-    m = rx.search(line)
-    if m is None:
-        return clip(line)
-    cs, ce = m.start(), m.end()
-    if ce <= MAX_LINE:
+    start = max(cs - MAX_LINE // 2, 0)
+    if start == 0:
         return clip(line)
     total = len(line)
-    pad = max(MAX_LINE - (ce - cs), 0) // 2
-    start = max(cs - pad, 0)
     end = start + MAX_LINE
     if end > total:
         end = total
@@ -748,12 +771,8 @@ def search(q: Query, state: FsState, caps: Capabilities) -> Op[SearchResult]:
             raise NotFound(failure.note)
         note = failure.note
     stdout = text(r.stdout)
-    hits = parse_colon_records(stdout, q) if engine == "busybox-grep" else parse_records(stdout)
+    hits = parse_colon_records(stdout, q) if engine == "busybox-grep" else parse_records(stdout, engine == "rg")
     hits = [h for h in hits if not is_under_git_dir(q.root, h.path)]
-    hits = [
-        Hit(h.path, h.line, clip_match(h.text, q) if h.is_match else clip(h.text), h.is_match)
-        for h in hits
-    ]
     hits, truncated = finalize(hits, q.limit)
     if note is None:
         detail = stderr.strip()

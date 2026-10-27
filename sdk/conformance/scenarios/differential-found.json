@@ -142,7 +142,7 @@
     },
     {
       "id": "differential-found.search.clip-uses-rust-regex-syntax",
-      "description": "A match line longer than 500 characters is clipped around the first match of the query, the pattern read as a Rust-syntax regular expression (FILES-OVER-EXEC 5.7, Clipping). The line here is 600 z, `needle`, 10 w; the match ends past column 500, so the text is `… ` + columns 117-616 and the `[truncated; columns 117-616 of 616]` suffix. A pattern that is valid Rust syntax but not JavaScript syntax must clip the same way.",
+      "description": "A match line longer than 500 characters is clipped around the column rg reports for its first match, never by searching the line again, so the pattern may use any Rust-syntax construct. The line here is 600 z, `needle`, 10 w; the window would start at character 350 and run past the end, so the text is `… ` + columns 117-616 and the `[truncated; columns 117-616 of 616]` suffix.",
       "requires": {
         "search_engine": "rg"
       },
@@ -202,12 +202,6 @@
                 }
               ]
             }
-          },
-          "xfail": {
-            "drivers": [
-              "beyond-sandbox-ts"
-            ],
-            "reason": "the TypeScript client finds the match to clip around with a JavaScript RegExp, which rejects Rust syntax such as (?i) and (?P<name>..); the line is then clipped as a context line"
           }
         },
         {
@@ -230,12 +224,6 @@
                 }
               ]
             }
-          },
-          "xfail": {
-            "drivers": [
-              "beyond-sandbox-ts"
-            ],
-            "reason": "the TypeScript client finds the match to clip around with a JavaScript RegExp, which rejects Rust syntax such as (?i) and (?P<name>..); the line is then clipped as a context line"
           }
         }
       ]

@@ -18,11 +18,9 @@ import {
 } from "./scripts.js";
 import {
   classifySearchFailure,
-  clipHits,
   finalize,
   grepArgs,
   isUnderGitDir,
-  matchFinder,
   parseColonRecords,
   parseRecords,
   rgArgs,
@@ -478,9 +476,8 @@ export class Files {
 
     let hits = engine === "busybox-grep"
       ? parseColonRecords(stdout, q)
-      : parseRecords(stdout);
+      : parseRecords(stdout, engine === "rg");
     hits = hits.filter((h) => !isUnderGitDir(q.root, h.path));
-    clipHits(hits, () => matchFinder(q));
     const done = finalize(hits, q.limit);
     const first = stderr.trim().split("\n")[0] ?? "";
     return {
