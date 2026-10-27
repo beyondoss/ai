@@ -105,7 +105,7 @@ fn assert_reopens_with_the_retry(path: &str, retried: &str) {
 }
 
 fn run_session(path: &str, base: &str) {
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let out = run_cmd(bin)
         .args([
             "run",
@@ -132,7 +132,7 @@ fn run_session(path: &str, base: &str) {
 }
 
 fn serve_session(path: &str, base: &str) {
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, base, path)
         .args(COMPACTION_ARGS)
         .current_dir(Path::new(path).parent().unwrap())

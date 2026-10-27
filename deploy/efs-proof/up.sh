@@ -252,7 +252,7 @@ JSON
 # `$1` is the extra agent flags — the held-back replica gets `--max-live-sessions 1`.
 register_replica() {
   local family=$1 extra=$2
-  local agent="/usr/local/bin/beyond-ai-agent serve --service --gateway-url http://$DRIVER_IP:19000 --model claude-test --listen 0.0.0.0:8080 --metrics-listen 127.0.0.1:9090 --grant-key $GRANT_KEY --seal-key /tmp/seal.key --shard s1=/mnt/efs/s1 --drain-grace 30 $extra"
+  local agent="/usr/local/bin/agent serve --service --gateway-url http://$DRIVER_IP:19000 --model claude-test --listen 0.0.0.0:8080 --metrics-listen 127.0.0.1:9090 --grant-key $GRANT_KEY --seal-key /tmp/seal.key --shard s1=/mnt/efs/s1 --drain-grace 30 $extra"
   local script="ulimit -c 0 2>/dev/null || true; mkdir -p /mnt/efs/s1 && printf '%s' '$SEAL_B64' > /tmp/seal.key && $agent & pid=\$!; trap 'kill -TERM \$pid 2>/dev/null' TERM; rc=0; while kill -0 \$pid 2>/dev/null; do wait \$pid; rc=\$?; done; exit \$rc"
   python3 - "$family" "$script" <<'PY' > /tmp/fleetsim-td-replica.json
 import json, os, sys

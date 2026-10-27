@@ -31,7 +31,7 @@ fn serve_rpc_prompt_pushed_image_is_downgraded_at_the_wire_when_block_images_is_
 
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file)
         .args(["--block-images"])
         .spawn_guarded();
@@ -83,7 +83,7 @@ fn serve_persisted_image_is_downgraded_on_resend_once_block_images_is_toggled_on
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
 
     let (base, bodies) = spawn_model_server(vec![turn_text("first"), turn_text("second")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     // First process: no `--block-images` — the image is ingested and persisted as-is.
     {
@@ -166,7 +166,7 @@ fn serve_set_block_images_toggles_and_rejects_a_non_boolean() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -217,7 +217,7 @@ fn serve_set_block_images_true_downgrades_a_persisted_image_mid_session_without_
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
 
     let (base, bodies) = spawn_model_server(vec![turn_text("first"), turn_text("second")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     // No `--block-images` — the image is ingested and sent to the wire as-is.
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();

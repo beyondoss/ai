@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use common::{run_cmd, spawn_model_server, turn_text, turn_tool_use};
 use serde_json::{Value, json};
 
-const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
+const BIN: &str = env!("CARGO_BIN_EXE_agent");
 
 /// A persistent loopback HTTP/1.1 server that replies to every request with `raw_response` (a full
 /// HTTP response including status line and headers). Records each raw request for assertions. Returns
@@ -137,7 +137,7 @@ fn fetch_mode_returns_status_headers_and_body() {
     assert_eq!(reqs.len(), 1, "exactly one fetch");
     assert!(reqs[0].starts_with("GET /"), "{}", reqs[0]);
     assert!(
-        reqs[0].contains("beyond-ai-agent/"),
+        reqs[0].contains("beyond-agent/"),
         "sends our UA: {}",
         reqs[0]
     );

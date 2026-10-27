@@ -26,7 +26,7 @@ fn seeded_session(dir: &std::path::Path) -> String {
 }
 
 fn run(base: &str, session_file: &str, prompt: &str) {
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",

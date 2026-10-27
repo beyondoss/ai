@@ -1,4 +1,4 @@
-//! Live smoke: the real `beyond-ai-agent` binary → the real `beyond-ai` gateway → a **real provider**.
+//! Live smoke: the real `agent` binary → the real gateway → a **real provider**.
 //!
 //! Ignored by default (bills tiny real requests). The gateway routes a bare `/v1/messages` to
 //! Anthropic and `/v1/chat/completions` to OpenAI by dialect, so one gateway with the right pool key

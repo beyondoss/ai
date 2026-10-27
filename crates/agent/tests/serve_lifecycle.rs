@@ -20,13 +20,13 @@ use common::{
 };
 use serde_json::{Value, json};
 
-const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
+const BIN: &str = env!("CARGO_BIN_EXE_agent");
 /// How long [`Collector::wait_until`] will wait for the POST it is looking for.
 ///
 /// Deliberately far longer than any healthy run needs: the loop returns the moment its predicate
 /// holds, so a generous bound costs nothing when the code works and only changes how long a genuinely
 /// broken test takes to report. At 5s this was a *pass/fail* threshold rather than a safety net — a
-/// loaded shard (four test threads, each spawning a real `beyond-ai-agent` plus a mock model server)
+/// loaded shard (four test threads, each spawning a real `agent` plus a mock model server)
 /// pushed a healthy run past it and failed the test for being slow.
 const WAIT: Duration = Duration::from_secs(60);
 

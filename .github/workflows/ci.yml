@@ -357,8 +357,8 @@ jobs:
         run: |
           echo "--- disk ---"; df -h / | tail -1
           echo "--- memory ---"; free -m | head -3
-          echo "--- surviving beyond-ai processes (leaked daemons) ---"
-          ps -eo pid,etime,rss,args | grep -E "beyond-ai|nats-server" | grep -v grep || echo "  none"
+          echo "--- surviving agent and gateway processes (leaked daemons) ---"
+          ps -eo pid,etime,rss,args | grep -E "agent|gateway|nats-server" | grep -v grep || echo "  none"
           sudo systemctl stop ci-resources 2>/dev/null
           echo "--- last resource samples ---"; tail -60 "$RUNNER_TEMP/resources.log"
       - name: upload logs
@@ -548,7 +548,7 @@ jobs:
         run: python3 -I .github/scripts/flaky-report.py "execd-arm64" target/nextest/ci/junit.xml
       - name: what was left running
         if: always()
-        run: ps -eo pid,etime,rss,args | grep -E "execd|beyond-ai" | grep -v grep || echo "  none"
+        run: ps -eo pid,etime,rss,args | grep -E "execd|agent|gateway" | grep -v grep || echo "  none"
   # Advisories only: no license or duplicate-version checks. Ignores live in .cargo/audit.toml.
   advisories:
     name: advisories

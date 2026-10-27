@@ -818,11 +818,11 @@ fn agent_binary() -> Result<String, String> {
     // to this binary: both land in the same target profile directory.
     let mut path = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     path.pop();
-    // `target/<profile>/deps/fleet-sim` → `target/<profile>/beyond-ai-agent`
+    // `target/<profile>/deps/fleet-sim` → `target/<profile>/agent`
     if path.ends_with("deps") {
         path.pop();
     }
-    let agent = path.join("beyond-ai-agent");
+    let agent = path.join("agent");
     if !agent.exists() {
         return Err(format!(
             "{} not found — build it first: cargo build -p beyond-agent",

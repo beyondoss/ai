@@ -79,7 +79,7 @@ fn set_mcp_enabled_changes_advertised_tools_and_model_request() {
         turn_text("two"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.env("HOME", &home);
     cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
@@ -256,7 +256,7 @@ fn disabled_mcp_tool_is_not_callable() {
         turn_text("ok"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.env("HOME", &home);
     cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");
@@ -310,7 +310,7 @@ fn new_session_resets_mcp_enablement() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![turn_text("x")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_cmd(bin, &base, &session_file);
     cmd.env("HOME", &home);
     cmd.env("BEYOND_AI_AGENT_MCP_IDLE_SECS", "0");

@@ -39,7 +39,7 @@ fn serve_export_html_writes_a_self_contained_transcript() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![turn_text("hello there")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -94,7 +94,7 @@ fn serve_export_html_includes_model_change_and_label_events() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![turn_text("hello there")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -175,7 +175,7 @@ fn serve_export_html_includes_abandoned_branches_not_just_the_active_path() {
     let (base, _bodies) =
         spawn_model_server(vec![turn_text("first answer"), turn_text("second answer")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -255,7 +255,7 @@ fn serve_defaults_to_home_claude_sessions_when_no_session_flag_given() {
     let project = tempfile::tempdir().unwrap();
     let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_default_persistence_cmd(bin, &base);
     cmd.current_dir(project.path()).env("HOME", home.path());
     let mut child = cmd.spawn_guarded();
@@ -305,7 +305,7 @@ fn serve_resumes_newest_session_matching_cwd_not_globally_newest() {
     let session_dir = session_dir_tmp.path().to_string_lossy().into_owned();
     let project_a = tempfile::tempdir().unwrap();
     let project_b = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     // Session A, from project_a.
     {
@@ -385,7 +385,7 @@ fn serve_reattaches_through_a_symlinked_cwd_to_the_session_recorded_under_its_re
     std::fs::create_dir(&real).unwrap();
     let link = projects.path().join("project-link");
     std::os::unix::fs::symlink(&real, &link).unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     // Start (and prompt) from the real path.
     {
@@ -442,7 +442,7 @@ fn serve_list_sessions_streams_progress_frames_correlated_to_the_request_id() {
     }
 
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_dir_cmd(bin, &base, &session_dir).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -540,7 +540,7 @@ fn serve_exits_gracefully_on_sigterm_mid_run() {
     );
     let (base, _bodies) = spawn_model_server(vec![turn1]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let pid = child.id();
     let mut stdin = child.stdin.take().unwrap();
@@ -644,7 +644,7 @@ fn serve_exits_gracefully_on_sighup_mid_run() {
     );
     let (base, _bodies) = spawn_model_server(vec![turn1]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let pid = child.id();
     let mut stdin = child.stdin.take().unwrap();
@@ -724,7 +724,7 @@ fn serve_exits_with_130_on_sigint_mid_run() {
     );
     let (base, _bodies) = spawn_model_server(vec![turn1]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let pid = child.id();
     let mut stdin = child.stdin.take().unwrap();
@@ -795,7 +795,7 @@ fn serve_streams_events_and_reattaches() {
     let turn2 = turn_text("Read complete.");
     let (base, _bodies) = spawn_model_server(vec![turn1, turn2]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     // --- First session: prompt, observe streamed events, read transcript ---
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
@@ -909,7 +909,7 @@ fn hard_crash_mid_second_round_trip(env: &[(&str, &str)]) {
         &json!({ "command": "sleep 5" }).to_string(),
     );
     let (base, _bodies) = spawn_model_server(vec![turn1, turn2, turn_text("done")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     let mut child = serve_cmd(bin, &base, &session_file)
         .envs(env.iter().copied())
@@ -981,7 +981,7 @@ fn serve_reports_success_when_a_failed_checkpoint_is_superseded_by_a_successful_
         &json!({ "command": "printf second-round-marker" }).to_string(),
     );
     let (base, _bodies) = spawn_model_server(vec![turn1, turn2, turn_text("done")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     let mut child = serve_cmd(bin, &base, &session_file)
         .env("BEYOND_AI_AGENT_TEST_FAIL_CHECKPOINT", "3")
@@ -1035,7 +1035,7 @@ fn a_failed_checkpoint_before_a_tool_means_the_tool_never_runs() {
         ),
         turn_text("done"),
     ]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     // Write 1 is the prompt's checkpoint (it lands); write 2 is the one before `toolu_1` runs.
     let mut child = serve_cmd(bin, &base, &session_file)
         .env("BEYOND_AI_AGENT_TEST_FAIL_CHECKPOINT", "2")
@@ -1100,7 +1100,7 @@ fn serve_stdout_stays_valid_json_even_when_a_load_warning_fires() {
     .unwrap();
 
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file.to_string_lossy())
         .env("RUST_LOG", "warn")
         .stderr(Stdio::piped())
@@ -1176,7 +1176,7 @@ fn new_session_reports_failure_and_leaves_the_old_session_active_when_persist_fa
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
 
     let (base, _bodies) = spawn_model_server(vec![turn_text("hello-reply")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -1238,7 +1238,7 @@ fn serve_unknown_command_type_reports_a_clear_failure_frame() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![turn_text("hi")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -1274,7 +1274,7 @@ fn serve_jsonl_framing_preserves_u2028_and_u2029_inside_a_payload() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -1319,7 +1319,7 @@ fn serve_jsonl_framing_handles_crlf_delimited_commands() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -1360,7 +1360,7 @@ fn serve_jsonl_framing_handles_a_final_command_with_no_trailing_newline() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -1393,7 +1393,7 @@ fn serve_name_flag_sets_the_initial_session_title() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![turn_text("hi")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file)
         .args(["--name", "my-serve-session"])
         .spawn_guarded();
@@ -1422,7 +1422,7 @@ fn serve_session_id_flag_applies_to_a_brand_new_session_file() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![turn_text("hi")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file)
         .args(["--session-id", "my-chosen-serve-id"])
         .spawn_guarded();
@@ -1459,7 +1459,7 @@ fn serve_session_id_flag_applies_to_the_default_repo_mode_when_no_session_exists
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut cmd = serve_default_persistence_cmd(bin, &base);
     cmd.current_dir(project.path())
         .env("HOME", home.path())
@@ -1489,7 +1489,7 @@ fn serve_session_id_flag_addresses_its_own_session_not_whatever_matched_the_cwd(
     let session_dir_tmp = tempfile::tempdir().unwrap();
     let session_dir = session_dir_tmp.path().to_string_lossy().into_owned();
     let project = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
 
     // First process: no `--session-id` — mints a fresh, freshly-generated id for this cwd.
     let existing_id = {
@@ -1593,7 +1593,7 @@ fn invalid_utf8_on_stdin_while_idle_ends_the_session_gracefully_instead_of_crash
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     // A lone 0xFF byte is never valid UTF-8 in any position — `AsyncBufReadExt::lines()` surfaces

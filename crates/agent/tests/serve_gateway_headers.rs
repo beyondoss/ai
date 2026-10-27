@@ -30,7 +30,7 @@ fn serve_startup_model_override_header_reaches_the_wire_request() {
 
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file)
         .env("AI_AGENT_CONFIG_DIR", &config_dir)
         .spawn_guarded();
@@ -74,7 +74,7 @@ fn serve_set_model_to_an_overridden_model_carries_that_models_own_header_on_the_
     // `gpt-4o`, which does have one.
     let (base, bodies) = spawn_model_server(vec![turn_text("first"), turn_text("second")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file)
         .env("AI_AGENT_CONFIG_DIR", &config_dir)
         .spawn_guarded();

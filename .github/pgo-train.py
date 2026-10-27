@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PGO training workload for `beyond-ai-agent`.
+"""PGO training workload for `agent`.
 
 Drives a PGO-*instrumented* build through the paths that decide the shipped binary's resident text,
 so the optimizer knows which code actually runs and can lay it out contiguously. See

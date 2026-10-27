@@ -24,7 +24,7 @@ fn run_binary_expands_a_skill_invocation_in_the_first_message() {
     .unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -77,7 +77,7 @@ fn run_binary_force_untrusted_overrides_trust_project() {
     .unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -123,7 +123,7 @@ fn run_binary_expands_a_prompt_template_in_the_first_message() {
     .unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -176,7 +176,7 @@ fn run_binary_no_skills_leaves_a_skill_invocation_unexpanded() {
     .unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -233,7 +233,7 @@ fn run_binary_no_skills_still_honors_an_explicit_skill_path() {
     .unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -277,7 +277,7 @@ fn run_binary_no_context_files_skips_project_instructions() {
     std::fs::write(dir.path().join("CLAUDE.md"), "PROJECT-MARKER-777").unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -320,7 +320,7 @@ fn run_binary_caps_a_long_project_instruction_file_at_32_kib_with_a_marker() {
     body.push_str("TAIL-MARKER-97\n");
     std::fs::write(dir.path().join("AGENTS.md"), &body).unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
-    let output = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let output = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .args([
             "run",
             "hello",
@@ -355,7 +355,7 @@ fn run_binary_injects_project_instructions_by_default() {
     std::fs::write(dir.path().join("CLAUDE.md"), "PROJECT-MARKER-778").unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -402,7 +402,7 @@ fn run_binary_no_prompt_templates_leaves_a_template_invocation_unexpanded() {
     .unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -457,7 +457,7 @@ fn run_binary_discovers_skills_from_an_ad_hoc_skill_path() {
     .unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -506,7 +506,7 @@ fn run_binary_ai_agent_skill_path_env_var_is_a_comma_separated_fallback_for_skil
     .unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .env(
             "AI_AGENT_SKILL_PATH",
@@ -547,7 +547,7 @@ fn run_binary_prompt_guideline_flag_reaches_the_system_prompt() {
     let dir = tempfile::tempdir().unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -589,7 +589,7 @@ fn run_binary_system_prompt_flag_replaces_the_base_prompt() {
     let dir = tempfile::tempdir().unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -635,7 +635,7 @@ fn run_binary_append_system_prompt_flag_appends_after_the_base_prompt() {
     let dir = tempfile::tempdir().unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -685,7 +685,7 @@ fn run_binary_explicit_system_prompt_wins_over_a_trusted_projects_system_md() {
     std::fs::write(claude_dir.join("SYSTEM.md"), "ON-DISK-SYSTEM-MD-MARKER").unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -736,7 +736,7 @@ fn run_binary_system_prompt_flag_reads_an_existing_file_as_its_contents() {
     std::fs::write(&persona_path, "FILE-CONTENTS-PERSONA-MARKER").unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -783,7 +783,7 @@ fn run_binary_append_system_prompt_flag_accumulates_across_repeated_occurrences(
     let dir = tempfile::tempdir().unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -838,7 +838,7 @@ fn run_binary_warns_on_stderr_when_an_untrusted_projects_gated_resources_are_ski
     std::fs::write(claude_dir.join("SYSTEM.md"), "SHOULD-NOT-APPLY").unwrap();
     let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
