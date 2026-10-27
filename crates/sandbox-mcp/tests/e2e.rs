@@ -454,6 +454,7 @@ async fn streamable_http_serves_the_same_tools_on_loopback_and_refuses_a_public_
         let (_dir, mock) = sandbox().await;
 
         let mut cmd = server_command(&mock.url);
+        // port-0: the child binds it, keeps it, and announces the port it got on stderr.
         cmd.env("SANDBOX_MCP_LISTEN", "127.0.0.1:0")
             .stderr(std::process::Stdio::piped());
         let mut child = cmd.spawn().unwrap();
@@ -479,7 +480,7 @@ async fn streamable_http_serves_the_same_tools_on_loopback_and_refuses_a_public_
         child.kill().await.unwrap();
 
         let out = server_command(&mock.url)
-            .env("SANDBOX_MCP_LISTEN", "0.0.0.0:0")
+            .env("SANDBOX_MCP_LISTEN", "0.0.0.0:1")
             .output()
             .await
             .unwrap();
