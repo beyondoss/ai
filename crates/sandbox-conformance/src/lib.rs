@@ -10,7 +10,10 @@ pub mod backends;
 pub mod eval;
 pub mod link;
 pub mod matrix;
+pub mod relay;
 pub mod report;
 pub mod run;
 
-pub use run::{Backend, Check, Connector, Link, Status, Tally, load_scenarios, run_scenario};
+pub use run::{
+    Backend, Check, Connector, Link, Status, Tally, load_scenarios, run_scenario, run_scenario_via,
+};

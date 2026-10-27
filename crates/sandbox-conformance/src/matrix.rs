@@ -8,6 +8,7 @@ use tokio::sync::Semaphore;
 
 use crate::backends::{self, Binaries};
 use crate::link::ProcessConnector;
+use crate::relay;
 use crate::report::Cell;
 use crate::run::{Backend, Check, Status, glob_match, run_scenario};
 
@@ -48,7 +49,10 @@ pub async fn run(plan: Plan) -> Vec<Cell> {
     // Plan order: driver-major.
     let order = |c: &Cell| {
         (
-            plan.drivers.iter().position(|d| d.name == c.driver),
+            plan.drivers
+                .iter()
+                .position(|d| d.name == c.driver)
+                .unwrap_or(usize::MAX),
             plan.backends.iter().position(|b| *b == c.backend),
         )
     };
@@ -68,8 +72,7 @@ async fn run_backend(plan: &Plan, name: &str) -> Vec<Cell> {
         }
     };
     let mut cells = Vec::new();
-    for d in &plan.drivers {
-        let cell_name = format!("{}__{}", d.name, name);
+    let open = |d: &Driver| {
         let connector = ProcessConnector {
             cmd: d.cmd.clone(),
             url: started.url.clone(),
@@ -77,14 +80,21 @@ async fn run_backend(plan: &Plan, name: &str) -> Vec<Cell> {
             jobs_root: started.jobs_root.clone(),
             caps: started.caps.clone(),
         };
-        let mut be = Backend::open(
-            &cell_name,
-            Box::new(connector),
+        let (cell_name, auth, work, vars) = (
+            format!("{}__{}", d.name, name),
             started.bearer.is_some(),
-            &started.work,
-        )
-        .await;
-        be.vars = started.vars.clone();
+            started.work.clone(),
+            started.vars.clone(),
+        );
+        async move {
+            let mut be = Backend::open(&cell_name, Box::new(connector), auth, &work).await;
+            be.vars = vars;
+            be
+        }
+    };
+    let mut opened = Vec::new();
+    for d in &plan.drivers {
+        let be = open(d).await;
         if be.ops.is_empty() {
             let why = be
                 .link
@@ -99,6 +109,34 @@ async fn run_backend(plan: &Plan, name: &str) -> Vec<Cell> {
             continue;
         }
         cells.push(run_cell(plan, &d.name, name, &be, started.suites).await);
+        opened.push((d, be));
+    }
+    // Relay: every ordered pair on this one sandbox. Pairs of a driver with itself use a second
+    // process of it, and run only the scenarios that ask.
+    if started.suites.is_none() {
+        for (da, a) in &opened {
+            for (db, b) in &opened {
+                let same = da.name == db.name;
+                let second;
+                let b = if same {
+                    second = open(db).await;
+                    &second
+                } else {
+                    b
+                };
+                let filter = plan.filter.clone();
+                let keep = move |id: &str| filter.as_deref().is_none_or(|f| glob_match(f, id));
+                let checks =
+                    relay::run_pair(&plan.scenarios, a, b, same, started.suites, &keep).await;
+                if relay::ran(&checks) {
+                    cells.push(Cell::from_checks(
+                        &format!("relay:{}>{}", da.name, db.name),
+                        name,
+                        &checks,
+                    ));
+                }
+            }
+        }
     }
     cells
 }
@@ -118,6 +156,9 @@ async fn run_cell(
         }
         for sc in file["scenarios"].as_array().into_iter().flatten() {
             let id = sc["id"].as_str().unwrap_or("");
+            if relay::is_relay(sc) {
+                continue;
+            }
             if plan.filter.as_deref().is_some_and(|f| !glob_match(f, id)) {
                 continue;
             }

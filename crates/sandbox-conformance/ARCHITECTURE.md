@@ -19,9 +19,10 @@ test (`crates/agent/tests/sdk_conformance.rs`) reaches the in-process reference 
 | `lib.rs`; `bin/sandbox-matrix.rs` | The library root; the CLI (`--driver NAME=CMD`, `--registry`, `--backend`, `--filter`, `--report`, `--verbose`). Exit 1 on any `fail`, 2 on a usage error. |
 | `eval.rs`                         | Pure functions of the scenario language: `${var}` substitution, `$repeat`, `_utf8` / `_len` / `_sha256` views, matchers.                                   |
 | `run.rs`                          | `Backend` (a connected driver plus what its probes found), `run_scenario`, the five outcomes, `Tally`. No I/O of its own beyond `Link` / `Connector`.      |
+| `relay.rs`                        | Relay scenarios (steps with `via`): which driver a step goes to, and one run of every relay scenario for a pair A, B on the same sandbox.                  |
 | `link.rs`                         | `ProcessLink`: `sh -c "exec CMD"` with the `CONFORMANCE_*` environment, one request in flight, a named call timeout, stderr kept for the death note.       |
 | `backends.rs`                     | Starts a backend and returns a `Started` (URL, bearer, work directory, extra variables, a guard that stops it).                                            |
-| `matrix.rs`                       | The plan: backends in parallel, each started once, its drivers one after another; the registry file.                                                       |
+| `matrix.rs`                       | The plan: backends in parallel, each started once, its drivers one after another, then every ordered pair of them for the relay scenarios; the registry.   |
 | `report.rs`                       | The table and the JSON cell.                                                                                                                               |
 | `bin/sandbox-driver-rust.rs`      | The Rust client's driver. Includes `crates/agent/tests/sdk_conformance_driver.rs` by path until `beyond-sandbox` owns the client.                          |
 | `bin/sandbox-driver-broken.rs`    | Wraps a driver and corrupts one op's answer. `tests/selftest.rs` proves the harness fails exactly the checks that use that op.                             |
