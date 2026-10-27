@@ -52,7 +52,12 @@ def build() -> dict[str, str]:
     resolve = macro(sh, "resolve_target")
     not_dir = macro(sh, "not_a_directory")
     new_temp = not_dir + re.findall(RAW, macro_body(sh, "new_temp"), re.S)[0]
-    macros = {"resolve_target": resolve, "not_a_directory": not_dir, "new_temp": new_temp}
+    macros = {
+        "resolve_target": resolve,
+        "not_a_directory": not_dir,
+        "new_temp": new_temp,
+        "copy_mode": macro(sh, "copy_mode"),
+    }
     jobs = JOBS.read_text()
     return {
         "STAT": raw_const(sh, "STAT_SCRIPT"),
