@@ -34,10 +34,9 @@ fn query(root: &Path) -> SearchQuery {
     }
 }
 
-/// N1: `find DIR -mindepth 1` does not follow a symlink given as DIR, so a symlinked directory lists
-/// as empty although `stat` says it is a directory.
+/// N1 (fixed): a symlink to a directory lists what it points to, under the link's path.
 #[test]
-fn n1_list_of_a_symlinked_directory_is_empty() {
+fn n1_list_of_a_symlinked_directory_lists_the_target() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("real")).unwrap();
     std::fs::write(dir.path().join("real/f"), b"x").unwrap();
@@ -47,10 +46,8 @@ fn n1_list_of_a_symlinked_directory_is_empty() {
     let st = env::rt().block_on(fs.stat(&link)).unwrap().unwrap();
     assert_eq!(format!("{:?}", st.kind), "Dir");
     let entries = env::rt().block_on(fs.list_dir(&link, 100, true)).unwrap();
-    assert!(
-        entries.is_empty(),
-        "N1 is fixed: delete this test and the known(\"N1\") call"
-    );
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "f");
 }
 
 /// N2: a path with a newline in it spreads the engine's one-line error over two lines, and the D4
