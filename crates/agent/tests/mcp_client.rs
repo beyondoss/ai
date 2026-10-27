@@ -1,5 +1,5 @@
 //! MCP (Model Context Protocol) client e2e: proves `tools::mcp` end to end through the real compiled
-//! `beyond-ai-agent` binary — real subprocess (stdio transport) and real TCP (streamable-HTTP
+//! `agent` binary — real subprocess (stdio transport) and real TCP (streamable-HTTP
 //! transport), never a mock of the MCP protocol itself. The model side stays mocked (`spawn_model_server`,
 //! matching every other e2e test in this directory) so a test can deterministically script "call this
 //! MCP tool with these arguments" and inspect exactly what reached the wire.
@@ -24,7 +24,7 @@ use common::{
 };
 use serde_json::{Value, json};
 
-/// The compiled fixture stdio server's path — a sibling `[[bin]]` target of the `beyond-ai-agent`
+/// The compiled fixture stdio server's path — a sibling `[[bin]]` target of the `agent`
 /// package (auto-discovered from `src/bin/`), so Cargo builds it before running this test and exposes
 /// its path the same way it does for the main binary.
 fn fixture_bin() -> &'static str {
@@ -84,7 +84,7 @@ fn trust(home: &Path, project: &Path) {
     );
 }
 
-/// Run the real `beyond-ai-agent run` binary against a mock model server, with `home` as `$HOME` (so
+/// Run the real `agent run` binary against a mock model server, with `home` as `$HOME` (so
 /// `~/.beyond/settings.json` resolves there) and `cwd` as the working directory. Returns
 /// `(exit_success, stdout, stderr, recorded_model_request_bodies)`.
 fn run_against(
@@ -94,7 +94,7 @@ fn run_against(
     responses: Vec<String>,
 ) -> (bool, String, String, Vec<String>) {
     let (base, bodies) = spawn_model_server(responses);
-    let output = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let output = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .env("HOME", home)
         .args([
             "run",
@@ -817,7 +817,7 @@ fn mcp_stdio_tool_is_discovered_and_callable_through_serve_too() {
         &json!({ "text": "serve-mcp-marker" }).to_string(),
     );
     let (base, bodies) = spawn_model_server(vec![turn1, turn_text("done")]);
-    let mut child = serve_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"), &base, &session_file)
+    let mut child = serve_cmd(env!("CARGO_BIN_EXE_agent"), &base, &session_file)
         .env("HOME", home.path())
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();

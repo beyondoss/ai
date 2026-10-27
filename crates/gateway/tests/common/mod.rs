@@ -1,4 +1,4 @@
-//! e2e harness: a real `beyond-ai` binary, a real `nats-server` (JetStream KV backing the deny-set
+//! e2e harness: a real `gateway` binary, a real `nats-server` (JetStream KV backing the deny-set
 //! and allowance-set), and a mock HTTP upstream that records what the gateway forwarded.
 //!
 //! Requires `nats-server` on PATH — run via `mise run test:integration:rs`.
@@ -85,7 +85,7 @@ where
 /// [`test_client`]'s request timeout, for the same reason.
 pub const CONDITION_BUDGET: Duration = Duration::from_secs(30);
 
-/// How long a spawned server (`beyond-ai`, `nats-server`) may take to listen on its port.
+/// How long a spawned server (`gateway`, `nats-server`) may take to listen on its port.
 ///
 /// A stall guard, not a performance bound: an idle host boots the gateway in ~0.1 s and 200 busy
 /// loops on 16 cores slow that to ~1.3 s, but a mutation run on the same box (load 60-230, disk
@@ -1011,7 +1011,7 @@ impl Drop for MockUpstream {
     }
 }
 
-// --- the real beyond-ai binary ----------------------------------------------
+// --- the real gateway binary ----------------------------------------------
 
 pub struct Gateway {
     /// The child's stderr, drained by a background thread. Structured JSON, one object per line —
@@ -1388,7 +1388,7 @@ impl GatewayBuilder {
             .write_all(cfg.as_bytes())
             .unwrap();
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_beyond-ai"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_gateway"))
             .arg("run")
             .arg("-c")
             .arg(&config_path)
@@ -1424,7 +1424,7 @@ impl GatewayBuilder {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn beyond-ai");
+            .expect("spawn gateway");
         let log = Arc::new(Mutex::new(String::new()));
         let drain = |stream: Option<Box<dyn std::io::Read + Send>>| {
             let Some(stream) = stream else { return };
@@ -1476,13 +1476,13 @@ impl GatewayBuilder {
             }
             if let Ok(Some(status)) = child.try_wait() {
                 panic!(
-                    "beyond-ai (pid {pid}) exited ({status}) before listening; log:\n{}",
+                    "gateway (pid {pid}) exited ({status}) before listening; log:\n{}",
                     log_tail(&log.lock().unwrap_or_else(|p| p.into_inner()))
                 );
             }
             if std::time::Instant::now() >= deadline {
                 panic!(
-                    "beyond-ai (pid {pid}) did not come up within {STARTUP_BUDGET:?}; log:\n{}",
+                    "gateway (pid {pid}) did not come up within {STARTUP_BUDGET:?}; log:\n{}",
                     log_tail(&log.lock().unwrap_or_else(|p| p.into_inner()))
                 );
             }
@@ -1987,13 +1987,13 @@ pub fn boot_refuses(extra: &str, limit: Duration) -> Option<String> {
         closed_port()
     );
     std::fs::write(&path, cfg).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_beyond-ai"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gateway"))
         .args(["run", "-c"])
         .arg(&path)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn beyond-ai");
+        .expect("spawn gateway");
     let start = std::time::Instant::now();
     let out = loop {
         if let Ok(Some(_)) = child.try_wait() {

@@ -56,7 +56,7 @@ fn wait_with_timeout(
 fn run_json_mode_exits_cleanly_instead_of_panicking_when_stdout_is_closed_early() {
     let (base, _bodies) = spawn_model_server(vec![turn_with_a_large_text_delta(500_000)]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = run_cmd(bin)
         .args([
             "run",
@@ -106,7 +106,7 @@ fn run_json_mode_exits_cleanly_instead_of_panicking_when_stdout_is_closed_early(
 fn run_text_mode_exits_cleanly_instead_of_panicking_when_stdout_is_closed_early() {
     let (base, _bodies) = spawn_model_server(vec![turn_with_a_large_text_delta(500_000)]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = run_cmd(bin)
         .args([
             "run",

@@ -15,7 +15,7 @@ event: error\n\
 data: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Number of request tokens has exceeded your per-minute rate limit\"}}\n\n";
 
 fn run(base: &str, extra: &[&str]) -> std::process::Output {
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut args = vec![
         "run",
         "hi",

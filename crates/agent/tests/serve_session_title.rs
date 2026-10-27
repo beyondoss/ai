@@ -38,7 +38,7 @@ fn a_session_names_itself_from_its_opening_exchange() {
         )],
         turn_text("here is the answer"),
     );
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_dir_cmd(bin, &base, &dir_str).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -72,7 +72,7 @@ fn an_unusable_title_is_attempted_once_and_costs_the_session_nothing() {
     // "model answered the question instead of naming it" case. Unbounded, so nothing here fails for
     // want of a scripted turn.
     let (base, bodies) = spawn_model_server_routed(Vec::new(), turn_text(&"x".repeat(200)));
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_dir_cmd(bin, &base, &dir_str).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -132,7 +132,7 @@ fn a_title_call_does_not_consume_the_conversation_script() {
         turn_text("SECOND-REPLY"),
         turn_text("THIRD-REPLY"),
     ]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_dir_cmd(bin, &base, &dir_str).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);

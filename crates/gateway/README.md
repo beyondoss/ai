@@ -44,7 +44,7 @@ curl localhost:8080/v1/chat/completions \
 ```
 
 An image is published as `ghcr.io/beyondoss/ai` (`latest` and by commit SHA,
-`linux/amd64` and `linux/arm64`); its entrypoint is `beyond-ai`. Configuration
+`linux/amd64` and `linux/arm64`); its entrypoint is `gateway`. Configuration
 comes from `./config.toml` (`-c`/`AI_CONFIG_PATH`) and `AI_`-prefixed
 environment variables.
 
@@ -70,7 +70,7 @@ AI_POOL_KEY_OPENAI=sk-... AI_ID_SIGNING_KEY_1=$(openssl rand -base64 32) \
 Then use `DEV_BAI_V1` as the API key against `http://localhost:8080/v1`. Until
 the allowance-set has been read from NATS (or a `snapshot_path` snapshot),
 managed requests get `503 allowance unavailable` and `/readyz` reports
-`not_ready`; BYO traffic is unaffected. `beyond-ai doctor` checks NATS, signing
+`not_ready`; BYO traffic is unaffected. `gateway doctor` checks NATS, signing
 keys, pool keys and provider DNS, and exits non-zero on a failure.
 
 Point an SDK at the gateway:

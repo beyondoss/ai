@@ -12,7 +12,7 @@ name = "beyond_gateway"
 path = "src/lib.rs"
 
 [[bin]]
-name = "beyond-ai"
+name = "gateway"
 path = "src/main.rs"
 
 # Inherit the workspace lint gates (`unsafe_code = "forbid"`, denied panic surface, …). They bind

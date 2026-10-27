@@ -40,7 +40,7 @@ fn no_test_spawns_the_agent_binary_with_a_bare_command_new() {
     let mut files = Vec::new();
     rust_files(&tests, &mut files);
     let binding = regex::Regex::new(
-        r#"(?:let|const|static)\s+(?:mut\s+)?(\w+)\s*(?::\s*&(?:'static\s+)?str\s*)?=\s*(?:env!\(\s*"CARGO_BIN_EXE_beyond-ai-agent"\s*\)|(?:[\w:]*::)?BIN)\s*;"#,
+        r#"(?:let|const|static)\s+(?:mut\s+)?(\w+)\s*(?::\s*&(?:'static\s+)?str\s*)?=\s*(?:env!\(\s*"CARGO_BIN_EXE_agent"\s*\)|(?:[\w:]*::)?BIN)\s*;"#,
     )
     .unwrap();
     let mut offenders = Vec::new();
@@ -62,7 +62,7 @@ fn no_test_spawns_the_agent_binary_with_a_bare_command_new() {
         let alternatives = names
             .iter()
             .map(|n| format!(r"(?:[\w:]*::)?{}", regex::escape(n)))
-            .chain([r#"env!\(\s*"CARGO_BIN_EXE_beyond-ai-agent"\s*\)"#.to_string()])
+            .chain([r#"env!\(\s*"CARGO_BIN_EXE_agent"\s*\)"#.to_string()])
             .collect::<Vec<_>>()
             .join("|");
         let spawn =

@@ -52,7 +52,7 @@ fn assert_no_model_call(gateway: &Gateway) {
 
 fn run(gateway: &Gateway, args: &[&str]) -> std::process::Output {
     let dir = tempfile::tempdir().unwrap();
-    run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    run_cmd(env!("CARGO_BIN_EXE_agent"))
         .args([
             "run",
             "--gateway-url",
@@ -130,7 +130,7 @@ fn serve_refuses_the_same_flags_at_startup() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("s.jsonl");
         let out = serve_cmd(
-            env!("CARGO_BIN_EXE_beyond-ai-agent"),
+            env!("CARGO_BIN_EXE_agent"),
             &gateway.base,
             session.to_str().unwrap(),
         )

@@ -16,7 +16,7 @@ fn run(
     gateway: &str,
     extra: &[&str],
 ) -> std::process::Output {
-    let out = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let out = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .env("AI_AGENT_CONFIG_DIR", config_dir)
         .env_remove("AI_AGENT_MODEL")
         .args(["run", "--gateway-url", gateway, "--key", "bai_v1.test"])

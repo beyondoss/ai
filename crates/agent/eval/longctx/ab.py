@@ -44,10 +44,10 @@ def resolve(sha: str) -> str:
 
 
 def build(sha: str, code_mode: bool = False) -> Path:
-    """The release `beyond-ai-agent` at `sha` (idempotent: a cached binary is reused)."""
+    """The release `agent` at `sha` (idempotent: a cached binary is reused)."""
     full = resolve(sha)
     label = full[:10] + ("-cm" if code_mode else "")
-    out = tasks.work_dir() / "bin" / f"beyond-ai-agent-{label}"
+    out = tasks.work_dir() / "bin" / f"agent-{label}"
     if out.exists():
         return out
     src = tasks.work_dir() / "src" / full[:10]
@@ -59,7 +59,7 @@ def build(sha: str, code_mode: bool = False) -> Path:
     cmd = ["cargo", "build", "--release", "-p", "beyond-agent"] + (["--features", "code-mode"] if code_mode else [])
     subprocess.run(cmd, cwd=src, env={**os.environ, "CARGO_TARGET_DIR": str(target)}, check=True)
     out.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(target / "release" / "beyond-ai-agent", out)
+    shutil.copy2(target / "release" / "agent", out)
     shutil.rmtree(target)
     return out
 

@@ -18,7 +18,7 @@ fn serve_set_auto_compaction_toggles_and_rejects_a_non_boolean() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -67,7 +67,7 @@ fn serve_no_compaction_flag_starts_with_auto_compaction_disabled() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file)
         .args(["--no-compaction"])
         .spawn_guarded();
@@ -99,7 +99,7 @@ fn serve_set_auto_compaction_persists_across_a_restart() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
 
     let (base, _bodies) = spawn_model_server(vec![]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file)
         .env("HOME", home.path())
         .spawn_guarded();
@@ -240,7 +240,7 @@ fn serve_compact_reports_too_small_reason_for_a_session_with_nothing_to_compact(
     // for, failing the test loudly rather than silently passing.
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -297,7 +297,7 @@ fn serve_compact_reports_already_compacted_reason_when_nothing_new_followed_the_
     // compaction attempt — a network call here would fail the test loudly rather than silently pass.
     let (base, bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -608,7 +608,7 @@ fn serve_set_auto_retry_toggles_and_rejects_a_non_boolean() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -659,7 +659,7 @@ fn serve_set_auto_retry_false_fails_immediately_instead_of_retrying_a_dropped_st
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, bodies) = spawn_model_server(vec![truncated.to_string()]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -711,7 +711,7 @@ fn serve_auto_retries_a_whole_run_after_mid_stream_retry_is_exhausted() {
         turn_text("recovered"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -807,7 +807,7 @@ fn serve_persists_the_retried_attempts_assistant_message_not_only_in_memory() {
         turn_text("recovered"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -888,7 +888,7 @@ fn serve_whole_run_retry_recovery_attempt_can_itself_dispatch_tool_calls() {
         turn_text("done after tool"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -941,7 +941,7 @@ fn serve_whole_run_retry_succeeds_on_its_second_attempt_not_its_first() {
         turn_text("recovered on the second whole-run attempt"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -1004,7 +1004,7 @@ fn serve_abort_retry_interrupts_a_pending_whole_run_retry_backoff() {
         turn_text("would have recovered"),
     ]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -1138,7 +1138,7 @@ fn serve_auto_retry_exhausts_all_attempts_and_reports_failure() {
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
     let (base, _bodies) = spawn_model_server(vec![truncated.to_string(); 12]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file).spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = common::child_frames(&mut child);
@@ -1214,7 +1214,7 @@ fn serve_idle_timeout_ms_flag_causes_a_stalled_response_to_fail_quickly() {
 
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = serve_cmd(bin, &base, &session_file)
         .args(["--idle-timeout-ms", "200", "--retry-max-retries", "0"])
         .spawn_guarded();

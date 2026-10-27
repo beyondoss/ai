@@ -44,7 +44,7 @@ fn run_binary_performs_tool_round_trip() {
     let turn2 = turn_text("I read the file.");
     let (base, bodies) = spawn_model_server(vec![turn1, turn2]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -104,7 +104,7 @@ fn run_binary_starts_the_answer_on_its_own_line_after_a_tool_call() {
     let turn2 = turn_text("I read the file.");
     let (base, _bodies) = spawn_model_server(vec![turn1, turn2]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -141,7 +141,7 @@ fn run_binary_exits_nonzero_on_a_refusal_in_text_mode() {
     // completion — a script/CI caller has no other signal to key off of in that mode.
     let (base, _bodies) = spawn_model_server(vec![turn_refusal("I can't help with that.")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -172,7 +172,7 @@ fn run_binary_a_normal_completion_in_text_mode_still_exits_zero() {
     // The exit-code check must not misfire on an ordinary end-of-turn — only an actual refusal.
     let (base, _bodies) = spawn_model_server(vec![turn_text("all done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -203,7 +203,7 @@ fn run_binary_refusal_exit_code_check_is_scoped_to_text_mode() {
     // a caller there is expected to inspect it programmatically, not rely on the process exit code.
     let (base, _bodies) = spawn_model_server(vec![turn_refusal("I can't help with that.")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -247,7 +247,7 @@ fn run_binary_json_mode_streams_structured_agent_events_not_text() {
     let turn2 = turn_text("I read the file.");
     let (base, _bodies) = spawn_model_server(vec![turn1, turn2]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -336,7 +336,7 @@ fn run_binary_session_id_flag_gives_a_deterministic_id_for_an_ephemeral_run() {
     let dir = tempfile::tempdir().unwrap();
     let (base, _bodies) = spawn_model_server(vec![turn_text("ok")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -385,7 +385,7 @@ fn run_binary_prints_a_live_preview_of_streamed_tool_arguments() {
     );
     let (base, _bodies) = spawn_model_server(vec![turn1, turn_text("done")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -423,7 +423,7 @@ fn run_binary_prints_startup_timings_only_when_the_env_var_is_set() {
     // stderr; unset, it must add nothing at all — and even enabled, it must never touch stdout, since
     // that's the streamed-text protocol surface.
     let (base, _bodies) = spawn_model_server(vec![turn_text("done")]);
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let args = [
         "run",
         "hi",
@@ -485,7 +485,7 @@ fn run_binary_sends_multiple_messages_as_sequential_turns() {
     let (base, bodies) =
         spawn_model_server(vec![turn_text("first reply"), turn_text("second reply")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -533,7 +533,7 @@ fn run_binary_composes_an_at_file_reference_into_the_first_message() {
     std::fs::write(dir.path().join("notes.txt"), "the-file-marker-77").unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("got it")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -584,7 +584,7 @@ fn run_binary_attaches_an_at_referenced_image_instead_of_erroring() {
     std::fs::write(dir.path().join("swatch.png"), &png).unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("I see a red swatch.")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",
@@ -628,7 +628,7 @@ fn run_binary_reads_piped_stdin_into_the_first_message() {
     let dir = tempfile::tempdir().unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("noted")]);
 
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let mut child = run_cmd(bin)
         .args([
             "run",
@@ -669,7 +669,7 @@ fn run_binary_reads_piped_stdin_into_the_first_message() {
 
 #[test]
 fn run_binary_errors_when_no_task_stdin_or_file_is_given() {
-    let bin = env!("CARGO_BIN_EXE_beyond-ai-agent");
+    let bin = env!("CARGO_BIN_EXE_agent");
     let output = run_cmd(bin)
         .args([
             "run",

@@ -32,7 +32,7 @@ fn assert_connects(server: Value, tool: &str) {
     )
     .unwrap();
     let (base, bodies) = spawn_model_server(vec![turn_text("hi")]);
-    let out = run_cmd(env!("CARGO_BIN_EXE_beyond-ai-agent"))
+    let out = run_cmd(env!("CARGO_BIN_EXE_agent"))
         .env("HOME", home.path())
         .current_dir(home.path())
         .args([
