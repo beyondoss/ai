@@ -3,14 +3,12 @@
 //! killing the command's whole process group, a backgrounded grandchild included.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use crate::common;
-
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use beyond_agent::exec_endpoint::HttpExecRunner;
-use beyond_agent::tools::exec::{CommandRunner, ExecResult, JobHooks, Kill};
-use common::exec_mock::{ExecMock, StreamEnd, wait_group_gone};
+use beyond_sandbox::exec::{CommandRunner, ExecResult, JobHooks, Kill};
+use beyond_sandbox::exec_endpoint::HttpExecRunner;
+use beyond_test_support::exec_mock::{ExecMock, StreamEnd, wait_group_gone};
 
 fn sh(script: &str) -> Vec<String> {
     vec!["-c".to_string(), script.to_string()]
@@ -51,7 +49,7 @@ async fn dropping_the_call_mid_stream_kills_the_process_group() {
         .wait_for_stream("drop-me", Duration::from_secs(5))
         .await
         .unwrap();
-    assert!(common::exec_mock::group_alive(s.pgid));
+    assert!(beyond_test_support::exec_mock::group_alive(s.pgid));
 
     task.abort();
     let _ = task.await;
@@ -121,8 +119,8 @@ async fn a_v11_tracked_run_reports_no_kill() {
     let dir = tempfile::tempdir().unwrap();
     let mock = ExecMock::start_with(
         dir.path(),
-        common::exec_mock::MockOptions {
-            protocol: common::exec_mock::Protocol::V11,
+        beyond_test_support::exec_mock::MockOptions {
+            protocol: beyond_test_support::exec_mock::Protocol::V11,
             ..Default::default()
         },
     )

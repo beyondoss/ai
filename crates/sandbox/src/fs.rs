@@ -19,14 +19,12 @@
 //! the fiddly details for free instead of by vigilance: there is only one `clip`, one `trim_eol`, one
 //! [`finalize`], and both backends call them.
 
-pub mod local;
 pub mod shell;
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agent_core::ToolError;
 use async_trait::async_trait;
 
 /// Long match lines are clipped to keep output readable — a *character* count, matching pi's own
@@ -156,15 +154,6 @@ pub enum FsError {
     InvalidQuery(String),
     /// The backend couldn't complete the operation. Not the caller's mistake.
     Backend(String),
-}
-
-impl From<FsError> for ToolError {
-    fn from(e: FsError) -> Self {
-        match e {
-            FsError::InvalidQuery(m) => ToolError::InvalidInput(m),
-            FsError::Backend(m) => ToolError::Execution(m),
-        }
-    }
 }
 
 impl std::fmt::Display for FsError {
@@ -587,6 +576,38 @@ pub fn finalize(mut hits: Vec<Hit>, limit: usize, stopped_early: bool) -> (Vec<H
         }
     }
     (hits, truncated)
+}
+
+/// Build a [`SearchQuery`] with the defaults every caller wants — used by tests and the benchmark so
+/// neither has to spell out seven fields to vary one.
+#[doc(hidden)]
+pub fn query(pattern: &str, root: PathBuf, limit: usize) -> SearchQuery {
+    SearchQuery {
+        pattern: pattern.to_string(),
+        literal: false,
+        ignore_case: false,
+        glob: None,
+        root,
+        limit,
+        before: 0,
+        after: 0,
+    }
+}
+
+/// An unpredictable per-call suffix for a temp file name, so it can't be preplanted under a symlink
+/// before the call happens. A process-wide salt (`RandomState` draws OS entropy once) plus a
+/// monotonic counter keeps same-process calls distinct — no `rand`/`uuid` dependency needed.
+pub fn temp_suffix() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SALT: OnceLock<u64> = OnceLock::new();
+    let salt = *SALT.get_or_init(|| RandomState::new().hash_one(0xA70A1Cu64));
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{salt:x}{seq:x}")
 }
 
 #[cfg(test)]

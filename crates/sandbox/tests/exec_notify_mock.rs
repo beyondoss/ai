@@ -8,17 +8,17 @@
 //! tests run every `v1.4-retry.json` timeline through it.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use crate::common;
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use beyond_agent::exec_endpoint::HttpExecRunner;
-use beyond_agent::exec_endpoint::jobs::{
+use beyond_sandbox::exec_endpoint::HttpExecRunner;
+use beyond_sandbox::exec_endpoint::jobs::{
     JobId, JobNotify, JobScope, JobSpec, JobStatus, SandboxJobs,
 };
-use beyond_agent::exec_endpoint::jobs_native::{JobOffer, NativeJobs};
-use common::exec_mock::{Answer, CallbackReceiver, ExecMock, LoseCallbacks, MockOptions};
+use beyond_sandbox::exec_endpoint::jobs_native::{JobOffer, NativeJobs};
+use beyond_test_support::exec_mock::{
+    Answer, CallbackReceiver, ExecMock, LoseCallbacks, MockOptions,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -480,7 +480,7 @@ async fn the_mock_retries_on_the_schedule_and_stops() {
     assert_eq!(rx.received().len(), 1, "a 404 was retried");
 
     // A connection error is retried: nothing listens on this port.
-    let port = common::DeadPort::bind();
+    let port = beyond_test_support::ports::DeadPort::bind();
     let dead = format!("127.0.0.1:{}", port.port());
     e.jobs()
         .keep_notify(

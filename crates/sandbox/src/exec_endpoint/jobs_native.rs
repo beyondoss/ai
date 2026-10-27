@@ -246,7 +246,8 @@ impl<'a> NativeJobs<'a> {
     }
 
     /// One non-streamed operation; its JSON answer.
-    pub(crate) async fn call(&self, job: Value) -> std::io::Result<Value> {
+    #[doc(hidden)]
+    pub async fn call(&self, job: Value) -> std::io::Result<Value> {
         let resp = self
             .runner
             .send_job(INERT, &[], None, OP_TIMEOUT, None, false, Some(&job))

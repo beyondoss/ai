@@ -6,15 +6,13 @@
 //! directory only the mock hands its commands.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use crate::common;
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use beyond_agent::exec_endpoint::HttpExecRunner;
-use beyond_agent::exec_endpoint::jobs::{JobId, JobNotify, JobScope, JobSpec};
-use beyond_agent::tools::exec::CommandRunner;
-use common::exec_mock::{ExecMock, MockOptions, NotifyFaults, Protocol};
+use beyond_sandbox::exec::CommandRunner;
+use beyond_sandbox::exec_endpoint::HttpExecRunner;
+use beyond_sandbox::exec_endpoint::jobs::{JobId, JobNotify, JobScope, JobSpec};
+use beyond_test_support::exec_mock::{ExecMock, MockOptions, NotifyFaults, Protocol};
 
 fn spec(script: &str) -> JobSpec {
     JobSpec {
@@ -168,7 +166,7 @@ async fn no_notify_answer_runs_anything_on_this_host() {
 /// An endpoint that cannot be reached is an error for every operation, never a local run.
 #[tokio::test]
 async fn an_unreachable_endpoint_fails_closed() {
-    let port = common::DeadPort::bind();
+    let port = beyond_test_support::ports::DeadPort::bind();
     let runner =
         Arc::new(HttpExecRunner::new(format!("http://127.0.0.1:{}/exec", port.port())).unwrap());
     let marker = tempfile::tempdir().unwrap();

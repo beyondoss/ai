@@ -1,19 +1,19 @@
 //! [`ShellFs`] — the same filesystem operations expressed as *commands*, over any
-//! [`CommandRunner`](crate::tools::exec::CommandRunner).
+//! [`CommandRunner`](crate::exec::CommandRunner).
 //!
 //! This backend assumes nothing is installed on the target beyond ordinary Linux utilities. It probes
 //! once for what's actually there ([`Capabilities`]) and picks the best available translation, so the
 //! same code works against a box we control and one we don't.
 //!
 //! Because it is generic over the runner rather than over a transport, it runs over
-//! [`RealRunner`](crate::tools::exec::RealRunner) on the host — against the very same files
+//! [`RealRunner`](crate::testing::Host) on the host — against the very same files
 //! [`super::local::LocalFs`] sees. That is what makes the two backends differentially testable in CI
 //! with no VM, no container, and no infrastructure, and it is the main reason the seam is shaped this
 //! way.
 //!
 //! ## Never build a shell string
 //!
-//! [`CommandRunner::run`](crate::tools::exec::CommandRunner::run) takes `program` and `args`
+//! [`CommandRunner::run`](crate::exec::CommandRunner::run) takes `program` and `args`
 //! separately, so every path and pattern here rides as its own argv entry and is never interpolated
 //! into text a shell will parse. A model-supplied path of `'; rm -rf /` is inert — it is one argument
 //! containing those characters, not a command. Nothing in this module may construct a command string;
@@ -30,7 +30,7 @@ use super::{
     DirEntry, FileKind, FsBackend, FsError, GlobOutcome, GlobQuery, Hit, MAX_CONTEXT, Meta,
     PathWorld, SearchOutcome, SearchQuery, finalize, trim_eol,
 };
-use crate::tools::exec::{CommandRunner, ExecResult};
+use crate::exec::{CommandRunner, ExecResult};
 
 /// How long a single backend command may run before it is reaped.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -47,7 +47,7 @@ const WRITE_CHUNK: usize = 48 * 1024;
 /// Raw bytes per `read_bytes` command: 96 KiB, which base64s to exactly 128 KiB — the head a runner's
 /// capture keeps whole ([`crate::tools::exec`]'s `STREAM_HEAD`), so a chunk is never cut.
 const READ_CHUNK: usize = 96 * 1024;
-const _: () = assert!(READ_CHUNK.div_ceil(3) * 4 <= crate::tools::exec::STREAM_HEAD);
+const _: () = assert!(READ_CHUNK.div_ceil(3) * 4 <= crate::exec::STREAM_HEAD);
 
 /// What the target actually has, probed once at attach.
 ///
@@ -261,7 +261,7 @@ impl ShellFs {
         // spans several shells, and unpredictable for the reason `LocalFs`'s is: a preplanted name
         // cannot redirect the write. Every script resolves the target the same way (`RESOLVE_TARGET`)
         // and names the temp beside the file it resolves to.
-        let suffix = crate::tools::temp_suffix();
+        let suffix = super::temp_suffix();
         let outcome = if self.caps.stdin {
             let args = sh_script(
                 WRITE_STDIN_SCRIPT,
@@ -1674,7 +1674,7 @@ fn memchr_from(bytes: &[u8], from: usize, needle: u8) -> Option<usize> {
 /// Build a [`SearchQuery`] the way the `grep` tool does, for tests.
 #[doc(hidden)]
 pub fn query(pattern: &str, root: PathBuf, limit: usize) -> SearchQuery {
-    super::local::query(pattern, root, limit)
+    super::query(pattern, root, limit)
 }
 
 /// Entry points for the fuzz targets (`crates/agent/fuzz`); not part of the API. The parsers stay
@@ -1684,7 +1684,7 @@ pub fn query(pattern: &str, root: PathBuf, limit: usize) -> SearchQuery {
 pub mod __fuzz {
     use std::path::PathBuf;
 
-    use super::super::{DirEntry, Hit, Meta};
+    use crate::fs::{DirEntry, Hit, Meta};
 
     /// `rg --null` / `grep -Z` records.
     pub fn records(stdout: &str) -> Vec<Hit> {
@@ -1802,9 +1802,7 @@ mod tests {
             if let ("sh", Some(script)) = (program, args.get_mut(1)) {
                 *script = format!("{}\n{script}", self.0);
             }
-            crate::tools::exec::RealRunner
-                .run(program, &args, cwd, timeout)
-                .await
+            crate::testing::Host.run(program, &args, cwd, timeout).await
         }
 
         async fn run_with_stdin(
@@ -1815,7 +1813,7 @@ mod tests {
             timeout: Duration,
             stdin: &[u8],
         ) -> std::io::Result<ExecResult> {
-            crate::tools::exec::RealRunner
+            crate::testing::Host
                 .run_with_stdin(program, args, cwd, timeout, stdin)
                 .await
         }

@@ -286,7 +286,10 @@ impl JobShared {
     }
 
     pub fn track(&self, kill: Kill) {
-        if let (Kill::Procs(group), Some(table)) = (&kill, self.table.upgrade()) {
+        if let (Some(group), Some(table)) = (
+            kill.as_local::<super::bash_proc::ProcGroup>(),
+            self.table.upgrade(),
+        ) {
             table.record_procs(group, None, self.command.get().map(String::as_str));
         }
         *lock(&self.kill) = Some(kill.clone());
@@ -645,7 +648,7 @@ impl BashJobs {
         for (tag, (pgid, start, job, command)) in by_tag {
             let group = super::bash_proc::ProcGroup::recorded(pgid, start, tag);
             if group.tag_alive() {
-                found.push((job, command.unwrap_or_default(), Kill::Procs(group)));
+                found.push((job, command.unwrap_or_default(), Kill::local(group)));
             }
         }
         let kills: Vec<Kill> = found.iter().map(|(_, _, k)| k.clone()).collect();
@@ -749,7 +752,10 @@ impl BashJobs {
         let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         job.id = Some(id);
         // Its processes were journaled at spawn; now their record names the job too.
-        if let Some(Kill::Procs(group)) = lock(&job.shared.kill).as_ref() {
+        if let Some(group) = lock(&job.shared.kill)
+            .as_ref()
+            .and_then(|k| k.as_local::<super::bash_proc::ProcGroup>())
+        {
             self.record_procs(group, Some(id), Some(&job.command));
         }
         id

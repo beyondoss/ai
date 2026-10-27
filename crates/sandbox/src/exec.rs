@@ -1,12 +1,9 @@
 //! A command-execution seam.
 //!
-//! `bash` runs real commands through [`RealRunner`]; the shell filesystem backend (`ShellFs`),
-//! worktree `git` and the sandbox-job scripts run theirs through the same trait, and an exec
-//! endpoint is just another [`CommandRunner`]. Tests inject one that records the argv instead of
-//! shelling out. This is the boundary that keeps shell-driven tools testable and lets them run
-//! somewhere other than this host.
+//! Layer 1: a command-execution seam. [`CommandRunner`] (re-exported as `Exec`) is everything the
+//! helpers above it need; an exec endpoint ([`crate::HttpExec`]), a `docker exec`/`ssh` template
+//! ([`crate::TemplateRunner`]), the host's own processes or a test double are just implementations.
 
-use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -18,8 +15,8 @@ use tokio::sync::watch;
 /// `yes`, `cat huge.bin`) holds at most ~`HEAD+TAIL` per stream in memory instead of the whole
 /// firehose. Sized well above `bash`'s own 30 KB output cap so any capture-level drop still leaves
 /// `bash` plenty to head/tail-truncate (with its own marker) on top.
-pub(crate) const STREAM_HEAD: usize = 128 * 1024;
-pub(crate) const STREAM_TAIL: usize = 128 * 1024;
+pub const STREAM_HEAD: usize = 128 * 1024;
+pub const STREAM_TAIL: usize = 128 * 1024;
 
 /// How long a pipe may sit silent, once the direct child has exited, before we stop waiting on it.
 /// Without this, a detached grandchild that inherits the stdout/stderr fd (e.g. `cmd &` backgrounding
@@ -59,39 +56,6 @@ pub struct ExecResult {
     pub truncated: bool,
 }
 
-/// The signal that killed `status`, if one did. `ExitStatus::code()` returns `None` in exactly this
-/// case on Unix, which is why a `None` code must never be read as "fine" — see [`ExecResult::signal`].
-#[cfg(unix)]
-fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
-    std::os::unix::process::ExitStatusExt::signal(status)
-}
-
-/// Non-Unix has no signal concept — a `None` exit code there really is just "unknown".
-#[cfg(not(unix))]
-fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
-    None
-}
-
-/// Human name for the signals a command realistically dies from, so the reported message says
-/// something a model (or a human reading the transcript) can act on. Anything outside this short list
-/// is reported by number alone rather than pulling in a libc-name lookup for it.
-pub fn signal_name(signal: i32) -> Option<&'static str> {
-    Some(match signal {
-        1 => "SIGHUP",
-        2 => "SIGINT",
-        3 => "SIGQUIT",
-        6 => "SIGABRT",
-        8 => "SIGFPE",
-        9 => "SIGKILL",
-        11 => "SIGSEGV",
-        13 => "SIGPIPE",
-        15 => "SIGTERM",
-        24 => "SIGXCPU",
-        25 => "SIGXFSZ",
-        _ => return None,
-    })
-}
-
 /// A sink for output chunks as they stream from a running command — used to surface live progress.
 /// `Send + Sync` because stdout and stderr are drained on separate concurrent tasks.
 pub type ChunkSink<'a> = &'a (dyn Fn(&[u8]) + Send + Sync);
@@ -100,6 +64,32 @@ pub type ChunkSink<'a> = &'a (dyn Fn(&[u8]) + Send + Sync);
 /// [`CommandRunner::run_streaming_tracked`].
 pub type SpawnSink<'a> = &'a (dyn Fn(Kill) + Send + Sync);
 
+/// How long a stopped job's local processes get to exit on SIGTERM before the SIGKILL sweep.
+/// SIGTERM first because SIGKILL cannot be relayed: `sudo cmd` forwards a TERM to its root child
+/// (gone 40 ms after the TERM on the dev box, `sudo -n sleep`), but a KILL takes `sudo` down alone
+/// and leaves the child — which we may not signal — running. 300 ms is ~7x that, and is only spent
+/// in full on a process that ignores or traps TERM; a job whose processes all exit returns as soon
+/// as they have.
+pub const TERM_GRACE: Duration = Duration::from_millis(300);
+
+/// How often the grace re-checks whether the jobs' processes have exited.
+const GRACE_POLL: Duration = Duration::from_millis(10);
+
+/// A set of processes on *this* host that [`kill_all`] can stop: the host process runner's job
+/// (its process group plus every process carrying its tag). Implemented by the embedding program,
+/// not by this crate, which only drives the three steps so several jobs share one SIGTERM grace.
+pub trait LocalKill: Send + Sync + 'static {
+    /// SIGTERM every process, without waiting.
+    fn terminate(&self);
+    /// Whether every process has exited.
+    fn gone(&self) -> bool;
+    /// The SIGKILL sweep. A description of what still ran after it (processes we may not signal,
+    /// e.g. the root child of a `sudo`), or `None`.
+    fn sweep(&self) -> Option<String>;
+    /// For the implementor to get its own type back from a [`Kill::Local`].
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
 /// How to stop a command that a tracked run started, wherever it runs.
 ///
 /// One shape for every place a command can live, so the code that keeps commands running past their
@@ -107,10 +97,8 @@ pub type SpawnSink<'a> = &'a (dyn Fn(Kill) + Send + Sync);
 /// way, from the same three places: a `bash_job` kill, a dropped job, and the exit path.
 #[derive(Clone)]
 pub enum Kill {
-    /// A job's processes on this host: its process group, plus every process carrying its tag —
-    /// including the ones that left the group (`setsid`, `timeout`, a double fork). See
-    /// [`super::bash_proc`].
-    Procs(super::bash_proc::ProcGroup),
+    /// A job's processes on this host, stopped by the embedding program's [`LocalKill`].
+    Local(std::sync::Arc<dyn LocalKill>),
     /// The runner's own way to stop the command: close the exec stream (protocol v1.2), run a kill
     /// inside the container a template transport reaches, or kill a sandbox-owned job
     /// ([`crate::exec_endpoint::jobs`]). Blocking, and returns once the runner has done everything
@@ -119,6 +107,19 @@ pub enum Kill {
 }
 
 impl Kill {
+    /// A [`Kill::Local`] for `local`.
+    pub fn local(local: impl LocalKill) -> Self {
+        Kill::Local(std::sync::Arc::new(local))
+    }
+
+    /// The local job's own kill handle, when this is one and it is a `T`.
+    pub fn as_local<T: LocalKill>(&self) -> Option<&T> {
+        match self {
+            Kill::Local(l) => l.as_any().downcast_ref(),
+            Kill::Hook(_) => None,
+        }
+    }
+
     /// Stop the command — see [`kill_all`], which this is for one. **Blocking**: called from a
     /// dedicated OS thread (a dropped job, the exit path) or `spawn_blocking` (a `bash_job` kill),
     /// never on a runtime worker, so a hook may wait for its runner to confirm. A description of
@@ -130,21 +131,21 @@ impl Kill {
 
 /// Stop several commands at once, spending one SIGTERM grace for all of them: SIGTERM every local
 /// job's processes, run the remote hooks (which overlap the grace), wait out what is left of
-/// [`super::bash_proc::TERM_GRACE`] for the local processes to exit, then SIGKILL-sweep them. Per
-/// command, in order: a description of the processes still running after it — ones we may not
-/// signal, e.g. the root child of a `sudo` — or `None`. Blocking, as [`Kill::kill`].
+/// [`TERM_GRACE`] for the local processes to exit, then SIGKILL-sweep them. Per command, in order:
+/// a description of the processes still running after it — ones we may not signal, e.g. the root
+/// child of a `sudo` — or `None`. Blocking, as [`Kill::kill`].
 pub fn kill_all(kills: &[Kill]) -> Vec<Option<String>> {
     use std::time::Instant;
-    let deadline = Instant::now() + super::bash_proc::TERM_GRACE;
-    let groups: Vec<&super::bash_proc::ProcGroup> = kills
+    let deadline = Instant::now() + TERM_GRACE;
+    let locals: Vec<&dyn LocalKill> = kills
         .iter()
         .filter_map(|k| match k {
-            Kill::Procs(g) => Some(g),
+            Kill::Local(l) => Some(&**l),
             Kill::Hook(_) => None,
         })
         .collect();
-    for group in &groups {
-        group.terminate();
+    for local in &locals {
+        local.terminate();
     }
     // Side by side: each may be a round trip with a grace of its own (a sandbox job's kill), and N
     // of them must cost one, not N.
@@ -153,7 +154,7 @@ pub fn kill_all(kills: &[Kill]) -> Vec<Option<String>> {
             .iter()
             .map(|k| match k {
                 Kill::Hook(hook) => Some(scope.spawn(|| hook())),
-                Kill::Procs(_) => None,
+                Kill::Local(_) => None,
             })
             .collect();
         running
@@ -161,15 +162,18 @@ pub fn kill_all(kills: &[Kill]) -> Vec<Option<String>> {
             .map(|h| h.and_then(|h| h.join().ok().flatten()))
             .collect()
     });
-    super::bash_proc::await_exit(&groups, deadline);
+    while locals.iter().any(|l| !l.gone()) {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        std::thread::sleep(GRACE_POLL.min(deadline - now));
+    }
     kills
         .iter()
         .zip(hooked)
         .map(|(k, hooked)| match k {
-            Kill::Procs(g) => {
-                let left = g.sweep();
-                (!left.is_empty()).then(|| super::bash_proc::describe(&left))
-            }
+            Kill::Local(l) => l.sweep(),
             Kill::Hook(_) => hooked,
         })
         .collect()
@@ -191,7 +195,7 @@ pub struct JobHooks<'a> {
     pub on_orphans: &'a (dyn Fn(&ExecResult, String) + Send + Sync),
 }
 
-/// Runs an external command. Implemented by [`RealRunner`] (production) and by test doubles that
+/// Runs an external command. Implemented by the host process runner (production) and by test doubles that
 /// capture the invocation.
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
@@ -290,7 +294,7 @@ pub trait CommandRunner: Send + Sync {
 
     /// Make sure the target is reachable before a caller asks something synchronous of it
     /// ([`Self::sandbox_jobs`]): a runner whose target is attached lazily
-    /// ([`crate::exec_endpoint::ExecCell::set_lazy`]) connects here, and its error — the probe's —
+    /// (the embedding program's lazy attach) connects here, and its error — the probe's —
     /// is the caller's to report. Every other runner is ready already.
     async fn ready(&self) -> std::io::Result<()> {
         Ok(())
@@ -331,176 +335,13 @@ pub trait CommandRunner: Send + Sync {
     }
 }
 
-/// Spawns the command for real, capturing stdout/stderr and enforcing a wall-clock timeout
-/// (`kill_on_drop` reaps the child if it overruns).
-pub struct RealRunner;
-
-impl RealRunner {
-    /// Shared spawn/capture body. `on_chunk`, when present, is called with each stdout/stderr chunk as
-    /// it streams (live progress); `run`, `run_streaming` and `run_with_stdin` all funnel through here.
-    /// `stdin` is `None` for everything a model runs — see the `.stdin(..)` comment below.
-    /// `bash`'s jobs go through [`super::bash_proc::run_tracked`] instead
-    /// ([`CommandRunner::run_streaming_tracked`]). `on_stderr`, when present, takes stderr's chunks
-    /// instead of `on_chunk` (`run_attached`, whose two streams must stay apart).
-    #[allow(clippy::too_many_arguments)]
-    async fn exec(
-        &self,
-        program: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        timeout: Duration,
-        on_chunk: Option<ChunkSink<'_>>,
-        on_stderr: Option<ChunkSink<'_>>,
-        stdin: Option<&[u8]>,
-    ) -> std::io::Result<ExecResult> {
-        // No `PATH` manipulation here — `Command` inherits the parent process's environment
-        // (including `PATH`) as-is. Pi-parity note: this is a deliberate, documented DIVERGENCE, not
-        // an oversight. Pi's `getShellEnv()` (`packages/coding-agent/src/utils/shell.ts`) prepends a
-        // managed-binaries directory (pinned `rg`/`fd` it downloads itself) onto `PATH` for every
-        // spawn, so its `grep`/`find` tools work even on a host with neither installed. Beyond's own
-        // `grep`/`find` tools are native (ripgrep/globset linked in-process, see `grep.rs`/`find.rs`) —
-        // unaffected either way — so this only matters for an arbitrary model-invoked `bash: rg ...` /
-        // `fd ...` on a host that happens to lack them. Not worth a from-scratch bundled-binaries
-        // mechanism just to cover that narrow case.
-        let mut cmd = tokio::process::Command::new(program);
-        cmd.args(args)
-            // Closed, not inherited: a model-run command has no business reading the agent process's
-            // real stdin (a shared terminal in `run`, or `serve`'s NDJSON control pipe). Without this,
-            // a command that tries to read stdin (bare `cat`, `read`, a prompt left off `-y`) blocks
-            // forever waiting for input that will never come, instead of seeing immediate EOF — matches
-            // pi's own `spawn(..., { stdio: ["ignore", "pipe", "pipe"] })`. Piped only for
-            // `run_with_stdin`, which carries bytes the *agent* supplied (file content), never the
-            // agent's own stdin.
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        // Run the command as its own process-group leader so a timeout can kill the *whole* tree —
-        // a `sh -c "foo &"` that backgrounds children would otherwise leak them as orphans, since
-        // `kill_on_drop` only reaps the direct child.
-        #[cfg(unix)]
-        cmd.process_group(0);
-        if let Some(dir) = cwd {
-            cmd.current_dir(dir);
-        }
-        let mut child = cmd.spawn()?;
-        // Arms a group-kill for the lifetime of this call: `kill_on_drop` above only reaps the
-        // *direct* child, so a future dropped mid-`await` (cancellation, not just a timeout) would
-        // otherwise leak a backgrounded grandchild as an orphan. `disarm`ed below once the child has
-        // actually exited on its own; still armed on both the timeout branch and an external drop, so
-        // either one reaches the whole process group.
-        let mut guard = GroupKillGuard {
-            group: child.id().map(GroupId::leader),
-        };
-        // Streaming (`bash`'s live path) hands every chunk straight to `on_chunk`'s sink, then ignores
-        // the `stdout`/`stderr`/`truncated` fields entirely (see the `Ok` arm's comment and `bash.rs`).
-        // So when streaming we skip the ≤256 KiB head/tail `Capture` *and* the final `from_utf8_lossy`
-        // allocations below — they'd only be produced to be discarded. The non-streaming `run` path
-        // (`ShellFs`'s commands, worktree `git`) keeps full capture, since it *does* read these
-        // fields.
-        let streaming = on_chunk.is_some() || on_stderr.is_some();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        // Fed concurrently with the drains, not before them — see `feed_stdin`.
-        let feed = feed_stdin(child.stdin.take(), stdin);
-        // Drain both pipes *concurrently* with the wait: a child that fills one pipe's OS buffer
-        // while we read only the other would deadlock, and an unread pipe stalls the child's exit.
-        // `exited` fans the wait's completion out to both drains so each can switch from "block on
-        // reads" to "release after a short idle grace" the moment the direct child exits (see
-        // `POST_EXIT_IDLE_GRACE`), independent of whether the *other* stream's holder has let go yet.
-        let (exited_tx, exited_rx) = watch::channel(false);
-        let wait = async {
-            let status = child.wait().await;
-            let _ = exited_tx.send(true);
-            status
-        };
-        let collect = async {
-            let (status, out, err, fed) = tokio::join!(
-                wait,
-                drain_capped(
-                    stdout,
-                    STREAM_HEAD,
-                    STREAM_TAIL,
-                    on_chunk,
-                    exited_rx.clone()
-                ),
-                drain_capped(
-                    stderr,
-                    STREAM_HEAD,
-                    STREAM_TAIL,
-                    on_stderr.or(on_chunk),
-                    exited_rx.clone()
-                ),
-                feed,
-            );
-            (status, out, err, fed)
-        };
-        match tokio::time::timeout(timeout, collect).await {
-            // Lossy on purpose, not by oversight: `bash` (this crate's primary consumer) never
-            // reads these two fields for real output — its `run_streaming` sink appends every chunk
-            // to its `OutputAccumulator` as raw bytes as they arrive (see `bash.rs`'s `sink`
-            // closure), and only falls back to `stdout`/`stderr` here when nothing streamed (a test
-            // double, a remote runner). The live path this struct actually feeds for `bash` never
-            // goes through `from_utf8_lossy`. The non-streaming callers that *do* read these fields
-            // (`ShellFs`, worktree `git`) run commands whose output is text, or base64-encode bytes
-            // that may not be (a worktree patch; see `worktree.rs`).
-            Ok((status, (stdout, out_trunc), (stderr, err_trunc), fed)) => {
-                guard.disarm();
-                let status = status?;
-                fed?;
-                Ok(ExecResult {
-                    code: status.code(),
-                    signal: exit_signal(&status),
-                    // Empty on the streaming path: `drain_capped` returned empty capture buffers there
-                    // (nothing to decode), and `bash` never reads these anyway.
-                    stdout: if streaming {
-                        String::new()
-                    } else {
-                        String::from_utf8_lossy(&stdout).into_owned()
-                    },
-                    stderr: if streaming {
-                        String::new()
-                    } else {
-                        String::from_utf8_lossy(&stderr).into_owned()
-                    },
-                    timed_out: false,
-                    truncated: out_trunc || err_trunc,
-                })
-            }
-            Err(_) => {
-                // Timed out: unlike a future dropped mid-`await` (`GroupKillGuard`'s own `Drop`, which
-                // can't `.await`), we're still in an async context here — so actually wait for the
-                // process-group kill to finish via `spawn_blocking` before returning, rather than
-                // firing it and hoping it lands before a caller re-checks side effects. Disarms the
-                // guard (via `take`) first so its own `Drop` doesn't *also* fire a redundant kill.
-                #[cfg(unix)]
-                if let Some(group) = guard.group.take() {
-                    let _ = tokio::task::spawn_blocking(move || kill_process_group(group)).await;
-                }
-                drop(guard);
-                Ok(ExecResult {
-                    code: None,
-                    stdout: String::new(),
-                    stderr: "command exceeded its timeout".into(),
-                    timed_out: true,
-                    ..Default::default()
-                })
-            }
-        }
-    }
-}
-
 /// Write `bytes` to a child's stdin, then close it (dropping the handle is the EOF).
 ///
 /// Must run *concurrently* with draining the child's output, never before it: a child that writes
 /// while it is still reading would fill its stdout pipe and block on it while we block on its stdin.
 /// A broken pipe is not an error — it means the child stopped reading, and its exit status is the
 /// real story (`ShellFs` also checks the byte count that arrived before it commits a write).
-pub(crate) async fn feed_stdin(
+pub async fn feed_stdin(
     pipe: Option<tokio::process::ChildStdin>,
     bytes: Option<&[u8]>,
 ) -> std::io::Result<()> {
@@ -514,180 +355,6 @@ pub(crate) async fn feed_stdin(
     Ok(())
 }
 
-/// Owns a spawned process-group leader; kills the whole group on drop unless [`disarm`](Self::disarm)d
-/// (the normal, already-reaped exit path). This is what actually closes the cancellation gap
-/// `kill_on_drop` leaves open: that flag only reaps the *direct* child on drop, but a future dropped
-/// mid-`await` — cancellation racing the whole dispatch, not just this call's own timeout — unwinds
-/// through this stack frame the same way, so arming the kill here (rather than only in the timeout
-/// branch) covers both.
-struct GroupKillGuard {
-    group: Option<GroupId>,
-}
-
-impl GroupKillGuard {
-    fn disarm(&mut self) {
-        self.group = None;
-    }
-}
-
-/// One per in-flight `GroupKillGuard`-triggered cleanup thread, `recv`d by
-/// [`wait_for_pending_group_kills`] — see that function's doc comment for why this registry exists
-/// at all (in short: `std::process::exit` doesn't wait for threads, so a caller that's about to call
-/// it needs an explicit way to wait for a just-dropped guard's cleanup itself).
-#[cfg(unix)]
-static PENDING_GROUP_KILLS: std::sync::Mutex<Vec<std::sync::mpsc::Receiver<()>>> =
-    std::sync::Mutex::new(Vec::new());
-
-impl Drop for GroupKillGuard {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(group) = self.group.take() {
-            // `Drop` can't `.await`, so this can't be made fully synchronous with the caller — but a
-            // real OS thread (not a `tokio::spawn`ed task) is scheduled by the kernel directly, rather
-            // than depending on the ambient tokio runtime finding a moment to poll it. That matters
-            // specifically when the runtime this drop happens on is a single-threaded `#[tokio::test]`
-            // runtime under real contention from many other concurrently-running OS threads (one per
-            // test) — a queued task on a busy single-threaded runtime can be delayed well past a
-            // `tokio::spawn`'s usual near-instant turnaround; a plain OS thread isn't multiplexed onto
-            // that runtime's own poll loop at all.
-            //
-            // Registered in `PENDING_GROUP_KILLS` (not truly fire-and-forget): a cancellation
-            // (SIGTERM/SIGINT/SIGHUP) can reach `std::process::exit` moments after this guard drops,
-            // and `process::exit` tears down every thread immediately with no chance for this one to
-            // finish — see `wait_for_pending_group_kills`, which such a caller must call first.
-            spawn_tracked_cleanup(move || kill_process_group(group));
-        }
-    }
-}
-
-/// Run `cleanup` on its own OS thread, registered so [`wait_for_pending_group_kills`] waits for it
-/// before `std::process::exit` tears it down. The one way a `Drop` here hands off process cleanup.
-#[cfg(unix)]
-pub(crate) fn spawn_tracked_cleanup(cleanup: impl FnOnce() + Send + 'static) {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        cleanup();
-        let _ = tx.send(());
-    });
-    if let Ok(mut pending) = PENDING_GROUP_KILLS.lock() {
-        // Opportunistically reclaim entries whose kill thread has already finished (`Ok`) or
-        // whose sender was dropped (`Disconnected`), so this registry — otherwise drained in
-        // full only just before `process::exit` — can't grow for the whole lifetime of a
-        // long-lived `serve` daemon that cancels one bash after another. A still-running kill
-        // thread's receiver (`Err(Empty)`) is kept, so `wait_for_pending_group_kills` can still
-        // block on it.
-        pending.retain(|rx| matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
-        pending.push(rx);
-    }
-}
-
-/// Block until every `GroupKillGuard` cleanup thread registered so far has actually finished its
-/// `kill_process_group` work, or `timeout` elapses overall, whichever comes first.
-///
-/// Necessary, not just defensive: `GroupKillGuard::drop` can't `.await` (it spawns a detached OS
-/// thread instead — see that impl's doc comment), and `std::process::exit` — which every shutdown-
-/// signal cancellation path in this crate calls, to set a precise POSIX `128+signal` exit code —
-/// terminates every thread immediately with no chance to finish whatever it was doing. Without this,
-/// a `run` process that gets SIGTERM'd mid-bash-tool-call could exit before its own cleanup thread
-/// ever got to run `kill`, silently orphaning the exact backgrounded grandchild `GroupKillGuard`
-/// exists to reap — confirmed live via `run_signal_handling.rs`'s e2e tests, which spawn the real
-/// compiled binary and send it a real OS signal. Call this immediately before any
-/// `std::process::exit` that follows a turn ending in `agent_core::Error::Cancelled`.
-#[cfg(unix)]
-pub fn wait_for_pending_group_kills(timeout: Duration) {
-    let deadline = std::time::Instant::now() + timeout;
-    let Ok(mut pending) = PENDING_GROUP_KILLS.lock() else {
-        return;
-    };
-    let receivers = std::mem::take(&mut *pending);
-    drop(pending);
-    for rx in receivers {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        // A zero/negative remaining budget still gets one non-blocking `try_recv`-equivalent poll
-        // (`recv_timeout(ZERO)`) rather than being skipped outright, so a kill that finished just as
-        // the deadline passed is still observed instead of assumed incomplete.
-        let _ = rx.recv_timeout(remaining);
-    }
-}
-
-#[async_trait]
-impl CommandRunner for RealRunner {
-    async fn run(
-        &self,
-        program: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        timeout: Duration,
-    ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, timeout, None, None, None)
-            .await
-    }
-
-    async fn run_streaming(
-        &self,
-        program: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        timeout: Duration,
-        on_chunk: ChunkSink<'_>,
-    ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, timeout, Some(on_chunk), None, None)
-            .await
-    }
-
-    async fn run_streaming_tracked(
-        &self,
-        program: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        hooks: &JobHooks<'_>,
-    ) -> std::io::Result<ExecResult> {
-        super::bash_proc::run_tracked(program, args, cwd, hooks).await
-    }
-
-    async fn tracks_jobs(&self) -> bool {
-        true
-    }
-
-    /// For tests of the sandbox-job scripts, which run them on this host. No deadline beyond
-    /// `STREAM_DEADLINE`'s; dropping the call kills the child's process group.
-    async fn run_attached(
-        &self,
-        program: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        on_stdout: ChunkSink<'_>,
-        on_stderr: ChunkSink<'_>,
-    ) -> std::io::Result<ExecResult> {
-        self.exec(
-            program,
-            args,
-            cwd,
-            crate::exec_endpoint::STREAM_DEADLINE,
-            Some(on_stdout),
-            Some(on_stderr),
-            None,
-        )
-        .await
-    }
-
-    async fn attaches(&self) -> bool {
-        true
-    }
-
-    async fn run_with_stdin(
-        &self,
-        program: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        timeout: Duration,
-        stdin: &[u8],
-    ) -> std::io::Result<ExecResult> {
-        self.exec(program, args, cwd, timeout, None, None, Some(stdin))
-            .await
-    }
-}
-
 /// Read a child pipe, keeping only the first `head_cap` and last `tail_cap` bytes; the middle is
 /// discarded as it arrives so memory stays bounded regardless of how much the command emits. Returns
 /// the kept bytes (head followed by tail) and whether any middle was dropped.
@@ -697,7 +364,7 @@ impl CommandRunner for RealRunner {
 /// polling). Once the child has exited, a read that doesn't complete within [`POST_EXIT_IDLE_GRACE`]
 /// means only a *detached* descendant is holding this pipe open — release rather than block on it
 /// indefinitely; a real EOF or actively-arriving output is still captured either way.
-pub(crate) async fn drain_capped<R: AsyncRead + Unpin>(
+pub async fn drain_capped<R: AsyncRead + Unpin>(
     reader: Option<R>,
     head_cap: usize,
     tail_cap: usize,
@@ -807,438 +474,9 @@ impl Capture {
     }
 }
 
-/// SIGKILL an entire process group: `kill -KILL -<pgid>` (falling back to `kill -KILL <pgid>`, no
-/// leading `-`, if that doesn't succeed — matching pi's own `killProcessTree`,
-/// `process.kill(-pid, "SIGKILL")` falling back to `process.kill(pid, "SIGKILL")`), *then* an explicit
-/// sweep that individually signals every process still reporting this pgid.
-///
-/// The sweep isn't defensive padding — it's load-bearing. Confirmed live on a real, resource-contended
-/// GitHub Actions runner (a fast dedicated dev box never reproduces this): a backgrounded grandchild,
-/// independently confirmed alive and already a member of the target pgid *before* the group-kill was
-/// even issued, survived it completely — through its full multi-second sleep — while the group
-/// leader died promptly. `kill -KILL -pgid` returning success only means the signal was handed to the
-/// kernel for group-wide delivery; it does not appear to guarantee every existing member actually
-/// receives it on every environment. Enumerating `ps`'s own pid/pgid columns and individually
-/// `kill -KILL <pid>`-ing each match closes that gap without depending on group-signal semantics at
-/// all. `pgid` doubles as the original child's own pid: the child is spawned as its own process-group
-/// leader (`process_group(0)`), so pid and pgid are the same number. Shelling out (not `libc`/`nix`)
-/// keeps this free of `unsafe`, which the workspace forbids.
-///
-/// Blocking, not async: called from places that each need a *synchronous* guarantee rather than a
-/// detached future — [`GroupKillGuard`]'s `Drop` impl (which can't `.await` at all, so this runs on a
-/// dedicated OS thread via `std::thread::spawn`, scheduled by the kernel independent of whatever the
-/// ambient tokio runtime is doing) and `exec`'s timeout branch (via `spawn_blocking`, so the caller
-/// actually waits for the kill to complete before `run()` returns, rather than firing it and hoping it
-/// lands before a caller re-checks side effects).
-///
-/// Never once the group's number has been recycled: see [`GroupId`].
-#[cfg(unix)]
-pub(crate) fn kill_process_group(group: GroupId) {
-    kill_group(group, true);
-}
-
-/// [`kill_process_group`] without its kill-by-pid fallback: only processes that are *in* group
-/// `pgid` are signalled. For a caller whose group leader has already been reaped — its pid is free
-/// to be reused by an unrelated process, which a fallback `kill -KILL <pid>` would then hit. The
-/// non-Linux `bash_proc` sweep (Linux tracks processes through `/proc` instead).
-#[cfg(unix)]
-#[cfg_attr(all(target_os = "linux", not(test)), allow(dead_code))]
-pub(crate) fn kill_group_members(group: GroupId) {
-    kill_group(group, false);
-}
-
-/// A process group, as the process that leads it was started: its number, and the leader's start
-/// time — which tells our group's number apart from the same number recycled for someone else's.
-///
-/// A group id is its leader's pid, and the kernel hands a pid out again only once nothing uses it —
-/// no process, and no group or session — so while our leader is unreaped (alive or a zombie), or
-/// any member of our group lives, the number is ours. Once the group is empty it is free: a later
-/// process may get that pid and lead a group of its own with it, and a `kill -<pgid>` aimed at ours
-/// would then hit the stranger's. [`Self::recycled`] is that case: a live process holds the pid
-/// but is not our leader (another start time).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GroupId {
-    pub pgid: u32,
-    /// The leader's start time (`/proc/<pid>/stat` field 22), read while it was ours; `None` where
-    /// `/proc` is unavailable, which leaves the old behavior (no recycling check).
-    start: Option<u64>,
-}
-
-impl GroupId {
-    /// The group `leader` leads, read now — call it while `leader` is still unreaped (right after
-    /// spawning it).
-    pub(crate) fn leader(leader: u32) -> Self {
-        Self {
-            pgid: leader,
-            start: start_time(leader),
-        }
-    }
-
-    /// The group as a session recorded it — see [`super::bash_proc::ProcGroup::recorded`].
-    pub(crate) fn recorded(pgid: u32, start: Option<u64>) -> Self {
-        Self { pgid, start }
-    }
-
-    /// The leader's start time, read while it was ours.
-    pub(crate) fn start(&self) -> Option<u64> {
-        self.start
-    }
-
-    /// Whether our leader still holds the number (alive or a zombie): a group signal can reach only
-    /// our group.
-    pub(crate) fn leader_holds(&self) -> bool {
-        self.start.is_some() && start_time(self.pgid) == self.start
-    }
-
-    /// Whether the number now belongs to someone else: a live process has the pid and it is not our
-    /// leader. Our group is then necessarily empty (the kernel would not have reused the number
-    /// otherwise), so there is nothing of ours left to signal by group.
-    pub(crate) fn recycled(&self) -> bool {
-        match (self.start, start_time(self.pgid)) {
-            (Some(ours), Some(now)) => ours != now,
-            _ => false,
-        }
-    }
-}
-
-/// A process's start time in clock ticks since boot (`/proc/<pid>/stat` field 22), or `None` if it
-/// does not exist (or this is not Linux). With the pid, it names one process for all time.
-pub(crate) fn start_time(pid: u32) -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
-        // `pid (comm) state …`: `comm` may hold spaces or parens, so count from after the last `)`.
-        let close = stat.iter().rposition(|&b| b == b')')?;
-        let rest = std::str::from_utf8(&stat[close + 1..]).ok()?;
-        // Field 3 (`state`) is the first after `)`, so field 22 is the 20th.
-        rest.split_whitespace().nth(19)?.parse().ok()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        None
-    }
-}
-
-#[cfg(unix)]
-fn kill_group(group: GroupId, pid_fallback: bool) {
-    let pgid = group.pgid;
-    if group.recycled() {
-        // Our group is gone and its number is a stranger's now: signalling it would kill them.
-        return;
-    }
-    // The pid is the leader's only while the leader holds it; once reaped, a fallback could hit
-    // whoever got the pid next.
-    let pid_fallback = pid_fallback && group.leader_holds();
-    let group_result = std::process::Command::new("kill")
-        .arg("-KILL")
-        // `--` first, so the exit status means what the code below assumes. Without it procps-ng
-        // `kill` still signals a live group, but exits 1 doing so (and 0 for a group that is already
-        // gone) — inverted, so the kill-by-pid fallback below ran after every successful group kill.
-        .arg("--")
-        .arg(format!("-{pgid}"))
-        // `kill` prints "No such process" on a group that already exited, which is the *expected*
-        // case here — and since an MCP connection sweeps its group on every drop, inheriting that
-        // would put a meaningless line on the operator's console routinely. The status is what this
-        // function acts on; the text adds nothing.
-        .stderr(std::process::Stdio::null())
-        .status();
-    // A non-success here (including `kill`'s own exit code, e.g. ESRCH because the group already
-    // exited on its own between the timeout firing and this running) isn't worth logging on its own —
-    // the group kill covers the overwhelmingly common case, so try the direct fallback next regardless
-    // of *why* it didn't succeed; a no-op fallback against an already-gone process is harmless.
-    if pid_fallback && !matches!(&group_result, Ok(status) if status.success()) {
-        match std::process::Command::new("kill")
-            .arg("-KILL")
-            .arg(pgid.to_string())
-            .stderr(std::process::Stdio::null())
-            .status()
-        {
-            // Still only the "couldn't even run `kill`" case is worth a warning — a non-zero exit
-            // here most likely just means the process (or its whole group) was already gone.
-            Ok(_) => {}
-            Err(e) => {
-                // If `kill` itself couldn't run (missing binary, restrictive sandboxing), a
-                // backgrounded grandchild from the timed-out command may be left running with
-                // nothing else to reap it — surface that instead of silently losing the signal.
-                tracing::warn!(pgid, error = %e, "failed to run `kill` to reap a timed-out process");
-            }
-        }
-    }
-    // Two passes with a short gap: the first catches whatever the group-kill above missed; the
-    // second catches anything that was itself mid-fork (and so invisible to `ps`) during the first.
-    sweep_kill_remaining_group_members(pgid);
-    std::thread::sleep(Duration::from_millis(50));
-    if !group.recycled() {
-        sweep_kill_remaining_group_members(pgid);
-    }
-}
-
-/// Enumerate every process currently reporting `pgid` via `ps -eo pid=,pgid=` and SIGKILL each one
-/// individually. See [`kill_process_group`]'s doc comment for why this exists — a bulk
-/// `kill -KILL -<pgid>` was empirically observed to miss a live, already-a-member process on a real
-/// CI runner. Best-effort: a `ps`/`kill` invocation failing outright is silently ignored (mirrors the
-/// group-kill's own "no-op fallback against an already-gone process is harmless" stance) since the
-/// caller already tried the cheaper group-kill/direct-kill paths first.
-#[cfg(unix)]
-fn sweep_kill_remaining_group_members(pgid: u32) {
-    let Ok(out) = std::process::Command::new("ps")
-        .args(["-eo", "pid=,pgid="])
-        .output()
-    else {
-        return;
-    };
-    let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines() {
-        let mut fields = line.split_whitespace();
-        let (Some(pid_str), Some(pgid_str)) = (fields.next(), fields.next()) else {
-            continue;
-        };
-        if pgid_str.parse::<u32>() != Ok(pgid) {
-            continue;
-        }
-        // Best-effort per-pid kill: an already-dead pid (ESRCH) is the overwhelmingly common,
-        // harmless case (the group-kill above likely already got it) — nothing further to do either
-        // way, so the result isn't checked.
-        let _ = std::process::Command::new("kill")
-            .arg("-KILL")
-            .arg(pid_str)
-            .status();
-    }
-}
-
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn spawned_commands_see_stdin_already_closed_not_the_real_terminal() {
-        // Pi-parity audit H1: a model-run command must never inherit the agent process's real stdin —
-        // `serve`'s NDJSON control pipe or an interactive `run`'s terminal. `cat` with no args reads
-        // stdin until EOF; if stdin were inherited (and this test's own harness stdin stays open) it
-        // would hang until the timeout fired. With stdin closed, `cat` sees immediate EOF and exits
-        // clean well within the generous timeout below.
-        let res = RealRunner
-            .run("cat", &[], None, Duration::from_secs(10))
-            .await
-            .unwrap();
-        assert_eq!(res.code, Some(0), "got: {res:?}");
-        assert!(!res.timed_out, "cat blocked on stdin instead of seeing EOF");
-        assert_eq!(res.stdout, "");
-    }
-
-    #[tokio::test]
-    async fn run_with_stdin_feeds_the_bytes_then_closes_the_pipe() {
-        // `cat` exits only on EOF, so a result at all proves the pipe was closed after the write.
-        let res = RealRunner
-            .run_with_stdin("cat", &[], None, Duration::from_secs(10), b"stdin-probe")
-            .await
-            .unwrap();
-        assert_eq!(res.code, Some(0), "got: {res:?}");
-        assert_eq!(res.stdout, "stdin-probe");
-    }
-
-    #[tokio::test]
-    async fn run_with_stdin_feeds_while_draining_so_big_input_and_output_cannot_deadlock() {
-        // 4 MiB through `cat` is far past both pipe buffers: written before draining (or drained
-        // before writing), the child blocks on a full stdout while we block on its full stdin.
-        let input = vec![b'x'; 4 * 1024 * 1024];
-        let res = RealRunner
-            .run_with_stdin("cat", &[], None, Duration::from_secs(30), &input)
-            .await
-            .unwrap();
-        assert!(!res.timed_out, "deadlocked until the timeout");
-        assert_eq!(res.code, Some(0));
-        assert!(res.truncated, "4 MiB of output must still be capped");
-
-        let res = RealRunner
-            .run_with_stdin("wc", &["-c".into()], None, Duration::from_secs(30), &input)
-            .await
-            .unwrap();
-        assert_eq!(
-            res.stdout.trim(),
-            input.len().to_string(),
-            "every byte arrived"
-        );
-    }
-
-    // Both tests below race a `kill -KILL -<pgid>` against a backgrounded grandchild's own delayed
-    // write. See `kill_process_group`'s own doc comment for what these margins are guarding against —
-    // a real GitHub Actions run proved this isn't merely a delivery-latency question (the grandchild
-    // ran its *entire* multi-second sleep to completion, unaffected, while the group leader died
-    // promptly) — `sweep_kill_remaining_group_members` is the actual fix; these wider margins
-    // (vs. the original 1s/1.2s, sized for a fast uncontended dev box) are cheap insurance on top.
-    const GRANDCHILD_DELAY: Duration = Duration::from_secs(3);
-    const SAFETY_WAIT: Duration = Duration::from_millis(3500);
-
-    #[tokio::test]
-    async fn timeout_kills_backgrounded_grandchildren() {
-        // A backgrounded grandchild would, after GRANDCHILD_DELAY, write a marker file. The command
-        // times out at 300ms; the process-group kill must reach the grandchild so the marker is never
-        // written.
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("leaked");
-        let script = format!(
-            "( sleep {}; echo leaked > {} ) & sleep 30",
-            GRANDCHILD_DELAY.as_secs(),
-            marker.display()
-        );
-        let res = RealRunner
-            .run(
-                "sh",
-                &["-c".into(), script],
-                None,
-                Duration::from_millis(300),
-            )
-            .await
-            .unwrap();
-        assert!(res.timed_out);
-
-        // Wait past when the grandchild would have written the marker; it must not exist.
-        tokio::time::sleep(SAFETY_WAIT).await;
-        assert!(
-            !marker.exists(),
-            "backgrounded grandchild survived the timeout — process group not killed"
-        );
-    }
-
-    #[tokio::test]
-    async fn cancelling_the_future_kills_backgrounded_grandchildren() {
-        // Same fixture as `timeout_kills_backgrounded_grandchildren`, but this time the *caller* drops
-        // the `run` future outright (as cancellation does) rather than the command's own timeout
-        // firing — `kill_on_drop` alone only reaps the direct child, so without `GroupKillGuard` the
-        // backgrounded grandchild would survive this path even though the timeout path already
-        // handles it.
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("leaked");
-        let script = format!(
-            "( sleep {}; echo leaked > {} ) & sleep 30",
-            GRANDCHILD_DELAY.as_secs(),
-            marker.display()
-        );
-
-        let args = vec!["-c".to_string(), script];
-        tokio::select! {
-            _ = RealRunner.run(
-                "sh",
-                &args,
-                None,
-                Duration::from_secs(30), // long enough that the timeout branch never fires
-            ) => panic!("the run future should have been dropped first"),
-            _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                // The `run` future is dropped here as `select!`'s other arm is discarded.
-            }
-        }
-
-        // Wait past when the grandchild would have written the marker; it must not exist.
-        tokio::time::sleep(SAFETY_WAIT).await;
-        assert!(
-            !marker.exists(),
-            "backgrounded grandchild survived dropping the future — process group not killed"
-        );
-    }
-
-    #[tokio::test]
-    async fn resolves_promptly_when_a_detached_child_holds_the_pipe_open_but_stays_quiet() {
-        // pi issue #5303: a shell exits immediately but a backgrounded sleeper inherits the stdout
-        // pipe and holds it open without writing. We must release via the post-exit idle grace rather
-        // than block until the pipe's true EOF (which wouldn't arrive for 30s here) — and, before the
-        // fix, not until the overall command timeout either.
-        let start = std::time::Instant::now();
-        let res = RealRunner
-            .run(
-                "sh",
-                &["-c".into(), "printf 'DONE\\n'; ( sleep 30 ) &".into()],
-                None,
-                Duration::from_secs(25), // far longer than the idle grace should ever need
-            )
-            .await
-            .unwrap();
-        assert!(!res.timed_out);
-        assert_eq!(res.stdout, "DONE\n");
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "took {:?}; must release via the idle grace, not wait on the held-open pipe",
-            start.elapsed()
-        );
-    }
-
-    #[tokio::test]
-    async fn captures_output_emitted_after_exit_while_a_detached_child_holds_stdout_open() {
-        // Companion to the test above: the idle grace must not cut off output that's still actively
-        // arriving from a detached descendant — only a genuinely quiet handle releases early. Ticks
-        // land every 50ms, each one re-arming the 100ms grace, well past a single grace window.
-        let res = RealRunner
-            .run(
-                "sh",
-                &[
-                    "-c".into(),
-                    "printf 'HEAD\\n'; ( for i in 1 2 3 4 5 6; do sleep 0.05; printf \"TICK$i\\n\"; done ) &"
-                        .into(),
-                ],
-                None,
-                Duration::from_secs(5),
-            )
-            .await
-            .unwrap();
-        assert!(!res.timed_out);
-        assert!(res.stdout.contains("HEAD"), "got: {:?}", res.stdout);
-        assert!(res.stdout.contains("TICK6"), "got: {:?}", res.stdout);
-    }
-
-    #[tokio::test]
-    async fn run_streaming_emits_chunks_reconstructing_stdout() {
-        // The streaming runner must hand each output chunk to `on_chunk` as it arrives, and the
-        // concatenated chunks must reconstruct the full stdout (it streams before the cap, not after).
-        // The sink *is* the output on this path — the `ExecResult::stdout`/`stderr` fields are left
-        // empty on purpose (the head/tail capture is skipped when streaming, since the only consumer,
-        // `bash`, reads the streamed chunks, never these fields — see the `exec` `Ok` arm).
-        let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-        let c = collected.clone();
-        let sink = move |bytes: &[u8]| c.lock().unwrap().extend_from_slice(bytes);
-        let res = RealRunner
-            .run_streaming(
-                "sh",
-                &["-c".into(), "printf 'hello\\nworld\\n'".into()],
-                None,
-                Duration::from_secs(5),
-                &sink,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            res.stdout, "",
-            "streaming skips the discarded capture; the sink is the source of truth"
-        );
-        let streamed = String::from_utf8(collected.lock().unwrap().clone()).unwrap();
-        assert_eq!(
-            streamed, "hello\nworld\n",
-            "streamed chunks must reconstruct stdout"
-        );
-    }
-
-    #[tokio::test]
-    async fn kill_process_group_completes_promptly_when_the_group_kill_finds_nothing_to_kill() {
-        // Track L10: exercises the two-attempt sequence end to end. Once the process has already
-        // exited and been reaped, the group kill (`kill -KILL -pgid`) finds nothing (ESRCH) and the
-        // direct-pid fallback that follows must also complete cleanly — no hang, no panic — rather
-        // than the two-step sequence somehow blocking on a process that's already gone.
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg("true")
-            .spawn()
-            .unwrap();
-        let pid = child.id().unwrap();
-        child.wait().await.unwrap(); // let it actually exit and get reaped
-
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || kill_process_group(GroupId::leader(pid))),
-        )
-        .await
-        .expect("kill_process_group must not hang when there's nothing left to kill")
-        .expect("kill_process_group must not panic");
-    }
 
     #[test]
     fn capture_keeps_head_and_tail_drops_middle() {
@@ -1259,57 +497,5 @@ mod tests {
         let (out, dropped) = cap.finish();
         assert!(!dropped);
         assert_eq!(&out, b"hello");
-    }
-
-    #[tokio::test]
-    async fn bounded_capture_survives_a_firehose() {
-        // `yes` emits unboundedly fast; with the old `wait_with_output()` this buffered the whole
-        // stream and OOMed. Capture must hold ~HEAD+TAIL, return promptly on timeout, and the kept
-        // bytes (after lossy decode) must start at the true beginning of the stream.
-        let res = RealRunner
-            .run(
-                "sh",
-                &["-c".into(), "yes AAAAAAAA".into()],
-                None,
-                Duration::from_millis(400),
-            )
-            .await
-            .unwrap();
-        // Timed out (yes never exits), so stdout was discarded by the timeout branch — prove instead
-        // with a bounded *finite* firehose that exits on its own.
-        assert!(res.timed_out);
-
-        let res = RealRunner
-            .run(
-                "sh",
-                // ~5 MiB of output that exits cleanly — far above the 256 KiB capture window.
-                &[
-                    "-c".into(),
-                    "yes ABCDEFGHIJKLMNOPQRST | head -n 250000".into(),
-                ],
-                None,
-                Duration::from_secs(30),
-            )
-            .await
-            .unwrap();
-        assert!(!res.timed_out);
-        assert!(
-            res.truncated,
-            "5 MiB through a 256 KiB window must drop the middle"
-        );
-        assert!(
-            res.stdout.len() <= STREAM_HEAD + STREAM_TAIL + 64,
-            "captured {} bytes; expected bounded to ~{}",
-            res.stdout.len(),
-            STREAM_HEAD + STREAM_TAIL
-        );
-        assert!(
-            res.stdout.starts_with("ABCDEFGHIJKLMNOPQRST"),
-            "head preserved"
-        );
-        assert!(
-            res.stdout.trim_end().ends_with("ABCDEFGHIJKLMNOPQRST"),
-            "tail preserved"
-        );
     }
 }

@@ -11,13 +11,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use beyond_agent::exec_endpoint::HttpExecRunner;
-use beyond_agent::exec_endpoint::jobs::{
+use beyond_sandbox::exec::CommandRunner;
+use beyond_sandbox::exec_endpoint::HttpExecRunner;
+use beyond_sandbox::exec_endpoint::jobs::{
     JobEvent, JobId, JobScope, JobSpec, JobStatus, SandboxJobs,
 };
-use beyond_agent::tools::exec::CommandRunner;
-use beyond_agent::tools::fs::shell::{Capabilities, SearchEngine, ShellFs};
-use beyond_agent::tools::fs::{FileKind, FsBackend, FsError, SearchQuery};
+use beyond_sandbox::fs::shell::{Capabilities, SearchEngine, ShellFs};
+use beyond_sandbox::fs::{FileKind, FsBackend, FsError, SearchQuery};
 use serde_json::{Value, json};
 
 pub const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;

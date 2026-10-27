@@ -19,7 +19,9 @@ use beyond_test_support::exec_mock::{ExecMock, MockOptions, Protocol};
 use serde_json::{Map, Value, json};
 use sha2::Digest as _;
 
-use crate::sdk_conformance_driver::{B64, CapsOverride, Config, Driver};
+#[path = "sdk_conformance/driver.rs"]
+mod driver;
+use driver::{B64, CapsOverride, Config, Driver};
 
 const BEARER: &str = "conformance-secret";
 

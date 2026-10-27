@@ -3,14 +3,12 @@
 //! streams is driven exactly as v1.1 always was.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use crate::common;
-
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use beyond_agent::exec_endpoint::HttpExecRunner;
-use beyond_agent::tools::exec::CommandRunner;
-use common::exec_mock::{ExecMock, MockOptions, Protocol, StreamEnd};
+use beyond_sandbox::exec::CommandRunner;
+use beyond_sandbox::exec_endpoint::HttpExecRunner;
+use beyond_test_support::exec_mock::{ExecMock, MockOptions, Protocol, StreamEnd};
 
 fn sh(script: &str) -> Vec<String> {
     vec!["-c".to_string(), script.to_string()]
@@ -41,7 +39,7 @@ async fn stream(
     runner: &HttpExecRunner,
     script: &str,
     timeout: Duration,
-) -> (beyond_agent::tools::exec::ExecResult, Sink) {
+) -> (beyond_sandbox::exec::ExecResult, Sink) {
     let sink = Sink::default();
     let s = sink.clone();
     let on_chunk = move |b: &[u8]| s.0.lock().unwrap().push((Instant::now(), b.to_vec()));
@@ -167,7 +165,7 @@ async fn every_final_frame_maps_onto_the_result() {
         Some(StreamEnd::TimedOut),
         "the endpoint enforced the timeout, not a client-side abort"
     );
-    assert!(common::exec_mock::wait_group_gone(s.pgid, Duration::from_secs(5)).await);
+    assert!(beyond_test_support::exec_mock::wait_group_gone(s.pgid, Duration::from_secs(5)).await);
 }
 
 #[tokio::test]

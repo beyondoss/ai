@@ -109,7 +109,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use sha2::Digest as _;
 
-use crate::tools::exec::CommandRunner;
+use crate::exec::CommandRunner;
 
 /// Where every scope lives, in the sandbox.
 pub const JOBS_ROOT: &str = "/tmp/beyond-jobs";
@@ -960,7 +960,7 @@ pub(crate) fn describe_survivors(pids: &str) -> String {
     }
 }
 
-fn exit_text(r: &crate::tools::exec::ExecResult) -> String {
+fn exit_text(r: &crate::exec::ExecResult) -> String {
     match (r.code, r.signal, r.timed_out) {
         (_, _, true) => "the exec endpoint timed it out".to_string(),
         (Some(c), _, _) => format!("exit {c}"),
@@ -1577,10 +1577,8 @@ mod tests {
             args: &[String],
             cwd: Option<&str>,
             timeout: Duration,
-        ) -> std::io::Result<crate::tools::exec::ExecResult> {
-            crate::tools::exec::RealRunner
-                .run(program, args, cwd, timeout)
-                .await
+        ) -> std::io::Result<crate::exec::ExecResult> {
+            crate::testing::Host.run(program, args, cwd, timeout).await
         }
 
         async fn run_with_stdin(
@@ -1590,10 +1588,10 @@ mod tests {
             cwd: Option<&str>,
             timeout: Duration,
             stdin: &[u8],
-        ) -> std::io::Result<crate::tools::exec::ExecResult> {
+        ) -> std::io::Result<crate::exec::ExecResult> {
             let mut args = args.to_vec();
             args[1] = format!("{}\n{}", self.0, args[1]);
-            crate::tools::exec::RealRunner
+            crate::testing::Host
                 .run_with_stdin(program, &args, cwd, timeout, stdin)
                 .await
         }
@@ -1631,7 +1629,7 @@ mod tests {
             _: &[String],
             _: Option<&str>,
             _: Duration,
-        ) -> std::io::Result<crate::tools::exec::ExecResult> {
+        ) -> std::io::Result<crate::exec::ExecResult> {
             unreachable!("only the held start runs")
         }
 
@@ -1640,14 +1638,14 @@ mod tests {
             _: &str,
             _: &[String],
             _: Option<&str>,
-            on_stdout: crate::tools::exec::ChunkSink<'_>,
-            on_stderr: crate::tools::exec::ChunkSink<'_>,
-        ) -> std::io::Result<crate::tools::exec::ExecResult> {
+            on_stdout: crate::exec::ChunkSink<'_>,
+            on_stderr: crate::exec::ChunkSink<'_>,
+        ) -> std::io::Result<crate::exec::ExecResult> {
             on_stdout(b"one\n");
             on_stderr(b"\x1ejob-start:42\n");
             on_stdout(b"two\n");
             on_stderr(b"\x1ejob-end:0\n");
-            Ok(crate::tools::exec::ExecResult {
+            Ok(crate::exec::ExecResult {
                 code: Some(0),
                 ..Default::default()
             })

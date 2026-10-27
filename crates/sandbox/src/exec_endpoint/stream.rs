@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 /// The media type of a v1.2 streamed response. Anything else in answer to `"stream": true` is a
 /// v1.1 endpoint that ignored the field and sent the whole result as one JSON object.
-pub(crate) const NDJSON: &str = "application/x-ndjson";
+pub const NDJSON: &str = "application/x-ndjson";
 
 /// The longest gap the endpoint may leave between frames: it sends a heartbeat (`{}`) whenever the
 /// command has been silent this long. Short enough to keep an idle connection open through every
@@ -24,7 +24,7 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// heartbeats. Without it a stream whose far side vanished (a sandbox host lost power, a NAT entry
 /// expired) would hold a `bash` job until the command's own timeout — the hang streaming exists to
 /// end.
-pub(crate) const FRAME_SILENCE_LIMIT: Duration = Duration::from_secs(30);
+pub const FRAME_SILENCE_LIMIT: Duration = Duration::from_secs(30);
 
 /// The most output one frame may carry, decoded. The endpoint MUST split anything longer.
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024;
@@ -130,7 +130,7 @@ pub fn decode_line(line: &[u8]) -> Result<Vec<Frame>, String> {
 /// Reads frames off a streamed response body, one line at a time. Holds at most one partial line
 /// (bounded by [`MAX_LINE`]) — the output itself goes straight to the caller, so a command that
 /// prints gigabytes costs this reader nothing but time.
-pub(crate) struct FrameReader {
+pub struct FrameReader {
     resp: reqwest::Response,
     buf: Vec<u8>,
     /// Bytes of `buf` already searched for a newline, so a long partial line is not rescanned on
@@ -141,7 +141,7 @@ pub(crate) struct FrameReader {
 }
 
 impl FrameReader {
-    pub(crate) fn new(resp: reqwest::Response) -> Self {
+    pub fn new(resp: reqwest::Response) -> Self {
         Self {
             resp,
             buf: Vec::new(),
@@ -154,7 +154,7 @@ impl FrameReader {
     /// The next frame, or `None` at the end of the body. An `Err` is a broken stream: the
     /// connection failed, a line did not parse, or nothing at all (not even a heartbeat) arrived for
     /// `silence`.
-    pub(crate) async fn next(&mut self, silence: Duration) -> Result<Option<Frame>, String> {
+    pub async fn next(&mut self, silence: Duration) -> Result<Option<Frame>, String> {
         loop {
             if let Some(f) = self.pending.pop_front() {
                 return Ok(Some(f));
@@ -171,7 +171,7 @@ impl FrameReader {
 
     /// The next line of the body (without its `\n`), or `None` at the end — for a decoder of its
     /// own (the v1.3 job streams, `jobs_native`). Errors as [`Self::next`].
-    pub(crate) async fn next_line(&mut self, silence: Duration) -> Result<Option<Vec<u8>>, String> {
+    pub async fn next_line(&mut self, silence: Duration) -> Result<Option<Vec<u8>>, String> {
         loop {
             if let Some(nl) = self.buf[self.scanned..].iter().position(|&b| b == b'\n') {
                 let end = self.scanned + nl;
@@ -217,7 +217,7 @@ impl FrameReader {
     /// After the final frame: give the body a moment to end so the connection can go back to the
     /// pool instead of being torn down. Bounded — a conforming endpoint ends the body right after
     /// the final frame, and one that does not costs a connection, never a hang.
-    pub(crate) async fn finish(mut self) {
+    pub async fn finish(mut self) {
         if !self.ended {
             let _ = tokio::time::timeout(Duration::from_millis(500), self.resp.chunk()).await;
         }
@@ -228,27 +228,27 @@ impl FrameReader {
 /// clear interval before the end proves it is incremental; a buffering endpoint or proxy delivers
 /// everything at once. `sleep 0.3` is not POSIX (busybox has it, some minimal `sleep`s do not), so
 /// it falls back to a whole second rather than failing the probe.
-pub(crate) const PROBE_SCRIPT: &str = "printf a; sleep 0.3 2>/dev/null || sleep 1; printf b";
+pub const PROBE_SCRIPT: &str = "printf a; sleep 0.3 2>/dev/null || sleep 1; printf b";
 
 /// The least gap between the probe's first output frame and its final frame that counts as
 /// incremental delivery. A third of the script's pause: wide enough to absorb scheduling noise on a
 /// loaded host, far above the ~0 a buffered body shows.
-pub(crate) const PROBE_MIN_GAP: Duration = Duration::from_millis(100);
+pub const PROBE_MIN_GAP: Duration = Duration::from_millis(100);
 
 /// What a probe saw, for the verdict and for the conformance report.
 #[derive(Debug, Default)]
-pub(crate) struct ProbeSeen {
-    pub(crate) ndjson: bool,
-    pub(crate) output_frames: usize,
-    pub(crate) stdout: Vec<u8>,
-    pub(crate) end: Option<Frame>,
+pub struct ProbeSeen {
+    pub ndjson: bool,
+    pub output_frames: usize,
+    pub stdout: Vec<u8>,
+    pub end: Option<Frame>,
     /// From the first output frame to the final frame.
-    pub(crate) gap: Option<Duration>,
+    pub gap: Option<Duration>,
 }
 
 impl ProbeSeen {
     /// The probe's verdict: streaming is adopted only on this.
-    pub(crate) fn streams(&self) -> bool {
+    pub fn streams(&self) -> bool {
         self.ndjson
             && self.output_frames >= 2
             && self.stdout == b"ab"
@@ -257,7 +257,7 @@ impl ProbeSeen {
     }
 
     /// Why the verdict is what it is, in a sentence.
-    pub(crate) fn explain(&self) -> String {
+    pub fn explain(&self) -> String {
         if !self.ndjson {
             return "answered `\"stream\": true` with a single JSON object (a v1.1 endpoint)"
                 .into();
@@ -288,7 +288,7 @@ impl ProbeSeen {
 }
 
 /// Read a probe's stream to its end, timing it.
-pub(crate) async fn observe_probe(resp: reqwest::Response) -> Result<ProbeSeen, String> {
+pub async fn observe_probe(resp: reqwest::Response) -> Result<ProbeSeen, String> {
     let mut seen = ProbeSeen {
         ndjson: true,
         ..ProbeSeen::default()
