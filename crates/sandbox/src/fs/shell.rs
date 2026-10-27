@@ -536,6 +536,7 @@ impl FsBackend for ShellFs {
                 .exec(
                     "find",
                     &[
+                        "-H".into(),
                         root.clone(),
                         "-mindepth".into(),
                         "1".into(),
@@ -563,6 +564,7 @@ impl FsBackend for ShellFs {
             .exec(
                 "find",
                 &[
+                    "-H".into(),
                     root.clone(),
                     "-mindepth".into(),
                     "1".into(),
@@ -583,6 +585,7 @@ impl FsBackend for ShellFs {
             .exec(
                 "find",
                 &[
+                    "-H".into(),
                     root,
                     "-mindepth".into(),
                     "1".into(),
