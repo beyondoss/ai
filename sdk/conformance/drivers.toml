@@ -12,3 +12,11 @@ run = "target/debug/sandbox-driver-rust"
 name = "ts"
 build = "npm ci --prefix sdk/ts --silent && npm run build --prefix sdk/ts --silent"
 run = "node sdk/ts/sandbox/dist/driver.mjs"
+
+[[driver]]
+name = "python"
+run = "env PYTHONPATH=sdk/python/sandbox/src python3 -m beyond_sandbox.driver"
+
+[[driver]]
+name = "python-async"
+run = "env PYTHONPATH=sdk/python/sandbox/src python3 -m beyond_sandbox.driver --async"

@@ -765,12 +765,6 @@ that show them, on a backend whose probes found `find_printf` and a busybox
    (`find: unrecognized: -printf`). Section 4 requires stdout `c` as well.
    Shown by every `list` check on busybox (19 checks in `files`, `errors` and
    `helpers`).
-2. **The reference's write through a dangling symlink lands in the wrong
-   directory on busybox.** Its resolve step gives a dangling link to
-   `readlink -f`, which on busybox resolves a relative target against the
-   working directory, so it names `CWD/made` instead of `DIR/made`. Section 5.3
-   and scripts C, D and E take `readlink -f` only for a link that resolves.
-   Shown by `files.write.dangling-symlink-creates-target/check`.
 
 When the reference (`ShellFs`) behaves differently from this spec, the
 difference is listed here, and the scenarios carry an `xfail` mark for the

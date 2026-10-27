@@ -1230,8 +1230,10 @@ exec dd if="$1" iflag=skip_bytes,count_bytes skip="$2" count="$3" status=none | 
 /// The opening of every write script: resolve the target `$1` to the file a write lands in, as `$t`,
 /// and name the temp `$tmp` beside it with the host's unpredictable suffix `$2`. The shell spelling of
 /// `LocalFs`'s `resolve_symlink_target`, so both backends write through a symlink rather than replacing
-/// it: `readlink -f` resolves the whole chain, and for a dangling link, which `readlink -f` may refuse,
-/// one `readlink` hop is joined to the link's directory. The temp sits beside the resolved file, so the
+/// it: `readlink -f` resolves a link whose target exists; a dangling link is never given to it (busybox
+/// resolves its relative target against the working directory, not the link's), but followed one
+/// `readlink` hop at a time, each relative target joined to the directory of the link it came from, for
+/// at most 40 hops (Linux's ELOOP limit, MAXSYMLINKS). The temp sits beside the resolved file, so the
 /// final `mv` is a rename within one filesystem.
 ///
 /// A path starting with `-` is prefixed with `./` so no command reads it as an option; `--` would do
@@ -1241,13 +1243,18 @@ macro_rules! resolve_target {
         r#"t="$1"
 case "$t" in -*) t="./$t" ;; esac
 if [ -L "$t" ]; then
-  r=$(readlink -f "$t" 2>/dev/null) || r=
+  r=
+  [ -e "$t" ] && r=$(readlink -f "$t" 2>/dev/null)
   if [ -z "$r" ]; then
-    r=$(readlink "$t") || exit 1
-    case "$r" in
-      /*) ;;
-      *) case "$t" in */*) r="${t%/*}/$r" ;; esac ;;
-    esac
+    r="$t" n=0
+    while [ -L "$r" ] && [ $n -lt 40 ]; do
+      l=$(readlink "$r") || exit 1
+      case "$l" in
+        /*) r="$l" ;;
+        *) case "$r" in */*) r="${r%/*}/$l" ;; *) r="$l" ;; esac ;;
+      esac
+      n=$((n + 1))
+    done
   fi
   t="$r"
   case "$t" in -*) t="./$t" ;; esac
@@ -1799,6 +1806,47 @@ mod tests {
         let f: Vec<&str> = line.trim_end().split('\t').collect();
         assert_eq!((f[1], f[2]), ("f", "12"), "{line:?}");
         assert_eq!(run("dangling").status.code(), Some(1));
+    }
+
+    /// A write through a dangling link lands beside the link, not in the working directory: the
+    /// script is run from a different cwd, which is where busybox's `readlink -f` would look.
+    #[test]
+    fn write_through_dangling_links_resolves_against_each_links_directory() {
+        use std::io::Write;
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::create_dir_all(d.join("a/b")).unwrap();
+        std::fs::create_dir(d.join("a/c")).unwrap();
+        std::fs::create_dir(d.join("elsewhere")).unwrap();
+        symlink("made", d.join("a/rel")).unwrap();
+        symlink("b/m", d.join("a/l1")).unwrap();
+        symlink("../l1", d.join("a/c/l2")).unwrap();
+        symlink("../c/l2", d.join("a/b/l3")).unwrap();
+        symlink("b/l3", d.join("a/l4")).unwrap();
+        symlink(d.join("elsewhere/abs"), d.join("a/abs")).unwrap();
+        let write = |link: &str| {
+            let mut c = std::process::Command::new("sh")
+                .args(["-c", WRITE_STDIN_SCRIPT, "sh"])
+                .arg(d.join(link))
+                .args(["sfx", "2"])
+                .current_dir(d.join("elsewhere"))
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            c.stdin.take().unwrap().write_all(b"hi").unwrap();
+            assert!(c.wait().unwrap().success(), "{link}");
+        };
+        for (link, target) in [
+            ("a/rel", "a/made"),
+            ("a/l4", "a/b/m"),
+            ("a/abs", "elsewhere/abs"),
+        ] {
+            write(link);
+            assert_eq!(std::fs::read(d.join(target)).unwrap(), b"hi", "{link}");
+            assert!(d.join(link).symlink_metadata().unwrap().is_symlink());
+        }
+        assert!(!d.join("elsewhere/made").exists());
     }
 
     #[test]
