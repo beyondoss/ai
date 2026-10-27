@@ -109,12 +109,35 @@ export class InvalidQueryError extends SandboxError {
   }
 }
 
+const OS_ERROR_NAMES = [
+  "no such file or directory",
+  "directory nonexistent",
+  "nonexistent directory",
+  "is a directory",
+  "not a directory",
+  "permission denied",
+];
+
+/**
+ * The detail of a failed command: the first line of trimmed stderr; when that line names no OS
+ * error, the lines through the first one that does (a path containing a newline splits the message).
+ */
+export function errorDetail(stderr: string): string {
+  const lines = stderr.trim().split("\n");
+  const at = lines.findIndex((l) => {
+    const low = l.toLowerCase();
+    return OS_ERROR_NAMES.some((n) => low.includes(n));
+  });
+  return (at < 0 ? lines[0] ?? "" : lines.slice(0, at + 1).join("\n"))
+    .trimEnd();
+}
+
 /**
  * A command ran and failed (FILES-OVER-EXEC section 3.3): the first line of its stderr, classified
  * case-insensitively by the first rule that matches.
  */
 export function classifyFailure(prefix: string, stderr: string): SandboxError {
-  const line = stderr.trim().split("\n")[0] ?? "";
+  const line = errorDetail(stderr);
   const detail = `${prefix}: ${line === "" ? "command failed" : line}`;
   const m = line.toLowerCase();
   if (

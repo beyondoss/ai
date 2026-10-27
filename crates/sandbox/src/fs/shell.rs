@@ -1071,8 +1071,33 @@ fn mtimes_match(a: Option<std::time::SystemTime>, b: Option<std::time::SystemTim
     secs(a) == secs(b)
 }
 
+/// The `detail` of a failed command (spec 3.3): the first line of trimmed stderr; and when that line
+/// names no OS error, the lines through the first one that does, because a path containing a newline
+/// splits the message and the OS error is on a later line. Always a slice of `stderr`.
 fn first_line_or<'a>(stderr: &'a str, fallback: &'a str) -> &'a str {
-    stderr.trim().lines().next().unwrap_or(fallback)
+    const NAMES: [&str; 6] = [
+        "no such file or directory",
+        "directory nonexistent",
+        "nonexistent directory",
+        "is a directory",
+        "not a directory",
+        "permission denied",
+    ];
+    let t = stderr.trim();
+    let mut end = None;
+    for line in t.split_inclusive('\n') {
+        let line_end = (line.as_ptr() as usize - t.as_ptr() as usize) + line.len();
+        let end_of_line = line.trim_end().len() + (line_end - line.len());
+        let low = line.to_ascii_lowercase();
+        if NAMES.iter().any(|n| low.contains(n)) {
+            return &t[..end_of_line];
+        }
+        end.get_or_insert(end_of_line);
+    }
+    match end {
+        Some(e) => &t[..e],
+        None => fallback,
+    }
 }
 
 /// Minimal base64, both directions. Written here rather than pulled in as a dependency: the crate
@@ -1376,6 +1401,11 @@ enum SearchFailure {
 
 /// Per-path read errors name the path and end in the OS message (`rg` appends ` (os error N)`).
 /// Anything else on stderr is the engine complaining about the pattern.
+///
+/// A path may contain a newline, which splits one error over two lines, so stderr is read as
+/// *records* that end at an OS error, not as lines: a record runs from where the previous one ended
+/// through the first line that ends in an OS message. The search root is known, so its own error is
+/// found by looking for that exact string, newlines and all.
 fn classify_search_failure(stderr: &str, root: &str) -> SearchFailure {
     const OS_ERRORS: [&str; 5] = [
         "No such file or directory",
@@ -1384,8 +1414,7 @@ fn classify_search_failure(stderr: &str, root: &str) -> SearchFailure {
         "Too many levels of symbolic links",
         "Input/output error",
     ];
-    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
-    let path_error = |l: &str| {
+    let ends_in_os_error = |l: &str| {
         let l = l.trim_end();
         let l = l
             .strip_suffix(')')
@@ -1393,23 +1422,36 @@ fn classify_search_failure(stderr: &str, root: &str) -> SearchFailure {
             .unwrap_or(l);
         OS_ERRORS.iter().any(|e| l.ends_with(e))
     };
-    if lines.is_empty() || !lines.iter().all(|l| path_error(l)) {
+    let mut records: Vec<&str> = Vec::new();
+    let mut start = 0;
+    for line in stderr.split_inclusive('\n') {
+        let end = (line.as_ptr() as usize - stderr.as_ptr() as usize) + line.len();
+        if ends_in_os_error(line) {
+            records.push(stderr[start..end].trim());
+            start = end;
+        }
+    }
+    if records.is_empty() || !stderr[start..].trim().is_empty() {
         return SearchFailure::BadRegex;
     }
     // The root's own error is `PROGRAM: ROOT: [IO error for operation on ROOT: ]No such file or
     // directory`; a path under the root carries more path after ROOT, so matching the exact
     // `: ROOT: ` form tells them apart.
     let root_prefix = format!(": {root}: ");
-    if let Some(l) = lines
-        .iter()
-        .find(|l| l.contains(&root_prefix) && l.contains("No such file or directory"))
-    {
-        return SearchFailure::MissingRoot(l.trim().to_string());
+    let io_prefix = format!("IO error for operation on {root}: ");
+    if let Some(r) = records.iter().find(|r| {
+        r.match_indices(&root_prefix).any(|(at, _)| {
+            let rest = &r[at + root_prefix.len()..];
+            let rest = rest.strip_prefix(&io_prefix).unwrap_or(rest);
+            rest.starts_with("No such file or directory")
+        })
+    }) {
+        return SearchFailure::MissingRoot((*r).to_string());
     }
-    let first = lines[0].trim();
     SearchFailure::Skipped(format!(
-        "{} path(s) could not be searched; first: {first}",
-        lines.len()
+        "{} path(s) could not be searched; first: {}",
+        records.len(),
+        records[0]
     ))
 }
 
@@ -1886,6 +1928,38 @@ mod tests {
             classify_search_failure("grep: /work/proj/x: No such file or directory", root),
             SearchFailure::Skipped(_)
         ));
+    }
+
+    #[test]
+    fn a_path_with_a_newline_does_not_hide_the_os_error() {
+        let root = "/work/no\nwhere";
+        for missing in [
+            "rg: /work/no\nwhere: No such file or directory (os error 2)\n",
+            "rg: /work/no\nwhere: IO error for operation on /work/no\nwhere: No such file or directory (os error 2)\n",
+            "grep: /work/no\nwhere: No such file or directory\n",
+        ] {
+            assert!(
+                matches!(
+                    classify_search_failure(missing, root),
+                    SearchFailure::MissingRoot(_)
+                ),
+                "{missing:?}"
+            );
+        }
+        let SearchFailure::Skipped(note) = classify_search_failure(
+            "rg: /work/proj/a\nb: Permission denied (os error 13)\nrg: /work/proj/c: Permission denied (os error 13)\n",
+            "/work/proj",
+        ) else {
+            panic!("per-file errors must keep the matches");
+        };
+        assert!(note.starts_with("2 path(s)"), "{note}");
+        // The detail of a failed command is cut at the OS error, not at the first newline.
+        assert_eq!(
+            first_line_or("cat: a\nb: No such file or directory\n", "x"),
+            "cat: a\nb: No such file or directory"
+        );
+        assert_eq!(first_line_or("one\ntwo\n", "x"), "one");
+        assert_eq!(first_line_or("  \n", "x"), "x");
     }
 
     /// This host's `sh`, with a prelude run before every script. A `PATH` shim, not a shell function,

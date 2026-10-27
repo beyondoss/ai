@@ -408,12 +408,6 @@ pub fn machine(tc: &TestCase, cfg: Config) -> Machine {
     m
 }
 
-/// A path with a newline in it splits the shell's one-line error: the OS message is on a line the spec's
-/// "first line of stderr" rule never reads, so the kind falls back to `io`. Allowed, and reported.
-fn kind_ok(kinds: &[Kind], k: Kind, p: &Path) -> bool {
-    kinds.contains(&k) || (k == Kind::Io && p.to_string_lossy().contains('\n'))
-}
-
 /// An open bug this test found: tolerated (and counted, and printed) until its fix lands, then removed
 /// from here. `known_bugs.rs` holds one deterministic test per entry that fails once the bug is fixed,
 /// so a fix cannot leave a stale exemption behind.
@@ -735,13 +729,9 @@ impl Machine {
                         Plan::Succeed => fail(format!(
                             "{op} {p:?} must succeed but failed ({kind:?}): {e}"
                         )),
-                        Plan::Fail(kinds)
-                            if !kind_ok(kinds, kind, &p) && !kind_ok(kinds, kind, &target) =>
-                        {
-                            fail(format!(
-                                "{op} {p:?} failed as {kind:?} ({e}), spec allows {kinds:?}"
-                            ))
-                        }
+                        Plan::Fail(kinds) if !kinds.contains(&kind) => fail(format!(
+                            "{op} {p:?} failed as {kind:?} ({e}), spec allows {kinds:?}"
+                        )),
                         _ => {}
                     }
                     check_unchanged("a failed write");
@@ -969,7 +959,7 @@ impl Machine {
             )),
             (Err(e), Err(kinds)) => {
                 let k = self.kind(&e, &p);
-                if !kind_ok(&kinds, k, &p) {
+                if !kinds.contains(&k) {
                     fail(format!(
                         "read {p:?} failed as {k:?} ({e}); spec allows {kinds:?}"
                     ));
@@ -1176,20 +1166,7 @@ impl Machine {
             Err(e) => {
                 let k = self.kind(&e, &root);
                 let tolerated = report.errored || (self.cfg.cap.is_some() && k == Kind::TooLarge);
-                let multiline = k == Kind::InvalidQuery
-                    && (want.root_missing || want.unreadable)
-                    && (root.to_string_lossy().contains('\n')
-                        || snapshot(&self.root)
-                            .keys()
-                            .any(|p| p.to_string_lossy().contains('\n')));
-                if multiline && !tolerated {
-                    known(
-                        "N2",
-                        format!(
-                            "search answered a missing/unreadable path as a bad regex because a path contains a newline: {e}"
-                        ),
-                    );
-                } else if !tolerated {
+                if !tolerated {
                     if want.root_below_file && k == Kind::InvalidQuery {
                         known(
                             "N3",
@@ -1342,7 +1319,7 @@ impl Machine {
                         Plan::Succeed => fail(format!(
                             "mkdir -p {p:?} must succeed but failed ({k:?}): {e}"
                         )),
-                        Plan::Fail(ks) if !kind_ok(&ks, k, &p) => fail(format!(
+                        Plan::Fail(ks) if !ks.contains(&k) => fail(format!(
                             "mkdir -p {p:?} failed as {k:?}, spec allows {ks:?}"
                         )),
                         _ => {}
