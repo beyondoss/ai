@@ -1488,7 +1488,7 @@ enum SearchFailure {
 /// through the first line that ends in an OS message. The search root is known, so its own error is
 /// found by looking for that exact string, newlines and all.
 fn classify_search_failure(stderr: &str, root: &str) -> SearchFailure {
-    const OS_ERRORS: [&str; 6] = [
+    const OS_ERRORS: [&str; 7] = [
         "No such file or directory",
         "Permission denied",
         "Is a directory",
