@@ -248,6 +248,7 @@ pub async fn start(name: &str, bins: &Binaries) -> Result<Started, String> {
 // ---- local execd -------------------------------------------------------------------------------
 
 struct Local {
+    _leader: Option<crate::reaper::Leader>,
     _child: tokio::process::Child,
     _dir: tempfile::TempDir,
 }
@@ -270,11 +271,13 @@ async fn local(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .kill_on_drop(true)
+        .process_group(0);
     if bearer {
         c.env("EXECD_BEARER", BEARER);
     }
     let mut child = c.spawn().map_err(|e| format!("start execd: {e}"))?;
+    let leader = crate::reaper::Leader::new(&child);
     let addr = listening(child.stderr.take().expect("piped")).await?;
     Ok(Started {
         name: name.into(),
@@ -286,6 +289,7 @@ async fn local(
         suites: None,
         vars: BTreeMap::new(),
         _guard: Box::new(Local {
+            _leader: leader,
             _child: child,
             _dir: dir,
         }),
@@ -371,6 +375,7 @@ impl Container {
 /// Removes the container when the backend is dropped.
 struct Removal {
     id: String,
+    name: String,
     _keep: Option<Box<dyn Any + Send + Sync>>,
 }
 
@@ -381,6 +386,7 @@ impl Drop for Removal {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        crate::reaper::forget_container(&self.name);
     }
 }
 
@@ -416,6 +422,7 @@ async fn docker(name: &str, bins: &Binaries, image: &str, c: Container) -> Resul
         },
     );
     let container = format!("matrix-{name}-{}-{}", std::process::id(), nonce());
+    crate::reaper::watch_container(&container);
     let mut args: Vec<String> = [
         "run",
         "-d",
@@ -444,9 +451,16 @@ async fn docker(name: &str, bins: &Binaries, image: &str, c: Container) -> Resul
     args.extend(c.args.clone());
     args.extend([image.to_string(), "sh".into(), "-c".into(), script]);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    let id = docker_out(&argv).await?;
+    let id = match docker_out(&argv).await {
+        Ok(id) => id,
+        Err(e) => {
+            crate::reaper::forget_container(&container);
+            return Err(e);
+        }
+    };
     let guard = Removal {
         id: id.clone(),
+        name: container.clone(),
         _keep: c.keep,
     };
 

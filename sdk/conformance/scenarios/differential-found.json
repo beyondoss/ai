@@ -1,0 +1,335 @@
+{
+  "suite": "differential-found",
+  "version": 1,
+  "description": "Divergences the randomized differential run (crates/sandbox-conformance/tests/differential.rs) found between clients or against the filesystem, each as a permanent check. A check marked xfail for a driver is a known defect of that client; a fix removes the mark and the matching entry in tests/differential/known.rs.",
+  "scenarios": [
+    {
+      "id": "differential-found.write.below-file-with-separator-in-name",
+      "description": "A write below a regular file fails with not_found or not_a_directory, whatever characters the name has. The failing command's stderr is `sh: N: cannot create PATH: Directory nonexistent`; the kind comes from the first line up to LF. A name containing CR (or another character Python's splitlines() breaks at) must not move the OS message out of that line.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; echo x > \"$1/f\"",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "cr",
+          "op": "write",
+          "path": "${ROOT}/f/cr\rname",
+          "data_b64": "",
+          "expect": {
+            "error": {
+              "kind": {
+                "$oneof": [
+                  "not_found",
+                  "not_a_directory"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "line-separator",
+          "op": "write",
+          "path": "${ROOT}/f/ls name",
+          "data_b64": "",
+          "expect": {
+            "error": {
+              "kind": {
+                "$oneof": [
+                  "not_found",
+                  "not_a_directory"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "form-feed",
+          "op": "write",
+          "path": "${ROOT}/f/ff\fname",
+          "data_b64": "",
+          "expect": {
+            "error": {
+              "kind": {
+                "$oneof": [
+                  "not_found",
+                  "not_a_directory"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "lf",
+          "op": "write",
+          "path": "${ROOT}/f/x\ny",
+          "data_b64": "",
+          "expect": {
+            "error": {
+              "kind": {
+                "$oneof": [
+                  "io",
+                  "not_found",
+                  "not_a_directory"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "differential-found.search.git-file-not-utf8",
+      "description": "A file called .git whose content is not UTF-8, in a directory above the search root, does not make the search fail. ripgrep reads the nearest .git as a gitdir pointer, complains on stderr (`stream did not contain valid UTF-8`) and exits 2; the line is not a per-path OS error, so the clients report invalid_query although the pattern is fine and the matches were printed.",
+      "requires": {
+        "search_engine": "rg"
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir sub; printf 'nothing here\\n' > sub/x.txt; printf '\\377\\376 not utf8\\n' > .git",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "no-match",
+          "op": "search",
+          "root": "${ROOT}/sub",
+          "pattern": "needle",
+          "literal": true,
+          "xfail": {
+            "drivers": [
+              "agent-reference",
+              "beyond-sandbox-ts",
+              "python",
+              "python-async",
+              "sandbox-mcp"
+            ],
+            "reason": "rg's complaint about the unreadable .git file above the root is not an OS error, so its exit 2 reads as a rejected pattern"
+          },
+          "expect": {
+            "ok": {
+              "hits": []
+            }
+          }
+        },
+        {
+          "id": "match",
+          "op": "search",
+          "root": "${ROOT}/sub",
+          "pattern": "nothing",
+          "literal": true,
+          "xfail": {
+            "drivers": [
+              "agent-reference",
+              "beyond-sandbox-ts",
+              "python",
+              "python-async",
+              "sandbox-mcp"
+            ],
+            "reason": "rg's complaint about the unreadable .git file above the root is not an OS error, so its exit 2 reads as a rejected pattern"
+          },
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/sub/x.txt",
+                  "line": 1,
+                  "text": "nothing here",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "differential-found.search.clip-uses-rust-regex-syntax",
+      "description": "A match line longer than 500 characters is clipped around the first match of the query, the pattern read as a Rust-syntax regular expression (FILES-OVER-EXEC 5.7, Clipping). The line here is 600 z, `needle`, 10 w; the match ends past column 500, so the text is `… ` + columns 117-616 and the `[truncated; columns 117-616 of 616]` suffix. A pattern that is valid Rust syntax but not JavaScript syntax must clip the same way.",
+      "requires": {
+        "search_engine": "rg"
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; { head -c 600 /dev/zero | tr '\\000' z; printf 'needlewwwwwwwwww\\n'; } > long.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "plain",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "needle",
+          "literal": false,
+          "limit": 5,
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/long.txt",
+                  "line": 1,
+                  "is_match": true,
+                  "text": {
+                    "$contains": "[truncated; columns 117-616 of 616]"
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "inline-flag",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "(?i)NEEDLE",
+          "literal": false,
+          "limit": 5,
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/long.txt",
+                  "line": 1,
+                  "is_match": true,
+                  "text": {
+                    "$contains": "[truncated; columns 117-616 of 616]"
+                  }
+                }
+              ]
+            }
+          },
+          "xfail": {
+            "drivers": [
+              "beyond-sandbox-ts"
+            ],
+            "reason": "the TypeScript client finds the match to clip around with a JavaScript RegExp, which rejects Rust syntax such as (?i) and (?P<name>..); the line is then clipped as a context line"
+          }
+        },
+        {
+          "id": "named-group",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "nee(?P<x>d)le",
+          "literal": false,
+          "limit": 5,
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/long.txt",
+                  "line": 1,
+                  "is_match": true,
+                  "text": {
+                    "$contains": "[truncated; columns 117-616 of 616]"
+                  }
+                }
+              ]
+            }
+          },
+          "xfail": {
+            "drivers": [
+              "beyond-sandbox-ts"
+            ],
+            "reason": "the TypeScript client finds the match to clip around with a JavaScript RegExp, which rejects Rust syntax such as (?i) and (?P<name>..); the line is then clipped as a context line"
+          }
+        }
+      ]
+    },
+    {
+      "id": "differential-found.search.binary-file-warning-is-not-a-path",
+      "description": "ripgrep, given a directory, searches a file with a NUL byte after a match as far as the NUL and then prints `PATH: WARNING: stopped searching binary file after match (found \"\\0\" byte around offset N)` on stdout. That line has no NUL, so a parser that scans for the NUL after the path reads it as the start of the next record's path. No hit's path may contain the warning. (Three such files: whichever is printed first is followed by another record.)",
+      "requires": {
+        "search_engine": "rg"
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; i=10; while [ $i -lt 40 ]; do echo x1 > f$i; i=$((i+1)); done; for b in bin1 bin2 bin3; do printf 'x1\\n\\000\\n' > $b; done",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "control",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "x1",
+          "literal": true,
+          "glob": "f2*",
+          "limit": 100,
+          "expect": {
+            "ok": {
+              "hits": {
+                "$len": 10
+              }
+            }
+          }
+        },
+        {
+          "id": "paths",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "x1",
+          "literal": true,
+          "limit": 100,
+          "xfail": {
+            "drivers": [
+              "agent-reference",
+              "beyond-sandbox-ts",
+              "python",
+              "python-async",
+              "sandbox-mcp"
+            ],
+            "reason": "the warning line is read as the beginning of the next record's path"
+          },
+          "expect": {
+            "ok": {
+              "hits": {
+                "$not": {
+                  "$includes": [
+                    {
+                      "path": {
+                        "$contains": "WARNING"
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

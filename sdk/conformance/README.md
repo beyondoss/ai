@@ -5,12 +5,12 @@ clients that drive a sandbox over the exec protocol: the Rust crate
 `beyond-sandbox`, the MCP server `sandbox-mcp`, `@beyond.dev/sandbox` (TypeScript)
 and `beyond-sandbox` (Python). They must behave identically.
 
-| file                                     | what it is                                                                                                                       |
-| ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| [FILES-OVER-EXEC.md](FILES-OVER-EXEC.md) | the normative spec of the three layers and of every helper (stat, read, write, search, jobs)                                     |
-| [DRIVER.md](DRIVER.md)                   | the driver protocol, the error vocabulary, and the scenario format                                                               |
-| [scenarios/](scenarios)                  | the shared scenario files: `exec`, `exec-bytes`, `stream`, `jobs`, `files`, `errors`, `helpers`, `bulk`, `environments`, `relay` |
-| [drivers.toml](drivers.toml)             | the registry of drivers that `mise run test:clients` runs                                                                        |
+| file                                     | what it is                                                                                                                                             |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [FILES-OVER-EXEC.md](FILES-OVER-EXEC.md) | the normative spec of the three layers and of every helper (stat, read, write, search, jobs)                                                           |
+| [DRIVER.md](DRIVER.md)                   | the driver protocol, the error vocabulary, and the scenario format                                                                                     |
+| [scenarios/](scenarios)                  | the shared scenario files: `exec`, `exec-bytes`, `stream`, `jobs`, `files`, `errors`, `helpers`, `bulk`, `environments`, `relay`, `differential-found` |
+| [drivers.toml](drivers.toml)             | the registry of drivers that `mise run test:clients` runs                                                                                              |
 
 ## How the suite composes
 
@@ -26,6 +26,11 @@ Skipped and unsupported checks are printed and never counted as passes.
 
 `relay` runs two clients on one sandbox, every ordered pair of drivers (DRIVER.md, Relay):
 one writes, starts or changes something and the other must see it exactly.
+
+`differential-found` holds what randomized differential testing found (`mise run test:differential`): Hegel
+generates operation sequences, each is run through every driver on its own fresh root and the answers are compared
+with each other and, on the local backends, with the filesystem itself. Each divergence it finds is shrunk and added
+here as a scenario, `xfail` for the clients that fail it.
 
 The three layers are tested separately: `exec`, `exec-bytes`, `stream` and `jobs` are the
 transport, `files` the helpers, `helpers` is code a user wrote on the raw exec
