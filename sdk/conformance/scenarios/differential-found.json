@@ -118,7 +118,8 @@
               "agent-reference",
               "beyond-sandbox-ts",
               "python",
-              "python-async"
+              "python-async",
+              "sandbox-mcp"
             ],
             "reason": "rg's complaint about the unreadable .git file above the root is not an OS error, so its exit 2 reads as a rejected pattern"
           },
@@ -139,7 +140,8 @@
               "agent-reference",
               "beyond-sandbox-ts",
               "python",
-              "python-async"
+              "python-async",
+              "sandbox-mcp"
             ],
             "reason": "rg's complaint about the unreadable .git file above the root is not an OS error, so its exit 2 reads as a rejected pattern"
           },
@@ -306,7 +308,8 @@
               "agent-reference",
               "beyond-sandbox-ts",
               "python",
-              "python-async"
+              "python-async",
+              "sandbox-mcp"
             ],
             "reason": "the warning line is read as the beginning of the next record's path"
           },
