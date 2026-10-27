@@ -105,8 +105,8 @@
 
 use std::collections::BTreeMap;
 
-use beyond_ai_agent::exec_endpoint::notify_kernel as nk;
-use beyond_ai_agent::tools::job_notify::kernel;
+use beyond_agent::exec_endpoint::notify_kernel as nk;
+use beyond_agent::tools::job_notify::kernel;
 use stateright::{Checker, Model, Property};
 
 /// Replicas in the ring.

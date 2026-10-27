@@ -90,7 +90,7 @@ async fn main() -> std::process::ExitCode {
             // runs. Deterministic by design — the seeds are fixed so a failure reproduces — which
             // also means they are not secret and an attached fleet must be private.
             let dir = flag(&args, "--dir").unwrap_or_else(|| ".".to_owned());
-            let minter = beyond_ai_test_support::grant::Minter::new(std::path::Path::new(&dir));
+            let minter = beyond_test_support::grant::Minter::new(std::path::Path::new(&dir));
             println!("AI_AGENT_GRANT_KEY={}", minter.grant_key_flag());
             println!("AI_AGENT_SEAL_KEY={}", minter.seal_key().display());
             std::process::ExitCode::SUCCESS

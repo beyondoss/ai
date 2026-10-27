@@ -548,7 +548,7 @@ mod tests {
     }
 
     /// Not a test: runs the parser over a corpus of real commands for offline measurement.
-    /// `BASH_WRITES_CORPUS=in.jsonl BASH_WRITES_OUT=out.jsonl cargo test -p beyond-ai-agent-core
+    /// `BASH_WRITES_CORPUS=in.jsonl BASH_WRITES_OUT=out.jsonl cargo test -p beyond-agent-core
     /// --lib -- --ignored bash_writes_over_a_corpus`; each input line is `{"id": …, "command": "…"}`,
     /// each output line adds `"paths": […]`.
     #[test]

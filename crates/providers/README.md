@@ -1,4 +1,4 @@
-# beyond-ai-providers
+# beyond-providers
 
 The facts about LLM providers that the gateway and the agent must agree on,
 as static tables and the lookups over them. No I/O, no dependencies.
@@ -16,7 +16,7 @@ scheme from being right in one and wrong in the other.
 
 ```toml
 [dependencies]
-providers = { package = "beyond-ai-providers", path = "crates/providers" }
+providers = { package = "beyond-providers", path = "crates/providers" }
 ```
 
 ## Providers

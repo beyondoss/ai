@@ -4,8 +4,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use base64::Engine as _;
-use beyond_ai_agent::exec_endpoint::jobs::JobStatus;
-use beyond_ai_agent::exec_endpoint::jobs_native::{
+use beyond_agent::exec_endpoint::jobs::JobStatus;
+use beyond_agent::exec_endpoint::jobs_native::{
     Event, JobFrame, decode_job_frame, parse_list, parse_read, parse_survivors,
 };
 use serde_json::Value;

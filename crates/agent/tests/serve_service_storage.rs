@@ -9,7 +9,7 @@
 
 use crate::common;
 
-use beyond_ai_agent::memory::{MemPath, MemoryBackend, View};
+use beyond_agent::memory::{MemPath, MemoryBackend, View};
 use common::service::{Service, files_under};
 use common::{
     TestWs, spawn_model_server, turn_text, turn_tool_use, ws_connect_with_headers,
@@ -113,7 +113,7 @@ async fn nothing_a_tenant_wrote_is_readable_on_the_mount_without_its_key() {
     assert!(transcript.contains(REPLY_MARKER), "{transcript}");
 
     let View::Document(text) =
-        beyond_ai_agent::memory::file::FileBackend::session_at(store.memory_dir())
+        beyond_agent::memory::file::FileBackend::session_at(store.memory_dir())
             .sealed(svc.codec("00tenant1"))
             .view(
                 &MemPath::parse_in("/session/scratch.md", "/session").unwrap(),

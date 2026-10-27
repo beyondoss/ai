@@ -5,7 +5,7 @@
 //! is the body.
 #![no_main]
 
-use beyond_ai::__test::peek::{self, ModelScanner};
+use beyond_gateway::__test::peek::{self, ModelScanner};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

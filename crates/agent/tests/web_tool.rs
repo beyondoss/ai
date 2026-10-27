@@ -21,7 +21,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_beyond-ai-agent");
 /// HTTP response including status line and headers). Records each raw request for assertions. Returns
 /// `(base_url, requests)`; the thread lives for the test process.
 fn web_fixture(raw_response: String) -> (String, Arc<Mutex<Vec<String>>>) {
-    let listener = beyond_ai_test_support::ports::listener();
+    let listener = beyond_test_support::ports::listener();
     let addr = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorder = requests.clone();

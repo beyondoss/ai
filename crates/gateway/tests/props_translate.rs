@@ -14,9 +14,9 @@
 
 mod props_support;
 
-use beyond_ai::__test::route::Endpoint;
-use beyond_ai::__test::translate;
-use beyond_ai::__test::usage;
+use beyond_gateway::__test::route::Endpoint;
+use beyond_gateway::__test::translate;
+use beyond_gateway::__test::usage;
 use props_support::requests::{
     Carried, MODELS, chat_request, check_carried, messages_request, responses_request,
 };

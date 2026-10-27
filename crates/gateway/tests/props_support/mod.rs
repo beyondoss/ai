@@ -8,7 +8,7 @@
 //! alias; default 2000), and stops drawing new ones after `PROPS_SECS` seconds (default 60), so a
 //! run stays bounded on a loaded machine and under nextest's `ci` terminate-after (180 s). The
 //! weekly deep job (`.github/workflows/deep.yml`: `PROPTEST_CASES=100000 PROPS_SECS=5400 cargo
-//! nextest run -p beyond-ai --profile deep -E 'test(/prop/)'`) raises the box and the profile's
+//! nextest run -p beyond-gateway --profile deep -E 'test(/prop/)'`) raises the box and the profile's
 //! timeouts so every property runs all of its cases. Every property's name starts with `prop_`. A failure prints its
 //! `PROPS_SEED`; set it to replay the same cases.
 
@@ -310,8 +310,11 @@ pub struct Billed {
     pub output: u64,
 }
 
-pub fn normalize(u: &beyond_ai::__test::usage::Usage) -> Billed {
-    let anthropic = matches!(u.wire, Some(beyond_ai::__test::route::Dialect::Anthropic));
+pub fn normalize(u: &beyond_gateway::__test::usage::Usage) -> Billed {
+    let anthropic = matches!(
+        u.wire,
+        Some(beyond_gateway::__test::route::Dialect::Anthropic)
+    );
     let prompt = if anthropic {
         u.input_tokens
             .saturating_add(u.cache_read_tokens)
@@ -757,7 +760,7 @@ pub fn edit_plan() -> impl Strategy<Value = EditPlan> {
 /// opaque edits between the clamp and the rename: those re-scan whatever they change, and
 /// `rewrite`'s own tests hold that re-scan to a fresh one.
 pub fn upstream(bytes: Vec<u8>, plan: &EditPlan) -> Vec<u8> {
-    let mut body = beyond_ai::__test::ScannedBody::new(bytes).clamp_output_limits(plan.cap);
+    let mut body = beyond_gateway::__test::ScannedBody::new(bytes).clamp_output_limits(plan.cap);
     if plan.rename {
         body = body.rename_max_tokens();
     }

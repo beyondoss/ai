@@ -4,7 +4,7 @@ the official Python MCP SDK (`mcp` 2.3.0), whose deliveries are signed by the of
 `standardwebhooks` library.
 
     python3 -m venv venv && venv/bin/pip install mcp-webhook-events==0.2.0 uvicorn websockets
-    cargo build -p beyond-ai-agent
+    cargo build -p beyond-agent
     AGENT_BIN=target/debug/beyond-ai-agent venv/bin/python crates/agent/eval/mcp_events_interop/check.py [http|stdio]
 
 Asserts: discovery, subscribe (incl. the package's verification challenge), a delivery reaching

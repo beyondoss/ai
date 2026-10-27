@@ -22,11 +22,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use beyond_ai_agent::exec_endpoint::jobs::{
+use beyond_agent::exec_endpoint::jobs::{
     JobId, JobNotify, JobScope, JobSpec, JobStatus, SandboxJobs, ShellJobs,
 };
-use beyond_ai_agent::exec_endpoint::{HttpExecRunner, TemplateRunner};
-use beyond_ai_agent::tools::exec::{CommandRunner, ExecResult, RealRunner};
+use beyond_agent::exec_endpoint::{HttpExecRunner, TemplateRunner};
+use beyond_agent::tools::exec::{CommandRunner, ExecResult, RealRunner};
 use common::exec_mock::{Answer, CallbackReceiver, ExecMock, MockOptions, exec_notify};
 
 /// Runs every command with `PATH` set to one directory, through `env`.
@@ -591,7 +591,7 @@ async fn a_notifier_that_dies_is_started_again() {
 /// rung's shell (dash here, busybox's `sh`, and the live target's).
 #[tokio::test]
 async fn a_job_kept_with_notify_outlives_its_hold() {
-    use beyond_ai_agent::exec_endpoint::jobs::JobEvent;
+    use beyond_agent::exec_endpoint::jobs::JobEvent;
     for rung in rungs() {
         let name = rung.name;
         let jobs = rung.jobs();

@@ -15,7 +15,7 @@
 //! `ImageSource::base64`, …), which take `impl Into<_>` and so compile unchanged before (`String`)
 //! and after (`Arc<str>`); the before/after delta is captured by re-running across the change.
 //!
-//! Run with `cargo bench -p beyond-ai-agent-core --bench session_push`.
+//! Run with `cargo bench -p beyond-agent-core --bench session_push`.
 //!
 //! Two groups:
 //! - `push_shared` — the real hot path: rebuild the realistic history, take `let _req =

@@ -53,7 +53,7 @@ fn stub_answer(status: u16) -> Vec<u8> {
 
 impl Stub {
     async fn start() -> Self {
-        let listener = beyond_ai_test_support::ports::tokio_listener().await;
+        let listener = beyond_test_support::ports::tokio_listener().await;
         let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
         let stub = Self {
             addr: Some(Addr::local(port)),

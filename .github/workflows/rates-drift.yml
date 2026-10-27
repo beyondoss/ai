@@ -65,7 +65,7 @@ jobs:
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
         run: |
           set +e
-          cargo run -q -p beyond-ai-rates-sync -- classify --apply >"$RUNNER_TEMP/classify.json" </dev/null
+          cargo run -q -p beyond-rates-sync -- classify --apply >"$RUNNER_TEMP/classify.json" </dev/null
           code=$?
           set -e
           case $code in
@@ -84,9 +84,9 @@ jobs:
         # vectors whose rates moved are recomputed by the independent reference pricer, never by
         # the crate under test, so a routine change (a promotion starting or ending) passes CI.
         run: |
-          cargo run -q -p beyond-ai-rates-sync -- rate-version </dev/null
+          cargo run -q -p beyond-rates-sync -- rate-version </dev/null
           mkdir -p target
-          cargo run -q -p beyond-ai-rates-sync -- dump --json >target/rate-table.json </dev/null
+          cargo run -q -p beyond-rates-sync -- dump --json >target/rate-table.json </dev/null
           python3 -I verify/pricing_reference.py target/rate-table.json verify/pricing_vectors.json --write
       - name: Open or update the rates PR
         if: steps.classify.outputs.class == 'routine' || steps.classify.outputs.class == 'review'

@@ -14,7 +14,7 @@
 //! very cost under test.
 //!
 //! Custom harness: this is a scaling table (median of a few runs per row), not a microbench.
-//! Run: `cargo bench -p beyond-ai-agent --bench worktree_seed`.
+//! Run: `cargo bench -p beyond-agent --bench worktree_seed`.
 
 use std::path::Path;
 use std::process::Command;
@@ -23,9 +23,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use beyond_ai_agent::tools::exec::{CommandRunner, ExecResult, RealRunner};
-use beyond_ai_agent::tools::fs::shell::ShellFs;
-use beyond_ai_agent::worktree::{Git, Worktree, preflight};
+use beyond_agent::tools::exec::{CommandRunner, ExecResult, RealRunner};
+use beyond_agent::tools::fs::shell::ShellFs;
+use beyond_agent::worktree::{Git, Worktree, preflight};
 
 const RUNS: usize = 3;
 const FILES_PER_DIR: usize = 10;

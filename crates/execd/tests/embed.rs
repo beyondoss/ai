@@ -8,8 +8,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use beyond_ai_agent::exec_endpoint::conformance::{Expectations, Verdict, verify};
-use beyond_ai_test_support::ports;
+use beyond_agent::exec_endpoint::conformance::{Expectations, Verdict, verify};
+use beyond_test_support::ports;
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
 use hyper_util::rt::{TokioExecutor, TokioIo};

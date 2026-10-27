@@ -18,7 +18,7 @@ const FIXTURE: &str = env!("CARGO_BIN_EXE_mcp_fixture_stdio_server");
 
 /// A TCP endpoint that accepts connections and never writes a byte.
 fn silent_http() -> String {
-    let listener = beyond_ai_test_support::ports::listener();
+    let listener = beyond_test_support::ports::listener();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
         let mut held = Vec::new();

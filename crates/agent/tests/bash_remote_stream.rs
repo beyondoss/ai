@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use agent_core::ToolProgress;
 use agent_core::tool::Tool;
-use beyond_ai_agent::exec_endpoint::HttpExecRunner;
+use beyond_agent::exec_endpoint::HttpExecRunner;
 use common::exec_mock::{ExecMock, MockOptions, Protocol, StreamEnd, wait_group_gone};
 use common::remote_bash::{call, job_number, kill_job, remote_bash};
 use serde_json::json;

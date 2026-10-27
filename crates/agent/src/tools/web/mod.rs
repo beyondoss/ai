@@ -603,7 +603,7 @@ mod tests {
             panic!("injected build panic")
         }
         for build in [errs as fn(_, _) -> _, panics] {
-            let listener = beyond_ai_test_support::ports::listener();
+            let listener = beyond_test_support::ports::listener();
             listener.set_nonblocking(true).unwrap();
             let url = format!(
                 "http://127.0.0.1:{}/",
@@ -625,7 +625,7 @@ mod tests {
     /// A one-shot loopback HTTP/1.1 server that replies with `response` to the first connection, and
     /// records the raw request line + headers it received. Returns `(port, join_handle_for_request)`.
     fn one_shot(response: &'static str) -> (u16, std::thread::JoinHandle<String>) {
-        let listener = beyond_ai_test_support::ports::listener();
+        let listener = beyond_test_support::ports::listener();
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -721,7 +721,7 @@ mod tests {
     /// A loopback server that answers `responses.len()` connections in order, one response each,
     /// and returns every raw request it received (head and body).
     fn serve_seq(responses: Vec<String>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
-        let listener = beyond_ai_test_support::ports::listener();
+        let listener = beyond_test_support::ports::listener();
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
             responses
@@ -875,7 +875,7 @@ mod tests {
     #[tokio::test]
     async fn a_cross_origin_307_or_308_is_refused_and_names_the_new_url() {
         for status in ["307 Temporary Redirect", "308 Permanent Redirect"] {
-            let b = beyond_ai_test_support::ports::listener();
+            let b = beyond_test_support::ports::listener();
             b.set_nonblocking(true).unwrap();
             let b_url = format!(
                 "http://127.0.0.1:{}/landing",

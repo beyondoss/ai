@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use beyond_ai::__test::key::{VirtualKey, mint};
+use beyond_gateway::__test::key::{VirtualKey, mint};
 use bytes::Bytes;
 use common::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -75,7 +75,7 @@ struct RawUpstream {
 
 impl RawUpstream {
     async fn start() -> Self {
-        let listener = beyond_ai_test_support::ports::tokio_listener().await;
+        let listener = beyond_test_support::ports::tokio_listener().await;
         let port = listener.local_addr().unwrap().port();
         let events = Arc::new(Mutex::new(Vec::new()));
         let conns = Arc::new(AtomicUsize::new(0));
@@ -657,7 +657,7 @@ impl RestartableNats {
         let dir = std::env::temp_dir().join(format!("beyond-ai-rel13-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let holder = beyond_ai_test_support::ports::bound_reuseport_socket();
+        let holder = beyond_test_support::ports::bound_reuseport_socket();
         let port = holder.local_addr().unwrap().port();
         RestartableNats {
             child: None,
@@ -724,7 +724,7 @@ impl RestartableNats {
             .expect("spawn nats-server");
         let start = Instant::now();
         let port = loop {
-            if let Some(port) = beyond_ai_test_support::ports::nats_port_from(&ports, child.id()) {
+            if let Some(port) = beyond_test_support::ports::nats_port_from(&ports, child.id()) {
                 break port;
             }
             if let Ok(Some(status)) = child.try_wait() {
@@ -1541,7 +1541,7 @@ async fn counting_h2_upstream(
     use hyper::service::service_fn;
     use hyper_util::rt::{TokioExecutor, TokioIo};
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let listener = beyond_ai_test_support::ports::tokio_listener().await;
+    let listener = beyond_test_support::ports::tokio_listener().await;
     let port = listener.local_addr().unwrap().port();
     let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.key_pair.serialize_der().into());
@@ -1725,7 +1725,7 @@ async fn goaway_upstream() -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()
     use hyper::service::service_fn;
     use hyper_util::rt::{TokioExecutor, TokioIo};
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let listener = beyond_ai_test_support::ports::tokio_listener().await;
+    let listener = beyond_test_support::ports::tokio_listener().await;
     let port = listener.local_addr().unwrap().port();
     let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.key_pair.serialize_der().into());
@@ -1824,7 +1824,7 @@ async fn refusing_h2_upstream(
     tokio::task::JoinHandle<()>,
 ) {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let listener = beyond_ai_test_support::ports::tokio_listener().await;
+    let listener = beyond_test_support::ports::tokio_listener().await;
     let port = listener.local_addr().unwrap().port();
     let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.key_pair.serialize_der().into());

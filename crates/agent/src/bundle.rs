@@ -635,7 +635,7 @@ impl FsBackend for BundleFs {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use beyond_ai_test_support::bundle::{BundleServer, Entry, Gauge, dir, file, sha256_hex, tar};
+    use beyond_test_support::bundle::{BundleServer, Entry, Gauge, dir, file, sha256_hex, tar};
 
     use super::*;
 

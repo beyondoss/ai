@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agent_core::{ContentBlock, Message};
-use beyond_ai_agent::session_store::{
+use beyond_agent::session_store::{
     Layout, RepoOptions, SessionMeta, SessionRepo, SessionStore, is_superseded,
 };
 use tempfile::TempDir;
@@ -99,7 +99,7 @@ fn a_takeover_seals_the_old_epoch_and_a_stale_writers_later_bytes_never_replay()
         .append_new(&[Message::user("one"), Message::user("stale")])
         .expect_err("a fenced owner must not report a successful write");
     assert!(
-        beyond_ai_agent::session_store::is_superseded(&refused),
+        beyond_agent::session_store::is_superseded(&refused),
         "and it must be the takeover signal, not an I/O error: {refused:?}"
     );
     assert!(old.superseded(), "poisoned: every later write fails too");

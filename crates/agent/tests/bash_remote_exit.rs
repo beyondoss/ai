@@ -14,7 +14,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use beyond_ai_agent::exec_endpoint::HttpExecRunner;
+use beyond_agent::exec_endpoint::HttpExecRunner;
 use common::exec_mock::{ExecMock, MockOptions, StreamEnd, wait_group_gone};
 use common::remote_bash::{call, job_number, remote_bash};
 use common::{SpawnGuarded, run_cmd, spawn_model_server, turn_tool_use};
@@ -40,8 +40,8 @@ async fn the_exit_path_reaches_a_parked_remote_job() {
 
     // Exactly what `main.rs`'s `finish_process_cleanup` does before `process::exit`.
     tokio::task::spawn_blocking(|| {
-        beyond_ai_agent::tools::bash::kill_live_jobs();
-        beyond_ai_agent::tools::exec::wait_for_pending_group_kills(Duration::from_secs(5));
+        beyond_agent::tools::bash::kill_live_jobs();
+        beyond_agent::tools::exec::wait_for_pending_group_kills(Duration::from_secs(5));
     })
     .await
     .unwrap();

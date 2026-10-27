@@ -49,7 +49,7 @@ pub(crate) fn settings(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
     else {
         unreachable!("dispatched on Command::Settings")
     };
-    let mut store = beyond_ai_agent::settings::SettingsStore::open_default();
+    let mut store = beyond_agent::settings::SettingsStore::open_default();
     let any_write = model.is_some()
         || clear_model
         || gateway_url.is_some()
@@ -181,7 +181,7 @@ pub(crate) fn settings(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Every field of the global store, plus where a project tier or `models.json` changes what `run`/`serve` will use.
-fn print_settings(store: &beyond_ai_agent::settings::SettingsStore, any_write: bool) {
+fn print_settings(store: &beyond_agent::settings::SettingsStore, any_write: bool) {
     if any_write {
         println!("updated settings:");
     }
@@ -201,9 +201,9 @@ fn print_settings(store: &beyond_ai_agent::settings::SettingsStore, any_write: b
     println!(
         "default_project_trust: {}",
         match s.default_project_trust {
-            Some(beyond_ai_agent::settings::TrustPolicy::Always) => "always",
-            Some(beyond_ai_agent::settings::TrustPolicy::Never) => "never",
-            Some(beyond_ai_agent::settings::TrustPolicy::Ask) => "ask",
+            Some(beyond_agent::settings::TrustPolicy::Always) => "always",
+            Some(beyond_agent::settings::TrustPolicy::Never) => "never",
+            Some(beyond_agent::settings::TrustPolicy::Ask) => "ask",
             None => "(not set)",
         }
     );
@@ -317,7 +317,7 @@ fn print_settings(store: &beyond_ai_agent::settings::SettingsStore, any_write: b
     // The values above are the global store alone; `run`/`serve` also merge a trusted
     // project's settings files over it, so say where that changes what they will use.
     if let Ok(cwd) = std::env::current_dir() {
-        for note in beyond_ai_agent::settings::project_override_notes(&cwd) {
+        for note in beyond_agent::settings::project_override_notes(&cwd) {
             println!("{note}");
         }
     }
@@ -326,8 +326,8 @@ fn print_settings(store: &beyond_ai_agent::settings::SettingsStore, any_write: b
     // an operator debugging "why is this model still hitting the gateway" can confirm the file
     // is actually being read, and how many overrides it currently holds, without a dedicated
     // dump-the-whole-file command.
-    let overrides = beyond_ai_agent::settings::ModelOverrides::open_default();
-    let overrides_path = beyond_ai_agent::settings::model_overrides_path();
+    let overrides = beyond_agent::settings::ModelOverrides::open_default();
+    let overrides_path = beyond_agent::settings::model_overrides_path();
     if overrides.is_empty() {
         println!(
             "model_overrides: {} (not present or empty)",

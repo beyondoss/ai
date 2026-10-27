@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_core::Message;
-use beyond_ai_agent::memory::file::FileBackend;
-use beyond_ai_agent::memory::{MemPath, MemoryBackend, View};
-use beyond_ai_agent::session_store::{
+use beyond_agent::memory::file::FileBackend;
+use beyond_agent::memory::{MemPath, MemoryBackend, View};
+use beyond_agent::session_store::{
     Layout, RepoOptions, SessionMeta, SessionRepo, SessionStore, TenantCodec,
 };
 use tempfile::TempDir;

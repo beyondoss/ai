@@ -45,7 +45,7 @@ execd_bin() { # builds it once per run; prints the path
   # because a static-pie musl binary segfaults at startup here.
   (cd "$ROOT" && RUSTFLAGS="-C relocation-model=static" CC_x86_64_unknown_linux_musl=musl-gcc \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
-    cargo build -q --release --locked --target x86_64-unknown-linux-musl -p beyond-ai-execd \
+    cargo build -q --release --locked --target x86_64-unknown-linux-musl -p beyond-execd \
     --target-dir "$dir/e2b-execd") >&2 || return 1
   echo "$bin"
 }

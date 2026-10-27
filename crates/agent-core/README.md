@@ -1,10 +1,10 @@
-# beyond-ai-agent-core
+# beyond-agent-core
 
 The agent loop as a library. Give it a message history, a model transport and a
 set of tools; it runs model turns and tool calls until the model stops, and
 emits an event for every streamed token, tool boundary and turn boundary.
 
-It is the layer under [`beyond-ai-agent`](../agent/README.md), which adds the
+It is the layer under [`beyond-agent`](../agent/README.md), which adds the
 concrete tools, the CLI and the `serve` protocol. Use this crate to build a
 different agent on the same loop. It has no HTTP server and no provider SDK,
 and ships no tools.

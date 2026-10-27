@@ -204,7 +204,7 @@ def run():
                 AGENT_CONFORMANCE_FRONT_TENANT_CAP="3",
             )
             out = subprocess.run(
-                ["cargo", "test", "-p", "beyond-ai-agent", "--test", "exec_front_conformance",
+                ["cargo", "test", "-p", "beyond-agent", "--test", "exec_front_conformance",
                  "the_configured_front_conforms", "--", "--nocapture"],
                 cwd=ROOT, env=env, capture_output=True, text=True).stdout
         finally:

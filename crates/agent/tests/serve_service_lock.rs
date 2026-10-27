@@ -14,7 +14,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use agent_core::Message;
-use beyond_ai_agent::session_store::SessionMeta;
+use beyond_agent::session_store::SessionMeta;
 use common::service::{Options, Service};
 use common::{
     TestWs, spawn_model_server, turn_text, ws_connect_with_headers, ws_read_until_response,

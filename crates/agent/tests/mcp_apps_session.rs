@@ -381,7 +381,7 @@ async fn view_html_is_cached_per_connection_until_the_server_says_resources_chan
         sessions.path(),
         "0",
         &[],
-        &[("RUST_LOG", "beyond_ai_agent::tools::mcp=debug")],
+        &[("RUST_LOG", "beyond_agent::tools::mcp=debug")],
         Some(&log),
     )
     .await;

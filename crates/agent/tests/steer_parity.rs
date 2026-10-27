@@ -14,7 +14,7 @@ use std::path::Path;
 use std::process::Stdio;
 
 use agent_core::{ContentBlock, Message, Session};
-use beyond_ai_agent::session_store::{SessionMeta, SessionRepo};
+use beyond_agent::session_store::{SessionMeta, SessionRepo};
 use common::{
     SpawnGuarded, read_until_response, run_cmd, serve_cmd, spawn_model_server, sse, turn_text,
 };

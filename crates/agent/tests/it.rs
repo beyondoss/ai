@@ -4,7 +4,7 @@
 //! the whole dependency graph (~3.9 GB of test artifacts, most of CI's build time), one binary links
 //! it once (~100 MB). The one-file-per-domain layout is unchanged; only how they are compiled moved.
 //!
-//! - Run one file's tests: `cargo nextest run -p beyond-ai-agent -E 'test(/^serve_approval::/)'`.
+//! - Run one file's tests: `cargo nextest run -p beyond-agent -E 'test(/^serve_approval::/)'`.
 //!   Under plain `cargo test` every file now shares one process, so use nextest (a process per
 //!   test, which is also what CI does).
 //! - A new `tests/<domain>.rs` must be declared below. `every_test_file_is_declared` fails if it

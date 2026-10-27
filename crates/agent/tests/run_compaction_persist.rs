@@ -6,7 +6,7 @@ use crate::common;
 use std::process::Stdio;
 
 use agent_core::{ContentBlock, Message, Role, Session};
-use beyond_ai_agent::session_store::{SessionMeta, SessionRepo, SessionStore};
+use beyond_agent::session_store::{SessionMeta, SessionRepo, SessionStore};
 use common::{run_cmd, spawn_model_server, turn_text};
 
 /// A session file holding six ~200-token exchanges, comfortably past a 200-token trigger.

@@ -7,8 +7,8 @@
 
 use std::time::{Duration, Instant};
 
-use beyond_ai_test_support::exec_mock::ExecMock;
-use beyond_ai_test_support::{
+use beyond_test_support::exec_mock::ExecMock;
+use beyond_test_support::{
     spawn_model_server, spawn_model_server_routed_unrecorded, stall_prompt, turn_text,
     turn_tool_use,
 };
@@ -356,7 +356,7 @@ impl Fleet {
                 let exec_at = format!("{}:{}", spec_bind.host, spec_bind.port + 1);
                 let exec =
                     ExecMock::start_on(&exec_at, sandbox.path(), Some(&sandbox_home), true).await;
-                let url = beyond_ai_test_support::spawn_model_server_routed_unrecorded_on(
+                let url = beyond_test_support::spawn_model_server_routed_unrecorded_on(
                     &model_at,
                     Vec::new(),
                     turn_text("ok"),
@@ -825,7 +825,7 @@ fn agent_binary() -> Result<String, String> {
     let agent = path.join("beyond-ai-agent");
     if !agent.exists() {
         return Err(format!(
-            "{} not found — build it first: cargo build -p beyond-ai-agent",
+            "{} not found — build it first: cargo build -p beyond-agent",
             agent.display()
         ));
     }
@@ -2193,14 +2193,14 @@ async fn sandbox_job_fleet(
         ));
     }
     let (gateway_url, bodies) =
-        beyond_ai_test_support::spawn_model_server_routed(sandbox_job_routes(), turn_text("ok"));
+        beyond_test_support::spawn_model_server_routed(sandbox_job_routes(), turn_text("ok"));
     let fleet = Fleet::start_against(kind, 2, 1, history_path, None, false, gateway_url).await?;
     let mut sandboxes = Vec::new();
     for (name, jobs) in [("native (v1.3)", true), ("baseline (v1.2)", false)] {
         let dir = tempfile::tempdir().map_err(|e| format!("sandbox: {e}"))?;
         let mock = ExecMock::start_with(
             dir.path(),
-            beyond_ai_test_support::exec_mock::MockOptions {
+            beyond_test_support::exec_mock::MockOptions {
                 jobs,
                 ..Default::default()
             },

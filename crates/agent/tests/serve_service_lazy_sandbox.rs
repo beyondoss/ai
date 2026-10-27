@@ -63,7 +63,7 @@ fn turn_tool_uses(calls: &[(&str, &str, Value)]) -> String {
     }
     events.push(json!({ "type": "message_delta", "delta": { "stop_reason": "tool_use" }, "usage": { "output_tokens": 8 } }));
     events.push(json!({ "type": "message_stop" }));
-    beyond_ai_test_support::sse(&events)
+    beyond_test_support::sse(&events)
 }
 
 /// The first life of `s1.alpha`: a workspace with a skill and an `AGENTS.md`, one prompt whose

@@ -86,7 +86,7 @@ fn tool_result(bodies: &[String], call_id: &str) -> Value {
 
 /// A text turn that ends with `stop_reason`, as the provider sends it.
 fn turn_ending(text: &str, stop_reason: &str) -> String {
-    beyond_ai_test_support::sse(&[
+    beyond_test_support::sse(&[
         json!({ "type": "message_start", "message": { "usage": { "input_tokens": 12, "output_tokens": 1 } } }),
         json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
         json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": text } }),

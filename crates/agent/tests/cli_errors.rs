@@ -60,7 +60,7 @@ fn an_unusable_session_dir_names_the_path() {
 #[test]
 fn a_transport_failure_prints_as_plain_text() {
     let port = {
-        let l = beyond_ai_test_support::ports::listener();
+        let l = beyond_test_support::ports::listener();
         l.local_addr().unwrap().port()
     };
     let gateway = format!("http://127.0.0.1:{port}");

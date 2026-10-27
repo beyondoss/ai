@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use agent_core::{ContentBlock, Message, Session};
-use beyond_ai_agent::session_store::{SessionMeta, SessionRepo};
+use beyond_agent::session_store::{SessionMeta, SessionRepo};
 use common::{
     ChildGuard, ISOLATED_HOME, spawn_listening, spawn_model_server,
     spawn_model_server_with_stalled_response, turn_text, ws_connect, ws_next_frame,

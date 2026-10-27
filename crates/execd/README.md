@@ -1,4 +1,4 @@
-# beyond-ai-execd
+# beyond-execd
 
 **Give the agent its full toolset in any sandbox.** `execd` is one static binary that speaks the whole of the agent's exec
 protocol, v1.1 through v1.4. Put it in the image and the agent works in your sandbox as it does on your laptop: same tools,
@@ -60,7 +60,7 @@ EXECD_LISTEN=0.0.0.0:8080 EXECD_BEARER_FILE=/run/execd-bearer EXECD_RUN_AS=sandb
 ```
 
 The tarballs, checksums and the other ways to install are in [`deploy/execd`](../../deploy/execd/README.md). To build from
-source (the crate is `beyond-ai-execd`, the binary `execd`): `cargo install --path crates/execd`.
+source (the crate is `beyond-execd`, the binary `execd`): `cargo install --path crates/execd`.
 
 **Security, in three lines.** Run execd as root with `EXECD_RUN_AS`. Give it a bearer file. Put TLS in front of it, or use the
 provider's (E2B does).

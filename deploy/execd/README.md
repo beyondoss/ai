@@ -67,7 +67,7 @@ curl -s -X POST -H "authorization: Bearer $(cat /path/to/token)" \
 
 ```sh
 RUSTFLAGS="-C relocation-model=static" \
-  cargo build --release --locked -p beyond-ai-execd --target x86_64-unknown-linux-musl
+  cargo build --release --locked -p beyond-execd --target x86_64-unknown-linux-musl
 deploy/execd/test-install.sh target/x86_64-unknown-linux-musl/release/execd
 ```
 

@@ -4,7 +4,7 @@
 //!
 //! ```sh
 //! AGENT_CONFORMANCE_BUNDLE_HOOK=/path/to/operator-hook \
-//!   cargo nextest run -p beyond-ai-agent -E 'test(/^bundle_conformance::/)' --no-capture
+//!   cargo nextest run -p beyond-agent -E 'test(/^bundle_conformance::/)' --no-capture
 //! ```
 //!
 //! The module doc of `conformance::bundle` lists the variables and the hook's ops. A full run waits
@@ -18,9 +18,9 @@ use crate::common;
 
 use std::time::Duration;
 
-use beyond_ai_agent::conformance::bundle::{self, BundleTarget, verify};
-use beyond_ai_agent::conformance::{CommandHook, Report};
-use beyond_ai_agent::exec_endpoint::conformance::Verdict;
+use beyond_agent::conformance::bundle::{self, BundleTarget, verify};
+use beyond_agent::conformance::{CommandHook, Report};
+use beyond_agent::exec_endpoint::conformance::Verdict;
 use common::bundle_mock::{BundleMock, Fault};
 
 fn target() -> BundleTarget {

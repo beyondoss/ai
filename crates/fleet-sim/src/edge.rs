@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use beyond_ai_test_support::grant::{Claims, Minter, Secrets};
+use beyond_test_support::grant::{Claims, Minter, Secrets};
 
 /// How long a grant this edge mints is good for. Long enough that no scenario trips over expiry, and
 /// finite so a grant is never mistaken for a credential.

@@ -6,8 +6,8 @@
 
 use std::time::{Duration, Instant};
 
-use beyond_ai_agent::settings::{McpServerConfig, McpTransport};
-use beyond_ai_agent::tools::mcp;
+use beyond_agent::settings::{McpServerConfig, McpTransport};
+use beyond_agent::tools::mcp;
 use serde_json::json;
 
 const FIXTURE: &str = env!("CARGO_BIN_EXE_mcp_fixture_stdio_server");

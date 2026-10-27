@@ -356,66 +356,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
-name = "beyond-ai"
-version = "0.1.0"
-dependencies = [
- "ahash",
- "arc-swap",
- "arrayvec",
- "async-trait",
- "base64 0.22.1",
- "beyond-ai",
- "beyond-ai-providers",
- "beyond-ai-test-support",
- "beyond-slipstream",
- "bytes",
- "clap",
- "criterion",
- "divan",
- "ed25519-dalek",
- "figment",
- "getrandom 0.3.4",
- "h2",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "loom",
- "memchr",
- "pingora",
- "pingora-cache",
- "pingora-core",
- "pingora-limits",
- "pingora-proxy",
- "prometheus",
- "proptest",
- "rcgen",
- "reqwest",
- "ring",
- "rustc-hash",
- "rustls",
- "serde",
- "serde_json",
- "stats_alloc",
- "thiserror 2.0.18",
- "tikv-jemallocator",
- "tokio",
- "tokio-rustls",
- "tracing",
- "tracing-subscriber",
- "zeroize",
-]
-
-[[package]]
-name = "beyond-ai-agent"
+name = "beyond-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
- "beyond-ai-agent-core",
- "beyond-ai-exec-notify",
- "beyond-ai-providers",
- "beyond-ai-test-support",
+ "beyond-agent-core",
+ "beyond-exec-notify",
+ "beyond-providers",
+ "beyond-test-support",
  "bytes",
  "chacha20poly1305",
  "divan",
@@ -476,13 +425,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "beyond-ai-agent-core"
+name = "beyond-agent-core"
 version = "0.1.0"
 dependencies = [
  "async-stream",
  "async-trait",
- "beyond-ai-providers",
- "beyond-ai-test-support",
+ "beyond-providers",
+ "beyond-test-support",
  "bytes",
  "divan",
  "futures",
@@ -504,13 +453,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "beyond-ai-demo"
+name = "beyond-demo"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
- "beyond-ai",
- "beyond-ai-agent",
- "beyond-ai-test-support",
+ "beyond-agent",
+ "beyond-gateway",
+ "beyond-test-support",
  "chacha20poly1305",
  "clap",
  "ed25519-dalek",
@@ -527,20 +476,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "beyond-ai-exec-notify"
+name = "beyond-exec-notify"
 version = "0.1.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
-name = "beyond-ai-execd"
+name = "beyond-execd"
 version = "0.1.14"
 dependencies = [
  "base64 0.22.1",
- "beyond-ai-agent",
- "beyond-ai-exec-notify",
- "beyond-ai-test-support",
+ "beyond-agent",
+ "beyond-exec-notify",
+ "beyond-test-support",
  "bytes",
  "getrandom 0.3.4",
  "http-body-util",
@@ -560,10 +509,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "beyond-ai-fleet-sim"
+name = "beyond-fleet-sim"
 version = "0.1.0"
 dependencies = [
- "beyond-ai-test-support",
+ "beyond-test-support",
  "futures",
  "serde_json",
  "tempfile",
@@ -572,65 +521,73 @@ dependencies = [
 ]
 
 [[package]]
-name = "beyond-ai-providers"
+name = "beyond-gateway"
 version = "0.1.0"
 dependencies = [
- "serde_json",
- "toml",
-]
-
-[[package]]
-name = "beyond-ai-rates-sync"
-version = "0.1.0"
-dependencies = [
- "beyond-ai-providers",
- "reqwest",
- "serde_json",
- "sha2",
- "toml",
-]
-
-[[package]]
-name = "beyond-ai-test-support"
-version = "0.1.0"
-dependencies = [
+ "ahash",
+ "arc-swap",
+ "arrayvec",
+ "async-trait",
  "base64 0.22.1",
- "beyond-ai-exec-notify",
- "beyond-ai-execd",
- "chacha20poly1305",
+ "beyond-gateway",
+ "beyond-providers",
+ "beyond-slipstream",
+ "beyond-test-support",
+ "bytes",
+ "clap",
+ "criterion",
+ "divan",
  "ed25519-dalek",
+ "figment",
  "getrandom 0.3.4",
- "hkdf",
- "reqwest",
- "rustls",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "x25519-dalek",
-]
-
-[[package]]
-name = "beyond-ai-verify"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "beyond-ai",
- "beyond-ai-providers",
- "beyond-ai-test-support",
- "ed25519-dalek",
- "httparse",
- "libtest-mimic",
+ "h2",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "loom",
+ "memchr",
+ "pingora",
+ "pingora-cache",
+ "pingora-core",
+ "pingora-limits",
+ "pingora-proxy",
+ "prometheus",
+ "proptest",
  "rcgen",
  "reqwest",
+ "ring",
+ "rustc-hash",
  "rustls",
  "serde",
  "serde_json",
- "socket2",
+ "stats_alloc",
+ "thiserror 2.0.18",
+ "tikv-jemallocator",
  "tokio",
  "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
+name = "beyond-providers"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
  "toml",
- "webpki-roots 1.0.11",
+]
+
+[[package]]
+name = "beyond-rates-sync"
+version = "0.1.0"
+dependencies = [
+ "beyond-providers",
+ "reqwest",
+ "serde_json",
+ "sha2",
+ "toml",
 ]
 
 [[package]]
@@ -653,6 +610,49 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "beyond-test-support"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "beyond-exec-notify",
+ "beyond-execd",
+ "chacha20poly1305",
+ "ed25519-dalek",
+ "getrandom 0.3.4",
+ "hkdf",
+ "reqwest",
+ "rustls",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "beyond-verify"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "beyond-gateway",
+ "beyond-providers",
+ "beyond-test-support",
+ "ed25519-dalek",
+ "httparse",
+ "libtest-mimic",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "socket2",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]

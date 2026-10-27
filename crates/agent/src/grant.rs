@@ -1082,7 +1082,7 @@ mod tests {
         }
     }
 
-    /// `UPDATE_FIXTURES=1 cargo test -p beyond-ai-agent grant::` rewrites the file (then run
+    /// `UPDATE_FIXTURES=1 cargo test -p beyond-agent grant::` rewrites the file (then run
     /// `dprint fmt`). Only for a deliberate change to the vectors: the control plane's minter has to
     /// match whatever this writes.
     #[test]

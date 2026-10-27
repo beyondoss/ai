@@ -1,12 +1,12 @@
-//! The `bjn_v1` notify token as the crate makes and checks it (`beyond_ai_agent::notify_token`),
+//! The `bjn_v1` notify token as the crate makes and checks it (`beyond_agent::notify_token`),
 //! held to `tests/fixtures/exec/v1.4-token.json` and to the spec's token requirements.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use beyond_ai_agent::exec_endpoint::jobs::{JobId, JobScope};
-use beyond_ai_agent::notify_token::{NotifyKey, Verdict};
+use beyond_agent::exec_endpoint::jobs::{JobId, JobScope};
+use beyond_agent::notify_token::{NotifyKey, Verdict};
 use serde_json::Value;
 
 const FIXTURE: &str = include_str!("fixtures/exec/v1.4-token.json");

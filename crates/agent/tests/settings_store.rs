@@ -819,7 +819,7 @@ fn run_binary_stored_default_compaction_tokens_force_compaction_with_no_explicit
     // on a resumed session crossing the soft threshold — but via a persisted `agent settings` default
     // instead of an explicit flag.
     use agent_core::{ContentBlock, Message, Session};
-    use beyond_ai_agent::session_store::{SessionMeta, SessionRepo};
+    use beyond_agent::session_store::{SessionMeta, SessionRepo};
 
     let home = tempfile::tempdir().unwrap();
 

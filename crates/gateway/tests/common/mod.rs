@@ -4,7 +4,7 @@
 //! Requires `nats-server` on PATH — run via `mise run test:integration:rs`.
 //! Signing keys + pool keys are passed via the gateway's *config* (not NATS); NATS carries the
 //! deny-set, allowance-set, and capture-set. Every component binds a port the kernel picks and the
-//! harness reads it back (`beyond_ai_test_support::ports`) — none is picked free, released and
+//! harness reads it back (`beyond_test_support::ports`) — none is picked free, released and
 //! rebound, so no other process can take one in between — and cleans up on drop, so tests run in
 //! parallel.
 
@@ -120,8 +120,8 @@ pub fn unused_nats_port() -> u16 {
 /// cargo-mutants run, another run's mock or gateway — and then the "dead" candidate answered: the
 /// failover tests' "a dead primary must be invisible" and "tried once" assertions failed.
 pub fn closed_port() -> u16 {
-    static HELD: Mutex<Vec<beyond_ai_test_support::ports::DeadPort>> = Mutex::new(Vec::new());
-    let dead = beyond_ai_test_support::ports::DeadPort::bind();
+    static HELD: Mutex<Vec<beyond_test_support::ports::DeadPort>> = Mutex::new(Vec::new());
+    let dead = beyond_test_support::ports::DeadPort::bind();
     let port = dead.port();
     HELD.lock().unwrap_or_else(|p| p.into_inner()).push(dead);
     port
@@ -274,7 +274,7 @@ rm -rf "$3""#;
                 .ok()
                 .and_then(|p| p.trim().parse().ok())
                 .unwrap_or_else(|| nats.child.id());
-            if let Some(port) = beyond_ai_test_support::ports::nats_port_from(&ports, server_pid) {
+            if let Some(port) = beyond_test_support::ports::nats_port_from(&ports, server_pid) {
                 return Nats { server: nats, port };
             }
             if let Ok(Some(status)) = nats.child.try_wait() {
@@ -889,7 +889,7 @@ impl MockUpstream {
     pub async fn start(mode: Mode) -> Self {
         // Bind `:0` and read the port back, keeping the listener open the whole time — no
         // pick-release-rebind window for another test to slip into (this is an in-process server).
-        let listener = beyond_ai_test_support::ports::tokio_listener().await;
+        let listener = beyond_test_support::ports::tokio_listener().await;
         let port = listener.local_addr().unwrap().port();
         let captured: Arc<Mutex<Option<Captured>>> = Arc::new(Mutex::new(None));
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -935,7 +935,7 @@ impl MockUpstream {
         // no default), pick ring to match the gateway. Idempotent across multiple mocks in one process.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let listener = beyond_ai_test_support::ports::tokio_listener().await;
+        let listener = beyond_test_support::ports::tokio_listener().await;
         let port = listener.local_addr().unwrap().port();
 
         let ck = rcgen::generate_simple_self_signed(vec![
@@ -1113,8 +1113,8 @@ pub const DEV_ID_SECRET: [u8; 32] = [7; 32];
 
 /// A signer holding the test gateway's default id signing key, to mint and read the signed ids
 /// a test gateway issues (`signed_id.rs`).
-pub fn dev_id_signer() -> beyond_ai::__test::signed_id::Signer {
-    beyond_ai::__test::signed_id::Signer::new(&[(b'1', &DEV_ID_SECRET)], b'1').unwrap()
+pub fn dev_id_signer() -> beyond_gateway::__test::signed_id::Signer {
+    beyond_gateway::__test::signed_id::Signer::new(&[(b'1', &DEV_ID_SECRET)], b'1').unwrap()
 }
 
 impl GatewayBuilder {
@@ -1280,7 +1280,7 @@ impl GatewayBuilder {
         let nats_port = self.nats_port;
         // Scalars first, `[…]` tables last (TOML ordering).
         let tls = self.real_upstreams || self.tls_upstream;
-        let listeners = beyond_ai_test_support::ports::GATEWAY_LISTENERS;
+        let listeners = beyond_test_support::ports::GATEWAY_LISTENERS;
         let mut cfg = format!(
             "{listeners}\
              nats_url = \"nats://127.0.0.1:{nats_port}\"\n\
@@ -1471,7 +1471,7 @@ impl GatewayBuilder {
         let pid = child.id();
         let deadline = std::time::Instant::now() + STARTUP_BUDGET;
         let ports = loop {
-            if let Some(ports) = beyond_ai_test_support::ports::gateway_ports(pid) {
+            if let Some(ports) = beyond_test_support::ports::gateway_ports(pid) {
                 break ports;
             }
             if let Ok(Some(status)) = child.try_wait() {
@@ -1749,7 +1749,7 @@ impl ScriptedUpstream {
     /// `script(body, n)` decides the reply to the `n`th (0-based) fully received request.
     pub async fn start(script: impl Fn(&[u8], usize) -> Vec<Step> + Send + Sync + 'static) -> Self {
         let script: Script = Arc::new(script);
-        let listener = beyond_ai_test_support::ports::tokio_listener().await;
+        let listener = beyond_test_support::ports::tokio_listener().await;
         let port = listener.local_addr().unwrap().port();
         let bodies: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&bodies);
@@ -1908,8 +1908,8 @@ pub async fn wait_usage_rows(gw: &Gateway, n: usize, secs: u64) -> Vec<serde_jso
 
 /// A `bai_` virtual key for `tenant_id` signed with `sk`.
 pub fn billing_vkey(sk: &ed25519_dalek::SigningKey, tenant_id: u64) -> String {
-    beyond_ai::__test::key::mint(
-        &beyond_ai::__test::key::VirtualKey {
+    beyond_gateway::__test::key::mint(
+        &beyond_gateway::__test::key::VirtualKey {
             tenant_id,
             vpc_id: 1,
             key_id: None,
@@ -1983,7 +1983,7 @@ pub fn boot_refuses(extra: &str, limit: Duration) -> Option<String> {
     let path = unique_temp("beyond-ai-bootcheck", "toml");
     let cfg = format!(
         "{}nats_url = \"nats://127.0.0.1:{}\"\nupstream_tls = false\n{extra}\n",
-        beyond_ai_test_support::ports::GATEWAY_LISTENERS,
+        beyond_test_support::ports::GATEWAY_LISTENERS,
         closed_port()
     );
     std::fs::write(&path, cfg).unwrap();
@@ -2127,7 +2127,7 @@ impl ReplyUpstream {
         script: impl Fn(usize, &ScriptReq) -> Reply + Send + Sync + 'static,
     ) -> Self {
         let script: ReplyScript = Arc::new(script);
-        let listener = beyond_ai_test_support::ports::tokio_listener().await;
+        let listener = beyond_test_support::ports::tokio_listener().await;
         let port = listener.local_addr().unwrap().port();
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = hits.clone();

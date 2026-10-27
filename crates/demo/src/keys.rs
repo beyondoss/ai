@@ -1,12 +1,12 @@
 //! Key generation and grant minting for the demo.
 //!
-//! The grant minter is the repo's own (`beyond_ai_test_support::grant::Minter`, pinned to the
+//! The grant minter is the repo's own (`beyond_test_support::grant::Minter`, pinned to the
 //! golden vectors); `tests/grant.rs` proves the agent's verifier accepts what it mints. Secrets are
 //! read from the environment, never argv.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use beyond_ai_test_support::grant::{Claims, Minter, Secrets};
+use beyond_test_support::grant::{Claims, Minter, Secrets};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -41,7 +41,7 @@ fn scratch(tag: &str) -> Res<std::path::PathBuf> {
 /// stores and never calls this again while those parameters exist.
 #[cfg(feature = "gateway-key")]
 pub fn generate() -> Res<serde_json::Value> {
-    use beyond_ai::__test::key::{VirtualKey, mint};
+    use beyond_gateway::__test::key::{VirtualKey, mint};
     use ed25519_dalek::SigningKey;
     use serde_json::json;
 
@@ -172,7 +172,7 @@ pub fn mint_grant(keys: &GrantKeys, a: &MintArgs) -> Res<String> {
         limits: a
             .limits
             .as_ref()
-            .map(|l| beyond_ai_test_support::grant::Limits {
+            .map(|l| beyond_test_support::grant::Limits {
                 models: l.models.clone(),
                 tools: l.tools.clone(),
                 max_steps: l.max_steps,
@@ -181,7 +181,7 @@ pub fn mint_grant(keys: &GrantKeys, a: &MintArgs) -> Res<String> {
         bundle: a
             .bundle
             .as_ref()
-            .map(|b| beyond_ai_test_support::grant::Bundle {
+            .map(|b| beyond_test_support::grant::Bundle {
                 url: b.url.clone(),
                 sha256: b.sha256.clone(),
             }),
@@ -236,7 +236,7 @@ fn managed_token(
     connector: &str,
     exp: u64,
 ) -> Res<String> {
-    use beyond_ai_agent::managed_mcp_token::{Claims, ManagedKey};
+    use beyond_agent::managed_mcp_token::{Claims, ManagedKey};
     let secret = keys
         .managed_secret
         .ok_or("DEMO_MANAGED_SECRET is not set (a managed connector needs it)")?;
@@ -259,8 +259,8 @@ fn managed_token(_: &GrantKeys, _: &str, _: &str, _: &str, _: u64) -> Res<String
 /// Returns `(token, scope)`; the scope is the session's own, as the body of a real callback names it.
 #[cfg(feature = "agent-lib")]
 pub fn notify_token(tenant: &str, session: &str, job: &str, forge: bool) -> Res<(String, String)> {
-    use beyond_ai_agent::exec_endpoint::jobs::{JobId, JobScope};
-    use beyond_ai_agent::notify_token::NotifyKey;
+    use beyond_agent::exec_endpoint::jobs::{JobId, JobScope};
+    use beyond_agent::notify_token::NotifyKey;
 
     let key = NotifyKey::from_secret_bytes(&b32("DEMO_FLEET_SECRET")?);
     let id = JobId::parse(job).ok_or("job id must be lowercase hex")?;
@@ -288,7 +288,7 @@ pub fn mint_managed_token(
     connector: &str,
     ttl_secs: u64,
 ) -> Res<String> {
-    use beyond_ai_agent::managed_mcp_token::{Claims, ManagedKey};
+    use beyond_agent::managed_mcp_token::{Claims, ManagedKey};
 
     let key = ManagedKey::from_secret_bytes(&b32("DEMO_MANAGED_SECRET")?);
     let now = std::time::SystemTime::now()
@@ -308,7 +308,7 @@ pub fn mint_managed_token(
 /// needle is in any of them.
 #[cfg(feature = "agent-lib")]
 pub fn inspect_grant(keys: &GrantKeys, token: &str, needle: &str) -> Res<serde_json::Value> {
-    use beyond_ai_agent::grant::{GrantVerifier, SealKeySource};
+    use beyond_agent::grant::{GrantVerifier, SealKeySource};
     use serde_json::json;
 
     let dir = scratch("inspect")?;

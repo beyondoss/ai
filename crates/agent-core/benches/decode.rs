@@ -5,7 +5,7 @@
 //! per streamed token, thousands of times per turn. Timing **and** allocations come from `divan`; its
 //! `AllocProfiler` (installed as the global allocator below) reports alloc count + bytes per sample
 //! beside ns/iter, so the decode findings' allocation claims are visible in one table, not inferred.
-//! Run with `mise run bench:decode` (or `cargo bench -p beyond-ai-agent-core --bench decode`).
+//! Run with `mise run bench:decode` (or `cargo bench -p beyond-agent-core --bench decode`).
 //!
 //! Three groups, mapping to the two audit findings:
 //! - `framing` — [`LineFramer`] alone: the byte-buffer newline split (finding #1). Two chunking

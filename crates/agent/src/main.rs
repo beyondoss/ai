@@ -22,12 +22,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_core::{Agent, GatewayClient, Session, StreamEvent, Tool};
-use beyond_ai_agent::gateway_credential::{
-    GatewayCredential, resolve_gateway_credential_and_headers,
-};
-use beyond_ai_agent::mode::Mode;
-use beyond_ai_agent::session_store::{SessionRepo, SessionStore};
-use beyond_ai_agent::{serve, tools};
+use beyond_agent::gateway_credential::{GatewayCredential, resolve_gateway_credential_and_headers};
+use beyond_agent::mode::Mode;
+use beyond_agent::session_store::{SessionRepo, SessionStore};
+use beyond_agent::{serve, tools};
 
 mod commands;
 
@@ -101,7 +99,7 @@ fn parse_reasoning_effort(s: &str) -> Result<agent_core::ThinkingLevel, String> 
 /// consistent with this same "unrecognized/inapplicable degrades to not-set" convention rather than a
 /// second, diverging validator.
 fn resolve_thinking_budget_overrides(
-    settings: &beyond_ai_agent::settings::Settings,
+    settings: &beyond_agent::settings::Settings,
 ) -> Option<std::collections::HashMap<agent_core::ReasoningEffort, u32>> {
     let table = settings.thinking_budget_overrides.as_ref()?;
     let map: std::collections::HashMap<agent_core::ReasoningEffort, u32> = table
@@ -133,7 +131,7 @@ fn build_run_gateway_client(
     raw_key: Option<String>,
     gateway: &str,
     model: &str,
-    provider_env: &beyond_ai_agent::gateway_credential::ProviderEnv,
+    provider_env: &beyond_agent::gateway_credential::ProviderEnv,
     retry_max_retries: Option<u32>,
     retry_base_delay_ms: Option<u64>,
     retry_max_backoff_ms: Option<u64>,
@@ -171,14 +169,14 @@ fn build_run_gateway_client(
 }
 
 /// Drives `agent login`'s interactive prompts over stderr/stdin — the CLI's one implementation of
-/// [`beyond_ai_agent::oauth::LoginCallbacks`]. `agent login` is a dedicated, single-purpose blocking
+/// [`beyond_agent::oauth::LoginCallbacks`]. `agent login` is a dedicated, single-purpose blocking
 /// invocation with no concurrent-command concerns (unlike `serve`), so blocking stdin reads (moved to
 /// a `spawn_blocking` task, out of hygiene rather than necessity here) are the whole interaction —
 /// there's no need for `serve`'s RPC surface's separate ack-now/respond-later, push-frame shape.
 struct CliLoginCallbacks;
 
 #[async_trait::async_trait]
-impl beyond_ai_agent::oauth::LoginCallbacks for CliLoginCallbacks {
+impl beyond_agent::oauth::LoginCallbacks for CliLoginCallbacks {
     async fn show_auth_url(&self, url: &str, instructions: Option<&str>) {
         eprintln!("Open this URL in a browser to continue:\n\n  {url}\n");
         if let Some(instructions) = instructions {
@@ -186,7 +184,7 @@ impl beyond_ai_agent::oauth::LoginCallbacks for CliLoginCallbacks {
         }
     }
 
-    async fn show_device_code(&self, info: &beyond_ai_agent::oauth::DeviceCodeInfo) {
+    async fn show_device_code(&self, info: &beyond_agent::oauth::DeviceCodeInfo) {
         eprintln!(
             "Go to {} and enter this code: {}",
             info.verification_uri, info.user_code
@@ -200,8 +198,8 @@ impl beyond_ai_agent::oauth::LoginCallbacks for CliLoginCallbacks {
 
     async fn prompt_text(
         &self,
-        prompt: &beyond_ai_agent::oauth::TextPrompt<'_>,
-    ) -> Result<String, beyond_ai_agent::oauth::OAuthError> {
+        prompt: &beyond_agent::oauth::TextPrompt<'_>,
+    ) -> Result<String, beyond_agent::oauth::OAuthError> {
         eprint!("{}", prompt.message);
         if let Some(placeholder) = prompt.placeholder {
             eprint!(" [{placeholder}]");
@@ -212,17 +210,17 @@ impl beyond_ai_agent::oauth::LoginCallbacks for CliLoginCallbacks {
             let mut line = String::new();
             std::io::stdin()
                 .read_line(&mut line)
-                .map_err(|e| beyond_ai_agent::oauth::OAuthError::InvalidInput(e.to_string()))?;
+                .map_err(|e| beyond_agent::oauth::OAuthError::InvalidInput(e.to_string()))?;
             Ok(line.trim().to_string())
         })
         .await
-        .map_err(|e| beyond_ai_agent::oauth::OAuthError::InvalidInput(e.to_string()))?
+        .map_err(|e| beyond_agent::oauth::OAuthError::InvalidInput(e.to_string()))?
     }
 
     async fn select(
         &self,
-        prompt: &beyond_ai_agent::oauth::SelectPrompt<'_>,
-    ) -> Result<Option<String>, beyond_ai_agent::oauth::OAuthError> {
+        prompt: &beyond_agent::oauth::SelectPrompt<'_>,
+    ) -> Result<Option<String>, beyond_agent::oauth::OAuthError> {
         eprintln!("{}", prompt.message);
         for (i, opt) in prompt.options.iter().enumerate() {
             eprintln!("  {}. {} ({})", i + 1, opt.label, opt.id);
@@ -460,7 +458,7 @@ enum Command {
         /// How MCP tools reach the model: `auto` (default), `search` (loaded on demand) or `eager`
         /// (all, always).
         #[usage(long, env = "AI_AGENT_MCP_TOOL_LOADING")]
-        mcp_tool_loading: Option<beyond_ai_agent::tools::tool_search::McpLoading>,
+        mcp_tool_loading: Option<beyond_agent::tools::tool_search::McpLoading>,
         /// Refuse every call to this tool; the model sees an error. Repeatable.
         #[usage(long, env = "AI_AGENT_DENY_TOOL", delimiter = ',')]
         deny_tool: Vec<String>,
@@ -834,7 +832,7 @@ enum Command {
         /// How MCP tools reach the model: `auto` (default), `search` (loaded on demand) or `eager`
         /// (all, always).
         #[usage(long, env = "AI_AGENT_MCP_TOOL_LOADING")]
-        mcp_tool_loading: Option<beyond_ai_agent::tools::tool_search::McpLoading>,
+        mcp_tool_loading: Option<beyond_agent::tools::tool_search::McpLoading>,
         /// Refuse every call to this tool; the model sees an error. Repeatable.
         #[usage(long, env = "AI_AGENT_DENY_TOOL", delimiter = ',')]
         deny_tool: Vec<String>,
@@ -963,7 +961,7 @@ enum Command {
         /// Default project trust when neither --trust-project nor --force-untrusted is given:
         /// `always`, `never` or `ask`.
         #[usage(long, value_enum)]
-        default_project_trust: Option<beyond_ai_agent::settings::TrustPolicy>,
+        default_project_trust: Option<beyond_agent::settings::TrustPolicy>,
         /// Clear the default project trust.
         #[usage(long)]
         clear_default_project_trust: bool,
@@ -1259,7 +1257,7 @@ fn expand_short_aliases(args: Vec<String>) -> Vec<String> {
 const DEFAULT_MODEL_PLACEHOLDER: &str = "{DEFAULT_MODEL}";
 
 /// Written in help text where the program's own name belongs (`{PROGRAM} trust <path>`), and
-/// replaced with [`beyond_ai_agent::PROGRAM`] when the help is rendered.
+/// replaced with [`beyond_agent::PROGRAM`] when the help is rendered.
 const PROGRAM_PLACEHOLDER: &str = "{PROGRAM}";
 
 /// A command's rendered `--help`/`-h` page, with [`DEFAULT_MODEL_PLACEHOLDER`] filled in.
@@ -1267,7 +1265,7 @@ fn render_help(cmd: &'static usage::Command, long: bool) -> String {
     Cli::render_help(cmd, long)
         .unwrap_or_default()
         .replace(DEFAULT_MODEL_PLACEHOLDER, DEFAULT_MODEL)
-        .replace(PROGRAM_PLACEHOLDER, beyond_ai_agent::PROGRAM)
+        .replace(PROGRAM_PLACEHOLDER, beyond_agent::PROGRAM)
 }
 
 fn cli() -> Cli {
@@ -1333,17 +1331,17 @@ fn main() -> std::process::ExitCode {
     // agent's is wanted here either.
     if subcommand
         .as_ref()
-        .is_some_and(|a| a == beyond_ai_agent::subreaper::TRAMPOLINE)
+        .is_some_and(|a| a == beyond_agent::subreaper::TRAMPOLINE)
     {
-        std::process::exit(beyond_ai_agent::subreaper::trampoline_main());
+        std::process::exit(beyond_agent::subreaper::trampoline_main());
     }
     // Before anything is spawned: the agent becomes a child subreaper, the main thread turns to
     // reaping the orphans that brings, and the rest runs on a thread of its own.
-    beyond_ai_agent::subreaper::run_main(agent_main)
+    beyond_agent::subreaper::run_main(agent_main)
 }
 
 /// `main`, past the subcommands that must run before anything exists — on its own thread under
-/// [`beyond_ai_agent::subreaper::run_main`]. Returns the exit status.
+/// [`beyond_agent::subreaper::run_main`]. Returns the exit status.
 fn agent_main() -> u8 {
     #[cfg(unix)]
     raise_open_file_limit();
@@ -1926,7 +1924,7 @@ enum CliTerminal {
 }
 
 async fn emit_cli_lifecycle(
-    life: Option<&std::sync::Arc<beyond_ai_agent::lifecycle::Run>>,
+    life: Option<&std::sync::Arc<beyond_agent::lifecycle::Run>>,
     session: &Session,
     kind: CliTerminal,
     structured: Option<serde_json::Value>,
@@ -1934,7 +1932,7 @@ async fn emit_cli_lifecycle(
     let Some(life) = life else {
         return;
     };
-    let summary = beyond_ai_agent::lifecycle::closing_summary(session);
+    let summary = beyond_agent::lifecycle::closing_summary(session);
     match kind {
         CliTerminal::Succeeded { refused } => {
             life.succeeded(session.steps, refused, summary, structured);
@@ -1986,7 +1984,7 @@ fn exit_cancelled(shutdown_cause: &std::sync::Mutex<Option<serve::Signal>>) -> !
 }
 
 /// [`run_turn_once`], wrapped with the same whole-run auto-retry `serve/prompt.rs`'s `"prompt"` command gets
-/// (see `beyond_ai_agent::retry`) — a run that ends in a transient-looking error (one already
+/// (see `beyond_agent::retry`) — a run that ends in a transient-looking error (one already
 /// exhausted `agent_core`'s own within-turn retries) is re-invoked from scratch against the same
 /// session, up to `retry::MAX_RUN_RETRIES` times with backoff, rather than failing a whole `agent run`
 /// invocation (plausibly unattended — a cron job, a CI step) outright on a hiccup that `serve` would
@@ -2001,12 +1999,12 @@ async fn run_turn(
     session: &mut Session,
     json: bool,
     cancel: &agent_core::CancellationToken,
-    retry_policy: &beyond_ai_agent::retry::RunRetryPolicy,
+    retry_policy: &beyond_agent::retry::RunRetryPolicy,
     broken_pipe: &AtomicBool,
     steering: &agent_core::Steering,
     session_memory_active: bool,
     pressure_point: u32,
-    life: Option<&std::sync::Arc<beyond_ai_agent::lifecycle::Run>>,
+    life: Option<&std::sync::Arc<beyond_agent::lifecycle::Run>>,
     heartbeat: std::time::Duration,
 ) -> agent_core::Result<agent_core::StopReason> {
     let mut attempt = 0u32;
@@ -2014,7 +2012,7 @@ async fn run_turn(
     // One observer for the whole prompt, retries included: a whole-run retry is the same fill cycle,
     // so the pressure nudge must not re-arm across it (`serve` holds its observer the same way).
     let session_steers =
-        beyond_ai_agent::memory::SessionSteers::new(session_memory_active, pressure_point);
+        beyond_agent::memory::SessionSteers::new(session_memory_active, pressure_point);
     loop {
         if let Some(life) = life {
             life.set_attempt(attempt);
@@ -2042,7 +2040,7 @@ async fn run_turn(
             Err(e)
                 if attempt < retry_policy.max_retries
                     && !cancel.is_cancelled()
-                    && beyond_ai_agent::retry::is_retryable_whole_run(e) =>
+                    && beyond_agent::retry::is_retryable_whole_run(e) =>
             {
                 attempt += 1;
                 let delay = retry_policy.backoff(attempt);
@@ -2232,9 +2230,9 @@ async fn run_turn_once(
     broken_pipe: &AtomicBool,
     steering: &agent_core::Steering,
     // The `/session` steers (pressure nudge, compaction reminder) — the observer `serve` shares. See
-    // `beyond_ai_agent::memory::SessionSteers`.
-    session_steers: &beyond_ai_agent::memory::SessionSteers,
-    life: Option<&std::sync::Arc<beyond_ai_agent::lifecycle::Run>>,
+    // `beyond_agent::memory::SessionSteers`.
+    session_steers: &beyond_agent::memory::SessionSteers,
+    life: Option<&std::sync::Arc<beyond_agent::lifecycle::Run>>,
     heartbeat_every: std::time::Duration,
 ) -> agent_core::Result<agent_core::StopReason> {
     let session_steers = |ev: &agent_core::AgentEvent| {
@@ -2250,7 +2248,7 @@ async fn run_turn_once(
     let life_obs = life.cloned();
     let heartbeat = match (life.cloned(), heartbeat_every) {
         (Some(life), every) if !every.is_zero() => Some(tokio::spawn(async move {
-            let Some(mut interval) = beyond_ai_agent::lifecycle::heartbeat_interval(every) else {
+            let Some(mut interval) = beyond_agent::lifecycle::heartbeat_interval(every) else {
                 return;
             };
             interval.tick().await;
@@ -2371,7 +2369,7 @@ async fn run_turn_once(
 /// round-trips already ran real commands or edited real files — lost all record of them, with the
 /// session file (if any) unable to distinguish that from "nothing happened yet".
 /// `run`'s MCP task journal: the same `mcp_task` custom entries `serve` writes (see
-/// `beyond_ai_agent::mcp_resume`), so a `run` that dies mid-task can be resumed by
+/// `beyond_agent::mcp_resume`), so a `run` that dies mid-task can be resumed by
 /// `run --continue` (or by `serve`). Process-wide because `run` drives exactly one session per
 /// process; set once, when that session is persisted.
 static RUN_JOURNAL: std::sync::OnceLock<RunJournal> = std::sync::OnceLock::new();
@@ -2401,8 +2399,8 @@ impl RunJournal {
             return;
         };
         self.append(
-            beyond_ai_agent::mcp_resume::TASK_ENTRY_KIND,
-            beyond_ai_agent::mcp_resume::task_entry(record, id, &self.session_id),
+            beyond_agent::mcp_resume::TASK_ENTRY_KIND,
+            beyond_agent::mcp_resume::task_entry(record, id, &self.session_id),
         );
     }
 
@@ -2428,10 +2426,10 @@ async fn resume_mcp_tasks_for_run(
     catalog: &tools::mcp::McpCatalog,
     cancel: &agent_core::CancellationToken,
 ) -> agent_core::Result<(
-    Vec<beyond_ai_agent::mcp_resume::Resolved>,
+    Vec<beyond_agent::mcp_resume::Resolved>,
     std::collections::HashSet<String>,
 )> {
-    use beyond_ai_agent::mcp_resume::{
+    use beyond_agent::mcp_resume::{
         PLACEHOLDER_ENTRY_KIND, RESULT_ENTRY_KIND, Resolved, TASK_ENTRY_KIND,
     };
     let Some(journal) = journal else {
@@ -2442,15 +2440,15 @@ async fn resume_mcp_tasks_for_run(
         match guard.as_ref() {
             Some(store) => (
                 store.active_journal(TASK_ENTRY_KIND),
-                beyond_ai_agent::mcp_resume::results(&store.active_journal(RESULT_ENTRY_KIND)),
-                beyond_ai_agent::mcp_resume::placeholder_ids(
+                beyond_agent::mcp_resume::results(&store.active_journal(RESULT_ENTRY_KIND)),
+                beyond_agent::mcp_resume::placeholder_ids(
                     &store.active_journal(PLACEHOLDER_ENTRY_KIND),
                 ),
             ),
             None => return Ok(Default::default()),
         }
     };
-    let mut pending = beyond_ai_agent::mcp_resume::pending(
+    let mut pending = beyond_agent::mcp_resume::pending(
         &session.messages,
         &tasks,
         &results,
@@ -2487,15 +2485,13 @@ async fn resume_mcp_tasks_for_run(
                 eprintln!("[MCP task {} is still pending: {why}]", task.record.task_id);
                 journal.append(
                     PLACEHOLDER_ENTRY_KIND,
-                    beyond_ai_agent::mcp_resume::placeholder_entry(
+                    beyond_agent::mcp_resume::placeholder_entry(
                         &task.tool_use_id,
                         &journal.session_id,
                     ),
                 );
                 placeholders.insert(task.tool_use_id.clone());
-                resolved.push(beyond_ai_agent::mcp_resume::pending_placeholder(
-                    &task, &why,
-                ));
+                resolved.push(beyond_agent::mcp_resume::pending_placeholder(&task, &why));
                 continue;
             }
             Err(tools::mcp::ResumeError::Final(e)) => Resolved {
@@ -2562,22 +2558,22 @@ fn persist_run(run: &RunStore, session: &Session) -> std::io::Result<()> {
 /// invocation, never prefetched (see `tools::mcp_skills`).
 async fn expand_message(
     message: &str,
-    skills: &[beyond_ai_agent::skills::Skill],
-    prompt_templates: &[beyond_ai_agent::prompts::PromptTemplate],
+    skills: &[beyond_agent::skills::Skill],
+    prompt_templates: &[beyond_agent::prompts::PromptTemplate],
     mcp_skills: &tools::mcp_skills::McpSkills,
 ) -> String {
     if let Some(expanded) = mcp_skills.expand_invocation(message, skills).await {
         return expanded;
     }
-    let message = beyond_ai_agent::skills::expand_if_skill_invocation(message, skills);
-    beyond_ai_agent::prompts::expand_if_slash(&message, prompt_templates)
+    let message = beyond_agent::skills::expand_if_skill_invocation(message, skills);
+    beyond_agent::prompts::expand_if_slash(&message, prompt_templates)
 }
 
 /// Whether `id` is safe to embed directly in a filename component. Delegates to the canonical
-/// implementation in [`beyond_ai_agent::session_store::is_valid_session_id`] (shared with the
+/// implementation in [`beyond_agent::session_store::is_valid_session_id`] (shared with the
 /// WebSocket transport, which validates a client-supplied `?session_id=` the same way).
 fn is_valid_session_id(id: &str) -> bool {
-    beyond_ai_agent::session_store::is_valid_session_id(id)
+    beyond_agent::session_store::is_valid_session_id(id)
 }
 
 /// The diagnostic to print and exit(1) on for a finished run's final stop reason, or `None` to exit
@@ -2615,7 +2611,7 @@ mod tests {
     use super::*;
     use agent_core::Error;
     use agent_core::mock::{MockTransport, turn};
-    use beyond_ai_agent::session_store::SessionMeta;
+    use beyond_agent::session_store::SessionMeta;
 
     /// A shell's low soft descriptor limit (256 on stock macOS) is lifted to the hard limit.
     #[cfg(target_os = "linux")]
@@ -3112,7 +3108,7 @@ mod tests {
             &mut session,
             false,
             &agent_core::CancellationToken::new(),
-            &beyond_ai_agent::retry::RunRetryPolicy::default(),
+            &beyond_agent::retry::RunRetryPolicy::default(),
             &AtomicBool::new(false),
             &agent_core::Steering::new(),
             false,
@@ -3145,7 +3141,7 @@ mod tests {
         // own unit tests already prove the registry's `Drop`-tied release in isolation, with a synthetic
         // critical section (`aborting_a_lock_holder_mid_critical_section_releases_the_lock_only_at_that_
         // point`); this drives the same guarantee through the *real* `write` tool
-        // (`beyond_ai_agent::tools::write::Write`) and the real `agent_core::Agent`
+        // (`beyond_agent::tools::write::Write`) and the real `agent_core::Agent`
         // dispatch/`write_target`-grouping path (`agent.rs`'s `group_runs`), across two independent,
         // genuinely concurrent `Agent::run` calls sharing one `WriteLockRegistry` — the same
         // two-runs-sharing-a-registry shape `same_write_target_serializes_across_two_agent_runs_sharing_
@@ -3379,7 +3375,7 @@ mod tests {
             &mut session,
             false,
             &agent_core::CancellationToken::new(),
-            &beyond_ai_agent::retry::RunRetryPolicy::default(),
+            &beyond_agent::retry::RunRetryPolicy::default(),
             &AtomicBool::new(false),
             &agent_core::Steering::new(),
             false,
@@ -3406,7 +3402,7 @@ mod tests {
         // fails — after `retry::MAX_RUN_RETRIES` whole-run retries, `run_turn` must give up and
         // propagate the error rather than retrying forever.
         let total_attempts =
-            (beyond_ai_agent::retry::MAX_RUN_RETRIES as usize + 1) * INNER_RETRY_ATTEMPTS;
+            (beyond_agent::retry::MAX_RUN_RETRIES as usize + 1) * INNER_RETRY_ATTEMPTS;
         let turns: Vec<Vec<Result<StreamEvent, Error>>> = (0..total_attempts)
             .map(|_| {
                 vec![Err(Error::Transport(
@@ -3424,7 +3420,7 @@ mod tests {
             &mut session,
             false,
             &agent_core::CancellationToken::new(),
-            &beyond_ai_agent::retry::RunRetryPolicy::default(),
+            &beyond_agent::retry::RunRetryPolicy::default(),
             &AtomicBool::new(false),
             &agent_core::Steering::new(),
             false,
@@ -3467,11 +3463,8 @@ mod tests {
         session.user("hi");
 
         // Mirrors `--no-retry` alongside a nonzero `--retry-max-retries`: disabled must win outright.
-        let policy = beyond_ai_agent::retry::RunRetryPolicy::from_overrides_with_enabled(
-            false,
-            Some(99),
-            None,
-        );
+        let policy =
+            beyond_agent::retry::RunRetryPolicy::from_overrides_with_enabled(false, Some(99), None);
         let err = run_turn(
             &agent,
             &mut session,
@@ -3523,7 +3516,7 @@ mod tests {
         let agent = Agent::new(transport.clone(), "claude-test");
         let mut session = Session::new();
         session.user("hi");
-        let policy = beyond_ai_agent::retry::RunRetryPolicy::from_overrides(
+        let policy = beyond_agent::retry::RunRetryPolicy::from_overrides(
             Some(1),
             Some(std::time::Duration::from_millis(1)),
         );
@@ -3561,7 +3554,7 @@ mod tests {
         let mut session = Session::new();
         session.user("hi");
         // A 60s whole-run backoff the cancel has to cut short.
-        let policy = beyond_ai_agent::retry::RunRetryPolicy::from_overrides(
+        let policy = beyond_agent::retry::RunRetryPolicy::from_overrides(
             Some(3),
             Some(std::time::Duration::from_secs(60)),
         );
@@ -3991,7 +3984,7 @@ mod tests {
 
     #[test]
     fn resolve_thinking_budget_overrides_returns_none_when_nothing_configured() {
-        let settings = beyond_ai_agent::settings::Settings::default();
+        let settings = beyond_agent::settings::Settings::default();
         assert_eq!(resolve_thinking_budget_overrides(&settings), None);
     }
 
@@ -4000,7 +3993,7 @@ mod tests {
         let mut table = std::collections::BTreeMap::new();
         table.insert("high".to_string(), 40_000u32);
         table.insert("low".to_string(), 1_000u32);
-        let settings = beyond_ai_agent::settings::Settings {
+        let settings = beyond_agent::settings::Settings {
             thinking_budget_overrides: Some(table),
             ..Default::default()
         };
@@ -4019,7 +4012,7 @@ mod tests {
     fn resolve_thinking_budget_overrides_skips_an_unrecognized_key() {
         let mut table = std::collections::BTreeMap::new();
         table.insert("not-a-real-effort".to_string(), 1u32);
-        let settings = beyond_ai_agent::settings::Settings {
+        let settings = beyond_agent::settings::Settings {
             thinking_budget_overrides: Some(table),
             ..Default::default()
         };

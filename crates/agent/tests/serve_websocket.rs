@@ -322,7 +322,7 @@ async fn ws_distinct_sessions_run_concurrently_and_stay_isolated() {
     // `_<id>.jsonl` lookup couldn't see daemon sessions at all: they showed up in `list_sessions` but
     // `switch_session`/`open_id` reported them missing. Resolving by id is the assertion that matters —
     // the filename is just how the repo spells it.
-    let repo = beyond_ai_agent::session_store::SessionRepo::open(dir.path()).unwrap();
+    let repo = beyond_agent::session_store::SessionRepo::open(dir.path()).unwrap();
     for id in ["alpha", "bravo"] {
         let (store, _) = repo
             .open_id(id)
@@ -384,7 +384,7 @@ async fn ws_sigterm_persists_in_flight_session_and_exits() {
     // The in-flight session was persisted before exit (graceful, not killed mid-write). Located
     // through the repo by its routing key rather than by a hand-built filename — the daemon persists
     // ordinary repo sessions (`<created_at>_<id>.jsonl`), so the id is what resolves it.
-    let repo = beyond_ai_agent::session_store::SessionRepo::open(dir.path()).unwrap();
+    let repo = beyond_agent::session_store::SessionRepo::open(dir.path()).unwrap();
     let (store, _) = repo
         .open_id(SID)
         .expect("the session should be on disk, and resolvable by id, after graceful shutdown");

@@ -13,7 +13,7 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use agent_core::{ContentBlock, Message, Session};
-use beyond_ai_agent::session_store::{SessionMeta, SessionRepo, SessionStore};
+use beyond_agent::session_store::{SessionMeta, SessionRepo, SessionStore};
 use common::{NoFrame, SpawnGuarded, serve_cmd, spawn_model_server_with_stalled_response};
 use serde_json::{Value, json};
 

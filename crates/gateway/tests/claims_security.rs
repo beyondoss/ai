@@ -12,7 +12,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use beyond_ai::__test::key::{VirtualKey, mint, mint_v2};
+use beyond_gateway::__test::key::{VirtualKey, mint, mint_v2};
 use bytes::Bytes;
 use common::*;
 use http_body_util::{BodyExt, Full};
@@ -112,7 +112,7 @@ struct EchoUpstream {
 
 impl EchoUpstream {
     async fn start(mode: Echo) -> Self {
-        let listener = beyond_ai_test_support::ports::tokio_listener().await;
+        let listener = beyond_test_support::ports::tokio_listener().await;
         let port = listener.local_addr().unwrap().port();
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {

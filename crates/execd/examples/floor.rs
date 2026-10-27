@@ -4,7 +4,7 @@
 //!
 //! ```sh
 //! RUSTFLAGS="-C relocation-model=static" cargo build --release --target x86_64-unknown-linux-musl \
-//!     -p beyond-ai-execd --example floor
+//!     -p beyond-execd --example floor
 //! target/x86_64-unknown-linux-musl/release/examples/floor 127.0.0.1:8080
 //! ```
 #![allow(clippy::unwrap_used, clippy::expect_used)]

@@ -118,7 +118,7 @@ fn an_event_during_a_manual_compact_is_queued_and_reaches_the_model_after_it() {
     // carries the transcript — the compaction's summarization call included — stalls 1.5 s too.
     for (id, msg) in [
         ("p1", "hello".to_owned()),
-        ("p2", beyond_ai_test_support::stall_prompt(1500)),
+        ("p2", beyond_test_support::stall_prompt(1500)),
     ] {
         send(
             &mut s.stdin,
@@ -155,7 +155,7 @@ fn mcp_events_commands_are_answered_mid_run_without_waiting_for_it() {
     let mut s = start(&[]);
     send(
         &mut s.stdin,
-        json!({ "type": "prompt", "id": "long", "message": beyond_ai_test_support::stall_prompt(3000) }),
+        json!({ "type": "prompt", "id": "long", "message": beyond_test_support::stall_prompt(3000) }),
     );
     s.frames
         .wait(Duration::from_secs(10), "the prompt's ack", |f| {

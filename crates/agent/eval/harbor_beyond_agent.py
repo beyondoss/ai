@@ -74,7 +74,7 @@ def resolve_agent_binary() -> Path:
     raise FileNotFoundError(
         "beyond-ai-agent binary not found. Build a static musl release "
         "(so it runs in any Terminal-Bench image):\n"
-        "  cargo build -p beyond-ai-agent --release --target x86_64-unknown-linux-musl\n"
+        "  cargo build -p beyond-agent --release --target x86_64-unknown-linux-musl\n"
         "or set BEYOND_AI_AGENT_BIN to an existing binary."
     )
 

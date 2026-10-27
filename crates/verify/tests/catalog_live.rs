@@ -3610,46 +3610,26 @@ fn retries_end_inside_the_nextest_budget() -> Result<(), Failed> {
     // (profile, binary, test name, budget)
     type Case<'a> = (&'a str, Option<&'a str>, Option<&'a str>, Option<Duration>);
     let cases: &[Case] = &[
+        ("verify", Some("beyond-verify::catalog_live"), None, min(3)),
         (
             "verify",
-            Some("beyond-ai-verify::catalog_live"),
-            None,
-            min(3),
-        ),
-        (
-            "verify",
-            Some("beyond-ai-verify::reconcile_live"),
+            Some("beyond-verify::reconcile_live"),
             None,
             min(95),
         ),
-        ("verify", Some("beyond-ai-verify::long_live"), None, min(35)),
-        ("verify", Some("beyond-ai-verify::live"), long, min(6)),
-        ("verify", Some("beyond-ai-verify::live"), short, min(3)),
-        (
-            "verify",
-            Some("beyond-ai-verify::catalog_live"),
-            long,
-            min(3),
-        ),
+        ("verify", Some("beyond-verify::long_live"), None, min(35)),
+        ("verify", Some("beyond-verify::live"), long, min(6)),
+        ("verify", Some("beyond-verify::live"), short, min(3)),
+        ("verify", Some("beyond-verify::catalog_live"), long, min(3)),
+        ("verify-isolated", Some("beyond-verify::live"), None, min(3)),
         (
             "verify-isolated",
-            Some("beyond-ai-verify::live"),
-            None,
-            min(3),
-        ),
-        (
-            "verify-isolated",
-            Some("beyond-ai-verify::long_live"),
+            Some("beyond-verify::long_live"),
             None,
             min(35),
         ),
-        ("ci", Some("beyond-ai-verify::catalog_live"), None, min(3)),
-        (
-            "default",
-            Some("beyond-ai-verify::catalog_live"),
-            None,
-            None,
-        ),
+        ("ci", Some("beyond-verify::catalog_live"), None, min(3)),
+        ("default", Some("beyond-verify::catalog_live"), None, None),
         ("verify", None, None, min(3)),
     ];
     let wrong: Vec<String> = cases

@@ -1,8 +1,8 @@
 //! The demo broker against the connector broker conformance kit (`BEYOND.md`, "Conformance"): the
 //! kit's operator hook is this harness's control plane and the fake identity provider, in process.
-use beyond_ai_agent::conformance::broker::{self, BrokerTarget, Hooks, verify};
-use beyond_ai_agent::exec_endpoint::conformance::Verdict;
-use beyond_ai_agent::managed_mcp_token::{Claims, ManagedKey};
+use beyond_agent::conformance::broker::{self, BrokerTarget, Hooks, verify};
+use beyond_agent::exec_endpoint::conformance::Verdict;
+use beyond_agent::managed_mcp_token::{Claims, ManagedKey};
 use serde_json::{Value, json};
 
 use super::{Harness, MANAGED, harness};

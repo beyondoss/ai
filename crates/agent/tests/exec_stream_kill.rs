@@ -8,8 +8,8 @@ use crate::common;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use beyond_ai_agent::exec_endpoint::HttpExecRunner;
-use beyond_ai_agent::tools::exec::{CommandRunner, ExecResult, JobHooks, Kill};
+use beyond_agent::exec_endpoint::HttpExecRunner;
+use beyond_agent::tools::exec::{CommandRunner, ExecResult, JobHooks, Kill};
 use common::exec_mock::{ExecMock, StreamEnd, wait_group_gone};
 
 fn sh(script: &str) -> Vec<String> {

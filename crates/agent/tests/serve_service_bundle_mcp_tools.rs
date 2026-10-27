@@ -7,7 +7,7 @@
 
 use crate::common;
 
-use beyond_ai_test_support::bundle::{BundleServer, file, sha256_hex, tar};
+use beyond_test_support::bundle::{BundleServer, file, sha256_hex, tar};
 use common::grant::Bundle;
 use common::mcp_fixture::{HttpMcpFixture, spawn_http_mcp_fixture};
 use common::service::{Options, Service};

@@ -13,11 +13,11 @@ use crate::common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use beyond_ai_agent::exec_endpoint::HttpExecRunner;
-use beyond_ai_agent::exec_endpoint::jobs::{
+use beyond_agent::exec_endpoint::HttpExecRunner;
+use beyond_agent::exec_endpoint::jobs::{
     JobId, JobNotify, JobScope, JobSpec, JobStatus, SandboxJobs,
 };
-use beyond_ai_agent::exec_endpoint::jobs_native::{JobOffer, NativeJobs};
+use beyond_agent::exec_endpoint::jobs_native::{JobOffer, NativeJobs};
 use common::exec_mock::{Answer, CallbackReceiver, ExecMock, LoseCallbacks, MockOptions};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -538,7 +538,7 @@ async fn the_server_is_verified_over_tls() {
         )
         .unwrap();
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-    let listener = beyond_ai_test_support::ports::tokio_listener().await;
+    let listener = beyond_test_support::ports::tokio_listener().await;
     let port = listener.local_addr().unwrap().port();
     let seen = Arc::new(std::sync::Mutex::new((0usize, 0usize)));
     {

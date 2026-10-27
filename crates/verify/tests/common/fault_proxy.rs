@@ -189,7 +189,7 @@ impl FaultProxy {
             .with_no_client_auth();
         client.alpn_protocols = vec![b"http/1.1".to_vec()];
 
-        let listener = beyond_ai_test_support::ports::tokio_listener().await;
+        let listener = beyond_test_support::ports::tokio_listener().await;
         let port = listener.local_addr()?.port();
         let state = Arc::new(State {
             upstream_host: upstream_host.to_owned(),

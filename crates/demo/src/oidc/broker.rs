@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use beyond_ai_agent::managed_mcp_token::{ManagedKey, Reject};
+use beyond_agent::managed_mcp_token::{ManagedKey, Reject};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;

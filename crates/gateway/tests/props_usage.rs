@@ -12,8 +12,8 @@
 
 mod props_support;
 
-use beyond_ai::__test::route::Endpoint;
-use beyond_ai::__test::usage::{self, InputTally};
+use beyond_gateway::__test::route::Endpoint;
+use beyond_gateway::__test::usage::{self, InputTally};
 use props_support::requests::chat_request;
 use props_support::script::script;
 use props_support::*;

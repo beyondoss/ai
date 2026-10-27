@@ -20,7 +20,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use beyond_ai::__test::key::{Keyring, VirtualKey, mint, mint_v3};
+use beyond_gateway::__test::key::{Keyring, VirtualKey, mint, mint_v3};
 use ed25519_dalek::SigningKey;
 
 fn main() {

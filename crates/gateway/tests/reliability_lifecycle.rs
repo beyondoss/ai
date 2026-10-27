@@ -8,7 +8,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use beyond_ai::__test::key::{VirtualKey, mint};
+use beyond_gateway::__test::key::{VirtualKey, mint};
 use common::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -144,7 +144,7 @@ async fn h2_upstream(head_delay: Duration, freeze: bool) -> (u16, tokio::task::J
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use std::sync::Arc;
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let listener = beyond_ai_test_support::ports::tokio_listener().await;
+    let listener = beyond_test_support::ports::tokio_listener().await;
     let port = listener.local_addr().unwrap().port();
     let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.key_pair.serialize_der().into());
@@ -238,7 +238,7 @@ async fn stream_to_end(gw: &Gateway) -> (u16, Result<String, String>, Duration) 
 /// defect: D36
 #[tokio::test]
 async fn a_dead_h2_upstream_is_detected_by_ping() {
-    let defaults = beyond_ai::AiConfig::default();
+    let defaults = beyond_gateway::AiConfig::default();
     assert!(
         defaults.h2_ping_interval_secs > 0 && defaults.h2_ping_interval_secs + 5 < 60,
         "upstream H2 PING is on by default, with a bound far under any client timeout: {}s",
@@ -281,7 +281,7 @@ async fn a_dead_h2_upstream_is_detected_by_ping() {
 /// defect: D36
 #[tokio::test]
 async fn an_alive_but_silent_upstream_is_not_cut() {
-    let defaults = beyond_ai::AiConfig::default();
+    let defaults = beyond_gateway::AiConfig::default();
     assert_eq!(
         defaults.read_timeout_secs, 600,
         "the silence bound is the OpenAI and Anthropic SDKs' 600s default request timeout"
@@ -406,7 +406,7 @@ async fn upstream_and_client_sockets_arm_tcp_keepalive() {
 #[tokio::test]
 async fn a_client_that_stops_reading_is_released() {
     assert_eq!(
-        beyond_ai::AiConfig::default().client_write_timeout_secs,
+        beyond_gateway::AiConfig::default().client_write_timeout_secs,
         60,
         "a default downstream write timeout exists"
     );

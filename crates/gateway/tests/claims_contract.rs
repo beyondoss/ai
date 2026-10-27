@@ -14,7 +14,7 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use beyond_ai::__test::key::{VirtualKey, mint};
+use beyond_gateway::__test::key::{VirtualKey, mint};
 use common::*;
 use serde_json::Value;
 
@@ -879,7 +879,7 @@ fn repo_file(rel: &str) -> String {
 
 /// Every top-level field `AiConfig` deserializes, with its default value.
 fn config_defaults() -> BTreeMap<String, Value> {
-    let v = serde_json::to_value(beyond_ai::AiConfig::default()).unwrap();
+    let v = serde_json::to_value(beyond_gateway::AiConfig::default()).unwrap();
     v.as_object()
         .unwrap()
         .iter()

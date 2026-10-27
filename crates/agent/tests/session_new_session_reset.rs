@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use agent_core::{ContentBlock, Message, Session};
-use beyond_ai_agent::session_store::{SessionMeta, SessionStore};
+use beyond_agent::session_store::{SessionMeta, SessionStore};
 use tempfile::TempDir;
 
 /// Message texts are words no id, hash or timestamp can contain: the reset test searches the raw

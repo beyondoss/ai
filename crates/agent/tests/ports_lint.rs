@@ -1,4 +1,4 @@
-//! Port 0 is spelled in one module: `beyond_ai_test_support::ports`.
+//! Port 0 is spelled in one module: `beyond_test_support::ports`.
 //!
 //! Binding port 0 and then reading the port the kernel picked is how code gets a port no other
 //! process holds. Releasing that socket and passing the number on for something else to bind
@@ -616,7 +616,7 @@ fn port_zero_is_written_only_in_the_ports_module() {
     unannotated.dedup();
     assert!(
         unannotated.is_empty(),
-        "port 0 written outside beyond_ai_test_support::ports — use its helpers (`listener()`, \
+        "port 0 written outside beyond_test_support::ports — use its helpers (`listener()`, \
          `tokio_listener()`, `bound_socket()`, `DeadPort`, or a child that reports its port):\n{}",
         unannotated.join("\n")
     );
@@ -705,7 +705,7 @@ fn the_rule_catches_every_spelling_of_port_zero() {
     }
     for fine in [
         "let l = TcpListener::bind(\"127.0.0.1:8080\").unwrap();",
-        "let listener = beyond_ai_test_support::ports::listener();",
+        "let listener = beyond_test_support::ports::listener();",
         "let dead = DeadPort::bind();",
         "// let p = TcpListener::bind(\"127.0.0.1:0\").unwrap();",
         "/* TcpListener::bind(\"127.0.0.1:0\") */",

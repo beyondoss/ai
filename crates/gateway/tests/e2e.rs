@@ -10,7 +10,7 @@
 
 mod common;
 
-use beyond_ai::__test::key::{VirtualKey, mint, mint_v2};
+use beyond_gateway::__test::key::{VirtualKey, mint, mint_v2};
 use common::*;
 
 fn body_for(model: &str) -> String {

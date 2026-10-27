@@ -73,7 +73,7 @@ say() { echo "── $* ──"; }
 
 # The repo's own tools (grant minter, chat client), built once from this checkout.
 demo_bin() {
-  (cd "$ROOT" && cargo build -q -p beyond-ai-demo >&2) || return 1
+  (cd "$ROOT" && cargo build -q -p beyond-demo >&2) || return 1
   local dir
   dir=$(cd "$ROOT" && cargo metadata --format-version 1 --no-deps 2>/dev/null | jq -r .target_directory)
   echo "$dir/debug/beyond-ai-demo"

@@ -16,14 +16,14 @@
 //! three arms isolate the three affected paths: `extract` (per-field name clone), `extract_where` (adds
 //! the filter lookup), and `table` (per-header name clone).
 //!
-//! Run: `cargo bench -p beyond-ai-agent --bench web_extract`.
+//! Run: `cargo bench -p beyond-agent --bench web_extract`.
 
 use std::hint::black_box;
 use std::io::{Read, Write};
 use std::sync::OnceLock;
 
 use agent_core::Tool;
-use beyond_ai_agent::tools::web::Web;
+use beyond_agent::tools::web::Web;
 use divan::Bencher;
 use serde_json::json;
 
@@ -73,7 +73,7 @@ fn page_html() -> &'static str {
 fn fixture() -> &'static str {
     static BASE: OnceLock<String> = OnceLock::new();
     BASE.get_or_init(|| {
-        let listener = beyond_ai_test_support::ports::listener();
+        let listener = beyond_test_support::ports::listener();
         let addr = listener.local_addr().unwrap();
         let body = page_html();
         let response = format!(

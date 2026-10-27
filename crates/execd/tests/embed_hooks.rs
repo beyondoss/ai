@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use beyond_ai_test_support::ports;
+use beyond_test_support::ports;
 use serde_json::{Value, json};
 use support::http::post;
 use tokio::io::AsyncWriteExt as _;

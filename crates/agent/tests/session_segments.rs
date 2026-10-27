@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agent_core::{ContentBlock, Message};
-use beyond_ai_agent::session_store::{Layout, RepoOptions, SessionMeta, SessionRepo, SessionStore};
+use beyond_agent::session_store::{Layout, RepoOptions, SessionMeta, SessionRepo, SessionStore};
 use serde_json::Value;
 use tempfile::TempDir;
 

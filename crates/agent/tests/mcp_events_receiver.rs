@@ -44,7 +44,7 @@ fn state_file(home: &std::path::Path) -> std::path::PathBuf {
 async fn busy(ws: &mut common::TestWs, ms: u64) {
     ws_send(
         ws,
-        json!({ "type": "prompt", "id": "long", "message": beyond_ai_test_support::stall_prompt(ms) }),
+        json!({ "type": "prompt", "id": "long", "message": beyond_test_support::stall_prompt(ms) }),
     )
     .await;
     ws_next(ws, Duration::from_secs(10), "the long run's ack", |f| {

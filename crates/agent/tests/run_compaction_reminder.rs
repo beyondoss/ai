@@ -11,7 +11,7 @@ use crate::common;
 use std::process::Stdio;
 
 use agent_core::{ContentBlock, Message, Session};
-use beyond_ai_agent::session_store::{SessionMeta, SessionRepo};
+use beyond_agent::session_store::{SessionMeta, SessionRepo};
 use common::{run_cmd, spawn_model_server, turn_text};
 
 const REMINDER: &str = "was just compacted";

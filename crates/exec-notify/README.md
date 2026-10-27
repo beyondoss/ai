@@ -1,4 +1,4 @@
-# beyond-ai-exec-notify
+# beyond-exec-notify
 
 The notification rules of exec protocol v1.4, as one pure function.
 
@@ -73,5 +73,5 @@ body; and `SH`, the same kernel in POSIX `sh` for endpoints that have no Rust.
 The normative spec is the "Sandbox job notify (v1.4)" section of the module doc
 in [`crates/agent/src/exec_endpoint.rs`](../agent/src/exec_endpoint.rs). Its
 requirements are tagged N1, N2, …; this crate implements N16 to N18 and the
-callback grammar and body (N4, N14). `cargo nextest run -p beyond-ai-exec-notify`
+callback grammar and body (N4, N14). `cargo nextest run -p beyond-exec-notify`
 runs the tests, including an exhaustive check of every short event sequence.

@@ -82,7 +82,7 @@ jobs:
       - run: mise check:rs
       # Code Mode is a cargo feature so default/release binaries do not link QuickJS (agent VM
       # density: idle RSS is resident `.text`). The feature-gated paths still have to clippy clean.
-      - run: cargo clippy -p beyond-ai-agent --all-targets --features code-mode --locked -- -D warnings
+      - run: cargo clippy -p beyond-agent --all-targets --features code-mode --locked -- -D warnings
   # The test binaries are compiled once, here, and the shards below only run them. Before this every
   # shard ran `cargo nextest run -E <filter>` on its own runner, and nextest applies `-E` *after* the
   # build: the core-providers shard compiled all 499 crates and ~330 test binaries (240 of them the
@@ -147,10 +147,10 @@ jobs:
       matrix:
         include:
           - name: gateway-unit
-            filter: package(beyond-ai) and kind(lib)
+            filter: package(beyond-gateway) and kind(lib)
             extra: ""
           - name: gateway-e2e
-            filter: package(beyond-ai) and kind(test)
+            filter: package(beyond-gateway) and kind(test)
             extra: ""
           # The agent package is split rather than run whole. Two reasons, both learned
           # the hard way: a single 1849-test job is the only shard that has ever wedged (its three
@@ -160,13 +160,13 @@ jobs:
           # will localize it inside the package, and each piece is small enough to stand a materially
           # better chance of simply passing.
           - name: agent-lib
-            filter: package(beyond-ai-agent) and (kind(lib) or kind(bin))
+            filter: package(beyond-agent) and (kind(lib) or kind(bin))
             extra: ""
           # Same agent-lib filter with QuickJS linked, plus the Code Mode eval harness (catalog
           # tokens + real-MCP composition). Default shards must not enable `code-mode` (that is the
           # density-default graph); this shard is the only one that compiles the interpreter.
           - name: agent-code-mode
-            filter: package(beyond-ai-agent) and (kind(lib) or kind(bin) or binary(code_mode_eval))
+            filter: package(beyond-agent) and (kind(lib) or kind(bin) or binary(code_mode_eval))
             extra: "--features code-mode"
           # agent-rest was one shard, 369-447s of test time: the critical path of the whole run once
           # the build is shared (below). Its per-binary time (junit, 4 test threads) is dominated by
@@ -186,22 +186,22 @@ jobs:
           # run (196 tests, 228s), and as these two halves. Cause not found; the halves are the
           # measured-good grouping.
           - name: agent-exec
-            filter: package(beyond-ai-agent) and binary(=it) and (test(/^[^:]*conformance[^:]*::/) or test(/^[^:]*exec_[^:]*::/)) and not test(/^[^:]*serve[^:]*::/) and not test(/^exec_endpoint_live::/) and not test(/^sandbox_jobs_notify::/) and not test(/^[^:]*notify_e2e[^:]*::/)
+            filter: package(beyond-agent) and binary(=it) and (test(/^[^:]*conformance[^:]*::/) or test(/^[^:]*exec_[^:]*::/)) and not test(/^[^:]*serve[^:]*::/) and not test(/^exec_endpoint_live::/) and not test(/^sandbox_jobs_notify::/) and not test(/^[^:]*notify_e2e[^:]*::/)
             extra: ""
           - name: agent-jobs
-            filter: package(beyond-ai-agent) and binary(=it) and (test(/^[^:]*jobs[^:]*::/) or test(/^[^:]*notify[^:]*::/)) and not (test(/^[^:]*conformance[^:]*::/) or test(/^[^:]*exec_[^:]*::/)) and not test(/^[^:]*serve[^:]*::/) and not test(/^exec_endpoint_live::/) and not test(/^sandbox_jobs_notify::/) and not test(/^[^:]*notify_e2e[^:]*::/)
+            filter: package(beyond-agent) and binary(=it) and (test(/^[^:]*jobs[^:]*::/) or test(/^[^:]*notify[^:]*::/)) and not (test(/^[^:]*conformance[^:]*::/) or test(/^[^:]*exec_[^:]*::/)) and not test(/^[^:]*serve[^:]*::/) and not test(/^exec_endpoint_live::/) and not test(/^sandbox_jobs_notify::/) and not test(/^[^:]*notify_e2e[^:]*::/)
             extra: ""
           - name: agent-rest
-            filter: package(beyond-ai-agent) and binary(=it) and not (test(/^[^:]*conformance[^:]*::/) or test(/^[^:]*exec_[^:]*::/) or test(/^[^:]*jobs[^:]*::/) or test(/^[^:]*notify[^:]*::/)) and not test(/^[^:]*serve[^:]*::/) and not test(/^exec_endpoint_live::/) and not test(/^sandbox_jobs_notify::/) and not test(/^[^:]*notify_e2e[^:]*::/)
+            filter: package(beyond-agent) and binary(=it) and not (test(/^[^:]*conformance[^:]*::/) or test(/^[^:]*exec_[^:]*::/) or test(/^[^:]*jobs[^:]*::/) or test(/^[^:]*notify[^:]*::/)) and not test(/^[^:]*serve[^:]*::/) and not test(/^exec_endpoint_live::/) and not test(/^sandbox_jobs_notify::/) and not test(/^[^:]*notify_e2e[^:]*::/)
             extra: ""
           # exec v1.4's end-to-end matrix and randomized orderings: real replicas behind a ring,
           # each case in three endpoint modes. Minutes of wall clock between them, so their own
           # shard rather than a slice of agent-rest's 10-minute budget.
           - name: agent-notify-e2e
-            filter: package(beyond-ai-agent) and binary(=it) and test(/^[^:]*notify_e2e[^:]*::/)
+            filter: package(beyond-agent) and binary(=it) and test(/^[^:]*notify_e2e[^:]*::/)
             extra: ""
           - name: agent-serve
-            filter: package(beyond-ai-agent) and binary(=it) and test(/^[^:]*serve[^:]*::/)
+            filter: package(beyond-agent) and binary(=it) and test(/^[^:]*serve[^:]*::/)
             extra: ""
           # The catch-all: every package the shards above do not own, selected by complement rather
           # than by name. Every shard compiles the whole workspace, so a crate missing from a
@@ -211,7 +211,7 @@ jobs:
           # cells without VERIFY_LIVE=1 (they spend real money), so they run zero tests here; they
           # run under the `verify` tasks, not in PR CI.
           - name: workspace-rest
-            filter: not (package(beyond-ai) or package(beyond-ai-agent))
+            filter: not (package(beyond-gateway) or package(beyond-agent))
             extra: ""
           # The remote-exec path against a **real, isolated target**, not a mock. Every other test of
           # it runs commands on the same machine, which proves the wiring and nothing about a
@@ -220,14 +220,14 @@ jobs:
           # — and it is what a large share of real sandboxes actually are. Running against a
           # GNU-flavoured image would quietly skip the code path most likely to be wrong.
           - name: exec-live
-            filter: package(beyond-ai-agent) and binary(=it) and (test(/^exec_endpoint_live::/) or test(/^sandbox_jobs_notify::/))
+            filter: package(beyond-agent) and binary(=it) and (test(/^exec_endpoint_live::/) or test(/^sandbox_jobs_notify::/))
             extra: ""
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
       # agent-code-mode is the one shard that cannot use the archive: it needs `--features code-mode`
       # (QuickJS), which would change the feature set of every other binary. It compiles for itself,
-      # but only the agent's own dependency graph (`-p beyond-ai-agent`), not the workspace.
+      # but only the agent's own dependency graph (`-p beyond-agent`), not the workspace.
       # Restore-only: cache-warm.yml writes this key on main.
       - uses: Swatinem/rust-cache@v2
         if: matrix.name == 'agent-code-mode'
@@ -304,7 +304,7 @@ jobs:
         timeout-minutes: 10
       - name: compile tests
         if: matrix.name == 'agent-code-mode'
-        run: cargo nextest run -p beyond-ai-agent --locked --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}' --no-run
+        run: cargo nextest run -p beyond-agent --locked --profile ci ${{ matrix.extra }} -E '${{ matrix.filter }}' --no-run
         timeout-minutes: 20
       # The run is a transient system unit (`systemd-run --wait`), not a child of the step. The
       # wedge leaves the test step `in_progress` past the nextest global-timeout, the step timeout and
@@ -331,7 +331,7 @@ jobs:
           env_args=()
           while IFS= read -r name; do env_args+=("--setenv=$name=${!name}"); done < <(compgen -e)
           if [ "${{ matrix.name }}" = agent-code-mode ]; then
-            run=(-p beyond-ai-agent --locked ${{ matrix.extra }})
+            run=(-p beyond-agent --locked ${{ matrix.extra }})
           else
             run=(--binaries-metadata target/nextest/binaries-metadata.json --cargo-metadata target/nextest/cargo-metadata.json --target-dir-remap target --workspace-remap .)
           fi
@@ -396,7 +396,7 @@ jobs:
     timeout-minutes: 30
     env:
       STRESS_FILTER: >-
-        package(beyond-ai) and (binary(=claims_reliability) or binary(reliability_*) or binary(billing_*) or binary(=claims_billing) or binary(=claims_billing_integrity) or binary(=cancellation) or binary(=cut_short) or binary(=claims_streaming) or binary(=capture) or binary(=tenant_concurrency) or (kind(lib) and test(capture_sink::))) and not test(=rss_plateaus_under_sustained_load_and_large_bodies)
+        package(beyond-gateway) and (binary(=claims_reliability) or binary(reliability_*) or binary(billing_*) or binary(=claims_billing) or binary(=claims_billing_integrity) or binary(=cancellation) or binary(=cut_short) or binary(=claims_streaming) or binary(=capture) or binary(=tenant_concurrency) or (kind(lib) and test(capture_sink::))) and not test(=rss_plateaus_under_sustained_load_and_large_bodies)
       # ~2 minutes an iteration on a 4-vCPU hosted runner under the hogs (measured ~1 minute on a
       # 16-core dev box restricted to 4 CPUs with 4 hogs), so ~10 minutes in all.
       STRESS_RUNS: "5"
@@ -541,7 +541,7 @@ jobs:
         with:
           tool: nextest
       - name: test
-        run: cargo nextest run -p beyond-ai-execd --locked --profile ci
+        run: cargo nextest run -p beyond-execd --locked --profile ci
         timeout-minutes: 15
       - name: report flaky tests
         if: always()

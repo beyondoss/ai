@@ -11,7 +11,7 @@
 
 mod common;
 
-use beyond_ai::__test::key::{VirtualKey, mint};
+use beyond_gateway::__test::key::{VirtualKey, mint};
 use common::*;
 use serde_json::{Value, json};
 

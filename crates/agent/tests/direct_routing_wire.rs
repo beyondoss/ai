@@ -14,14 +14,14 @@ use std::sync::{Arc, Mutex};
 
 use agent_core::transport::ModelTransport;
 use agent_core::{GatewayClient, Message, ModelRequest};
-use beyond_ai_agent::gateway_credential::{
+use beyond_agent::gateway_credential::{
     GatewayCredential, ProviderEnv, resolve_gateway_credential,
 };
 use futures::StreamExt;
 
 /// A one-shot listener that records the raw request text and answers with an empty SSE 200.
 fn capture_request() -> (String, Arc<Mutex<String>>) {
-    let listener = beyond_ai_test_support::ports::listener();
+    let listener = beyond_test_support::ports::listener();
     let addr = listener.local_addr().expect("addr");
     let captured = Arc::new(Mutex::new(String::new()));
     let sink = Arc::clone(&captured);

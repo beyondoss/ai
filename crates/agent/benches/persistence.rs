@@ -20,13 +20,13 @@
 //!   (deliberately), so — following `benches/serve_events.rs`'s own precedent — this replicates both
 //!   strategies against the same public `agent_core::Message` payload the real `Entry` wraps.
 //!
-//! Run: `cargo bench -p beyond-ai-agent --bench persistence`.
+//! Run: `cargo bench -p beyond-agent --bench persistence`.
 
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 
 use agent_core::{ContentBlock, Message};
-use beyond_ai_agent::session_store::{SessionMeta, SessionRepo, SessionStore};
+use beyond_agent::session_store::{SessionMeta, SessionRepo, SessionStore};
 use divan::Bencher;
 use serde::Serialize;
 use serde_json::Value;

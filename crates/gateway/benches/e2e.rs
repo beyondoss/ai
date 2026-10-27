@@ -24,7 +24,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use tokio::runtime::Runtime;
 use tokio::task::JoinSet;
 
-use beyond_ai::__bench::key::{VirtualKey, mint};
+use beyond_gateway::__bench::key::{VirtualKey, mint};
 use common::*;
 
 const MANAGED_BODY: &str = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;

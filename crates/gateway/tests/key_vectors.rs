@@ -4,7 +4,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use beyond_ai::__test::key::{KeyError, Keyring, VirtualKey, mint, mint_v2, mint_v3};
+use beyond_gateway::__test::key::{KeyError, Keyring, VirtualKey, mint, mint_v2, mint_v3};
 use serde_json::Value;
 
 fn vectors() -> Value {

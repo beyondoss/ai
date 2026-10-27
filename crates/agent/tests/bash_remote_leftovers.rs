@@ -15,8 +15,8 @@ use crate::common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use beyond_ai_agent::exec_endpoint::{HttpExecRunner, TemplateRunner};
-use beyond_ai_agent::tools::exec::CommandRunner;
+use beyond_agent::exec_endpoint::{HttpExecRunner, TemplateRunner};
+use beyond_agent::tools::exec::CommandRunner;
 use common::exec_mock::{ExecMock, MockOptions, StreamEnd};
 use common::remote_bash::{call, job_number, remote_bash};
 use serde_json::json;

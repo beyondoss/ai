@@ -16,7 +16,7 @@ use std::path::Path;
 use std::process::Stdio;
 
 use agent_core::{ContentBlock, Message, Session};
-use beyond_ai_agent::session_store::{SessionMeta, SessionStore, lock_session_writer};
+use beyond_agent::session_store::{SessionMeta, SessionStore, lock_session_writer};
 use common::{SpawnGuarded, run_cmd, serve_cmd, spawn_model_server, turn_text};
 
 /// A two-message session at `path`, ending in a torn line — what a writer mid-append looks like from

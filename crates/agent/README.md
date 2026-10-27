@@ -49,7 +49,7 @@ curl -fsSL "https://github.com/beyondoss/ai/releases/download/$V/beyond-ai-agent
 ./beyond-ai-agent --version
 ```
 
-From a checkout, `cargo run -p beyond-ai-agent -- <args>` runs the same binary.
+From a checkout, `cargo run -p beyond-agent -- <args>` runs the same binary.
 
 ## Try it
 
@@ -259,7 +259,7 @@ Try it locally with execd, no model needed. In one terminal:
 ```sh
 mkdir -p /tmp/ws /tmp/ws-home
 EXECD_LISTEN=127.0.0.1:8081 EXECD_ROOT=/tmp/ws EXECD_HOME=/tmp/ws-home \
-  cargo run -p beyond-ai-execd
+  cargo run -p beyond-execd
 ```
 
 In another, run `bash` through it with a `serve` command (the dummy key only satisfies startup):
@@ -293,7 +293,7 @@ disconnect, leftover processes, job scopes):
 ```sh
 AGENT_CONFORMANCE_EXEC_URL=https://exec.internal/run \
 AGENT_CONFORMANCE_EXEC_HEADER='Authorization: Bearer ...' \
-  cargo nextest run -p beyond-ai-agent -E 'test(/^exec_conformance::/)' --no-capture
+  cargo nextest run -p beyond-agent -E 'test(/^exec_conformance::/)' --no-capture
 ```
 
 [`BEYOND.md`](BEYOND.md) lists the other conformance kits (exec front,
@@ -354,7 +354,7 @@ metadata, never session text.
 - [`FLEET.md`](FLEET.md): running service-mode replicas as a fleet.
 - [`BEYOND.md`](BEYOND.md): what a hosting platform must provide, with the
   conformance kits.
-- [`beyond-ai-agent-core`](../agent-core/README.md): the loop this crate
+- [`beyond-agent-core`](../agent-core/README.md): the loop this crate
   builds on.
 - `beyond-ai-agent <command> --help`: every flag, with its `AI_AGENT_*`
   variable.
