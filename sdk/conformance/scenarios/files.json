@@ -5547,7 +5547,8 @@
               "agent-reference",
               "beyond-sandbox-ts",
               "python",
-              "python-async"
+              "python-async",
+              "sandbox-mcp"
             ],
             "reason": "the write script reads the temp back to check its size, and the temp has mode 0200"
           },
@@ -5570,7 +5571,8 @@
               "agent-reference",
               "beyond-sandbox-ts",
               "python",
-              "python-async"
+              "python-async",
+              "sandbox-mcp"
             ],
             "reason": "the write was refused"
           },
