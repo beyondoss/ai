@@ -459,8 +459,9 @@ share exit 2:
 for a match and `-` for a context line. Parse by scanning for the **NUL**, not
 for newlines: a path may contain a newline. At each position, first check for
 a group separator: the bytes `--` + LF (or `--` at the very end) are skipped.
-(ripgrep with `--crlf` writes `--` + CR + LF; a client MUST skip that too:
-D5.) Otherwise the path runs to the next NUL, the rest of the record to the
+(ripgrep with `--crlf` writes `--` + CR + LF; a client MUST skip that too.
+A file actually named `--` is not mistaken for a separator: its record is
+`--` NUL ..., so the byte after `--` (or `--` CR) is NUL, not LF.) Otherwise the path runs to the next NUL, the rest of the record to the
 next LF; `LINE` is one or more digits followed by `:` or `-`; a record that
 does not fit is dropped.
 
@@ -722,8 +723,3 @@ reference driver, which turns into a plain pass when the reference is fixed.
   while `kind` follows the link, so `write_if_unchanged` through a link
   compares the wrong file. Scenarios `files.stat.symlink-size-and-mtime-follow`
   and `files.write-if-unchanged.through-symlink`.
-- **D5. Context separator with `rg --crlf`.** The separator is `--` CR LF,
-  which the reference parser does not recognise: the next hit's path becomes
-  `--\r\n/real/path`, so it sorts and prints wrongly. Affects any search with
-  context whose groups are not adjacent. Scenarios `files.search.context-lines`
-  and `files.search.limit-counts-only-matches-and-drops-dangling-context`.
