@@ -2032,7 +2032,8 @@ as `write("/home/…/f")` would.
   fast with a clear error, matching `edit`'s identical pre-check just below (the OS itself would
   otherwise never see this: `rename(2)` only consults the _containing directory's_ write permission,
   not the target file's own mode bits). If `path` is itself a symlink, `write_atomic` resolves it first
-  (`canonicalize`, falling back to a single `read_link` hop for a dangling target) and writes through to
+  (every link followed one `read_link` hop at a time, live or dangling, at most 40 hops; a loop fails
+  with ELOOP and changes nothing, exactly as `ShellFs` does) and writes through to
   the real file — `rename(2)` never follows a trailing symlink at its destination, it replaces the
   directory entry itself, so writing straight to a symlinked path would otherwise sever the link (a
   fresh regular file landing at the link's own path) while leaving the real target untouched; matches
@@ -2821,9 +2822,16 @@ One `POST` per command:
 { "exit_code": 0, "stdout": "hello", "stderr": "" }
 ```
 
-v1.1 is v1 plus one optional request field, **`stdin_base64`**: standard base64 of the bytes to write
+v1.1 is v1 plus two optional request fields. **`stdin_base64`**: standard base64 of the bytes to write
 to the command's stdin, which is then closed. Absent, the command gets no stdin: v1 behavior. A v1
-endpoint keeps working unchanged. It just never gets stdin.
+endpoint keeps working unchanged. It just never gets stdin. **`output_base64`**: `true` asks for the
+answer's `stdout`/`stderr` as `stdout_base64`/`stderr_base64`, the bytes the command wrote, instead of
+JSON strings (which cannot carry invalid UTF-8: an endpoint replaces it with U+FFFD and answers
+success with corrupt data). Raw exec (`Sandbox::exec`, the other clients' `exec`) returns bytes with an
+`exact` flag: over `output_base64` when a probe (`printf '\377\000\n'`) shows the endpoint honours it,
+else over a v1.2 stream's base64 frames, else the endpoint's text with `exact: false`. The file and job
+helpers read text and keep the plain answer. The spec ("Exact output") is the module doc of
+`crates/sandbox/src/exec_endpoint.rs`; the verifier checks any endpoint that answers the probe.
 
 **Why stdin exists: the 128 KiB argv limit.** A remote write used to ship the whole file as _one_
 base64 argv entry, and Linux caps a single argv string at 128 KiB (`MAX_ARG_STRLEN`), so every
@@ -2844,9 +2852,10 @@ between chunks.
 
 Both paths also keep the rest of `FsBackend::write_bytes`'s contract, which is written down once on
 that trait method and checked on every backend by `tests/fs_backend_parity.rs`. Every write script
-starts by resolving the target the way `LocalFs` does: `readlink -f` for a link whose target exists,
-and for a dangling link (which busybox's `readlink -f` resolves against the working directory) a hop-by-hop `readlink`
-chain, each relative target joined to its link's directory, at most 40 hops. It then names the temp beside the resolved file, so a write through a symlink
+starts by resolving the target the way `LocalFs` does: a hop-by-hop `readlink` chain, each relative target joined to its link's
+directory, at most 40 hops (`readlink -f` is not used: it is unbounded in time and memory on an adversarial chain, and busybox
+resolves a dangling link's relative target against the working directory). A chain still a link after 40 hops is a loop: the
+write fails with `Too many levels of symbolic links (os error 40)` and changes nothing. It then names the temp beside the resolved file, so a write through a symlink
 lands in its target and the link stays a link. The temp is created empty and given the existing file's
 mode before any content goes in, with `chmod --reference` or, on busybox, which has no
 `--reference`, `chmod "$(stat -L -c %a ...)"`. A mode that cannot be copied fails the write. Before

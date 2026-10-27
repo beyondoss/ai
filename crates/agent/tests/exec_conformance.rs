@@ -77,7 +77,7 @@ async fn a_conforming_endpoint_passes_every_check() {
         .map(|c| c.name)
         .collect();
     assert_eq!(skipped, conformance::notify::CHECKS, "{}", report.render());
-    assert_eq!(report.checks.len(), 18 + conformance::notify::CHECKS.len());
+    assert_eq!(report.checks.len(), 20 + conformance::notify::CHECKS.len());
 }
 
 /// The reference v1.4 endpoint passes every check, the v1.4 ones included.
@@ -98,7 +98,7 @@ async fn a_conforming_v14_endpoint_passes_every_check() {
         "{}",
         report.render()
     );
-    assert_eq!(report.checks.len(), 18 + conformance::notify::CHECKS.len());
+    assert_eq!(report.checks.len(), 20 + conformance::notify::CHECKS.len());
     assert!(report.render().contains("v1.4"), "{}", report.render());
 }
 
@@ -456,6 +456,67 @@ async fn an_endpoint_that_ignores_the_v11_timeout_fails_that_check_alone() {
         "{}",
         report.render()
     );
+}
+
+/// An endpoint that answers `output_base64` with the base64 fields but converts through lossy UTF-8
+/// first claims what it does not deliver: the verifier must catch it, and only it.
+#[tokio::test]
+async fn an_endpoint_that_base64s_lossy_text_fails_the_byte_check_alone() {
+    let (opts, expect) = quick();
+    let report = verify_mock(
+        MockOptions {
+            lossy_output_base64: true,
+            ..opts
+        },
+        &expect,
+    )
+    .await;
+    let failed: Vec<&str> = report
+        .checks
+        .iter()
+        .filter(|c| c.verdict == Verdict::Fail)
+        .map(|c| c.name)
+        .collect();
+    // The probe's `ff` also came back as U+FFFD, so the claim itself is the first thing wrong.
+    assert_eq!(
+        failed,
+        vec![conformance::OUTPUT_BASE64, conformance::OUTPUT_BYTES],
+        "{}",
+        report.render()
+    );
+    assert!(
+        report
+            .check(conformance::OUTPUT_BYTES)
+            .unwrap()
+            .detail
+            .contains("first difference"),
+        "{}",
+        report.render()
+    );
+}
+
+/// An endpoint that predates `output_base64` is not held to it: a plain v1.1 or v1.2 endpoint passes
+/// with the two checks skipped.
+#[tokio::test]
+async fn an_endpoint_without_output_base64_passes_with_its_checks_skipped() {
+    let (opts, expect) = quick();
+    let report = verify_mock(
+        MockOptions {
+            honors_output_base64: false,
+            ..opts
+        },
+        &expect,
+    )
+    .await;
+    assert!(report.passed(), "{}", report.render());
+    for name in [conformance::OUTPUT_BASE64, conformance::OUTPUT_BYTES] {
+        assert_eq!(
+            report.check(name).unwrap().verdict,
+            Verdict::Skip,
+            "{}",
+            report.render()
+        );
+    }
 }
 
 #[tokio::test]

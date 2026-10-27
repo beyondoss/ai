@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use bytes::Bytes;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, Sleep};
@@ -134,6 +134,18 @@ async fn capture<R: tokio::io::AsyncRead + Unpin>(
 const TIMEOUT_EXIT: i32 = 124;
 const TIMEOUT_NOTE: &str = "command exceeded its timeout";
 
+/// A v1.1 answer. `exact` (the request's `output_base64`) sends the bytes as `stdout_base64` and
+/// `stderr_base64`, both always present, instead of text: no lossy conversion, ever.
+fn answer(exact: bool, code: i32, stdout: &[u8], stderr: &[u8]) -> Value {
+    if exact {
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        json!({ "exit_code": code, "stdout_base64": b64(stdout), "stderr_base64": b64(stderr) })
+    } else {
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        json!({ "exit_code": code, "stdout": text(stdout), "stderr": text(stderr) })
+    }
+}
+
 /// v1.1: run to completion, answer with one object.
 pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
     let line = Line::new("exec", &req.command);
@@ -160,7 +172,7 @@ pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
             line.done(200, "spawn failed");
             return http::json_response(
                 200,
-                &json!({ "exit_code": 127, "stdout": "", "stderr": e.to_string() }),
+                &answer(req.wants_exact_output(), 127, b"", e.to_string().as_bytes()),
             );
         }
     };
@@ -210,8 +222,7 @@ pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
         a.abort();
     }
     feeder.abort();
-    let take =
-        |m: &Arc<std::sync::Mutex<Vec<u8>>>| String::from_utf8_lossy(&locked(m)).into_owned();
+    let take = |m: &Arc<std::sync::Mutex<Vec<u8>>>| std::mem::take(&mut *locked(m));
     if dropped.load(Ordering::Relaxed) {
         // Output past the cap was thrown away, so there is no honest result to return: a prefix
         // presented as the output would be a confident wrong answer. 422, not 5xx or 413: the
@@ -228,23 +239,24 @@ pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
             ),
         );
     }
+    let exact = req.wants_exact_output();
     let payload = match status {
         Ok(_) if timed_out => {
             line.done(200, "timed out");
             let mut stderr = take(&err);
-            if !stderr.is_empty() && !stderr.ends_with('\n') {
-                stderr.push('\n');
+            if !stderr.is_empty() && !stderr.ends_with(b"\n") {
+                stderr.push(b'\n');
             }
-            stderr.push_str(TIMEOUT_NOTE);
-            json!({ "exit_code": TIMEOUT_EXIT, "stdout": take(&out), "stderr": stderr })
+            stderr.extend_from_slice(TIMEOUT_NOTE.as_bytes());
+            answer(exact, TIMEOUT_EXIT, &take(&out), &stderr)
         }
         Ok(s) => {
             line.done(200, "exit");
-            json!({ "exit_code": exit_code(s), "stdout": take(&out), "stderr": take(&err) })
+            answer(exact, exit_code(s), &take(&out), &take(&err))
         }
         Err(e) => {
             line.done(200, "wait failed");
-            json!({ "exit_code": 127, "stdout": take(&out), "stderr": e.to_string() })
+            answer(exact, 127, &take(&out), e.to_string().as_bytes())
         }
     };
     http::json_response(200, &payload)

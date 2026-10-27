@@ -1395,3 +1395,157 @@ async fn write_and_edit_go_through_a_symlink_on_every_backend() {
         }
     }
 }
+
+// ------------------------------------------- write through symlinks
+
+/// The tree under `root` as text: every entry's relative path, with a link's target or a file's
+/// content, `root` itself spelled `ROOT`.
+fn snapshot(root: &Path) -> String {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        let mut ents: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        ents.sort();
+        for p in ents {
+            let rel = p.strip_prefix(root).unwrap().display().to_string();
+            let meta = std::fs::symlink_metadata(&p).unwrap();
+            if meta.file_type().is_symlink() {
+                let t = std::fs::read_link(&p).unwrap().display().to_string();
+                out.push(format!(
+                    "{rel} -> {}",
+                    t.replace(root.to_str().unwrap(), "ROOT")
+                ));
+            } else if meta.is_dir() {
+                out.push(format!("{rel}/"));
+                walk(root, &p, out);
+            } else {
+                out.push(format!("{rel}: {:?}", std::fs::read_to_string(&p).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.join("\n")
+}
+
+/// Write `x` to `<root>/<target>` on every backend over the tree `build` makes, and require the same
+/// outcome class and the same resulting tree. Returns the outcome class and tree of `local`.
+async fn write_through_links_identically(
+    build: impl Fn(&Path),
+    target: &str,
+) -> (&'static str, String) {
+    let mut seen: Vec<(&str, &'static str, String)> = Vec::new();
+    for (name, backend) in all_backends().await {
+        let dir = tempfile::tempdir().unwrap();
+        build(dir.path());
+        let p = dir.path().join(target);
+        let reg = registry_for(Some(backend));
+        let outcome = match tool_of(&reg, "write")
+            .run(json!({ "path": p.to_str().unwrap(), "content": "x" }))
+            .await
+        {
+            Ok(_) => "ok",
+            Err(e) => {
+                let m = e.to_string();
+                if m.contains("os error 40") || m.contains("Too many levels") {
+                    "eloop"
+                } else if m.contains("No such file") || m.contains("nonexistent") {
+                    "not_found"
+                } else {
+                    panic!("{name}: unclassified error: {m}")
+                }
+            }
+        };
+        seen.push((name, outcome, snapshot(dir.path())));
+    }
+    let (n0, o0, t0) = seen[0].clone();
+    for (n, o, t) in &seen[1..] {
+        assert_eq!((o0, &t0), (*o, t), "{n0} and {n} disagreed");
+    }
+    (o0, t0)
+}
+
+fn ln(target: &str, at: &Path) {
+    std::os::unix::fs::symlink(target, at).unwrap();
+}
+
+#[tokio::test]
+async fn write_through_a_two_link_loop_fails_identically_and_changes_nothing() {
+    let (o, tree) = write_through_links_identically(
+        |r| {
+            ln("b", &r.join("a"));
+            ln("a", &r.join("b"));
+        },
+        "a",
+    )
+    .await;
+    assert_eq!(o, "eloop");
+    assert_eq!(tree, "a -> b\nb -> a");
+}
+
+#[tokio::test]
+async fn write_through_a_self_loop_fails_identically_and_changes_nothing() {
+    let (o, tree) = write_through_links_identically(|r| ln("s", &r.join("s")), "s").await;
+    assert_eq!(o, "eloop");
+    assert_eq!(tree, "s -> s");
+}
+
+#[tokio::test]
+async fn write_through_a_three_hop_dangling_chain_across_directories_is_identical() {
+    let (o, tree) = write_through_links_identically(
+        |r| {
+            std::fs::create_dir_all(r.join("a")).unwrap();
+            std::fs::create_dir_all(r.join("b")).unwrap();
+            ln("../b/l2", &r.join("a/l1"));
+            ln("../a/l3", &r.join("b/l2"));
+            ln("../a/final.txt", &r.join("a/l3"));
+            ln("a/l1", &r.join("l0"));
+        },
+        "l0",
+    )
+    .await;
+    assert_eq!(o, "ok");
+    assert!(tree.contains("a/final.txt: \"x\""), "{tree}");
+    assert!(tree.contains("l0 -> a/l1"), "{tree}");
+}
+
+#[tokio::test]
+async fn write_through_an_absolute_dangling_target_is_identical() {
+    // The absolute target names the tree's own root, which differs per backend run; `snapshot`
+    // spells it ROOT, so the trees compare equal.
+    let (o, tree) = write_through_links_identically(
+        |r| ln(r.join("made.txt").to_str().unwrap(), &r.join("l")),
+        "l",
+    )
+    .await;
+    assert_eq!(o, "ok");
+    assert!(tree.contains("made.txt: \"x\""), "{tree}");
+    assert!(tree.contains("l -> ROOT/made.txt"), "{tree}");
+}
+
+#[tokio::test]
+async fn write_through_a_dangling_target_in_a_missing_directory_is_not_found_identically() {
+    let (o, tree) = write_through_links_identically(|r| ln("nodir/f.txt", &r.join("l")), "l").await;
+    assert_eq!(o, "not_found");
+    assert_eq!(tree, "l -> nodir/f.txt");
+}
+
+#[tokio::test]
+async fn write_through_a_link_fan_out_fails_identically_and_fast() {
+    let (o, tree) = write_through_links_identically(
+        |r| {
+            ln(".", &r.join("l0"));
+            for i in 1..=12 {
+                let p = format!("l{}", i - 1);
+                ln(&format!("{p}/{p}/{p}"), &r.join(format!("l{i}")));
+            }
+        },
+        "l12",
+    )
+    .await;
+    // ShellFs reports the kernel's ELOOP as an io error, LocalFs as ELOOP: both are "eloop" here.
+    assert_eq!(o, "eloop");
+    assert!(tree.contains("l12 -> l11/l11/l11"), "{tree}");
+    assert!(!tree.contains(".tmp"), "{tree}");
+}

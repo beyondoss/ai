@@ -71,7 +71,9 @@ async fn a_sandbox_over_a_test_written_transport_has_all_three_layers() {
         .run()
         .await
         .unwrap();
-    assert_eq!(out.stdout, format!("sh\n{}\n", root.display()));
+    assert_eq!(out.stdout_text(), format!("sh\n{}\n", root.display()));
+    // `LocalSh` implements `run` only: its text is not claimed to be the bytes.
+    assert!(!out.exact);
 
     let piped = sandbox
         .exec("cat", [] as [&str; 0])
@@ -79,7 +81,7 @@ async fn a_sandbox_over_a_test_written_transport_has_all_three_layers() {
         .run()
         .await
         .unwrap();
-    assert_eq!(piped.stdout, "in");
+    assert_eq!(piped.stdout, b"in");
 
     let file = root.join("notes.txt");
     sandbox

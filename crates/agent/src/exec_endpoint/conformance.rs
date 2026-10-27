@@ -147,6 +147,8 @@ impl Report {
 
 pub const ENVELOPE: &str = "v1.1 envelope";
 pub const ENVELOPE_TIMEOUT: &str = "v1.1 timeout kills the process group";
+pub const OUTPUT_BASE64: &str = "exact output offered (v1.1 output_base64)";
+pub const OUTPUT_BYTES: &str = "output_base64 returns every byte value intact";
 pub const CONTENT_TYPE: &str = "stream content type";
 pub const INCREMENTAL: &str = "incremental delivery (the probe)";
 pub const BYTES: &str = "bytes and streams survive exactly";
@@ -197,6 +199,7 @@ pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectatio
     };
 
     let mut checks = vec![v.envelope().await, v.envelope_timeout().await];
+    checks.extend(v.exact_output().await);
     let streams = match v.run("printf a", Duration::from_secs(10)).await {
         Ok(Exchange::Stream { .. }) => {
             checks.push(pass(CONTENT_TYPE, format!("`{}`", stream::NDJSON)));
@@ -275,6 +278,23 @@ pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectatio
         jobs,
         notify,
         checks,
+    }
+}
+
+/// Where two byte strings first differ, for a failure message.
+fn first_difference(got: &[u8], want: &[u8]) -> Option<String> {
+    let at = got.iter().zip(want).position(|(a, b)| a != b);
+    match at {
+        Some(i) => Some(format!(
+            "byte {i} is {:#04x}, wanted {:#04x}",
+            got[i], want[i]
+        )),
+        None if got.len() != want.len() => Some(format!(
+            "{} bytes where {} were wanted",
+            got.len(),
+            want.len()
+        )),
+        None => None,
     }
 }
 
@@ -494,6 +514,139 @@ impl Verifier {
         };
         let _ = self.sh(&format!("rm -f {marker}")).await;
         check
+    }
+
+    /// One v1.1 request carrying `output_base64`, its answer as JSON.
+    async fn exact_answer(&self, script: &str) -> Result<serde_json::Value, String> {
+        let resp = self
+            .runner
+            .send_exact(
+                "sh",
+                &Self::args(script),
+                None,
+                Duration::from_secs(10),
+                None,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let (body, over) = self
+            .runner
+            .read_capped(resp)
+            .await
+            .map_err(|e| e.to_string())?;
+        if over {
+            return Err("the answer exceeded the response cap".to_string());
+        }
+        serde_json::from_slice(&body).map_err(|e| format!("unparseable JSON ({e})"))
+    }
+
+    /// An `output_base64` answer taken apart: the exit code and the decoded streams. Everything the
+    /// spec says an honouring endpoint MUST do is checked here: both fields present, standard
+    /// base64, and no text fields beside them.
+    fn exact_parts(v: &serde_json::Value) -> Result<(i64, Vec<u8>, Vec<u8>), String> {
+        use base64::Engine as _;
+        let field = |key: &str| -> Result<Vec<u8>, String> {
+            let s = v[key]
+                .as_str()
+                .ok_or_else(|| format!("`{key}` is missing or not a string"))?;
+            base64::engine::general_purpose::STANDARD
+                .decode(s)
+                .map_err(|e| format!("`{key}` is not standard base64 with padding ({e})"))
+        };
+        if v.get("stdout").is_some() || v.get("stderr").is_some() {
+            return Err(
+                "the answer carries `stdout`/`stderr` text beside the base64 fields".into(),
+            );
+        }
+        let code = v["exit_code"]
+            .as_i64()
+            .ok_or_else(|| "no integer `exit_code`".to_string())?;
+        Ok((code, field("stdout_base64")?, field("stderr_base64")?))
+    }
+
+    /// Exact output (v1.1 `output_base64`): optional, probed the way a client probes it, and an
+    /// endpoint that answers with either base64 field is held to all of it.
+    async fn exact_output(&self) -> [Check; 2] {
+        let probe = match self.exact_answer(r"printf '\377\000\n'").await {
+            Ok(v) => v,
+            Err(e) => {
+                return [
+                    fail(OUTPUT_BASE64, e),
+                    skip(OUTPUT_BYTES, "the probe request failed"),
+                ];
+            }
+        };
+        if probe.get("stdout_base64").is_none() && probe.get("stderr_base64").is_none() {
+            return [
+                skip(
+                    OUTPUT_BASE64,
+                    "answers text: a plain v1.1 endpoint (raw exec output through it is inexact; clients \
+                     say so, or use a v1.2 stream)",
+                ),
+                skip(OUTPUT_BYTES, "output_base64 is not offered"),
+            ];
+        }
+        let offered = match Self::exact_parts(&probe) {
+            Ok((0, out, err)) if out == [0xff, 0x00, 0x0a] && err.is_empty() => pass(
+                OUTPUT_BASE64,
+                "`ff 00 0a` came back as `stdout_base64`, `stderr_base64` empty",
+            ),
+            Ok((code, out, err)) => fail(
+                OUTPUT_BASE64,
+                format!(
+                    "expected exit 0, stdout ff 00 0a, empty stderr; got exit {code}, stdout {out:?}, stderr {err:?}"
+                ),
+            ),
+            Err(e) => fail(OUTPUT_BASE64, e),
+        };
+        [offered, self.exact_bytes().await]
+    }
+
+    async fn exact_bytes(&self) -> Check {
+        // Every byte value, as a shell writes them: 0x00 and 0x80 to 0xFF are what text cannot hold.
+        let gen_ =
+            r#"i=0; while [ $i -lt 256 ]; do printf "\\$(printf %03o $i)"; i=$((i+1)); done"#;
+        let all: Vec<u8> = (0..=255u8).collect();
+        let cases = [
+            ("stdout", gen_.to_string(), 0, all.clone(), Vec::new()),
+            ("stderr", format!("{gen_} >&2"), 0, Vec::new(), all),
+            (
+                "both streams and an exit code",
+                r"printf '\377\000\001'; printf '\376\000\002' >&2; exit 3".to_string(),
+                3,
+                vec![0xff, 0x00, 0x01],
+                vec![0xfe, 0x00, 0x02],
+            ),
+        ];
+        for (what, script, code, want_out, want_err) in cases {
+            let got = match self.exact_answer(&script).await {
+                Ok(v) => Self::exact_parts(&v),
+                Err(e) => Err(e),
+            };
+            match got {
+                Ok((c, out, err)) if c == code && out == want_out && err == want_err => {}
+                Ok((c, out, err)) => {
+                    return fail(
+                        OUTPUT_BYTES,
+                        format!(
+                            "{what}: expected exit {code}, {} stdout bytes, {} stderr bytes; got exit {c}, {} and {} bytes (first difference: {})",
+                            want_out.len(),
+                            want_err.len(),
+                            out.len(),
+                            err.len(),
+                            first_difference(&out, &want_out)
+                                .or_else(|| first_difference(&err, &want_err))
+                                .unwrap_or_else(|| "none in the bytes: the exit code".into()),
+                        ),
+                    );
+                }
+                Err(e) => return fail(OUTPUT_BYTES, format!("{what}: {e}")),
+            }
+        }
+        pass(
+            OUTPUT_BYTES,
+            "all 256 byte values on stdout and on stderr, and both streams with an exit code, came back intact",
+        )
     }
 
     async fn incremental(&self) -> Check {

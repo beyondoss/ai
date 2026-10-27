@@ -113,7 +113,7 @@ def probe_streaming(h: BaseHTTPRequestHandler) -> None:
 def test_run_sends_the_v11_request_and_the_bearer(ep: Endpoint) -> None:
     ep.handler = lambda h, b: reply(h, 200, {"exit_code": 3, "stdout": "o", "stderr": "e"})
     t = HttpTransport(ep.url, "tok", headers={"X-Tenant": "acme"})
-    r = t.run("sh", ["-c", "x"], cwd="/w", timeout_ms=5000, stdin=b"in")
+    r = t.run_text("sh", ["-c", "x"], cwd="/w", timeout_ms=5000, stdin=b"in")
     assert (r.exit_code, r.stdout, r.stderr) == (3, b"o", b"e")
     assert ep.requests[0] == {
         "command": "sh", "args": ["-c", "x"], "cwd": "/w", "timeout_ms": 5000,
@@ -123,7 +123,7 @@ def test_run_sends_the_v11_request_and_the_bearer(ep: Endpoint) -> None:
 
 
 def test_no_token_sends_no_authorization(ep: Endpoint) -> None:
-    HttpTransport(ep.url).run("true")
+    HttpTransport(ep.url).run_text("true")
     assert ep.auth == [None]
 
 
@@ -137,9 +137,9 @@ def test_a_401_refreshes_the_token_once_and_retries_that_request_once(ep: Endpoi
     ep.handler = handler
     tokens = iter(["stale", "fresh", "never"])
     t = HttpTransport(ep.url, lambda: next(tokens))
-    assert t.run("true").stdout == b"ok"
+    assert t.run_text("true").stdout == b"ok"
     assert ep.auth == ["Bearer stale", "Bearer fresh"]
-    assert t.run("true").stdout == b"ok"  # the fresh token is kept, not fetched again
+    assert t.run_text("true").stdout == b"ok"  # the fresh token is kept, not fetched again
     assert ep.auth[2:] == ["Bearer fresh"]
 
 
@@ -219,7 +219,7 @@ def test_the_request_deadline_is_timeout_plus_grace(
     ep.handler = lambda h, b: time.sleep(2)
     t0 = time.monotonic()
     with pytest.raises(Timeout):
-        HttpTransport(ep.url).run("true", timeout_ms=100)
+        HttpTransport(ep.url).run_text("true", timeout_ms=100)
     assert 0.3 <= time.monotonic() - t0 < 1.5
 
 
@@ -341,7 +341,7 @@ def test_async_run_refresh_and_errors(ep: Endpoint) -> None:
             return next(tokens)
 
         t = AsyncHttpTransport(ep.url, token)
-        assert (await t.run("true")).stdout == b"ok"
+        assert (await t.run_text("true")).stdout == b"ok"
         assert ep.auth == ["Bearer stale", "Bearer fresh"]
         ep.handler = lambda h, b: reply(
             h, 200, {"exit_code": 0, "stdout": "x" * 5000, "stderr": ""}

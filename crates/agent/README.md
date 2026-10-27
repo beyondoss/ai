@@ -242,7 +242,8 @@ The spec is the module doc of `src/exec_endpoint.rs`; the prose is
 protocol (v1.1) is one `POST`:
 
 ```jsonc
-// request; cwd and stdin_base64 (standard base64, written to stdin) are optional
+// request; cwd, stdin_base64 (standard base64, written to stdin) and output_base64 (true: answer with
+// stdout_base64/stderr_base64, the exact bytes) are optional
 { "command": "rg", "args": ["--files"], "cwd": "/work", "timeout_ms": 120000 }
 // response, 200
 { "exit_code": 0, "stdout": "...", "stderr": "..." }

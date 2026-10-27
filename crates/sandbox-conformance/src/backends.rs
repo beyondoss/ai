@@ -33,7 +33,12 @@ pub const GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "fault",
-        &["fault-no-stdin", "fault-v11", "fault-baseline-jobs"],
+        &[
+            "fault-no-stdin",
+            "fault-v11",
+            "fault-v12-text",
+            "fault-baseline-jobs",
+        ],
     ),
 ];
 pub const SINGLES: &[&str] = &["alpine", "debian-runas", "readonly", "tinydisk"];
@@ -156,9 +161,10 @@ pub async fn start(name: &str, bins: &Binaries) -> Result<Started, String> {
                 name,
                 MockOptions {
                     honors_stdin: false,
+                    honors_output_base64: false,
                     ..MockOptions::default()
                 },
-                Some(&["files", "errors", "helpers"]),
+                Some(&["files", "errors", "helpers", "exec-bytes"]),
             )
             .await
         }
@@ -168,9 +174,22 @@ pub async fn start(name: &str, bins: &Binaries) -> Result<Started, String> {
                 name,
                 MockOptions {
                     protocol: Protocol::V11,
+                    honors_output_base64: false,
                     ..MockOptions::default()
                 },
-                Some(&["files", "errors", "helpers"]),
+                Some(&["files", "errors", "helpers", "exec-bytes"]),
+            )
+            .await
+        }
+        "fault-v12-text" => {
+            // Streams, but predates `output_base64`: raw exec is exact over a stream.
+            fault(
+                name,
+                MockOptions {
+                    honors_output_base64: false,
+                    ..MockOptions::default()
+                },
+                Some(&["exec-bytes"]),
             )
             .await
         }

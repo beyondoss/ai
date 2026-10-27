@@ -70,24 +70,36 @@ absent or `null`.
 
 ### Meta
 
-| op             | request | result                                                                                       |
-| -------------- | ------- | -------------------------------------------------------------------------------------------- |
-| `hello`        |         | `{driver, protocol: 1, ops: [names]}`: the ops this driver implements                        |
-| `capabilities` |         | `{stdin, stream, jobs: "native"/"baseline"/"none", search_engine, find_printf, read_window}` |
+| op             | request | result                                                                                                                  |
+| -------------- | ------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `hello`        |         | `{driver, protocol: 1, ops: [names]}`: the ops this driver implements                                                   |
+| `capabilities` |         | `{stdin, stream, jobs: "native"/"baseline"/"none", search_engine, find_printf, read_window, output_base64, exact_exec}` |
 
 `hello` MUST succeed without reaching the endpoint. `capabilities` reports what
 the probes found (after `CONFORMANCE_CAPS`), or the connection error if the
-endpoint cannot be used (for example `auth`).
+endpoint cannot be used (for example `auth`). `output_base64` is whether the
+endpoint honours the v1.1 `output_base64` request field (probed), and
+`exact_exec` whether raw `exec` returns the command's bytes: `output_base64`, or
+a stream the client can run the one-shot call over. Both `false` means the
+endpoint can only answer text.
 
 ### Exec (layer 1)
 
 | op            | request                                                                                | result                                                                                  |
 | ------------- | -------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| `exec`        | `command`, `args` (default `[]`), `cwd?`, `timeout_ms?` (default 120000), `stdin_b64?` | `{exit_code, stdout_b64, stderr_b64}`                                                   |
+| `exec`        | `command`, `args` (default `[]`), `cwd?`, `timeout_ms?` (default 120000), `stdin_b64?` | `{exit_code, stdout_b64, stderr_b64, exact}`                                            |
 | `exec_stream` | `command`, `args`, `cwd?`, `timeout_ms?`                                               | `{stdout_b64, stderr_b64}` plus exactly one of `exit_code`, `signal`, `timed_out: true` |
 
 `exec` is the one-shot call (v1.1): a non-zero `exit_code` is a normal result;
-a timeout is `exit_code` 124. `exec_stream` is v1.2: output is collected until
+a timeout is `exit_code` 124 (stderr ending `command exceeded its timeout`), a
+command killed by signal N is `128 + N`. `stdout_b64` and `stderr_b64` are the
+**bytes** the command wrote. `exact` says whether they are all of those bytes,
+unaltered: `true` when the driver's client got them from an endpoint that
+honours `output_base64` or over a v1.2 stream; `false` only when the endpoint
+could answer nothing but text (a plain v1.1 endpoint, which has already replaced
+invalid UTF-8 with U+FFFD), in which case the bytes are the UTF-8 of that text. A
+client MUST NOT report `true` for text. A call with `stdin_b64` on an endpoint
+without `output_base64` is text, `exact: false`. `exec_stream` is v1.2: output is collected until
 the final frame. Without `timeout_ms` the stream has no deadline of its own.
 `not_offered` if the endpoint did not prove it streams; the command is not run
 as a one-shot instead. (The reference driver puts both streams in `stdout_b64`
@@ -245,8 +257,8 @@ failure). Used for job state.
 
 ### requires
 
-All of: `stdin`, `stream`, `find_printf`, `read_window` (booleans, compared with
-`capabilities`); `jobs` (`native`, `baseline`, `any` meaning either);
+All of: `stdin`, `stream`, `find_printf`, `read_window`, `output_base64`,
+`exact_exec` (booleans, compared with `capabilities`); `jobs` (`native`, `baseline`, `any` meaning either);
 `search_engine` (a value or a list of acceptable values); `auth` (true when the
 backend demands a bearer); `not_root` (the sandbox user is not uid 0, so
 permission checks mean something); `commands` (a list that `command -v` finds in

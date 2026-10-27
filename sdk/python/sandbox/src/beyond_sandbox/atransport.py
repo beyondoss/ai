@@ -244,6 +244,7 @@ class AsyncHttpTransport:
         self._ssl = ssl_context
         self._lock = asyncio.Lock()
         self._streams: bool | None = None
+        self._output: bool | None = None
         self._offer: _wire.JobOffer | None = None
 
     async def _bearer(self, refresh: bool) -> list[tuple[str, str]]:
@@ -299,10 +300,10 @@ class AsyncHttpTransport:
             return await self._open(body, timeout_ms, refresh=True)
         raise _wire.status_error(self.url, parsed.status, err_body)
 
-    async def _post(self, body: bytes, timeout_ms: int) -> bytes:
+    async def _post(self, body: bytes, timeout_ms: int, cap: int | None = None) -> bytes:
         resp = await self._open(body, timeout_ms)
         try:
-            return await resp.read_capped(self._cap)
+            return await resp.read_capped(self._cap if cap is None else cap)
         finally:
             await resp.close()
 
@@ -315,8 +316,76 @@ class AsyncHttpTransport:
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
         stdin: bytes | None = None,
     ) -> ExecResult:
+        """As :meth:`HttpTransport.run`: the command's bytes, ``exact`` or said not to be."""
+        if await self.outputs_base64():
+            body = _wire.request_body(
+                command, args, cwd=cwd, timeout_ms=timeout_ms, stdin=stdin, output_base64=True
+            )
+            raw = await self._post(body, timeout_ms, _wire.body_cap(self._cap))
+            return _wire.decode_output(self.url, raw, self._cap)
+        if stdin is None and await self.streams():
+            return await self._run_over_stream(command, args, cwd, timeout_ms)
+        return await self.run_text(command, args, cwd=cwd, timeout_ms=timeout_ms, stdin=stdin)
+
+    async def run_text(
+        self,
+        command: str,
+        args: Sequence[str] = (),
+        *,
+        cwd: str | None = None,
+        timeout_ms: int = DEFAULT_TIMEOUT_MS,
+        stdin: bytes | None = None,
+    ) -> ExecResult:
+        """:meth:`run` the plain v1.1 way (``exact=False``), for the helpers."""
         body = _wire.request_body(command, args, cwd=cwd, timeout_ms=timeout_ms, stdin=stdin)
         return _wire.parse_envelope(self.url, await self._post(body, timeout_ms))
+
+    async def outputs_base64(self) -> bool:
+        """As :meth:`HttpTransport.outputs_base64`."""
+        if self._output is None:
+            body = _wire.request_body(
+                "sh",
+                ["-c", _wire.OUTPUT_PROBE_SCRIPT],
+                cwd=None,
+                timeout_ms=10_000,
+                output_base64=True,
+            )
+            try:
+                raw = await self._post(body, 10_000, _wire.body_cap(len(_wire.OUTPUT_PROBE_BYTES)))
+            except EndpointError as e:
+                if e.status != 400:
+                    raise
+                self._output = False
+                return False
+            obj = _wire.parse_json(self.url, raw)
+            if not isinstance(obj, dict) or not isinstance(obj.get("exit_code"), int):
+                raise ProtocolError(
+                    f"exec endpoint {self.url} returned unparseable JSON (no exit_code)"
+                )
+            self._output = _wire.probe_honoured(obj)
+        return self._output
+
+    async def _run_over_stream(
+        self, command: str, args: Sequence[str], cwd: str | None, timeout_ms: int
+    ) -> ExecResult:
+        body = _wire.request_body(command, args, cwd=cwd, timeout_ms=timeout_ms, stream=True)
+        resp = await self._open(body, timeout_ms)
+        try:
+            if not resp.headers.get("content-type", "").lower().startswith("application/x-ndjson"):
+                return _wire.parse_envelope(self.url, await resp.read_capped(self._cap))
+            decoder, fold = _wire.frame_decoder(), _wire.OneShot()
+            while True:
+                data = await resp.next_chunk(_wire.SILENCE_S)
+                if not data:
+                    decoder.eof()
+                for frame in decoder.feed(data):
+                    done = fold.feed(frame)
+                    if done is not None:
+                        return done
+                    if fold.size > self._cap:
+                        raise _wire.too_large(self.url, self._cap)
+        finally:
+            await resp.close()
 
     async def streams(self) -> bool:
         if self._streams is None:

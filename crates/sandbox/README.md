@@ -16,7 +16,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         TokenSource::command(["mint-exec-token"]),
     )
     .await?;
-    println!("{}", sb.exec("uname", ["-a"]).run().await?.stdout);
+    let uname = sb.exec("uname", ["-a"]).run().await?; // stdout and stderr are bytes
+    assert!(uname.exact); // ...and these are exactly what the command wrote
+    println!("{}", uname.stdout_text());
     sb.files()
         .write_bytes("/work/hello.txt".as_ref(), b"hi\n".to_vec())
         .await?;
@@ -61,6 +63,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Write a transport for anything that can run a command (a vendor SDK, a test double) by implementing `Exec::run`; every
 other method has a safe default (`Unsupported`, or a deadline), and the helpers probe what the transport can do.
+
+**Raw output is bytes.** `sb.exec(..).run()` returns stdout and stderr as `Vec<u8>` and an `exact` flag. Over an endpoint
+that honours `output_base64` (`execd` does) or streams (v1.2) the bytes are exactly what the command wrote; a `tar`, a
+`gzip` or a `cat` of a binary comes back intact. A plain v1.1 endpoint can only answer text (it already replaced invalid
+UTF-8 with U+FFFD), so the result carries that text as UTF-8 and `exact: false`: the client does not pass text off as
+bytes. A transport of your own returns its bytes by implementing `Exec::run_exact`; the default wraps `run` and is
+`exact: false`.
 
 ## Protocol and conformance
 
