@@ -12,7 +12,7 @@ import binascii
 import contextlib
 import re
 import secrets
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Sequence
 
 from . import _scripts
@@ -395,7 +395,8 @@ def rg_args(q: Query, in_git_repo: bool) -> list[str]:
 def posix_grep_args(q: Query, gnu: bool) -> list[str]:
     args = ["-r", "-n", "-H"]
     if gnu:
-        args += ["-Z", "-I", "--color=never"]
+        # -b: the offset of each line, which a second run's ``-o -b`` match offsets turn into a column.
+        args += ["-Z", "-I", "--color=never", "-b"]
     args.append("-F" if q.literal else "-E")
     if q.ignore_case:
         args.append("-i")
@@ -518,7 +519,18 @@ def _eol(s: str) -> str:
     return s.replace("\r", "") if "\r" in s else s
 
 
-def parse_records(stdout: str, columns: bool = False) -> list[Hit]:
+@dataclass(slots=True)
+class LongLine:
+    """A long match line of a GNU ``grep`` run, whose column the second run finds."""
+
+    index: int
+    line_start: int
+    raw: str
+
+
+def parse_records(
+    stdout: str, columns: bool | str = False, longs: list[LongLine] | None = None
+) -> list[Hit]:
     """``PATH NUL LINE SEP TEXT LF`` records of ``rg --null`` and ``grep -Z``.
 
     Scans for the NUL, not for newlines: a path may contain a newline. The group separator is
@@ -542,7 +554,7 @@ def parse_records(stdout: str, columns: bool = False) -> list[Hit]:
         nl = stdout.find("\n", nul)
         if nl < 0:
             nl = n
-        hit = _parse_body(stdout[i:nul], stdout[nul + 1 : nl], columns)
+        hit = _parse_body(stdout[i:nul], stdout[nul + 1 : nl], columns, longs, len(hits))
         if hit is not None:
             hits.append(hit)
         i = nl + 1
@@ -552,24 +564,60 @@ def parse_records(stdout: str, columns: bool = False) -> list[Hit]:
 _BODY = re.compile(r"([0-9]+)([:-])", re.S)
 
 
-_COLUMN = re.compile(r"([0-9]+):", re.S)
+_NUM = re.compile(r"([0-9]+)", re.S)
 
 
-def _parse_body(path: str, rest: str, columns: bool) -> Hit | None:
+def _parse_body(
+    path: str, rest: str, columns: bool | str, longs: list[LongLine] | None, index: int
+) -> Hit | None:
     m = _BODY.match(rest)
     if m is None:
         return None
-    is_match = m.group(2) == ":"
+    sep = m.group(2)
+    is_match = sep == ":"
     text_ = rest[m.end() :]
     col = None
-    # ``rg --column``: a match record is ``LINE:COL:TEXT``, a context record ``LINE-TEXT``.
-    if columns and is_match:
-        c = _COLUMN.match(text_)
-        if c is None:
+    # ``rg --column``: a match record is ``LINE:COL:TEXT``, a context record ``LINE-TEXT``. GNU
+    # ``grep -b`` ("gnu"): ``LINE:OFFSET:TEXT`` and ``LINE-OFFSET-TEXT``, the offset of the line start.
+    if columns == "gnu" or (columns and is_match):
+        c = _NUM.match(text_)
+        if c is None or text_[c.end() : c.end() + 1] != sep:
             return None
-        col = int(c.group(1))
-        text_ = text_[c.end() :]
+        n = int(c.group(1))
+        text_ = text_[c.end() + 1 :]
+        if columns == "gnu":
+            if is_match and longs is not None and len(text_) > MAX_LINE:
+                longs.append(LongLine(index, n, text_))
+        else:
+            col = n
     return Hit(path, int(m.group(1)), clip_at(_eol(text_), match_offset(text_, col)), is_match)
+
+
+def window_long_lines(hits: list[Hit], longs: list[LongLine], stdout: str) -> None:
+    """Clip the long match lines of a GNU ``grep`` run from a second run with ``-o -b`` and no
+    context: the file offset of a line's first match less the line's offset is the byte column
+    ``rg --column`` would have given."""
+    first: dict[tuple[str, int], int] = {}
+    i, n = 0, len(stdout)
+    while i < n:
+        nul = stdout.find("\0", i)
+        if nul < 0:
+            break
+        nl = stdout.find("\n", nul)
+        if nl < 0:
+            nl = n
+        m = re.match(r"([0-9]+):([0-9]+):", stdout[nul + 1 : nl])
+        if m:
+            first.setdefault((stdout[i:nul], int(m.group(1))), int(m.group(2)))
+        i = nl + 1
+    for long in longs:
+        hit = hits[long.index]
+        off = first.get((hit.path, hit.line))
+        if off is None or off < long.line_start:
+            continue
+        cs = match_offset(long.raw, off - long.line_start + 1)
+        if cs is not None:
+            hits[long.index] = replace(hit, text=clip_at(_eol(long.raw), cs))
 
 
 def split_colon_record(line: str) -> tuple[str, int, bool, str] | None:
@@ -814,11 +862,16 @@ def search(q: Query, state: FsState, caps: Capabilities) -> Op[SearchResult]:
             raise NotFound(failure.note)
         note = failure.note
     stdout = text(r.stdout)
+    longs: list[LongLine] = []
     hits = (
         parse_colon_records(stdout, q)
         if engine == "busybox-grep"
-        else parse_records(stdout, engine == "rg")
+        else parse_records(stdout, True if engine == "rg" else "gnu", longs)
     )
+    if longs:
+        second = yield Run("grep", ["-o", *posix_grep_args(replace(q, before=0, after=0), True)])
+        if second.exit_code in (0, 1, 2):
+            window_long_lines(hits, longs, text(second.stdout))
     hits = [h for h in hits if not is_under_git_dir(q.root, h.path)]
     hits, truncated = finalize(hits, q.limit)
     if note is None:

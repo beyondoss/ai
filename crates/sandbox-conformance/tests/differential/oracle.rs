@@ -455,7 +455,7 @@ pub fn after(
             want.exact &= !ctx.busybox;
             // GNU grep applies `--include`/`--exclude` to a file named on the command line, ripgrep
             // searches it whatever the glob says: the model is ripgrep's.
-            want.exact &= !(ctx.engine == Engine::Grep && glob.is_some() && root.is_file());
+            want.exact &= !(ctx.engine != Engine::Rg && glob.is_some() && root.is_file());
             match (ok, err) {
                 (None, Some(e)) => {
                     let k = kind_of(e);

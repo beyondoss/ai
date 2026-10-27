@@ -2274,7 +2274,7 @@ characters keeps the head clip. A head clip hid a match at column 100,000 of a m
 lockfile or SVG entirely, and `read` (which caps a line at 4,000 bytes) could not show it either.
 `ShellFs` takes the match position from `rg --column` (the byte column, turned into a character
 offset by `fs::match_offset`) and never searches the line again, so no client's regex dialect can
-differ; the `grep` rungs report no column and clip every long line at its head. `LocalFs` finds the
+differ; GNU `grep` gets it from a second `-o -b` run over the long lines only (`ShellFs::window_long_lines`), and busybox reports none and clips at the head. `LocalFs` finds the
 match with a lazily compiled `regex::Regex` (`fs::MatchFinder`) and calls the same `clip_at`. A
 context line keeps the head clip. A line longer than a remote
 runner's 128 KiB capture arrives already cut and is flagged as a truncated result. It also takes

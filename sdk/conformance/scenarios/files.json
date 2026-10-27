@@ -5164,7 +5164,7 @@
     },
     {
       "id": "files.search.long-lines-are-clipped",
-      "description": "A line longer than 500 characters is cut: a match inside the first 500 shows the head plus '… [truncated]'; a match whose column (as rg reports it) is past 250 shows a 500-character window starting 250 characters before the match, '… <window> … [truncated; columns A-B of N]'; at the end of the line the window is the last 500 characters. Counts are characters, not bytes. A context line is only ever cut at its head.",
+      "description": "A line longer than 500 characters is cut: a match inside the first 500 shows the head plus '… [truncated]'; a match whose column (as rg reports it, or as GNU grep's `-o -b` second run finds it) is past 250 shows a 500-character window starting 250 characters before the match, '… <window> … [truncated; columns A-B of N]'; at the end of the line the window is the last 500 characters. Counts are characters, not bytes. A context line is only ever cut at its head.",
       "setup": [
         {
           "id": "setup",
@@ -5314,12 +5314,15 @@
         }
       ],
       "requires": {
-        "search_engine": "rg"
+        "search_engine": [
+          "rg",
+          "grep"
+        ]
       }
     },
     {
       "id": "files.search.long-lines-are-clipped-without-a-column",
-      "description": "On the grep rungs, which report no match column, a long line is cut at its head whether it matched or not: the first 500 characters followed by '… [truncated]'.",
+      "description": "On the busybox rung, which reports no match offset, a long line is cut at its head whether it matched or not: the first 500 characters followed by '… [truncated]'.",
       "setup": [
         {
           "id": "setup",
@@ -5469,10 +5472,7 @@
         }
       ],
       "requires": {
-        "search_engine": [
-          "grep",
-          "busybox-grep"
-        ]
+        "search_engine": "busybox-grep"
       }
     },
     {

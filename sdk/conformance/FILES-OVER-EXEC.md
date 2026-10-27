@@ -499,7 +499,9 @@ off without also turning off the `.gitignore` handling the helper promises).
 for a match and `-` for a context line. `rg --column` puts the byte column of the
 line's first match between the separator and the text of a **match** record:
 `PATH<NUL>LINE:COL:TEXT<LF>` (`COL` is 1-based, in bytes of the raw line, CRs
-included; a context record has none). `grep -Z` has no such field. The command MUST turn off the group
+included; a context record has none). GNU `grep -b` puts the byte offset of the
+line start there instead, in match **and** context records
+(`PATH<NUL>LINE:OFF:TEXT`, `PATH<NUL>LINE-OFF-TEXT`). The command MUST turn off the group
 separator: `rg --no-context-separator` (ripgrep 0.10 and later), GNU
 `grep --no-group-separator` (2.5.4 and later). The separator is the only record
 without a NUL, and a path may begin with `--` + LF (or `--` + CR LF under
@@ -554,7 +556,8 @@ column for it, or if its match starts early (below). A client never searches the
 line for the match itself: the position is what the engine reported, so clients
 cannot differ on pattern syntax.
 
-For a **match** line with an `rg` column `COL`: `cs` is the number of characters
+For a **match** line with a byte column `COL` (from `rg --column`; for GNU
+`grep`, below): `cs` is the number of characters
 of the line's UTF-8 encoding before byte `COL - 1`, not counting CRs (the text
 has none, see Parsing); a `COL` that is not a character boundary of the line
 (possible only when the line had bytes that are not UTF-8) counts as no column.
@@ -564,13 +567,22 @@ has none, see Parsing); a `COL` that is not a character boundary of the line
 `[start, end)` + (`…` if `end < total`) + `[truncated; columns
 {start+1}-{end} of {total}]`.
 
+GNU `grep` has no column field. When the run returned a match line of more than
+500 characters, the client runs the same command once more with `-o` added and
+no context flags (`-o -b` prints `PATH<NUL>LINE:OFF:MATCH` per match, `OFF` the
+byte offset of the match in its file). For each such line the first record with
+its path and line number gives `COL = OFF - LINEOFF + 1`, where `LINEOFF` is the
+offset the first run printed for the line. A second run that fails, or has no
+record for the line, leaves the line clipped at its head.
+
 #### Engines differ; say which you used
 
 `rg` honors `.gitignore`/`.ignore`, skips binary files (any NUL), uses Rust
 regex syntax and searches hidden files. `grep` does none of the ignore
 handling, skips binary files with `-I` (in a UTF-8 locale also files with
 invalid UTF-8), and uses POSIX ERE; `\d` and non-greedy quantifiers are not
-available; having no match column, they clip every long line at its head.
+available. `busybox-grep` reports no match position and clips every long line
+at its head.
 `busybox-grep` additionally cannot represent some path names (above)
 and may report binary files differently. A client MUST report the engine in use
 (`capabilities.search_engine`); scenarios that depend on one declare

@@ -21,9 +21,11 @@ import {
   finalize,
   grepArgs,
   isUnderGitDir,
+  type LongLine,
   parseColonRecords,
   parseRecords,
   rgArgs,
+  windowLongLines,
   withDefaults,
 } from "./search.js";
 import type { SearchEngine, SearchQuery, SearchResult } from "./search.js";
@@ -474,9 +476,19 @@ export class Files {
       skipped = f.note;
     }
 
+    const longs: LongLine[] = [];
     let hits = engine === "busybox-grep"
       ? parseColonRecords(stdout, q)
-      : parseRecords(stdout, engine === "rg");
+      : parseRecords(stdout, engine === "rg" ? true : "gnu", longs);
+    if (longs.length > 0) {
+      const second = await this.exec(
+        "grep",
+        ["-o", ...grepArgs({ ...q, before: 0, after: 0 }, true)],
+      );
+      if (second.exitCode >= 0 && second.exitCode <= 2) {
+        windowLongLines(hits, longs, text(second.stdout));
+      }
+    }
     hits = hits.filter((h) => !isUnderGitDir(q.root, h.path));
     const done = finalize(hits, q.limit);
     const first = stderr.trim().split("\n")[0] ?? "";

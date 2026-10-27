@@ -307,6 +307,55 @@ impl ShellFs {
     }
 }
 
+impl ShellFs {
+    /// GNU `grep` reports no match column, so the long match lines of a run (`longs`) are found a
+    /// second time, with `-o -b` and no context: the file offset of each match less the line's
+    /// offset (`-b` of the first run) is the byte column `rg --column` would have given. Only lines
+    /// that need it cost the run; a run that fails leaves them clipped at their head.
+    async fn window_long_lines(&self, hits: &mut [Hit], longs: &[Long], q: &SearchQuery) {
+        let mut q2 = q.clone();
+        q2.before = 0;
+        q2.after = 0;
+        let mut args = posix_grep_args(&q2, true);
+        args.insert(0, "-o".to_string());
+        let Ok(result) = self.runner.run("grep", &args, None, self.timeout).await else {
+            return;
+        };
+        // Exit 2 is per-path read errors here too (the first run already reported them).
+        if !matches!(result.code, Some(0..=2)) {
+            return;
+        }
+        // The first match of each line: `PATH NUL LINE:OFFSET:MATCH`.
+        let mut first: std::collections::HashMap<(&str, usize), usize> = Default::default();
+        let out = &result.stdout;
+        let mut i = 0;
+        while let Some(nul) = memchr_from(out.as_bytes(), i, b'\0') {
+            let nl = memchr_from(out.as_bytes(), nul, b'\n').unwrap_or(out.len());
+            let mut it = out[nul + 1..nl].splitn(3, ':');
+            if let (Some(l), Some(o)) = (it.next(), it.next())
+                && let (Ok(l), Ok(o)) = (l.parse::<usize>(), o.parse::<usize>())
+            {
+                first.entry((&out[i..nul], l)).or_insert(o);
+            }
+            i = nl + 1;
+        }
+        for long in longs {
+            let hit = &mut hits[long.index];
+            let Some(off) = hit
+                .path
+                .to_str()
+                .and_then(|p| first.get(&(p, hit.line)))
+                .and_then(|o| o.checked_sub(long.line_start))
+            else {
+                continue;
+            };
+            if let Some(cs) = super::match_offset(&long.raw, off + 1) {
+                hit.text = super::clip_at(&trim_eol(&long.raw), cs);
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl FsBackend for ShellFs {
     /// Never [`PathWorld::Local`], even when the runner happens to be `RealRunner` and the files
@@ -372,13 +421,21 @@ impl FsBackend for ShellFs {
             },
         }
 
+        let mut longs = Vec::new();
         let mut hits = if engine == SearchEngine::BusyboxGrep {
             // No `-Z`, so records are `path:line:text` with no unambiguous path terminator, and no
             // `--include`, so the glob is applied here instead.
             parse_colon_records(&result.stdout, q)
         } else {
-            parse_records(&result.stdout, engine == SearchEngine::Ripgrep)
+            let cols = match engine {
+                SearchEngine::Ripgrep => Cols::Rg,
+                _ => Cols::Gnu,
+            };
+            parse_core(&result.stdout, cols, &mut longs)
         };
+        if !longs.is_empty() {
+            self.window_long_lines(&mut hits, &longs, q).await;
+        }
         // The engine was asked to skip `.git` where it can; this is the guarantee for the rungs that
         // can't (busybox `grep`, and a `.git` *file* GNU `--exclude-dir` does not cover).
         hits.retain(|h| !super::is_under_git_dir(&q.root, &h.path));
@@ -1542,6 +1599,9 @@ fn posix_grep_args(q: &SearchQuery, gnu: bool) -> Vec<String> {
         // rejects `--color` outright.
         args.push("-Z".to_string());
         args.push("-I".to_string());
+        // The byte offset of each line: with a second run's `-o -b` match offsets it gives a long
+        // line's match column (`window_long_lines`).
+        args.push("-b".to_string());
         args.push("--color=never".to_string());
     }
     if q.literal {
@@ -1671,7 +1731,36 @@ fn push_context(args: &mut Vec<String>, q: &SearchQuery) {
 /// There is no group-separator line to skip: the engines are run with it turned off (see `rg_args` and
 /// `posix_grep_args`), because `--` + newline is also a legal start of a path. Every record is
 /// `PATH NUL ...`, so a path beginning with `--` + newline round-trips.
+/// What follows the line number in a `PATH NUL` record.
+#[derive(Clone, Copy, PartialEq)]
+enum Cols {
+    /// Nothing.
+    None,
+    /// `rg --column`: a match record is `LINE:COL:TEXT`, a context record `LINE-TEXT`.
+    Rg,
+    /// GNU `grep -b`: `LINE:OFFSET:TEXT` and `LINE-OFFSET-TEXT`, the byte offset of the line start.
+    Gnu,
+}
+
+/// A long match line of a GNU `grep` run, whose column the second run finds.
+struct Long {
+    /// Index into the hits.
+    index: usize,
+    /// Byte offset of the line start in its file.
+    line_start: usize,
+    /// The text as printed, CRs included.
+    raw: String,
+}
+
 fn parse_records(stdout: &str, columns: bool) -> Vec<Hit> {
+    parse_core(
+        stdout,
+        if columns { Cols::Rg } else { Cols::None },
+        &mut Vec::new(),
+    )
+}
+
+fn parse_core(stdout: &str, cols: Cols, longs: &mut Vec<Long>) -> Vec<Hit> {
     let bytes = stdout.as_bytes();
     let mut hits = Vec::new();
     let mut i = 0usize;
@@ -1684,7 +1773,14 @@ fn parse_records(stdout: &str, columns: bool) -> Vec<Hit> {
         let nl = memchr_from(bytes, nul, b'\n').unwrap_or(bytes.len());
         let path = &stdout[i..nul];
         let rest = &stdout[nul + 1..nl];
-        if let Some(hit) = parse_body(path, rest, columns) {
+        if let Some((hit, long)) = parse_body(path, rest, cols) {
+            if let Some((line_start, raw)) = long {
+                longs.push(Long {
+                    index: hits.len(),
+                    line_start,
+                    raw,
+                });
+            }
             hits.push(hit);
         }
         i = nl + 1;
@@ -1694,8 +1790,9 @@ fn parse_records(stdout: &str, columns: bool) -> Vec<Hit> {
 
 /// Split `<line><sep><text>` into its parts. Returns `None` for a record whose line number isn't
 /// digits — malformed output from an implementation we didn't anticipate, dropped rather than
-/// surfaced as a bogus hit at line 0.
-fn parse_body(path: &str, rest: &str, columns: bool) -> Option<Hit> {
+/// surfaced as a bogus hit at line 0. The second part is a GNU long match line left for the second
+/// run: its line-start offset and raw text.
+fn parse_body(path: &str, rest: &str, cols: Cols) -> Option<(Hit, Option<(usize, String)>)> {
     let digits_end = rest.find(|c: char| !c.is_ascii_digit())?;
     if digits_end == 0 {
         return None;
@@ -1708,32 +1805,47 @@ fn parse_body(path: &str, rest: &str, columns: bool) -> Option<Hit> {
         _ => return None,
     };
     let mut text = &rest[digits_end + 1..];
-    // `rg --column`: a match record is `LINE:COL:TEXT`, a context record `LINE-TEXT`.
     let mut col = None;
-    if columns && is_match {
-        let c_end = text.find(|c: char| !c.is_ascii_digit())?;
-        if c_end == 0 || text.as_bytes()[c_end] != b':' {
+    let mut line_start = None;
+    if cols == Cols::Gnu || (cols == Cols::Rg && is_match) {
+        let n_end = text.find(|c: char| !c.is_ascii_digit())?;
+        // The number ends in `:` (rg's column; GNU's offset of a match line) or `-` (GNU, context).
+        if n_end == 0 || text.as_bytes()[n_end] != sep {
             return None;
         }
-        col = text[..c_end].parse::<usize>().ok();
-        text = &text[c_end + 1..];
+        let n = text[..n_end].parse::<usize>().ok();
+        if cols == Cols::Rg {
+            col = n;
+        } else {
+            line_start = n;
+        }
+        text = &text[n_end + 1..];
     }
     let normalized = trim_eol(text);
+    let mut long = None;
     // The same normalization and clip `LocalFs`'s sink applies, from the same functions — see
     // `super`. A match line is clipped around the column the engine reported.
-    let text = match col
-        .filter(|_| text.len() > super::MAX_LINE)
-        .and_then(|c| super::match_offset(text, c))
-    {
-        Some(cs) => super::clip_at(&normalized, cs),
-        None => super::clip(&normalized),
+    let text = if is_match && text.len() > super::MAX_LINE && line_start.is_some() {
+        long = line_start.map(|s| (s, text.to_string()));
+        super::clip(&normalized)
+    } else {
+        match col
+            .filter(|_| text.len() > super::MAX_LINE)
+            .and_then(|c| super::match_offset(text, c))
+        {
+            Some(cs) => super::clip_at(&normalized, cs),
+            None => super::clip(&normalized),
+        }
     };
-    Some(Hit {
-        path: Arc::from(Path::new(path)),
-        line,
-        text,
-        is_match,
-    })
+    Some((
+        Hit {
+            path: Arc::from(Path::new(path)),
+            line,
+            text,
+            is_match,
+        },
+        long,
+    ))
 }
 
 /// `bytes[from..]`-relative byte search returning an absolute index. A tiny helper rather than pulling
