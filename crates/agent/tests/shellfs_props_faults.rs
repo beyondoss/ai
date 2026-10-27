@@ -33,9 +33,10 @@ fn a_faulty_transport(tc: TestCase) {
 fn the_probe_never_caches_what_a_failed_request_says(tc: TestCase) {
     let seed = tc.draw(gs::integers::<u64>());
     let pct = tc.draw(gs::sampled_from(vec![20u64, 60, 100]));
+    let healthy = env::http_runner(None);
     let clean = env::rt()
         .block_on(async {
-            env::connect(env::http_runner(None))
+            env::connect(healthy)
                 .await
                 .expect("connect sends nothing")
                 .capabilities()

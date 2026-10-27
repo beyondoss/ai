@@ -104,26 +104,10 @@ async fn no_callback_keeps_the_stream() {
     assert!(f.model_saw("done-b1", Duration::from_secs(15)).await);
 }
 
-/// N36: no notify without the edge's origin, or from an endpoint that does not offer it: `keep` is
-/// sent without `notify`, exactly as today.
+/// N36: no notify without the edge's origin: `keep` is sent without `notify`, exactly as today.
 #[tokio::test(flavor = "multi_thread")]
 async fn keep_without_notify_when_unavailable() {
-    // The endpoint does not advertise (its deployment does not say kept jobs survive idling).
-    let f = fleet(
-        MockOptions::default(),
-        "echo up; sleep 30; echo done-c1",
-        None,
-    )
-    .await;
-    let _ws = f.start_job().await;
-    let pgid = f.stream("done-c1").await;
-    let _reap = Reap(pgid);
-    assert!(still_held(&f, pgid, Duration::from_secs(1)).await);
-    let keeps = f.keeps();
-    assert!(!keeps.is_empty());
-    assert!(keeps.iter().all(|k| k.get("notify").is_none()), "{keeps:?}");
-
-    // No origin configured: nothing to name, so no notify, whatever the endpoint offers.
+    // No origin configured: nothing to name, so no notify.
     let mut turns = vec![bash_bg("echo up; sleep 3; echo done-c2"), turn_text("ok")];
     turns.extend((0..4).map(|_| turn_text("noted")));
     let (base, _r) = spawn_model_server(turns);

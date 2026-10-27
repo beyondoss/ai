@@ -541,7 +541,8 @@ pub struct Setup {
     pub mode: Mode,
     /// Replica slots on the ring.
     pub replicas: usize,
-    /// Whether the endpoint's deployment offers notify (off: today's behaviour).
+    /// Whether the replicas are told the edge's origin, which makes notify available (off: today's
+    /// behaviour).
     pub notify: bool,
     /// A detached session's idle timeout, in seconds.
     pub idle_timeout: Option<u64>,
@@ -581,7 +582,11 @@ impl E2e {
     pub async fn start(setup: Setup) -> Self {
         let (base, requests) = beyond_test_support::spawn_model_server_fn(answer);
         let (front, listener) = Front::bind(setup.replicas).await;
-        let mut replica_args = vec!["--notify-origin".to_string(), front.origin.clone()];
+        // Notify is available when the operator configured the origin the edge serves sessions at.
+        let mut replica_args = Vec::new();
+        if setup.notify {
+            replica_args.extend(["--notify-origin".to_string(), front.origin.clone()]);
+        }
         if let Some(secs) = setup.idle_timeout {
             replica_args.extend(["--session-idle-timeout".to_string(), secs.to_string()]);
         }
