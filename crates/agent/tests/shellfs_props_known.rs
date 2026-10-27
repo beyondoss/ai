@@ -46,10 +46,8 @@ fn n1_list_of_a_symlinked_directory_lists_the_target() {
     let st = env::rt().block_on(fs.stat(&link)).unwrap().unwrap();
     assert_eq!(format!("{:?}", st.kind), "Dir");
     let entries = env::rt().block_on(fs.list_dir(&link, 100, true)).unwrap();
-    assert!(
-        entries.is_empty(),
-        "N1 is fixed: delete this test and the known(\"N1\") call"
-    );
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "f");
 }
 
 /// N3 (fixed): a search root below a regular file is `not_a_directory`, not a bad regex.
