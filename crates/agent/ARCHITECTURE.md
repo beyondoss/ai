@@ -2032,7 +2032,8 @@ as `write("/home/…/f")` would.
   fast with a clear error, matching `edit`'s identical pre-check just below (the OS itself would
   otherwise never see this: `rename(2)` only consults the _containing directory's_ write permission,
   not the target file's own mode bits). If `path` is itself a symlink, `write_atomic` resolves it first
-  (`canonicalize`, falling back to a single `read_link` hop for a dangling target) and writes through to
+  (every link followed one `read_link` hop at a time, live or dangling, at most 40 hops; a loop fails
+  with ELOOP and changes nothing, exactly as `ShellFs` does) and writes through to
   the real file — `rename(2)` never follows a trailing symlink at its destination, it replaces the
   directory entry itself, so writing straight to a symlinked path would otherwise sever the link (a
   fresh regular file landing at the link's own path) while leaving the real target untouched; matches
