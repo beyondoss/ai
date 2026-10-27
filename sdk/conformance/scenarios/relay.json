@@ -1,0 +1,1188 @@
+{
+  "suite": "relay",
+  "version": 1,
+  "description": "Two clients on one sandbox: steps carry via A or B, and the harness runs the scenario for every ordered pair of drivers (DRIVER.md, Relay). What one client writes, starts or changes, the other sees exactly.",
+  "scenarios": [
+    {
+      "id": "relay.bytes.binary-nul-and-invalid-utf8",
+      "description": "A writes all 256 byte values (NULs, invalid UTF-8) four times; B reads the same bytes. Also runs a driver against a second process of itself.",
+      "same_driver": true,
+      "steps": [
+        {
+          "id": "w",
+          "via": "A",
+          "op": "write",
+          "path": "${ROOT}/b",
+          "data_b64": {
+            "$repeat": {
+              "b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==",
+              "times": 5,
+              "len": 1024
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "r",
+          "via": "B",
+          "op": "read",
+          "path": "${ROOT}/b",
+          "expect": {
+            "ok": {
+              "data_len": 1024,
+              "data_sha256": "785b0751fc2c53dc14a4ce3d800e69ef9ce1009eb327ccf458afe09c242c26c9"
+            }
+          }
+        },
+        {
+          "id": "stat",
+          "via": "B",
+          "op": "stat",
+          "path": "${ROOT}/b",
+          "expect": {
+            "ok": {
+              "exists": true,
+              "kind": "file",
+              "size": 1024
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "relay.bytes.crlf",
+      "description": "CRLF and a lone CR survive A's write and B's read unchanged.",
+      "steps": [
+        {
+          "id": "w",
+          "via": "A",
+          "op": "write",
+          "path": "${ROOT}/crlf",
+          "data_b64": "YQ0KYg0KDQpubyBuZXdsaW5lDQ==",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "r",
+          "via": "B",
+          "op": "read",
+          "path": "${ROOT}/crlf",
+          "expect": {
+            "ok": {
+              "data_b64": "YQ0KYg0KDQpubyBuZXdsaW5lDQ==",
+              "data_len": 19
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "relay.bytes.empty",
+      "description": "An empty file written by A is an empty file for B (stat size 0, read nothing); B overwrites it and A reads that.",
+      "steps": [
+        {
+          "id": "w",
+          "via": "A",
+          "op": "write",
+          "path": "${ROOT}/e",
+          "data_b64": "",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "stat",
+          "via": "B",
+          "op": "stat",
+          "path": "${ROOT}/e",
+          "expect": {
+            "ok": {
+              "exists": true,
+              "kind": "file",
+              "size": 0
+            }
+          }
+        },
+        {
+          "id": "r",
+          "via": "B",
+          "op": "read",
+          "path": "${ROOT}/e",
+          "expect": {
+            "ok": {
+              "data_len": 0
+            }
+          }
+        },
+        {
+          "id": "w2",
+          "via": "B",
+          "op": "write",
+          "path": "${ROOT}/e",
+          "data_b64": "eA==",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "r2",
+          "via": "A",
+          "op": "read",
+          "path": "${ROOT}/e",
+          "expect": {
+            "ok": {
+              "data_utf8": "x"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "relay.bytes.read-window-sizes",
+      "description": "Files at the 96 KiB read window (exactly one window, one byte over) and across three windows: A writes, B reads whole and by window, byte-identical.",
+      "steps": [
+        {
+          "id": "w98304",
+          "via": "A",
+          "op": "write",
+          "path": "${ROOT}/f98304",
+          "data_b64": {
+            "$repeat": {
+              "b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==",
+              "times": 385,
+              "len": 98304
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "r98304",
+          "via": "B",
+          "op": "read",
+          "path": "${ROOT}/f98304",
+          "expect": {
+            "ok": {
+              "data_len": 98304,
+              "data_sha256": "8f65e1015c4ffa783265c5fe24846a063d625460fd268c408dd18f334de6a02f"
+            }
+          }
+        },
+        {
+          "id": "w98305",
+          "via": "A",
+          "op": "write",
+          "path": "${ROOT}/f98305",
+          "data_b64": {
+            "$repeat": {
+              "b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==",
+              "times": 385,
+              "len": 98305
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "r98305",
+          "via": "B",
+          "op": "read",
+          "path": "${ROOT}/f98305",
+          "expect": {
+            "ok": {
+              "data_len": 98305,
+              "data_sha256": "a580e3b1cfefa5b5fedf3b547c9ed7ac303123250e072b94e9cae85ebed91228"
+            }
+          }
+        },
+        {
+          "id": "w300001",
+          "via": "A",
+          "op": "write",
+          "path": "${ROOT}/f300001",
+          "data_b64": {
+            "$repeat": {
+              "b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==",
+              "times": 1172,
+              "len": 300001
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "r300001",
+          "via": "B",
+          "op": "read",
+          "path": "${ROOT}/f300001",
+          "expect": {
+            "ok": {
+              "data_len": 300001,
+              "data_sha256": "7e30771ba86f8a296f84a03cbaca2bc2d852e8e1500a812795316594567b170a"
+            }
+          }
+        },
+        {
+          "id": "window",
+          "via": "B",
+          "op": "read",
+          "path": "${ROOT}/f300001",
+          "offset": 98300,
+          "max": 200000,
+          "expect": {
+            "ok": {
+              "data_len": 200000,
+              "data_sha256": "e77cd86c03cdaa4cf278c8037efbafe6134bf2a7b381d3191365b7abef74bc1e"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "relay.stat.after-write",
+      "description": "B sees A's file and directory: kind and exact size, and a missing path as absent.",
+      "steps": [
+        {
+          "id": "w",
+          "via": "A",
+          "op": "write",
+          "path": "${ROOT}/f",
+          "data_b64": "aGVsbG8=",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "d",
+          "via": "A",
+          "op": "mkdir",
+          "path": "${ROOT}/d",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "file",
+          "via": "B",
+          "op": "stat",
+          "path": "${ROOT}/f",
+          "expect": {
+            "ok": {
+              "exists": true,
+              "kind": "file",
+              "size": 5,
+              "writable": true
+            }
+          }
+        },
+        {
+          "id": "dir",
+          "via": "B",
+          "op": "stat",
+          "path": "${ROOT}/d",
+          "expect": {
+            "ok": {
+              "exists": true,
+              "kind": "dir"
+            }
+          }
+        },
+        {
+          "id": "missing",
+          "via": "B",
+          "op": "stat",
+          "path": "${ROOT}/nope",
+          "expect": {
+            "ok": {
+              "exists": false
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "relay.list.kinds",
+      "description": "B lists what A created: names and kinds (mkdir by A, files written by A, a file written by A inside the new directory).",
+      "steps": [
+        {
+          "id": "d",
+          "via": "A",
+          "op": "mkdir",
+          "path": "${ROOT}/dir/sub",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "f1",
+          "via": "A",
+          "op": "write",
+          "path": "${ROOT}/dir/one",
+          "data_b64": "MQ==",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "f2",
+          "via": "A",
+          "op": "write",
+          "path": "${ROOT}/two",
+          "data_b64": "MjI=",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "root",
+          "via": "B",
+          "op": "list",
+          "path": "${ROOT}",
+          "expect": {
+            "ok": {
+              "entries": {
+                "$unordered": [
+                  {
+                    "name": "dir",
+                    "kind": "dir"
+                  },
+                  {
+                    "name": "two",
+                    "kind": "file"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "dir",
+          "via": "B",
+          "op": "list",
+          "path": "${ROOT}/dir",
+          "expect": {
+            "ok": {
+              "entries": {
+                "$unordered": [
+                  {
+                    "name": "sub",
+                    "kind": "dir"
+                  },
+                  {
+                    "name": "one",
+                    "kind": "file"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "b-writes-in-a-dir",
+          "via": "B",
+          "op": "write",
+          "path": "${ROOT}/dir/sub/three",
+          "data_b64": "MzMz",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "a-reads",
+          "via": "A",
+          "op": "read",
+          "path": "${ROOT}/dir/sub/three",
+          "expect": {
+            "ok": {
+              "data_utf8": "333"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "relay.list.sizes",
+      "description": "B lists A's files with their exact byte sizes.",
+      "requires": {
+        "find_printf": true
+      },
+      "steps": [
+        {
+          "id": "w1",
+          "via": "A",
+          "op": "write",
+          "path": "${ROOT}/a",
+          "data_b64": {
+            "$repeat": {
+              "b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==",
+              "times": 49,
+              "len": 12345
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "w2",
+          "via": "A",
+          "op": "write",
+          "path": "${ROOT}/b",
+          "data_b64": "",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "list",
+          "via": "B",
+          "op": "list",
+          "path": "${ROOT}",
+          "expect": {
+            "ok": {
+              "entries": {
+                "$unordered": [
+                  {
+                    "name": "a",
+                    "kind": "file",
+                    "size": 12345
+                  },
+                  {
+                    "name": "b",
+                    "kind": "file",
+                    "size": 0
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "relay.write-if-unchanged.sees-the-other-writer",
+      "description": "B's conditional write with the mtime A's stat gave succeeds; once A writes again, B's write with the now-stale mtime is a conflict and A's data survives. A file that must not exist conflicts once A has created it.",
+      "steps": [
+        {
+          "id": "w",
+          "via": "A",
+          "op": "write",
+          "path": "${ROOT}/f",
+          "data_b64": "djEK",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "age",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "TZ=UTC touch -t 200102030405.06 \"$1\"",
+            "sh",
+            "${ROOT}/f"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          },
+          "via": "A"
+        },
+        {
+          "id": "stat",
+          "via": "A",
+          "op": "stat",
+          "path": "${ROOT}/f",
+          "save": {
+            "m": "mtime"
+          },
+          "expect": {
+            "ok": {
+              "mtime": 981173106
+            }
+          }
+        },
+        {
+          "id": "b-writes",
+          "via": "B",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/f",
+          "data_b64": "djIK",
+          "expected_mtime": "${m}",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "a-sees-b",
+          "via": "A",
+          "op": "read",
+          "path": "${ROOT}/f",
+          "expect": {
+            "ok": {
+              "data_utf8": "v2\n"
+            }
+          }
+        },
+        {
+          "id": "age-again",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "TZ=UTC touch -t 200102030405.06 \"$1\"",
+            "sh",
+            "${ROOT}/f"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          },
+          "via": "A"
+        },
+        {
+          "id": "b-stat",
+          "via": "B",
+          "op": "stat",
+          "path": "${ROOT}/f",
+          "save": {
+            "m2": "mtime"
+          },
+          "expect": {
+            "ok": {
+              "mtime": 981173106
+            }
+          }
+        },
+        {
+          "id": "a-writes",
+          "via": "A",
+          "op": "write",
+          "path": "${ROOT}/f",
+          "data_b64": "djMK",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "b-stale",
+          "via": "B",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/f",
+          "data_b64": "djQK",
+          "expected_mtime": "${m2}",
+          "expect": {
+            "error": {
+              "kind": "conflict"
+            }
+          }
+        },
+        {
+          "id": "a-data-survives",
+          "via": "A",
+          "op": "read",
+          "path": "${ROOT}/f",
+          "expect": {
+            "ok": {
+              "data_utf8": "v3\n"
+            }
+          }
+        },
+        {
+          "id": "b-must-not-exist",
+          "via": "B",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/f",
+          "data_b64": "djUK",
+          "expected_mtime": null,
+          "expect": {
+            "error": {
+              "kind": "conflict"
+            }
+          }
+        },
+        {
+          "id": "b-creates",
+          "via": "B",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/new",
+          "data_b64": "bg==",
+          "expected_mtime": null,
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "a-must-not-exist",
+          "via": "A",
+          "op": "write_if_unchanged",
+          "path": "${ROOT}/new",
+          "data_b64": "bQ==",
+          "expected_mtime": null,
+          "expect": {
+            "error": {
+              "kind": "conflict"
+            }
+          }
+        },
+        {
+          "id": "b-data-survives",
+          "via": "B",
+          "op": "read",
+          "path": "${ROOT}/new",
+          "expect": {
+            "ok": {
+              "data_utf8": "n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "relay.search.context",
+      "description": "B searches A's file with context lines (before/after merge without repeats) and a literal, case-insensitive query.",
+      "requires": {
+        "search_engine": [
+          "rg",
+          "grep"
+        ]
+      },
+      "steps": [
+        {
+          "id": "w",
+          "via": "A",
+          "op": "write",
+          "path": "${ROOT}/ctx.txt",
+          "data_b64": "bDEKbDIKTUFUQ0ggYQpsNApsNQpsNgpsNwpNQVRDSCBiCmw5Cg==",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "ctx",
+          "via": "B",
+          "op": "search",
+          "pattern": "MATCH",
+          "before": 1,
+          "after": 1,
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 2,
+                  "text": "l2",
+                  "is_match": false
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 3,
+                  "text": "MATCH a",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 4,
+                  "text": "l4",
+                  "is_match": false
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 7,
+                  "text": "l7",
+                  "is_match": false
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 8,
+                  "text": "MATCH b",
+                  "is_match": true
+                },
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 9,
+                  "text": "l9",
+                  "is_match": false
+                }
+              ],
+              "truncated": false
+            }
+          }
+        },
+        {
+          "id": "plain",
+          "via": "B",
+          "op": "search",
+          "pattern": "match b",
+          "ignore_case": true,
+          "literal": true,
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 8,
+                  "text": "MATCH b",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "rewrite",
+          "via": "A",
+          "op": "write",
+          "path": "${ROOT}/ctx.txt",
+          "data_b64": "b25seSBNQVRDSCBoZXJlCg==",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "b-sees-rewrite",
+          "via": "B",
+          "op": "search",
+          "pattern": "MATCH",
+          "root": "${ROOT}",
+          "expect": {
+            "ok": {
+              "hits": [
+                {
+                  "path": "${ROOT}/ctx.txt",
+                  "line": 1,
+                  "text": "only MATCH here",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "relay.exec.helper-output",
+      "description": "A runs a raw exec helper that writes bytes (NUL, CR LF; and 0xFF 0xFE in a second file) into the sandbox; B reads them with the file helper and with its own raw exec, byte for byte (raw exec output is text, so only the file helper is byte-exact for invalid UTF-8); B's write is then what A's exec sees.",
+      "steps": [
+        {
+          "id": "a-exec",
+          "via": "A",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf \"\\000abc\\r\\n\" > \"$1\"; printf \"\\377\\376\\000z\" > \"$1.2\"; printf out; printf err >&2; exit 3",
+            "sh",
+            "${ROOT}/h"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 3,
+              "stdout_utf8": "out",
+              "stderr_utf8": "err"
+            }
+          }
+        },
+        {
+          "id": "b-read",
+          "via": "B",
+          "op": "read",
+          "path": "${ROOT}/h",
+          "expect": {
+            "ok": {
+              "data_b64": "AGFiYw0K",
+              "data_len": 6
+            }
+          }
+        },
+        {
+          "id": "b-read-invalid-utf8",
+          "via": "B",
+          "op": "read",
+          "path": "${ROOT}/h.2",
+          "expect": {
+            "ok": {
+              "data_b64": "//4Aeg==",
+              "data_len": 4
+            }
+          }
+        },
+        {
+          "id": "b-exec",
+          "via": "B",
+          "op": "exec",
+          "command": "cat",
+          "args": [
+            "${ROOT}/h"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_b64": "AGFiYw0K"
+            }
+          }
+        },
+        {
+          "id": "b-write",
+          "via": "B",
+          "op": "write",
+          "path": "${ROOT}/h",
+          "data_b64": "Y2hhbmdlZAo=",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "a-exec-sees",
+          "via": "A",
+          "op": "exec",
+          "command": "cat",
+          "args": [
+            "${ROOT}/h"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "changed\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "relay.jobs.live-job-from-the-other-client",
+      "description": "A starts a long job; B lists it (with A's label), reads its output from offset 0 and from an offset, and kills it with no survivors; A sees the job ended. Native and baseline jobs alike.",
+      "requires": {
+        "jobs": "any"
+      },
+      "steps": [
+        {
+          "id": "start",
+          "via": "A",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "rl01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo first; sleep 30"
+          ],
+          "label": "from A",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 1
+              }
+            }
+          }
+        },
+        {
+          "id": "list",
+          "via": "B",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": [
+                {
+                  "id": "rl01",
+                  "state": "running",
+                  "code": null,
+                  "label": "from A"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "read",
+          "via": "B",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "rl01",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "running",
+              "offset": 0,
+              "data_utf8": "first\n"
+            }
+          }
+        },
+        {
+          "id": "read-offset",
+          "via": "B",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "rl01",
+          "offset": 2,
+          "expect": {
+            "ok": {
+              "offset": 2,
+              "data_utf8": "rst\n"
+            }
+          }
+        },
+        {
+          "id": "kill",
+          "via": "B",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "rl01"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        },
+        {
+          "id": "a-sees-ended",
+          "via": "A",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "rl01",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": {
+                "$oneof": [
+                  137,
+                  143
+                ]
+              },
+              "data_utf8": "first\n"
+            }
+          }
+        },
+        {
+          "id": "b-list-ended",
+          "via": "B",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": [
+                {
+                  "id": "rl01",
+                  "state": "ended"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "relay.jobs.ended-job-is-shared",
+      "description": "A runs a job to its end; B lists it with its exit code, attaches from an offset, then removes it; A finds it gone.",
+      "requires": {
+        "jobs": "any"
+      },
+      "steps": [
+        {
+          "id": "start",
+          "via": "A",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "rl02",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo one; echo two; exit 4"
+          ],
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "b-list",
+          "via": "B",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "jobs": [
+                {
+                  "id": "rl02",
+                  "state": "ended",
+                  "code": 4
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "b-attach",
+          "via": "B",
+          "op": "job_attach",
+          "scope": "${SCOPE}",
+          "job": "rl02",
+          "offset": 4,
+          "expect": {
+            "ok": {
+              "output_utf8": "two\n",
+              "exit_code": 4,
+              "gap": 0
+            }
+          }
+        },
+        {
+          "id": "a-attach",
+          "via": "A",
+          "op": "job_attach",
+          "scope": "${SCOPE}",
+          "job": "rl02",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "output_utf8": "one\ntwo\n",
+              "exit_code": 4
+            }
+          }
+        },
+        {
+          "id": "b-remove",
+          "via": "B",
+          "op": "job_remove",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "rl02"
+          ],
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "a-gone",
+          "via": "A",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "rl02",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "state": "gone"
+            }
+          }
+        },
+        {
+          "id": "a-list",
+          "via": "A",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "relay.jobs.kill-takes-the-whole-group",
+      "description": "A starts a job whose child would write a marker later; B kills it with survivors []; the marker never appears.",
+      "requires": {
+        "jobs": "any"
+      },
+      "steps": [
+        {
+          "id": "start",
+          "via": "A",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "rl03",
+          "command": "sh",
+          "args": [
+            "-c",
+            "(sleep 1; echo late > \"$1/marker\") & sleep 30",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 1
+              }
+            }
+          }
+        },
+        {
+          "id": "kill",
+          "via": "B",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "rl03"
+          ],
+          "remove": true,
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        },
+        {
+          "id": "a-gone",
+          "via": "A",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "rl03",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "state": "gone"
+            }
+          }
+        },
+        {
+          "id": "wait",
+          "via": "A",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 1.5; ls \"$1\"",
+            "sh",
+            "${ROOT}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": ""
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
