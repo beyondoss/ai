@@ -814,7 +814,11 @@ def search(q: Query, state: FsState, caps: Capabilities) -> Op[SearchResult]:
             raise NotFound(failure.note)
         note = failure.note
     stdout = text(r.stdout)
-    hits = parse_colon_records(stdout, q) if engine == "busybox-grep" else parse_records(stdout, engine == "rg")
+    hits = (
+        parse_colon_records(stdout, q)
+        if engine == "busybox-grep"
+        else parse_records(stdout, engine == "rg")
+    )
     hits = [h for h in hits if not is_under_git_dir(q.root, h.path)]
     hits, truncated = finalize(hits, q.limit)
     if note is None:

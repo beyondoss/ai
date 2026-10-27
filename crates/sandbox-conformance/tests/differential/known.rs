@@ -16,14 +16,13 @@ fn strings(v: &Value, out: &mut Vec<String>) {
 
 /// `Some(id)` when `step` is one an open defect explains and exactly the drivers it is known to
 /// afflict (`differing`) are the ones that answered unlike the rest or against the filesystem.
-pub fn divergence(step: &Value, differing: &[&str], answers: &[Value]) -> Option<&'static str> {
+pub fn divergence(step: &Value, _differing: &[&str], answers: &[Value]) -> Option<&'static str> {
     // `DIFFERENTIAL_NO_KNOWN=1` reports these too: to see a defect shrunk, or to check one is fixed.
     if std::env::var_os("DIFFERENTIAL_NO_KNOWN").is_some() {
         return None;
     }
     let mut text = vec![];
     strings(step, &mut text);
-    let only = |names: &[&str]| differing.iter().all(|d| names.contains(d));
     // D5: ripgrep prints `PATH: WARNING: stopped searching binary file after match ...` on stdout
     // when a NUL follows a match. The line has no NUL, so the parser (which scans for the NUL after
     // the path) takes it as the start of the next record's path; which record that is depends on
