@@ -47,15 +47,6 @@ fn structured(u: &mut Unstructured<'_>) -> libfuzzer_sys::arbitrary::Result<()> 
 
 fn raw(data: &[u8]) {
     let input = String::from_utf8_lossy(data);
-    // KNOWN (F2, unfixed): a modification time past i64::MAX seconds panics in `SystemTime + Duration`.
-    // Drop this guard when the parser is fixed; corpus/stat/known-mtime-overflow is the input.
-    let mtime = input.lines().next().and_then(|l| l.split('\t').nth(3));
-    if mtime
-        .and_then(|s| s.split('.').next()?.trim().parse::<u64>().ok())
-        .is_some_and(|s| s > i64::MAX as u64)
-    {
-        return;
-    }
     let got = stat(&input);
     let first = input.lines().next().unwrap_or("");
     if let Some(m) = got {

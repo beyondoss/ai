@@ -925,10 +925,12 @@ fn parse_stat(stdout: &str) -> Option<Meta> {
         .and_then(|s| s.split('.').next())
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
+    // `SystemTime + Duration` panics past what the platform can hold; an out-of-range mtime is unknown.
+    let mtime = std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs));
     Some(Meta {
         kind,
         len,
-        mtime: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
+        mtime,
         writable,
     })
 }
@@ -1728,6 +1730,13 @@ pub mod __fuzz {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stat_mtime_past_systemtime_range_is_unknown_not_a_panic() {
+        let m = parse_stat("w\tf\t1\t18446744073709551615\n").expect("a well-formed line parses");
+        assert_eq!(m.mtime, None);
+        assert_eq!(m.len, 1);
+    }
 
     #[test]
     fn stat_script_follows_a_symlink_for_size_and_mtime() {
