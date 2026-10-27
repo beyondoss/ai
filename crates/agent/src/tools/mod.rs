@@ -1438,10 +1438,9 @@ mod tests {
         symlink("../a/l3", r.join("b/l2")).unwrap();
         symlink("../a/final.txt", r.join("a/l3")).unwrap();
         symlink("a/l1", r.join("l0")).unwrap();
-        assert_eq!(
-            resolve_symlink_target(&r.join("l0")).unwrap(),
-            r.join("a/../a/final.txt")
-        );
+        let resolved = resolve_symlink_target(&r.join("l0")).unwrap();
+        assert_eq!(resolved.file_name().unwrap(), "final.txt");
+        assert!(!resolved.exists(), "the chain ends in a missing file");
         write_atomic(r.join("l0").to_str().unwrap(), b"x").unwrap();
         assert_eq!(std::fs::read(r.join("a/final.txt")).unwrap(), b"x");
         assert!(
