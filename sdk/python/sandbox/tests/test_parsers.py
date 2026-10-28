@@ -249,10 +249,11 @@ def test_rg_only_drops_require_git_outside_a_repo() -> None:
     assert "--no-require-git" not in rg_args(q(), True)
 
 
-def test_a_negated_glob_becomes_a_bang_rg_glob_and_git_outranks_it() -> None:
+def test_rg_gets_only_a_restricting_glob_and_git_outranks_it() -> None:
+    # `--glob '!G'` would also prune a directory whose name matches; the hits are filtered instead
     args = rg_args(q(glob="*.test.rs", glob_exclude=True), False)
     globs = [args[i + 1] for i, a in enumerate(args) if a == "--glob"]
-    assert globs == ["!*.test.rs", "!.git"]
+    assert globs == ["!.git"]
     args = rg_args(q(glob="*", glob_exclude=False), False)
     assert [args[i + 1] for i, a in enumerate(args) if a == "--glob"] == ["*", "!.git"]
 

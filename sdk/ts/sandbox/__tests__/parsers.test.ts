@@ -162,14 +162,16 @@ describe("argument builders", () => {
     expect(rgArgs(q("p", "/r"), true)).not.toContain("--no-require-git");
   });
 
-  it("turns a negated glob into !GLOB and keeps !.git last so it outranks the caller's", () => {
+  it("gives rg only a restricting glob (`!G` would prune directories) and keeps !.git last", () => {
     const args = rgArgs(
       { ...q("x"), glob: "*.test.rs", globExclude: true },
       false,
     );
-    expect(args[args.indexOf("--glob") + 1]).toBe("!*.test.rs");
     const globs = args.flatMap((a, i) => (a === "--glob" ? [args[i + 1]] : []));
-    expect(globs).toEqual(["!*.test.rs", "!.git"]);
+    expect(globs).toEqual(["!.git"]);
+    const kept = rgArgs({ ...q("x"), glob: "*", globExclude: false }, false);
+    expect(kept.flatMap((a, i) => (a === "--glob" ? [kept[i + 1]] : [])))
+      .toEqual(["*", "!.git"]);
   });
 
   it("excludes .git for GNU grep unless the root is .git itself, and never for busybox", () => {

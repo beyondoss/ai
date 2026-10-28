@@ -327,8 +327,10 @@ def rg_args(q: Query, in_git_repo: bool) -> list[str]:
         args.append("--ignore-case")
     if q.literal:
         args.append("--fixed-strings")
-    if q.glob is not None:
-        args += ["--glob", f"!{q.glob}" if q.glob_exclude else q.glob]
+    # only a restricting glob goes to rg: its ``--glob '!G'`` also matches directories, so ``!*.txt``
+    # would never descend into ``d.txt/``. An excluding glob is applied to the hits (``search``).
+    if q.glob is not None and not q.glob_exclude:
+        args += ["--glob", q.glob]
     # after the caller's glob on purpose: ripgrep gives the last matching glob precedence
     args += ["--glob", f"!{GIT_DIR}"]
     args += _context(q)
@@ -813,6 +815,12 @@ def root_in_git_repo(state: FsState, root: str) -> Op[bool]:
 
 def search(q: Query, state: FsState, caps: Capabilities) -> Op[SearchResult]:
     engine = caps.search_engine
+    excluded = None
+    if engine == "rg" and q.glob is not None and q.glob_exclude:
+        try:  # rg is not given this glob, so a bad one is rejected here
+            excluded = re.compile(_glob_regex(q.glob), re.S)
+        except (ValueError, re.error) as e:
+            raise InvalidQuery(f"bad glob: {e}") from e
     if engine == "rg":
         args, program = rg_args(q, (yield from root_in_git_repo(state, q.root))), "rg"
     else:
@@ -844,6 +852,10 @@ def search(q: Query, state: FsState, caps: Capabilities) -> Op[SearchResult]:
         if second.exit_code in (0, 1, 2):
             window_long_lines(hits, longs, second.stdout_text)
     hits = [h for h in hits if not is_under_git_dir(q.root, h.path)]
+    if excluded is not None:
+        # files only: the glob never decides whether a directory is descended; a root that is itself
+        # a file is searched whatever the glob says
+        hits = [h for h in hits if h.path == q.root or excluded.fullmatch(h.path) is None]
     hits, truncated = finalize(hits, q.limit)
     if note is None:
         detail = stderr.strip()
