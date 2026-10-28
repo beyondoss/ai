@@ -606,6 +606,15 @@ fn args_of(req: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The status of a command that cannot start: 127 when the program is not there, else 126.
+fn spawn_code(e: &std::io::Error) -> i32 {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        127
+    } else {
+        126
+    }
+}
+
 /// A command that cannot start, named as the spec asks: the program as sent, and why.
 fn spawn_failure(shared: &Shared, req: &Value, e: &std::io::Error) -> String {
     if shared.opts.bare_spawn_errors {
@@ -692,7 +701,7 @@ async fn serve_envelope(mut sock: tokio::net::TcpStream, req: Value, shared: Sha
         // `Argument list too long` lands here.
         Err(e) => answer(
             &shared,
-            127,
+            spawn_code(&e),
             b"",
             spawn_failure(&shared, &req, &e).as_bytes(),
         ),
@@ -776,7 +785,7 @@ async fn serve_stream(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
         Err(e) => {
             let mut out =
                 chunk(&json!({ "stderr": b64(spawn_failure(&shared, &req, &e).as_bytes()) }));
-            out.extend(chunk(&json!({ "exit_code": 127 })));
+            out.extend(chunk(&json!({ "exit_code": spawn_code(&e) })));
             out.extend_from_slice(b"0\r\n\r\n");
             let _ = wr.write_all(&out).await;
             let _ = wr.shutdown().await;

@@ -66,7 +66,7 @@ accept ──► hyper (HTTP/1.1, or prior-knowledge HTTP/2 on the same port)
 ```
 
 A request that is none of those fails before a process exists. A command that cannot be spawned is an ordinary result (exit
-127) whose stderr names what failed, as the caller sent it (`execd: pytest -q: command not found`, `execd: cwd /x: No such
+127 when the program or the `cwd` is not there, 126 when the program is there and cannot be run, as a shell reports them) whose stderr names what failed, as the caller sent it (`execd: pytest -q: command not found`, `execd: cwd /x: No such
 file or directory`): `exec::spawn_failure` for the direct path, the helper's own `exec` failure under `EXECD_RUN_AS`.
 
 ### one-shot: `exec::envelope`
@@ -184,7 +184,7 @@ What the spec and the conformance verifier assume, and what holds:
   `Permission denied`, as it would for any user.
 - **Jobs.** The supervisor stays execd (root) and signals the user's groups; `kill`, `wipe`, a dropped hold and the shutdown
   sweep all work (`tests/security.rs` kills a user's job by `SIGTERM` to execd).
-- **A missing program** is exit 127 with `execd: PROGRAM: command not found`, as without `EXECD_RUN_AS`. A job whose program is missing is
+- **A missing program** is exit 127 with `execd: PROGRAM: command not found`, and one that cannot be run (`Permission denied`) is 126, as without `EXECD_RUN_AS`. A job whose program is missing is
   a started job that ends 127, not a `500` at `start`.
 - **argv.** For the instant between the spawn and the `exec`, a command's `/proc/<pid>/cmdline` is the helper's: the uid, gid,
   groups, directory, command and arguments. The bearer is never among them.
@@ -306,8 +306,8 @@ for a signal in one-shot, a late background write possibly lost in one-shot) are
 - **Disk full.** A kept job keeps running. Output that cannot be written reads back as a gap (`offset` moves forward, never back,
   and the bytes at it are the bytes written), a refused chunk leaves no file behind, and other jobs, one-shot and streaming are unaffected.
   Output written after space returns is retained again.
-- **No descriptors, no processes.** A command that cannot be spawned is an ordinary result on one-shot (`exit_code` 127 with the
-  reason) and streaming (a `stderr` frame, then 127); a job that cannot start is `500` and leaves no job behind. `/livez` and the jobs
+- **No descriptors, no processes.** A command that cannot be spawned is an ordinary result on one-shot (`exit_code` 126 with the
+  reason) and streaming (a `stderr` frame, then 126); a job that cannot start is `500` and leaves no job behind. `/livez` and the jobs
   already running are unaffected, and everything works again, with no descriptor leaked, once the limit clears. With no descriptor
   left to accept with, a request waits in the kernel's queue rather than failing. The `/proc` scans that run off the runtime
   (`proc::off_runtime`) fall back to running in place when no thread can be created, since `tokio::task::spawn_blocking` panics there.

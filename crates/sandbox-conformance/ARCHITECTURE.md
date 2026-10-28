@@ -40,7 +40,7 @@ lockstep through every driver in `drivers.toml`, each in its own fresh root on o
 two ways:
 
 1. against the other drivers', byte for byte after the normalisations listed in `tests/differential/norm.rs` (request ids, error
-   `detail`, the root path, mtimes, directory sizes, listing order, the text of a search `note`), each of which the spec lets differ;
+   `detail`, the root path, mtimes, directory sizes, listing order, the text of a search `note`), each of which the spec lets differ. One rule depends on the driver: the MCP driver runs `exec` through `sh -c`, so when its `exec` answer is exit 126 or 127 the step compares every driver's stderr by the reason it names (`not found` or `Permission denied`: `sh: 1: exec: x: not found` against `execd: x: command not found`); the statuses agree and stay strict, with `stdout` and every other op still byte for byte;
 2. on the local backends, against the filesystem: `std::fs` snapshots and the brute-force search of the property test
    (`oracle.rs`, which includes `truth.rs` and `search_truth.rs` from `crates/agent/tests/shellfs_props_env`). Writes must change only
    their target, failed operations nothing, reads must equal the file's bytes, listings the directory's entries.

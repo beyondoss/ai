@@ -130,6 +130,7 @@ impl Report {
 pub const ENVELOPE: &str = "one-shot envelope";
 pub const ENVELOPE_TIMEOUT: &str = "one-shot timeout kills the process group";
 pub const SPAWN_FAILURE: &str = "a command that cannot be started names it";
+pub const NOT_RUNNABLE: &str = "a command that is there but cannot be run is 126";
 pub const OUTPUT_BYTES: &str = "every byte value round-trips on stdout and stderr";
 pub const CONTENT_TYPE: &str = "stream content type";
 pub const INCREMENTAL: &str = "incremental delivery (the probe)";
@@ -177,6 +178,7 @@ pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectatio
         v.envelope().await,
         v.envelope_timeout().await,
         v.spawn_failure().await,
+        v.not_runnable().await,
         v.output_bytes().await,
     ];
     match v.run("printf a", Duration::from_secs(10)).await {
@@ -492,6 +494,38 @@ impl Verifier {
                 ),
             ),
             Err(e) => fail(SPAWN_FAILURE, e.to_string()),
+        }
+    }
+
+    /// A program that exists but is not executable is 126 (the shell's status), not 127, and
+    /// stderr still names it. The file is made on the far side and removed after.
+    async fn not_runnable(&self) -> Check {
+        let file = self.marker("noexec");
+        let made = self
+            .sh(&format!("rm -f {file}; : > {file} && chmod 644 {file}"))
+            .await;
+        if let Err(e) = made {
+            return fail(NOT_RUNNABLE, e);
+        }
+        let r = self
+            .runner
+            .run(&file, &[], None, Duration::from_secs(10))
+            .await;
+        let _ = self.sh(&format!("rm -f {file}")).await;
+        match r {
+            Ok(r) if r.code == Some(126) && r.stderr_text().contains(&file) => {
+                pass(NOT_RUNNABLE, "exit 126, stderr names the file")
+            }
+            Ok(r) => fail(
+                NOT_RUNNABLE,
+                format!(
+                    "want exit 126 and stderr naming {file:?} for a file that is not executable; \
+                     got exit {:?}, stderr {:?}",
+                    r.code,
+                    r.stderr_text()
+                ),
+            ),
+            Err(e) => fail(NOT_RUNNABLE, e.to_string()),
         }
     }
 
