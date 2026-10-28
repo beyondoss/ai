@@ -265,21 +265,30 @@ fn kill_group(group: GroupId, pid_fallback: bool) {
     }
     // Two passes with a short gap: the first catches whatever the group-kill above missed; the
     // second catches anything that was itself mid-fork (and so invisible to `ps`) during the first.
-    sweep_kill_remaining_group_members(pgid);
+    // Each pass rechecks [`GroupId::recycled`] and, on Linux, each pid's start time, so a number
+    // reused since the listing is not signalled.
+    if !group.recycled() {
+        sweep_kill_remaining_group_members(group);
+    }
     std::thread::sleep(Duration::from_millis(50));
     if !group.recycled() {
-        sweep_kill_remaining_group_members(pgid);
+        sweep_kill_remaining_group_members(group);
     }
 }
 
 /// Enumerate every process currently reporting `pgid` via `ps -eo pid=,pgid=` and SIGKILL each one
-/// individually. See [`kill_process_group`]'s doc comment for why this exists — a bulk
-/// `kill -KILL -<pgid>` was empirically observed to miss a live, already-a-member process on a real
-/// CI runner. Best-effort: a `ps`/`kill` invocation failing outright is silently ignored (mirrors the
-/// group-kill's own "no-op fallback against an already-gone process is harmless" stance) since the
-/// caller already tried the cheaper group-kill/direct-kill paths first.
+/// that is still the same process the listing saw. See [`kill_process_group`]'s doc comment for why
+/// this exists — a bulk `kill -KILL -<pgid>` was empirically observed to miss a live, already-a-member
+/// process on a real CI runner. Best-effort: a `ps`/`kill` invocation failing outright is silently
+/// ignored (mirrors the group-kill's own "no-op fallback against an already-gone process is harmless"
+/// stance) since the caller already tried the cheaper group-kill/direct-kill paths first. A pid whose
+/// start time changed since the listing is skipped: that number belongs to someone else now.
 #[cfg(unix)]
-fn sweep_kill_remaining_group_members(pgid: u32) {
+fn sweep_kill_remaining_group_members(group: GroupId) {
+    if group.recycled() {
+        return;
+    }
+    let pgid = group.pgid;
     let Ok(out) = std::process::Command::new("ps")
         .args(["-eo", "pid=,pgid="])
         .output()
@@ -288,6 +297,9 @@ fn sweep_kill_remaining_group_members(pgid: u32) {
     };
     let text = String::from_utf8_lossy(&out.stdout);
     for line in text.lines() {
+        if group.recycled() {
+            return;
+        }
         let mut fields = line.split_whitespace();
         let (Some(pid_str), Some(pgid_str)) = (fields.next(), fields.next()) else {
             continue;
@@ -295,12 +307,75 @@ fn sweep_kill_remaining_group_members(pgid: u32) {
         if pgid_str.parse::<u32>() != Ok(pgid) {
             continue;
         }
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        // Read the start time, then again immediately before the signal. A pid that died and was
+        // reused has a different start time (or none). On Linux a pid we cannot identify is left
+        // alone: the group signal already ran, and killing an unidentified pid is how this sweep
+        // would hit a stranger. Where `/proc` does not exist, start times are unavailable and the
+        // pgid match is the check.
+        let seen = start_time(pid);
+        if !same_incarnation(pid, seen) {
+            continue;
+        }
         // Best-effort per-pid kill: an already-dead pid (ESRCH) is the overwhelmingly common,
-        // harmless case (the group-kill above likely already got it) — nothing further to do either
-        // way, so the result isn't checked.
+        // harmless case (the group-kill above likely already got it).
         let _ = std::process::Command::new("kill")
             .arg("-KILL")
-            .arg(pid_str)
+            .arg(pid.to_string())
             .status();
+    }
+}
+
+/// Whether `pid` is still the process whose start time was `seen` when we decided to signal it.
+#[cfg(unix)]
+fn same_incarnation(pid: u32, seen: Option<u64>) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        match (seen, start_time(pid)) {
+            (Some(then), Some(now)) => then == now,
+            _ => false,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, seen);
+        true
+    }
+}
+
+#[cfg(all(test, unix, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    struct Reap(Option<std::process::Child>);
+
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn a_pid_is_signalled_only_while_it_is_the_same_process() {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let mut reap = Reap(Some(child));
+        let child = reap.0.as_mut().unwrap();
+        let pid = child.id();
+        let seen = start_time(pid);
+        assert!(seen.is_some(), "linux reports a start time");
+        assert!(same_incarnation(pid, seen));
+        assert!(!same_incarnation(pid, None));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        reap.0 = None;
+        assert!(!same_incarnation(pid, seen));
     }
 }

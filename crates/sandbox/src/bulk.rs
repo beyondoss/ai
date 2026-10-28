@@ -578,6 +578,22 @@ impl std::io::Read for ChanReader {
 /// Chunks of stdout waiting for the extraction thread: the bound on what a slow disk holds back.
 const PIPE_CHUNKS: usize = 8;
 
+/// Push one stdout chunk at the extract thread. A full pipe blocks until that thread takes it.
+/// On a multi-thread runtime the wait is [`tokio::task::block_in_place`], so the worker can run
+/// other tasks; on a current-thread runtime `block_in_place` panics, and the extract thread is
+/// already off the runtime, so the worker waits directly.
+fn send_chunk(tx: &std::sync::mpsc::SyncSender<Vec<u8>>, bytes: Vec<u8>) {
+    let multithreaded = tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if multithreaded {
+        tokio::task::block_in_place(|| {
+            let _ = tx.send(bytes);
+        });
+    } else {
+        let _ = tx.send(bytes);
+    }
+}
+
 /// Download `remote_path` (a directory's contents, or one file) into `local_dir`, created if missing.
 pub async fn download(
     exec: &dyn CommandRunner,
@@ -613,7 +629,9 @@ pub async fn download(
         let guard = tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(t) = &*guard {
             // A thread that has stopped has dropped its end: the notify below ends the call.
-            let _ = t.send(b.to_vec());
+            // The send blocks when the extract thread is behind. On a multi-thread runtime that
+            // wait must not pin the worker, or every other task stalls for a slow disk.
+            send_chunk(t, b.to_vec());
         }
     };
     let args = sh(DOWNLOAD_SCRIPT, &[remote_path]);

@@ -34,7 +34,7 @@ execd takes no arguments; it is configured by environment variables:
   EXECD_ROOT                      where a command runs when its request names no directory (default: the current directory)
   EXECD_HOME                      HOME for every command (default: execd's own, or with EXECD_RUN_AS the user's own)
   EXECD_BEARER_FILE               a file holding the bearer token every request must present (mode 0600 is best)
-  EXECD_BEARER                    the bearer token itself, a weaker way than the file
+  EXECD_BEARER                    the bearer token itself, a weaker way than the file; execd refuses to start if it cannot move it out of the environment
   EXECD_INSECURE_NO_AUTH          1|true|0|false: serve with no bearer on a non-loopback address (default 0)
   EXECD_RUN_AS                    run every command as user, uid, user:group or uid:gid; execd must be root
   EXECD_MAX_RESPONSE_BYTES        the most output one answer carries (default 16777216)

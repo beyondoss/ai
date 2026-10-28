@@ -130,8 +130,16 @@ impl Extractor {
 
 fn set_mtime(path: &Path, secs: u64) -> Result<(), BulkError> {
     let f = File::open(path).map_err(|e| io_ctx(path, e))?;
-    f.set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+    f.set_modified(mtime_instant(secs)?)
         .map_err(|e| io_ctx(path, e))
+}
+
+/// `SystemTime + Duration` panics past what the platform can hold. A hostile archive can set a GNU
+/// base-256 mtime of `u64::MAX`; that is a bad member, not a crash. `parse_stat` makes the same choice.
+fn mtime_instant(secs: u64) -> Result<std::time::SystemTime, BulkError> {
+    UNIX_EPOCH
+        .checked_add(Duration::from_secs(secs))
+        .ok_or_else(|| BulkError::Archive(format!("archive member mtime {secs} is out of range")))
 }
 
 impl Extractor {
@@ -254,7 +262,7 @@ impl Extractor {
                 .set_permissions(fs::Permissions::from_mode(cur.mode & 0o777))
                 .map_err(|e| io_ctx(&cur.path, e))?;
             cur.file
-                .set_modified(UNIX_EPOCH + Duration::from_secs(cur.mtime))
+                .set_modified(mtime_instant(cur.mtime)?)
                 .map_err(|e| io_ctx(&cur.path, e))?;
         }
         Ok(())
@@ -497,5 +505,26 @@ mod tests {
             run(&root, &[member("d", Regular, b"x", "", 0o644)]),
             Err(BulkError::Io(e)) if e.to_string().contains("Is a directory")
         ));
+    }
+
+    #[test]
+    fn an_mtime_systemtime_cannot_hold_is_an_archive_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(Regular);
+        h.set_path("a").unwrap();
+        h.set_size(1);
+        h.set_mode(0o644);
+        h.set_mtime(u64::MAX);
+        h.set_cksum();
+        let mut m = h.as_bytes().to_vec();
+        m.push(b'x');
+        m.resize(m.len().div_ceil(512) * 512, 0);
+        m.extend_from_slice(&[0u8; 1024]);
+        match crate::bulk::extract(&m, &root).unwrap_err() {
+            BulkError::Archive(msg) => assert!(msg.contains("mtime"), "{msg}"),
+            other => panic!("expected an archive error, got {other:?}"),
+        }
     }
 }

@@ -150,6 +150,24 @@ fn exit_code(s: ExitStatus) -> i32 {
 // one-shot
 // ---------------------------------------------------------------------------------------------
 
+/// Take up to `n` bytes from `budget`, once. Two callers (stdout and stderr) can run at once on a
+/// multi-thread runtime; a load followed by `fetch_sub` would let both keep the same remainder and,
+/// once the counter wraps, keep every later byte. `compare_exchange` publishes one remainder to one
+/// caller. `0` means nothing is left.
+fn reserve(budget: &AtomicUsize, n: usize) -> usize {
+    loop {
+        let left = budget.load(Ordering::Relaxed);
+        let take = n.min(left);
+        if take == 0
+            || budget
+                .compare_exchange_weak(left, left - take, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            return take;
+        }
+    }
+}
+
 /// Read `pipe` into `into` as it arrives, keeping at most what is left of `budget` across both
 /// pipes; the rest is read and dropped.
 async fn capture<R: tokio::io::AsyncRead + Unpin>(
@@ -163,13 +181,11 @@ async fn capture<R: tokio::io::AsyncRead + Unpin>(
         if n == 0 {
             break;
         }
-        let left = budget.load(Ordering::Relaxed);
-        let take = n.min(left);
+        let take = reserve(&budget, n);
         if take < n {
-            dropped.store(true, Ordering::Relaxed);
+            dropped.store(true, Ordering::Release);
         }
         if take > 0 {
-            budget.fetch_sub(take, Ordering::Relaxed);
             locked(&into).extend_from_slice(&buf[..take]);
         }
     }
@@ -262,7 +278,7 @@ pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
     }
     feeder.abort();
     let take = |m: &Arc<std::sync::Mutex<Vec<u8>>>| std::mem::take(&mut *locked(m));
-    if dropped.load(Ordering::Relaxed) {
+    if dropped.load(Ordering::Acquire) {
         // Output past the cap was thrown away, so there is no honest result to return: a prefix
         // presented as the output would be a confident wrong answer. 422, not 5xx or 413: the
         // agent reads 400 and 422 as "this request, as written, is declined" and does not rebuild
@@ -603,5 +619,49 @@ async fn drive(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::reserve;
+
+    #[test]
+    fn reserve_stops_at_what_is_left() {
+        let budget = AtomicUsize::new(10);
+        assert_eq!(reserve(&budget, 100), 10);
+        assert_eq!(reserve(&budget, 1), 0);
+        assert_eq!(budget.load(Ordering::Relaxed), 0);
+    }
+
+    /// Several threads drawing at once must share one counter: the takes add up to the budget and
+    /// never past it. A load followed by `fetch_sub` would let two of them keep the same remainder.
+    #[test]
+    fn two_threads_cannot_reserve_the_same_byte() {
+        let budget = Arc::new(AtomicUsize::new(1_000_003));
+        let mut threads = Vec::new();
+        for size in [1usize, 7, 64, 4096] {
+            for _ in 0..4 {
+                let budget = Arc::clone(&budget);
+                threads.push(std::thread::spawn(move || {
+                    let mut got = 0usize;
+                    loop {
+                        let n = reserve(&budget, size);
+                        if n == 0 {
+                            break;
+                        }
+                        got += n;
+                    }
+                    got
+                }));
+            }
+        }
+        let sum: usize = threads.into_iter().map(|t| t.join().unwrap()).sum();
+        assert_eq!(sum, 1_000_003);
+        assert_eq!(budget.load(Ordering::Relaxed), 0);
     }
 }
