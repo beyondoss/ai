@@ -62,6 +62,13 @@ extra arguments reach `sandbox-matrix` (`--filter 'files.*'`, `--verbose` to lis
 `execd` (installed by `install-execd.sh`), over the internet. It is opt-in and billed (one VM, about $0.10/hour, deleted at the end
 and by a 25 minute auto-kill); it is not part of `test:clients` or of PR CI.
 
+`BEYOND_EXEC_URL=... BEYOND_EXEC_TOKEN_CMD=... mise run test:clients:beyond` runs the same against an existing Beyond sandbox, through
+the Beyond edge: `BEYOND_EXEC_URL` is the `exec_url` of `POST /sandboxes/{id}/exec-token`, `BEYOND_EXEC_TOKEN_CMD` a shell command
+that prints a fresh `bagt_v1` token (the harness runs it once per start; the TS and Python clients also take a token function
+and call it again on a 401). `BEYOND_EXEC_WORK` is a directory the sandbox user may write (default `/home/user/work`), and
+`EXECD_BIN` is a local `execd` that `extract` serves archives with. It is opt-in, owns no sandbox (it creates and deletes
+nothing), and is not part of `test:clients` or of PR CI.
+
 CI runs the matrix on a PR that touches `sdk/`, `crates/sandbox*`, `crates/execd` or the agent's exec endpoint and file helpers.
 
 ## Adding a client

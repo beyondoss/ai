@@ -415,6 +415,10 @@ pub async fn run_scenario_via(sc: &Value, be: &Backend, peer: Option<&Backend>) 
             u64::from_be_bytes(d[..8].try_into().unwrap())
         })),
     );
+    // A persistent backend (a real sandbox) keeps what an earlier run left: a killed run's files, and
+    // the jobs of the scopes a scenario derives from its own (`-other`, `-third`).
+    wipe_scopes(be, &vars).await;
+    let _ = exec(be, "rm", &["-rf", &root]).await;
     let mut seq = 0u64;
     let boot = json!({"op": "exec", "command": "mkdir", "args": ["-p", "${ROOT}"]});
     if let Err(why) = run_step(be.link.as_ref(), &boot, &mut vars, &mut seq, true).await {
@@ -498,12 +502,25 @@ pub async fn run_scenario_via(sc: &Value, be: &Backend, peer: Option<&Backend>) 
         });
     }
     // Best-effort cleanup: the scope's jobs, then the directory.
-    let _ = be
-        .link
-        .call(&json!({"id": 0, "op": "job_wipe", "scope": vars["SCOPE"]}))
-        .await;
+    wipe_scopes(be, &vars).await;
     let _ = exec(be, "rm", &["-rf", &root]).await;
     out
+}
+
+/// Wipe the scenario's job scope and the two it derives from it (`jobs.json` names `${SCOPE}-other`
+/// and `${SCOPE}-third`). Best effort and idempotent.
+async fn wipe_scopes(be: &Backend, vars: &Vars) {
+    let base = vars["SCOPE"].as_str().unwrap_or_default();
+    for scope in [
+        base.to_string(),
+        format!("{base}-other"),
+        format!("{base}-third"),
+    ] {
+        let _ = be
+            .link
+            .call(&json!({"id": 0, "op": "job_wipe", "scope": scope}))
+            .await;
+    }
 }
 
 /// Every scenario file in `dir`, in name order, as `(file name, parsed)`.

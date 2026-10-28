@@ -23,6 +23,7 @@ test (`crates/agent/tests/sdk_conformance.rs`) reaches the in-process reference 
 | `link.rs`                         | `ProcessLink`: `sh -c "exec CMD"` with the `CONFORMANCE_*` environment, one request in flight, a named call timeout, stderr kept for the death note.                                                                                                                                                                                                |
 | `backends.rs`                     | Starts a backend and returns a `Started` (URL, bearer, work directory, extra variables, a guard that stops it).                                                                                                                                                                                                                                     |
 | `reaper.rs`                       | Every child is its own process group, killed on drop; a registry file plus one watchdog kill the groups and remove the containers when the harness dies by SIGKILL.                                                                                                                                                                                 |
+| `beyond.rs`                       | The opt-in `beyond` backend: an existing Beyond sandbox behind the Beyond edge; `BEYOND_EXEC_URL` plus a token command whose stdout is the `bagt_v1` bearer. Owns nothing, so nothing to delete.                                                                                                                                                    |
 | `e2b.rs`                          | The opt-in `e2b` backend: one E2B VM with a hard create-time timeout, execd from the GitHub release (sha256-checked), deleted on drop and by the watchdog.                                                                                                                                                                                          |
 | `matrix.rs`                       | The plan: backends in parallel, each started once, its drivers one after another, then every ordered pair of them for the relay scenarios; the registry. A driver's `build` runs under the host build lock (`$BEYOND_BUILD_LOCK`, default `~/.cache/beyond-locks/rust-build.lock`) via `flock -o` when its directory exists and `flock` is on PATH. |
 | `report.rs`                       | The table and the JSON cell.                                                                                                                                                                                                                                                                                                                        |
@@ -94,6 +95,7 @@ A backend is a URL plus how to start and stop it. `Started` holds the guard; dro
 | `readonly`                         | Debian, run-as: `${RO}` a read-only mount, `${LOCKED}` a directory the user may not write |
 | `tinydisk`                         | Debian, run-as: `${TINY}` a 1 MiB tmpfs that fills                                        |
 | `e2b` (opt-in)                     | the released `execd` in a real E2B microVM, over E2B's port forwarding and TLS            |
+| `beyond` (opt-in)                  | Beyond's `sandbox-exec` in a real sandbox, through the Beyond edge with a `bagt_v1` token |
 
 The container backends mount a static (musl) `execd` read-only into the image, so no image is built; the only network use is
 pulling `alpine:3.20` and `debian:12-slim`. Each container is named after the process and removed on drop. Readiness is
@@ -107,6 +109,14 @@ installed binary's is printed; `E2B_EXECD_BIN=/path/to/execd`, a static build, i
 it is never in a process listing. The guard deletes the VM on drop; its id is also on the reaper registry (`e <id>`), so the
 watchdog deletes it through the API if the harness is killed. `mise run test:clients:e2b` runs it; the differential test runs
 against it only with `DIFFERENTIAL_BACKENDS=e2b`.
+
+`beyond` (`beyond.rs`) is likewise only ever named: `--backend beyond`, and only with `BEYOND_EXEC_URL` and `BEYOND_EXEC_TOKEN_CMD` set
+(`expand` refuses otherwise). The harness does not create the sandbox: the operator makes one (`POST /sandboxes`, then
+`POST /sandboxes/{id}/exec-token`) and hands over the `exec_url` and a command that mints tokens. Because the sandbox outlives a run,
+every scenario wipes its job scope and the `-other` and `-third` scopes it derives, and its root directory, both before it starts and
+after it ends. `mise run test:clients:beyond` runs it. Measured (execd v0.1.18 behind the edge): every check passes for all five
+drivers and all 25 relay pairs except `bulk.round-trip.large-file`, which fails identically for every client because the edge answers
+`413` to a request body over 5 MiB (the clients send 16 MiB chunks).
 
 A backend's extra directories are variables (`${RO}`, `${LOCKED}`, `${TINY}`) that a scenario names in `requires.vars`; the
 `environments` suite is skipped, visibly, everywhere else.

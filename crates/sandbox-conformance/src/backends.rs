@@ -34,10 +34,14 @@ pub const SINGLES: &[&str] = &["alpine", "debian-runas", "readonly", "tinydisk"]
 /// Expand group names and `*` globs to backend names, in a stable order, without duplicates.
 pub fn expand(requested: &[String]) -> Result<Vec<String>, String> {
     // `e2b` costs money and needs the internet: only ever by its exact name, never in a group or a glob.
-    let (live, requested): (Vec<&String>, Vec<&String>) =
-        requested.iter().partition(|w| *w == "e2b");
-    if !live.is_empty() && crate::e2b::key().is_none() {
+    let (live, requested): (Vec<&String>, Vec<&String>) = requested
+        .iter()
+        .partition(|w| *w == "e2b" || *w == "beyond");
+    if live.iter().any(|w| *w == "e2b") && crate::e2b::key().is_none() {
         return Err("backend e2b needs E2B_API_KEY in the environment".into());
+    }
+    if live.iter().any(|w| *w == "beyond") {
+        crate::beyond::configured()?;
     }
     let requested: Vec<String> = requested.into_iter().cloned().collect();
     let requested = &requested[..];
@@ -68,8 +72,10 @@ pub fn expand(requested: &[String]) -> Result<Vec<String>, String> {
             }
         }
     }
-    if !live.is_empty() {
-        out.push("e2b".into());
+    for w in ["e2b", "beyond"] {
+        if live.iter().any(|l| *l == w) {
+            out.push(w.into());
+        }
     }
     Ok(out)
 }
@@ -156,6 +162,7 @@ pub async fn start(name: &str, bins: &Binaries) -> Result<Started, String> {
         // which need no binary. Not part of any group.
         "embedded" => embedded(name).await,
         "e2b" => crate::e2b::start(name).await,
+        "beyond" => crate::beyond::start(name).await,
         "alpine" => {
             docker(
                 name,
