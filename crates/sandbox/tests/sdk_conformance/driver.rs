@@ -1,5 +1,7 @@
-//! The reference driver for `sdk/conformance`: the agent's own `HttpExecRunner` + `ShellFs`, speaking
-//! the driver contract of `sdk/conformance/DRIVER.md`.
+//! The reference driver for `sdk/conformance`: a `beyond_sandbox::Sandbox` over the HTTP exec client,
+//! speaking the driver contract of `sdk/conformance/DRIVER.md`. Exec, files, jobs and bulk copy go
+//! through the `Sandbox`; only what it has no method for (the two output streams of a stream kept
+//! apart, a bulk copy with a chosen chunk size) uses its raw exec.
 //!
 //! Every op below is the thinnest possible mapping from the contract's request to one call of the
 //! existing code, and from its result or error back to the contract's JSON. The error vocabulary
@@ -11,10 +13,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
+use beyond_sandbox::Sandbox;
 use beyond_sandbox::exec::CommandRunner;
 use beyond_sandbox::exec_endpoint::HttpExecRunner;
 use beyond_sandbox::exec_endpoint::jobs::{JobEnd, JobEvent, JobId, JobScope, JobSpec, JobStatus};
-use beyond_sandbox::fs::shell::{Capabilities, SearchEngine, ShellFs};
+use beyond_sandbox::fs::shell::{Capabilities, SearchEngine};
 use beyond_sandbox::fs::{FileKind, FsBackend, FsError, SearchQuery};
 use sandbox_conformance::trees::{Layout, Tree};
 use serde_json::{Value, json};
@@ -43,14 +46,12 @@ pub struct CapsOverride {
 }
 
 pub struct Driver {
-    runner: Arc<dyn CommandRunner>,
-    jobs: Option<beyond_sandbox::Jobs>,
-    fs: ShellFs,
-    /// The error every op returns when the endpoint could not be reached or refused the first
-    /// request: probes that fail at that level are not capabilities, they are an outage.
+    sb: Sandbox,
     jobs_root: Option<PathBuf>,
+    /// Set only when `CONFORMANCE_CAPS` overrides what the probe found, which needs the probe up
+    /// front: the error every op returns when that probe's request failed (an outage is not a
+    /// capability). Without an override the `Sandbox` probes lazily and each op reports its own.
     connect_error: Option<Value>,
-    caps: Capabilities,
 }
 
 /// One op's outcome in the contract's terms.
@@ -230,47 +231,49 @@ impl Driver {
     }
 
     async fn build(runner: Arc<dyn CommandRunner>, cfg: &Config) -> Self {
-        // ShellFs itself decides: a probe whose request failed (unreachable, `401`) fails connect, and
-        // that error is what every op reports. The exec/stream/jobs paths then fail the same way
-        // on their own first request.
-        let (mut caps, connect_error) = match Capabilities::probe(&*runner).await {
-            Ok(caps) => (caps, None),
-            Err(e) => (Capabilities::default(), Some(io_err(&e))),
+        let overridden = cfg.caps.find_printf.is_some() || cfg.caps.search_engine.is_some();
+        let (sb, connect_error) = if overridden {
+            match Capabilities::probe(&*runner).await {
+                Ok(mut caps) => {
+                    if let Some(f) = cfg.caps.find_printf {
+                        caps.find_printf = f;
+                    }
+                    match cfg.caps.search_engine {
+                        Some("rg") => {
+                            caps.rg = true;
+                            caps.grep_null = true;
+                        }
+                        Some("grep") => {
+                            caps.rg = false;
+                            caps.grep_null = true;
+                        }
+                        Some("busybox-grep") => {
+                            caps.rg = false;
+                            caps.grep_null = false;
+                        }
+                        _ => {}
+                    }
+                    (Sandbox::with_capabilities(runner, caps), None)
+                }
+                Err(e) => (
+                    Sandbox::with_capabilities(runner, Capabilities::default()),
+                    Some(io_err(&e)),
+                ),
+            }
+        } else {
+            (Sandbox::over(runner).await.expect("a lazy connect"), None)
         };
-        if let Some(f) = cfg.caps.find_printf {
-            caps.find_printf = f;
-        }
-        match cfg.caps.search_engine {
-            Some("rg") => {
-                caps.rg = true;
-                caps.grep_null = true;
-            }
-            Some("grep") => {
-                caps.rg = false;
-                caps.grep_null = true;
-            }
-            Some("busybox-grep") => {
-                caps.rg = false;
-                caps.grep_null = false;
-            }
-            _ => {}
-        }
-        let fs = ShellFs::with_capabilities(runner.clone(), caps);
-        let jobs = beyond_sandbox::Jobs::over(runner.clone());
         Self {
-            runner,
-            jobs,
-            fs,
+            sb,
             jobs_root: cfg.jobs_root.clone(),
             connect_error,
-            caps,
         }
     }
 
     fn jobs(&self) -> Result<&beyond_sandbox::Jobs, Value> {
-        self.jobs
-            .as_ref()
-            .ok_or_else(|| err("unsupported", "this exec does not own jobs"))
+        self.sb
+            .jobs()
+            .map_err(|_| err("unsupported", "this exec does not own jobs"))
     }
 
     fn scope(&self, req: &Value) -> Result<JobScope, Value> {
@@ -288,7 +291,7 @@ impl Driver {
 
     /// The ops this driver offers: the job ops only over an exec that owns jobs.
     pub fn ops(&self) -> Vec<&'static str> {
-        Self::ops_with(self.jobs.is_some())
+        Self::ops_with(self.sb.jobs().is_ok())
     }
 
     /// [`Self::ops`] for an exec that owns jobs, or not.
@@ -351,15 +354,21 @@ impl Driver {
         if let Some(e) = &self.connect_error {
             return Err(e.clone());
         }
-        let engine = match self.caps.search_engine() {
+        let caps = self
+            .sb
+            .files()
+            .capabilities()
+            .await
+            .map_err(|e| io_err(&e))?;
+        let engine = match caps.search_engine() {
             SearchEngine::Ripgrep => "rg",
             SearchEngine::PosixGrep => "grep",
             SearchEngine::BusyboxGrep => "busybox-grep",
         };
         Ok(json!({
             "search_engine": engine,
-            "find_printf": self.caps.find_printf,
-            "read_window": !self.caps.no_read_window,
+            "find_printf": caps.find_printf,
+            "read_window": !caps.no_read_window,
         }))
     }
 
@@ -400,16 +409,14 @@ impl Driver {
         } else {
             Some(bytes_arg(req, "stdin_b64")?)
         };
-        let r = match stdin.as_deref() {
-            Some(stdin) => {
-                self.runner
-                    .run_with_stdin(command, &args, cwd, timeout, stdin)
-                    .await
-            }
-            None => self.runner.run(command, &args, cwd, timeout).await,
+        let mut cmd = self.sb.exec(command, args).timeout(timeout);
+        if let Some(cwd) = cwd {
+            cmd = cmd.cwd(cwd);
         }
-        .map_err(|e| io_err(&e))?;
-        let r = beyond_sandbox::ExecOutput::from(r);
+        if let Some(stdin) = stdin {
+            cmd = cmd.stdin(stdin);
+        }
+        let r = cmd.run().await.map_err(|e| io_err(&e))?;
         Ok(json!({
             "exit_code": r.code,
             "stdout_b64": b64(&r.stdout),
@@ -426,13 +433,19 @@ impl Driver {
         // `run_attached` keeps the two streams apart but has no deadline of its own; a request that
         // carries `timeout_ms` goes through `run_streaming`, which has one and merges the streams.
         let result = if let Some(ms) = u64_arg(req, "timeout_ms")? {
-            self.runner
-                .run_streaming(command, &args, cwd, Duration::from_millis(ms), &|b| {
-                    out.lock().unwrap().extend_from_slice(b)
-                })
+            let mut cmd = self
+                .sb
+                .exec(command, args)
+                .timeout(Duration::from_millis(ms));
+            if let Some(cwd) = cwd {
+                cmd = cmd.cwd(cwd);
+            }
+            cmd.stream(&|b| out.lock().unwrap().extend_from_slice(b))
                 .await
         } else {
-            self.runner
+            // The `Sandbox` has no call that keeps stdout and stderr apart: its raw exec does.
+            self.sb
+                .raw()
                 .run_attached(
                     command,
                     &args,
@@ -588,7 +601,8 @@ impl Driver {
     async fn stat(&self, req: &Value) -> Out {
         let path = str_arg(req, "path")?;
         match self
-            .fs
+            .sb
+            .files()
             .stat(Path::new(path))
             .await
             .map_err(|e| fs_err(&e))?
@@ -609,7 +623,8 @@ impl Driver {
         let offset = u64_arg(req, "offset")?.unwrap_or(0);
         let max = u64_arg(req, "max")?.map_or(usize::MAX, |m| m as usize);
         let bytes = self
-            .fs
+            .sb
+            .files()
             .read_bytes(Path::new(path), offset, max)
             .await
             .map_err(|e| fs_err(&e))?;
@@ -619,7 +634,8 @@ impl Driver {
     async fn write(&self, req: &Value) -> Out {
         let path = str_arg(req, "path")?;
         let data = bytes_arg(req, "data_b64")?;
-        self.fs
+        self.sb
+            .files()
             .write_bytes(Path::new(path), data)
             .await
             .map_err(|e| fs_err(&e))?;
@@ -649,7 +665,8 @@ impl Driver {
             ));
         }
         let wrote = self
-            .fs
+            .sb
+            .files()
             .write_if_unchanged(Path::new(path), data, expected)
             .await
             .map_err(|e| fs_err(&e))?;
@@ -662,7 +679,8 @@ impl Driver {
 
     async fn mkdir(&self, req: &Value) -> Out {
         let path = str_arg(req, "path")?;
-        self.fs
+        self.sb
+            .files()
             .create_dir_all(Path::new(path))
             .await
             .map_err(|e| fs_err(&e))?;
@@ -674,7 +692,8 @@ impl Driver {
         let include_hidden = flag(req, "include_hidden")?;
         let limit = u64_arg(req, "limit")?.unwrap_or(10_000) as usize;
         let entries = self
-            .fs
+            .sb
+            .files()
             .list_dir(Path::new(path), limit, include_hidden)
             .await
             .map_err(|e| fs_err(&e))?;
@@ -700,7 +719,7 @@ impl Driver {
             before: u64_arg(req, "before")?.unwrap_or(0) as usize,
             after: u64_arg(req, "after")?.unwrap_or(0) as usize,
         };
-        let o = self.fs.search(&q).await.map_err(|e| fs_err(&e))?;
+        let o = self.sb.files().search(&q).await.map_err(|e| fs_err(&e))?;
         let hits: Vec<Value> = o
             .hits
             .iter()
@@ -735,13 +754,12 @@ impl Driver {
                     .collect(),
             ),
         };
-        let t = beyond_sandbox::bulk::upload_chunked(
-            &*self.runner,
-            sources,
-            dest,
-            chunk.unwrap_or(beyond_sandbox::bulk::BULK_CHUNK_BYTES),
-        )
-        .await
+        let t = match chunk {
+            Some(chunk) => {
+                beyond_sandbox::bulk::upload_chunked(&**self.sb.raw(), sources, dest, chunk).await
+            }
+            None => self.sb.upload(sources, dest).await,
+        }
         .map_err(|e| bulk_err(&e))?;
         Ok(transfer_json(t))
     }
@@ -749,7 +767,7 @@ impl Driver {
     async fn download(&self, req: &Value) -> Out {
         let remote = str_arg(req, "path")?;
         let layout = Layout::new(&req["prefill"])?;
-        let r = beyond_sandbox::bulk::download(&*self.runner, remote, &layout.local).await;
+        let r = self.sb.download(remote, &layout.local).await;
         layout.finish(r.map(transfer_json).map_err(|e| bulk_err(&e)))
     }
 
