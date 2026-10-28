@@ -31,7 +31,7 @@ fn member(u: &mut Unstructured<'_>) -> libfuzzer_sys::arbitrary::Result<Vec<u8>>
     let g = h.as_gnu_mut().expect("gnu");
     let nb = n.as_bytes();
     g.name[..nb.len().min(100)].copy_from_slice(&nb[..nb.len().min(100)]);
-    let kind = *u.choose(&[b'0', b'5', b'2', b'1', b'3'])?;
+    let kind = *u.choose(b"05213")?;
     h.set_entry_type(tar::EntryType::new(kind));
     h.set_mode(u.int_in_range(0..=0o7777u32)?);
     h.set_mtime(u.arbitrary::<u32>()?.into());

@@ -20,7 +20,10 @@
 //! convention, which execd follows), so they stay strict. When the MCP driver's answer to an `exec` is
 //! exit 126 or 127, every driver's answer to that step compares its stderr by the reason it names
 //! (`not found`, `Permission denied`; else the bytes). `stdout` and every other comparison stay
-//! byte for byte, and so do the cwd errors, which execd words the same for both.
+//! byte for byte, and so do the cwd errors, which execd words the same for both. An MCP `exec_stream`
+//! is a job, so a command it cannot start is also a refused start (`endpoint`) or words in the job's
+//! one log: when its answer is 126, 127 or `endpoint`, every driver's `exec_stream` answer for the
+//! step compares by the not-started class alone.
 //!
 //! The result is a valid `expect` for a scenario step, which is how a divergence is printed.
 use base64::Engine as _;

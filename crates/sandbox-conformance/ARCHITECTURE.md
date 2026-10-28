@@ -69,8 +69,9 @@ and tiny-disk backends.
 Every process the harness starts (drivers, a local `execd`) is its own process-group leader and held by a `reaper::Leader`:
 dropping it kills the group. Leaders and containers are also written to a registry file watched by one watchdog process
 that, once the harness is gone (SIGKILL included), kills the registered groups and removes the registered containers. The
-differential test aborts after `DIFFERENTIAL_DEADLINE_SECS` (1800) and leaves the same cleanup to the watchdog. Killing the test
-binary mid-run with SIGKILL left no `execd`, driver or container behind (29 processes and 2 containers before, none after).
+differential test aborts after `DIFFERENTIAL_DEADLINE_SECS` (1800), counted from its own start, and leaves the same cleanup to
+the watchdog. Killing the test binary mid-run with SIGKILL left no `execd`, driver or container behind (29 processes and 2
+containers before, none after).
 
 ## Outcomes
 

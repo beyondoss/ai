@@ -9,7 +9,7 @@
 
 use beyond_sandbox::fs::Hit;
 use beyond_sandbox::fs::shell::__fuzz::records;
-use beyond_sandbox_fuzz::{name, text};
+use beyond_sandbox_fuzz::{clip_slack, name, text};
 use libfuzzer_sys::arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
 
@@ -82,14 +82,16 @@ fn structured(u: &mut Unstructured<'_>) -> libfuzzer_sys::arbitrary::Result<()> 
 fn raw(data: &[u8]) {
     let input = String::from_utf8_lossy(data);
     let hits = records(&input);
-    // Records do not overlap, so what comes back cannot outweigh what went in.
+    // Records do not overlap, so what comes back cannot outweigh what went in, except by the clip
+    // suffix on each line it truncated.
     let total: usize = hits
         .iter()
         .map(|h| h.path.as_os_str().len() + h.text.len())
         .sum();
+    let allowed = input.len() + clip_slack(&hits);
     assert!(
-        total <= input.len(),
-        "returned {total} bytes from {} bytes",
+        total <= allowed,
+        "returned {total} bytes from {} bytes (allowed {allowed})",
         input.len()
     );
     for h in &hits {
