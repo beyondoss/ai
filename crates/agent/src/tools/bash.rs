@@ -455,14 +455,14 @@ impl Bash {
         } else {
             None
         };
-        if start == Start::Background {
-            if let Some(running) = self.jobs.intended_full() {
-                return Err(ToolError::Execution(format!(
-                    "Not started: {MAX_INTENDED_JOBS} {INTENDED_JOBS} are already running \
-                     ({running}). Stop one with bash_job {{\"job\": N, \"kill\": true}}, then run \
-                     this again."
-                )));
-            }
+        if start == Start::Background
+            && let Some(running) = self.jobs.intended_full()
+        {
+            return Err(ToolError::Execution(format!(
+                "Not started: {MAX_INTENDED_JOBS} {INTENDED_JOBS} are already running \
+                 ({running}). Stop one with bash_job {{\"job\": N, \"kill\": true}}, then run \
+                 this again."
+            )));
         }
         // Prefix and command run as one script in one shell invocation — matches pi's
         // `${commandPrefix}\n${command}` — so both land in the same combined output stream, in order,
@@ -1590,7 +1590,7 @@ mod tests {
             _: crate::tools::exec::ChunkSink<'_>,
             _: crate::tools::exec::ChunkSink<'_>,
         ) -> std::io::Result<crate::tools::exec::ExecResult> {
-            unimplemented!("a test double that only runs to completion")
+            unreachable!("a test double that only runs to completion")
         }
     }
 
@@ -1656,7 +1656,7 @@ mod tests {
             _: crate::tools::exec::ChunkSink<'_>,
             _: crate::tools::exec::ChunkSink<'_>,
         ) -> std::io::Result<crate::tools::exec::ExecResult> {
-            unimplemented!("a test double that only runs to completion")
+            unreachable!("a test double that only runs to completion")
         }
     }
 
@@ -2299,7 +2299,7 @@ mod tests {
             _: crate::tools::exec::ChunkSink<'_>,
             _: crate::tools::exec::ChunkSink<'_>,
         ) -> std::io::Result<crate::tools::exec::ExecResult> {
-            unimplemented!("a test double that only runs to completion")
+            unreachable!("a test double that only runs to completion")
         }
     }
 
@@ -2502,7 +2502,7 @@ mod tests {
             _: crate::tools::exec::ChunkSink<'_>,
             _: crate::tools::exec::ChunkSink<'_>,
         ) -> std::io::Result<crate::tools::exec::ExecResult> {
-            unimplemented!("a test double that only runs to completion")
+            unreachable!("a test double that only runs to completion")
         }
     }
 

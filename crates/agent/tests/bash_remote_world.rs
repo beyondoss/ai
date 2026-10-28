@@ -119,7 +119,7 @@ impl CommandRunner for Recorder {
         _: beyond_agent::tools::exec::ChunkSink<'_>,
         _: beyond_agent::tools::exec::ChunkSink<'_>,
     ) -> std::io::Result<beyond_agent::tools::exec::ExecResult> {
-        unimplemented!("a test double that only runs to completion")
+        unreachable!("a test double that only runs to completion")
     }
 }
 

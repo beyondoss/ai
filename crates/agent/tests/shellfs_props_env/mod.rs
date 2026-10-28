@@ -275,7 +275,7 @@ impl CommandRunner for NsRunner {
         _: std::time::Duration,
         _: beyond_agent::tools::exec::ChunkSink<'_>,
     ) -> std::io::Result<beyond_agent::tools::exec::ExecResult> {
-        unimplemented!("a test double that only runs to completion")
+        unreachable!("a test double that only runs to completion")
     }
 
     async fn run_streaming_tracked(
@@ -285,7 +285,7 @@ impl CommandRunner for NsRunner {
         _: Option<&str>,
         _: &beyond_agent::tools::exec::JobHooks<'_>,
     ) -> std::io::Result<beyond_agent::tools::exec::ExecResult> {
-        unimplemented!("a test double that only runs to completion")
+        unreachable!("a test double that only runs to completion")
     }
 
     async fn run_attached(
@@ -296,7 +296,7 @@ impl CommandRunner for NsRunner {
         _: beyond_agent::tools::exec::ChunkSink<'_>,
         _: beyond_agent::tools::exec::ChunkSink<'_>,
     ) -> std::io::Result<beyond_agent::tools::exec::ExecResult> {
-        unimplemented!("a test double that only runs to completion")
+        unreachable!("a test double that only runs to completion")
     }
 }
 

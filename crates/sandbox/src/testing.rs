@@ -103,7 +103,7 @@ impl CommandRunner for Host {
         _: std::time::Duration,
         _: crate::exec::ChunkSink<'_>,
     ) -> std::io::Result<crate::exec::ExecResult> {
-        unimplemented!("a test double that only runs to completion")
+        unreachable!("a test double that only runs to completion")
     }
 
     async fn run_streaming_tracked(
@@ -113,7 +113,7 @@ impl CommandRunner for Host {
         _: Option<&str>,
         _: &crate::exec::JobHooks<'_>,
     ) -> std::io::Result<crate::exec::ExecResult> {
-        unimplemented!("a test double that only runs to completion")
+        unreachable!("a test double that only runs to completion")
     }
 
     async fn run_attached(
@@ -124,7 +124,7 @@ impl CommandRunner for Host {
         _: crate::exec::ChunkSink<'_>,
         _: crate::exec::ChunkSink<'_>,
     ) -> std::io::Result<crate::exec::ExecResult> {
-        unimplemented!("a test double that only runs to completion")
+        unreachable!("a test double that only runs to completion")
     }
 }
 

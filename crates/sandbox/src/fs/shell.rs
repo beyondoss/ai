@@ -2145,7 +2145,7 @@ mod tests {
             _: std::time::Duration,
             _: crate::exec::ChunkSink<'_>,
         ) -> std::io::Result<crate::exec::ExecResult> {
-            unimplemented!("a test double that only runs to completion")
+            unreachable!("a test double that only runs to completion")
         }
 
         async fn run_streaming_tracked(
@@ -2155,7 +2155,7 @@ mod tests {
             _: Option<&str>,
             _: &crate::exec::JobHooks<'_>,
         ) -> std::io::Result<crate::exec::ExecResult> {
-            unimplemented!("a test double that only runs to completion")
+            unreachable!("a test double that only runs to completion")
         }
 
         async fn run_attached(
@@ -2166,7 +2166,7 @@ mod tests {
             _: crate::exec::ChunkSink<'_>,
             _: crate::exec::ChunkSink<'_>,
         ) -> std::io::Result<crate::exec::ExecResult> {
-            unimplemented!("a test double that only runs to completion")
+            unreachable!("a test double that only runs to completion")
         }
     }
 
@@ -2251,7 +2251,7 @@ mod tests {
             _: std::time::Duration,
             _: crate::exec::ChunkSink<'_>,
         ) -> std::io::Result<crate::exec::ExecResult> {
-            unimplemented!("a test double that only runs to completion")
+            unreachable!("a test double that only runs to completion")
         }
 
         async fn run_streaming_tracked(
@@ -2261,7 +2261,7 @@ mod tests {
             _: Option<&str>,
             _: &crate::exec::JobHooks<'_>,
         ) -> std::io::Result<crate::exec::ExecResult> {
-            unimplemented!("a test double that only runs to completion")
+            unreachable!("a test double that only runs to completion")
         }
 
         async fn run_attached(
@@ -2272,7 +2272,7 @@ mod tests {
             _: crate::exec::ChunkSink<'_>,
             _: crate::exec::ChunkSink<'_>,
         ) -> std::io::Result<crate::exec::ExecResult> {
-            unimplemented!("a test double that only runs to completion")
+            unreachable!("a test double that only runs to completion")
         }
     }
 
@@ -2302,7 +2302,7 @@ mod tests {
             _: std::time::Duration,
             _: crate::exec::ChunkSink<'_>,
         ) -> std::io::Result<crate::exec::ExecResult> {
-            unimplemented!("a test double that only runs to completion")
+            unreachable!("a test double that only runs to completion")
         }
 
         async fn run_streaming_tracked(
@@ -2312,7 +2312,7 @@ mod tests {
             _: Option<&str>,
             _: &crate::exec::JobHooks<'_>,
         ) -> std::io::Result<crate::exec::ExecResult> {
-            unimplemented!("a test double that only runs to completion")
+            unreachable!("a test double that only runs to completion")
         }
 
         async fn run_attached(
@@ -2323,7 +2323,7 @@ mod tests {
             _: crate::exec::ChunkSink<'_>,
             _: crate::exec::ChunkSink<'_>,
         ) -> std::io::Result<crate::exec::ExecResult> {
-            unimplemented!("a test double that only runs to completion")
+            unreachable!("a test double that only runs to completion")
         }
     }
 
