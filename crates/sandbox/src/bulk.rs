@@ -2,15 +2,13 @@
 //! (FILES-OVER-EXEC.md section 5.8).
 //!
 //! Layer 2 like [`crate::Files`]: built only on [`CommandRunner`]. The archive is written and read
-//! by this module (`archive`), so the client's machine needs no `tar`; the sandbox needs `sh` and a
+//! by the `tar` crate, so the client's machine needs no `tar` binary; the sandbox needs `sh` and a
 //! `tar`, GNU or busybox. The local side of a download is untrusted input and is extracted by
 //! rules that never write through a link (`extract`).
 
-mod archive;
 mod extract;
 
 use std::fs::{self, File};
-use std::io::Read as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -19,8 +17,10 @@ use std::time::Duration;
 
 use crate::exec::{CommandRunner, ExecOutput};
 
-use archive::{BLOCK, Entry, Parser, pad_to_block, write_end, write_header};
-use extract::Extractor;
+use extract::{Extractor, extract_stream};
+
+/// The smallest chunk: one tar block.
+const BLOCK: usize = 512;
 
 /// Raw tar bytes per upload request. 16 MiB is 21.3 MB of base64: under the 64 MiB an `execd`
 /// accepts, and equal to the one-shot response cap. A call holds about two chunks.
@@ -197,18 +197,18 @@ struct Chunk {
     last: bool,
 }
 
-/// Writes the archive and hands out chunks (blocking: it runs on a blocking thread).
-struct Builder {
+/// The archive's sink: collects what the `tar` writer produces and hands out full chunks (blocking:
+/// it runs on a blocking thread).
+struct ChunkWriter {
     buf: Vec<u8>,
     chunk: usize,
     tx: tokio::sync::mpsc::Sender<Chunk>,
-    counts: Transfer,
 }
 
-impl Builder {
+impl ChunkWriter {
     /// Send a full chunk once there is one. `Err` is the receiver gone: the upload failed or was
     /// dropped, and the walk stops.
-    fn flush(&mut self, force_last: bool) -> Result<(), BulkError> {
+    fn flush(&mut self, force_last: bool) -> std::io::Result<()> {
         while self.buf.len() >= self.chunk || force_last {
             let n = self.buf.len().min(self.chunk);
             let last = force_last && self.buf.len() <= self.chunk;
@@ -216,36 +216,91 @@ impl Builder {
             let bytes = std::mem::replace(&mut self.buf, rest);
             self.tx
                 .blocking_send(Chunk { bytes, last })
-                .map_err(|_| BulkError::Io(std::io::Error::other("upload aborted")))?;
+                .map_err(|_| std::io::Error::other("upload aborted"))?;
             if last {
                 return Ok(());
             }
         }
         Ok(())
     }
+}
 
+impl std::io::Write for ChunkWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(bytes);
+        self.flush(false)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A file's content, exactly as many bytes as its header says: a file that shrinks while it is read
+/// fails the upload (a short member would corrupt the archive), one that grows is cut.
+struct Exact {
+    file: File,
+    left: u64,
+    path: PathBuf,
+}
+
+impl std::io::Read for Exact {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.left == 0 {
+            return Ok(0);
+        }
+        let want = buf.len().min(self.left as usize);
+        let n = self.file.read(&mut buf[..want])?;
+        if n == 0 {
+            return Err(std::io::Error::other(format!(
+                "{}: changed while being archived",
+                self.path.display()
+            )));
+        }
+        self.left -= n as u64;
+        Ok(n)
+    }
+}
+
+struct Builder {
+    tar: tar::Builder<ChunkWriter>,
+    counts: Transfer,
+}
+
+/// The upload's own error back out of the `tar` writer's `io::Error`.
+fn upload_err(path: &Path, e: std::io::Error) -> BulkError {
+    if e.to_string() == "upload aborted" || e.to_string().contains("changed while being archived") {
+        return BulkError::Io(e);
+    }
+    local_err(path, e)
+}
+
+impl Builder {
     fn add(&mut self, name: &[u8], path: &Path) -> Result<(), BulkError> {
         let meta = fs::symlink_metadata(path).map_err(|e| local_err(path, e))?;
         let ft = meta.file_type();
-        let mut e = Entry {
-            name: name.to_vec(),
-            kind: b'0',
-            mode: meta.permissions().mode() & 0o777,
-            size: 0,
-            mtime: u64::try_from(meta.mtime()).unwrap_or(0),
-            link: Vec::new(),
-        };
         if std::str::from_utf8(name).is_err() {
             return Err(BulkError::InvalidRequest(format!(
                 "{}: the name is not valid UTF-8",
                 path.display()
             )));
         }
+        let mut h = tar::Header::new_gnu();
+        h.set_mode(meta.permissions().mode() & 0o777);
+        h.set_mtime(u64::try_from(meta.mtime()).unwrap_or(0));
+        h.set_uid(0);
+        h.set_gid(0);
+        let os = |b: &[u8]| std::ffi::OsStr::from_bytes(b).to_owned();
         if ft.is_dir() {
-            e.kind = b'5';
-            write_header(&mut self.buf, &e);
+            h.set_entry_type(tar::EntryType::Directory);
+            h.set_size(0);
+            let mut n = name.to_vec();
+            n.push(b'/');
+            self.tar
+                .append_data(&mut h, Path::new(&os(&n)), std::io::empty())
+                .map_err(|e| upload_err(path, e))?;
             self.counts.dirs += 1;
-            self.flush(false)?;
             let mut names: Vec<_> = fs::read_dir(path)
                 .map_err(|e| local_err(path, e))?
                 .map(|r| r.map(|d| d.file_name()))
@@ -261,42 +316,28 @@ impl Builder {
                 self.add(&child, &path.join(&n))?;
             }
         } else if ft.is_symlink() {
-            e.kind = b'2';
-            e.mode = 0o777;
-            e.link = fs::read_link(path)
-                .map_err(|e| local_err(path, e))?
-                .as_os_str()
-                .as_bytes()
-                .to_vec();
-            write_header(&mut self.buf, &e);
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_mode(0o777);
+            h.set_size(0);
+            let target = fs::read_link(path).map_err(|e| local_err(path, e))?;
+            self.tar
+                .append_link(&mut h, Path::new(&os(name)), target)
+                .map_err(|e| upload_err(path, e))?;
             self.counts.links += 1;
-            self.flush(false)?;
         } else if ft.is_file() {
-            e.size = meta.len();
-            write_header(&mut self.buf, &e);
-            let mut f = File::open(path).map_err(|e| local_err(path, e))?;
-            let mut left = e.size;
-            while left > 0 {
-                let at = self.buf.len();
-                let want = left.min(64 * 1024) as usize;
-                self.buf.resize(at + want, 0);
-                let got = f
-                    .read(&mut self.buf[at..])
-                    .map_err(|e| local_err(path, e))?;
-                self.buf.truncate(at + got);
-                if got == 0 {
-                    return Err(BulkError::Io(std::io::Error::other(format!(
-                        "{}: changed while being archived",
-                        path.display()
-                    ))));
-                }
-                left -= got as u64;
-                self.counts.bytes += got as u64;
-                self.flush(false)?;
-            }
-            pad_to_block(&mut self.buf, e.size);
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_size(meta.len());
+            let file = File::open(path).map_err(|e| local_err(path, e))?;
+            let body = Exact {
+                file,
+                left: meta.len(),
+                path: path.to_path_buf(),
+            };
+            self.tar
+                .append_data(&mut h, Path::new(&os(name)), body)
+                .map_err(|e| upload_err(path, e))?;
             self.counts.files += 1;
-            self.flush(false)?;
+            self.counts.bytes += meta.len();
         } else {
             let what = if ft.is_fifo() {
                 "a FIFO"
@@ -320,9 +361,11 @@ fn build(
     tx: tokio::sync::mpsc::Sender<Chunk>,
 ) -> Result<Transfer, BulkError> {
     let mut b = Builder {
-        buf: Vec::new(),
-        chunk,
-        tx,
+        tar: tar::Builder::new(ChunkWriter {
+            buf: Vec::new(),
+            chunk,
+            tx,
+        }),
         counts: Transfer::default(),
     };
     match sources {
@@ -356,8 +399,9 @@ fn build(
             }
         }
     }
-    write_end(&mut b.buf);
-    b.flush(true)?;
+    // The end-of-archive blocks, then the last chunk.
+    let mut w = b.tar.into_inner().map_err(BulkError::Io)?;
+    w.flush(true).map_err(BulkError::Io)?;
     Ok(b.counts)
 }
 
@@ -506,22 +550,33 @@ fn suffix() -> String {
 
 // ---- download ---------------------------------------------------------------------------------
 
-/// The extractor and the parser behind one lock, because a streaming sink is `Fn`.
-struct Pipe {
-    parser: Parser,
-    extractor: Extractor,
-    error: Option<BulkError>,
+/// The receiving end of the download's pipe as a `Read`, for the extraction thread.
+struct ChanReader {
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    cur: Vec<u8>,
+    pos: usize,
 }
 
-impl Pipe {
-    fn feed(&mut self, bytes: &[u8]) {
-        if self.error.is_none()
-            && let Err(e) = self.parser.feed(bytes, &mut self.extractor)
-        {
-            self.error = Some(e);
+impl std::io::Read for ChanReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.pos >= self.cur.len() {
+            match self.rx.recv() {
+                Ok(v) => {
+                    self.cur = v;
+                    self.pos = 0;
+                }
+                Err(_) => return Ok(0),
+            }
         }
+        let n = buf.len().min(self.cur.len() - self.pos);
+        buf[..n].copy_from_slice(&self.cur[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
     }
 }
+
+/// Chunks of stdout waiting for the extraction thread: the bound on what a slow disk holds back.
+const PIPE_CHUNKS: usize = 8;
 
 /// Download `remote_path` (a directory's contents, or one file) into `local_dir`, created if missing.
 pub async fn download(
@@ -531,25 +586,40 @@ pub async fn download(
 ) -> Result<Transfer, BulkError> {
     remote_path_check(remote_path)?;
     fs::create_dir_all(local_dir).map_err(|e| local_err(local_dir, e))?;
-    let pipe = Mutex::new(Pipe {
-        parser: Parser::new(),
-        extractor: Extractor::new(local_dir),
-        error: None,
-    });
-    let args = sh(DOWNLOAD_SCRIPT, &[remote_path]);
-    let stderr = Mutex::new(Vec::<u8>::new());
-    let bad = tokio::sync::Notify::new();
-
-    let out: ExecOutput = if exec.attaches().await {
-        let on_out = |b: &[u8]| {
-            let mut p = pipe
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            p.feed(b);
-            if p.error.is_some() {
+    // The command's stdout goes down a bounded channel to a blocking thread that reads it as a tar
+    // archive and extracts it as it arrives.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PIPE_CHUNKS);
+    let tx = Mutex::new(Some(tx));
+    let bad = std::sync::Arc::new(tokio::sync::Notify::new());
+    let worker = {
+        let (bad, root) = (bad.clone(), local_dir.to_path_buf());
+        tokio::task::spawn_blocking(move || {
+            let mut ex = Extractor::new(&root);
+            let r = extract_stream(
+                ChanReader {
+                    rx,
+                    cur: Vec::new(),
+                    pos: 0,
+                },
+                &mut ex,
+            );
+            if r.is_err() {
                 bad.notify_one();
             }
-        };
+            r.and_then(|()| ex.finish())
+        })
+    };
+    let feed = |b: &[u8]| {
+        let guard = tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(t) = &*guard {
+            // A thread that has stopped has dropped its end: the notify below ends the call.
+            let _ = t.send(b.to_vec());
+        }
+    };
+    let args = sh(DOWNLOAD_SCRIPT, &[remote_path]);
+    let stderr = Mutex::new(Vec::<u8>::new());
+
+    let out: Result<ExecOutput, BulkError> = if exec.attaches().await {
         let on_err = |b: &[u8]| {
             let mut s = stderr
                 .lock()
@@ -557,47 +627,61 @@ pub async fn download(
             let room = BULK_STDERR_BYTES.saturating_sub(s.len());
             s.extend_from_slice(&b[..b.len().min(room)]);
         };
-        let run = exec.run_attached("sh", &args, None, &on_out, &on_err);
+        let run = exec.run_attached("sh", &args, None, &feed, &on_err);
         tokio::select! {
             r = tokio::time::timeout(BULK_TIMEOUT, run) => match r {
-                Ok(r) => r?.into(),
-                Err(_) => return Err(BulkError::Io(std::io::Error::new(
+                Ok(r) => r.map(ExecOutput::from).map_err(BulkError::Io),
+                Err(_) => Err(BulkError::Io(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!("download {remote_path}: timed out"),
                 ))),
             },
-            // An unsafe member closes the stream: dropping `run` kills the command.
-            () = bad.notified() => ExecOutput::default(),
+            // A bad member closes the stream: dropping `run` kills the command.
+            () = bad.notified() => Ok(ExecOutput::default()),
         }
     } else {
-        let r: ExecOutput = exec.run("sh", &args, None, BULK_TIMEOUT).await?.into();
-        pipe.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .feed(&r.stdout);
-        *stderr
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = r.stderr.clone();
-        ExecOutput {
-            stdout: Vec::new(),
-            ..r
+        match exec.run("sh", &args, None, BULK_TIMEOUT).await {
+            Ok(r) => {
+                let r: ExecOutput = r.into();
+                feed(&r.stdout);
+                *stderr
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = r.stderr.clone();
+                Ok(ExecOutput {
+                    stdout: Vec::new(),
+                    ..r
+                })
+            }
+            Err(e) => Err(BulkError::Io(e)),
         }
     };
-
-    let mut p = pipe
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(e) = p.error {
-        return Err(e);
+    // No more input: the thread sees the end of the archive (or its absence).
+    drop(
+        tx.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take(),
+    );
+    let extracted = worker
+        .await
+        .map_err(|e| BulkError::Io(std::io::Error::other(e.to_string())))?;
+    let out = out?;
+    match extracted {
+        // An unsafe or local failure is the cause whatever the command said.
+        Err(e) if !matches!(&e, BulkError::Archive(m) if !m.starts_with("unsafe archive member")) => {
+            Err(e)
+        }
+        // A command that failed leaves an archive that is cut short: the command's message is the report.
+        other if out.code != 0 => {
+            drop(other);
+            let err =
+                String::from_utf8_lossy(&stderr.into_inner().unwrap_or_default()).into_owned();
+            Err(BulkError::Command(format!(
+                "download {remote_path}: {}",
+                first_line(&err)
+            )))
+        }
+        other => other,
     }
-    if out.code != 0 {
-        let err = String::from_utf8_lossy(&stderr.into_inner().unwrap_or_default()).into_owned();
-        return Err(BulkError::Command(format!(
-            "download {remote_path}: {}",
-            first_line(&err)
-        )));
-    }
-    p.parser.finish()?;
-    p.extractor.finish()
 }
 
 fn remote_path_check(p: &str) -> Result<(), BulkError> {
@@ -608,9 +692,7 @@ fn remote_path_check(p: &str) -> Result<(), BulkError> {
 /// transport that delivered the bytes some other way and for tests.
 pub fn extract(archive: &[u8], local_dir: &Path) -> Result<Transfer, BulkError> {
     fs::create_dir_all(local_dir).map_err(|e| local_err(local_dir, e))?;
-    let mut parser = Parser::new();
     let mut ex = Extractor::new(local_dir);
-    parser.feed(archive, &mut ex)?;
-    parser.finish()?;
+    extract_stream(archive, &mut ex)?;
     ex.finish()
 }

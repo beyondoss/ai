@@ -214,7 +214,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [records, colon, stat, listing, base64, frame, jobs]
+        target: [records, colon, stat, listing, base64, frame, jobs, extract]
     env:
       FUZZ_NIGHTLY: nightly-2026-04-01
     steps:

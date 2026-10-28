@@ -643,7 +643,7 @@ upload and is recreated as a hard link on download. A FIFO, socket or device is
 Both directions use the same subset of `tar`, written and read by the client
 itself (no `tar` on the client's machine is run):
 
-- **Written** (upload): POSIX ustar headers (magic `ustar\0`, version `00`),
+- **Written** (upload): ustar-compatible headers (POSIX `ustar\0` magic, or GNU's `ustar  \0` as the `tar` crate writes it),
   types `0` file, `5` directory (name with a trailing `/`), `2` symlink. A name
   or link target over 100 bytes uses a GNU `L` / `K` extension member (busybox
   and GNU tar both read these; the ustar `prefix` field is never written). `uid`
@@ -701,9 +701,13 @@ against another local process changing `local_dir` while a download runs.
 
 Upload needs no such rules for the sandbox: every member name was produced by
 the client under rule-1 shape, and the archive never has a member below a
-symlink of its own. A symbolic link that **already exists** in `remote_dir` is
-followed by the sandbox's `tar -x` like any other, and stays inside the
-sandbox.
+symlink of its own. A symbolic link that **already exists** inside `remote_dir`
+is followed by the sandbox's own `tar -x`, as it would be for anyone running
+`tar -x` there; the helper does not defend against it. The effect is contained
+in the sandbox, which is the isolation boundary: it can write where the
+sandbox user could write anyway, and nothing on the client's machine is
+reached. (Links in the _local_ source are archived as links and never
+followed.)
 
 #### Upload
 

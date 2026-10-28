@@ -19,27 +19,27 @@ Paste that into `.mcp.json` (Claude Code), `claude_desktop_config.json`, or any 
 `cargo install --path crates/sandbox-mcp`.
 
 It passes the shared conformance matrix (`mise run test:clients`) with 0 failures on every backend, through a real MCP
-session: 363 checks pass on a plain `execd`, and the same 5 known defects of the file helpers that every client has are the
-only others. The checks that need streaming or a caller-chosen mtime are reported unsupported (see below), not skipped.
+session: 463 checks pass on a plain `execd`, and 13 are reported `unsupported` (not skipped): all of them need the raw
+exec stream, which an MCP tool result cannot carry (see below).
 
 ## Tools
 
-| tool         | what it does                                                                                                  |
-| ------------ | ------------------------------------------------------------------------------------------------------------- |
-| `exec`       | run a program and wait: `command`, `args`, `cwd`, `timeout_ms`, `stdin`. Always present: the escape hatch     |
-| `read_file`  | bytes of a file from `offset`, at most `max` (default 128 KiB); text, or base64 for binary                    |
-| `write_file` | create or replace a file atomically, from `content` or `content_base64`; keeps an existing file's permissions |
-| `edit_file`  | replace `old_str` (must match once, or `replace_all`) with `new_str`; never overwrites a concurrent change    |
-| `list_dir`   | entries with name, kind and size; `include_hidden`, `limit`                                                   |
-| `stat`       | exists, kind, size, mtime, writable                                                                           |
-| `search`     | regular-expression search under a directory, with `context`, `glob`, `literal`, `ignore_case`, `limit`        |
-| `mkdir`      | create a directory and its parents                                                                            |
-| `upload`     | copy a directory or file of this machine into a sandbox directory as tar (needs `SANDBOX_LOCAL_ROOT`)         |
-| `download`   | copy a sandbox directory or file to a directory of this machine, never writing through a link (same)          |
-| `job_start`  | start a command that outlives the call; the sandbox keeps it and its output                                   |
-| `job_list`   | jobs and their state: `running`, `exited`, `ended`, `lost`                                                    |
-| `job_output` | a job's output from an offset; follow it by passing back `next_offset`                                        |
-| `job_kill`   | SIGTERM, a grace, SIGKILL; `remove` also deletes the job                                                      |
+| tool         | what it does                                                                                                                                                                                                 |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `exec`       | run a program and wait: `command`, `args`, `cwd`, `timeout_ms`, `stdin`. Always present: the escape hatch                                                                                                    |
+| `read_file`  | bytes of a file from `offset`, at most `max` (default 128 KiB); text, or base64 for binary                                                                                                                   |
+| `write_file` | create or replace a file atomically, from `content` or `content_base64`; keeps an existing file's permissions; `if_unchanged_since` (the `stat` mtime) or `create_only` refuse a lost update with `conflict` |
+| `edit_file`  | replace `old_str` (must match once, or `replace_all`) with `new_str`; never overwrites a concurrent change                                                                                                   |
+| `list_dir`   | entries with name, kind and size; `include_hidden`, `limit`                                                                                                                                                  |
+| `stat`       | exists, kind, size, mtime, writable                                                                                                                                                                          |
+| `search`     | regular-expression search under a directory, with `context`, `glob`, `literal`, `ignore_case`, `limit`                                                                                                       |
+| `mkdir`      | create a directory and its parents                                                                                                                                                                           |
+| `upload`     | copy a directory or file of this machine into a sandbox directory as tar (needs `SANDBOX_LOCAL_ROOT`)                                                                                                        |
+| `download`   | copy a sandbox directory or file to a directory of this machine, never writing through a link (same)                                                                                                         |
+| `job_start`  | start a command that outlives the call; the sandbox keeps it and its output                                                                                                                                  |
+| `job_list`   | jobs and their state: `running`, `exited`, `ended`, `lost`                                                                                                                                                   |
+| `job_output` | a job's output from an offset; follow it by passing back `next_offset`                                                                                                                                       |
+| `job_kill`   | SIGTERM, a grace, SIGKILL; `remove` also deletes the job                                                                                                                                                     |
 
 A failed call is a tool result with `isError: true` and `structuredContent.error = {kind, detail}`, never a protocol error.
 `kind` is one of `not_found`, `is_directory`, `not_a_directory`, `permission_denied`, `io`, `invalid_query`, `conflict`
@@ -70,8 +70,12 @@ that is not a loopback name.
 ## What is not offered
 
 `exec` returns the whole output at once: there is no streaming tool, because an MCP tool result is not streamed. Use
-`job_start` and `job_output` for anything long or noisy. No tool lets the caller supply an expected mtime to a write
-(`edit_file` does the guarded write itself), so those two ops are `unsupported` in the conformance matrix.
+`job_start` and `job_output` for anything long or noisy. So the conformance matrix's `exec_stream` op (frames, signals,
+heartbeats, a timeout that is a frame) is `unsupported`: the 13 checks that use it are the only ones.
+
+To write without losing a concurrent change, pass `write_file` the `mtime` that `stat` returned, as `if_unchanged_since`
+(fractional seconds, exactly as `stat` gave it): a file changed in the meantime, even within the same second, or removed,
+fails with `conflict` and nothing is written. `create_only` is the same guard for "the file must not exist".
 
 More: [ARCHITECTURE.md](ARCHITECTURE.md), the file helpers' spec
 [FILES-OVER-EXEC.md](../../sdk/conformance/FILES-OVER-EXEC.md).

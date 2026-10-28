@@ -4,13 +4,12 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write as _;
+use std::io::{Read, Write as _};
 use std::os::unix::ffi::OsStringExt as _;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
-use super::archive::{Entry, Sink};
 use super::{BulkError, Transfer};
 
 fn unsafe_member(name: &[u8], why: &str) -> BulkError {
@@ -135,7 +134,7 @@ fn set_mtime(path: &Path, secs: u64) -> Result<(), BulkError> {
         .map_err(|e| io_ctx(path, e))
 }
 
-impl Sink for Extractor {
+impl Extractor {
     fn begin(&mut self, e: &Entry) -> Result<(), BulkError> {
         let comps = components(&e.name).map_err(|why| unsafe_member(&e.name, why))?;
         if comps.is_empty() {
@@ -239,7 +238,7 @@ impl Sink for Extractor {
         Ok(())
     }
 
-    fn data(&mut self, bytes: &[u8]) -> Result<(), BulkError> {
+    pub(super) fn data(&mut self, bytes: &[u8]) -> Result<(), BulkError> {
         if let Some(cur) = &mut self.current {
             cur.file
                 .write_all(bytes)
@@ -249,7 +248,7 @@ impl Sink for Extractor {
         Ok(())
     }
 
-    fn end(&mut self) -> Result<(), BulkError> {
+    pub(super) fn end(&mut self) -> Result<(), BulkError> {
         if let Some(cur) = self.current.take() {
             cur.file
                 .set_permissions(fs::Permissions::from_mode(cur.mode & 0o777))
@@ -262,37 +261,113 @@ impl Sink for Extractor {
     }
 }
 
+/// A member as the policy layer sees it.
+struct Entry {
+    name: Vec<u8>,
+    kind: u8,
+    mode: u32,
+    mtime: u64,
+    link: Vec<u8>,
+}
+
+/// Wraps the archive's bytes to tell a clean end (the end-of-archive block) from a stream that just stops:
+/// the `tar` crate reads up to the first zero block and no further, so an end of input it has seen is
+/// an archive that lacks one.
+struct Probe<R> {
+    inner: R,
+    eof: bool,
+}
+
+impl<R: Read> Read for Probe<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n == 0 && !buf.is_empty() {
+            self.eof = true;
+        }
+        Ok(n)
+    }
+}
+
+fn archive_err(e: &std::io::Error) -> BulkError {
+    BulkError::Archive(format!("malformed tar archive: {e}"))
+}
+
+/// Read `input` as a tar archive and extract it by the rules of section 5.8 into `ex`'s root.
+pub(super) fn extract_stream(input: impl Read, ex: &mut Extractor) -> Result<(), BulkError> {
+    let mut probe = Probe {
+        inner: input,
+        eof: false,
+    };
+    {
+        let mut archive = tar::Archive::new(&mut probe);
+        let mut buf = vec![0u8; 64 * 1024];
+        for entry in archive.entries().map_err(|e| archive_err(&e))? {
+            let mut entry = entry.map_err(|e| archive_err(&e))?;
+            let h = entry.header();
+            let kind = match h.entry_type() {
+                tar::EntryType::Regular | tar::EntryType::Continuous => b'0',
+                tar::EntryType::Directory => b'5',
+                tar::EntryType::Symlink => b'2',
+                tar::EntryType::Link => b'1',
+                other => other.as_byte(),
+            };
+            let e = Entry {
+                name: entry.path_bytes().into_owned(),
+                kind,
+                mode: h.mode().map_err(|e| archive_err(&e))?,
+                mtime: h.mtime().map_err(|e| archive_err(&e))?,
+                link: entry
+                    .link_name_bytes()
+                    .map(std::borrow::Cow::into_owned)
+                    .unwrap_or_default(),
+            };
+            ex.begin(&e)?;
+            if kind == b'0' {
+                loop {
+                    let n = entry.read(&mut buf).map_err(|e| archive_err(&e))?;
+                    if n == 0 {
+                        break;
+                    }
+                    ex.data(&buf[..n])?;
+                }
+            }
+            ex.end()?;
+        }
+    }
+    if probe.eof {
+        return Err(BulkError::Archive(
+            "the archive ended before its end-of-archive block".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::archive::{Entry, Parser, pad_to_block, write_end, write_header};
     use super::*;
 
-    fn member(name: &str, kind: u8, data: &[u8], link: &str, mode: u32) -> Vec<u8> {
-        let mut out = Vec::new();
-        write_header(
-            &mut out,
-            &Entry {
-                name: name.into(),
-                kind,
-                mode,
-                size: data.len() as u64,
-                mtime: 1_500_000_000,
-                link: link.into(),
-            },
-        );
-        out.extend_from_slice(data);
-        pad_to_block(&mut out, data.len() as u64);
-        out
+    fn member(name: &str, kind: tar::EntryType, data: &[u8], link: &str, mode: u32) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(kind);
+        h.set_mode(mode);
+        h.set_mtime(1_500_000_000);
+        h.set_size(data.len() as u64);
+        if link.is_empty() {
+            b.append_data(&mut h, name, data).unwrap();
+        } else {
+            b.append_link(&mut h, name, link).unwrap();
+        }
+        // The archive's end is added by `run`, so take the bytes before the builder writes its own.
+        std::mem::take(b.get_mut())
     }
 
     fn run(root: &Path, members: &[Vec<u8>]) -> Result<Transfer, BulkError> {
         std::fs::create_dir_all(root).unwrap();
         let mut a: Vec<u8> = members.concat();
-        write_end(&mut a);
-        let mut p = Parser::new();
+        a.extend_from_slice(&[0u8; 1024]);
         let mut ex = Extractor::new(root);
-        p.feed(&a, &mut ex)?;
-        p.finish()?;
+        extract_stream(&a[..], &mut ex)?;
         ex.finish()
     }
 
@@ -306,12 +381,23 @@ mod tests {
         }
     }
 
+    use tar::EntryType::{Directory, Link, Regular, Symlink};
+
     #[test]
     fn a_name_that_leaves_the_target_is_refused_and_nothing_is_written() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
+        // `append_data` itself refuses `..`, so the member is made by hand.
         for name in ["../x", "a/../../x", "/tmp/abs-escape", "a/.."] {
-            let r = run(&root, &[member(name, b'0', b"x", "", 0o644)]);
+            let mut h = tar::Header::new_gnu();
+            h.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name.as_bytes());
+            h.set_size(1);
+            h.set_mode(0o644);
+            h.set_cksum();
+            let mut m = h.as_bytes().to_vec();
+            m.extend_from_slice(&[b'x'; 1]);
+            m.resize(1024, 0);
+            let r = run(&root, &[m]);
             assert!(matches!(r, Err(BulkError::Archive(_))), "{name:?}: {r:?}");
         }
         assert!(!dir.path().join("x").exists());
@@ -325,25 +411,23 @@ mod tests {
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::create_dir_all(&root).unwrap();
-        // A link the archive made, and one that was already there.
         refused(
             run(
                 &root,
                 &[
-                    member("l", b'2', b"", "../outside", 0o777),
-                    member("l/f", b'0', b"pwned", "", 0o644),
+                    member("l", Symlink, b"", "../outside", 0o777),
+                    member("l/f", Regular, b"pwned", "", 0o644),
                 ],
             ),
             "a parent is not a directory",
         );
         std::os::unix::fs::symlink(&outside, root.join("pre")).unwrap();
         refused(
-            run(&root, &[member("pre/f", b'0', b"pwned", "", 0o644)]),
+            run(&root, &[member("pre/f", Regular, b"pwned", "", 0o644)]),
             "a parent is not a directory",
         );
         assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
-        // A file or directory member replaces the link; the link's target is untouched.
-        run(&root, &[member("pre", b'0', b"now a file", "", 0o600)]).unwrap();
+        run(&root, &[member("pre", Regular, b"now a file", "", 0o600)]).unwrap();
         assert_eq!(std::fs::read(root.join("pre")).unwrap(), b"now a file");
         assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
     }
@@ -353,18 +437,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
         refused(
-            run(&root, &[member("h", b'1', b"", "/etc/passwd", 0o644)]),
+            run(&root, &[member("h", Link, b"", "/etc/passwd", 0o644)]),
             "link target",
         );
         refused(
-            run(&root, &[member("h", b'1', b"", "never", 0o644)]),
+            run(&root, &[member("h", Link, b"", "never", 0o644)]),
             "already wrote",
         );
         let t = run(
             &root,
             &[
-                member("a", b'0', b"data", "", 0o644),
-                member("b", b'1', b"", "./a", 0o644),
+                member("a", Regular, b"data", "", 0o644),
+                member("b", Link, b"", "./a", 0o644),
             ],
         )
         .unwrap();
@@ -380,8 +464,8 @@ mod tests {
         run(
             &root,
             &[
-                member("d/", b'5', b"", "", 0o555),
-                member("d/f", b'0', b"f", "", 0o4755),
+                member("d/", Directory, b"", "", 0o555),
+                member("d/f", Regular, b"f", "", 0o4755),
             ],
         )
         .unwrap();
@@ -394,21 +478,23 @@ mod tests {
         };
         assert_eq!(mode("d"), 0o555);
         assert_eq!(mode("d/f"), 0o755, "set-id bits are not carried");
-        // So the temp directory can be removed.
         std::fs::set_permissions(root.join("d"), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
-    fn an_unsupported_member_type_is_io_and_a_file_over_a_directory_is_an_error() {
+    fn an_archive_without_its_end_block_and_a_file_over_a_directory_are_errors() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let a = member("a", Regular, b"x", "", 0o644);
+        let mut ex = Extractor::new(&root);
         assert!(matches!(
-            run(&root, &[member("dev", b'3', b"", "", 0o644)]),
-            Err(BulkError::Io(e)) if e.to_string().contains("unsupported member type")
+            extract_stream(&a[..], &mut ex),
+            Err(BulkError::Archive(m)) if m.contains("end-of-archive")
         ));
         std::fs::create_dir_all(root.join("d")).unwrap();
         assert!(matches!(
-            run(&root, &[member("d", b'0', b"x", "", 0o644)]),
+            run(&root, &[member("d", Regular, b"x", "", 0o644)]),
             Err(BulkError::Io(e)) if e.to_string().contains("Is a directory")
         ));
     }

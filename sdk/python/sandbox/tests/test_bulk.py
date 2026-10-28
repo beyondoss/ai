@@ -182,8 +182,7 @@ def archive(members: list[tuple[_tar.Entry, bytes]]) -> bytes:
     return out + _tar.END
 
 
-@pytest.mark.parametrize("step", [1, 7, 511, 512, 513, 100_000])
-def test_what_is_written_is_read_back_at_every_chunk_size(step: int) -> None:
+def test_what_is_written_is_read_back() -> None:
     long, tgt = "d" * 150, "t" * 130
     a = archive(
         [
@@ -195,11 +194,8 @@ def test_what_is_written_is_read_back_at_every_chunk_size(step: int) -> None:
         ]
     )
     c = Collect()
-    p = _tar.Parser(c)
-    for i in range(0, len(a), step):
-        p.feed(a[i : i + step])
-    p.finish()
-    assert [e.name for e, _ in c.seen] == [b"a.txt", b"sub/", f"sub/{long}".encode(), b"l", b"e"]
+    _tar.read_archive(io.BytesIO(a), c)
+    assert [e.name for e, _ in c.seen] == [b"a.txt", b"sub", f"sub/{long}".encode(), b"l", b"e"]
     assert bytes(c.seen[0][1]) == b"hello" and bytes(c.seen[2][1]) == b"xyz"
     assert c.seen[3][0].link == tgt.encode()
     assert (c.seen[0][0].mode, c.seen[0][0].mtime) == (0o640, 1_700_000_000)
@@ -207,17 +203,16 @@ def test_what_is_written_is_read_back_at_every_chunk_size(step: int) -> None:
 
 def test_base_256_sizes_round_trip() -> None:
     h = _tar.header(_tar.Entry(b"big", b"0", 0o644, 9 << 30))
-    assert _tar._number(h[124:136], "size") == 9 << 30
+    assert h[124] & 0x80, "a size over 8 GiB is base-256"
+    assert tarfile.TarInfo.frombuf(h, "utf-8", "surrogateescape").size == 9 << 30
 
 
 def test_a_bad_checksum_and_a_missing_end_are_refused() -> None:
     a = archive([(_tar.Entry(b"a", b"0", 0o644, 1), b"x")])
-    p = _tar.Parser(Collect())
-    p.feed(a[:-1024])
     with pytest.raises(ProtocolError):
-        p.finish()
+        _tar.read_archive(io.BytesIO(a[:-1024]), Collect())
     with pytest.raises(ProtocolError):
-        _tar.Parser(Collect()).feed(bytes([a[0] ^ 1]) + a[1:])
+        _tar.read_archive(io.BytesIO(bytes([a[0] ^ 1]) + a[1:]), Collect())
 
 
 def py_tar(fmt: int, members: list[tuple[str, int, bytes, str]]) -> bytes:

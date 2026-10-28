@@ -25,6 +25,7 @@ fn server_command(url: &str) -> tokio::process::Command {
         "SANDBOX_TOKEN_CMD",
         "SANDBOX_CAPS",
         "SANDBOX_MCP_LISTEN",
+        "SANDBOX_LOCAL_ROOT",
     ] {
         cmd.env_remove(k);
     }
@@ -89,7 +90,11 @@ async fn an_agent_lists_the_tools_writes_a_file_runs_cat_and_reads_it_back() {
             tools.iter().any(|t| t.name == "exec"),
             "exec is always present"
         );
-        assert_eq!(tools.len(), 12);
+        assert_eq!(
+            tools.len(),
+            12,
+            "upload and download need SANDBOX_LOCAL_ROOT"
+        );
 
         let w = call(
             peer,
@@ -207,6 +212,80 @@ async fn files_edit_list_search_and_stat_work_through_the_tools() {
         assert_eq!(ok(&gone)["exists"], false);
 
         client.cancel().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn write_file_guarded_by_the_mtime_from_stat_refuses_a_lost_update() {
+    tokio::time::timeout(DEADLINE, async {
+        let (dir, mock) = sandbox().await;
+        let root = dir.path().canonicalize().unwrap();
+        let f = format!("{}/g.txt", root.display());
+        let client = connect(&mock.url).await;
+        let peer = client.peer();
+
+        // create_only: the first write makes the file, the second finds it there.
+        ok(&call(
+            peer,
+            "write_file",
+            json!({"path": f, "content": "v1", "create_only": true}),
+        )
+        .await);
+        let r = call(
+            peer,
+            "write_file",
+            json!({"path": f, "content": "x", "create_only": true}),
+        )
+        .await;
+        assert_eq!(error_kind(&r), "conflict");
+
+        // The mtime stat returns is fractional, and writing against it works.
+        let st = call(peer, "stat", json!({"path": f})).await;
+        let m = ok(&st)["mtime"].as_f64().unwrap();
+        assert!(m > 1.0e9);
+        ok(&call(
+            peer,
+            "write_file",
+            json!({"path": f, "content": "v2", "if_unchanged_since": m}),
+        )
+        .await);
+
+        // The file changed, so the same (now stale) mtime is a conflict that writes nothing.
+        let r = call(
+            peer,
+            "write_file",
+            json!({"path": f, "content": "v3", "if_unchanged_since": m}),
+        )
+        .await;
+        assert_eq!(error_kind(&r), "conflict");
+        let r = call(peer, "read_file", json!({"path": f})).await;
+        assert_eq!(ok(&r)["content"], "v2");
+
+        // A removed file is a conflict too; the two guards do not combine; a negative mtime is refused.
+        let gone = format!("{}/none.txt", root.display());
+        let r = call(
+            peer,
+            "write_file",
+            json!({"path": gone, "content": "x", "if_unchanged_since": m}),
+        )
+        .await;
+        assert_eq!(error_kind(&r), "conflict");
+        let r = call(
+            peer,
+            "write_file",
+            json!({"path": f, "content": "x", "if_unchanged_since": m, "create_only": true}),
+        )
+        .await;
+        assert_eq!(error_kind(&r), "invalid_request");
+        let r = call(
+            peer,
+            "write_file",
+            json!({"path": f, "content": "x", "if_unchanged_since": -1.0}),
+        )
+        .await;
+        assert_eq!(error_kind(&r), "invalid_request");
     })
     .await
     .unwrap();
@@ -524,6 +603,67 @@ async fn a_wrong_token_is_an_auth_error_and_a_token_command_is_asked_again_after
         cmd.env("SANDBOX_TOKEN_CMD", script);
         let client = ().serve(TokioChildProcess::new(cmd).unwrap()).await.unwrap();
         ok(&call(client.peer(), "exec", json!({"command": "true"})).await);
+        client.cancel().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// With `SANDBOX_LOCAL_ROOT` the server offers `upload` and `download`, confined to that directory.
+#[tokio::test]
+async fn upload_and_download_copy_trees_below_the_local_root_only() {
+    tokio::time::timeout(DEADLINE, async {
+        let (dir, mock) = sandbox().await;
+        let remote = dir.path().canonicalize().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let lroot = local.path().canonicalize().unwrap();
+        std::fs::create_dir_all(lroot.join("src/sub")).unwrap();
+        std::fs::write(lroot.join("src/a.txt"), b"alpha\n").unwrap();
+        std::fs::write(lroot.join("src/sub/b.bin"), [0u8, 1, 2, 255]).unwrap();
+        std::os::unix::fs::symlink("a.txt", lroot.join("src/link")).unwrap();
+        std::fs::create_dir_all(lroot.join("outside-link-target")).unwrap();
+        std::os::unix::fs::symlink("/etc", lroot.join("escape")).unwrap();
+
+        let mut cmd = server_command(&mock.url);
+        cmd.env("SANDBOX_LOCAL_ROOT", &lroot);
+        let client = ().serve(TokioChildProcess::new(cmd).unwrap()).await.unwrap();
+        let peer = client.peer();
+        assert_eq!(peer.list_all_tools().await.unwrap().len(), 14);
+
+        let dest = format!("{}/dst", remote.display());
+        let up = call(peer, "upload", json!({"local": "src", "remote_dir": dest})).await;
+        assert_eq!(ok(&up)["files"], 2);
+        assert_eq!(ok(&up)["links"], 1);
+        let down = call(
+            peer,
+            "download",
+            json!({"remote_path": dest, "local_dir": "back/here"}),
+        )
+        .await;
+        assert_eq!(ok(&down)["bytes"], 10);
+        assert_eq!(
+            std::fs::read(lroot.join("back/here/a.txt")).unwrap(),
+            b"alpha\n"
+        );
+        assert_eq!(
+            std::fs::read_link(lroot.join("back/here/link"))
+                .unwrap()
+                .to_str(),
+            Some("a.txt")
+        );
+
+        // Nothing outside the root is reachable: `..`, an absolute path, a link out.
+        for bad in ["../x", "/etc", "escape/x"] {
+            let r = call(peer, "upload", json!({"local": bad, "remote_dir": dest})).await;
+            assert_eq!(error_kind(&r), "invalid_request", "{bad}");
+            let r = call(
+                peer,
+                "download",
+                json!({"remote_path": dest, "local_dir": bad}),
+            )
+            .await;
+            assert_eq!(error_kind(&r), "invalid_request", "{bad}");
+        }
         client.cancel().await.unwrap();
     })
     .await

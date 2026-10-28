@@ -106,8 +106,11 @@ sb.download("/work/project", "./out")              # a directory's contents, or 
 
 - **One request** when the archive fits `chunk_bytes` (16 MiB); larger trees are staged in chunks
   and extracted by one last command. Memory held is about two chunks, however big the tree.
-- **Downloads stream**: stdout frames feed the extractor as they arrive, so size is not capped by the
-  one-shot response limit.
+- **Downloads stream**: stdout frames are spooled to an unnamed temporary file as they arrive and read
+  back with the standard library's `tarfile` (no dependency), so size is not capped by the one-shot
+  response limit and memory stays flat. The extractor applies the rules of the spec itself rather than
+  `tarfile`'s `filter="data"`, which refuses symlinks whose target leaves the destination (allowed here:
+  a link is never followed); no minimum Python above 3.10 is needed.
 - **The sandbox is not trusted.** A member with `..`, an absolute name, or a path below a symlink is
   refused (`protocol`, `unsafe archive member NAME: ...`); nothing is written through a link.
 - **Failures are reported**: a destination that is a file is `not_a_directory`, a read-only or full

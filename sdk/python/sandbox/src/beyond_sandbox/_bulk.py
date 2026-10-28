@@ -9,8 +9,10 @@ extracted by rules that never write through a link.
 from __future__ import annotations
 
 import contextlib
+import io
 import os
 import stat as stat_mod
+import tempfile
 from collections.abc import Iterable, Iterator
 from typing import Any
 
@@ -402,32 +404,38 @@ def extract(archive: bytes, local_dir: str | os.PathLike[str]) -> Transfer:
     """Extract an archive already in memory under ``local_dir``: the local half of a download."""
     _make_local(local_dir)
     ex = Extractor(local_dir)
-    parser = _tar.Parser(ex)
     try:
-        parser.feed(archive)
-        parser.finish()
+        _tar.read_archive(io.BytesIO(archive), ex)
         return ex.finish()
     finally:
         ex.abort()
 
 
 def download(remote_path: str, local_dir: str | os.PathLike[str]) -> Op[Transfer]:
-    """Download ``remote_path`` (a directory's contents, or one file) into ``local_dir``."""
+    """Download ``remote_path`` (a directory's contents, or one file) into ``local_dir``.
+
+    The stream is spooled to an unnamed temporary file as it arrives (disk, not memory: it is the
+    archive's size) and read back by ``tarfile``, which wants a file to pull from.
+    """
     _remote_path("remote_path", remote_path, not_root=False)
     _make_local(local_dir)
     ex = Extractor(local_dir)
-    parser = _tar.Parser(ex)
     try:
-        r: ExecResult = yield Pipe(
-            "sh",
-            sh(_scripts.DOWNLOAD, remote_path),
-            parser.feed,
-            BULK_TIMEOUT_MS,
-            BULK_STDERR_BYTES,
-        )
-        if r.exit_code != 0:
-            raise fail(f"download {remote_path}", r)
-        parser.finish()
+        with tempfile.TemporaryFile() as spool:
+
+            def spool_write(b: bytes) -> None:
+                spool.write(b)
+
+            r: ExecResult = yield Pipe(
+                "sh",
+                sh(_scripts.DOWNLOAD, remote_path),
+                spool_write,
+                BULK_TIMEOUT_MS,
+                BULK_STDERR_BYTES,
+            )
+            if r.exit_code != 0:
+                raise fail(f"download {remote_path}", r)
+            _tar.read_archive(spool, ex)
         return ex.finish()
     finally:
         ex.abort()
