@@ -114,6 +114,10 @@ pub fn decode_line(line: &[u8]) -> Result<Vec<Frame>, String> {
     } else if let Some(code) = wire.exit_code {
         frames.push(Frame::Exit(code));
     } else if let Some(sig) = wire.signal {
+        // The shell status is `128 + sig`. A value that does not fit is a broken frame, never a
+        // truncated status and never a panic in `ExecOutput`'s conversion. Jobs apply the same rule.
+        sig.checked_add(128)
+            .ok_or_else(|| format!("`signal` is out of range: {sig}"))?;
         frames.push(Frame::Signal(sig));
     } else if wire.timed_out {
         frames.push(Frame::TimedOut);
@@ -299,5 +303,17 @@ mod tests {
             };
             assert_eq!(end, want_end, "{name}: final frame");
         }
+    }
+
+    #[test]
+    fn a_signal_whose_shell_status_does_not_fit_an_i32_is_rejected() {
+        let too_wide = i32::MAX - 127;
+        let err = decode_line(format!(r#"{{"signal":{too_wide}}}"#).as_bytes()).unwrap_err();
+        assert!(err.contains("signal"), "{err}");
+        let fits = i32::MAX - 128;
+        assert_eq!(
+            decode_line(format!(r#"{{"signal":{fits}}}"#).as_bytes()).unwrap(),
+            vec![Frame::Signal(fits)]
+        );
     }
 }
