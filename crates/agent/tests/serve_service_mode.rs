@@ -152,7 +152,6 @@ fn every_refused_flag_fails_at_startup() {
         vec!["--trust-project".into()],
         vec!["--force-untrusted".into()],
         vec!["--exec-url".into(), "http://127.0.0.1:1/exec".into()],
-        vec!["--exec-cmd".into(), "sh -c {}".into()],
         vec!["--exec-header".into(), "A: b".into()],
         vec!["--web-allow-private".into()],
         vec!["--web-allow-host".into(), "example.com".into()],

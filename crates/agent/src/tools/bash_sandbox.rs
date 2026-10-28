@@ -1,8 +1,7 @@
 //! `bash` jobs the sandbox runs ([`crate::exec_endpoint::jobs`]): how the job table starts them,
 //! hands them over, kills them, and finds them again on a session's next attach.
 //!
-//! Every remote command of a session with a job scope starts **held** in the sandbox (or kept, over
-//! an endpoint that cannot stream): its stream is the attachment, so a foreground command still dies
+//! Every remote command of a session with a job scope starts **held** in the sandbox: its stream is the attachment, so a foreground command still dies
 //! with its call, its turn or its replica. The moment it becomes an intended job — parked by a
 //! `run_in_background` start, or adopted when its shell exits leaving processes running — the table
 //! **keeps** it under its job number ([`keep`]), and from then on the sandbox owns it: dropping the
@@ -55,15 +54,14 @@ impl SandboxLink {
     }
 }
 
-/// The sandbox and scope this table's remote commands start jobs in, when it has both and the
-/// sandbox can run them.
-pub(crate) async fn store_for(
+/// The sandbox and scope this table's remote commands start jobs in, when it has both.
+pub(crate) fn store_for(
     jobs: &BashJobs,
     runner: &Arc<dyn CommandRunner>,
 ) -> Option<(Arc<dyn SandboxJobs>, JobScope)> {
     let scope = jobs.scope()?;
     let store = runner.clone().sandbox_jobs()?;
-    store.available().await.then_some((store, scope))
+    Some((store, scope))
 }
 
 /// The [`Kill`] for a sandbox job: the `kill` operation (`SIGTERM`, the grace, `SIGKILL`), which
@@ -144,42 +142,31 @@ pub(crate) enum Ctl {
     StopFollow,
 }
 
-/// The runner task of a new remote command run as a sandbox job: held when the sandbox can stream
-/// it, kept from the start otherwise. A held stream that breaks after the job was kept does not end
+/// The runner task of a new remote command run as a sandbox job, held. A held stream that breaks after the job was kept does not end
 /// the job; it is followed from where the stream left off. Under exec notify the notify driver can
 /// close either ([`Ctl`]), and the task then holds nothing until it is told to follow.
 pub(crate) async fn run(
     shared: &Arc<JobShared>,
     link: &SandboxLink,
     spec: &JobSpec,
-    held: bool,
 ) -> Result<ExecResult, String> {
     let mut ctl = Steer::install(shared);
     let events = |e: JobEvent<'_>| on_event(shared, link, e);
-    if held {
-        let held = link.store.run_held(&link.scope, &link.id, spec, &events);
-        let outcome = tokio::select! {
-            r = held => Some(r),
-            () = ctl.until(|c| matches!(c, Ctl::Close)) => None,
-        };
-        if outcome.is_some() {
-            stream_ended(shared, link);
+    let held = link.store.run_held(&link.scope, &link.id, spec, &events);
+    let outcome = tokio::select! {
+        r = held => Some(r),
+        () = ctl.until(|c| matches!(c, Ctl::Close)) => None,
+    };
+    if outcome.is_some() {
+        stream_ended(shared, link);
+    }
+    match outcome {
+        Some(Ok(code)) => return Ok(status_result(code)),
+        Some(Err(e)) if !link.kept() => return Err(e.to_string()),
+        Some(Err(e)) => {
+            tracing::info!(job = %link.id, error = %e, "a kept job's stream broke; following it by polling");
         }
-        match outcome {
-            Some(Ok(code)) => return Ok(status_result(code)),
-            Some(Err(e)) if !link.kept() => return Err(e.to_string()),
-            Some(Err(e)) => {
-                tracing::info!(job = %link.id, error = %e, "a kept job's stream broke; following it by polling");
-            }
-            None => return steered(shared, link, &mut ctl, Phase::Released).await,
-        }
-    } else {
-        let pgid = link
-            .store
-            .start_kept(&link.scope, &link.id, spec)
-            .await
-            .map_err(|e| e.to_string())?;
-        events(JobEvent::Started(pgid));
+        None => return steered(shared, link, &mut ctl, Phase::Released).await,
     }
     steered(shared, link, &mut ctl, Phase::Follow(FollowKind::Holding)).await
 }
@@ -422,7 +409,7 @@ pub(crate) async fn keep(
 }
 
 /// A keep the session's notify kernel decides: whether notify is available for this job (the
-/// endpoint offers it, and the session has the origin to name), then each `keep` it asks for,
+/// session has the origin to name), then each `keep` it asks for,
 /// feeding back how each was answered. `adopted`: a reopen keeping a job it found running, which
 /// sends nothing when notify is not available (the job is kept already).
 async fn keep_through(
@@ -431,10 +418,7 @@ async fn keep_through(
     (num, kind, seen): (u64, &str, u64),
     adopted: bool,
 ) -> Result<(), String> {
-    let target = match n.target_for(&link.id) {
-        Some(t) if link.store.offers_notify().await => Some(t),
-        _ => None,
-    };
+    let target = n.target_for(&link.id);
     let job = link.id.as_str().to_string();
     let mut todo: std::collections::VecDeque<Action> = n
         .feed_collect(Event::Kept {
@@ -675,7 +659,7 @@ async fn read_back(
     catch_up: bool,
 ) -> Option<Reattached> {
     let mut report = Reattached::default();
-    let Some((store, scope)) = store_for(jobs, &runner).await else {
+    let Some((store, scope)) = store_for(jobs, &runner) else {
         return Some(report);
     };
     let listed = match store.list(&scope).await {
@@ -817,9 +801,6 @@ pub async fn wipe(runner: Arc<dyn CommandRunner>, scope: &JobScope) {
     let Some(store) = runner.sandbox_jobs() else {
         return;
     };
-    if !store.available().await {
-        return;
-    }
     match store.wipe(scope).await {
         Ok(survivors) if !survivors.is_empty() => {
             tracing::warn!(
@@ -856,7 +837,6 @@ mod notify_tests {
         let runner =
             std::sync::Arc::new(crate::exec_endpoint::HttpExecRunner::new(&mock.url).unwrap());
         let store = runner.sandbox_jobs().unwrap();
-        assert!(store.available().await);
         let jobs = Arc::new(BashJobs::new(EndPolicy::KeepRunning));
         let hub = NotifyHub::new(crate::notify_token::NotifyKey::from_secret_bytes(&[5; 32]));
         let session = SessionNotify::register(&hub, "t", "s");
@@ -873,7 +853,7 @@ mod notify_tests {
         let job = link.id.as_str().to_string();
         let task = {
             let (shared, link) = (shared.clone(), link.clone());
-            tokio::spawn(async move { run(&shared, &link, &spec, true).await })
+            tokio::spawn(async move { run(&shared, &link, &spec).await })
         };
         // Kept with notify, its proof never comes: proving.
         session.feed(Event::Kept {

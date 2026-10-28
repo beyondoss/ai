@@ -2136,6 +2136,38 @@ mod tests {
                 .run_with_stdin(program, args, cwd, timeout, stdin)
                 .await
         }
+
+        async fn run_streaming(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<&str>,
+            _: std::time::Duration,
+            _: crate::exec::ChunkSink<'_>,
+        ) -> std::io::Result<crate::exec::ExecResult> {
+            unreachable!("a test double that only runs to completion")
+        }
+
+        async fn run_streaming_tracked(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<&str>,
+            _: &crate::exec::JobHooks<'_>,
+        ) -> std::io::Result<crate::exec::ExecResult> {
+            unreachable!("a test double that only runs to completion")
+        }
+
+        async fn run_attached(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<&str>,
+            _: crate::exec::ChunkSink<'_>,
+            _: crate::exec::ChunkSink<'_>,
+        ) -> std::io::Result<crate::exec::ExecResult> {
+            unreachable!("a test double that only runs to completion")
+        }
     }
 
     /// A directory whose `dd`/`base64` reject the flags, as a busybox without them does, and the
@@ -2210,6 +2242,38 @@ mod tests {
                 "exec endpoint http://x returned 401: unauthorized",
             ))
         }
+
+        async fn run_streaming(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<&str>,
+            _: std::time::Duration,
+            _: crate::exec::ChunkSink<'_>,
+        ) -> std::io::Result<crate::exec::ExecResult> {
+            unreachable!("a test double that only runs to completion")
+        }
+
+        async fn run_streaming_tracked(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<&str>,
+            _: &crate::exec::JobHooks<'_>,
+        ) -> std::io::Result<crate::exec::ExecResult> {
+            unreachable!("a test double that only runs to completion")
+        }
+
+        async fn run_attached(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<&str>,
+            _: crate::exec::ChunkSink<'_>,
+            _: crate::exec::ChunkSink<'_>,
+        ) -> std::io::Result<crate::exec::ExecResult> {
+            unreachable!("a test double that only runs to completion")
+        }
     }
 
     /// A runner whose every answer exceeds the response cap.
@@ -2228,6 +2292,38 @@ mod tests {
                 std::io::ErrorKind::FileTooLarge,
                 "the response exceeded the 9-byte cap",
             ))
+        }
+
+        async fn run_streaming(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<&str>,
+            _: std::time::Duration,
+            _: crate::exec::ChunkSink<'_>,
+        ) -> std::io::Result<crate::exec::ExecResult> {
+            unreachable!("a test double that only runs to completion")
+        }
+
+        async fn run_streaming_tracked(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<&str>,
+            _: &crate::exec::JobHooks<'_>,
+        ) -> std::io::Result<crate::exec::ExecResult> {
+            unreachable!("a test double that only runs to completion")
+        }
+
+        async fn run_attached(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<&str>,
+            _: crate::exec::ChunkSink<'_>,
+            _: crate::exec::ChunkSink<'_>,
+        ) -> std::io::Result<crate::exec::ExecResult> {
+            unreachable!("a test double that only runs to completion")
         }
     }
 

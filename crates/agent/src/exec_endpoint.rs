@@ -1,6 +1,6 @@
 //! The agent's side of the exec protocol: per-session targets and the lazily attached cell.
 //!
-//! The client (`HttpExecRunner`, `TemplateRunner`, the stream and job clients) and the normative
+//! The client (`HttpExecRunner`, the stream and job clients) and the normative
 //! protocol spec live in the `beyond-sandbox` crate (`crates/sandbox/src/exec_endpoint.rs`). What
 //! stays here is agent policy: which target a session runs on, when it connects, the notify job-end
 //! receiver (`tools::job_notify`) and the server-conformance verifier ([`conformance`]).
@@ -49,11 +49,6 @@ impl ExecTarget {
             runner = runner.with_header(name, value);
         }
         Self::over(std::sync::Arc::new(runner)).await
-    }
-
-    /// Build from an argv template (`ssh host -- {}`, `docker exec ctr {}`, …).
-    pub async fn template(template: &str) -> Result<Self, String> {
-        Self::over(std::sync::Arc::new(TemplateRunner::parse(template)?)).await
     }
 
     /// Wrap an already-built runner, probing it for the capability rung. A probe request that fails
@@ -400,9 +395,6 @@ impl CommandRunner for CellRunner {
         }
     }
 
-    /// Forwarded, not left to the default: without it a `bash` job behind a cell — every `serve`
-    /// session's — reported no [`Kill`], so the exit path could not reach it, a remote job never
-    /// yielded, and on this host a leftover `cmd &` went untracked.
     async fn run_streaming_tracked(
         &self,
         program: &str,
@@ -421,17 +413,6 @@ impl CommandRunner for CellRunner {
                     .run_streaming_tracked(program, args, cwd, hooks)
                     .await
             }
-        }
-    }
-
-    /// Forwarded for the same reason: the target behind the cell decides whether `bash` can run a
-    /// command in the background. A strict cell with no target answers `false`; running anything
-    /// then fails with the cell's own refusal.
-    async fn tracks_jobs(&self) -> bool {
-        match self.0.resolve().await {
-            Ok(Some(t)) => t.runner().tracks_jobs().await,
-            Ok(None) => true,
-            Err(_) => false,
         }
     }
 
@@ -454,14 +435,6 @@ impl CommandRunner for CellRunner {
                     .run_attached(program, args, cwd, on_stdout, on_stderr)
                     .await
             }
-        }
-    }
-
-    async fn attaches(&self) -> bool {
-        match self.0.resolve().await {
-            Ok(Some(t)) => t.runner().attaches().await,
-            Ok(None) => true,
-            Err(_) => false,
         }
     }
 
@@ -628,8 +601,7 @@ mod lazy_cell_tests {
                 }
                 let flag = Arc::new(AtomicBool::new(false));
                 probe.flags.lock().unwrap().push(flag.clone());
-                let runner: Arc<dyn CommandRunner> =
-                    Arc::new(TemplateRunner::parse("env {}").map_err(|e| e.to_string())?);
+                let runner: Arc<dyn CommandRunner> = Arc::new(crate::tools::exec::RealRunner);
                 Ok(
                     ExecTarget::over_with_home(runner, Some("/sandbox/home".into()))
                         .await?

@@ -314,8 +314,7 @@ pub async fn job_ended_after_takeover(kind: Kind, history: &Path) -> Outcome {
                 format!("B reported the end {n} time(s), want 1"),
             ));
 
-            // A late copy, replayed with the token the sandbox holds (native only: the baseline's is in
-            // its supervisor's 0600 file). Still A first, still B's to answer, and nothing new.
+            // A late copy, replayed with the token the sandbox holds (the sandbox's own copy). Still A first, still B's to answer, and nothing new.
             if let Some(token) = native_token(exec, &session) {
                 let scope_id = native_scope_id(exec, &session);
                 let body = scope_id

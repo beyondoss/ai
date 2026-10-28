@@ -12,7 +12,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use beyond_agent::exec_endpoint::{ExecCell, ExecTarget, HttpExecRunner, TemplateRunner};
+use beyond_agent::exec_endpoint::{
+    DEFAULT_MAX_RESPONSE_BYTES, ExecCell, ExecTarget, HttpExecRunner,
+};
 use beyond_agent::tools::exec::{CommandRunner, RealRunner};
 use beyond_agent::tools::fs::FsBackend;
 use beyond_agent::tools::fs::shell::{Capabilities, ShellFs};
@@ -21,6 +23,71 @@ use common::exec_mock::ExecMock;
 use serde_json::{Value, json};
 
 use crate::common;
+
+/// The host runner with every `stdin` swallowed: the command runs, and sees an empty input.
+struct SwallowsStdin;
+
+#[async_trait::async_trait]
+impl CommandRunner for SwallowsStdin {
+    async fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<beyond_agent::tools::exec::ExecResult> {
+        RealRunner.run(program, args, cwd, timeout).await
+    }
+
+    async fn run_with_stdin(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: std::time::Duration,
+        _stdin: &[u8],
+    ) -> std::io::Result<beyond_agent::tools::exec::ExecResult> {
+        RealRunner.run(program, args, cwd, timeout).await
+    }
+
+    async fn run_streaming(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: std::time::Duration,
+        on_chunk: beyond_agent::tools::exec::ChunkSink<'_>,
+    ) -> std::io::Result<beyond_agent::tools::exec::ExecResult> {
+        RealRunner
+            .run_streaming(program, args, cwd, timeout, on_chunk)
+            .await
+    }
+
+    async fn run_streaming_tracked(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        hooks: &beyond_agent::tools::exec::JobHooks<'_>,
+    ) -> std::io::Result<beyond_agent::tools::exec::ExecResult> {
+        RealRunner
+            .run_streaming_tracked(program, args, cwd, hooks)
+            .await
+    }
+
+    async fn run_attached(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        on_stdout: beyond_agent::tools::exec::ChunkSink<'_>,
+        on_stderr: beyond_agent::tools::exec::ChunkSink<'_>,
+    ) -> std::io::Result<beyond_agent::tools::exec::ExecResult> {
+        RealRunner
+            .run_attached(program, args, cwd, on_stdout, on_stderr)
+            .await
+    }
+}
 
 /// 200 KiB — comfortably past the 128 KiB single-argv cap even before base64's 4/3 growth.
 const BIG: usize = 200 * 1024;
@@ -99,18 +166,10 @@ async fn a_200k_write_is_one_call_and_byte_exact() {
 
 #[tokio::test]
 async fn a_write_whose_stdin_never_arrives_fails_instead_of_emptying_the_file() {
-    // A transport that closes the command's stdin (`docker exec` / `kubectl exec` without `-i`): the
-    // far command sees empty input. The write must fail — not commit zero bytes.
+    // A transport that closes the command's stdin: the far command sees empty input. The write must
+    // fail — not commit zero bytes.
     let dir = tempfile::tempdir().unwrap();
-    let swallowing = TemplateRunner::new(vec![
-        "sh".into(),
-        "-c".into(),
-        r#"exec "$@" < /dev/null"#.into(),
-        "sh".into(),
-        "{}".into(),
-    ])
-    .unwrap();
-    let fs = ShellFs::connect(Arc::new(swallowing)).await.unwrap();
+    let fs = ShellFs::connect(Arc::new(SwallowsStdin)).await.unwrap();
     let path = dir.path().join("precious.txt");
     std::fs::write(&path, "old content\n").unwrap();
 
@@ -207,9 +266,9 @@ async fn a_cell_delegates_stdin_to_whatever_it_currently_holds() {
     // Empty: this host.
     assert_eq!(echo(cell.runner()).await, "through the cell");
     // Pointed at a target: that target.
-    let target = format!("env -C {} {{}}", dir.path().display());
+    let mock = ExecMock::start(dir.path()).await;
     cell.set(Some(
-        ExecTarget::over(Arc::new(TemplateRunner::parse(&target).unwrap()))
+        ExecTarget::http(&mock.url, &[], DEFAULT_MAX_RESPONSE_BYTES)
             .await
             .unwrap(),
     ));

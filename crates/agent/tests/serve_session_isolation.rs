@@ -60,10 +60,6 @@ fn tenant(secret: &str) -> tempfile::TempDir {
     dir
 }
 
-fn target_cmd(dir: &std::path::Path) -> String {
-    format!("env -C {} {{}}", dir.display())
-}
-
 /// Two concurrent one-turn prompts on distinct session ids: each transcript (and each live
 /// `get_messages`) must contain only that session's marker. The mock is routed by the marker so
 /// arrival order cannot hand session A's reply to B.
@@ -167,6 +163,8 @@ async fn concurrent_sessions_do_not_leak_transcripts() {
 async fn concurrent_sessions_do_not_leak_exec_endpoints() {
     let a_dir = tenant("SECRET-AAAA");
     let b_dir = tenant("SECRET-BBBB");
+    let a_box = crate::common::exec_mock::ExecMock::start(a_dir.path()).await;
+    let b_box = crate::common::exec_mock::ExecMock::start(b_dir.path()).await;
     let (base, _bodies) = spawn_model_server(vec![
         turn_tool_use("t1", "read", &json!({ "path": "secret.txt" }).to_string()),
         turn_text("first"),
@@ -181,7 +179,7 @@ async fn concurrent_sessions_do_not_leak_exec_endpoints() {
 
     ws_send(
         &mut a,
-        json!({ "type": "set_exec_endpoint", "id": "ea", "command": target_cmd(a_dir.path()) }),
+        json!({ "type": "set_exec_endpoint", "id": "ea", "url": a_box.url }),
     )
     .await;
     let ea = ws_read_until_response(&mut a, "set_exec_endpoint").await;
@@ -189,7 +187,7 @@ async fn concurrent_sessions_do_not_leak_exec_endpoints() {
 
     ws_send(
         &mut b,
-        json!({ "type": "set_exec_endpoint", "id": "eb", "command": target_cmd(b_dir.path()) }),
+        json!({ "type": "set_exec_endpoint", "id": "eb", "url": b_box.url }),
     )
     .await;
     let eb = ws_read_until_response(&mut b, "set_exec_endpoint").await;

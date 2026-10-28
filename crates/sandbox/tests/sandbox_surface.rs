@@ -92,9 +92,10 @@ async fn a_sandbox_over_a_test_written_transport_has_all_three_layers() {
         b"hello\n"
     );
 
-    assert!(
-        sandbox.jobs().available().await,
-        "the baseline jobs are built from plain exec"
+    assert_eq!(
+        sandbox.jobs().err().map(|e| e.kind()),
+        Some(std::io::ErrorKind::Unsupported),
+        "an exec that owns no jobs has none"
     );
     let raw = sandbox
         .raw()

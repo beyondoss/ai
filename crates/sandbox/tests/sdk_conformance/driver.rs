@@ -41,7 +41,7 @@ pub struct CapsOverride {
 
 pub struct Driver {
     runner: Arc<dyn CommandRunner>,
-    jobs: beyond_sandbox::Jobs,
+    jobs: Option<beyond_sandbox::Jobs>,
     fs: ShellFs,
     /// The error every op returns when the endpoint could not be reached or refused the first
     /// request: probes that fail at that level are not capabilities, they are an outage.
@@ -262,6 +262,12 @@ impl Driver {
         }
     }
 
+    fn jobs(&self) -> Result<&beyond_sandbox::Jobs, Value> {
+        self.jobs
+            .as_ref()
+            .ok_or_else(|| err("unsupported", "this exec does not own jobs"))
+    }
+
     fn scope(&self, req: &Value) -> Result<JobScope, Value> {
         let name = str_arg(req, "scope")?;
         Ok(match &self.jobs_root {
@@ -275,19 +281,26 @@ impl Driver {
         JobId::parse(s).ok_or_else(|| err("invalid_request", format!("bad job id {s:?}")))
     }
 
-    pub fn ops() -> Vec<&'static str> {
-        vec![
-            "hello",
-            "capabilities",
-            "exec",
-            "exec_stream",
-            "job_start",
-            "job_list",
-            "job_read",
-            "job_attach",
-            "job_kill",
-            "job_remove",
-            "job_wipe",
+    /// The ops this driver offers: the job ops only over an exec that owns jobs.
+    pub fn ops(&self) -> Vec<&'static str> {
+        Self::ops_with(self.jobs.is_some())
+    }
+
+    /// [`Self::ops`] for an exec that owns jobs, or not.
+    pub fn ops_with(jobs: bool) -> Vec<&'static str> {
+        let mut ops = vec!["hello", "capabilities", "exec", "exec_stream"];
+        if jobs {
+            ops.extend([
+                "job_start",
+                "job_list",
+                "job_read",
+                "job_attach",
+                "job_kill",
+                "job_remove",
+                "job_wipe",
+            ]);
+        }
+        ops.extend([
             "stat",
             "read",
             "write",
@@ -298,7 +311,8 @@ impl Driver {
             "upload",
             "download",
             "extract",
-        ]
+        ]);
+        ops
     }
 
     /// One request line in, one response line out.
@@ -307,7 +321,7 @@ impl Driver {
         let op = req["op"].as_str().unwrap_or("");
         let out = if op == "hello" || op == "capabilities" {
             self.meta(op).await
-        } else if !Self::ops().contains(&op) {
+        } else if !self.ops().contains(&op) {
             Err(err("unsupported", format!("no such op {op:?}")))
         } else if let Some(e) = &self.connect_error {
             Err(e.clone())
@@ -325,7 +339,7 @@ impl Driver {
             return Ok(json!({
                 "driver": "agent-reference",
                 "protocol": 1,
-                "ops": Self::ops(),
+                "ops": self.ops(),
             }));
         }
         if let Some(e) = &self.connect_error {
@@ -449,7 +463,7 @@ impl Driver {
             label: opt_str(req, "label")?.unwrap_or("").to_string(),
         };
         let pgid = self
-            .jobs
+            .jobs()?
             .start_kept(&scope, &id, &spec)
             .await
             .map_err(|e| io_err(&e))?;
@@ -458,7 +472,7 @@ impl Driver {
 
     async fn job_list(&self, req: &Value) -> Out {
         let scope = self.scope(req)?;
-        let jobs = self.jobs.list(&scope).await.map_err(|e| io_err(&e))?;
+        let jobs = self.jobs()?.list(&scope).await.map_err(|e| io_err(&e))?;
         let jobs: Vec<Value> = jobs
             .iter()
             .map(|j| {
@@ -479,7 +493,7 @@ impl Driver {
         let offset = u64_arg(req, "offset")?.unwrap_or(0);
         let max = u64_arg(req, "max")?.unwrap_or(128 * 1024) as usize;
         let c = self
-            .jobs
+            .jobs()?
             .read(&scope, &id, offset, max)
             .await
             .map_err(|e| io_err(&e))?;
@@ -497,7 +511,7 @@ impl Driver {
         let out = Mutex::new(Vec::new());
         let gaps = Mutex::new(0u64);
         let code = self
-            .jobs
+            .jobs()?
             .follow(&scope, &id, offset, &|ev: JobEvent<'_>| match ev {
                 JobEvent::Output(b) => out.lock().unwrap().extend_from_slice(b),
                 JobEvent::Gap(n) => *gaps.lock().unwrap() += n,
@@ -520,7 +534,7 @@ impl Driver {
             .collect::<Result<_, _>>()?;
         let remove = flag(req, "remove")?;
         let survivors = self
-            .jobs
+            .jobs()?
             .kill(&scope, &ids, remove)
             .await
             .map_err(|e| io_err(&e))?;
@@ -537,7 +551,7 @@ impl Driver {
             .iter()
             .filter_map(|s| JobId::parse(s))
             .collect();
-        self.jobs
+        self.jobs()?
             .remove(&scope, &ids)
             .await
             .map_err(|e| io_err(&e))?;
@@ -546,7 +560,7 @@ impl Driver {
 
     async fn job_wipe(&self, req: &Value) -> Out {
         let scope = self.scope(req)?;
-        let survivors = self.jobs.wipe(&scope).await.map_err(|e| io_err(&e))?;
+        let survivors = self.jobs()?.wipe(&scope).await.map_err(|e| io_err(&e))?;
         Ok(json!({ "survivors": survivors }))
     }
 

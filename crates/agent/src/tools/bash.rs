@@ -218,8 +218,7 @@ fn describe(idle_yield: Option<Duration>) -> String {
              a command you don't need to wait on (a server, a watcher): the call returns at once with \
              a job number and you are notified when it exits; don't poll or sleep. You are told when \
              every job exits, without asking. Use `bash_job` with the number to see what a job has \
-             printed, to wait for one whose result you need, or to stop one. (Where a remote sandbox \
-             cannot stream output as it happens, a call waits for its command to exit.)",
+             printed, to wait for one whose result you need, or to stop one.",
             idle.as_secs(),
             OUTPUT_CEILING.as_secs() / 60,
         ));
@@ -452,28 +451,18 @@ impl Bash {
             if let Err(e) = super::bash_sandbox::reconcile(&self.jobs).await {
                 tracing::warn!(error = %e, "could not read back the session's sandbox jobs");
             }
-            super::bash_sandbox::store_for(&self.jobs, &self.runner).await
+            super::bash_sandbox::store_for(&self.jobs, &self.runner)
         } else {
             None
         };
-        if start == Start::Background {
-            // Refused before anything runs: starting a server only to stop it helps nobody.
-            if sandbox.is_none() && !self.runner.tracks_jobs().await {
-                return Err(ToolError::InvalidInput(
-                    "`run_in_background` is unavailable here: this sandbox's exec endpoint (protocol \
-                     one-shot) cannot stream a command's output or stop it, so nothing can keep running \
-                     past the call. Run the command without it; the call then waits for the command \
-                     to exit."
-                        .into(),
-                ));
-            }
-            if let Some(running) = self.jobs.intended_full() {
-                return Err(ToolError::Execution(format!(
-                    "Not started: {MAX_INTENDED_JOBS} {INTENDED_JOBS} are already running \
-                     ({running}). Stop one with bash_job {{\"job\": N, \"kill\": true}}, then run \
-                     this again."
-                )));
-            }
+        if start == Start::Background
+            && let Some(running) = self.jobs.intended_full()
+        {
+            return Err(ToolError::Execution(format!(
+                "Not started: {MAX_INTENDED_JOBS} {INTENDED_JOBS} are already running \
+                 ({running}). Stop one with bash_job {{\"job\": N, \"kill\": true}}, then run \
+                 this again."
+            )));
         }
         // Prefix and command run as one script in one shell invocation — matches pi's
         // `${commandPrefix}\n${command}` — so both land in the same combined output stream, in order,
@@ -488,7 +477,7 @@ impl Bash {
     }
 
     /// The command runs on its own task, and this call waits on it until it exits, it has been quiet
-    /// for the idle window ([`Self::idle_window`]), it has kept printing for the call's ceiling
+    /// for the idle window ([`Self::idle_yield`]), it has kept printing for the call's ceiling
     /// ([`OUTPUT_CEILING`]), the model's `timeout_ms` passes, or its shell exits leaving processes
     /// running — or, for `run_in_background`, until [`BACKGROUND_SETTLE`] passes. In every case but
     /// the first the command keeps running as a numbered job (see [`super::bash_jobs`]): the model
@@ -518,25 +507,17 @@ impl Bash {
     ) -> Result<ToolOutput, ToolError> {
         let shared = Arc::new(JobShared::new(world.is_remote(), &self.jobs));
         shared.set_command(truncate_command(command, COMMAND_CHARS));
-        // A sandbox job when the sandbox can host it: held when its start can stream, kept from the
-        // start otherwise — which only a background job needs; a foreground command over an endpoint
-        // that cannot stream waits for its exit as before.
-        let sandbox = match sandbox {
-            Some((store, scope)) => {
-                let held = store.holds().await;
-                (held || start == Start::Background).then(|| {
-                    let link = super::bash_sandbox::SandboxLink::new(
-                        store,
-                        scope,
-                        crate::exec_endpoint::jobs::JobId::fresh(),
-                        !held,
-                    );
-                    shared.set_sandbox(link.clone());
-                    (link, held)
-                })
-            }
-            None => None,
-        };
+        // A sandbox job when the sandbox can host it, held by its start's stream.
+        let sandbox = sandbox.map(|(store, scope)| {
+            let link = super::bash_sandbox::SandboxLink::new(
+                store,
+                scope,
+                crate::exec_endpoint::jobs::JobId::fresh(),
+                false,
+            );
+            shared.set_sandbox(link.clone());
+            link
+        });
         if let Some(p) = progress {
             p.emit("", None);
         }
@@ -559,14 +540,14 @@ impl Bash {
                     on_orphans: &on_orphans,
                 };
                 let result = match sandbox {
-                    Some((link, held)) => {
+                    Some(link) => {
                         let spec = crate::exec_endpoint::jobs::JobSpec {
                             program: shell,
                             args,
                             cwd,
                             label,
                         };
-                        super::bash_sandbox::run(&shared, &link, &spec, held).await
+                        super::bash_sandbox::run(&shared, &link, &spec).await
                     }
                     None => runner
                         .run_streaming_tracked(&shell, &args, cwd.as_deref(), &hooks)
@@ -598,20 +579,7 @@ impl Bash {
             reminded: false,
             command: truncate_command(command, COMMAND_CHARS),
         };
-        let started = job.started;
-        let result = self.attach(job, progress, hold).await;
-        // A runner that streams nothing (an exec endpoint on protocol one-shot) cannot hand control
-        // back before the command exits; a `timeout_ms` it outlived must not look honored.
-        match timeout_unheard(&shared, &start, started) {
-            Some(note) => match result {
-                Ok(out) => Ok(append_status(&out.text, &note).into()),
-                Err(ToolError::Execution(text)) => {
-                    Err(ToolError::Execution(append_status(&text, &note)))
-                }
-                Err(e) => Err(e),
-            },
-            None => result,
-        }
+        self.attach(job, progress, hold).await
     }
 
     /// Wait on `job` until it ends (its final result), its shell exits leaving processes running
@@ -710,9 +678,9 @@ impl Bash {
     /// When this attach hands control back. A foreground attach (the call that starts a command, or
     /// a `bash_job` wait) yields after the idle window of silence (measured from the later of the
     /// last output and this attach, so a re-attached job always gets a full window), at its
-    /// ceiling, or at the model's `timeout_ms` (0: at once), whichever is first — and never, when
-    /// the command's silence says nothing (see [`Self::idle_window`]). A background start returns
-    /// at its settle.
+    /// ceiling, or at the model's `timeout_ms` (0: at once), whichever is first. The silence
+    /// allowed is [`Self::idle_yield`], the same for the call that started the command and for every
+    /// wait after it. A background start returns at its settle.
     fn yield_deadline(&self, job: &Job, attached: Instant, hold: Hold) -> Instant {
         let (ceiling, timeout_ms) = match hold {
             Hold::Settle(settle) => return attached + settle,
@@ -721,7 +689,7 @@ impl Bash {
                 timeout_ms,
             } => (ceiling, timeout_ms),
         };
-        let Some(idle) = self.idle_window(job) else {
+        let Some(idle) = self.idle_yield else {
             // Never yield: a far deadline is the honest answer.
             return attached + Duration::from_secs(u64::from(u32::MAX));
         };
@@ -731,25 +699,6 @@ impl Bash {
             Some(ms) => deadline.min(attached + Duration::from_millis(ms)),
             None => deadline,
         }
-    }
-
-    /// The silence any attach allows before reporting: [`Self::idle_yield`], the same for the call
-    /// that started the command and for every wait after it. It used to grow ×4 per report (60 s,
-    /// 240 s, 960 s), so a silent build was reported once rather than every minute; that predates
-    /// finish notices. With the exit pushed to the model, an early return costs one model turn
-    /// (median 2.5 s on Luna), while a long window costs its whole length on a job that never exits
-    /// — in the background A/B the one grown window was a 240 s wait on a watcher. See "`bash` and
-    /// hung commands" in `ARCHITECTURE.md`.
-    ///
-    /// `None` (never yield) when the command runs somewhere this host sees no output from as it
-    /// happens: a one-shot request/response exec endpoint streams nothing, so its silence says nothing
-    /// about the command. A remote runner whose output is live (exec protocol streaming, a template
-    /// transport) says so by reporting a [`Kill`], and from then on yields exactly as local does.
-    fn idle_window(&self, job: &Job) -> Option<Duration> {
-        if job.shared.remote && !job.shared.live.load(std::sync::atomic::Ordering::Relaxed) {
-            return None;
-        }
-        self.idle_yield
     }
 
     /// Why this attach should return now, if it should. The model's own `timeout_ms` is named first
@@ -763,7 +712,7 @@ impl Bash {
                 timeout_ms,
             } => (ceiling, timeout_ms),
         };
-        let window = self.idle_window(job)?;
+        let window = self.idle_yield?;
         if let Some(ms) = timeout_ms
             && waited >= Duration::from_millis(ms)
         {
@@ -962,17 +911,6 @@ impl Bash {
         let result = end.result.map_err(ToolError::Execution)?;
         let snap = {
             let mut out = job.shared.out();
-            // A non-streaming runner (a test double, a remote endpoint) delivered nothing through the
-            // sink; its captured output is the whole story.
-            if !out.streamed {
-                out.acc.append(&result.stdout);
-                if !result.stderr.is_empty() {
-                    if !result.stdout.is_empty() {
-                        out.acc.append(b"\n");
-                    }
-                    out.acc.append(&result.stderr);
-                }
-            }
             out.acc.finish();
             out.acc.snapshot(true)
         };
@@ -1129,20 +1067,6 @@ enum Yield {
 
 /// What the cap on intended jobs counts, as the model is told.
 const INTENDED_JOBS: &str = "jobs started in the background or left running by a command";
-
-/// The note for a foreground call whose `timeout_ms` passed while a runner that streams nothing (an
-/// exec endpoint on protocol one-shot) held it until the command exited — see [`Bash::idle_window`].
-fn timeout_unheard(shared: &JobShared, start: &Start, started: Instant) -> Option<String> {
-    let Start::Foreground(Some(ms)) = *start else {
-        return None;
-    };
-    let unheard = shared.remote && !shared.live.load(std::sync::atomic::Ordering::Relaxed);
-    (unheard && started.elapsed() >= Duration::from_millis(ms)).then(|| {
-        "This sandbox's exec endpoint cannot return before a command exits, so `timeout_ms` had \
-         no effect."
-            .to_string()
-    })
-}
 
 /// Records a job's end when its runner task is dropped (aborted) or panics before recording one.
 struct FinishOnDrop(Option<Arc<JobShared>>);
@@ -1608,8 +1532,8 @@ mod tests {
         assert!(truncation_details(&snap).is_none());
     }
 
-    /// Records the last invocation and returns a canned result (a non-streaming runner: it never
-    /// delivers chunks, so `bash` exercises its fallback-from-`ExecResult` path).
+    /// Records the last invocation and returns a canned result, delivering its output through the
+    /// sink as one burst.
     struct RecordingRunner {
         last: std::sync::Mutex<Option<(String, Vec<String>, Duration)>>,
         result: ExecResult,
@@ -1626,6 +1550,47 @@ mod tests {
         ) -> std::io::Result<ExecResult> {
             *self.last.lock().unwrap() = Some((program.to_string(), args.to_vec(), timeout));
             Ok(self.result.clone())
+        }
+
+        async fn run_streaming(
+            &self,
+            program: &str,
+            args: &[String],
+            cwd: Option<&str>,
+            timeout: Duration,
+            on_chunk: ChunkSink<'_>,
+        ) -> std::io::Result<ExecResult> {
+            let result = self.run(program, args, cwd, timeout).await?;
+            on_chunk(&result.stdout);
+            if !result.stderr.is_empty() {
+                if !result.stdout.is_empty() {
+                    on_chunk(b"\n");
+                }
+                on_chunk(&result.stderr);
+            }
+            Ok(result)
+        }
+
+        async fn run_streaming_tracked(
+            &self,
+            program: &str,
+            args: &[String],
+            cwd: Option<&str>,
+            hooks: &JobHooks<'_>,
+        ) -> std::io::Result<ExecResult> {
+            self.run_streaming(program, args, cwd, Duration::ZERO, hooks.on_chunk)
+                .await
+        }
+
+        async fn run_attached(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<&str>,
+            _: crate::tools::exec::ChunkSink<'_>,
+            _: crate::tools::exec::ChunkSink<'_>,
+        ) -> std::io::Result<crate::tools::exec::ExecResult> {
+            unreachable!("a test double that only runs to completion")
         }
     }
 
@@ -1670,6 +1635,28 @@ mod tests {
                 code: Some(0),
                 ..Default::default()
             })
+        }
+
+        async fn run_streaming_tracked(
+            &self,
+            program: &str,
+            args: &[String],
+            cwd: Option<&str>,
+            hooks: &JobHooks<'_>,
+        ) -> std::io::Result<ExecResult> {
+            self.run_streaming(program, args, cwd, Duration::ZERO, hooks.on_chunk)
+                .await
+        }
+
+        async fn run_attached(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<&str>,
+            _: crate::tools::exec::ChunkSink<'_>,
+            _: crate::tools::exec::ChunkSink<'_>,
+        ) -> std::io::Result<crate::tools::exec::ExecResult> {
+            unreachable!("a test double that only runs to completion")
         }
     }
 
@@ -1719,26 +1706,6 @@ mod tests {
         assert_eq!(resolve_shell(), shell);
     }
 
-    #[tokio::test]
-    async fn timeout_ms_never_reaches_the_runner_as_a_kill_deadline() {
-        // `timeout_ms` only decides when the call returns. A runner that cannot track a job (no
-        // live output, no kill: here a test double, in production a one-shot exec endpoint) gets the
-        // one internal deadline that ends a hung command, whatever the model asked for.
-        for input in [
-            json!({ "command": "echo hi" }),
-            json!({ "command": "echo hi", "timeout_ms": 5_000 }),
-        ] {
-            let runner = recording(ExecResult {
-                code: Some(0),
-                stdout: "hi\n".into(),
-                ..Default::default()
-            });
-            Bash::with_runner(runner.clone()).run(input).await.unwrap();
-            let (_, _, timeout) = runner.last.lock().unwrap().clone().unwrap();
-            assert_eq!(timeout, crate::tools::exec::UNTRACKED_DEADLINE);
-        }
-    }
-
     #[test]
     fn the_schema_says_timeout_ms_returns_and_offers_run_in_background() {
         let schema = Bash::real().input_schema();
@@ -1780,12 +1747,10 @@ mod tests {
             desc.contains("after its `timeout_ms` returns early"),
             "{desc}"
         );
-        // Over one-shot a background job is the sandbox's (it starts kept and is polled); only a
-        // foreground call still has to wait for its command.
         assert!(
-            desc.contains("a call waits for its command to exit")
+            !desc.contains("waits for its command to exit")
                 && !desc.contains("`run_in_background` is unavailable"),
-            "the one-shot exception: {desc}"
+            "no exception for a runner that cannot stream: {desc}"
         );
         assert!(
             desc.contains(&DEFAULT_MAX_LINES.to_string())
@@ -2312,6 +2277,28 @@ mod tests {
                 ..Default::default()
             })
         }
+
+        async fn run_streaming_tracked(
+            &self,
+            program: &str,
+            args: &[String],
+            cwd: Option<&str>,
+            hooks: &JobHooks<'_>,
+        ) -> std::io::Result<ExecResult> {
+            self.run_streaming(program, args, cwd, Duration::ZERO, hooks.on_chunk)
+                .await
+        }
+
+        async fn run_attached(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<&str>,
+            _: crate::tools::exec::ChunkSink<'_>,
+            _: crate::tools::exec::ChunkSink<'_>,
+        ) -> std::io::Result<crate::tools::exec::ExecResult> {
+            unreachable!("a test double that only runs to completion")
+        }
     }
 
     #[tokio::test]
@@ -2481,6 +2468,39 @@ mod tests {
                 timed_out: false,
                 truncated: false,
             })
+        }
+
+        async fn run_streaming(
+            &self,
+            program: &str,
+            args: &[String],
+            cwd: Option<&str>,
+            timeout: Duration,
+            _on_chunk: ChunkSink<'_>,
+        ) -> std::io::Result<ExecResult> {
+            self.run(program, args, cwd, timeout).await
+        }
+
+        async fn run_streaming_tracked(
+            &self,
+            program: &str,
+            args: &[String],
+            cwd: Option<&str>,
+            hooks: &JobHooks<'_>,
+        ) -> std::io::Result<ExecResult> {
+            self.run_streaming(program, args, cwd, Duration::ZERO, hooks.on_chunk)
+                .await
+        }
+
+        async fn run_attached(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<&str>,
+            _: crate::tools::exec::ChunkSink<'_>,
+            _: crate::tools::exec::ChunkSink<'_>,
+        ) -> std::io::Result<crate::tools::exec::ExecResult> {
+            unreachable!("a test double that only runs to completion")
         }
     }
 

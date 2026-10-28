@@ -11,8 +11,7 @@ can link it, and a model checker can call it exactly as production does.
 
 Use it if you write an exec endpoint (a vendor adapter, a sandbox service) that
 supports `keep` with `notify`. The agent and the reference endpoint in
-`crates/test-support` link it; the baseline's `sh` supervisor follows the same
-rules, and a differential test holds the two together.
+`crates/test-support` link it.
 
 ## Use
 
@@ -66,7 +65,7 @@ assert_eq!(actions, [Action::Begin { attempt: 2 }]);
 Also exported: `check_notify(url, token)`, which applies the `keep` grammar
 (absolute `https` URL, or `http` to loopback, at most 2048 bytes, no userinfo or
 fragment; token of 1 to 512 `token68` bytes); `body(scope, id)`, the callback
-body; and `SH`, the same kernel in POSIX `sh` for endpoints that have no Rust.
+body.
 
 ## Reference
 

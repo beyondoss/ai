@@ -9,11 +9,10 @@ depends on it; it depends on neither `beyond-agent` nor `beyond-agent-core`.
 | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
 | `src/lib.rs`                       | the public names: `Exec`, `HttpExec`, `Files`, `Jobs`, `Sandbox`, `TokenSource`                                              |
 | `src/exec.rs`                      | `CommandRunner` (`Exec`), `ExecResult`, `ExecOutput` (code and bytes), `Kill`/`LocalKill`/`kill_all`, bounded output capture |
-| `src/exec_endpoint.rs`             | the protocol spec (module doc), `HttpExecRunner`, `TemplateRunner`                                                           |
+| `src/exec_endpoint.rs`             | the protocol spec (module doc), `HttpExecRunner`                                                                             |
 | `src/exec_endpoint/stream.rs`      | stream frames and the frame reader                                                                                           |
-| `src/exec_endpoint/jobs.rs`        | `SandboxJobs`, `ShellJobs` (jobs over plain exec, for a transport with none), scopes, ids                                    |
+| `src/exec_endpoint/jobs.rs`        | `SandboxJobs`, scopes, ids                                                                                                   |
 | `src/exec_endpoint/jobs_native.rs` | the endpoint's jobs: `NativeJobs`, `HttpJobs`                                                                                |
-| `src/exec_endpoint/far_kill.rs`    | killing a template transport's command on the far side                                                                       |
 | `src/fs.rs`                        | `FsBackend`, its types, and the result policy every backend shares                                                           |
 | `src/fs/shell.rs`                  | `ShellFs` (`Files`): file operations as commands, the one lazy environment probe, parsers, `__fuzz`                          |
 | `src/bulk.rs`                      | `upload`/`download`/`extract`: tar over exec, the three scripts, the staged upload, `Sources`, `Transfer`, `BulkError`       |
@@ -31,19 +30,19 @@ Sandbox            layer 3   connect, .exec() .files() .jobs() .raw()          s
 Files  Jobs        layer 2   built only on layer 1                              src/fs/shell.rs, src/exec_endpoint/jobs*.rs
 Exec               layer 1   run, run_streaming(_tracked), run_attached,        src/exec.rs
                              run_with_stdin, sandbox_jobs, ready
-  HttpExec   TemplateRunner   your own                                          src/exec_endpoint.rs
+  HttpExec   your own                                          src/exec_endpoint.rs
 ```
 
-**Layer 1 is one trait.** `Exec` is `exec::CommandRunner`; only `run` is required. Everything else defaults to the
-safe answer: `run_streaming` runs and never calls the sink, `run_streaming_tracked` runs under a 30-minute deadline and
-reports no `Kill`, `run_attached` and `run_with_stdin` answer `Unsupported`, `tracks_jobs` and `attaches` say `false`.
-A runner that does more says so, and the callers ask before relying on it. Calling a sink is a promise that every byte
-of both streams went through it.
+**Layer 1 is one trait.** `Exec` is `exec::CommandRunner`. `run`, `run_streaming`, `run_streaming_tracked` and
+`run_attached` are required: every implementation streams and can be stopped. `run_with_stdin` answers `Unsupported`
+unless overridden, `ready` is a no-op, and `sandbox_jobs` is `None` for a runner whose commands run on this host.
+Calling a sink is a promise that every byte of both streams went through it.
 
 **Layer 2 never reaches below the trait.** `ShellFs` (`Files`) builds every file operation from `Exec::run` and
-`run_with_stdin`; `Jobs` is `Exec::sandbox_jobs()` when the runner has jobs of its own (the HTTP one), else `ShellJobs` over plain `run` and
-`run_attached`. Neither knows about HTTP. The proof is a test-written transport (`sh` through `std::process::Command`)
-that runs the shared scenarios with the same counts as the HTTP client (`tests/sdk_conformance.rs`, profile `local-sh`).
+`run_with_stdin`; `Jobs` is `Exec::sandbox_jobs()`: the target's own jobs (the HTTP client's), and `None` for a runner without any, where
+`Sandbox::jobs()` answers `Unsupported`. Neither knows about HTTP. The proof is a test-written transport (`sh` through
+`std::process::Command`) that runs the files, helpers and bulk scenarios with the same counts as the HTTP client
+(`tests/sdk_conformance.rs`, profile `local-sh`).
 
 **Layer 3 is a holder.** `Sandbox` owns an `Arc<dyn Exec>`, the `ShellFs` over it and the `Jobs`, and hands the
 raw `Exec` back (`.raw()`), so nothing the helpers do is out of reach of a caller who needs something else.
@@ -65,10 +64,6 @@ raw `Exec` back (`.raw()`), so nothing the helpers do is out of reach of a calle
   (heartbeats are every 5 s).
 - **Disconnect kills.** For a stream the connection is the command's lifetime: dropping the call, or the `Kill` a
   tracked run hands out, closes it, and the endpoint kills the process group.
-
-`TemplateRunner` drives targets with no HTTP surface (`ssh host -- {}`, `docker exec ctr {}`). Killing the local transport
-does not kill the far command (measured with a real `docker exec`), so every command runs under a wrapper that starts it
-in a new session and prints its pid first; `far_kill.rs` kills the group through a second invocation of the transport.
 
 ## Files (`fs.rs`, `fs/shell.rs`)
 
@@ -105,17 +100,15 @@ stream built only on `Exec` (spec: `sdk/conformance/FILES-OVER-EXEC.md` 5.8). Th
 ## Jobs (`exec_endpoint/jobs.rs`, `jobs_native.rs`)
 
 `SandboxJobs` is the operation set (run held, start kept, follow, read from an offset, keep, kill, list, remove, wipe).
-`NativeJobs` speaks the operations to an endpoint, and `HttpJobs` is the one an `HttpExec` hands out. `ShellJobs` is for a
-transport with no jobs of its own (a template, this host): a supervisor script run over plain exec, a job directory under
-`/tmp/beyond-jobs/<scope>/`, output read back with `dd`/`base64`. It offers no notify. It is client logic that any user
-of the crate needs on such transports, so it lives here, not in the agent.
+`NativeJobs` speaks the operations to an endpoint, and `HttpJobs` is the one an `HttpExec` hands out. The endpoint owns
+the processes, the output and the notify sender (`execd` is the reference); the client holds none of it.
 
 ## Process-group machinery (`procgroup.rs`)
 
-A `TemplateRunner` and the agent's host runner both spawn a child as its own process-group leader and must kill the whole
+The agent's host runner spawns a child as its own process-group leader and must kill the whole
 group if the owning future is dropped. `GroupId` names a group in a way that survives pid recycling, `GroupKillGuard`
 kills it on drop, and `spawn_tracked_cleanup` runs the blocking kill on its own thread that the exit path can wait for
-(`wait_for_pending_group_kills`). `Kill` is either a hook (a stream close, a far-side kill, a sandbox job's kill) or a
+(`wait_for_pending_group_kills`). `Kill` is either a hook (a stream close, a sandbox job's kill) or a
 `LocalKill`, which the embedding program implements for its own local jobs; `kill_all` spends one SIGTERM grace for any
 number of them.
 

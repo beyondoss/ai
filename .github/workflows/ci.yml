@@ -256,16 +256,25 @@ jobs:
       - name: start a real sandbox target (Alpine = busybox, the hardest rung)
         if: matrix.name == 'exec-live'
         run: |
-          docker run -d --name agent-exec-target --rm alpine:latest sleep 900
-          docker exec agent-exec-target sh -c '
-            mkdir -p /work
-            printf "fn one() { NEEDLE }\n" > /work/a.rs
-            printf "TARGET-ONLY-MARKER\n"  > /work/marker.txt
-          '
+          sudo apt-get install -y musl-tools
+          mise run build:execd-static
+          docker run -d --name agent-exec-target --rm -p 127.0.0.1:18080:8080 \
+            -v "$PWD/target/$(uname -m)-unknown-linux-musl/debug/execd:/usr/local/bin/execd:ro" \
+            -e EXECD_LISTEN=0.0.0.0:8080 -e EXECD_ROOT=/work -e EXECD_BEARER=exec-live-token \
+            alpine:latest sh -c '
+              mkdir -p /work && chmod 777 /work
+              printf "fn one() { NEEDLE }\n" > /work/a.rs
+              printf "TARGET-ONLY-MARKER\n"  > /work/marker.txt
+              exec execd'
+          for _ in $(seq 60); do
+            docker logs agent-exec-target 2>&1 | grep -q ' listening listen=' && break
+            sleep 1
+          done
+          docker logs agent-exec-target 2>&1 | grep -q ' listening listen='
           # The asymmetry the assertions rely on: /work must NOT exist on the runner.
           test ! -e /work
-          # `-i`: a write sends its content on stdin, so the transport must forward it.
-          echo "AGENT_LIVE_EXEC_CMD=docker exec -i agent-exec-target {}" >> "$GITHUB_ENV"
+          echo "AGENT_LIVE_EXEC_URL=http://127.0.0.1:18080/exec" >> "$GITHUB_ENV"
+          echo "AGENT_LIVE_EXEC_HEADER=Authorization: Bearer exec-live-token" >> "$GITHUB_ENV"
           echo "AGENT_LIVE_WORKDIR=/work" >> "$GITHUB_ENV"
       # A resource trend that outlives a wedge: memory, swap, PSI, load, pid count, disk and the
       # biggest processes every 5s, appended to a file by a transient *system* unit. It is outside the

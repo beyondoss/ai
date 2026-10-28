@@ -234,12 +234,8 @@ impl CommandRunner for RealRunner {
         super::bash_proc::run_tracked(program, args, cwd, hooks).await
     }
 
-    async fn tracks_jobs(&self) -> bool {
-        true
-    }
-
-    /// For tests of the sandbox-job scripts, which run them on this host. No deadline beyond
-    /// `STREAM_DEADLINE`'s; dropping the call kills the child's process group.
+    /// Stdout and stderr to separate sinks. No deadline beyond `STREAM_DEADLINE`'s; dropping the
+    /// call kills the child's process group.
     async fn run_attached(
         &self,
         program: &str,
@@ -258,10 +254,6 @@ impl CommandRunner for RealRunner {
             None,
         )
         .await
-    }
-
-    async fn attaches(&self) -> bool {
-        true
     }
 
     async fn run_with_stdin(

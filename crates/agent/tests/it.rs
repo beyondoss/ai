@@ -54,7 +54,6 @@ mod exec_endpoint_writes;
 mod exec_front_conformance;
 mod exec_multi_tenant;
 mod exec_notify_vectors;
-mod exec_template_kill;
 mod fs_backend_cost;
 mod fs_backend_fuzz;
 mod fs_backend_parity;
