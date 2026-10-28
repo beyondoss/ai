@@ -1615,7 +1615,8 @@
     },
     {
       "id": "jobs.attach.signal",
-      "description": "attach reports a signalled job as 128+N.",
+      "description": "attach reports a signalled job as `signal` N, not an exit code.",
+      "requires": { "features": ["exit_signal"] },
       "steps": [
         {
           "id": "start",
@@ -1645,7 +1646,8 @@
           "expect": {
             "ok": {
               "output_utf8": "up\n",
-              "exit_code": 143
+              "signal": 15,
+              "exit_code": { "$absent": true }
             }
           }
         }
