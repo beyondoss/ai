@@ -13,7 +13,12 @@ describe("driver without an endpoint", () => {
     const r = await ask(dead, { id: { any: ["json"] }, op: "hello" });
     expect(r).toEqual({
       id: { any: ["json"] },
-      ok: { driver: "beyond-sandbox-ts", protocol: 1, ops: [...OPS] },
+      ok: {
+        driver: "beyond-sandbox-ts",
+        protocol: 1,
+        ops: [...OPS],
+        features: ["frames", "unbounded_stream", "exit_signal"],
+      },
     });
   });
 

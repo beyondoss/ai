@@ -40,12 +40,12 @@ lockstep through every driver in `drivers.toml`, each in its own fresh root on o
 two ways:
 
 1. against the other drivers', byte for byte after the normalisations listed in `tests/differential/norm.rs` (request ids, error
-   `detail`, the root path, mtimes, directory sizes, listing order, the text of a search `note`), each of which the spec lets differ. One rule depends on the driver: the MCP driver runs `exec` through `sh -c`, so when its `exec` answer is exit 126 or 127 the step compares every driver's stderr by the reason it names (`not found` or `Permission denied`: `sh: 1: exec: x: not found` against `execd: x: command not found`); the statuses agree and stay strict, with `stdout` and every other op still byte for byte;
+   `detail`, the root path, mtimes, directory sizes, listing order, the text of a search `note`), each of which the spec lets differ. One rule depends on the driver: the MCP driver runs `exec` through `sh -c`, so when its `exec` answer is exit 126 or 127 the step compares every driver's stderr by the reason it names (`not found` or `Permission denied`: `sh: 1: exec: x: not found` against `execd: x: command not found`); the statuses agree and stay strict, with `stdout` and every other op still byte for byte (an MCP `exec_stream` is a job, so its not-started answer, exit 126 or 127 or a refused start, compares every driver's `exec_stream` by that class alone);
 2. on the local backends, against the filesystem: `std::fs` snapshots and the brute-force search of the property test
    (`oracle.rs`, which includes `truth.rs` and `search_truth.rs` from `crates/agent/tests/shellfs_props_env`). Writes must change only
    their target, failed operations nothing, reads must equal the file's bytes, listings the directory's entries.
 
-An op is compared across the drivers whose `hello` lists it. A driver without it (the MCP driver has no `exec_stream` or `write_if_unchanged`) is not asked, is never a divergence, and does not make the others skip the op. When the others applied a `write_if_unchanged`, the driver without it is brought level with a plain `write` of the same bytes, so its tree stays the same.
+An op is compared across the drivers whose `hello` lists it. A driver without it (the MCP driver has no `write_if_unchanged`) is not asked, is never a divergence, and does not make the others skip the op. When the others applied a `write_if_unchanged`, the driver without it is brought level with a plain `write` of the same bytes, so its tree stays the same.
 
 A sequence ends with a read-back of every path it named, so the final tree is compared too. On the container backends there
 is no host filesystem to read, so only (1) applies. Hegel shrinks a difference to a minimal sequence and the test prints it,
@@ -77,7 +77,7 @@ containers before, none after).
 
 A check is `pass`, `fail`, `known defect` (an `xfail` for this driver, which failed as marked), `unsupported` (the driver's
 `hello` lacks an op the check uses: a missing op in `setup`, or in a step that `save`s a value, makes the whole
-scenario unsupported; otherwise only the steps that use it) or `skipped` (planned, or `requires` unmet). Only `pass` is a pass. An `xfail` that
+scenario unsupported; otherwise only the steps that use it; or a scenario whose `requires.features` the driver's `hello.features` lacks, whole, with the driver's `hello.missing` reason) or `skipped` (planned, or `requires` unmet). Only `pass` is a pass. An `xfail` that
 passes is a `fail`, so a mark cannot outlive the defect. The `xfail` driver name is the `driver` the driver's `hello` reports.
 A driver that cannot be started, or answers nothing to `hello`, fails its cell with one `driver/hello` check.
 

@@ -6,16 +6,23 @@
 //! speaks to it with rmcp's client. It has no sandbox code of its own, so what it proves is the
 //! server: the tools' schemas, their errors, and what a model would get back.
 //!
-//! The one op with no tool is answered `unsupported`, with the reason, and is left out of `hello`'s
-//! list so the harness counts the checks that need it as unsupported, never as passes:
-//! `exec_stream` (a tool result is not streamed).
-//!
-//! Two ops are composed of tool calls because the contract's operation is a loop or a filter over
+//! Four ops are composed of tool calls because the contract's operation is a loop or a filter over
 //! them: `job_attach` polls `job_output` to the job's end, `job_remove` and `job_wipe` list jobs
-//! and `job_kill` the right ones with `remove`.
+//! and `job_kill` the right ones with `remove`, and `exec_stream` is what an agent does to watch a
+//! command: `job_start`, `job_output` from an offset until the job ends, `job_kill` at the
+//! deadline, then remove the job. A job's log is one stream, so the command's stderr is sent to a
+//! file of its own in the sandbox (`exec 2>file`) and read back with `read_file`. What the
+//! contract's `exec_stream` has that a tool result cannot carry (frames, heartbeats) is not
+//! reachable here; the scenarios that check only for it are left unanswered (see `hello`).
+//!
+//! `extract` has no tool of its own, and the local half of a download is the `download` tool. It
+//! is run through a private `execd` (next to this binary, or `$EXECD_BIN`) whose `tar` is a
+//! script that prints the archive the driver wrote with `write_file`: `download` runs its real
+//! extractor, under the real `SANDBOX_LOCAL_ROOT` confinement, on bytes the harness chose.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -33,6 +40,8 @@ use tokio::io::{AsyncBufReadExt as _, BufReader};
 mod trees;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+/// The longest nap between two reads of a job that is quiet.
+const FOLLOW_POLL_MAX: Duration = Duration::from_millis(250);
 const DRIVER: &str = "sandbox-mcp";
 
 /// One op's outcome in the contract's terms.
@@ -42,6 +51,8 @@ const OPS: &[&str] = &[
     "hello",
     "capabilities",
     "exec",
+    "exec_stream",
+    "extract",
     "job_start",
     "job_list",
     "job_read",
@@ -60,18 +71,14 @@ const OPS: &[&str] = &[
     "download",
 ];
 
-fn unsupported_reason(op: &str) -> Option<&'static str> {
-    match op {
-        "exec_stream" => Some(
-            "sandbox-mcp has no streaming tool: an MCP tool result arrives whole, so there is no live \
-             output to compare (use exec, or job_start and job_output)",
-        ),
-        "extract" => Some(
-            "sandbox-mcp has no tool that extracts an archive it is handed: the local half of a \
-             download is inside its download tool",
-        ),
-        _ => None,
-    }
+/// The `requires.features` of the scenarios (sdk/conformance/DRIVER.md) this driver cannot meet,
+/// each with why. `exec_stream` here is a job, read by polling.
+fn missing_features() -> Value {
+    json!({
+        "frames": "an MCP tool result arrives whole, so there are no frames or heartbeats to see",
+        "unbounded_stream": "exec_stream is job_output over a job's log, which keeps the last 8 MiB of output (a bound of the job protocol): a longer stream loses its head",
+        "exit_signal": "a job's status is the shell's, 128 + N for signal N, and job_output and job_list carry no separate signal: a kill by signal 9 reads as an exit of 137",
+    })
 }
 
 fn err(kind: &str, detail: impl Into<String>) -> Value {
@@ -164,17 +171,132 @@ fn args(pairs: Vec<(&str, Value)>) -> Map<String, Value> {
         .collect()
 }
 
+/// `s` as one shell word.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The sandbox `extract` downloads from: an `execd` of its own on loopback, with a `tar` ahead of
+/// the real one on its `PATH` that prints one file, the archive. It is the far end of a download
+/// that sends the bytes the harness chose; it is not the endpoint under test.
+struct PrivateSandbox {
+    mcp: Box<Mcp>,
+    /// Where `write_file` puts the archive, and where the `tar` script reads it.
+    archive: PathBuf,
+    _execd: tokio::process::Child,
+    _dir: tempfile::TempDir,
+}
+
+impl PrivateSandbox {
+    async fn start() -> Result<Self, Value> {
+        let io = |what: &str, e: &dyn std::fmt::Display| err("io", format!("{what}: {e}"));
+        let execd = std::env::var_os("EXECD_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let mut p = std::env::current_exe().expect("current exe");
+                p.set_file_name("execd");
+                p
+            });
+        if !execd.is_file() {
+            return Err(err(
+                "io",
+                format!(
+                    "extract needs an execd to serve the archive: {} is not there (cargo build -p beyond-execd, or set EXECD_BIN)",
+                    execd.display()
+                ),
+            ));
+        }
+        let dir = tempfile::tempdir().map_err(|e| io("tempdir", &e))?;
+        let base = dir.path().canonicalize().map_err(|e| io("tempdir", &e))?;
+        let bin = base.join("bin");
+        let archive = base.join("archive.tar");
+        std::fs::create_dir(&bin).map_err(|e| io("mkdir", &e))?;
+        let tar = bin.join("tar");
+        std::fs::write(
+            &tar,
+            format!(
+                "#!/bin/sh\nexec cat -- {}\n",
+                shell_quote(&archive.to_string_lossy())
+            ),
+        )
+        .map_err(|e| io("write tar", &e))?;
+        std::fs::set_permissions(&tar, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .map_err(|e| io("chmod tar", &e))?;
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut child = tokio::process::Command::new(&execd)
+            .env_clear()
+            .env("PATH", path)
+            // port-0: execd binds it, keeps it, and announces the port it got (read below).
+            .env("EXECD_LISTEN", "127.0.0.1:0")
+            .env("EXECD_ROOT", &base)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| io("start execd", &e))?;
+        let mut lines = BufReader::new(child.stderr.take().expect("piped")).lines();
+        let addr = tokio::time::timeout(Duration::from_secs(20), async {
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(rest) = line.split(" listen=").nth(1) {
+                    return rest.split_whitespace().next().map(str::to_string);
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+        .ok_or_else(|| err("io", "execd did not report a listening address"))?;
+        // Keep reading so a full pipe never stops execd.
+        tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+        let mcp = Box::new(Mcp::start_at(&format!("http://{addr}/exec"), None).await?);
+        Ok(Self {
+            mcp,
+            archive,
+            _execd: child,
+            _dir: dir,
+        })
+    }
+}
+
+/// What following a job to its end found.
+struct Followed {
+    output: Vec<u8>,
+    /// Bytes the sandbox no longer had (a jump in the offset).
+    gap: u64,
+    code: Option<i64>,
+    /// The deadline passed and the job was killed.
+    timed_out: bool,
+}
+
 struct Mcp {
     // Held so the server (a child process) lives as long as the driver.
     _service: RunningService<RoleClient, ()>,
     peer: Peer<RoleClient>,
+    /// Counts `exec_stream` jobs, for their ids.
+    jobs: std::sync::atomic::AtomicU64,
+    /// The sandbox `extract` reads archives from, started by the first `extract`.
+    private: tokio::sync::OnceCell<PrivateSandbox>,
     /// The server's `SANDBOX_LOCAL_ROOT`: the trees of upload and download live below it.
     root: tempfile::TempDir,
 }
 
 impl Mcp {
+    /// The server for the endpoint under test, from the `CONFORMANCE_*` environment.
     async fn start() -> Result<Self, Value> {
         let url = std::env::var("CONFORMANCE_URL").unwrap_or_default();
+        let bearer = std::env::var("CONFORMANCE_BEARER")
+            .ok()
+            .filter(|b| !b.is_empty());
+        Self::start_at(&url, bearer).await
+    }
+
+    async fn start_at(url: &str, bearer: Option<String>) -> Result<Self, Value> {
         let bin = std::env::var("SANDBOX_MCP_BIN").ok().unwrap_or_else(|| {
             let mut p = std::env::current_exe().expect("current exe");
             p.set_file_name("sandbox-mcp");
@@ -192,11 +314,8 @@ impl Mcp {
         }
         let root = tempfile::tempdir().map_err(|e| err("io", e.to_string()))?;
         cmd.env("SANDBOX_LOCAL_ROOT", root.path());
-        cmd.env("SANDBOX_URL", &url);
-        if let Some(b) = std::env::var("CONFORMANCE_BEARER")
-            .ok()
-            .filter(|b| !b.is_empty())
-        {
+        cmd.env("SANDBOX_URL", url);
+        if let Some(b) = bearer {
             cmd.env("SANDBOX_TOKEN", b);
         }
         if let Some(c) = std::env::var("CONFORMANCE_CAPS")
@@ -215,6 +334,8 @@ impl Mcp {
         Ok(Self {
             _service: service,
             peer,
+            jobs: 0.into(),
+            private: tokio::sync::OnceCell::new(),
             root,
         })
     }
@@ -425,26 +546,9 @@ impl Mcp {
                     .await?;
                 Ok(counts(&r))
             }
-            "download" => {
-                let layout = trees::Layout::new_in(Some(self.root.path()), &req["prefill"])?;
-                let rel = layout
-                    .local
-                    .strip_prefix(self.root.path())
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned();
-                let r = self
-                    .tool(
-                        "download",
-                        args(vec![
-                            ("remote_path", json!(str_arg(req, "path")?)),
-                            ("local_dir", json!(rel)),
-                        ]),
-                    )
-                    .await
-                    .map(|r| counts(&r));
-                layout.finish(r)
-            }
+            "download" => self.download(&req["prefill"], str_arg(req, "path")?).await,
+            "extract" => self.extract(req).await,
+            "exec_stream" => self.exec_stream(req).await,
             "write_if_unchanged" => {
                 let path = str_arg(req, "path")?;
                 bytes_arg(req, "data_b64")?;
@@ -520,8 +624,96 @@ impl Mcp {
                     .await?;
                 Ok(json!({ "hits": r["hits"], "truncated": r["truncated"], "note": r["note"] }))
             }
-            _ => Err(err("unsupported", unsupported_reason(op).unwrap_or(op))),
+            _ => Err(err("unsupported", op)),
         }
+    }
+
+    /// `download` into a fresh `local` below this server's root, after building `prefill` in it.
+    async fn download(&self, prefill: &Value, remote_path: &str) -> Out {
+        let layout = trees::Layout::new_in(Some(self.root.path()), prefill)?;
+        let rel = layout
+            .local
+            .strip_prefix(self.root.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let r = self
+            .tool(
+                "download",
+                args(vec![
+                    ("remote_path", json!(remote_path)),
+                    ("local_dir", json!(rel)),
+                ]),
+            )
+            .await
+            .map(|r| counts(&r));
+        layout.finish(r)
+    }
+
+    /// `exec_stream` as an agent would watch a command: a job, read from an offset until it ends,
+    /// killed at the deadline, removed at the end. The command's stderr goes to its own file in the
+    /// sandbox because a job's log is one stream.
+    async fn exec_stream(&self, req: &Value) -> Out {
+        let scope = format!("drv-stream-{}", std::process::id());
+        let n = self.jobs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = format!("s{n}");
+        let errfile = format!("/tmp/.{scope}-{id}.err");
+        let line = format!("exec 2>{} && {}", shell_quote(&errfile), command_line(req)?);
+        self.tool(
+            "job_start",
+            args(vec![
+                ("scope", json!(scope)),
+                ("id", json!(id)),
+                ("command", json!(line)),
+                ("cwd", json!(opt_str(req, "cwd")?)),
+            ]),
+        )
+        .await?;
+        let deadline = u64_arg(req, "timeout_ms")?.map(Duration::from_millis);
+        let followed = self.follow(&scope, &id, 0, deadline).await;
+        // Whatever happened, the job and its stderr file are removed.
+        let stderr = self.read(&json!({ "path": errfile })).await;
+        let _ = self.kill_all(&scope, vec![id]).await;
+        let _ = self
+            .tool(
+                "exec",
+                args(vec![(
+                    "command",
+                    json!(format!("rm -f -- {}", shell_quote(&errfile))),
+                )]),
+            )
+            .await;
+        let f = followed?;
+        let stderr = stderr.map(|v| v["data_b64"].clone()).unwrap_or(json!(""));
+        let mut out = json!({ "stdout_b64": b64(&f.output), "stderr_b64": stderr });
+        // A job's status is the shell's: 128 + N for a command killed by signal N, which
+        // `job_output` cannot tell from an exit of that number. The `exit_signal` feature is
+        // left out of `hello` for it.
+        match f.code {
+            _ if f.timed_out => out["timed_out"] = json!(true),
+            c => out["exit_code"] = json!(c.unwrap_or(-1)),
+        }
+        Ok(out)
+    }
+
+    /// `extract`: write the archive into a private sandbox whose `tar` prints it, and `download`
+    /// from there.
+    async fn extract(&self, req: &Value) -> Out {
+        let archive = bytes_arg(req, "tar_b64")?;
+        let p = self.private.get_or_try_init(PrivateSandbox::start).await?;
+        p.mcp
+            .tool(
+                "write_file",
+                args(vec![
+                    ("path", json!(p.archive.to_string_lossy())),
+                    ("content_base64", json!(b64(&archive))),
+                ]),
+            )
+            .await?;
+        // The download script insists the path exists; the `tar` there ignores it.
+        p.mcp
+            .download(&req["prefill"], &p.archive.to_string_lossy())
+            .await
     }
 
     /// `read` with the contract's `max` (default: to the end of the file), in as many `read_file`
@@ -558,14 +750,31 @@ impl Mcp {
         Ok(json!({ "data_b64": b64(&data) }))
     }
 
-    /// `job_attach`: follow the job to its end by reading its output, as the client library's polling
-    /// follow does: a jump in the offset is a gap, `gone` is an error, and the job has ended when
-    /// everything it wrote has been read.
+    /// `job_attach`: follow the job to its end.
     async fn job_attach(&self, req: &Value) -> Out {
-        let scope = str_arg(req, "scope")?;
-        let id = str_arg(req, "job")?;
-        let mut offset = u64_arg(req, "offset")?.unwrap_or(0);
-        let (mut out, mut gap) = (Vec::new(), 0u64);
+        let f = self
+            .follow(
+                str_arg(req, "scope")?,
+                str_arg(req, "job")?,
+                u64_arg(req, "offset")?.unwrap_or(0),
+                None,
+            )
+            .await?;
+        Ok(json!({ "exit_code": f.code, "output_b64": b64(&f.output), "gap": f.gap }))
+    }
+
+    /// Follow a job by reading its output, as the client library's polling follow does: a jump in
+    /// the offset is a gap, `gone` is an error, and the job has ended when everything it wrote has
+    /// been read. At `deadline` (from now) the job is killed and followed to its end.
+    async fn follow(
+        &self,
+        scope: &str,
+        id: &str,
+        mut offset: u64,
+        deadline: Option<Duration>,
+    ) -> Result<Followed, Value> {
+        let started = std::time::Instant::now();
+        let (mut out, mut gap, mut timed_out) = (Vec::new(), 0u64, false);
         let mut wait = Duration::from_millis(25);
         loop {
             let r = self
@@ -601,9 +810,12 @@ impl Mcp {
             }
             match r["state"].as_str() {
                 Some("ended") if offset >= end || chunk.is_empty() => {
-                    return Ok(json!({
-                        "exit_code": r["code"], "output_b64": b64(&out), "gap": gap,
-                    }));
+                    return Ok(Followed {
+                        output: out,
+                        gap,
+                        code: r["code"].as_i64(),
+                        timed_out,
+                    });
                 }
                 Some("ended") => continue,
                 Some("lost") => {
@@ -611,8 +823,23 @@ impl Mcp {
                 }
                 _ => {}
             }
-            tokio::time::sleep(wait).await;
-            wait = (wait * 2).min(Duration::from_secs(2));
+            let mut nap = wait;
+            if let Some(d) = deadline.filter(|_| !timed_out) {
+                match d.checked_sub(started.elapsed()) {
+                    Some(left) => nap = nap.min(left),
+                    None => {
+                        timed_out = true;
+                        self.tool(
+                            "job_kill",
+                            args(vec![("scope", json!(scope)), ("ids", json!([id]))]),
+                        )
+                        .await?;
+                        continue;
+                    }
+                }
+            }
+            tokio::time::sleep(nap).await;
+            wait = (wait * 2).min(FOLLOW_POLL_MAX);
         }
     }
 
@@ -654,12 +881,12 @@ async fn main() {
                 let id = req["id"].clone();
                 let op = req["op"].as_str().unwrap_or("").to_string();
                 let result = if op == "hello" {
-                    Ok(json!({ "driver": DRIVER, "protocol": 1, "ops": OPS }))
+                    Ok(json!({
+                        "driver": DRIVER, "protocol": 1, "ops": OPS,
+                        "features": [], "missing": missing_features(),
+                    }))
                 } else if !OPS.contains(&op.as_str()) {
-                    Err(err(
-                        "unsupported",
-                        unsupported_reason(&op).unwrap_or("no such op"),
-                    ))
+                    Err(err("unsupported", "no such op"))
                 } else {
                     if mcp.is_none() {
                         mcp = Some(Mcp::start().await);

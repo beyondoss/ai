@@ -39,6 +39,10 @@ class _Unsupported(SandboxError):
     kind = "unsupported"
 
 
+# What a scenario's `requires.features` may name (sdk/conformance/DRIVER.md): this client reads the
+# raw stream, so it has all of them.
+FEATURES = ["frames", "unbounded_stream", "exit_signal"]
+
 OPS = [
     "hello", "capabilities", "exec", "exec_stream",
     "job_start", "job_list", "job_read", "job_attach", "job_kill", "job_remove", "job_wipe",
@@ -606,7 +610,7 @@ class Driver:
 
     def meta(self, op: str) -> Any:
         if op == "hello":
-            return {"driver": self.name, "protocol": 1, "ops": OPS}
+            return {"driver": self.name, "protocol": 1, "ops": OPS, "features": FEATURES}
         return self.sb.capabilities()
 
     @staticmethod
