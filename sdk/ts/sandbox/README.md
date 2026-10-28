@@ -148,6 +148,6 @@ When you need a pipeline, send a fixed script and let the variable parts arrive 
 mise run install:ts && mise run build:ts && mise run check:ts && mise run test:ts
 ```
 
-`test:ts` starts a loopback `execd` (`EXECD_BIN`, else `target/debug/execd`, built with `cargo build -p beyond-execd` if absent).
+`test:ts` starts a loopback `execd` (`EXECD_BIN`, else `target/debug/execd`, built with `cargo build -p beyond-execd` if absent). The build runs under the host cargo lock (`$BEYOND_BUILD_LOCK`, default `~/.cache/beyond-locks/rust-build.lock`, via `flock -o`) when that directory exists and `flock` is on PATH.
 `src/scripts.ts` is generated from the spec by `node scripts/gen-scripts.mjs`; a test fails when
 it and `FILES-OVER-EXEC.md` disagree.
