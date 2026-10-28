@@ -12,7 +12,9 @@ bench/out/
 .mcp.json
 # The demo's agent folders are examples, and their .mcp.json is part of the example.
 !deploy/demo/agents/*/.mcp.json
-.claude
+# Local Claude Code state (worktrees, settings); the skills link is shared.
+.claude/*
+!.claude/skills
 .env
 
 # Byte-compiled Python from `.github/pgo-train.py` (the release PGO training driver).
