@@ -149,6 +149,27 @@ def test_a_second_401_is_an_auth_error_and_not_retried_again(ep: Endpoint) -> No
     assert len(ep.requests) == 2 and len(calls) == 2
 
 
+def test_a_token_source_that_fails_is_an_auth_error_and_sends_nothing(ep: Endpoint) -> None:
+    def boom() -> str:
+        raise RuntimeError("vault sealed")
+
+    for source in (boom, lambda: "  "):
+        with pytest.raises(AuthError):
+            HttpTransport(ep.url, source).run("true")
+    with pytest.raises(AuthError, match="token source failed: vault sealed"):
+        HttpTransport(ep.url, boom).run("true")
+
+    async def aboom() -> str:
+        raise RuntimeError("vault sealed")
+
+    async def go() -> None:
+        with pytest.raises(AuthError, match="token source failed: vault sealed"):
+            await AsyncHttpTransport(ep.url, aboom).run("true")
+
+    asyncio.run(go())
+    assert ep.requests == []
+
+
 def test_a_fixed_token_is_not_retried_on_401_and_403_is_never_retried(ep: Endpoint) -> None:
     ep.handler = lambda h, b: reply(h, 401, {})
     with pytest.raises(AuthError):

@@ -81,7 +81,10 @@ fn classify(msg: &str, kind: Option<std::io::ErrorKind>) -> Value {
     if kind == Some(std::io::ErrorKind::Unsupported) {
         return err("not_offered", msg);
     }
-    if msg.contains("returned 401") || msg.contains("returned 403") {
+    if msg.contains("returned 401")
+        || msg.contains("returned 403")
+        || msg.contains("token source failed")
+    {
         return err("auth", msg);
     }
     if msg.contains("exceeded the") && msg.contains("-byte cap") {

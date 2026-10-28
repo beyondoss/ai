@@ -443,8 +443,11 @@ function cat(chunks: Uint8Array[]): Uint8Array {
 function tokenFromCommand(cmd: string): () => Promise<string> {
   return () =>
     new Promise((resolve, reject) => {
-      execFile("sh", ["-c", cmd], (err, stdout) => {
-        if (err) return reject(err);
+      execFile("sh", ["-c", cmd], (err, stdout, stderr) => {
+        if (err) {
+          const said = stderr.trim();
+          return reject(new Error(said === "" ? err.message : said));
+        }
         const token = stdout.trim();
         if (token === "") {
           return reject(new Error("the token command printed nothing"));
