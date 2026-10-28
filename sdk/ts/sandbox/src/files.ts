@@ -443,11 +443,44 @@ export class Files {
     hits = hits.filter((h) => !isUnderGitDir(q.root, h.path));
     const done = finalize(hits, q.limit);
     const first = stderr.trim().split("\n")[0] ?? "";
-    return {
-      hits: done.hits,
-      truncated: done.truncated,
-      note: skipped ?? (first === "" ? null : first),
-    };
+    let note = skipped ?? (first === "" ? null : first);
+    if (
+      note === null && engine === "grep" && q.glob !== undefined
+    ) note = await this.unsearchableDirsNote(q.root);
+    return { hits: done.hits, truncated: done.truncated, note };
+  }
+
+  /**
+   * The note GNU `grep` does not give: a directory that can be listed but not entered. `grep`
+   * cannot stat what is inside one and judges it by name alone, as a file, so with `--include` (or
+   * `--exclude`) it skips the entry in silence. `find ! -executable` lists such directories (the
+   * unreadable ones `grep` reports itself, so this is asked only when it said nothing and the search
+   * had a glob). A `find` without `-executable`, or a transport error, gives no note.
+   */
+  private async unsearchableDirsNote(root: string): Promise<string | null> {
+    let out: string;
+    try {
+      const r = await this.exec("find", [
+        "-H",
+        root,
+        "-type",
+        "d",
+        "!",
+        "-executable",
+        "-print0",
+      ]);
+      out = text(r.stdout);
+    } catch {
+      return null;
+    }
+    const dirs = out.split("\0").filter((d) =>
+      d !== "" && !isUnderGitDir(root, d)
+    );
+    return dirs.length === 0
+      ? null
+      : `${dirs.length} path(s) could not be searched; first: grep: ${
+        dirs[0]
+      }: Permission denied`;
   }
 
   /** Whether `root` or an ancestor holds a `.git`, asked in the sandbox and cached per root. */

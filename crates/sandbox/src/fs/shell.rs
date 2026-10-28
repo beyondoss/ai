@@ -416,6 +416,10 @@ impl FsBackend for ShellFs {
         // must reach the outcome, or this backend would report a confidently incomplete result as
         // complete. Treated as "stopped early", which is exactly what it is.
         let (hits, truncated) = finalize(hits, q.limit, result.truncated);
+        let mut first_error = skipped_note.or_else(|| incomplete_note(&result));
+        if first_error.is_none() && engine == SearchEngine::PosixGrep && q.glob.is_some() {
+            first_error = self.unsearchable_dirs_note(&q.root).await;
+        }
         Ok(SearchOutcome {
             hits,
             truncated,
@@ -423,7 +427,7 @@ impl FsBackend for ShellFs {
             // unreadable subdirectory shows up only as noise on stderr, in a format that varies by
             // implementation. Reported when the command still succeeded but said something — enough
             // for the "search was incomplete" notice to fire, without pretending to name the path.
-            first_error: skipped_note.or_else(|| incomplete_note(&result)),
+            first_error,
         })
     }
 
@@ -884,6 +888,39 @@ impl ShellFs {
             cache.insert(root.to_path_buf(), answer);
         }
         answer
+    }
+
+    /// The note GNU `grep` does not give: a directory that can be listed but not entered.
+    ///
+    /// `grep` cannot stat what is inside such a directory, and a path it cannot stat is judged by
+    /// name alone, as a file: with `--include` it is skipped, without a word, unless its name
+    /// satisfies the glob; with `--exclude` it is skipped when its name matches. Either way a whole
+    /// subtree vanishes with no stderr. `find ! -executable` lists the directories the sandbox user
+    /// cannot enter (the unreadable ones `grep` reports itself, so this is asked only when it said
+    /// nothing, and only when the search had a glob). It costs one more command and about a
+    /// twentieth of the grep's own walk. A `find` without `-executable`, or a transport error, gives
+    /// no note, which is the old behavior.
+    async fn unsearchable_dirs_note(&self, root: &Path) -> Option<String> {
+        let args = [
+            "-H".to_string(),
+            root.to_string_lossy().into_owned(),
+            "-type".into(),
+            "d".into(),
+            "!".into(),
+            "-executable".into(),
+            "-print0".into(),
+        ];
+        let found = self.exec("find", &args).await.ok()?;
+        let dirs: Vec<&str> = found
+            .stdout
+            .split('\0')
+            .filter(|d| !d.is_empty() && !super::is_under_git_dir(root, Path::new(d)))
+            .collect();
+        let first = dirs.first()?;
+        Some(format!(
+            "{} path(s) could not be searched; first: grep: {first}: Permission denied",
+            dirs.len()
+        ))
     }
 
     /// One command, one place: every operation's timeout, error wrapping and argv discipline.

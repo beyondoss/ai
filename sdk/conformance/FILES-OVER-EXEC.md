@@ -499,6 +499,32 @@ off without also turning off the `.gitignore` handling the helper promises).
   `invalid_query` with detail `bad regex: STDERR` (trimmed; `bad regex: PROGRAM
   rejected the pattern` if stderr is empty).
 
+**Unsearchable directories under GNU `grep` with a glob.** A directory that can
+be listed but not entered (mode `r--` for the sandbox user) hides what is in it:
+`grep` cannot stat the entries and judges one by its name alone, as a file, so
+with `--include=G` it skips every entry whose name does not satisfy `G` (and
+with `--exclude=G` every one that does) and prints nothing. The run exits 0 or 1
+with an empty stderr, and the matches below that directory are missing with
+`note` null. So when the engine is GNU `grep`, the search has a glob, the run
+succeeded and stderr was empty, the client runs one more command:
+
+```text
+find -H ROOT -type d ! -executable -print0
+```
+
+(`-executable` is `access(X_OK)` for the sandbox user, so nothing is listed
+when that user is root; a `find` without `-executable`, or a transport error,
+lists nothing and adds no note; the exit code is not read.) Drop each path
+that has a `.git` component below the root. When any is left, `note` is
+`N path(s) could not be searched; first: grep: PATH: Permission denied` with `N`
+their number and `PATH` the first in `find`'s order. A directory that cannot be
+read at all is already reported by `grep` itself, which is why this is asked
+only when stderr was empty. The check lists a directory whose entries the glob
+would have skipped anyway too, so the note means "may be incomplete". `rg` and
+busybox `grep` need none (the first says so itself, the second has no glob).
+The check walks the tree once, about 6% of the time the same search takes
+(measured on a 105 000 file tree, 0.05 s against 0.8 s).
+
 #### Parsing
 
 `rg` and `grep -Z` emit records `PATH<NUL>LINE<SEP>TEXT<LF>`, where `SEP` is `:`

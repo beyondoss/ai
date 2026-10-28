@@ -848,7 +848,27 @@ def search(q: Query, state: FsState, caps: Capabilities) -> Op[SearchResult]:
     if note is None:
         detail = stderr.strip()
         note = detail.split("\n", 1)[0] if detail else None
+    if note is None and engine == "grep" and q.glob is not None:
+        note = yield from unsearchable_dirs_note(q.root)
     return SearchResult(hits, truncated, note)
+
+
+def unsearchable_dirs_note(root: str) -> Op[str | None]:
+    """The note GNU ``grep`` does not give: a directory that can be listed but not entered.
+
+    ``grep`` cannot stat what is inside one and judges it by name alone, as a file, so with
+    ``--include`` (or ``--exclude``) it skips the entry in silence. ``find ! -executable`` lists such
+    directories (the unreadable ones ``grep`` reports itself, so this is asked only when it said
+    nothing and the search had a glob). A ``find`` without ``-executable``, or a transport error,
+    gives no note."""
+    try:
+        r = yield Run("find", ["-H", root, "-type", "d", "!", "-executable", "-print0"])
+    except SandboxError:
+        return None
+    dirs = [d for d in r.stdout_text.split("\0") if d and not is_under_git_dir(root, d)]
+    if not dirs:
+        return None
+    return f"{len(dirs)} path(s) could not be searched; first: grep: {dirs[0]}: Permission denied"
 
 
 __all__: Sequence[str] = [
