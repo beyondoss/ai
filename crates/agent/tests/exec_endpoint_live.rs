@@ -425,7 +425,9 @@ async fn until(what: &str, cond: impl Fn() -> bool) {
 /// stops it and removes its directory, and a job started kept is followed to its end.
 #[tokio::test]
 async fn a_sandbox_job_lives_in_the_target_and_outlives_its_hold_once_kept() {
-    use beyond_agent::exec_endpoint::jobs::{JobEvent, JobId, JobScope, JobSpec, JobStatus};
+    use beyond_agent::exec_endpoint::jobs::{
+        JobEnd, JobEvent, JobId, JobScope, JobSpec, JobStatus,
+    };
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     let Some(runner) = live_runner() else {
@@ -532,7 +534,10 @@ async fn a_sandbox_job_lives_in_the_target_and_outlives_its_hold_once_kept() {
     .await
     .unwrap();
     output.lock().unwrap().clear();
-    assert_eq!(jobs.follow(&scope, &followed, 0, &events).await.unwrap(), 6);
+    assert_eq!(
+        jobs.follow(&scope, &followed, 0, &events).await.unwrap(),
+        JobEnd::Exit(6)
+    );
     assert_eq!(output.lock().unwrap().as_slice(), b"a\nb\n");
     jobs.wipe(&scope).await.unwrap();
     assert!(jobs.list(&scope).await.unwrap().is_empty());

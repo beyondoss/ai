@@ -4,7 +4,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use base64::Engine as _;
-use beyond_sandbox::exec_endpoint::jobs::JobStatus;
+use beyond_sandbox::exec_endpoint::jobs::{JobEnd, JobStatus};
 use beyond_sandbox::exec_endpoint::jobs_native::{
     Event, JobFrame, decode_job_frame, parse_list, parse_read, parse_survivors,
 };
@@ -41,7 +41,7 @@ fn job_streams_decode_as_the_vectors_say() {
                 JobFrame::Event(Event::Gap(n)) => gap += n,
                 JobFrame::Event(Event::ShellExit(c)) => shell.push(c),
                 JobFrame::Heartbeat => {}
-                JobFrame::End(c) => end = Some(c),
+                JobFrame::End(e) => end = Some(e),
                 JobFrame::Error(e) => error = Some(e),
             }
         }
@@ -60,7 +60,16 @@ fn job_streams_decode_as_the_vectors_say() {
             .map(|c| c.as_i64().unwrap() as i32)
             .collect();
         assert_eq!(shell, shells, "{name}");
-        assert_eq!(end.map(i64::from), want["end"].as_i64(), "{name}");
+        assert_eq!(
+            end.map(|e: JobEnd| i64::from(e.code())),
+            want["end"].as_i64(),
+            "{name}"
+        );
+        assert_eq!(
+            end.and_then(JobEnd::signal).map(i64::from),
+            want["end_signal"].as_i64(),
+            "{name}"
+        );
         assert_eq!(error.as_deref(), want["error"].as_str(), "{name}");
     }
 }

@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 
 use super::HttpExecRunner;
 use super::jobs::{
-    EventSink, JobEvent, JobId, JobInfo, JobNotify, JobScope, JobSpec, JobStatus, ReadChunk,
-    SandboxJobs,
+    EventSink, JobEnd, JobEvent, JobId, JobInfo, JobNotify, JobScope, JobSpec, JobStatus,
+    ReadChunk, SandboxJobs,
 };
 use super::stream::{FRAME_SILENCE_LIMIT, FrameReader};
 
@@ -58,7 +58,7 @@ impl SandboxJobs for HttpJobs {
         id: &JobId,
         spec: &JobSpec,
         events: EventSink<'_>,
-    ) -> std::io::Result<i32> {
+    ) -> std::io::Result<JobEnd> {
         dispatch!(self, run_held(scope, id, spec, events))
     }
 
@@ -77,7 +77,7 @@ impl SandboxJobs for HttpJobs {
         id: &JobId,
         from: u64,
         events: EventSink<'_>,
-    ) -> std::io::Result<i32> {
+    ) -> std::io::Result<JobEnd> {
         dispatch!(self, follow(scope, id, from, events))
     }
 
@@ -188,7 +188,7 @@ impl<'a> NativeJobs<'a> {
         cwd: Option<&str>,
         job: Value,
         events: EventSink<'_>,
-    ) -> std::io::Result<i32> {
+    ) -> std::io::Result<JobEnd> {
         let resp = self
             .runner
             .send_job(
@@ -219,9 +219,9 @@ impl<'a> NativeJobs<'a> {
                 JobFrame::Event(Event::Gap(n)) => events(JobEvent::Gap(n)),
                 JobFrame::Event(Event::ShellExit(c)) => events(JobEvent::ShellExit(c)),
                 JobFrame::Heartbeat => {}
-                JobFrame::End(code) => {
+                JobFrame::End(end) => {
                     reader.finish().await;
-                    return Ok(code);
+                    return Ok(end);
                 }
                 JobFrame::Error(e) => return Err(broken(e)),
             }
@@ -237,7 +237,7 @@ impl SandboxJobs for NativeJobs<'_> {
         id: &JobId,
         spec: &JobSpec,
         events: EventSink<'_>,
-    ) -> std::io::Result<i32> {
+    ) -> std::io::Result<JobEnd> {
         let job = Self::op(
             "start",
             scope,
@@ -293,7 +293,7 @@ impl SandboxJobs for NativeJobs<'_> {
         id: &JobId,
         from: u64,
         events: EventSink<'_>,
-    ) -> std::io::Result<i32> {
+    ) -> std::io::Result<JobEnd> {
         let job = Self::op(
             "attach",
             scope,
@@ -422,8 +422,8 @@ impl SandboxJobs for NativeJobs<'_> {
 pub enum JobFrame {
     Event(Event),
     Heartbeat,
-    /// Final: the job ended with this status (128 + N for signal N).
-    End(i32),
+    /// Final: the job ended, with an exit code or by a signal.
+    End(JobEnd),
     /// Final: the endpoint failed.
     Error(String),
 }
@@ -484,14 +484,14 @@ pub fn decode_job_frame(line: &[u8]) -> Result<JobFrame, String> {
     } else if let Some(c) = w.shell_exit {
         JobFrame::Event(Event::ShellExit(wire_i32("shell_exit", c)?))
     } else if let Some(c) = w.exit_code {
-        JobFrame::End(wire_i32("exit_code", c)?)
+        JobFrame::End(JobEnd::Exit(wire_i32("exit_code", c)?))
     } else if let Some(s) = w.signal {
         let s = wire_i32("signal", s)?;
-        JobFrame::End(
-            128i32
-                .checked_add(s)
-                .ok_or_else(|| wire_out_of_range("signal", s))?,
-        )
+        // The status `128 + s` must fit too: a signal past it is a protocol error.
+        128i32
+            .checked_add(s)
+            .ok_or_else(|| wire_out_of_range("signal", s))?;
+        JobFrame::End(JobEnd::Signal(s))
     } else if w.timed_out {
         JobFrame::Error("the endpoint timed the job out".into())
     } else {
@@ -668,7 +668,10 @@ mod tests {
             "{err}"
         );
         assert!(decode_job_frame(br#"{"signal":4294967297}"#).is_err());
-        assert_eq!(decode_job_frame(br#"{"signal":9}"#), Ok(JobFrame::End(137)));
+        assert_eq!(
+            decode_job_frame(br#"{"signal":9}"#),
+            Ok(JobFrame::End(JobEnd::Signal(9)))
+        );
     }
 
     #[test]
@@ -681,7 +684,7 @@ mod tests {
         assert!(decode_job_frame(br#"{"shell_exit":4294967297}"#).is_err());
         assert_eq!(
             decode_job_frame(br#"{"exit_code":3}"#),
-            Ok(JobFrame::End(3))
+            Ok(JobFrame::End(JobEnd::Exit(3)))
         );
         assert!(decode_job_frame(br#"{"started":4294967297}"#).is_err());
     }

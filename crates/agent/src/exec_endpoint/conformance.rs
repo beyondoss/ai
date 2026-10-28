@@ -33,7 +33,7 @@
 use std::time::{Duration, Instant};
 
 use super::HttpExecRunner;
-use super::jobs::{JobEvent, JobId, JobScope, JobSpec, JobStatus, SandboxJobs as _};
+use super::jobs::{JobEnd, JobEvent, JobId, JobScope, JobSpec, JobStatus, SandboxJobs as _};
 use super::jobs_native::NativeJobs;
 use super::stream::{self, Frame, FrameReader, HEARTBEAT_INTERVAL};
 use beyond_sandbox::Exec as _;
@@ -1137,7 +1137,7 @@ impl Verifier {
         let _ = jobs.wipe(&scope).await;
         let (pgid, out, first) = heard.into_inner().unwrap_or_else(|e| e.into_inner());
         match r {
-            Ok(0) if pgid.is_some() && out == b"ab" => {
+            Ok(JobEnd::Exit(0)) if pgid.is_some() && out == b"ab" => {
                 let lead =
                     first.map(|f| started.elapsed().saturating_sub(f.duration_since(started)));
                 match lead {
@@ -1154,10 +1154,10 @@ impl Verifier {
                     ),
                 }
             }
-            Ok(code) => fail(
+            Ok(end) => fail(
                 JOBS_HELD,
                 format!(
-                    "want `started`, output `ab` and exit 0; got started {pgid:?}, output {:?}, exit {code}",
+                    "want `started`, output `ab` and exit 0; got started {pgid:?}, output {:?}, ended {end:?}",
                     String::from_utf8_lossy(&out)
                 ),
             ),
@@ -1417,8 +1417,21 @@ impl Verifier {
                     ));
                 }
             }
+            // An attach to the ended job says it the same way as its final frame.
+            for (id, want) in [(&killed, JobEnd::Signal(9)), (&exited, JobEnd::Exit(137))] {
+                let end = jobs
+                    .follow(&scope, id, 0, &|_| {})
+                    .await
+                    .map_err(|e| format!("attach: {e}"))?;
+                if end != want {
+                    return Err(format!(
+                        "an attach to a job that ended as {want:?} ended as {end:?}: the final frame \
+                         must be `signal` for a death by signal and `exit_code` for an exit"
+                    ));
+                }
+            }
             Ok("`signal` 9 beside `code` 137 for a SIGKILL, none for an exit of 137, the signal of \
-                a `kill`; `list` agrees with `read`"
+                a `kill`; `list` agrees with `read`; an attach ends the same way"
                 .to_string())
         }
         .await;

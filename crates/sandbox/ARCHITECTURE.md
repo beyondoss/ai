@@ -122,7 +122,8 @@ for a deadline) and the bytes. The response cap is on the decoded bytes of both 
 
 A job's `read` (`ReadChunk`) and `list` (`JobInfo`) carry `signal: Option<i32>` beside `status`: the signal that killed the shell,
 whose code is then `128 + signal`; `None` for a shell that exited, even with 137. `JobStatus` stays the code, so followers that
-want only the status are unchanged; the signal is read only where a state has a code (`exited`, `ended`).
+want only the status are unchanged; the signal is read only where a state has a code (`exited`, `ended`). `run_held` and `follow`
+return `JobEnd` (`Exit(code)` or `Signal(n)`, as a stream's final frame says it; `.code()` is the shell's status, `128 + n`).
 
 ## What is not here
 

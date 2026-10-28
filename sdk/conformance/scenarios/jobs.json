@@ -2217,6 +2217,94 @@
           }
         }
       ]
+    },
+    {
+      "id": "jobs.signal.attach-ends-with-the-signal",
+      "description": "Attaching to a job whose shell a signal killed ends as a stream does: `signal` in place of `exit_code`.",
+      "requires": {
+        "features": [
+          "exit_signal"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "ak04",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo out; kill -9 $$"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "attach",
+          "op": "job_attach",
+          "scope": "${SCOPE}",
+          "job": "ak04",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "signal": 9,
+              "exit_code": {
+                "$absent": true
+              },
+              "output_utf8": "out\n",
+              "gap": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.signal.attach-exit-137-is-an-exit",
+      "description": "Attaching to a job that exited 137 by itself ends with `exit_code` 137 and no `signal`.",
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "ak05",
+          "command": "sh",
+          "args": [
+            "-c",
+            "exit 137"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "attach",
+          "op": "job_attach",
+          "scope": "${SCOPE}",
+          "job": "ak05",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "exit_code": 137,
+              "signal": {
+                "$absent": true
+              },
+              "gap": 0
+            }
+          }
+        }
+      ]
     }
   ]
 }

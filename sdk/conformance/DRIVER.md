@@ -98,15 +98,15 @@ Every job op carries `scope`, a string of 1 to 64 characters of `[0-9a-z-]`
 naming one session's jobs; the harness sends a scope unique to the scenario.
 `job` is the job id, 1 to 32 characters of `[0-9a-z]`, chosen by the caller.
 
-| op           | request                                             | result                                                                               |
-| ------------ | --------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| `job_start`  | `scope`, `job`, `command`, `args`, `cwd?`, `label?` | `{pgid}`: the job is kept by the sandbox from the start                              |
-| `job_list`   | `scope`                                             | `{jobs: [{id, state, code, signal?, kept, num, kind, seen, started, ended, label}]}` |
-| `job_read`   | `scope`, `job`, `offset` (0), `max` (131072)        | `{state, code, signal?, offset, end, data_b64}`                                      |
-| `job_attach` | `scope`, `job`, `offset` (0)                        | `{exit_code, output_b64, gap}`: follows to the job's end; `gap` is bytes dropped     |
-| `job_kill`   | `scope`, `jobs: [ids]`, `remove?`                   | `{survivors: [{id, detail}]}`: groups still alive after TERM, grace and KILL         |
-| `job_remove` | `scope`, `jobs: [ids]`                              | `{}`                                                                                 |
-| `job_wipe`   | `scope`                                             | `{survivors: [..]}`                                                                  |
+| op           | request                                             | result                                                                                                                                                                                  |
+| ------------ | --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `job_start`  | `scope`, `job`, `command`, `args`, `cwd?`, `label?` | `{pgid}`: the job is kept by the sandbox from the start                                                                                                                                 |
+| `job_list`   | `scope`                                             | `{jobs: [{id, state, code, signal?, kept, num, kind, seen, started, ended, label}]}`                                                                                                    |
+| `job_read`   | `scope`, `job`, `offset` (0), `max` (131072)        | `{state, code, signal?, offset, end, data_b64}`                                                                                                                                         |
+| `job_attach` | `scope`, `job`, `offset` (0)                        | `{exit_code \| signal, output_b64, gap}`: follows to the job's end, ending as `exec_stream` does (`signal` in place of `exit_code` for a shell a signal killed); `gap` is bytes dropped |
+| `job_kill`   | `scope`, `jobs: [ids]`, `remove?`                   | `{survivors: [{id, detail}]}`: groups still alive after TERM, grace and KILL                                                                                                            |
+| `job_remove` | `scope`, `jobs: [ids]`                              | `{}`                                                                                                                                                                                    |
+| `job_wipe`   | `scope`                                             | `{survivors: [..]}`                                                                                                                                                                     |
 
 `state` is `running`, `exited` (the shell exited, its group runs on), `ended`,
 `lost` or `gone`; `code` is null unless `exited` or `ended`. `signal` is present

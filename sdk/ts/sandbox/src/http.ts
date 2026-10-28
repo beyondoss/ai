@@ -723,7 +723,7 @@ class HttpJobs implements JobOps {
         const f = decodeJobFrame(line);
         if (f === "heartbeat") continue;
         yield f;
-        if (f.type === "exit") return;
+        if (f.type === "exit" || f.type === "signal") return;
       }
       throw new TransportError(
         "job stream: the stream ended before the job's final frame",
@@ -808,7 +808,7 @@ export function decodeJobFrame(line: Uint8Array): JobFrame | "heartbeat" {
     return { type: "exit", code: v.exit_code };
   }
   if (typeof v.signal === "number") {
-    return { type: "exit", code: 128 + v.signal };
+    return { type: "signal", signal: v.signal };
   }
   if (v.timed_out === true) {
     throw new TransportError("job stream: the endpoint timed the job out");

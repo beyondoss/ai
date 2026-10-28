@@ -765,7 +765,13 @@ impl Mcp {
                 None,
             )
             .await?;
-        Ok(json!({ "exit_code": f.code, "output_b64": b64(&f.output), "gap": f.gap }))
+        let mut out = json!({ "output_b64": b64(&f.output), "gap": f.gap });
+        // As `exec_stream` ends: `signal` in place of `exit_code` for a death by signal.
+        match f.signal {
+            Some(s) => out["signal"] = json!(s),
+            None => out["exit_code"] = json!(f.code),
+        }
+        Ok(out)
     }
 
     /// Follow a job by reading its output, as the client library's polling follow does: a jump in

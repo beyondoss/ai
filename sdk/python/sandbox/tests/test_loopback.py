@@ -73,8 +73,9 @@ def test_jobs(execd_url: str) -> None:
         # A signal and an exit of 128 + S are told apart, in read and in list.
         sb.jobs.start(scope, "a3", "sh", ["-c", "kill -9 $$"])
         sb.jobs.start(scope, "a4", "sh", ["-c", "exit 137"])
-        sb.jobs.attach(scope, "a3")
-        sb.jobs.attach(scope, "a4")
+        a3, a4 = sb.jobs.attach(scope, "a3"), sb.jobs.attach(scope, "a4")
+        assert (a3.exit_code, a3.signal) == (137, 9)
+        assert (a4.exit_code, a4.signal) == (137, None)
         by_id = {j.id: j for j in sb.jobs.list(scope)}
         assert (by_id["a3"].code, by_id["a3"].signal) == (137, 9)
         assert (by_id["a4"].code, by_id["a4"].signal) == (137, None)

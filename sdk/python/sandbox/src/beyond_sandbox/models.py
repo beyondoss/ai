@@ -175,9 +175,11 @@ class JobStarted:
 
 @dataclass(frozen=True, slots=True)
 class JobEnd:
-    """Final frame of a job stream: the job's status (the exit code, or 128 + signal)."""
+    """Final frame of a job stream: the job's status (``code`` is the exit code, or 128 + signal
+    when a signal killed the shell, in which case ``signal`` is that signal)."""
 
     code: int
+    signal: int | None = None
 
 
 JobEvent = Union[JobOutput, JobGap, JobShellExit, JobStarted]
@@ -188,10 +190,11 @@ JobFrame = Union[JobOutput, JobGap, JobShellExit, JobStarted, JobEnd]
 class Attached:
     """What following a job to its end collected."""
 
-    exit_code: int
+    exit_code: int  # the shell's status: 128 + ``signal`` when a signal killed it
     output: bytes = b""
     gap: int = 0
     shell_exit: int | None = field(default=None)
+    signal: int | None = None  # the signal that killed the shell; None for a shell that exited
 
 
 @dataclass(frozen=True, slots=True)

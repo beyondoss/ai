@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use beyond_sandbox::exec::CommandRunner;
 use beyond_sandbox::exec_endpoint::HttpExecRunner;
-use beyond_sandbox::exec_endpoint::jobs::{JobEvent, JobId, JobScope, JobSpec, JobStatus};
+use beyond_sandbox::exec_endpoint::jobs::{JobEnd, JobEvent, JobId, JobScope, JobSpec, JobStatus};
 use beyond_sandbox::fs::shell::{Capabilities, SearchEngine, ShellFs};
 use beyond_sandbox::fs::{FileKind, FsBackend, FsError, SearchQuery};
 use sandbox_conformance::trees::{Layout, Tree};
@@ -519,7 +519,7 @@ impl Driver {
         let offset = u64_arg(req, "offset")?.unwrap_or(0);
         let out = Mutex::new(Vec::new());
         let gaps = Mutex::new(0u64);
-        let code = self
+        let end = self
             .jobs()?
             .follow(&scope, &id, offset, &|ev: JobEvent<'_>| match ev {
                 JobEvent::Output(b) => out.lock().unwrap().extend_from_slice(b),
@@ -528,11 +528,16 @@ impl Driver {
             })
             .await
             .map_err(|e| io_err(&e))?;
-        Ok(json!({
-            "exit_code": code,
+        let mut v = json!({
             "output_b64": b64(&out.lock().unwrap()),
             "gap": *gaps.lock().unwrap(),
-        }))
+        });
+        // As `exec_stream` ends: `signal` in place of `exit_code` for a death by signal.
+        match end {
+            JobEnd::Exit(c) => v["exit_code"] = json!(c),
+            JobEnd::Signal(s) => v["signal"] = json!(s),
+        }
+        Ok(v)
     }
 
     async fn job_kill(&self, req: &Value) -> Out {

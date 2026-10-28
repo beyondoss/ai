@@ -84,8 +84,10 @@ export type JobFrame =
   /** `bytes` of output from the requested offset are no longer kept. */
   | { type: "gap"; bytes: number }
   | { type: "shell_exit"; code: number }
-  /** Final: the job's status (the exit code, or 128+N for signal N). */
-  | { type: "exit"; code: number };
+  /** Final: the shell exited with `code`. */
+  | { type: "exit"; code: number }
+  /** Final: signal `signal` killed the shell (its status is 128+`signal`). */
+  | { type: "signal"; signal: number };
 
 /** What `start` takes: the same command, arguments and directory as `run`, plus a label. */
 export interface JobSpec {

@@ -124,6 +124,7 @@ def test_the_v13_job_stream_vectors() -> None:
     for case in fixture("jobs.json")["streams"]:
         name, want = case["name"], case["expect"]
         started, out, gap, shell, end, error = None, bytearray(), 0, [], None, None
+        end_signal = None
         dec = _wire.job_decoder()
         try:
             for line in case["lines"]:
@@ -138,6 +139,7 @@ def test_the_v13_job_stream_vectors() -> None:
                         shell.append(f.code)
                     elif isinstance(f, JobEnd):
                         end = f.code
+                        end_signal = f.signal
             if not dec.finished:
                 dec.eof()
         except (ProtocolError, TransportError) as e:
@@ -156,6 +158,7 @@ def test_the_v13_job_stream_vectors() -> None:
             want["shell_exits"],
             want["end"],
         ), name
+        assert end_signal == want.get("end_signal"), name
 
 
 def test_the_v13_answer_vectors() -> None:

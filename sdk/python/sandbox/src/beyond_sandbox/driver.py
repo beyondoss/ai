@@ -292,7 +292,12 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
         )  # fmt: skip
     return (  # job_attach
         lambda sb: sb.jobs.attach(scope, job, offset),
-        lambda a: {"exit_code": a.exit_code, "output_b64": _b64(a.output), "gap": a.gap},
+        # As ``exec_stream`` ends: ``signal`` in place of ``exit_code`` for a death by signal.
+        lambda a: {
+            **({"exit_code": a.exit_code} if a.signal is None else {"signal": a.signal}),
+            "output_b64": _b64(a.output),
+            "gap": a.gap,
+        },
     )
 
 

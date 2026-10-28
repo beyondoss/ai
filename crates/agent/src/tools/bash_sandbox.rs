@@ -161,7 +161,7 @@ pub(crate) async fn run(
         stream_ended(shared, link);
     }
     match outcome {
-        Some(Ok(code)) => return Ok(status_result(code)),
+        Some(Ok(end)) => return Ok(status_result(end.code())),
         Some(Err(e)) if !link.kept() => return Err(e.to_string()),
         Some(Err(e)) => {
             tracing::info!(job = %link.id, error = %e, "a kept job's stream broke; following it by polling");
@@ -368,7 +368,7 @@ async fn follow(shared: &JobShared, link: &SandboxLink, from: u64) -> Result<Exe
     link.store
         .follow(&link.scope, &link.id, from, &events)
         .await
-        .map(status_result)
+        .map(|end| status_result(end.code()))
         .map_err(|e| e.to_string())
 }
 

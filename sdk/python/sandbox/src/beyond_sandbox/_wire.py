@@ -223,7 +223,7 @@ def decode_job_line(line: bytes) -> list[JobFrame]:
     if isinstance(obj.get("exit_code"), int):
         return [JobEnd(obj["exit_code"])]
     if isinstance(obj.get("signal"), int):
-        return [JobEnd(128 + obj["signal"])]
+        return [JobEnd(128 + obj["signal"], obj["signal"])]
     if obj.get("timed_out") is True:
         raise TransportError("job stream: the endpoint timed the job out")
     return []

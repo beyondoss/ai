@@ -296,7 +296,11 @@ export class Driver {
           str(req, "job"),
           optCount(req, "offset") ?? 0,
         );
-        return { exit_code: a.exitCode, output_b64: b64(a.output), gap: a.gap };
+        // As `exec_stream` ends: `signal` in place of `exit_code` for a death by signal.
+        const end = a.signal === undefined
+          ? { exit_code: a.exitCode }
+          : { signal: a.signal };
+        return { ...end, output_b64: b64(a.output), gap: a.gap };
       }
       case "job_kill": {
         const s = await jobs.kill(str(req, "scope"), strings(req, "jobs"), {

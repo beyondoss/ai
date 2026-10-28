@@ -44,7 +44,7 @@ fn line(data: &[u8]) {
         // A status that does not fit an i32, or a `128 + signal` that does not, is an error (the
         // decoder returned `Err` and never reaches here). The expected value is computed checked,
         // so an out-of-range input that decodes to an `End` fails the assertion.
-        JobFrame::End(code) if v["error"].is_null() && v["started"].is_null() => {
+        JobFrame::End(end) if v["error"].is_null() && v["started"].is_null() => {
             let want = match (v["exit_code"].as_i64(), v["signal"].as_i64()) {
                 (Some(c), _) if v["stdout"].is_null() && v["stderr"].is_null() => {
                     i32::try_from(c).ok()
@@ -52,7 +52,11 @@ fn line(data: &[u8]) {
                 (_, Some(s)) => i32::try_from(s).ok().and_then(|s| 128i32.checked_add(s)),
                 _ => return,
             };
-            assert_eq!(Some(code), want, "a value out of range was accepted: {v}");
+            assert_eq!(
+                Some(end.code()),
+                want,
+                "a value out of range was accepted: {v}"
+            );
         }
         _ => {}
     }
