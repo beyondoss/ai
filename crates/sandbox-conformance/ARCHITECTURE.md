@@ -114,9 +114,9 @@ against it only with `DIFFERENTIAL_BACKENDS=e2b`.
 (`expand` refuses otherwise). The harness does not create the sandbox: the operator makes one (`POST /sandboxes`, then
 `POST /sandboxes/{id}/exec-token`) and hands over the `exec_url` and a command that mints tokens. Because the sandbox outlives a run,
 every scenario wipes its job scope and the `-other` and `-third` scopes it derives, and its root directory, both before it starts and
-after it ends. `mise run test:clients:beyond` runs it. Measured (execd v0.1.18 behind the edge): every check passes for all five
-drivers and all 25 relay pairs except `bulk.round-trip.large-file`, which fails identically for every client because the edge answers
-`413` to a request body over 5 MiB (the clients send 16 MiB chunks).
+after it ends. `mise run test:clients:beyond` runs it. Against current Beyond main, the full matrix passes for all five drivers and
+every relay pair. The edge streams request bodies; it buffers and caps them only for namespaces with a middleware, and its WAF
+inspects only a 16 KiB prefix (beyondoss/beyond#563, #564).
 
 A backend's extra directories are variables (`${RO}`, `${LOCKED}`, `${TINY}`) that a scenario names in `requires.vars`; the
 `environments` suite is skipped, visibly, everywhere else.
