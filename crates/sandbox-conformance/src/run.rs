@@ -30,6 +30,10 @@ pub struct Backend {
     pub caps: Value,
     /// What `hello` listed.
     pub ops: Vec<String>,
+    /// `hello.features`: what the driver can do that a scenario's `requires.features` names.
+    pub features: Vec<String>,
+    /// `hello.missing`: why the driver lacks a feature, by feature name (for the report).
+    pub missing: Value,
     /// `hello.driver`: the name an `xfail` mark is matched against.
     pub driver: String,
     /// The backend demands a bearer (`requires.auth`).
@@ -58,6 +62,15 @@ impl Backend {
                     .collect()
             })
             .unwrap_or_default();
+        let features = hello["ok"]["features"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|o| o.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let missing = hello["ok"]["missing"].clone();
         let driver = hello["ok"]["driver"].as_str().unwrap_or("").to_string();
         let caps = link.call(&json!({"id": 0, "op": "capabilities"})).await["ok"].clone();
         Backend {
@@ -66,6 +79,8 @@ impl Backend {
             connector,
             caps,
             ops,
+            features,
+            missing,
             driver,
             auth,
             work: work.to_string(),
@@ -166,6 +181,8 @@ async fn unmet(req: &Value, be: &Backend) -> Option<String> {
                     return Some(format!("requires search_engine={want}, backend has {have}"));
                 }
             }
+            // Judged for the driver, not the backend (see `lacks_feature`).
+            "features" => {}
             "vars" => {
                 for v in want.as_array().unwrap() {
                     let name = v.as_str().unwrap();
@@ -202,6 +219,19 @@ async fn unmet(req: &Value, be: &Backend) -> Option<String> {
                     ));
                 }
             }
+        }
+    }
+    None
+}
+
+/// `requires.features` against what the driver's `hello` listed: `Some(why)` for the first one it
+/// lacks, with the reason the driver gave in `hello.missing`.
+fn lacks_feature(req: &Value, be: &Backend) -> Option<String> {
+    for f in req["features"].as_array().into_iter().flatten() {
+        let f = f.as_str()?;
+        if !be.features.iter().any(|x| x == f) {
+            let why = be.missing[f].as_str().unwrap_or("no reason given");
+            return Some(format!("driver {} lacks feature {f}: {why}", be.driver));
         }
     }
     None
@@ -343,6 +373,12 @@ pub async fn run_scenario_via(sc: &Value, be: &Backend, peer: Option<&Backend>) 
     if !per_step && sc["steps"][0]["expect"]["error"]["kind"] != "unsupported" {
         let used: Vec<&str> = setup_lacks.into_iter().chain(step_lacks).collect();
         return all(sid, steps, Status::Unsupported, &format!("no op {used:?}"));
+    }
+    // A feature the driver lacks makes the whole scenario unsupported, with the driver's reason.
+    for b in std::iter::once(be).chain(peer) {
+        if let Some(why) = lacks_feature(&sc["requires"], b) {
+            return all(sid, steps, Status::Unsupported, &why);
+        }
     }
     for b in std::iter::once(be).chain(peer) {
         if let Some(why) = unmet(&sc["requires"], b).await {

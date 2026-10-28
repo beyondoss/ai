@@ -68,10 +68,10 @@ absent or `null`.
 
 ### Meta
 
-| op             | request | result                                                                |
-| -------------- | ------- | --------------------------------------------------------------------- |
-| `hello`        |         | `{driver, protocol: 1, ops: [names]}`: the ops this driver implements |
-| `capabilities` |         | `{search_engine, find_printf, read_window}`                           |
+| op             | request | result                                                                                                                                                |
+| -------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `hello`        |         | `{driver, protocol: 1, ops: [names], features?: [names], missing?: {name: reason}}`: the ops and features this driver has, and why it lacks a feature |
+| `capabilities` |         | `{search_engine, find_printf, read_window}`                                                                                                           |
 
 `hello` MUST succeed without reaching the endpoint. `capabilities` reports what
 the environment probe found (after `CONFORMANCE_CAPS`), or the connection error
@@ -291,6 +291,18 @@ All of: `find_printf`, `read_window` (booleans, compared with `capabilities`);
 backend demands a bearer); `not_root` (the sandbox user is not uid 0, so
 permission checks mean something); `commands` (a list that `command -v` finds in
 the sandbox); `vars` (a list of variable names the backend defines, see below).
+
+`features` (a list of names) is judged against the **driver**, not the backend: a scenario
+whose `requires.features` names a feature that the driver's `hello.features` lacks is
+**unsupported** as a whole (never skipped, never a pass), with the driver's reason from
+`hello.missing`. A driver that lists no `features` lacks them all. A feature marks a
+scenario whose point is something a driver's transport cannot show, however the outcome reads:
+
+| feature            | the scenario needs                                                                               |
+| ------------------ | ------------------------------------------------------------------------------------------------ |
+| `frames`           | the stream's own frames (heartbeats, splitting of output into frames), not only its final answer |
+| `unbounded_stream` | a stream longer than any retention window: output beyond 8 MiB arrives whole, with no head lost  |
+| `exit_signal`      | a kill by signal N told apart from an exit of 128+N (`signal` in place of `exit_code`)           |
 
 A backend may define directories beyond `${ROOT}` and `${WORK}`, as variables:
 `${RO}` (a read-only mount holding one file, `existing`, with content `old`),

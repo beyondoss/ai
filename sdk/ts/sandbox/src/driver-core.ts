@@ -186,7 +186,12 @@ export class Driver {
       if (op === "hello") {
         return {
           id,
-          ok: { driver: "beyond-sandbox-ts", protocol: 1, ops: [...OPS] },
+          ok: {
+            driver: "beyond-sandbox-ts",
+            protocol: 1,
+            ops: [...OPS],
+            features: ["frames", "unbounded_stream", "exit_signal"],
+          },
         };
       }
       const conn = await this.connect();

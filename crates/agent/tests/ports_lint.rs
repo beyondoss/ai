@@ -82,6 +82,8 @@ const ALLOWED: &[(&str, usize)] = &[
     ("sandbox-conformance/src/backends.rs", 1),
     // sandbox-mcp's HTTP test asks the server to bind port 0 and announce the port it got.
     ("sandbox-mcp/tests/e2e.rs", 1),
+    // The MCP conformance driver's private execd binds port 0, keeps it, and announces it.
+    ("sandbox-mcp/src/bin/sandbox-driver-mcp.rs", 1),
 ];
 
 /// A source file with comments blanked out (newlines kept) and its string literals located.

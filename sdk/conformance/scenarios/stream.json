@@ -50,6 +50,11 @@
     {
       "id": "stream.frames.larger-than-a-frame",
       "description": "Output beyond one 64 KiB frame is split by the endpoint and reassembled by the client without loss.",
+      "requires": {
+        "features": [
+          "frames"
+        ]
+      },
       "steps": [
         {
           "id": "a",
@@ -72,6 +77,11 @@
     {
       "id": "stream.output.beyond-the-v11-cap",
       "description": "A stream is never buffered whole: 20 MB of output, more than the 16 MiB one-shot cap, streams through.",
+      "requires": {
+        "features": [
+          "unbounded_stream"
+        ]
+      },
       "steps": [
         {
           "id": "a",
@@ -86,10 +96,6 @@
               "exit_code": 0,
               "stdout_len": 20000000
             }
-          },
-          "xfail": {
-            "drivers": ["sandbox-mcp"],
-            "reason": "exec_stream is job_start plus job_output, and a job keeps only the last 8 MiB of its output (execd's job_output_retention): a command that writes 20 MB faster than an agent reads loses the head. A live stream has no such window."
           }
         }
       ]
@@ -97,6 +103,11 @@
     {
       "id": "stream.exit.signal",
       "description": "A command killed by signal S ends the stream with signal S, not an exit code.",
+      "requires": {
+        "features": [
+          "exit_signal"
+        ]
+      },
       "steps": [
         {
           "id": "a",
@@ -224,6 +235,11 @@
     {
       "id": "stream.heartbeat.silent-command",
       "description": "A command silent for longer than the client's patience still completes: heartbeats are not output and not an end.",
+      "requires": {
+        "features": [
+          "frames"
+        ]
+      },
       "steps": [
         {
           "id": "a",

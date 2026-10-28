@@ -100,8 +100,9 @@ built beside it, and the harness crate should not depend on the thing it judges.
 | `extract`                                                                               | `write_file` of the archive into a private `execd` whose `tar` prints it, then `download` from there                              |
 | `write_if_unchanged`                                                                    | `write_file` with `if_unchanged_since` (a number) or `create_only` (null)                                                         |
 
-The driver lists every op. A job keeps the last 8 MiB of its output, so `stream.output.beyond-the-v11-cap` (20 MB) is a
-strict `xfail` for this driver; a status of 129 to 159 is reported as a signal, as the shell does. `extract` runs the real
+The driver lists every op, and none of the `requires.features` (`frames`, `unbounded_stream`, `exit_signal`), so the four
+scenarios that need one are `unsupported` with the driver's reason: a tool result has no frames, a job keeps the last 8 MiB of its
+output, and `job_output` reports a signal only as the shell's 128 + N. `extract` runs the real
 `download` tool and its extractor under `SANDBOX_LOCAL_ROOT`; only the sandbox's `tar` is a stand-in.
 
 ## Release

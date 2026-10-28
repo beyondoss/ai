@@ -340,6 +340,7 @@ impl Driver {
                 "driver": "agent-reference",
                 "protocol": 1,
                 "ops": self.ops(),
+                "features": ["frames", "unbounded_stream", "exit_signal"],
             }));
         }
         if let Some(e) = &self.connect_error {

@@ -77,7 +77,7 @@ containers before, none after).
 
 A check is `pass`, `fail`, `known defect` (an `xfail` for this driver, which failed as marked), `unsupported` (the driver's
 `hello` lacks an op the check uses: a missing op in `setup`, or in a step that `save`s a value, makes the whole
-scenario unsupported; otherwise only the steps that use it) or `skipped` (planned, or `requires` unmet). Only `pass` is a pass. An `xfail` that
+scenario unsupported; otherwise only the steps that use it; or a scenario whose `requires.features` the driver's `hello.features` lacks, whole, with the driver's `hello.missing` reason) or `skipped` (planned, or `requires` unmet). Only `pass` is a pass. An `xfail` that
 passes is a `fail`, so a mark cannot outlive the defect. The `xfail` driver name is the `driver` the driver's `hello` reports.
 A driver that cannot be started, or answers nothing to `hello`, fails its cell with one `driver/hello` check.
 

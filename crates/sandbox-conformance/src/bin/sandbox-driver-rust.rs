@@ -12,6 +12,10 @@ use driver::{CapsOverride, Config, Driver};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 
+/// What a scenario's `requires.features` may name (sdk/conformance/DRIVER.md): this client reads the
+/// raw stream, so it has all of them.
+const FEATURES: [&str; 3] = ["frames", "unbounded_stream", "exit_signal"];
+
 fn config() -> Config {
     let url = std::env::var("CONFORMANCE_URL").unwrap_or_default();
     let bearer = std::env::var("CONFORMANCE_BEARER")
@@ -53,7 +57,7 @@ async fn main() {
             }
             Ok(req) if req["op"] == "hello" => {
                 json!({"id": req["id"], "ok": {"driver": "agent-reference", "protocol": 1,
-                    "ops": Driver::ops_with(true)}})
+                    "ops": Driver::ops_with(true), "features": FEATURES}})
             }
             Ok(req) => {
                 if driver.is_none() {
