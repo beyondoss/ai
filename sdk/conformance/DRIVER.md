@@ -188,9 +188,11 @@ and the op's own fields go to the driver. The harness fields are not sent:
 1. If `planned`, skip it and print `skipped: planned (<value>) <id>`.
 2. Evaluate `requires` (below); if unmet, print `skipped: <why>: <id>`.
 3. If the driver does not list every op the scenario uses in `hello.ops`, the
-   scenario is **unsupported**: its checks are counted as `unsupported`, never
-   as passes (except that a step expecting `error.kind` `unsupported` for an op
-   the driver lacks is fine).
+   checks that need the op are **unsupported**, never passes (except that a step
+   expecting `error.kind` `unsupported` for an op the driver lacks is fine). A
+   missing op in `setup`, or in a step that `save`s a value, makes the whole
+   scenario unsupported; otherwise only the steps that use the op are, and the
+   rest run.
 4. Use the backend's driver, or if `connect` is present a fresh driver whose
    `CONFORMANCE_BEARER` and `CONFORMANCE_URL` are replaced by `connect.bearer`
    (`null` meaning none) and `connect.url`.

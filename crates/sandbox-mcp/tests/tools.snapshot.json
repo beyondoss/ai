@@ -439,7 +439,7 @@
     "name": "stat"
   },
   {
-    "description": "Create a file or replace it entirely, atomically; an existing file keeps its permissions. Give content (text) or content_base64 (binary). The parent directory must exist (see mkdir). To change part of a file use edit_file.",
+    "description": "Create a file or replace it entirely, atomically; an existing file keeps its permissions. Give content (text) or content_base64 (binary). The parent directory must exist (see mkdir). To change part of a file use edit_file. To avoid overwriting a concurrent change, pass if_unchanged_since (the mtime from stat): a changed file fails with kind conflict and nothing is written. create_only refuses to replace a file that exists.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -454,6 +454,21 @@
           "description": "The new contents as base64, for binary files.",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "create_only": {
+          "description": "Write only if no file exists at `path` yet (kind `conflict` if one does). Default false.\nNot combinable with `if_unchanged_since`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "if_unchanged_since": {
+          "description": "Write only if the file's mtime is still this: the `mtime` that `stat` returned, fraction\nincluded. If the file changed since (or was removed), nothing is written and the call fails\nwith kind `conflict`. Leave out to write unconditionally.",
+          "format": "double",
+          "type": [
+            "number",
             "null"
           ]
         },

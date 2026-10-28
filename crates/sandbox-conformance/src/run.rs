@@ -320,20 +320,28 @@ pub async fn run_scenario_via(sc: &Value, be: &Backend, peer: Option<&Backend>) 
     if let Some(p) = sc.get("planned") {
         return all(sid, steps, Status::Skipped, &format!("planned ({p})"));
     }
-    let used: Vec<&str> = sc["setup"]
+    // An op the driver lacks makes the checks that need it unsupported. In `setup` that is the whole
+    // scenario (nothing can be built); among the steps it is those steps alone, so a scenario that
+    // only touches the op once (one error kind among a dozen) still proves the rest. A missing step
+    // that `save`s a value the later steps use cannot be skipped over, so it takes the scenario.
+    fn lacks_op<'a>(s: &'a Value, be: &Backend, peer: Option<&Backend>) -> Option<&'a str> {
+        s["op"]
+            .as_str()
+            .filter(|op| !crate::relay::side(s, be, peer).ops.iter().any(|o| o == op))
+    }
+    let setup_lacks: Vec<&str> = sc["setup"]
         .as_array()
         .into_iter()
         .flatten()
-        .chain(steps)
-        .filter_map(|s| {
-            s["op"]
-                .as_str()
-                .map(|op| (op, crate::relay::side(s, be, peer)))
-        })
-        .filter(|(op, b)| !b.ops.iter().any(|o| o == op))
-        .map(|(op, _)| op)
+        .filter_map(|s| lacks_op(s, be, peer))
         .collect();
-    if !used.is_empty() && sc["steps"][0]["expect"]["error"]["kind"] != "unsupported" {
+    let step_lacks: Vec<&str> = steps.iter().filter_map(|s| lacks_op(s, be, peer)).collect();
+    let per_step = setup_lacks.is_empty()
+        && steps
+            .iter()
+            .all(|s| lacks_op(s, be, peer).is_none() || s.get("save").is_none());
+    if !per_step && sc["steps"][0]["expect"]["error"]["kind"] != "unsupported" {
+        let used: Vec<&str> = setup_lacks.into_iter().chain(step_lacks).collect();
         return all(sid, steps, Status::Unsupported, &format!("no op {used:?}"));
     }
     for b in std::iter::once(be).chain(peer) {
@@ -402,6 +410,16 @@ pub async fn run_scenario_via(sc: &Value, be: &Backend, peer: Option<&Backend>) 
             step["id"].as_str().expect("every step has an id")
         );
         let side = crate::relay::side(step, be, peer);
+        if let Some(op) = lacks_op(step, be, peer).filter(|_| per_step)
+            && step["expect"]["error"]["kind"] != "unsupported"
+        {
+            out.push(Check {
+                id: check,
+                status: Status::Unsupported,
+                detail: format!("no op [{op:?}]"),
+            });
+            continue;
+        }
         let known = match step.get("xfail") {
             Some(x) => {
                 x["drivers"]
