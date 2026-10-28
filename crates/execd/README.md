@@ -80,7 +80,7 @@ error that names the variable and the value (exit 2), and so is any argument: ex
 | `EXECD_ROOT`               | the current directory                              | where a command runs when its request names no directory                                                 |
 | `EXECD_HOME`               | execd's own `HOME`; the user's with `EXECD_RUN_AS` | `HOME` for every command                                                                                 |
 | `EXECD_BEARER_FILE`        | unset                                              | a file holding the bearer token (mode 0600)                                                              |
-| `EXECD_BEARER`             | unset                                              | the bearer token itself, a weaker way: execd re-execs to move it out of its environment                  |
+| `EXECD_BEARER`             | unset                                              | the bearer token itself, a weaker way: execd re-execs to move it out of its environment, and refuses to start if it cannot |
 | `EXECD_INSECURE_NO_AUTH`   | `false`                                            | serve with no bearer on a non-loopback address; without it execd refuses to start                        |
 | `EXECD_RUN_AS`             | unset                                              | run every command as `user`, `uid`, `user:group` or `uid:gid` with the user's groups; execd must be root |
 | `EXECD_MAX_RESPONSE_BYTES` | 16 MiB                                             | most output one one-shot answer carries; match the agent's `--exec-max-response-bytes`                   |
