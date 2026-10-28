@@ -10,6 +10,7 @@ import {
 } from "./errors.js";
 import { compileGlob } from "./glob.js";
 import {
+  DIRS_SCRIPT,
   GIT_SCRIPT,
   READ_SCRIPT,
   REMOVE_TEMP_SCRIPT,
@@ -18,7 +19,7 @@ import {
 } from "./scripts.js";
 import {
   classifySearchFailure,
-  dropExcludedErrors,
+  excludedErrorRecords,
   finalize,
   grepArgs,
   isUnderGitDir,
@@ -418,7 +419,10 @@ export class Files {
     let stderr = text(r.stderr);
     let exitCode = r.exitCode;
     if (skippedErrors && stderr !== "") {
-      const kept = dropExcludedErrors(stderr, (p) => skippedErrors.test(p));
+      const kept = await this.dropExcludedErrors(
+        stderr,
+        (p) => skippedErrors.test(p),
+      );
       // Every complaint was about an excluded file: the run was a success.
       if (kept === "" && exitCode === 2) exitCode = 0;
       stderr = kept;
@@ -506,6 +510,33 @@ export class Files {
       : `${dirs.length} path(s) could not be searched; first: grep: ${
         dirs[0]
       }: Permission denied`;
+  }
+
+  /**
+   * `stderr` without the per-path errors about files an excluding glob skips. The glob never
+   * excludes a directory, though, and an unreadable directory named like it still hides files the
+   * caller wanted, so the matching paths are asked about in one more command and the errors about
+   * directories stay. A failed command keeps every error. Only when something matched.
+   */
+  private async dropExcludedErrors(
+    stderr: string,
+    excluded: (path: string) => boolean,
+  ): Promise<string> {
+    const records = excludedErrorRecords(stderr, excluded);
+    if (records === null) return stderr;
+    const matching = records.flatMap((r) => r.path === null ? [] : [r.path]);
+    if (matching.length === 0) return stderr;
+    let dirs: Set<string> | null = null;
+    try {
+      const r = await this.exec("sh", sh(DIRS_SCRIPT, matching));
+      dirs = new Set(text(r.stdout).split("\0").filter((d) => d !== ""));
+    } catch {
+      dirs = null;
+    }
+    return records
+      .filter((r) => r.path === null || dirs === null || dirs.has(r.path))
+      .map((r) => r.record)
+      .join("\n");
   }
 
   /** Whether `root` or an ancestor holds a `.git`, asked in the sandbox and cached per root. */

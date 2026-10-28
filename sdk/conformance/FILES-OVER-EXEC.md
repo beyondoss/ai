@@ -429,8 +429,13 @@ matches the glob (same `globset` matcher as busybox, below, but case-sensitive,
 like `rg --glob`), context hits included. Excluded files are still read by `rg` and by busybox `grep` (which filters
 client-side too), so their per-path errors about an excluded file are dropped
 from stderr before it is read: a record whose path, between an optional `rg:`
-or `grep:` and the OS message, matches the glob (the same matcher as the hits);
-if none are left, a run that exited 2 is a success with no note. A glob that does not parse is
+or `grep:` and the OS message, matches the glob (the same matcher as the hits).
+Only files: the glob never excludes a directory, and an unreadable directory
+named like the glob still hides files the caller wanted. So when at least one
+record matches the glob, the client runs `sh -c DIRS_SCRIPT sh PATH...` (script
+J) once with the paths of those records, and keeps the record of each path it
+prints. If that command fails, every record is kept. If no record is left, a run
+that exited 2 is a success with no note. A glob that does not parse is
 `invalid_query` (`bad glob: ...`) whichever engine runs. A root that is itself a
 file is searched whatever the glob says on `rg`; GNU `grep` applies it to a file
 named on the command line.
@@ -1087,6 +1092,15 @@ fi
 ```
 
 The chunk is on stdin.
+
+### J. DIRS_SCRIPT (`$@` paths)
+
+```sh
+for p; do [ -d "$p" ] && printf '%s\0' "$p"; done
+```
+
+Prints, NUL-terminated, the arguments that are directories. The exit status is
+not read.
 
 ## Known deviations from the reference implementation
 

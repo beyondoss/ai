@@ -556,6 +556,70 @@
           }
         }
       ]
+    },
+    {
+      "id": "differential-found.search.exclude-glob-keeps-the-note-for-an-unreadable-directory",
+      "description": "An excluding glob selects files only, so a directory named like the glob is still entered and searched. An unreadable `d.txt/` holding a file hides that file, and the search must say so even though its name matches `*.txt` (contrast: an unreadable excluded FILE is not a reason for a note).",
+      "requires": {
+        "not_root": true
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo foo > ok.md; mkdir d.txt; echo foo > d.txt/in.md; chmod 000 d.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "search",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "foo",
+          "literal": true,
+          "ignore_case": false,
+          "glob": "*.txt",
+          "glob_exclude": true,
+          "limit": 100,
+          "before": 0,
+          "after": 0,
+          "expect": {
+            "ok": {
+              "truncated": false,
+              "note": {
+                "$any": true
+              },
+              "hits": [
+                {
+                  "path": "${ROOT}/ok.md",
+                  "line": 1,
+                  "text": "foo",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "restore",
+          "op": "exec",
+          "command": "chmod",
+          "args": [
+            "755",
+            "--",
+            "${ROOT}/d.txt"
+          ],
+          "expect": {
+            "ok": {}
+          }
+        }
+      ]
     }
   ]
 }

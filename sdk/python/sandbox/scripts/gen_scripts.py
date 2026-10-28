@@ -77,6 +77,7 @@ def build() -> dict[str, str]:
         "UPLOAD": spec_script("UPLOAD_SCRIPT"),
         "DOWNLOAD": spec_script("DOWNLOAD_SCRIPT"),
         "STAGE": spec_script("STAGE_SCRIPT"),
+        "DIRS": spec_script("DIRS_SCRIPT"),
     }
 
 

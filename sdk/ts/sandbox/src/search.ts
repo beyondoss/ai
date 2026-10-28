@@ -394,31 +394,29 @@ function osErrorRecords(stderr: string): string[] | null {
 }
 
 /**
- * Drop the per-path errors about files an excluding glob skips: `rg` opens them (the exclusion is
- * applied to its hits), but the caller asked for them not to be searched, so an unreadable one is
- * no reason for a note. Stderr that is not purely per-path errors is returned unchanged.
+ * The per-path errors of stderr, each with its path when `excluded` matches it: `rg` and busybox
+ * `grep` open the files the glob skips (it is applied to their hits), so an unreadable excluded
+ * file is no reason for a note. Null when stderr is not purely per-path errors.
  */
-export function dropExcludedErrors(
+export function excludedErrorRecords(
   stderr: string,
   excluded: (path: string) => boolean,
-): string {
+): Array<{ record: string; path: string | null }> | null {
   const records = osErrorRecords(stderr);
-  if (records === null) return stderr;
-  return records
-    .filter((r) => {
-      const msg = stripOsError(r);
-      for (const e of OS_ERRORS) {
-        if (!msg.endsWith(e)) continue;
-        let path = msg.slice(0, msg.length - e.length);
-        if (!path.endsWith(": ")) return true;
-        path = path.slice(0, -2);
-        if (path.startsWith("rg: ")) path = path.slice(4);
-        else if (path.startsWith("grep: ")) path = path.slice(6);
-        return !excluded(path);
-      }
-      return true;
-    })
-    .join("\n");
+  if (records === null) return null;
+  return records.map((record) => {
+    const msg = stripOsError(record);
+    for (const e of OS_ERRORS) {
+      if (!msg.endsWith(e)) continue;
+      let path = msg.slice(0, msg.length - e.length);
+      if (!path.endsWith(": ")) break;
+      path = path.slice(0, -2);
+      if (path.startsWith("rg: ")) path = path.slice(4);
+      else if (path.startsWith("grep: ")) path = path.slice(6);
+      return { record, path: excluded(path) ? path : null };
+    }
+    return { record, path: null };
+  });
 }
 
 /**

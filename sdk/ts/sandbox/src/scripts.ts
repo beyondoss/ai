@@ -16,3 +16,5 @@ export const UPLOAD_SCRIPT = "d=\"$1\"\ns=\"$2\"\nif [ -e \"$d\" ] && [ ! -d \"$
 export const DOWNLOAD_SCRIPT = "if [ ! -e \"$1\" ]; then\n  echo \"No such file or directory (os error 2)\" >&2\n  exit 1\nfi\nif [ -d \"$1\" ]; then\n  exec tar -cf - -C \"$1\" .\nfi\nexec tar -cf - -C \"$(dirname -- \"$1\")\" \"./$(basename -- \"$1\")\"";
 
 export const STAGE_SCRIPT = "f=\"$1\"\nif [ \"$2\" -eq 0 ]; then\n  mkdir -p -- \"$(dirname -- \"$f\")\" || exit 1\n  set -C\n  : > \"$f\" || exit 1\n  set +C\nfi\nn=$(wc -c < \"$f\") || exit 1\nif [ \"$n\" -ne \"$2\" ]; then\n  echo \"stage is $n bytes, expected $2\" >&2\n  exit 1\nfi\ncat >> \"$f\" || exit 1\nn=$(wc -c < \"$f\")\nif [ \"$n\" -ne $(($2 + $3)) ]; then\n  echo \"short write: $n of $(($2 + $3)) bytes in the stage\" >&2\n  exit 1\nfi";
+
+export const DIRS_SCRIPT = "for p; do [ -d \"$p\" ] && printf '%s\\0' \"$p\"; done";

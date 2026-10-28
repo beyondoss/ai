@@ -435,25 +435,36 @@ def os_error_records(stderr: str) -> list[str] | None:
     return None if not records or stderr[start:].strip() else records
 
 
-def drop_excluded_errors(stderr: str, excluded: re.Pattern[str]) -> str:
-    """Drop the per-path errors about files an excluding glob skips: ``rg`` opens them (the
-    exclusion is applied to its hits), but the caller asked for them not to be searched, so an
-    unreadable one is no reason for a note. Stderr that is not purely per-path errors is returned
-    unchanged."""
+def drop_excluded_errors(stderr: str, excluded: re.Pattern[str]) -> Op[str]:
+    """``stderr`` without the per-path errors about files an excluding glob skips: ``rg`` and busybox
+    ``grep`` open them (the exclusion is applied to their hits), so an unreadable excluded file is
+    no reason for a note. The glob never excludes a directory, though, and an unreadable directory
+    named like it still hides files the caller wanted, so the matching paths are asked about in one
+    more command and the errors about directories stay. A failed command keeps every error. Stderr
+    that is not purely per-path errors is returned unchanged."""
     records = os_error_records(stderr)
     if records is None:
         return stderr
-    kept: list[str] = []
+    parsed: list[tuple[str, str | None]] = []
     for rec in records:
         msg = _strip_os_error(rec)
         path = None
         for e in _OS_ERRORS:
             if msg.endswith(e) and msg[: -len(e)].endswith(": "):
-                path = msg[: -len(e) - 2].removeprefix("rg: ").removeprefix("grep: ")
+                p = msg[: -len(e) - 2].removeprefix("rg: ").removeprefix("grep: ")
+                path = p if excluded.fullmatch(p) is not None else None
                 break
-        if path is None or excluded.fullmatch(path) is None:
-            kept.append(rec)
-    return "\n".join(kept)
+        parsed.append((rec, path))
+    matching = [p for _, p in parsed if p is not None]
+    if not matching:
+        return stderr
+    dirs: set[str] | None
+    try:
+        r = yield Run("sh", sh(_scripts.DIRS, *matching))
+        dirs = {d for d in r.stdout_text.split("\0") if d}
+    except SandboxError:
+        dirs = None
+    return "\n".join(rec for rec, p in parsed if p is None or dirs is None or p in dirs)
 
 
 def classify_search_failure(stderr: str, root: str) -> SearchFailure:
@@ -861,7 +872,7 @@ def search(q: Query, state: FsState, caps: Capabilities) -> Op[SearchResult]:
     stderr = r.stderr_text
     exit_code = r.exit_code
     if skipped_errors is not None and stderr:
-        kept = drop_excluded_errors(stderr, skipped_errors)
+        kept = yield from drop_excluded_errors(stderr, skipped_errors)
         if not kept and exit_code == 2:  # every complaint was about an excluded file: a success
             exit_code = 0
         stderr = kept

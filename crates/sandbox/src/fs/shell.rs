@@ -386,12 +386,12 @@ impl FsBackend for ShellFs {
         if let Some(matcher) = &skipped_errors
             && !result.stderr.is_empty()
         {
-            let kept = drop_excluded_errors(&result.stderr, matcher);
+            let stderr = std::mem::take(&mut result.stderr);
+            result.stderr = self.drop_excluded_errors(stderr, matcher).await;
             // Every complaint was about an excluded file: the run was a success.
-            if kept.is_empty() && result.code == Some(2) {
+            if result.stderr.is_empty() && result.code == Some(2) {
                 result.code = Some(0);
             }
-            result.stderr = kept;
         }
 
         // Both `rg` and `grep` use exit 1 for "no matches" — a perfectly ordinary outcome, not a
@@ -961,6 +961,47 @@ impl ShellFs {
         ))
     }
 
+    /// `stderr` without the per-path errors about files an excluding glob skips. The glob never
+    /// excludes a directory, though, and an unreadable directory named like it still hides files the
+    /// caller wanted, so the matching paths are asked about in one more command and the errors about
+    /// directories stay. A failed command keeps every error. Only when something matched.
+    async fn drop_excluded_errors(
+        &self,
+        stderr: String,
+        excluded: &globset::GlobMatcher,
+    ) -> String {
+        let Some(records) = excluded_error_records(&stderr, excluded) else {
+            return stderr;
+        };
+        let matching: Vec<String> = records
+            .iter()
+            .filter_map(|(_, p)| p.map(str::to_string))
+            .collect();
+        if matching.is_empty() {
+            return stderr;
+        }
+        let dirs: Option<std::collections::HashSet<String>> =
+            match self.exec("sh", &sh_script(DIRS_SCRIPT, &matching)).await {
+                Ok(r) => Some(
+                    r.stdout
+                        .split('\0')
+                        .filter(|d| !d.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                ),
+                Err(_) => None,
+            };
+        records
+            .iter()
+            .filter(|(_, p)| match (p, &dirs) {
+                (Some(p), Some(dirs)) => dirs.contains(*p),
+                _ => true,
+            })
+            .map(|(r, _)| *r)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// One command, one place: every operation's timeout, error wrapping and argv discipline.
     async fn exec(&self, program: &str, args: &[String]) -> Result<Text, FsError> {
         self.runner
@@ -1292,6 +1333,9 @@ fi
 printf '
 '"#;
 
+/// Which of the arguments are directories, NUL-terminated (appendix J).
+const DIRS_SCRIPT: &str = r#"for p; do [ -d "$p" ] && printf '%s\0' "$p"; done"#;
+
 /// Walk `$1` and its ancestors looking for a `.git`, exiting 0 the moment one is found — the
 /// target-side twin of [`crate::tools::root_is_inside_git_repo`], step for step, so the two backends
 /// make the same `--no-require-git` decision about the same tree.
@@ -1509,29 +1553,32 @@ fn os_error_records(stderr: &str) -> Option<Vec<&str>> {
     (!records.is_empty() && stderr[start..].trim().is_empty()).then_some(records)
 }
 
-/// Drop the per-path errors about files an excluding glob skips: ripgrep opens them (the exclusion
-/// is applied to its hits), but the caller asked for them not to be searched, so an unreadable one
-/// is no reason for a note. Anything that is not purely per-path errors is returned unchanged.
-fn drop_excluded_errors(stderr: &str, excluded: &globset::GlobMatcher) -> String {
-    let Some(records) = os_error_records(stderr) else {
-        return stderr.to_string();
-    };
-    let kept: Vec<&str> = records
-        .into_iter()
-        .filter(|r| {
-            let msg = strip_os_error(r);
-            let path = OS_ERRORS
-                .iter()
-                .find_map(|e| msg.strip_suffix(e))
-                .and_then(|m| m.strip_suffix(": "))
-                .map(|m| {
-                    let m = m.strip_prefix("rg: ").unwrap_or(m);
-                    m.strip_prefix("grep: ").unwrap_or(m)
-                });
-            !path.is_some_and(|p| excluded.is_match(p))
-        })
-        .collect();
-    kept.join("\n")
+/// The per-path errors of stderr, each with its path when the excluding glob matches it: ripgrep and
+/// busybox `grep` open the files the glob skips (it is applied to their hits), so an unreadable
+/// excluded file is no reason for a note. `None` when stderr is not purely per-path errors.
+fn excluded_error_records<'a>(
+    stderr: &'a str,
+    excluded: &globset::GlobMatcher,
+) -> Option<Vec<(&'a str, Option<&'a str>)>> {
+    let records = os_error_records(stderr)?;
+    Some(
+        records
+            .into_iter()
+            .map(|r| {
+                let msg = strip_os_error(r);
+                let path = OS_ERRORS
+                    .iter()
+                    .find_map(|e| msg.strip_suffix(e))
+                    .and_then(|m| m.strip_suffix(": "))
+                    .map(|m| {
+                        let m = m.strip_prefix("rg: ").unwrap_or(m);
+                        m.strip_prefix("grep: ").unwrap_or(m)
+                    })
+                    .filter(|p| excluded.is_match(p));
+                (r, path)
+            })
+            .collect(),
+    )
 }
 
 /// Per-path read errors name the path and end in the OS message (`rg` appends ` (os error N)`).
@@ -2008,13 +2055,14 @@ mod appendix_tests {
 
     #[test]
     fn the_appendix_scripts_are_the_scripts_sent() {
-        let scripts: [(char, &str); 6] = [
+        let scripts: [(char, &str); 7] = [
             ('A', super::STAT_SCRIPT),
             ('B', super::READ_WINDOW_SCRIPT),
             ('C', super::WRITE_STDIN_SCRIPT),
             ('D', super::REMOVE_TEMP_SCRIPT),
             ('E', super::GIT_REPO_SCRIPT),
             ('F', super::PROBE_SCRIPT),
+            ('J', super::DIRS_SCRIPT),
         ];
         let mut wrong = Vec::new();
         for (letter, code) in scripts {
