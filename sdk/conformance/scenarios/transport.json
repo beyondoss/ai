@@ -968,12 +968,9 @@
           },
           "xfail": {
             "drivers": [
-              "agent-reference",
-              "python",
-              "python-async",
               "sandbox-mcp"
             ],
-            "reason": "a stream request answered with a one-shot JSON body is a clean empty exit 0; TS reports protocol; the MCP driver's stream is a job, whose start answer it cannot read (io)"
+            "reason": "the MCP driver's stream is a job, whose start answer it cannot read (io)"
           }
         },
         {

@@ -299,7 +299,11 @@ class AsyncHttpTransport:
     ) -> AsyncFrameStream:
         ms = _wire.STREAM_DEADLINE_MS if timeout_ms is None else timeout_ms
         body = _wire.request_body(command, args, cwd=cwd, timeout_ms=ms, stream=True)
-        return _Frames(await self._open(body, ms), _wire.frame_decoder())
+        resp = await self._open(body, ms)
+        if not _http.is_ndjson(resp.headers):
+            await resp.close()
+            raise _wire.not_a_stream(self.url)
+        return _Frames(resp, _wire.frame_decoder())
 
     async def job_call(
         self,

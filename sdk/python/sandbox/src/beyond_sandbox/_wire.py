@@ -358,3 +358,11 @@ def frame_decoder() -> StreamDecoder[Frame]:
 
 def job_decoder() -> StreamDecoder[JobFrame]:
     return StreamDecoder(decode_job_line, lambda f: isinstance(f, JobEnd))
+
+
+def not_a_stream(url: str) -> ProtocolError:
+    """A stream request answered 200 without ``application/x-ndjson``: whatever its body, it is not
+    read as a one-shot answer (an object that looks like a result would be a clean empty exit 0)."""
+    return ProtocolError(
+        f"exec endpoint {url} answered a stream request with something that is not a stream"
+    )

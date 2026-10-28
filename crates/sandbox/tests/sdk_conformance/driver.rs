@@ -92,7 +92,7 @@ fn classify(msg: &str, kind: Option<std::io::ErrorKind>) -> Value {
     if msg.contains("unreachable") {
         return err("transport", msg);
     }
-    if msg.contains("unparseable JSON") {
+    if msg.contains("unparseable JSON") || msg.contains("not a stream") {
         return err("protocol", msg);
     }
     if msg.contains("exec endpoint") && msg.contains(" returned ") {

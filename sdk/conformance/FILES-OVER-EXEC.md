@@ -133,7 +133,13 @@ situations.
 | HTTP 422 whose body says the output exceeded the cap, or client cap | `too_large` |
 | any other non-2xx                                                   | `endpoint`  |
 | 200 whose body is not the expected JSON                             | `protocol`  |
+| a stream request answered 200 without `application/x-ndjson`       | `protocol`  |
 | a stream ends without its final frame, or a `{"error"}` frame       | `transport` |
+
+A stream request is answered by a stream or not at all. A 200 to it whose `Content-Type` is not
+`application/x-ndjson` is `protocol`, whatever its body: a client never reads that body as a
+one-shot answer (an object that looks like a result would be a clean empty exit 0, silent data
+loss).
 
 A transport-level failure is never a capability: see
 [probe errors](#42-probe-errors).

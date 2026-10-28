@@ -250,6 +250,18 @@ def test_a_stream_that_ends_without_a_final_frame_is_a_transport_error(ep: Endpo
         list(HttpTransport(ep.url).stream("echo"))
 
 
+def test_a_stream_request_answered_with_a_one_shot_body_is_a_protocol_error(ep: Endpoint) -> None:
+    # The default handler answers 200 with a result object and no ndjson Content-Type.
+    with pytest.raises(ProtocolError, match="not a stream"):
+        HttpTransport(ep.url).stream("echo")
+
+    async def go() -> None:
+        with pytest.raises(ProtocolError, match="not a stream"):
+            await AsyncHttpTransport(ep.url).stream("echo")
+
+    asyncio.run(go())
+
+
 def test_an_error_frame_is_a_transport_error(ep: Endpoint) -> None:
     streaming_endpoint(ep, [{"error": "sandbox lost"}])
     with pytest.raises(TransportError, match="sandbox lost"):
