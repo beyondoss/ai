@@ -190,3 +190,14 @@ class Attached:
     output: bytes = b""
     gap: int = 0
     shell_exit: int | None = field(default=None)
+
+
+@dataclass(frozen=True, slots=True)
+class Transfer:
+    """What a bulk copy moved: members that are regular files, directories (not the root), links,
+    and the bytes of file content."""
+
+    files: int = 0
+    dirs: int = 0
+    links: int = 0
+    bytes: int = 0

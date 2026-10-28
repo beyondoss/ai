@@ -51,6 +51,7 @@ from .models import (
     Stdout,
     Survivor,
     TimedOut,
+    Transfer,
 )
 from .sandbox import AsyncFrames, AsyncSandbox, Frames, Sandbox
 from .transport import FrameStream, HttpTransport, JobTransport, Transport
@@ -110,6 +111,7 @@ __all__ = [
     "TimedOut",
     "Timeout",
     "TooLarge",
+    "Transfer",
     "Transport",
     "TransportError",
     "__version__",

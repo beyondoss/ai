@@ -5,17 +5,17 @@ jobs) and back; the behaviour behind every tool is specified in `sdk/conformance
 
 ## Modules
 
-| file                            | what                                                                                                                       |
-| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `src/lib.rs`                    | the library root: `Config`, `SandboxMcp`, and the modules below                                                            |
-| `src/main.rs`                   | reads the environment, serves stdio or streamable HTTP, exits on SIGTERM / SIGINT / stdin closing                          |
-| `src/config.rs`                 | `Config::from_env`: every variable parsed in one place, errors name the variable                                           |
-| `src/server.rs`                 | `SandboxMcp`: the twelve tools, the `sandbox://capabilities` resource, the lazily made connection                          |
-| `src/error.rs`                  | `ToolError` and `classify`: the spec's error kinds, as a tool result                                                       |
-| `src/http.rs`                   | the streamable-HTTP listener (loopback unless told otherwise)                                                              |
-| `src/bin/sandbox-driver-mcp.rs` | the conformance driver: DRIVER.md on stdin/stdout, every op a tool call over a real MCP session to a spawned `sandbox-mcp` |
-| `tests/tools_snapshot.rs`       | pins the tools' names, descriptions and input schemas (`tests/tools.snapshot.json`)                                        |
-| `tests/e2e.rs`                  | a generic MCP client driving the real binary: list tools, write, `cat`, read back; errors; jobs; HTTP; token command       |
+| file                            | what                                                                                                                                                         |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `src/lib.rs`                    | the library root: `Config`, `SandboxMcp`, and the modules below                                                                                              |
+| `src/main.rs`                   | reads the environment, serves stdio or streamable HTTP, exits on SIGTERM / SIGINT / stdin closing                                                            |
+| `src/config.rs`                 | `Config::from_env`: every variable parsed in one place, errors name the variable                                                                             |
+| `src/server.rs`                 | `SandboxMcp`: the twelve tools (and `upload`/`download` when `SANDBOX_LOCAL_ROOT` is set), the `sandbox://capabilities` resource, the lazily made connection |
+| `src/error.rs`                  | `ToolError` and `classify`: the spec's error kinds, as a tool result                                                                                         |
+| `src/http.rs`                   | the streamable-HTTP listener (loopback unless told otherwise)                                                                                                |
+| `src/bin/sandbox-driver-mcp.rs` | the conformance driver: DRIVER.md on stdin/stdout, every op a tool call over a real MCP session to a spawned `sandbox-mcp`                                   |
+| `tests/tools_snapshot.rs`       | pins the tools' names, descriptions and input schemas (`tests/tools.snapshot.json`)                                                                          |
+| `tests/e2e.rs`                  | a generic MCP client driving the real binary: list tools, write, `cat`, read back; errors; jobs; HTTP; token command                                         |
 
 ## One connection, made on first use
 
@@ -31,7 +31,7 @@ MCP sessions; there is no per-session state, because the sandbox holds the state
 ## Tools
 
 `exec`, `read_file`, `write_file`, `edit_file`, `list_dir`, `stat`, `search`, `mkdir`, `job_start`, `job_list`,
-`job_output`, `job_kill`. Each is one `do_*` method returning `Result<Value, ToolError>`; `reply` turns it into
+`job_output`, `job_kill`; with `SANDBOX_LOCAL_ROOT`, also `upload` and `download` (tar over exec between the server's machine and the sandbox, confined to that directory: paths are relative, `..` is refused, and an existing component that is a link leaving the root is refused). Without it the two routes are removed from the router, so the model never sees a tool that reads or writes its host. Each is one `do_*` method returning `Result<Value, ToolError>`; `reply` turns it into
 `CallToolResult::structured` (`isError: false`) or `structured_error` with `{"error": {"kind", "detail"}}`.
 
 - **Errors are results.** `kind` is the DRIVER.md vocabulary. Arguments that do not fit a tool's schema are caught in

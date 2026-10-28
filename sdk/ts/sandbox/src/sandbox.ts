@@ -1,3 +1,5 @@
+import { download, upload } from "./bulk.js";
+import type { Transfer, UploadOptions } from "./bulk.js";
 import { text, utf8 } from "./bytes.js";
 import { Files } from "./files.js";
 import type { FilesOptions } from "./files.js";
@@ -56,6 +58,28 @@ export class Sandbox {
     const sandbox = new Sandbox(transport, { files: options.files });
     await sandbox.files.capabilities();
     return sandbox;
+  }
+
+  /**
+   * Copy local files into the sandbox directory `remoteDir` as a tar stream (created if missing).
+   * `sources` is a directory (its contents land directly in `remoteDir`) or a list of paths (each
+   * under its base name). Modes and symlinks are kept; nothing is followed.
+   */
+  upload(
+    sources: string | string[],
+    remoteDir: string,
+    options?: UploadOptions,
+  ): Promise<Transfer> {
+    return upload(this.transport, sources, remoteDir, options);
+  }
+
+  /**
+   * Copy a sandbox directory's contents (or one file) into the local directory `localDir`
+   * (created if missing). The sandbox is not trusted: nothing is written outside `localDir` or
+   * through a link.
+   */
+  download(remotePath: string, localDir: string): Promise<Transfer> {
+    return download(this.transport, remotePath, localDir);
   }
 
   /** Run a command to completion. A non-zero exit is a result, not an error. */

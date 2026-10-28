@@ -29,6 +29,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
+# The archive: written and read by the `tar` crate; the policy layer around it is `bulk/extract.rs`.
+tar = { version = "0.4", default-features = false }
 tokio.workspace = true
 tracing.workspace = true
 

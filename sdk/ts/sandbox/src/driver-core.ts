@@ -7,7 +7,17 @@
  *   CONFORMANCE_BEARER    the bearer token; absent or empty means none
  *   CONFORMANCE_CAPS      JSON overriding probes: find_printf, search_engine
  */
+import { mkdirSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { download, extract, upload } from "./bulk.js";
 import { fromBase64, toBase64 } from "./bytes.js";
+import {
+  BulkReject,
+  forceRemove,
+  materialize,
+  withSandboxDir,
+} from "./driver-bulk.js";
 import { SandboxError } from "./errors.js";
 import type { ErrorKind } from "./errors.js";
 import { Files } from "./files.js";
@@ -39,6 +49,9 @@ export const OPS = [
   "mkdir",
   "list",
   "search",
+  "upload",
+  "download",
+  "extract",
 ] as const;
 
 export interface DriverConfig {
@@ -370,6 +383,38 @@ export class Driver {
           note: r.note,
         };
       }
+      case "upload": {
+        const dest = str(req, "path");
+        if (!Array.isArray(req.entries)) {
+          throw invalid("`entries` must be a list");
+        }
+        const chunk = optCount(req, "chunk_bytes");
+        const tmp = mkdtempSync(join(tmpdir(), "bulk-up-"));
+        try {
+          const src = join(tmp, "src");
+          mkdirSync(src);
+          materialize(src, req.entries as Json[], tmp);
+          const sources = req.sources === undefined || req.sources === null
+            ? src
+            : strings(req, "sources").map((n) => join(src, n));
+          return {
+            ...await upload(transport, sources, dest, { chunkBytes: chunk }),
+          };
+        } finally {
+          forceRemove(tmp);
+        }
+      }
+      case "download": {
+        const remote = str(req, "path");
+        return withSandboxDir(
+          req,
+          (local) => download(transport, remote, local),
+        );
+      }
+      case "extract": {
+        const tar = bytes(req, "tar_b64");
+        return withSandboxDir(req, (local) => extract(tar, local));
+      }
       default:
         throw new Reject({ kind: "unsupported", detail: op });
     }
@@ -389,6 +434,9 @@ function cat(chunks: Uint8Array[]): Uint8Array {
 }
 
 function toError(e: unknown): DriverError {
+  if (e instanceof BulkReject) {
+    return { kind: e.kind as ErrorKind, detail: e.detail };
+  }
   if (e instanceof SandboxError) return { kind: e.kind, detail: e.detail };
   return { kind: "io", detail: e instanceof Error ? e.message : String(e) };
 }
