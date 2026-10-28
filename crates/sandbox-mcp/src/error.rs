@@ -101,6 +101,7 @@ pub fn classify(msg: &str, kind: Option<std::io::ErrorKind>) -> ToolError {
         return err("transport");
     }
     if msg.contains("unparseable JSON")
+        || msg.contains("not a stream")
         || msg.contains("unparseable frame")
         || msg.contains("unparseable job frame")
         || msg.contains("is not standard base64")
@@ -148,6 +149,12 @@ mod tests {
         assert_eq!(k("exec endpoint returned 401"), "auth");
         assert_eq!(k("exec endpoint returned 500: boom"), "endpoint");
         assert_eq!(k("exec endpoint unreachable: refused"), "transport");
+        assert_eq!(
+            k(
+                "exec endpoint http://x answered a stream request with something that is not a stream"
+            ),
+            "protocol"
+        );
         assert_eq!(
             k("exec endpoint http://x: unparseable frame (expected value): nope"),
             "protocol"

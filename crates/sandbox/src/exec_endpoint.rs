@@ -109,6 +109,10 @@
 //! | `{"timed_out": true}` | **final**: the endpoint killed the command at `timeout_ms` |
 //! | `{"error": "<message>"}` | **final**: the endpoint failed after answering 200 (lost the sandbox) |
 //!
+//! - **A 200 that is not a stream.** A client MUST fail a stream request whose `200` does not carry
+//!   `Content-Type: application/x-ndjson` as `protocol` (FILES-OVER-EXEC.md section 3.2), whatever the
+//!   body holds: it never reads that body as a one-shot answer. A non-2xx answer is an error as for a
+//!   one-shot call.
 //! - **A line that is not a frame** (not a JSON object, an output field that is not standard base64,
 //!   a line past the client's limit with no newline) is `protocol` for a client (FILES-OVER-EXEC.md
 //!   section 3.2); a stream that stops (no final frame, `{"error"}`, silence) is `transport`.
@@ -1273,14 +1277,7 @@ impl CommandRunner for HttpExecRunner {
             .send(program, args, cwd, STREAM_DEADLINE, None, true)
             .await?;
         if !is_ndjson(&resp) {
-            // One object after all (a fleet mid-rollout): everything arrives at once, at the end.
-            let done = self.answer(resp).await?;
-            on_stdout(&done.stdout);
-            on_stderr(&done.stderr);
-            return Ok(ExecResult {
-                code: done.code,
-                ..Default::default()
-            });
+            return Err(self.not_a_stream(resp).await);
         }
         let mut frames = FrameReader::new(resp);
         let broken = |e: String| std::io::Error::other(format!("exec endpoint {}: {e}", self.url));
@@ -1374,8 +1371,22 @@ impl Drop for Released {
 }
 
 impl HttpExecRunner {
-    /// The streaming exchange. Falls back to one-shot when the endpoint has not proved it streams, or when it
-    /// answers this request with one JSON object after all (a fleet mid-rollout).
+    /// The error for a stream request answered `200` without `application/x-ndjson` (`protocol`).
+    /// The body is read as a one-shot answer first, so one that is over the cap or not an answer
+    /// at all is reported as that; a clean result is the silent data loss this refuses.
+    async fn not_a_stream(&self, resp: reqwest::Response) -> std::io::Error {
+        if let Err(e) = self.answer(resp).await {
+            return e;
+        }
+        std::io::Error::other(format!(
+            "exec endpoint {} answered a stream request with something that is not a stream",
+            self.url
+        ))
+    }
+
+    /// The streaming exchange. An endpoint that answers a stream request with anything but
+    /// `application/x-ndjson` is not speaking the protocol: [`Self::not_a_stream`], never a guess at
+    /// what its body means.
     #[allow(clippy::too_many_arguments)]
     async fn run_stream(
         &self,
@@ -1393,7 +1404,7 @@ impl HttpExecRunner {
         let _released = Released(stop.clone());
         let resp = self.send(program, args, cwd, timeout, None, true).await?;
         if !is_ndjson(&resp) {
-            return self.answer(resp).await;
+            return Err(self.not_a_stream(resp).await);
         }
         if let Some(report) = on_spawn {
             let stop = stop.clone();

@@ -1,6 +1,5 @@
 //! Exec protocol streaming at the runner: frames reach the sink in order, arbitrary bytes survive, output
-//! is bounded, every final frame maps onto the result — and an endpoint that has not *proved* it
-//! streams is driven exactly as one-shot always was.
+//! is bounded, every final frame maps onto the result — and an answer that is not a stream is an error.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::{Arc, Mutex};
@@ -185,4 +184,47 @@ async fn a_stream_asks_for_the_stream_and_a_plain_run_does_not() {
     );
     // No request but the two: nothing is probed first.
     assert_eq!(mock.bodies().len(), 2);
+}
+
+/// A stream request answered with a one-shot object is not the protocol: it would otherwise be a
+/// clean empty exit 0 (silent data loss), whatever the object says.
+#[tokio::test]
+async fn a_stream_request_answered_with_a_one_shot_body_is_a_protocol_error() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = beyond_test_support::ports::tokio_listener().await;
+    let url = format!("http://{}/exec", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut got = Vec::new();
+                let mut b = [0u8; 4096];
+                // The head and the whole body, so closing never resets the request in flight.
+                loop {
+                    let n = sock.read(&mut b).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    got.extend_from_slice(&b[..n]);
+                    if got.windows(4).any(|w| w == b"\r\n\r\n") && got.ends_with(b"}") {
+                        break;
+                    }
+                }
+                let body = r#"{"exit_code":0,"stdout":"","stderr":""}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+            });
+        }
+    });
+    let runner = HttpExecRunner::new(&url).unwrap();
+    let err = runner
+        .run_streaming("true", &[], None, Duration::from_secs(10), &|_| {})
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not a stream"), "{err}");
 }
