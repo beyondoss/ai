@@ -605,9 +605,7 @@ def _token_from(cmd: str, use_async: bool) -> Callable[[], Any]:
         return token
 
     async def asynchronous() -> str:
-        proc = await asyncio.create_subprocess_exec(
-            "sh", "-c", cmd, stdout=asyncio.subprocess.PIPE
-        )
+        proc = await asyncio.create_subprocess_exec("sh", "-c", cmd, stdout=asyncio.subprocess.PIPE)
         out, _ = await proc.communicate()
         if proc.returncode != 0:
             raise RuntimeError(f"the token command exited with {proc.returncode}")
