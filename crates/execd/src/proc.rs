@@ -261,15 +261,27 @@ pub(crate) fn group_empty(pgid: i32) -> bool {
 
 /// `(state, ppid, pgrp)` of `pid`, from `/proc/<pid>/stat`.
 fn stat(pid: u32) -> Option<(char, i32, i32)> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // The command name is parenthesised and may itself hold spaces and parentheses: split after
-    // the last one.
-    let (_, rest) = text.rsplit_once(')')?;
-    let mut f = rest.split_whitespace();
-    let state = f.next()?.chars().next()?;
-    let ppid = f.next()?.parse().ok()?;
-    let pgrp = f.next()?.parse().ok()?;
-    Some((state, ppid, pgrp))
+    // Bytes, not a `String`: the command name inside the parentheses is a raw `comm` and need not
+    // be UTF-8. A name that failed to decode would otherwise vanish from the scan, and a precise
+    // check would call a still-live group empty.
+    let text = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    parse_stat(&text)
+}
+
+/// The fields after the last `)` of a `/proc/<pid>/stat` line. The command name may itself hold
+/// spaces, parentheses, and bytes that are not UTF-8, so the split is on that last parenthesis.
+fn parse_stat(text: &[u8]) -> Option<(char, i32, i32)> {
+    let close = text.iter().rposition(|&b| b == b')')?;
+    let mut fields = text[close + 1..]
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|f| !f.is_empty());
+    let state = *fields.next()?.first()?;
+    if !state.is_ascii() {
+        return None;
+    }
+    let ppid = std::str::from_utf8(fields.next()?).ok()?.parse().ok()?;
+    let pgrp = std::str::from_utf8(fields.next()?).ok()?.parse().ok()?;
+    Some((state as char, ppid, pgrp))
 }
 
 /// How many bytes a pipe holds before its writer blocks: the pipe's own capacity
@@ -528,5 +540,65 @@ mod tests {
         let out = child.stdout.take().unwrap();
         assert_eq!(pipe_capacity(&out), 64 * 1024);
         child.wait().unwrap();
+    }
+
+    #[test]
+    fn a_comm_that_is_not_text_still_parses() {
+        // `pid (comm) state ppid pgrp`. The name holds a raw byte, a space, and a parenthesis;
+        // the split is the last `)`.
+        let mut text = b"12 (".to_vec();
+        text.push(0xff);
+        text.extend_from_slice(b" a)b) R 7 99 1");
+        assert!(std::str::from_utf8(&text).is_err());
+        assert_eq!(parse_stat(&text), Some(('R', 7, 99)));
+        assert_eq!(parse_stat(b"no parenthesis here"), None);
+    }
+
+    /// A live member whose `comm` is a raw byte still shows up in the scan. A parent cannot write
+    /// another process's `comm`, so the byte is the executable's own name.
+    #[test]
+    fn a_comm_that_is_not_text_is_still_a_live_member() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(std::ffi::OsString::from_vec(vec![0xff]));
+        std::fs::copy(sleep, &path).unwrap();
+        let mut cmd = std::process::Command::new(&path);
+        cmd.arg("30").process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id();
+        let kill = KillOnDrop(&mut child);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let stat_path = format!("/proc/{pid}/stat");
+        loop {
+            let text = std::fs::read(&stat_path).unwrap_or_default();
+            if text.contains(&0xff) {
+                assert!(std::str::from_utf8(&text).is_err());
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the raw comm never appeared: {text:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            live_members(pid as i32).contains(&pid),
+            "a non-text comm was skipped"
+        );
+        drop(kill);
+    }
+
+    /// Kill and wait, including when the assertion above fails.
+    struct KillOnDrop<'a>(&'a mut std::process::Child);
+
+    impl Drop for KillOnDrop<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 }
