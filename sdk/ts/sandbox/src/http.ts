@@ -357,7 +357,7 @@ export class HttpTransport implements Transport {
         }
         scanned = buf.length;
         if (buf.length > MAX_LINE) {
-          throw new TransportError(
+          throw new ProtocolError(
             `exec endpoint ${this.url}: a frame exceeded ${MAX_LINE} bytes without a newline`,
           );
         }
@@ -504,7 +504,7 @@ type Decoded = Frame | { type: "error"; message: string } | "heartbeat";
 function b64Field(field: string, s: unknown, url: string): Uint8Array {
   const b = typeof s === "string" ? fromBase64(s) : null;
   if (!b) {
-    throw new TransportError(
+    throw new ProtocolError(
       `exec endpoint ${url}: \`${field}\` is not standard base64`,
     );
   }
@@ -523,14 +523,14 @@ export function decodeFrameLine(line: Uint8Array, url = "endpoint"): Decoded[] {
   try {
     v = JSON.parse(s);
   } catch (e) {
-    throw new TransportError(
+    throw new ProtocolError(
       `exec endpoint ${url}: unparseable frame (${errorText(e)}): ${
         s.slice(0, 200)
       }`,
     );
   }
   if (!isRecord(v)) {
-    throw new TransportError(
+    throw new ProtocolError(
       `exec endpoint ${url}: unparseable frame: ${s.slice(0, 200)}`,
     );
   }
@@ -773,12 +773,12 @@ export function decodeJobFrame(line: Uint8Array): JobFrame | "heartbeat" {
   try {
     v = JSON.parse(s);
   } catch (e) {
-    throw new TransportError(
+    throw new ProtocolError(
       `job stream: unparseable job frame (${errorText(e)}): ${s.slice(0, 200)}`,
     );
   }
   if (!isRecord(v)) {
-    throw new TransportError(
+    throw new ProtocolError(
       `job stream: unparseable job frame: ${s.slice(0, 200)}`,
     );
   }
@@ -796,7 +796,7 @@ export function decodeJobFrame(line: Uint8Array): JobFrame | "heartbeat" {
   if (out !== null) {
     const data = fromBase64(out);
     if (!data) {
-      throw new TransportError("job stream: output is not standard base64");
+      throw new ProtocolError("job stream: output is not standard base64");
     }
     return { type: "output", data };
   }

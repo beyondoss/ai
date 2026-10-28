@@ -109,6 +109,9 @@
 //! | `{"timed_out": true}` | **final**: the endpoint killed the command at `timeout_ms` |
 //! | `{"error": "<message>"}` | **final**: the endpoint failed after answering 200 (lost the sandbox) |
 //!
+//! - **A line that is not a frame** (not a JSON object, an output field that is not standard base64,
+//!   a line past the client's limit with no newline) is `protocol` for a client (FILES-OVER-EXEC.md
+//!   section 3.2); a stream that stops (no final frame, `{"error"}`, silence) is `transport`.
 //! - Output is **standard base64 with padding** (RFC 4648 §4), so arbitrary bytes — invalid UTF-8,
 //!   NULs, terminal escapes — survive. An output frame MUST NOT be empty and MUST carry at most
 //!   64 KiB of decoded bytes ([`stream::MAX_FRAME_PAYLOAD`]); split anything longer.
