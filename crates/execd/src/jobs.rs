@@ -628,7 +628,8 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         Ok(p) => p,
         Err(e) => {
             ctx.jobs.remove(std::slice::from_ref(&key));
-            return http::error_response(500, &e.to_string());
+            let why = exec::spawn_failure(ctx, req, &e);
+            return http::error_response(500, why.trim_end());
         }
     };
     let pgid = proc.pgid;

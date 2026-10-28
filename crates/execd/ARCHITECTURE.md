@@ -66,7 +66,8 @@ accept ──► hyper (HTTP/1.1, or prior-knowledge HTTP/2 on the same port)
 ```
 
 A request that is none of those fails before a process exists. A command that cannot be spawned is an ordinary result (exit
-127), as a shell reports it.
+127) whose stderr names what failed, as the caller sent it (`execd: pytest -q: command not found`, `execd: cwd /x: No such
+file or directory`): `exec::spawn_failure` for the direct path, the helper's own `exec` failure under `EXECD_RUN_AS`.
 
 ### one-shot: `exec::envelope`
 
@@ -183,7 +184,7 @@ What the spec and the conformance verifier assume, and what holds:
   `Permission denied`, as it would for any user.
 - **Jobs.** The supervisor stays execd (root) and signals the user's groups; `kill`, `wipe`, a dropped hold and the shutdown
   sweep all work (`tests/security.rs` kills a user's job by `SIGTERM` to execd).
-- **A missing program** is exit 127 with `No such file or directory`, as without `EXECD_RUN_AS`. A job whose program is missing is
+- **A missing program** is exit 127 with `execd: PROGRAM: command not found`, as without `EXECD_RUN_AS`. A job whose program is missing is
   a started job that ends 127, not a `500` at `start`.
 - **argv.** For the instant between the spawn and the `exec`, a command's `/proc/<pid>/cmdline` is the helper's: the uid, gid,
   groups, directory, command and arguments. The bearer is never among them.

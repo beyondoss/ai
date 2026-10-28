@@ -100,7 +100,7 @@ execd's own `listening` line in `docker logs`, never a port probe (docker-proxy 
 `e2b` (`e2b.rs`) is never in a group or a glob: `--backend e2b` by exact name, and only with `E2B_API_KEY` set (`expand` refuses
 otherwise). It creates one VM with a hard auto-kill (`LIFETIME_SECS`, 25 minutes, set at create time), installs `execd` with the
 release's own `install-execd.sh` (`E2B_EXECD_VERSION`, default `v0.1.16`; the script checks the tarball's sha256, and the
-installed binary's is printed), runs it as root with `EXECD_RUN_AS=user` and a random bearer, and waits for the public URL
+installed binary's is printed; `E2B_EXECD_BIN=/path/to/execd`, a static build, is uploaded through envd's files endpoint instead, to prove unreleased endpoint code), runs it as root with `EXECD_RUN_AS=user` and a random bearer, and waits for the public URL
 `https://8081-<id>.e2b.app/exec` to answer 401. The VM is created and driven with `curl`, the key handed over as a config on stdin so
 it is never in a process listing. The guard deletes the VM on drop; its id is also on the reaper registry (`e <id>`), so the
 watchdog deletes it through the API if the harness is killed. `mise run test:clients:e2b` runs it; the differential test runs

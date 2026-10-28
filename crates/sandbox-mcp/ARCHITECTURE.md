@@ -37,12 +37,22 @@ MCP sessions; there is no per-session state, because the sandbox holds the state
 - **Errors are results.** `kind` is the DRIVER.md vocabulary. Arguments that do not fit a tool's schema are caught in
   `call_tool` (rmcp rejects them as `invalid_params`) and re-issued as `invalid_request` results, so the agent sees and
   fixes them.
-- **Bytes.** `read_file` and `job_output` return text when the bytes are UTF-8 and base64 otherwise (`encoding` says
-  which; `encoding: "base64"` forces it). A window that ends inside a multi-byte character gives that character up and
+- **`exec` and `job_start` take a command line, not an argv.** Models call a bash tool with one string (`cd app && pytest -q`);
+  given `command` and `args` they put the whole line in `command` and get exit 127. So `command` is the line, run as
+  `sh -c <line>` (`do_exec`, `do_job_start`), and the args structs are `deny_unknown_fields`: a stray `args` is refused as
+  `invalid_request: unknown field`args``, and the schema is a closed object. Raw argv exec stays one layer down, in the client
+  library; the conformance driver quotes each argv word into a line.
+- **One encoding vocabulary.** Every result that carries bytes says `encoding` (or `stdout_encoding` / `stderr_encoding`) as `utf8`
+  or `base64`, and every `encoding` argument accepts exactly those. `read_file` and `job_output` return text when the bytes are
+  UTF-8 and base64 otherwise (`encoding` says which; `encoding: "base64"` forces it). A window that ends inside a multi-byte character gives that character up and
   reports `bytes` / `next_offset` for what it returned, so a client that follows `next_offset` never sees a split
   character. `exec` output is text: the client library already decodes it.
 - **`edit_file`** stats the file, reads it whole, requires exactly one match (or `replace_all`), and writes with
   `write_if_unchanged` on the mtime it stat'ed. A false return is `conflict`; nothing is written.
+- **`write_file` makes missing parents.** The first attempt is the plain write; when it fails with the spec's
+  `parent directory DIR does not exist` (FILES-OVER-EXEC.md section 5.3) the server runs `create_dir_all(parent)` and retries once, so
+  a write into an existing directory costs no extra command. `create_parents: false` skips the retry (the conformance driver
+  sets it, because the contract's `write` does not make parents) and the caller gets `not_found` with that same plain detail.
 - **`write_file`** is unconditional unless a guard is given. `if_unchanged_since` (an `f64` of epoch seconds, the `stat`
   tool's `mtime`) and `create_only` (the file must not exist) both go to `write_if_unchanged`, which compares mtimes as
   the doubles `stat` reports, so a same-second change is still a change. A false return is `conflict`; the two guards

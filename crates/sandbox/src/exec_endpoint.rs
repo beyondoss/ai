@@ -40,9 +40,18 @@
 //! base64 too; an endpoint answers `400` to one that is not. Everything else in the answer is as
 //! ever: `exit_code` is the command's, `128 + S` for a command killed by signal `S`, `124` for one
 //! that hit its deadline (with a note, below), `127` for one that could not be started, with the
-//! reason as its stderr; none of these is an error. [`stream`] frames carry their output as base64
+//! reason as its stderr (see below); none of these is an error. [`stream`] frames carry their output as base64
 //! alike, so every path moves the same bytes. `tests/fixtures/exec/output.json` holds the answer
 //! vectors every client decodes.
+//!
+//! **A command that cannot be started** is `exit_code` 127 and a reason on stderr that **names what
+//! failed, as the caller sent it**: `execd: pytest -q: command not found` when `command` is not a
+//! program the endpoint can find (the usual cause is a whole command line in `command`), and
+//! `execd: cwd /no/dir: No such file or directory` when `cwd` is the problem. A bare OS error
+//! (`No such file or directory (os error 2)`) names neither and is not conforming. For a program
+//! that is missing the endpoint MUST put `command` and the words `command not found` in stderr; any
+//! other reason (`Permission denied`, `Argument list too long`) MUST still name `command`. The
+//! streaming surface carries the same text in a `stderr` frame before the `127` final frame.
 //!
 //! **Timeouts.** `timeout_ms` is the endpoint's to enforce: at the deadline it MUST kill the
 //! command's whole process group and SHOULD answer 200 with `exit_code` 124 and the note

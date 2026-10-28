@@ -519,7 +519,10 @@ async fn under_run_as_the_envelope_behaves() {
         .await
         .json();
     assert_eq!(a["exit_code"], 127, "{a}");
-    assert!(text(&a, "stderr").contains("No such file"), "{a}");
+    assert!(
+        text(&a, "stderr").contains("no-such-program-xyz: command not found"),
+        "{a}"
+    );
     // A directory the user cannot enter is refused as that user, not entered as root.
     let a = run(json!({ "command": "pwd", "cwd": "/root" }))
         .await

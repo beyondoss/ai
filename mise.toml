@@ -310,7 +310,7 @@ target/debug/sandbox-matrix --registry sdk/conformance/drivers.toml $backends \
 """
 
 [tasks."test:clients:e2b"]
-description = "The client conformance matrix against a real E2B VM running the released execd (every driver, plus relay pairs). Opt-in and billed (about $0.10/hour, one VM, hard 25 minute lifetime): needs E2B_API_KEY in the environment. E2B_EXECD_VERSION picks the release tag. Extra arguments go to sandbox-matrix. Set DIFFERENTIAL_E2B=1 to also run the differential test against it (DIFFERENTIAL_CASES sets the count)."
+description = "The client conformance matrix against a real E2B VM running the released execd (every driver, plus relay pairs). Opt-in and billed (about $0.10/hour, one VM, hard 25 minute lifetime): needs E2B_API_KEY in the environment. E2B_EXECD_VERSION picks the release tag; E2B_EXECD_BIN=/path/to/static/execd uploads that build instead. Extra arguments go to sandbox-matrix. Set DIFFERENTIAL_E2B=1 to also run the differential test against it (DIFFERENTIAL_CASES sets the count)."
 run = """
 set -e
 cargo build -q -p beyond-sandbox-conformance -p beyond-sandbox-mcp

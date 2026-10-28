@@ -237,11 +237,24 @@ fn helper(args: &[OsString]) -> ExitCode {
         }
         (Some("run"), [cwd, command, argv @ ..]) => {
             if let Err(e) = nix::unistd::chdir(Path::new(cwd)) {
-                eprint!("{cwd:?}: {}", std::io::Error::from(e));
+                let e = std::io::Error::from(e);
+                eprintln!(
+                    "execd: cwd {}: {}",
+                    cwd.to_string_lossy(),
+                    crate::exec::strip_os_code(&e)
+                );
                 return ExitCode::from(127);
             }
             let err = std::process::Command::new(command).args(argv).exec();
-            eprint!("{err}");
+            if err.kind() == std::io::ErrorKind::NotFound {
+                eprint!("{}", crate::exec::not_found(&command.to_string_lossy()));
+            } else {
+                eprintln!(
+                    "execd: {}: {}",
+                    command.to_string_lossy(),
+                    crate::exec::strip_os_code(&err)
+                );
+            }
             ExitCode::from(127)
         }
         _ => fail("bad helper mode".into()),

@@ -70,7 +70,7 @@ async fn a_conforming_endpoint_passes_every_check() {
         "{}",
         report.render()
     );
-    assert_eq!(report.checks.len(), 18 + conformance::notify::CHECKS.len());
+    assert_eq!(report.checks.len(), 19 + conformance::notify::CHECKS.len());
 }
 
 /// A conforming mock with one fault: of the notify checks, exactly `check` fails. (The other checks
@@ -322,6 +322,33 @@ async fn an_endpoint_that_ignores_the_one_shot_timeout_fails_that_check_alone() 
 
 /// An endpoint whose base64 is not base64 delivers nothing the client can decode: the verifier must
 /// catch it, and only it.
+/// A 127 whose stderr is the bare OS error names neither the program nor the cause: the verifier
+/// must catch it, and only it.
+#[tokio::test]
+async fn an_endpoint_that_reports_a_bare_os_error_fails_the_spawn_check() {
+    let (opts, expect) = quick();
+    let report = verify_mock(
+        MockOptions {
+            bare_spawn_errors: true,
+            ..opts
+        },
+        &expect,
+    )
+    .await;
+    let failed: Vec<&str> = report
+        .checks
+        .iter()
+        .filter(|c| c.verdict == Verdict::Fail)
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(
+        failed,
+        vec![conformance::SPAWN_FAILURE],
+        "{}",
+        report.render()
+    );
+}
+
 #[tokio::test]
 async fn an_endpoint_with_corrupt_base64_fails_the_byte_check() {
     let (opts, expect) = quick();

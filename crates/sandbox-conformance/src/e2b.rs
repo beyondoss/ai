@@ -2,7 +2,8 @@
 //! through E2B's port forwarding and TLS.
 //!
 //! Opt-in: it is never in a group or a glob, and needs `E2B_API_KEY`. The VM is made with a hard
-//! auto-kill timeout ([`LIFETIME_SECS`]); `execd` is installed in it by the release's own
+//! auto-kill timeout ([`LIFETIME_SECS`]); `E2B_EXECD_BIN` uploads a local static build instead of the
+//! release (to prove unreleased code); otherwise `execd` is installed in it by the release's own
 //! `install-execd.sh` (which verifies the tarball's sha256), not built here. The VM is deleted when
 //! the guard drops, and its id is on the reaper registry so the watchdog deletes it if the harness
 //! dies first. The API key travels to `curl` as a config on stdin, never on a command line.
@@ -232,15 +233,50 @@ pub async fn start(name: &str) -> Result<Started, String> {
             s
         })
     };
-    let install = format!(
-        "set -e; mkdir -p {HOME}/bin {HOME}/work\n\
-         curl -fsSL --retry 3 https://github.com/beyondoss/ai/releases/download/{tag}/install-execd.sh \
-           | EXECD_VERSION={tag} EXECD_INSTALL_DIR={HOME}/bin sh\n\
-         sha256sum {HOME}/bin/execd"
-    );
+    // `E2B_EXECD_BIN=/path/to/execd` (a static build) is uploaded instead of installing the release:
+    // the way to prove unreleased endpoint code on a real VM.
+    let local = std::env::var("E2B_EXECD_BIN")
+        .ok()
+        .filter(|p| !p.is_empty());
+    let install = match &local {
+        None => format!(
+            "set -e; mkdir -p {HOME}/bin {HOME}/work\n\
+             curl -fsSL --retry 3 https://github.com/beyondoss/ai/releases/download/{tag}/install-execd.sh \
+               | EXECD_VERSION={tag} EXECD_INSTALL_DIR={HOME}/bin sh\n\
+             sha256sum {HOME}/bin/execd"
+        ),
+        Some(_) => format!(
+            "set -e; mkdir -p {HOME}/bin {HOME}/work; mv {HOME}/execd.upload {HOME}/bin/execd; \
+             chmod +x {HOME}/bin/execd; sha256sum {HOME}/bin/execd"
+        ),
+    };
     let mut last = String::new();
     let mut installed = false;
     for _ in 0..30 {
+        if let Some(bin) = &local {
+            // The files endpoint answers once envd is up; a failure here is retried like a command's.
+            let up = curl(
+                &[("X-Access-Token", &vm.envd_token)],
+                &[
+                    "-f",
+                    "-X",
+                    "POST",
+                    &format!(
+                        "https://49983-{}.e2b.app/files?path={HOME}/execd.upload&username=user",
+                        vm.id
+                    ),
+                    "-F",
+                    &format!("file=@{bin};filename=execd.upload"),
+                ],
+                None,
+            )
+            .await;
+            if let Err(e) = up {
+                last = e;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        }
         match vm.run(&install, json!({})).await {
             Ok((0, out, _)) => {
                 eprintln!("e2b: {}", out.trim().replace('\n', "; "));

@@ -84,6 +84,9 @@ pub struct MockOptions {
     /// Answer every one-shot request with corrupted base64 in `stdout` and `stderr`: the
     /// non-conforming endpoint the verifier has to catch.
     pub corrupts_base64: bool,
+    /// Report a command that cannot start as the bare OS error (`No such file or directory (os
+    /// error 2)`), naming nothing: the non-conforming endpoint the verifier has to catch.
+    pub bare_spawn_errors: bool,
     pub protocol: Protocol,
     /// The silence after which a stream gets a heartbeat frame. The spec's is 5 s; a suite that
     /// wants to prove heartbeats are not output makes it much shorter than its idle window.
@@ -177,6 +180,7 @@ impl Default for MockOptions {
     fn default() -> Self {
         Self {
             corrupts_base64: false,
+            bare_spawn_errors: false,
             protocol: Protocol::Streaming,
             heartbeat: Duration::from_secs(5),
             kills_on_disconnect: true,
@@ -202,6 +206,7 @@ impl MockOptions {
     /// that refuses the extensions, a v1 endpoint that ignores stdin), keeps the mock's own server.
     pub fn is_conforming(&self) -> bool {
         !self.corrupts_base64
+            && !self.bare_spawn_errors
             && self.protocol == Protocol::Streaming
             && self.kills_on_disconnect
             && self.tracks_leftovers
@@ -601,6 +606,19 @@ fn args_of(req: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// A command that cannot start, named as the spec asks: the program as sent, and why.
+fn spawn_failure(shared: &Shared, req: &Value, e: &std::io::Error) -> String {
+    if shared.opts.bare_spawn_errors {
+        return e.to_string();
+    }
+    let command = req["command"].as_str().unwrap_or("true");
+    if e.kind() == std::io::ErrorKind::NotFound {
+        format!("execd: {command}: command not found\n")
+    } else {
+        format!("execd: {command}: {e}\n")
+    }
+}
+
 fn command_for(req: &Value, shared: &Shared) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(req["command"].as_str().unwrap_or("true"));
     cmd.args(args_of(req))
@@ -672,7 +690,12 @@ async fn serve_envelope(mut sock: tokio::net::TcpStream, req: Value, shared: Sha
             }
         }
         // `Argument list too long` lands here.
-        Err(e) => answer(&shared, 127, b"", e.to_string().as_bytes()),
+        Err(e) => answer(
+            &shared,
+            127,
+            b"",
+            spawn_failure(&shared, &req, &e).as_bytes(),
+        ),
     };
     let body = payload.to_string();
     let resp = format!(
@@ -751,7 +774,8 @@ async fn serve_stream(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let mut out = chunk(&json!({ "stderr": b64(e.to_string().as_bytes()) }));
+            let mut out =
+                chunk(&json!({ "stderr": b64(spawn_failure(&shared, &req, &e).as_bytes()) }));
             out.extend(chunk(&json!({ "exit_code": 127 })));
             out.extend_from_slice(b"0\r\n\r\n");
             let _ = wr.write_all(&out).await;

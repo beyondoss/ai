@@ -69,6 +69,40 @@ pub(crate) fn command_for(ctx: &Ctx, req: &Request) -> std::process::Command {
     cmd
 }
 
+/// Why `req` could not be started, as the one line a shell would print: `execd: pytest -q: command
+/// not found` for a program that is not there (the caller put a whole command line in `command`, or
+/// misspelled it), `execd: cwd DIR: No such file or directory` for a directory that is not, and
+/// `execd: PROGRAM: REASON` for anything else (`Argument list too long`, `Permission denied`). The
+/// name is always the one the caller sent, because a bare OS error says neither which file nor which
+/// directory. Ends in a newline, like stderr.
+pub(crate) fn spawn_failure(ctx: &Ctx, req: &Request, e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        let cwd = req
+            .cwd
+            .as_deref()
+            .map_or_else(|| ctx.opts.root.clone(), Into::into);
+        if !cwd.is_dir() {
+            return format!("execd: cwd {}: {}\n", cwd.display(), strip_os_code(e));
+        }
+        return not_found(&req.command);
+    }
+    format!("execd: {}: {}\n", req.command, strip_os_code(e))
+}
+
+/// The line for a program that is not there.
+pub(crate) fn not_found(command: &str) -> String {
+    format!("execd: {command}: command not found\n")
+}
+
+/// An I/O error's text without the ` (os error N)` suffix Rust appends.
+pub(crate) fn strip_os_code(e: &std::io::Error) -> String {
+    let s = e.to_string();
+    match s.rfind(" (os error ") {
+        Some(i) => s[..i].to_string(),
+        None => s,
+    }
+}
+
 /// Owns a running command's process group: registered for the shutdown sweep, and killed on drop if
 /// anything of it is left. A dropped handler (the client went away, the server is shutting down)
 /// therefore never leaves its command behind.
@@ -165,7 +199,8 @@ pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
         // `Argument list too long` lands here: an ordinary result, as a shell reports it.
         Err(e) => {
             line.done(200, "spawn failed");
-            return http::json_response(200, &answer(127, b"", e.to_string().as_bytes()));
+            let why = spawn_failure(ctx, &req, &e);
+            return http::json_response(200, &answer(127, b"", why.as_bytes()));
         }
     };
     // Killed on every way out, including this future being dropped when the client leaves (one-shot: a
@@ -394,8 +429,9 @@ async fn run_stream(ctx: Arc<Ctx>, req: Request, out: mpsc::Sender<Bytes>) {
         Ok(p) => p,
         Err(e) => {
             // A command that cannot be spawned is an ordinary result, as a shell reports it.
+            let why = spawn_failure(&ctx, &req, &e);
             let _ = sink
-                .put_final(frame::output("stderr", e.to_string().as_bytes()))
+                .put_final(frame::output("stderr", why.as_bytes()))
                 .await;
             let _ = sink
                 .put_final(frame::json(&json!({ "exit_code": 127 })))

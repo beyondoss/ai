@@ -129,6 +129,7 @@ impl Report {
 
 pub const ENVELOPE: &str = "one-shot envelope";
 pub const ENVELOPE_TIMEOUT: &str = "one-shot timeout kills the process group";
+pub const SPAWN_FAILURE: &str = "a command that cannot be started names it";
 pub const OUTPUT_BYTES: &str = "every byte value round-trips on stdout and stderr";
 pub const CONTENT_TYPE: &str = "stream content type";
 pub const INCREMENTAL: &str = "incremental delivery (the probe)";
@@ -175,6 +176,7 @@ pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectatio
     let mut checks = vec![
         v.envelope().await,
         v.envelope_timeout().await,
+        v.spawn_failure().await,
         v.output_bytes().await,
     ];
     match v.run("printf a", Duration::from_secs(10)).await {
@@ -460,6 +462,36 @@ impl Verifier {
                 ),
             ),
             Err(e) => fail(ENVELOPE, e),
+        }
+    }
+
+    /// A command that cannot be started is exit 127 whose stderr names the command as sent, with
+    /// `command not found`: the usual cause is a whole command line (`pytest -q`) in `command`, and
+    /// a bare OS error would not say which program or why. The name has a space in it on purpose.
+    async fn spawn_failure(&self) -> Check {
+        let command = format!("exec-conformance-no-such-program-{} -q", self.nonce);
+        let r = self
+            .runner
+            .run(&command, &[], None, Duration::from_secs(10))
+            .await;
+        match r {
+            Ok(r)
+                if r.code == Some(127)
+                    && r.stderr_text().contains(&command)
+                    && r.stderr_text().contains("command not found") =>
+            {
+                pass(SPAWN_FAILURE, "exit 127, stderr `...: command not found`")
+            }
+            Ok(r) => fail(
+                SPAWN_FAILURE,
+                format!(
+                    "want exit 127 and stderr naming {command:?} with `command not found`; got \
+                     exit {:?}, stderr {:?}",
+                    r.code,
+                    r.stderr_text()
+                ),
+            ),
+            Err(e) => fail(SPAWN_FAILURE, e.to_string()),
         }
     }
 

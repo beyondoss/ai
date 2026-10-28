@@ -161,6 +161,40 @@ fn the_request_limit_is_the_largest_file_the_agent_writes_in_base64_plus_an_argv
     assert_eq!(execd::MAX_REQUEST_BYTES, 89_478_488 + 2 * 1024 * 1024);
 }
 
+/// A command that cannot start says what failed, as the caller sent it, on both surfaces: a whole
+/// command line in `command` (the usual mistake) is `command not found` naming the line, and a
+/// missing `cwd` is named as the directory, not as the program.
+#[tokio::test]
+async fn a_command_that_cannot_start_names_what_failed() {
+    let (server, _dir) = start(|_| {}).await;
+    let addr = server.local_addr();
+    let stderr_of = |a: &support::http::Answer| -> String {
+        let v = a.json();
+        assert_eq!(v["exit_code"], 127, "{v}");
+        String::from_utf8(bytes(&v, "stderr")).unwrap()
+    };
+    let a = post(addr, &[], &run("pytest -q", &[])).await;
+    assert_eq!(stderr_of(&a), "execd: pytest -q: command not found\n");
+    let mut req = run("pwd", &[]);
+    req["cwd"] = json!("/no/such/dir");
+    let a = post(addr, &[], &req).await;
+    assert_eq!(
+        stderr_of(&a),
+        "execd: cwd /no/such/dir: No such file or directory\n"
+    );
+    let mut req = run("pytest -q", &[]);
+    req["stream"] = json!(true);
+    let frames = post(addr, &[], &req).await.frames();
+    assert_eq!(frames.last().unwrap(), &json!({ "exit_code": 127 }));
+    let err: Vec<u8> = frames
+        .iter()
+        .filter_map(|f| f["stderr"].as_str())
+        .flat_map(|b| base64::engine::general_purpose::STANDARD.decode(b).unwrap())
+        .collect();
+    assert_eq!(err, b"execd: pytest -q: command not found\n");
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_stream_frames_its_output_and_ends_with_one_final_frame() {
     let (server, _dir) = start(|_| {}).await;

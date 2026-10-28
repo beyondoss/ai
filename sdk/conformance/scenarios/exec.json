@@ -133,7 +133,28 @@
               "exit_code": 127,
               "stdout_utf8": "",
               "stderr_utf8": {
-                "$re": "No such file or directory"
+                "$re": "no-such-command-xyz: (command )?not found"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "exec.exit.command-line-in-command",
+      "description": "A whole command line in `command` (the usual mistake) is exit 127 whose stderr names the line it was given and says `not found`, so the caller can see what went wrong. execd says `execd: pytest -q: command not found`; a shell-run command (the MCP server's) says `sh: 1: pytest -q: not found`.",
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec",
+          "command": "no-such-command-xyz -q",
+          "args": [],
+          "expect": {
+            "ok": {
+              "exit_code": 127,
+              "stdout_utf8": "",
+              "stderr_utf8": {
+                "$re": "no-such-command-xyz -q: (command )?not found"
               }
             }
           }

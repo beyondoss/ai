@@ -127,6 +127,20 @@ fn bytes_arg(req: &Value, key: &str) -> Result<Vec<u8>, Value> {
         .map_err(|e| err("invalid_request", format!("`{key}` is not base64: {e}")))
 }
 
+/// The contract's `command` and `args` as the one shell command line the tools take: every word
+/// single-quoted, so the shell hands the program exactly the arguments the contract sent, and
+/// `exec`, so the program replaces the shell: a signal reaches the program itself (a job killed
+/// with SIGKILL ends 137, not as the shell's 143 and `Terminated`).
+fn command_line(req: &Value) -> Result<String, Value> {
+    let quote = |w: &str| format!("'{}'", w.replace('\'', "'\\''"));
+    let mut line = format!("exec {}", quote(str_arg(req, "command")?));
+    for a in strings(req, "args")? {
+        line.push(' ');
+        line.push_str(&quote(&a));
+    }
+    Ok(line)
+}
+
 /// A tool's arguments: the keys given, with `null`s left out.
 fn args(pairs: Vec<(&str, Value)>) -> Map<String, Value> {
     pairs
@@ -230,8 +244,7 @@ impl Mcp {
                     .tool(
                         "exec",
                         args(vec![
-                            ("command", json!(str_arg(req, "command")?)),
-                            ("args", json!(strings(req, "args")?)),
+                            ("command", json!(command_line(req)?)),
                             ("cwd", json!(opt_str(req, "cwd")?)),
                             ("timeout_ms", json!(u64_arg(req, "timeout_ms")?)),
                             ("stdin_base64", json!(opt_str(req, "stdin_b64")?)),
@@ -260,8 +273,7 @@ impl Mcp {
                         args(vec![
                             ("scope", json!(str_arg(req, "scope")?)),
                             ("id", json!(str_arg(req, "job")?)),
-                            ("command", json!(str_arg(req, "command")?)),
-                            ("args", json!(strings(req, "args")?)),
+                            ("command", json!(command_line(req)?)),
                             ("cwd", json!(opt_str(req, "cwd")?)),
                             ("label", json!(opt_str(req, "label")?)),
                         ]),
@@ -362,6 +374,8 @@ impl Mcp {
                     args(vec![
                         ("path", json!(path)),
                         ("content_base64", json!(str_arg(req, "data_b64")?)),
+                        // The contract's write does not make parents; the tool's default does.
+                        ("create_parents", json!(false)),
                     ]),
                 )
                 .await?;
@@ -394,6 +408,7 @@ impl Mcp {
                     args(vec![
                         ("path", json!(path)),
                         ("content_base64", json!(str_arg(req, "data_b64")?)),
+                        ("create_parents", json!(false)),
                         guard,
                     ]),
                 )

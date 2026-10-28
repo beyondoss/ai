@@ -99,7 +99,7 @@ async fn an_agent_lists_the_tools_writes_a_file_runs_cat_and_reads_it_back() {
         .await;
         assert_eq!(ok(&w)["bytes"], 7);
 
-        let cat = call(peer, "exec", json!({"command": "cat", "args": [file]})).await;
+        let cat = call(peer, "exec", json!({"command": format!("cat {file}")})).await;
         let cat = ok(&cat);
         assert_eq!(cat["exit_code"], 0);
         assert_eq!(cat["stdout"], "héllo\n");
@@ -373,6 +373,246 @@ async fn failures_are_tool_results_with_the_spec_kind_never_protocol_errors() {
     .unwrap();
 }
 
+/// Friction found driving the server with an off-the-shelf agent (OpenAI Agents SDK): each of these
+/// cost it several tool calls.
+#[tokio::test]
+async fn write_file_makes_missing_parents_by_default_and_names_a_missing_one_when_asked_not_to() {
+    tokio::time::timeout(DEADLINE, async {
+        let (dir, mock) = sandbox().await;
+        let root = dir.path().canonicalize().unwrap();
+        let p = |name: &str| format!("{}/{name}", root.display());
+        let client = connect(&mock.url).await;
+        let peer = client.peer();
+
+        // The default: `pkg/tests/test_a.py` needs no mkdir first, and a second write into the
+        // directory just made takes the plain path.
+        let w = call(
+            peer,
+            "write_file",
+            json!({"path": p("pkg/tests/test_a.py"), "content": "x\n"}),
+        )
+        .await;
+        assert_eq!(ok(&w)["bytes"], 2);
+        let r = call(peer, "read_file", json!({"path": p("pkg/tests/test_a.py")})).await;
+        assert_eq!(ok(&r)["content"], "x\n");
+        ok(&call(
+            peer,
+            "write_file",
+            json!({"path": p("pkg/tests/test_b.py"), "content": "y"}),
+        )
+        .await);
+        // The guarded forms make parents too: create_only into a new tree.
+        ok(&call(
+            peer,
+            "write_file",
+            json!({"path": p("new/deep/f"), "content": "z", "create_only": true}),
+        )
+        .await);
+
+        // Opting out: not_found, in plain words, naming the directory and no temp file.
+        let r = call(
+            peer,
+            "write_file",
+            json!({"path": p("nope/f"), "content": "x", "create_parents": false}),
+        )
+        .await;
+        assert_eq!(error_kind(&r), "not_found");
+        let detail = r.structured_content.as_ref().unwrap()["error"]["detail"]
+            .as_str()
+            .unwrap();
+        assert!(
+            detail.contains(&format!("parent directory {} does not exist", p("nope"))),
+            "{detail}"
+        );
+        assert!(!detail.contains(".tmp."), "{detail}");
+        let st = call(peer, "stat", json!({"path": p("nope")})).await;
+        assert_eq!(ok(&st)["exists"], false, "a refused write made nothing");
+
+        client.cancel().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn exec_takes_one_shell_command_line_and_refuses_an_argument_list() {
+    tokio::time::timeout(DEADLINE, async {
+        let (dir, mock) = sandbox().await;
+        let root = dir.path().canonicalize().unwrap();
+        let client = connect(&mock.url).await;
+        let peer = client.peer();
+
+        // The call models make: a whole command line, with a pipe, a quote and `&&`.
+        let r = call(
+            peer,
+            "exec",
+            json!({"command": "echo 'a b' | tr a-z A-Z && echo done >&2; exit 3", "cwd": root.display().to_string()}),
+        )
+        .await;
+        let r = ok(&r);
+        assert_eq!(
+            (r["exit_code"].clone(), r["stdout"].clone(), r["stderr"].clone()),
+            (json!(3), json!("A B\n"), json!("done\n"))
+        );
+        // A program that is not there is 127 and the shell names it.
+        let r = call(peer, "exec", json!({"command": "no-such-program-xyz -q"})).await;
+        let r = ok(&r);
+        assert_eq!(r["exit_code"], 127);
+        assert!(
+            r["stderr"].as_str().unwrap().contains("no-such-program-xyz"),
+            "{r}"
+        );
+        // stdin reaches the command.
+        let r = call(peer, "exec", json!({"command": "cat", "stdin": "in"})).await;
+        assert_eq!(ok(&r)["stdout"], "in");
+
+        // The old shape is refused by name, with the fields that exist, instead of half-working.
+        for tool in ["exec", "job_start"] {
+            let r = call(peer, tool, json!({"command": "pytest", "args": ["-q"]})).await;
+            assert_eq!(error_kind(&r), "invalid_request");
+            let detail = r.structured_content.as_ref().unwrap()["error"]["detail"]
+                .as_str()
+                .unwrap();
+            assert!(detail.contains("unknown field `args`"), "{tool}: {detail}");
+        }
+        // The schema says so too: a closed object whose `command` is a command line.
+        let tools = peer.list_all_tools().await.unwrap();
+        let exec = tools.iter().find(|t| t.name == "exec").unwrap();
+        assert_eq!(exec.input_schema["additionalProperties"], false);
+        assert!(exec.input_schema["properties"].get("args").is_none());
+
+        client.cancel().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// The real execd behind the server: when a command cannot start the agent reads which part was
+/// wrong (here the directory), not a bare OS error.
+#[tokio::test]
+async fn a_command_that_cannot_start_through_the_real_execd_names_what_failed() {
+    tokio::time::timeout(DEADLINE, async {
+        let dir = tempfile::tempdir().unwrap();
+        let server = execd::serve(
+            beyond_test_support::ports::tokio_listener().await,
+            execd::Options::new(dir.path()),
+        )
+        .unwrap();
+        let client = connect(&format!("http://{}/exec", server.local_addr())).await;
+        let peer = client.peer();
+
+        let r = call(
+            peer,
+            "exec",
+            json!({"command": "pwd", "cwd": "/no/such/dir"}),
+        )
+        .await;
+        let r = ok(&r);
+        assert_eq!(r["exit_code"], 127);
+        assert_eq!(
+            r["stderr"],
+            "execd: cwd /no/such/dir: No such file or directory\n"
+        );
+        // Through `sh -c` a missing program is the shell's 127, which also names it.
+        let r = call(peer, "exec", json!({"command": "pytest -q"})).await;
+        let r = ok(&r);
+        assert_eq!(r["exit_code"], 127);
+        assert!(
+            r["stderr"].as_str().unwrap().contains("pytest: not found"),
+            "{r}"
+        );
+
+        client.cancel().await.unwrap();
+        server.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn one_encoding_vocabulary_in_every_tool_what_a_result_says_is_what_a_call_accepts() {
+    tokio::time::timeout(DEADLINE, async {
+        let (dir, mock) = sandbox().await;
+        let root = dir.path().canonicalize().unwrap();
+        let file = format!("{}/t.txt", root.display());
+        let client = connect(&mock.url).await;
+        let peer = client.peer();
+
+        ok(&call(peer, "write_file", json!({"path": file, "content": "hé\n"})).await);
+        let e = call(peer, "exec", json!({"command": "echo out"})).await;
+        let said = ok(&e)["stdout_encoding"].as_str().unwrap().to_string();
+        assert_eq!(said, "utf8");
+
+        let j = call(peer, "job_start", json!({"command": format!("cat {file}")})).await;
+        let id = ok(&j)["id"].as_str().unwrap().to_string();
+        // Wait for the job to end.
+        let mut o;
+        loop {
+            o = call(peer, "job_output", json!({"id": id, "encoding": said})).await;
+            if ok(&o)["state"] == "ended" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            (ok(&o)["encoding"].clone(), ok(&o)["content"].clone()),
+            (json!("utf8"), json!("hé\n"))
+        );
+        for tool in ["read_file", "job_output"] {
+            let args = if tool == "read_file" {
+                json!({"path": file, "encoding": "base64"})
+            } else {
+                json!({"id": id, "encoding": "base64"})
+            };
+            let r = call(peer, tool, args).await;
+            assert_eq!(ok(&r)["encoding"], "base64", "{tool}");
+            let r = call(
+                peer,
+                tool,
+                if tool == "read_file" {
+                    json!({"path": file, "encoding": "utf8"})
+                } else {
+                    json!({"id": id, "encoding": "utf8"})
+                },
+            )
+            .await;
+            assert_eq!(ok(&r)["encoding"], "utf8", "{tool}");
+            // Words nobody says are refused with the two that exist.
+            let bad = if tool == "read_file" {
+                json!({"path": file, "encoding": "auto"})
+            } else {
+                json!({"id": id, "encoding": "auto"})
+            };
+            let r = call(peer, tool, bad).await;
+            assert_eq!(error_kind(&r), "invalid_request", "{tool}");
+        }
+        // Invalid UTF-8 falls back to base64 and says so.
+        let b = call(peer, "exec", json!({"command": "printf '\\377'"})).await;
+        assert_eq!(
+            (ok(&b)["stdout_encoding"].clone(), ok(&b)["stdout"].clone()),
+            (json!("base64"), json!("/w=="))
+        );
+        let b = call(
+            peer,
+            "write_file",
+            json!({"path": format!("{}/bin", root.display()), "content_base64": "/w=="}),
+        )
+        .await;
+        ok(&b);
+        let r = call(
+            peer,
+            "read_file",
+            json!({"path": format!("{}/bin", root.display()), "encoding": "utf8"}),
+        )
+        .await;
+        assert_eq!(ok(&r)["encoding"], "base64");
+
+        client.cancel().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn jobs_start_report_output_and_stop() {
     tokio::time::timeout(DEADLINE, async {
@@ -383,7 +623,7 @@ async fn jobs_start_report_output_and_stop() {
         let s = call(
             peer,
             "job_start",
-            json!({"command": "sh", "args": ["-c", "echo started; sleep 300"], "label": "waiter"}),
+            json!({"command": "echo started; sleep 300", "label": "waiter"}),
         )
         .await;
         let id = ok(&s)["id"].as_str().unwrap().to_string();
@@ -541,12 +781,7 @@ async fn streamable_http_serves_the_same_tools_on_loopback_and_refuses_a_public_
 
         let client = ().serve(StreamableHttpClientTransport::from_uri(url)).await.unwrap();
         assert_eq!(client.peer().list_all_tools().await.unwrap().len(), 12);
-        let r = call(
-            client.peer(),
-            "exec",
-            json!({"command": "echo", "args": ["over http"]}),
-        )
-        .await;
+        let r = call(client.peer(), "exec", json!({"command": "echo over http"})).await;
         assert_eq!(ok(&r)["stdout"], "over http\n");
         client.cancel().await.unwrap();
         child.kill().await.unwrap();
