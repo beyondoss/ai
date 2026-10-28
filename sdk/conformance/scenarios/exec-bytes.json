@@ -403,7 +403,7 @@
       ]
     },
     {
-      "id": "exec.stdout.large-output-decodes",
+      "id": "exec-bytes.stdout.large-output-decodes",
       "description": "Raw exec with 7 MB of stdout returns exactly 7,000,000 bytes. Large base64 bodies (over 6 MB) must decode in every client.",
       "steps": [
         {
