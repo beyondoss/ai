@@ -54,37 +54,25 @@ function stripSpace(s: string): string {
 }
 
 /**
- * Strict base64 check in one linear pass, no regex: the length is a multiple of 4, and the
- * alphabet is `A-Za-z0-9+/` except for up to two `=` at the very end.
+ * Strict standard base64 with padding; whitespace is ignored. Returns null if it is not base64.
+ * Decodes with the platform, then re-encodes and compares: that rejects anything the decoder
+ * silently skips (bad characters, wrong padding, bad length) and non-canonical trailing bits,
+ * as the Rust client does. Both calls are native and linear.
  */
-function isStrictBase64(s: string): boolean {
-  const n = s.length;
-  if (n % 4 !== 0) return false;
-  let end = n;
-  for (let pad = 0; pad < 2 && end > 0 && s.charCodeAt(end - 1) === 61; pad++) {
-    end--;
-  }
-  for (let i = 0; i < end; i++) {
-    const c = s.charCodeAt(i);
-    const ok = (c >= 65 && c <= 90)
-      || (c >= 97 && c <= 122)
-      || (c >= 48 && c <= 57)
-      || c === 43
-      || c === 47;
-    if (!ok) return false;
-  }
-  return true;
-}
-
-/** Strict standard base64 with padding; whitespace is ignored. Returns null if it is not base64. */
 export function fromBase64(s: string): Uint8Array | null {
   const clean = stripSpace(s);
-  if (!isStrictBase64(clean)) return null;
   if (typeof Buffer !== "undefined") {
     const b = Buffer.from(clean, "base64");
+    if (b.toString("base64") !== clean) return null;
     return new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
   }
-  const bin = atob(clean);
+  let bin: string;
+  try {
+    bin = atob(clean);
+  } catch {
+    return null;
+  }
+  if (btoa(bin) !== clean) return null;
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;

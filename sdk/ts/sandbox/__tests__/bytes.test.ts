@@ -19,6 +19,7 @@ describe("fromBase64", () => {
     expect(fromBase64("AAAA")).toEqual(new Uint8Array([0, 0, 0]));
     expect(fromBase64("AA==")).toEqual(new Uint8Array([0]));
     expect(fromBase64("AAA=")).toEqual(new Uint8Array([0, 0]));
+    expect(fromBase64("AQ==")).toEqual(new Uint8Array([1]));
     expect(fromBase64(" AA\n==\t")).toEqual(new Uint8Array([0]));
     expect(fromBase64(" AAAA ")).toEqual(new Uint8Array([0, 0, 0]));
   });
@@ -33,6 +34,9 @@ describe("fromBase64", () => {
     expect(fromBase64("AA-_")).toBeNull(); // url-safe alphabet is not standard
     expect(fromBase64("AAA!")).toBeNull();
     expect(fromBase64("AAAé")).toBeNull();
+    expect(fromBase64("AB==")).toBeNull(); // non-zero trailing bits: not canonical
+    expect(fromBase64("AR==")).toBeNull();
+    expect(fromBase64("AAB=")).toBeNull();
     expect(fromBase64("AAAA\u0000")).toBeNull();
   });
 
