@@ -111,7 +111,8 @@
 //!
 //! - **A 200 that is not a stream.** A client MUST fail a stream request whose `200` does not carry
 //!   `Content-Type: application/x-ndjson` as `protocol` (FILES-OVER-EXEC.md section 3.2), whatever the
-//!   body holds: it never reads that body as a one-shot answer.
+//!   body holds: it never reads that body as a one-shot answer. A non-2xx answer is an error as for a
+//!   one-shot call.
 //! - Output is **standard base64 with padding** (RFC 4648 §4), so arbitrary bytes — invalid UTF-8,
 //!   NULs, terminal escapes — survive. An output frame MUST NOT be empty and MUST carry at most
 //!   64 KiB of decoded bytes ([`stream::MAX_FRAME_PAYLOAD`]); split anything longer.
@@ -1273,7 +1274,7 @@ impl CommandRunner for HttpExecRunner {
             .send(program, args, cwd, STREAM_DEADLINE, None, true)
             .await?;
         if !is_ndjson(&resp) {
-            return Err(self.not_a_stream());
+            return Err(self.not_a_stream(resp).await);
         }
         let mut frames = FrameReader::new(resp);
         let broken = |e: String| std::io::Error::other(format!("exec endpoint {}: {e}", self.url));
@@ -1367,8 +1368,13 @@ impl Drop for Released {
 }
 
 impl HttpExecRunner {
-    /// The error for a stream request answered with a body that is not a stream (`protocol`).
-    fn not_a_stream(&self) -> std::io::Error {
+    /// The error for a stream request answered `200` without `application/x-ndjson` (`protocol`).
+    /// The body is read as a one-shot answer first, so one that is over the cap or not an answer
+    /// at all is reported as that; a clean result is the silent data loss this refuses.
+    async fn not_a_stream(&self, resp: reqwest::Response) -> std::io::Error {
+        if let Err(e) = self.answer(resp).await {
+            return e;
+        }
         std::io::Error::other(format!(
             "exec endpoint {} answered a stream request with something that is not a stream",
             self.url
@@ -1395,7 +1401,7 @@ impl HttpExecRunner {
         let _released = Released(stop.clone());
         let resp = self.send(program, args, cwd, timeout, None, true).await?;
         if !is_ndjson(&resp) {
-            return Err(self.not_a_stream());
+            return Err(self.not_a_stream(resp).await);
         }
         if let Some(report) = on_spawn {
             let stop = stop.clone();

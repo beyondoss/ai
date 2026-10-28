@@ -823,7 +823,7 @@
     },
     {
       "id": "transport.malformed.answer-that-is-not-the-protocol",
-      "description": "A 200 whose body is not the protocol is protocol: text where JSON should be, JSON of the wrong shape, a stream of lines that are not frames, and a stream request answered with a one-shot body. Nothing is guessed and nothing is a success.",
+      "description": "A 200 whose body is not the protocol is protocol: text where JSON should be, JSON of the wrong shape, a stream of lines that are not frames, and a stream request answered with a one-shot body. Nothing is guessed and nothing is a success. A stream request answered by an error status (422 over the cap, 500) is that error, not a protocol failure.",
       "connect": {
         "edge": {}
       },
@@ -971,6 +971,62 @@
               "sandbox-mcp"
             ],
             "reason": "the MCP driver's stream is a job, whose start answer it cannot read (io)"
+          }
+        },
+        {
+          "id": "set-422",
+          "edge": {
+            "set": {
+              "fault": {
+                "kind": "status",
+                "status": 422,
+                "body": "{\"error\":\"the output exceeded the response cap\"}"
+              }
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "stream-answered-422",
+          "op": "exec_stream",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "error": {
+              "kind": "too_large"
+            }
+          }
+        },
+        {
+          "id": "set-500",
+          "edge": {
+            "set": {
+              "fault": {
+                "kind": "status",
+                "status": 500,
+                "body": "{\"error\":\"internal\"}"
+              }
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "stream-answered-500",
+          "op": "exec_stream",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "error": {
+              "kind": "endpoint"
+            }
           }
         },
         {
