@@ -75,6 +75,52 @@ impl Exec for Spy {
             .run_with_stdin(program, args, cwd, timeout, stdin)
             .await
     }
+
+    async fn run_streaming(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        on_chunk: beyond_sandbox::exec::ChunkSink<'_>,
+    ) -> std::io::Result<ExecResult> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((program.into(), args.to_vec(), 0));
+        self.inner
+            .run_streaming(program, args, cwd, timeout, on_chunk)
+            .await
+    }
+
+    async fn run_streaming_tracked(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        hooks: &beyond_sandbox::exec::JobHooks<'_>,
+    ) -> std::io::Result<ExecResult> {
+        self.inner
+            .run_streaming_tracked(program, args, cwd, hooks)
+            .await
+    }
+
+    async fn run_attached(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        on_stdout: beyond_sandbox::exec::ChunkSink<'_>,
+        on_stderr: beyond_sandbox::exec::ChunkSink<'_>,
+    ) -> std::io::Result<ExecResult> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((program.into(), args.to_vec(), 0));
+        self.inner
+            .run_attached(program, args, cwd, on_stdout, on_stderr)
+            .await
+    }
 }
 
 fn tree(root: &std::path::Path) {
