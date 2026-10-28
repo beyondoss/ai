@@ -1,4 +1,4 @@
-//! The MCP server: one sandbox connection, twelve tools and one resource.
+//! The MCP server: one sandbox connection, twelve tools (fourteen with a local root) and one resource.
 //!
 //! Every tool is a thin mapping from its arguments to one call of [`beyond_sandbox`] (raw exec,
 //! the file helpers, jobs) and from its outcome to a structured result. The connection is made on
@@ -68,6 +68,28 @@ pub struct SandboxMcp {
 }
 
 // ---- arguments ------------------------------------------------------------------------------
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UploadArgs {
+    /// A directory or file of this machine, relative to the server's local root. A directory
+    /// uploads its contents; a file uploads that file.
+    local: String,
+    /// The sandbox directory to put it in (absolute; created if missing).
+    remote_dir: String,
+    /// When `local` is a directory: upload only these entries of it, each by its own name.
+    only: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DownloadArgs {
+    /// A directory (its contents) or file of the sandbox (absolute).
+    remote_path: String,
+    /// The directory of this machine to extract into, relative to the server's local root;
+    /// created if missing.
+    local_dir: String,
+}
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -301,6 +323,10 @@ fn is_missing_parent(detail: &str) -> bool {
     detail.contains(": parent directory ") && detail.contains(" does not exist")
 }
 
+fn transfer(t: beyond_sandbox::Transfer) -> Value {
+    json!({ "files": t.files, "dirs": t.dirs, "links": t.links, "bytes": t.bytes })
+}
+
 fn job_id(s: &str) -> Result<JobId, ToolError> {
     JobId::parse(s).ok_or_else(|| {
         ToolError::invalid(format!("bad job id {s:?}: 1 to 32 characters of [0-9a-z]"))
@@ -311,12 +337,20 @@ fn job_id(s: &str) -> Result<JobId, ToolError> {
 
 impl SandboxMcp {
     pub fn new(config: Config) -> Self {
+        let local_root_unset = config.local_root.is_none();
         Self {
             inner: Arc::new(Inner {
                 config,
                 target: Mutex::new(None),
             }),
-            tool_router: Self::tool_router(),
+            tool_router: {
+                let mut r = Self::tool_router();
+                if local_root_unset {
+                    r.remove_route("upload");
+                    r.remove_route("download");
+                }
+                r
+            },
         }
     }
 
@@ -477,6 +511,22 @@ impl SandboxMcp {
     )]
     async fn mkdir(&self, Parameters(a): Parameters<PathArgs>) -> ToolReply {
         Ok(reply(self.do_mkdir(a).await))
+    }
+
+    #[tool(
+        name = "upload",
+        description = "Copy a directory or file of the server's machine (a path under its local root) into a sandbox directory, as a tar stream: modes, symlinks and empty directories survive, large trees go in chunks. Returns files, dirs, links and bytes. Merges into a destination that exists; a destination that is a file fails with not_a_directory."
+    )]
+    async fn upload(&self, Parameters(a): Parameters<UploadArgs>) -> ToolReply {
+        Ok(reply(self.do_upload(a).await))
+    }
+
+    #[tool(
+        name = "download",
+        description = "Copy a sandbox directory (its contents) or file into a directory of the server's machine (a path under its local root), as a tar stream. Links are copied as links and never followed, and nothing is written outside the target. Returns files, dirs, links and bytes."
+    )]
+    async fn download(&self, Parameters(a): Parameters<DownloadArgs>) -> ToolReply {
+        Ok(reply(self.do_download(a).await))
     }
 
     #[tool(
@@ -760,6 +810,78 @@ impl SandboxMcp {
         Ok(json!({ "path": a.path }))
     }
 
+    /// A path the model named, under the local root: relative, no `..`, and no existing component
+    /// that is a link leaving the root.
+    fn local_path(&self, p: &str) -> Result<PathBuf, ToolError> {
+        let root = self.inner.config.local_root.as_ref().ok_or_else(|| {
+            ToolError::invalid("the server has no SANDBOX_LOCAL_ROOT: upload and download are off")
+        })?;
+        let rel = Path::new(p);
+        let mut out = root.clone();
+        for c in rel.components() {
+            match c {
+                std::path::Component::Normal(n) => out.push(n),
+                std::path::Component::CurDir => {}
+                _ => {
+                    return Err(ToolError::invalid(format!(
+                        "{p:?} must be a relative path below the local root, without `..`"
+                    )));
+                }
+            }
+        }
+        // The deepest part that exists, resolved, must still be inside the root.
+        let real_root = root.canonicalize()?;
+        let mut probe = out.clone();
+        loop {
+            match probe.canonicalize() {
+                Ok(real) => {
+                    if !real.starts_with(&real_root) {
+                        return Err(ToolError::invalid(format!(
+                            "{p:?} leaves the local root through a link"
+                        )));
+                    }
+                    break;
+                }
+                Err(_) if !probe.pop() => break,
+                Err(_) => {}
+            }
+        }
+        Ok(out)
+    }
+
+    async fn do_upload(&self, a: UploadArgs) -> Out {
+        let local = self.local_path(&a.local)?;
+        let sources = if local.is_dir() {
+            match &a.only {
+                None => beyond_sandbox::Sources::Dir(local),
+                Some(names) => {
+                    let mut paths = Vec::new();
+                    for n in names {
+                        if n.contains('/') || n == ".." || n == "." || n.is_empty() {
+                            return Err(ToolError::invalid(format!(
+                                "`only` names entries of the directory, not paths: {n:?}"
+                            )));
+                        }
+                        paths.push(local.join(n));
+                    }
+                    beyond_sandbox::Sources::Paths(paths)
+                }
+            }
+        } else {
+            beyond_sandbox::Sources::Paths(vec![local])
+        };
+        let t = self.target().await?;
+        let r = t.sandbox.upload(sources, &a.remote_dir).await?;
+        Ok(transfer(r))
+    }
+
+    async fn do_download(&self, a: DownloadArgs) -> Out {
+        let local = self.local_path(&a.local_dir)?;
+        let t = self.target().await?;
+        let r = t.sandbox.download(&a.remote_path, &local).await?;
+        Ok(transfer(r))
+    }
+
     async fn do_job_start(&self, a: JobStartArgs) -> Out {
         let scope = self.scope(a.scope.as_deref())?;
         let id = match a.id.as_deref() {
@@ -841,7 +963,7 @@ impl SandboxMcp {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for SandboxMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
@@ -856,7 +978,8 @@ impl ServerHandler for SandboxMcp {
         ))
         .with_instructions(
             "Tools for one sandbox: exec, files (read_file, write_file, edit_file, list_dir, stat, \
-             search, mkdir) and background jobs (job_start, job_list, job_output, job_kill). A failed \
+             search, mkdir), bulk copy between this machine and the sandbox (upload, download; only \
+             when the server has a local root) and background jobs (job_start, job_list, job_output, job_kill). A failed \
              call returns isError with structuredContent.error.kind (not_found, permission_denied, \
              conflict, auth, transport, ...). The sandbox://capabilities resource says what the \
              sandbox supports.",

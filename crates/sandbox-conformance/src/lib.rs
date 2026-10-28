@@ -15,6 +15,7 @@ pub mod reaper;
 pub mod relay;
 pub mod report;
 pub mod run;
+pub mod trees;
 
 pub use run::{
     Backend, Check, Connector, Link, Status, Tally, load_scenarios, run_scenario, run_scenario_via,

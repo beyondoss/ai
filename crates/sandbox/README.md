@@ -43,6 +43,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **The layers compose.** The same files, helpers and bulk scenarios run over a transport that is nothing but
   `sh` on this host (written inside the test, no HTTP anywhere, and no jobs): 263 checks pass, 22 skipped
   ([`tests/sdk_conformance.rs`](tests/sdk_conformance.rs)).
+- **Whole trees move as tar over exec.** `upload` and `download` keep modes, symlinks and empty directories, round-trip a
+  50 MiB file in four chunks, refuse a hostile archive (`..`, absolute names, writes through links, hard links out), and
+  report ENOSPC and read-only destinations; 0 failures in every client's driver on every backend (busybox and GNU `tar`).
 - **A user-written helper needs only `run`.** A `git status` helper written on raw `Exec` runs unchanged over any
   transport ([`tests/sandbox_surface.rs`](tests/sandbox_surface.rs)).
 - **Token renewal is exactly one retry:** a `401` asks the source once for a new token and repeats that request once;

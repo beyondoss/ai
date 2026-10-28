@@ -15,6 +15,8 @@ depends on it; it depends on neither `beyond-agent` nor `beyond-agent-core`.
 | `src/exec_endpoint/jobs_native.rs` | the endpoint's jobs: `NativeJobs`, `HttpJobs`                                                                                |
 | `src/fs.rs`                        | `FsBackend`, its types, and the result policy every backend shares                                                           |
 | `src/fs/shell.rs`                  | `ShellFs` (`Files`): file operations as commands, the one lazy environment probe, parsers, `__fuzz`                          |
+| `src/bulk.rs`                      | `upload`/`download`/`extract`: tar over exec, the three scripts, the staged upload, `Sources`, `Transfer`, `BulkError`       |
+| `src/bulk/extract.rs`              | the policy layer over the `tar` crate for untrusted archives: never writes through a link, directory modes last              |
 | `src/procgroup.rs`                 | process-group identity and kill guards for local children                                                                    |
 | `src/sandbox.rs`                   | `Jobs`, `Sandbox`, the `Command` builder                                                                                     |
 | `src/token.rs`                     | `TokenSource` and the one-renewal bearer                                                                                     |
@@ -73,6 +75,27 @@ backend shares (`clip`, `finalize`, `finalize_glob`) is in `fs.rs`, so a result'
 agent's `LocalFs` implements the same trait on the host's disk.
 
 Parsers of command output are private; `fs::shell::__fuzz` is the `#[doc(hidden)]` seam for `fuzz/`.
+
+## Bulk copy (`bulk.rs`, `bulk/`)
+
+`bulk::upload(exec, sources, remote_dir)` and `bulk::download(exec, remote_path, local_dir)` move whole trees as a tar
+stream built only on `Exec` (spec: `sdk/conformance/FILES-OVER-EXEC.md` 5.8). The archive is written and read by the `tar` crate (no system `tar` on the client machine); the sandbox needs `sh` and a GNU or busybox
+`tar`.
+
+- **Upload** is a producer on a blocking thread (a walk that appends headers and file bytes to a buffer) feeding a channel
+  of capacity one, and the async side sending what arrives: a tree that fits `BULK_CHUNK_BYTES` (16 MiB) is one command with
+  the archive on stdin; a larger one is appended to a stage file beside the destination (each append checks the stage's
+  size first, so a repeated or lost chunk fails) and extracted once. Memory is about two chunks. A failure removes the stage
+  (`rm -f`) and, for a destination this call created, the script removes the destination.
+- **Download** streams through `run_attached` (stdout frames go down a bounded channel to a blocking thread that
+  reads them with `tar::Archive` and feeds `extract::Extractor`, with stderr kept to 64 KiB). An unsafe
+  member closes the stream. The extractor lstat-walks every parent, creates files `O_EXCL`, replaces (never follows) a link
+  in the way, applies directory modes and mtimes last, and refuses names with `..`, absolute names, hard links to anything
+  the archive did not write, and unsupported member types.
+- **Errors** are `BulkError`: `InvalidRequest` (nothing sent), `Archive` (`protocol`: unsafe or malformed), `Command`
+  (a failed script, classified from its stderr like the file helpers), `Io` (transport or local).
+- **Tests**: `tests/bulk.rs` (wire shape, the staged path, the cleanup, over a transport written in the test),
+  `bulk/extract.rs` unit tests, the `extract` fuzz target (`fuzz/fuzz_targets/extract.rs`: nothing lands beside the target or through a link), and `sdk/conformance/scenarios/bulk.json` through every driver.
 
 ## Jobs (`exec_endpoint/jobs.rs`, `jobs_native.rs`)
 

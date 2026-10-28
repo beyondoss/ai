@@ -16,6 +16,7 @@ use beyond_sandbox::exec_endpoint::HttpExecRunner;
 use beyond_sandbox::exec_endpoint::jobs::{JobEvent, JobId, JobScope, JobSpec, JobStatus};
 use beyond_sandbox::fs::shell::{Capabilities, SearchEngine, ShellFs};
 use beyond_sandbox::fs::{FileKind, FsBackend, FsError, SearchQuery};
+use sandbox_conformance::trees::{Layout, Tree};
 use serde_json::{Value, json};
 
 pub const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
@@ -114,6 +115,16 @@ fn classify(msg: &str, kind: Option<std::io::ErrorKind>) -> Value {
         "io"
     };
     err(kind, msg)
+}
+
+fn bulk_err(e: &beyond_sandbox::BulkError) -> Value {
+    use beyond_sandbox::BulkError;
+    match e {
+        BulkError::InvalidRequest(m) => err("invalid_request", m.clone()),
+        BulkError::Archive(m) => err("protocol", m.clone()),
+        BulkError::Command(m) => classify(m, None),
+        BulkError::Io(e) => io_err(e),
+    }
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -297,6 +308,9 @@ impl Driver {
             "mkdir",
             "list",
             "search",
+            "upload",
+            "download",
+            "extract",
         ]);
         ops
     }
@@ -359,6 +373,9 @@ impl Driver {
             "write" => self.write(req).await,
             "write_if_unchanged" => self.write_if_unchanged(req).await,
             "mkdir" => self.mkdir(req).await,
+            "upload" => self.upload(req).await,
+            "download" => self.download(req).await,
+            "extract" => self.extract(req).await,
             "list" => self.list(req).await,
             "search" => self.search(req).await,
             _ => Err(err("unsupported", op)),
@@ -676,5 +693,51 @@ impl Driver {
             })
             .collect();
         Ok(json!({ "hits": hits, "truncated": o.truncated, "note": o.first_error }))
+    }
+}
+
+// ---- bulk copy (FILES-OVER-EXEC.md 5.8) ---------------------------------------------------------
+
+fn transfer_json(t: beyond_sandbox::Transfer) -> Value {
+    json!({"files": t.files, "dirs": t.dirs, "links": t.links, "bytes": t.bytes})
+}
+
+impl Driver {
+    async fn upload(&self, req: &Value) -> Out {
+        let dest = str_arg(req, "path")?;
+        let chunk = u64_arg(req, "chunk_bytes")?.map(|c| c as usize);
+        let tree = Tree::build(req)?;
+        let sources = match &req["sources"] {
+            Value::Null => beyond_sandbox::Sources::Dir(tree.dir()),
+            _ => beyond_sandbox::Sources::Paths(
+                strings(req, "sources")?
+                    .iter()
+                    .map(|n| tree.dir().join(n))
+                    .collect(),
+            ),
+        };
+        let t = beyond_sandbox::bulk::upload_chunked(
+            &*self.runner,
+            sources,
+            dest,
+            chunk.unwrap_or(beyond_sandbox::bulk::BULK_CHUNK_BYTES),
+        )
+        .await
+        .map_err(|e| bulk_err(&e))?;
+        Ok(transfer_json(t))
+    }
+
+    async fn download(&self, req: &Value) -> Out {
+        let remote = str_arg(req, "path")?;
+        let layout = Layout::new(&req["prefill"])?;
+        let r = beyond_sandbox::bulk::download(&*self.runner, remote, &layout.local).await;
+        layout.finish(r.map(transfer_json).map_err(|e| bulk_err(&e)))
+    }
+
+    async fn extract(&self, req: &Value) -> Out {
+        let tar = bytes_arg(req, "tar_b64")?;
+        let layout = Layout::new(&req["prefill"])?;
+        let r = beyond_sandbox::bulk::extract(&tar, &layout.local);
+        layout.finish(r.map(transfer_json).map_err(|e| bulk_err(&e)))
     }
 }

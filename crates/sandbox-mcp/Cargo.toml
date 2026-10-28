@@ -26,6 +26,7 @@ workspace = true
 [dependencies]
 base64.workspace = true
 beyond-sandbox = { path = "../sandbox" }
+hex = "0.4"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
@@ -34,6 +35,9 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
 rmcp = { version = "3.2.0", default-features = false, features = ["server", "macros", "transport-io", "transport-streamable-http-server", "client", "transport-child-process"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
+# The conformance driver builds the local trees of the bulk-copy ops in a directory of its own.
+tempfile = "3"
 tokio.workspace = true
 tokio-util.workspace = true
 
@@ -45,4 +49,3 @@ beyond-test-support = { path = "../test-support" }
 # has no default provider here, so the test installs `ring`.
 rmcp = { version = "3.2.0", default-features = false, features = ["server", "macros", "transport-io", "transport-streamable-http-server", "client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-tempfile = "3"

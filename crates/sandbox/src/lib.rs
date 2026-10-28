@@ -2,6 +2,7 @@
 // `.unwrap()` *is* the assertion in a unit test.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod bulk;
 pub mod exec;
 pub mod exec_endpoint;
 pub mod fs;
@@ -12,6 +13,7 @@ mod testing;
 mod tls;
 mod token;
 
+pub use bulk::{BulkError, Sources, Transfer};
 pub use exec::{CommandRunner as Exec, ExecOutput, ExecResult};
 pub use exec_endpoint::HttpExecRunner as HttpExec;
 pub use fs::FsBackend;

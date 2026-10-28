@@ -71,6 +71,18 @@ as text in one place (`text()` in `src/bytes.ts`).
 | `mkdir(path)`, `list(path, { includeHidden, limit })`       | `mkdir -p`; entries `{ name, kind, size }`                                                                                                                 |
 | `search({ pattern, root, literal, ignoreCase, glob, ... })` | context, limits, long-line windows; `capabilities().searchEngine` says which engine ran, and the engines differ in regex dialect and `.gitignore` handling |
 
+### Bulk copy
+
+```ts
+await sandbox.upload("./project", "/work/project"); // a directory's contents
+await sandbox.upload(["./a.txt", "./data"], "/work/in"); // each by base name
+await sandbox.download("/work/out", "./out"); // a directory, or one file
+```
+
+Trees move as a `tar` stream over raw exec: modes, mtimes and symlinks are kept, nothing is followed, and the sandbox needs only `sh` and a GNU or busybox `tar`. The archive is written and read by this package, so the local machine needs no `tar` and holds no more than about two 16 MiB chunks (`BULK_CHUNK_BYTES`) of it. An upload that fits one chunk is one command with the tar on stdin; a larger one goes to a stage file beside the destination in checked, offset-numbered appends and is extracted by a final command (a 50 MiB file takes five). A download streams the tar through the extractor and never buffers it whole.
+
+The sandbox is not trusted on download: a member with `..` or an absolute name, one below a symlink (made by the archive or already local), or a hard link to anything the archive did not write, is refused as `protocol` (`unsafe archive member ...`) and the stream is closed. A destination that is a file is `not_a_directory`; a read-only or full filesystem is `io`, and a destination the call created is removed on failure. The shared matrix runs this against GNU and busybox `tar`, a read-only mount, a locked directory and a 1 MiB disk (FILES-OVER-EXEC.md section 5.8).
+
 ### Jobs
 
 `jobs.start(scope, id, { command, args, cwd, label })`, `list`, `read(scope, id, { offset, max })`, `follow` / `attach`, `kill`,

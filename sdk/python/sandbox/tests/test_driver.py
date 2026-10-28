@@ -33,7 +33,7 @@ def test_hello_does_not_reach_the_endpoint(d: driver.Driver) -> None:
 
 
 def test_an_unknown_op_is_unsupported_never_a_silent_pass(d: driver.Driver) -> None:
-    for op in ("upload_dir", "remove", "frobnicate", ""):
+    for op in ("upload_tar", "remove", "frobnicate", ""):
         assert ask(d, id="x", op=op)["error"]["kind"] == "unsupported", op
 
 

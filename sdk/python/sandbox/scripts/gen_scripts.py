@@ -1,4 +1,4 @@
-"""Regenerate src/beyond_sandbox/_scripts.py from the Rust reference.
+"""Regenerate src/beyond_sandbox/_scripts.py from the Rust reference (and, for bulk copy, the spec).
 
 The shell scripts are constants that every client must send byte for byte, so they are
 extracted from the reference sources instead of being retyped. Run from anywhere:
@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[4]
 OUT = Path(__file__).resolve().parents[1] / "src" / "beyond_sandbox" / "_scripts.py"
 
 SHELL = ROOT / "crates/sandbox/src/fs/shell.rs"
+SPEC = ROOT / "sdk/conformance/FILES-OVER-EXEC.md"
 
 RAW = r'r#"(.*?)"#'
 
@@ -45,6 +46,16 @@ def concat_const(src: str, name: str, macros: dict[str, str]) -> str:
     return "".join(out)
 
 
+def spec_script(name: str) -> str:
+    """A script of the spec's appendix, by name (the letters may change)."""
+    spec = SPEC.read_text()
+    appendix = spec[spec.index("## 7. Appendix: the scripts") :]
+    m = re.search(rf"### [A-Z]\. {name}[^\n]*\n\n```sh\n(.*?)\n```", appendix, re.S)
+    if not m:
+        raise SystemExit(f"script {name} not found in the spec")
+    return m.group(1)
+
+
 def build() -> dict[str, str]:
     sh = SHELL.read_text()
     resolve = macro(sh, "resolve_target")
@@ -62,6 +73,10 @@ def build() -> dict[str, str]:
         "READ_WINDOW": raw_const(sh, "READ_WINDOW_SCRIPT"),
         "WRITE_STDIN": concat_const(sh, "WRITE_STDIN_SCRIPT", macros),
         "REMOVE_TEMP": concat_const(sh, "REMOVE_TEMP_SCRIPT", macros),
+        # Bulk copy (section 5.8) has no Rust-source twin to extract from: the appendix is the source.
+        "UPLOAD": spec_script("UPLOAD_SCRIPT"),
+        "DOWNLOAD": spec_script("DOWNLOAD_SCRIPT"),
+        "STAGE": spec_script("STAGE_SCRIPT"),
     }
 
 

@@ -622,14 +622,200 @@ and may report binary files differently. A client MUST report the engine in use
 (`capabilities.search_engine`); scenarios that depend on one declare
 `requires.search_engine`.
 
-### 5.8 Not specified here
+### 5.8 Bulk copy: upload and download
+
+Two helpers move whole trees between the **client's machine** (the _local_ side)
+and the sandbox as a `tar` stream over layer 1. Nothing in the sandbox is
+installed: it needs `sh` and a `tar` (GNU or busybox).
+
+```text
+upload(sources, remote_dir)        -> { files, dirs, links, bytes }
+download(remote_path, local_dir)   -> { files, dirs, links, bytes }
+```
+
+`sources` is a local directory (its contents land directly in `remote_dir`) or
+a list of local paths (each lands in `remote_dir` under its base name, a
+directory with its whole tree). `remote_dir` and `remote_path` are absolute
+(`invalid_request` otherwise; so is `/` as `remote_dir`); `local_dir` is where
+the client's own process runs, and is created (with its parents) when missing.
+The result counts what was written: members that are regular files, directories
+(not the root), symbolic or hard links, and the bytes of file content.
+
+A tree is copied as it is: regular files, directories and symbolic links, with
+the **permission bits** (`0o777` mask: set-id and sticky bits are not carried)
+and the **mtime** of files (directories too on download; on upload the
+sandbox's `tar` decides, and busybox does not restore a directory's). A symbolic link is a link, stored
+by its target text and never followed on either side. Ownership is not
+carried: files belong to whoever extracts them. A hard link is two files on
+upload and is recreated as a hard link on download. A FIFO, socket or device is
+`invalid_request` on upload (naming the path) and `io` on download
+(`unsupported member type`).
+
+#### The archive
+
+Both directions use the same subset of `tar`, written and read by the client
+itself (no `tar` on the client's machine is run):
+
+- **Written** (upload): ustar-compatible headers (POSIX `ustar\0` magic, or GNU's `ustar  \0` as the `tar` crate writes it),
+  types `0` file, `5` directory (name with a trailing `/`), `2` symlink. A name
+  or link target over 100 bytes uses a GNU `L` / `K` extension member (busybox
+  and GNU tar both read these; the ustar `prefix` field is never written). `uid`
+  and `gid` are 0, `uname` and `gname` empty, `mode` the permission bits,
+  `mtime` the local mtime in whole seconds (never negative); a `size` of 8 GiB
+  or more is base-256. Names are relative, have no `./`, no `..` and no empty
+  component, and are valid UTF-8 (a name that is not is `invalid_request`).
+  Members come in pre-order, siblings sorted by name bytewise, so a directory
+  precedes its content. There is no member for the root. The archive ends with
+  two 512-byte zero blocks and no padding to a record. A file that changes size
+  while it is read fails the upload (`io`, `PATH: changed while being
+  archived`).
+- **Read** (download): ustar, v7, GNU (`L`, `K`, base-256 numbers) and pax
+  (`x`, `g`: the `path`, `linkpath` and `size` records), whatever `tar -c` of
+  the sandbox wrote. A header whose checksum is wrong, or an archive that ends
+  without its end-of-archive block, is `protocol`.
+
+#### Extraction on the local side
+
+The sandbox is not trusted: a tar from it may hold anything. The client
+extracts under `local_dir` by these rules and refuses, with `protocol` and a
+`detail` `unsafe archive member NAME: WHY`, at the first member that breaks one,
+leaving what was already written. `WHY` is one of `it is absolute`,
+`it has a ".." component`, `it has a NUL`, `it is not valid UTF-8`,
+`a parent is not a directory (a link or a file)`,
+`its link target is unsafe:` and one of the first four,
+`a hard link must name a file this archive already wrote`,
+`its link target is not a file` (the scenarios match these words):
+
+1. A member name is split on `/`; empty and `.` components are dropped; a name
+   that is absolute, has a `..` component or a NUL, or is not valid UTF-8, is
+   refused. A name that is empty after that (`./`, the root) is skipped: it
+   sets no mode or mtime on `local_dir`.
+2. Every component above a member's last must be a real directory at that
+   moment (an `lstat`, not a `stat`); a missing one is created (mode `0o755`);
+   a **symbolic link or file there is refused**: nothing is ever written
+   through a link, whether it was in the archive or was already in `local_dir`.
+3. A file is created with `O_CREAT|O_EXCL|O_NOFOLLOW` (mode `0o600` until it is
+   complete) after an existing non-directory of that name is unlinked; an
+   existing directory of that name is an error `PATH: Is a directory (os error
+   21)`, kind `is_directory` (section 3.3). A directory member over an existing non-directory unlinks it first. A
+   directory is created `0o700`; the **mode and mtime** of every directory
+   are applied at the end, deepest first, so a `0o555` directory can still be
+   filled. A file gets its mode (set-id and sticky bits masked off) and mtime
+   when it is complete.
+4. A symlink member is created with the target text unchanged; the target is
+   never resolved. A hard link member is created only for a target that, read
+   the way rule 1 reads a name, names a regular file this archive already
+   wrote; anything else is refused.
+5. Any member type other than file (`0`, `\0`, `7`), directory, symlink,
+   hard link and the meta types is `io` (`unsupported member type`).
+
+The rules are checks of paths at the time of the call: they do not defend
+against another local process changing `local_dir` while a download runs.
+
+Upload needs no such rules for the sandbox: every member name was produced by
+the client under rule-1 shape, and the archive never has a member below a
+symlink of its own. A symbolic link that **already exists** inside `remote_dir`
+is followed by the sandbox's own `tar -x`, as it would be for anyone running
+`tar -x` there; the helper does not defend against it. The effect is contained
+in the sandbox, which is the isolation boundary: it can write where the
+sandbox user could write anyway, and nothing on the client's machine is
+reached. (Links in the _local_ source are archived as links and never
+followed.)
+
+#### Upload
+
+The archive is produced incrementally and sent in **chunks** of at most
+`BULK_CHUNK_BYTES` (16 MiB of raw tar, 21.3 MB of base64: under the 64 MiB an
+`execd` accepts and the 16 MiB a one-shot answer may carry). A client holds at
+most about two chunks.
+
+- **Fits in one chunk** (the common case): one command,
+  `sh -c UPLOAD_SCRIPT sh DEST ""` (script G) with the whole archive as stdin and
+  `timeout_ms` `BULK_TIMEOUT_MS`.
+- **Larger**: a _stage_ file beside the destination,
+  `STAGE = DEST (trailing slashes removed) + ".upload." + SUFFIX`, `SUFFIX` 16
+  lowercase hex digits chosen by the client (as in 5.3). Each chunk is one
+  command `sh -c STAGE_SCRIPT sh STAGE OFFSET LENGTH` (script I; stdin the chunk;
+  120 s) with `OFFSET` the bytes already staged: the first (`OFFSET` 0) creates
+  the file (refusing one that exists, creating missing parents), each later one
+  first checks that the stage is exactly `OFFSET` bytes, so a repeated or lost
+  chunk fails instead of corrupting the archive; each checks the size after its
+  append. Then `sh -c UPLOAD_SCRIPT sh DEST STAGE` with no stdin extracts the
+  stage and removes it. The number of commands is `ceil(size / BULK_CHUNK_BYTES) + 1`.
+  A chunk is never empty except when the archive is an exact multiple of the
+  chunk size, in which case the empty tail is not sent.
+
+The script, in this order: refuses a `DEST` that exists and is not a directory
+(`Not a directory (os error 20)`, exit 1); creates `DEST` with `mkdir -p` when it
+is missing; runs `umask 0` so that `tar` applies the archive's modes exactly
+(busybox applies the umask even to preserved modes); `cd`s into `DEST` and runs
+`tar -xf -` (or `tar -xf STAGE`). On any failure it removes the stage and,
+**when this call created `DEST`, removes `DEST`**; a `DEST` that existed keeps
+whatever `tar` had written when it failed (extraction is not atomic; the error
+is the report). Success exits 0.
+
+On a failure (a non-zero exit, or a transport error) of any command the client
+sends one best-effort `rm -f -- STAGE` (its result is ignored) when it staged,
+and reports the failure: a transport error as it is, otherwise
+`upload DEST: LINE` classified by section 3.3. A `tar` that is out of space or
+on a read-only filesystem says so on stderr and exits non-zero, which is `io`
+(`No space left on device`, `Read-only file system`), and an unwritable
+destination is `permission_denied`. If the local read fails before the archive
+is complete nothing is extracted. A call cancelled in the middle of a staged
+upload can leave its stage behind.
+
+#### Download
+
+`sh -c DOWNLOAD_SCRIPT sh PATH` (script H) writes the archive to stdout:
+`tar -cf - -C PATH .` for a directory, and for anything else a one-member
+archive of `./NAME` (so `download("/w/a.txt", d)` writes `d/a.txt`). A missing
+path is `No such file or directory (os error 2)` on stderr and exit 1.
+
+The archive's size is not known in advance, so the client **streams** it: the
+stream form of the exec call, stdout frames fed to the extractor as they arrive
+(never held whole), stderr kept up to `BULK_STDERR_BYTES`, `timeout_ms`
+`BULK_TIMEOUT_MS`.
+A client reports a failed command (a non-zero final status, a signal, a
+timeout) as `download PATH: LINE` classified by section 3.3 **before** it
+reports anything about the archive's content, but an unsafe member is reported
+the moment it is seen and the stream is closed. Whatever was extracted before
+a failure stays in `local_dir`: a partial download is an error, never a result.
+`tar` exits non-zero for a file that vanished or changed while it was read; the
+client does not interpret that.
+
+#### Limits
+
+| name                | value  | what it bounds                                                     |
+| ------------------- | ------ | ------------------------------------------------------------------ |
+| `BULK_CHUNK_BYTES`  | 16 MiB | raw tar bytes per upload request; memory held is about two chunks  |
+| `BULK_TIMEOUT_MS`   | 600000 | the extraction command and the download stream (a hung `tar` ends) |
+| `BULK_STDERR_BYTES` | 64 KiB | the stderr a download keeps for its error `detail`                 |
+
+A stage append and a cleanup use the helpers' 120 s. There is no limit on the
+size of a tree: the chunk count follows from it. A client SHOULD let a caller
+lower the chunk size (the matrix does, to walk the staged path with small
+trees), and a lower value is never an error.
+
+#### Errors
+
+| situation                                                      | kind                                                                                                                 |
+| -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `remote_dir` / `remote_path` not absolute, `/` as `remote_dir` | `invalid_request` (nothing sent)                                                                                     |
+| a local source that is a FIFO, socket or device; a bad name    | `invalid_request` (nothing sent)                                                                                     |
+| a local source or `local_dir` missing, unreadable, not a dir   | `not_found`, `permission_denied`, `not_a_directory`, ... classified from the OS error, as section 3.3 does from text |
+| `DEST` exists and is a file                                    | `not_a_directory`                                                                                                    |
+| read-only filesystem, no space, other `tar` failure            | `io` (or `permission_denied` / `not_found` from the text)                                                            |
+| an archive member that breaks the extraction rules             | `protocol`, `unsafe archive member NAME: WHY`                                                                        |
+| a malformed or truncated archive                               | `protocol`                                                                                                           |
+| an unsupported member type                                     | `io`                                                                                                                 |
+| transport failures                                             | section 3.2                                                                                                          |
+
+### 5.9 Not specified here
 
 - `glob` (find paths by pattern): the reference computes it host-side with
   `globset`; surfaces build it on `find`/`rg --files` over raw exec.
 - `remove`: no counterpart in the reference. A surface that offers it runs
   `rm -rf -- PATH`-style commands through raw exec.
-- `upload_dir` / `download_dir` (tar over exec): planned (T7); the scenarios in
-  `bulk.json` are marked planned and are skipped.
 
 ## 6. Jobs
 
@@ -810,6 +996,71 @@ grep -rnZ -e __cap_probe__ -- /dev/null >/dev/null 2>&1; [ $? -le 1 ] && echo gr
 [ "$(printf abc | dd iflag=skip_bytes,count_bytes skip=1 count=1 status=none 2>/dev/null | base64 -w0 2>/dev/null)" = Yg== ] && echo read_window
 true
 ```
+
+### G. UPLOAD_SCRIPT (`$1` destination directory, `$2` stage file or the empty string)
+
+```sh
+d="$1"
+s="$2"
+if [ -e "$d" ] && [ ! -d "$d" ]; then
+  echo "Not a directory (os error 20)" >&2
+  [ -z "$s" ] || rm -f -- "$s"
+  exit 1
+fi
+new=
+if [ ! -d "$d" ]; then
+  mkdir -p -- "$d" || { [ -z "$s" ] || rm -f -- "$s"; exit 1; }
+  new=1
+fi
+umask 0
+if cd -- "$d"; then
+  if [ -n "$s" ]; then tar -xf "$s"; else tar -xf -; fi && { [ -z "$s" ] || rm -f -- "$s"; exit 0; }
+fi
+[ -z "$s" ] || rm -f -- "$s"
+cd /
+[ -z "$new" ] || rm -rf -- "$d"
+exit 1
+```
+
+Section 5.8. With an empty `$2` the archive is on stdin.
+
+### H. DOWNLOAD_SCRIPT (`$1` path)
+
+```sh
+if [ ! -e "$1" ]; then
+  echo "No such file or directory (os error 2)" >&2
+  exit 1
+fi
+if [ -d "$1" ]; then
+  exec tar -cf - -C "$1" .
+fi
+exec tar -cf - -C "$(dirname -- "$1")" "./$(basename -- "$1")"
+```
+
+### I. STAGE_SCRIPT (`$1` stage file, `$2` bytes already staged, `$3` bytes in this chunk)
+
+```sh
+f="$1"
+if [ "$2" -eq 0 ]; then
+  mkdir -p -- "$(dirname -- "$f")" || exit 1
+  set -C
+  : > "$f" || exit 1
+  set +C
+fi
+n=$(wc -c < "$f") || exit 1
+if [ "$n" -ne "$2" ]; then
+  echo "stage is $n bytes, expected $2" >&2
+  exit 1
+fi
+cat >> "$f" || exit 1
+n=$(wc -c < "$f")
+if [ "$n" -ne $(($2 + $3)) ]; then
+  echo "short write: $n of $(($2 + $3)) bytes in the stage" >&2
+  exit 1
+fi
+```
+
+The chunk is on stdin.
 
 ## Known deviations from the reference implementation
 

@@ -13,15 +13,20 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
+import hashlib
 import inspect
 import json
 import os
+import shutil
+import stat as stat_mod
 import sys
+import tempfile
 import traceback
 from typing import Any, Callable, cast
 
-from . import AsyncSandbox, Exit, Sandbox, SandboxError, Signal, Stderr, Stdout, TimedOut
-from .errors import InvalidRequest
+from . import AsyncSandbox, Exit, Sandbox, SandboxError, Signal, Stderr, Stdout, TimedOut, _bulk
+from .errors import InvalidRequest, IoError
 from .files import CapsOverride
 from .models import Stat
 
@@ -38,6 +43,7 @@ OPS = [
     "hello", "capabilities", "exec", "exec_stream",
     "job_start", "job_list", "job_read", "job_attach", "job_kill", "job_remove", "job_wipe",
     "stat", "read", "write", "write_if_unchanged", "mkdir", "list", "search",
+    "upload", "download", "extract",
 ]  # fmt: skip
 
 
@@ -319,6 +325,241 @@ def _take(frame: Any, out: bytearray, err: bytearray, final: list[Any]) -> None:
         final.append(frame)
 
 
+# ---- bulk copy: trees (DRIVER.md, "Trees") ---------------------------------------------------------
+
+_BULK_OPS = ("upload", "download", "extract")
+
+
+def _os_error(e: OSError, path: object = "") -> SandboxError:
+    return _bulk.local_error(path, e)
+
+
+def _tree(req: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    v = req.get(key)
+    if v is None:
+        return []
+    if not isinstance(v, list) or not all(isinstance(e, dict) for e in v):
+        raise InvalidRequest(f"`{key}` must be a list of entries")
+    return v
+
+
+def _materialize(root: str, entries: list[dict[str, Any]], outside: str) -> None:
+    """Build the local tree an entry list describes. Directory modes are applied last."""
+    dirs: list[tuple[str, int]] = []
+    times: list[tuple[str, int]] = []
+    for e in entries:
+        rel = _str(e, "path")
+        path = os.path.join(root, rel)
+        # The directories this creates are 0755 whatever the umask.
+        missing: list[str] = []
+        p = os.path.dirname(path)
+        while p != root and not os.path.exists(p):
+            missing.append(p)
+            p = os.path.dirname(p)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        dirs.extend((m, 0o755) for m in missing)
+        raw_mode = e.get("mode")
+        try:
+            mode = int(raw_mode, 8) if isinstance(raw_mode, str) else 0o644
+        except ValueError:
+            raise InvalidRequest(f"bad mode {raw_mode!r}") from None
+        kind = e.get("type", "file")
+        if kind == "dir":
+            os.makedirs(path, exist_ok=True)
+            dirs = [d for d in dirs if d[0] != path]
+            dirs.append((path, mode if isinstance(raw_mode, str) else 0o755))
+        elif kind == "symlink":
+            os.symlink(_str(e, "target").replace("${OUTSIDE}", outside), path)
+        elif kind == "fifo":
+            os.mkfifo(path)
+        else:
+            with open(path, "wb") as f:
+                if isinstance(e.get("pattern_b64"), str):
+                    pat = _bytes(e, "pattern_b64")
+                    left = _count(e, "size") or 0
+                    if not pat:
+                        raise InvalidRequest("`pattern_b64` is empty")
+                    step = (1 << 20) - (1 << 20) % len(pat) if len(pat) <= 1 << 20 else len(pat)
+                    block = pat * (step // len(pat))
+                    while left > 0:
+                        n = min(left, len(block))
+                        f.write(block[:n])
+                        left -= n
+                elif isinstance(e.get("data_b64"), str):
+                    f.write(_bytes(e, "data_b64"))
+            os.chmod(path, mode)
+            if (t := _count(e, "mtime")) is not None:
+                times.append((path, t))
+    for path, t in times:
+        os.utime(path, (t, t))
+    for path, mode in sorted(dirs, key=lambda d: -d[0].count("/")):
+        os.chmod(path, mode)
+
+
+def _describe(root: str) -> list[dict[str, Any]]:
+    """What is under ``root``, sorted by path."""
+    out: list[dict[str, Any]] = []
+
+    def walk(d: str) -> None:
+        for name in sorted(os.listdir(d)):
+            p = os.path.join(d, name)
+            rel = os.path.relpath(p, root)
+            st = os.lstat(p)
+            m = st.st_mode
+            if stat_mod.S_ISLNK(m):
+                out.append({"path": rel, "type": "symlink", "target": os.readlink(p)})
+            elif stat_mod.S_ISDIR(m):
+                out.append(
+                    {
+                        "path": rel,
+                        "type": "dir",
+                        "mode": f"{m & 0o7777:04o}",
+                        "mtime": int(st.st_mtime),
+                    }
+                )
+                # A mode-000 directory is listed, not entered.
+                if m & 0o500 == 0o500:
+                    walk(p)
+            else:
+                h = hashlib.sha256()
+                with open(p, "rb") as f:
+                    while block := f.read(1 << 20):
+                        h.update(block)
+                out.append(
+                    {
+                        "path": rel, "type": "file", "mode": f"{m & 0o7777:04o}",
+                        "size": st.st_size, "sha256": h.hexdigest(), "mtime": int(st.st_mtime),
+                    }
+                )  # fmt: skip
+
+    walk(root)
+    return out
+
+
+def _transfer(t: Any, entries: list[dict[str, Any]] | None) -> Result:
+    out: Result = {"files": t.files, "dirs": t.dirs, "links": t.links, "bytes": t.bytes}
+    if entries is not None:
+        out["entries"] = entries
+    return out
+
+
+class _Scratch:
+    """The sentinel layout of a download-side op: the target is ``<tmp>/local``; ``<tmp>/outside``
+    is where a ``${OUTSIDE}`` link points. Anything else that appears, or anything in
+    ``outside``, is a write that escaped its target, and fails the op."""
+
+    def __init__(self, req: dict[str, Any]) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="bulk-")
+        self.local = os.path.join(self.tmp, "local")
+        self.outside = os.path.join(self.tmp, "outside")
+        os.mkdir(self.local)
+        os.mkdir(self.outside)
+        try:
+            _materialize(self.local, _tree(req, "prefill"), self.outside)
+        except OSError as e:
+            self.close()
+            raise _os_error(e) from None
+
+    def check(self) -> None:
+        extra = [n for n in os.listdir(self.tmp) if n not in ("local", "outside")]
+        if extra:
+            raise IoError(f"the extraction wrote outside its directory: {extra[0]}")
+        if os.listdir(self.outside):
+            raise IoError("the extraction wrote through a link into `outside`")
+
+    def describe(self) -> list[dict[str, Any]]:
+        try:
+            return _describe(self.local)
+        except OSError as e:
+            raise _os_error(e) from None
+
+    def close(self) -> None:
+        # Modes may have made directories unreadable; the scratch is ours to open up.
+        for dirpath, dirnames, _ in os.walk(self.tmp):
+            for d in dirnames:
+                with contextlib.suppress(OSError):
+                    os.chmod(os.path.join(dirpath, d), 0o700)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+def _upload_args(
+    req: dict[str, Any],
+) -> tuple[str, list[dict[str, Any]], list[str] | None, int | None]:
+    dest = _str(req, "path")
+    if not isinstance(req.get("entries"), list):
+        raise InvalidRequest("`entries` must be a list")
+    sources = _strings(req, "sources") if req.get("sources") is not None else None
+    return dest, _tree(req, "entries"), sources, _count(req, "chunk_bytes")
+
+
+def _bulk_sync(op: str, req: dict[str, Any], sb: Any) -> Result:
+    if op == "upload":
+        dest, entries, names, chunk = _upload_args(req)
+        tmp = tempfile.mkdtemp(prefix="bulk-up-")
+        try:
+            src = os.path.join(tmp, "src")
+            os.mkdir(src)
+            try:
+                _materialize(src, entries, tmp)
+            except OSError as e:
+                raise _os_error(e) from None
+            sources: Any = [os.path.join(src, n) for n in names] if names is not None else src
+            return _transfer(sb.upload(sources, dest, chunk_bytes=chunk), None)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    scratch = _Scratch(req)
+    try:
+        err: BaseException | None = None
+        result = None
+        try:
+            if op == "download":
+                result = sb.download(_str(req, "path"), scratch.local)
+            else:
+                result = _bulk.extract(_bytes(req, "tar_b64"), scratch.local)
+        except SandboxError as e:
+            err = e
+        scratch.check()
+        if err is not None:
+            raise err
+        return _transfer(result, scratch.describe())
+    finally:
+        scratch.close()
+
+
+async def _bulk_async(op: str, req: dict[str, Any], sb: Any) -> Result:
+    if op == "upload":
+        dest, entries, names, chunk = _upload_args(req)
+        tmp = tempfile.mkdtemp(prefix="bulk-up-")
+        try:
+            src = os.path.join(tmp, "src")
+            os.mkdir(src)
+            try:
+                _materialize(src, entries, tmp)
+            except OSError as e:
+                raise _os_error(e) from None
+            sources: Any = [os.path.join(src, n) for n in names] if names is not None else src
+            return _transfer(await sb.upload(sources, dest, chunk_bytes=chunk), None)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    scratch = _Scratch(req)
+    try:
+        err: BaseException | None = None
+        result = None
+        try:
+            if op == "download":
+                result = await sb.download(_str(req, "path"), scratch.local)
+            else:
+                result = _bulk.extract(_bytes(req, "tar_b64"), scratch.local)
+        except SandboxError as e:
+            err = e
+        scratch.check()
+        if err is not None:
+            raise err
+        return _transfer(result, scratch.describe())
+    finally:
+        scratch.close()
+
+
 # ---- the loop --------------------------------------------------------------------------------------
 
 
@@ -386,6 +627,8 @@ class Driver:
                 return {"id": id_, "ok": self.meta(op)}
             if op == "capabilities":
                 return {"id": id_, "ok": self.caps_result(self.meta(op))}
+            if op in _BULK_OPS:
+                return {"id": id_, "ok": _bulk_sync(op, req, self.sb)}
             call, shape = plan(op, req)
             return {"id": id_, "ok": shape(call(self.sb))}
         except Exception as e:
@@ -401,6 +644,8 @@ class Driver:
                 return {"id": id_, "ok": self.meta(op)}
             if op == "capabilities":
                 return {"id": id_, "ok": self.caps_result(await self.meta(op))}
+            if op in _BULK_OPS:
+                return {"id": id_, "ok": await _bulk_async(op, req, self.sb)}
             call, shape = plan(op, req)
             result = call(self.sb)
             if inspect.isawaitable(result):

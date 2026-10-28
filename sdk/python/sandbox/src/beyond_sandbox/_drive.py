@@ -28,7 +28,7 @@ from typing import (
 )
 
 from .errors import SandboxError
-from .models import ExecResult, JobEnd
+from .models import ExecResult, Exit, JobEnd, Signal, Stderr, Stdout, TimedOut
 
 T = TypeVar("T")
 
@@ -65,7 +65,50 @@ class Follow:
     job: dict[str, Any]
 
 
-Effect = Union[Run, Emit, Call, Follow]
+@dataclass(slots=True)
+class Pipe:
+    """A streamed command whose stdout goes to ``on_stdout`` as it arrives (never held whole).
+
+    Answered with an :class:`~beyond_sandbox.ExecResult` whose ``stdout`` is empty and whose
+    ``stderr`` is the first ``stderr_limit`` bytes of what the command wrote there. An exception
+    from ``on_stdout`` closes the stream (which kills the command) and propagates.
+    """
+
+    command: str
+    args: Sequence[str]
+    on_stdout: Callable[[bytes], None]
+    timeout_ms: int
+    stderr_limit: int
+
+
+class _PipeAcc:
+    """The frames of one :class:`Pipe`, folded: stdout out, stderr kept, the final status."""
+
+    def __init__(self, effect: Pipe) -> None:
+        self.effect = effect
+        self.stderr = bytearray()
+        self.code: int | None = None
+
+    def take(self, frame: Any) -> None:
+        if isinstance(frame, Stdout):
+            self.effect.on_stdout(frame.data)
+        elif isinstance(frame, Stderr):
+            room = self.effect.stderr_limit - len(self.stderr)
+            if room > 0:
+                self.stderr += frame.data[:room]
+        elif isinstance(frame, Exit):
+            self.code = frame.code
+        elif isinstance(frame, Signal):
+            self.code = 128 + frame.signal
+        elif isinstance(frame, TimedOut):
+            self.code = 124
+            self.stderr += b"\ncommand exceeded its timeout"
+
+    def result(self) -> ExecResult:
+        return ExecResult(self.code if self.code is not None else -1, b"", bytes(self.stderr))
+
+
+Effect = Union[Run, Emit, Call, Follow, Pipe]
 Op = Generator[Effect, Any, T]
 
 #: Marks the end of a driven op's items; carries its result.
@@ -92,6 +135,17 @@ def drive_iter(op: Op[T], transport: Any) -> Iterator[Any]:
                     answer = _NOTHING
                 elif isinstance(effect, Call):
                     answer = transport.job_call(effect.job, effect.command, effect.args, effect.cwd)
+                elif isinstance(effect, Pipe):
+                    frames = transport.stream(
+                        effect.command, effect.args, timeout_ms=effect.timeout_ms
+                    )
+                    acc = _PipeAcc(effect)
+                    try:
+                        for frame in frames:
+                            acc.take(frame)
+                    finally:
+                        frames.close()
+                    answer = acc.result()
                 elif isinstance(effect, Follow):
                     stream = transport.job_stream(effect.job)
                     try:
@@ -145,6 +199,17 @@ async def adrive_emit(
                     answer = await transport.job_call(
                         effect.job, effect.command, effect.args, effect.cwd
                     )
+                elif isinstance(effect, Pipe):
+                    aframes = await transport.stream(
+                        effect.command, effect.args, timeout_ms=effect.timeout_ms
+                    )
+                    acc = _PipeAcc(effect)
+                    try:
+                        async for frame in aframes:
+                            acc.take(frame)
+                    finally:
+                        await aframes.aclose()
+                    answer = acc.result()
                 elif isinstance(effect, Follow):
                     stream = await transport.job_stream(effect.job)
                     try:
