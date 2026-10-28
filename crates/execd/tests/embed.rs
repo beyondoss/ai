@@ -528,3 +528,58 @@ async fn activity_changed_fires_for_each_transition() {
     assert!(bumped(&mut rx).await, "job removed");
     server.shutdown().await;
 }
+
+/// Output is not a transition. A host blocked on the activity view must not wake because a job
+/// wrote: each wake calls `activity()`, which walks the table. The bytes still reach a reader.
+#[tokio::test]
+async fn job_output_does_not_bump_activity() {
+    let (server, _dir) = start(|_| {}).await;
+    let addr = server.local_addr();
+    let rx = server.activity_changed();
+    let start = job_req(
+        json!({ "op": "start", "scope": "s", "id": "loud", "hold": false, "label": "" }),
+        Some(("sh", &["-c", "while true; do echo xxxxxxxxxx; done"])),
+    );
+    let started = post(addr, &[], &start).await;
+    assert_eq!(
+        started.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&started.body)
+    );
+    // The start request's own bumps have landed once its answer has been read.
+    tokio::task::yield_now().await;
+    let before = *rx.borrow();
+    let read = job_req(
+        json!({ "op": "read", "scope": "s", "id": "loud", "offset": 0, "max": 1 }),
+        None,
+    );
+    let mut reads = 0u64;
+    let mut end = 0u64;
+    let mut saw = 0u64;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while end.saturating_sub(saw) < 16 * 1024 {
+        assert!(
+            Instant::now() < deadline,
+            "the job wrote only {end} bytes; pumps never advanced past {saw}"
+        );
+        let body = post(addr, &[], &read).await;
+        assert_eq!(body.status, 200, "{}", String::from_utf8_lossy(&body.body));
+        let n = body.json()["end"].as_u64().expect("end");
+        if reads == 0 {
+            saw = n;
+        }
+        end = n;
+        reads += 1;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // One request moves the counter twice: it starts, then its body is dropped. Nothing else
+    // about this job changed (it is still running).
+    let after = *rx.borrow();
+    assert_eq!(
+        after.wrapping_sub(before),
+        reads * 2,
+        "output bumped activity ({before} -> {after} over {reads} reads, end {saw} -> {end})"
+    );
+    server.shutdown().await;
+}

@@ -724,6 +724,10 @@ that moves whenever that may have changed (a request starts or ends, a job start
   until it is settled, abandoned at the attempt limit, or the job is removed. A host that pauses idle machines must stay awake
   while it is not zero, or a paused machine never sends the callback. Every kernel step bumps `activity_changed`.
 
+A job writing output leaves the counter where it is. Its pumps wake only the streams attached to that job
+(`attach`, a held `start`), through a separate watch. A host blocked in the loop below stays blocked for as long as a kept
+job only writes, and `activity()` (a walk of every job in the table) runs only when one of the counts above can have changed.
+
 A host that pauses an idle machine subscribes and re-reads:
 
 ```rust

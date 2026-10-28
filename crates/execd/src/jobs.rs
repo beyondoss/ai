@@ -201,8 +201,14 @@ impl Jobs {
         }
     }
 
-    fn bump(&self) {
+    /// Wake streams attached to a job (`attach`, a held `start`). Output does not change
+    /// [`crate::Handle::activity`]: a host blocked on that view stays blocked while a job only writes.
+    fn note_output(&self) {
         self.changed.send_modify(|v| *v = v.wrapping_add(1));
+    }
+
+    fn bump(&self) {
+        self.note_output();
         self.bump_activity();
     }
 
@@ -725,7 +731,9 @@ fn pump<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
                 j.out.push(&buf[..n]);
             }
             progress.fetch_add(n, Ordering::Relaxed);
-            ctx.jobs.bump();
+            // Streams follow the ring. The activity view is lifecycle only: a chunk does not
+            // change a count, and waking it here would walk the table on every read.
+            ctx.jobs.note_output();
         }
     })
 }

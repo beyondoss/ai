@@ -302,8 +302,9 @@ impl Handle {
         }
     }
 
-    /// Bumps whenever [`Self::activity`] may have changed: a request starts or ends, a job is kept,
-    /// a kept job ends, a job is removed. A bump with no subscriber costs a store.
+    /// Bumps whenever [`Self::activity`] may have changed: a request starts or ends, a job starts,
+    /// is kept, ends or is removed, and whenever a notify callback is owed or settled. Job output
+    /// does not bump it. A bump with no subscriber costs a store.
     pub fn activity_changed(&self) -> tokio::sync::watch::Receiver<u64> {
         self.ctx.activity.subscribe()
     }
