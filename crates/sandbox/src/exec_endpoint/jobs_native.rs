@@ -276,13 +276,13 @@ impl SandboxJobs for NativeJobs<'_> {
             .and_then(|v| v.get("started")?.as_u64())
             .ok_or_else(|| {
                 std::io::Error::other(format!(
-                    "the endpoint did not report the job's start: {}",
+                    "unreadable job answer: the endpoint did not report the job's start: {}",
                     String::from_utf8_lossy(&body[..body.len().min(200)])
                 ))
             })?;
         u32::try_from(started).map_err(|_| {
             std::io::Error::other(format!(
-                "the endpoint reported an out-of-range job start: {started}"
+                "unreadable job answer: the endpoint reported an out-of-range job start: {started}"
             ))
         })
     }
