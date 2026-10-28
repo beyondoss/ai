@@ -22,8 +22,8 @@ name = "python-async"
 run = "env PYTHONPATH=sdk/python/sandbox/src python3 -m beyond_sandbox.driver --async"
 
 # The MCP server, through a real MCP session: the driver spawns `sandbox-mcp` (built beside it) and
-# implements each op by calling its tools. `exec_stream` and `write_if_unchanged` have no tool and
-# are reported unsupported (see crates/sandbox-mcp/src/bin/sandbox-driver-mcp.rs).
+# implements each op by calling its tools. `exec_stream` has no tool and is
+# reported unsupported (see crates/sandbox-mcp/src/bin/sandbox-driver-mcp.rs).
 [[driver]]
 name = "mcp"
 build = "cargo build -q -p beyond-sandbox-mcp"

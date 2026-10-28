@@ -43,6 +43,11 @@ MCP sessions; there is no per-session state, because the sandbox holds the state
   character. `exec` output is text: the client library already decodes it.
 - **`edit_file`** stats the file, reads it whole, requires exactly one match (or `replace_all`), and writes with
   `write_if_unchanged` on the mtime it stat'ed. A false return is `conflict`; nothing is written.
+- **`write_file`** is unconditional unless a guard is given. `if_unchanged_since` (an `f64` of epoch seconds, the `stat`
+  tool's `mtime`) and `create_only` (the file must not exist) both go to `write_if_unchanged`, which compares mtimes as
+  the doubles `stat` reports, so a same-second change is still a change. A false return is `conflict`; the two guards
+  together, or a negative or non-finite mtime, are `invalid_request`. Every mtime the server returns comes from `stat`
+  (`epoch_f64`, nanosecond fraction kept); `read_file` returns none.
 - **Jobs** are kept jobs (`start_kept`): the sandbox owns them, so they outlive the MCP server and are found again by the
   next one with the same `SANDBOX_JOBS_SCOPE`. `scope` and `id` are optional arguments only so a harness can pick them.
 
@@ -82,7 +87,7 @@ built beside it, and the harness crate should not depend on the thing it judges.
 | `job_remove`, `job_wipe`                                                                | `job_list`, then `job_kill` with `remove` on the ended jobs / on every job          |
 | `capabilities`                                                                          | the `sandbox://capabilities` resource                                               |
 | `exec_stream`                                                                           | `unsupported`: a tool result is not streamed                                        |
-| `write_if_unchanged`                                                                    | `unsupported`: no tool takes a caller-supplied mtime                                |
+| `write_if_unchanged`                                                                    | `write_file` with `if_unchanged_since` (a number) or `create_only` (null)           |
 
 An unsupported op is left out of `hello`'s list, so the harness counts the scenarios that need it as `unsupported`, never
 as passes.
