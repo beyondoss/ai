@@ -52,14 +52,6 @@ macro_rules! dispatch {
 
 #[async_trait]
 impl SandboxJobs for HttpJobs {
-    async fn available(&self) -> bool {
-        true
-    }
-
-    async fn holds(&self) -> bool {
-        true
-    }
-
     async fn run_held(
         &self,
         scope: &JobScope,
@@ -108,10 +100,6 @@ impl SandboxJobs for HttpJobs {
         seen: u64,
     ) -> std::io::Result<()> {
         dispatch!(self, keep(scope, id, num, kind, seen))
-    }
-
-    async fn offers_notify(&self) -> bool {
-        true
     }
 
     async fn keep_notify(
@@ -243,14 +231,6 @@ impl<'a> NativeJobs<'a> {
 
 #[async_trait]
 impl SandboxJobs for NativeJobs<'_> {
-    async fn available(&self) -> bool {
-        true
-    }
-
-    async fn holds(&self) -> bool {
-        true
-    }
-
     async fn run_held(
         &self,
         scope: &JobScope,
@@ -354,10 +334,6 @@ impl SandboxJobs for NativeJobs<'_> {
         ))
         .await
         .map(drop)
-    }
-
-    async fn offers_notify(&self) -> bool {
-        true
     }
 
     async fn keep_notify(
@@ -641,12 +617,20 @@ pub fn parse_survivors(v: &Value) -> Vec<(Option<String>, String)> {
                         .unwrap_or_default();
                     (
                         s.get("id").and_then(Value::as_str).map(str::to_string),
-                        super::jobs::describe_survivors(&pids.join(",")),
+                        describe_survivors(&pids),
                     )
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn describe_survivors(pids: &[String]) -> String {
+    match pids {
+        [] => "a process in the sandbox".to_string(),
+        [one] => format!("process {one} in the sandbox"),
+        many => format!("processes {} in the sandbox", many.join(", ")),
+    }
 }
 
 #[cfg(test)]

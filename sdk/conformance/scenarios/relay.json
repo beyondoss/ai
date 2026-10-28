@@ -843,7 +843,7 @@
     },
     {
       "id": "relay.jobs.live-job-from-the-other-client",
-      "description": "A starts a long job; B lists it (with A's label), reads its output from offset 0 and from an offset, and kills it with no survivors; A sees the job ended. Native and baseline jobs alike.",
+      "description": "A starts a long job; B lists it (with A's label), reads its output from offset 0 and from an offset, and kills it with no survivors; A sees the job ended.",
       "steps": [
         {
           "id": "start",

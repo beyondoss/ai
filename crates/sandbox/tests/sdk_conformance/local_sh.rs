@@ -116,6 +116,43 @@ impl Exec for LocalSh {
         spawn(program, args, cwd, Some(stdin), timeout).await
     }
 
+    /// Both streams to one sink, as they are produced.
+    async fn run_streaming(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        on_chunk: beyond_sandbox::exec::ChunkSink<'_>,
+    ) -> std::io::Result<ExecResult> {
+        match tokio::time::timeout(
+            timeout,
+            self.run_attached(program, args, cwd, on_chunk, on_chunk),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Ok(ExecResult {
+                timed_out: true,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Not offered: nothing here keeps a command running past its call.
+    async fn run_streaming_tracked(
+        &self,
+        _: &str,
+        _: &[String],
+        _: Option<&str>,
+        _: &beyond_sandbox::exec::JobHooks<'_>,
+    ) -> std::io::Result<ExecResult> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this transport does not track jobs",
+        ))
+    }
+
     /// Output as it is produced; dropping the call kills the command (`kill_on_drop`).
     async fn run_attached(
         &self,
@@ -150,9 +187,5 @@ impl Exec for LocalSh {
             code: status?.code(),
             ..Default::default()
         })
-    }
-
-    async fn attaches(&self) -> bool {
-        true
     }
 }

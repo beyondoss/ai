@@ -2259,8 +2259,7 @@ fn replica_at(fleet: &Fleet, addr: &Addr) -> Option<usize> {
 /// session's sandbox; the owning replica is killed outright; the session reopens on the other
 /// replica, which lists the job under its number as **not yet checked** (it has not woken the
 /// sandbox to look), and, at the model's first look, finds it still running, shows its output from
-/// where the model left off, and kills it. On both kinds of sandbox: one that runs jobs itself (jobs) and
-/// one that only runs commands (the baseline). Before, the job lived in the dead replica's exec
+/// where the model left off, and kills it. Before, the job lived in the dead replica's exec
 /// stream, and the endpoint killed it with the connection.
 pub async fn sandbox_job_survives_its_replica(
     kind: Kind,

@@ -129,7 +129,6 @@ fn validate(cmd: Command) -> Result<(ServeTrust, ServeTransport), Box<dyn std::e
         web_allow_host,
         exec_url,
         exec_header,
-        exec_cmd,
         tools,
         exclude_tools,
         no_tools,
@@ -317,7 +316,7 @@ fn validate(cmd: Command) -> Result<(ServeTrust, ServeTransport), Box<dyn std::e
         // for it in its own `.claude/agents/*.md` (`isolation: worktree`). Service mode
         // discovers those definitions in the sandbox and runs the worktree's `git` there
         // (`worktree::Git::Remote`), so there is nothing to refuse.
-        let refused: [(&str, bool); 19] = [
+        let refused: [(&str, bool); 18] = [
             ("--key", key.is_some()),
             ("--session-file", session_file.is_some()),
             ("--session-dir", session_dir.is_some()),
@@ -329,7 +328,6 @@ fn validate(cmd: Command) -> Result<(ServeTrust, ServeTransport), Box<dyn std::e
             ("--trust-project", trust_project),
             ("--force-untrusted", force_untrusted),
             ("--exec-url", exec_url.is_some()),
-            ("--exec-cmd", exec_cmd.is_some()),
             ("--exec-header", !exec_header.is_empty()),
             ("--web-allow-private", web_allow_private),
             ("--web-allow-host", !web_allow_host.is_empty()),
@@ -757,7 +755,6 @@ fn build_config(
         exec_url,
         exec_header,
         exec_max_response_bytes,
-        exec_cmd,
         lifecycle_url,
         lifecycle_header,
         lifecycle_heartbeat_secs,
@@ -915,7 +912,6 @@ fn build_config(
             beyond_agent::exec_endpoint::DEFAULT_MAX_RESPONSE_BYTES,
             |n| usize::try_from(n).unwrap_or(usize::MAX),
         ),
-        exec_cmd,
         lifecycle: beyond_agent::lifecycle::open(lifecycle_url.as_deref(), &lifecycle_header)
             .unwrap_or_else(|e| {
                 eprintln!("{e}");

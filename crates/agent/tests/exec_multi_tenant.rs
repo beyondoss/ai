@@ -17,20 +17,19 @@
 //! with a registry that is built **exactly once** and never rebuilt — the pessimal case.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::sync::Arc;
-
-use beyond_agent::exec_endpoint::{ExecCell, ExecTarget, TemplateRunner};
+use crate::common::exec_mock::ExecMock;
+use beyond_agent::exec_endpoint::{DEFAULT_MAX_RESPONSE_BYTES, ExecCell, ExecTarget};
 use beyond_agent::tools::{ToolConfig, default_registry_with_config};
 use serde_json::{Value, json};
 
 /// A stand-in for one tenant's sandbox: a directory only that tenant's target can reach.
 ///
-/// `env {}` is the transport — it runs whatever follows, exactly as `docker exec ctr` or `ssh host --`
-/// do — and the *cwd* is what makes each target distinct, so a call landing on the wrong target reads
-/// the wrong tenant's files. That is the failure this file is looking for.
+/// An endpoint rooted at `dir` is the transport, and the *root* is what makes each target distinct,
+/// so a call landing on the wrong target reads the wrong tenant's files. That is the failure this
+/// file is looking for. The endpoint serves for the rest of the test.
 async fn tenant_target(dir: &std::path::Path) -> ExecTarget {
-    let template = format!("env -C {} {{}}", dir.display());
-    ExecTarget::over(Arc::new(TemplateRunner::parse(&template).unwrap()))
+    let mock = Box::leak(Box::new(ExecMock::start(dir).await));
+    ExecTarget::http(&mock.url, &[], DEFAULT_MAX_RESPONSE_BYTES)
         .await
         .unwrap()
 }

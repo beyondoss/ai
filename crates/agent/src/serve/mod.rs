@@ -683,7 +683,6 @@ async fn restore_persisted_exec_endpoint(
     max_response_bytes: usize,
 ) -> Option<crate::exec_endpoint::ExecTarget> {
     let url = spec.get("url").and_then(Value::as_str);
-    let cmd = spec.get("command").and_then(Value::as_str);
     let headers: Vec<String> = spec
         .get("headers")
         .and_then(Value::as_array)
@@ -693,13 +692,9 @@ async fn restore_persisted_exec_endpoint(
                 .collect()
         })
         .unwrap_or_default();
-    match (url, cmd) {
-        (Some(u), _) => crate::exec_endpoint::ExecTarget::http(u, &headers, max_response_bytes)
-            .await
-            .ok(),
-        (None, Some(c)) => crate::exec_endpoint::ExecTarget::template(c).await.ok(),
-        (None, None) => None,
-    }
+    crate::exec_endpoint::ExecTarget::http(url?, &headers, max_response_bytes)
+        .await
+        .ok()
 }
 
 /// Resolve the model/thinking-level `serve` actually starts with (Task #5, pi-parity fix). An explicit

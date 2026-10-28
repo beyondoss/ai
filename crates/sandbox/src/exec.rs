@@ -1,8 +1,8 @@
 //! A command-execution seam.
 //!
 //! Layer 1: a command-execution seam. [`CommandRunner`] (re-exported as `Exec`) is everything the
-//! helpers above it need; an exec endpoint ([`crate::HttpExec`]), a `docker exec`/`ssh` template
-//! ([`crate::TemplateRunner`]), the host's own processes or a test double are just implementations.
+//! helpers above it need; an exec endpoint ([`crate::HttpExec`]), the host's own processes or a test
+//! double are just implementations. Every implementation streams and tracks what it runs.
 
 use std::time::Duration;
 
@@ -26,14 +26,6 @@ pub const STREAM_TAIL: usize = 128 * 1024;
 /// — only a genuinely quiet held-open handle releases us. Matches pi's `waitForChildProcess` fix for
 /// earendil-works/pi#5303 (`EXIT_STDIO_GRACE_MS = 100`).
 const POST_EXIT_IDLE_GRACE: Duration = Duration::from_millis(100);
-
-/// The hard deadline for a command run through [`CommandRunner::run_streaming_tracked`] by a runner
-/// that cannot track it (the default implementation; an exec endpoint on protocol one-shot). Such a runner
-/// streams nothing and reports no [`Kill`], so nothing else could ever stop a command that hangs, and
-/// the call waiting on it would wait forever. Not model-facing: `bash`'s `timeout_ms` only decides
-/// when a call returns. 30 minutes is well above the 3 min 44 s a clean release build of this repo
-/// takes. See "`bash` timeouts" in `ARCHITECTURE.md`.
-pub const UNTRACKED_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 /// The result of running a command.
 #[derive(Debug, Clone, Default)]
@@ -151,8 +143,7 @@ pub trait LocalKill: Send + Sync + 'static {
 pub enum Kill {
     /// A job's processes on this host, stopped by the embedding program's [`LocalKill`].
     Local(std::sync::Arc<dyn LocalKill>),
-    /// The runner's own way to stop the command: close the exec stream (protocol streaming), run a kill
-    /// inside the container a template transport reaches, or kill a sandbox-owned job
+    /// The runner's own way to stop the command: close the exec stream, or kill a sandbox-owned job
     /// ([`crate::exec_endpoint::jobs`]). Blocking, and returns once the runner has done everything
     /// it can — see [`Kill::kill`] — with a description of what survived, when it can tell.
     Hook(std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>),
@@ -242,8 +233,7 @@ pub struct JobHooks<'a> {
     /// The shell exited, but processes it started are still running (`cmd &`, a daemon): the
     /// shell's own result, and a short description of what is left. The call goes on — streaming
     /// their output — until they have all exited or been killed. This host's runner scans for them;
-    /// a streaming endpoint says so with a `shell_exit` frame, and a template transport's wrapper with a
-    /// marker (both for the command's process group). A one-shot endpoint cannot, and never calls it.
+    /// an endpoint says so with a `shell_exit` frame (for the command's process group).
     pub on_orphans: &'a (dyn Fn(&ExecResult, String) + Send + Sync),
 }
 
@@ -260,13 +250,10 @@ pub trait CommandRunner: Send + Sync {
     ) -> std::io::Result<ExecResult>;
 
     /// Like [`run`](CommandRunner::run), but invokes `on_chunk` with each chunk of stdout/stderr as it
-    /// arrives, for live progress. Defaults to the non-streaming `run`, which never calls the sink.
+    /// arrives, for live progress.
     ///
-    /// Calling the sink at all is a promise that *every* byte of *both* streams went through it: the
-    /// caller (`bash`) takes any chunk as proof the output streamed and never reads
-    /// [`ExecResult::stdout`]/[`ExecResult::stderr`]. A runner with nothing to stream incrementally
-    /// (a test double, a request/response endpoint) inherits this default rather than replaying part
-    /// of its result into the sink.
+    /// Calling the sink is a promise that *every* byte of *both* streams went through it: the caller
+    /// (`bash`) never reads [`ExecResult::stdout`]/[`ExecResult::stderr`] of a streamed run.
     async fn run_streaming(
         &self,
         program: &str,
@@ -274,18 +261,14 @@ pub trait CommandRunner: Send + Sync {
         cwd: Option<&str>,
         timeout: Duration,
         on_chunk: ChunkSink<'_>,
-    ) -> std::io::Result<ExecResult> {
-        let _ = on_chunk;
-        self.run(program, args, cwd, timeout).await
-    }
+    ) -> std::io::Result<ExecResult>;
 
     /// Like [`run_streaming`](CommandRunner::run_streaming), for a caller that keeps the command
     /// running past its own return (`bash`'s jobs): reports to [`JobHooks::on_spawn`], the moment
     /// the command starts, how to stop it ([`Kill`]) — so it can be killed from a `bash_job` kill, a
-    /// dropped job, or the exit path where no future is left to drop. A runner that can tell when
-    /// the shell exits leaving processes running (this host's, a stream, a template transport)
-    /// also tells [`JobHooks::on_orphans`], and keeps going until those exit too, so nothing the
-    /// command started is left untracked.
+    /// dropped job, or the exit path where no future is left to drop. When the shell exits leaving
+    /// processes running, it tells [`JobHooks::on_orphans`] and keeps going until those exit too, so
+    /// nothing the command started is left untracked.
     ///
     /// **No deadline.** The command runs until it exits or its [`Kill`] stops it: the caller owns its
     /// lifetime (`bash`'s jobs end with the turn, the run or the session). A remote runner still has
@@ -293,36 +276,18 @@ pub trait CommandRunner: Send + Sync {
     ///
     /// **Calling `on_spawn` is a promise that the output is live**: every byte reaches `on_chunk` as
     /// the command produces it, so silence on the sink means the command is silent. `bash` measures
-    /// its idle yield on that promise. Defaults to plain `run_streaming` under
-    /// [`UNTRACKED_DEADLINE`], calling neither hook: a runner that cannot see output as it happens (a
-    /// one-shot request/response endpoint) has nothing to measure silence with and nothing to kill, so a
-    /// deadline is the only thing that ends a command that hangs.
+    /// its idle yield on that promise.
     async fn run_streaming_tracked(
         &self,
         program: &str,
         args: &[String],
         cwd: Option<&str>,
         hooks: &JobHooks<'_>,
-    ) -> std::io::Result<ExecResult> {
-        self.run_streaming(program, args, cwd, UNTRACKED_DEADLINE, hooks.on_chunk)
-            .await
-    }
-
-    /// Whether [`run_streaming_tracked`](CommandRunner::run_streaming_tracked) reports a [`Kill`]
-    /// (live output, and a way to stop the command) — what `bash` needs to run a command in the
-    /// background. Asked before the command starts, so a runner that cannot is refused without
-    /// running anything. Defaults to `false`, matching the default `run_streaming_tracked`.
-    async fn tracks_jobs(&self) -> bool {
-        false
-    }
+    ) -> std::io::Result<ExecResult>;
 
     /// Run a command with its stdout and stderr streamed to **separate** sinks as they arrive, for
-    /// as long as it runs: no deadline, and dropping the future stops it (closes the streams,
-    /// kills the template transport's far side, kills the local child). The held start of a
-    /// sandbox job ([`crate::exec_endpoint::jobs`]) is the one caller: its output is the job's and
-    /// its stderr carries the supervisor's markers, so the two must never be merged.
-    ///
-    /// Defaults to [`std::io::ErrorKind::Unsupported`]; [`Self::attaches`] says whether it works.
+    /// as long as it runs: no deadline, and dropping the future stops the command. For a caller that
+    /// must tell the two streams apart ([`run_streaming`](CommandRunner::run_streaming) merges them).
     async fn run_attached(
         &self,
         program: &str,
@@ -330,19 +295,7 @@ pub trait CommandRunner: Send + Sync {
         cwd: Option<&str>,
         on_stdout: ChunkSink<'_>,
         on_stderr: ChunkSink<'_>,
-    ) -> std::io::Result<ExecResult> {
-        let _ = (program, args, cwd, on_stdout, on_stderr);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "this command runner cannot stream a command's output as it runs",
-        ))
-    }
-
-    /// Whether [`Self::run_attached`] works here: the output streams, and dropping the call stops
-    /// the command.
-    async fn attaches(&self) -> bool {
-        false
-    }
+    ) -> std::io::Result<ExecResult>;
 
     /// Make sure the target is reachable before a caller asks something synchronous of it
     /// ([`Self::sandbox_jobs`]): a runner whose target is attached lazily

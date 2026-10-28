@@ -94,6 +94,38 @@ impl CommandRunner for Host {
     ) -> std::io::Result<ExecResult> {
         Self::go(program, args, cwd, timeout, Some(stdin)).await
     }
+
+    async fn run_streaming(
+        &self,
+        _: &str,
+        _: &[String],
+        _: Option<&str>,
+        _: std::time::Duration,
+        _: crate::exec::ChunkSink<'_>,
+    ) -> std::io::Result<crate::exec::ExecResult> {
+        unimplemented!("a test double that only runs to completion")
+    }
+
+    async fn run_streaming_tracked(
+        &self,
+        _: &str,
+        _: &[String],
+        _: Option<&str>,
+        _: &crate::exec::JobHooks<'_>,
+    ) -> std::io::Result<crate::exec::ExecResult> {
+        unimplemented!("a test double that only runs to completion")
+    }
+
+    async fn run_attached(
+        &self,
+        _: &str,
+        _: &[String],
+        _: Option<&str>,
+        _: crate::exec::ChunkSink<'_>,
+        _: crate::exec::ChunkSink<'_>,
+    ) -> std::io::Result<crate::exec::ExecResult> {
+        unimplemented!("a test double that only runs to completion")
+    }
 }
 
 #[cfg(test)]

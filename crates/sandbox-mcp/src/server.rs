@@ -695,14 +695,14 @@ impl SandboxMcp {
             label: a.label.unwrap_or_default(),
         };
         let t = self.target().await?;
-        let pgid = t.sandbox.jobs().start_kept(&scope, &id, &spec).await?;
+        let pgid = t.sandbox.jobs()?.start_kept(&scope, &id, &spec).await?;
         Ok(json!({ "id": id.as_str(), "scope": scope.name(), "pgid": pgid }))
     }
 
     async fn do_job_list(&self, a: JobListArgs) -> Out {
         let scope = self.scope(a.scope.as_deref())?;
         let t = self.target().await?;
-        let jobs = t.sandbox.jobs().list(&scope).await?;
+        let jobs = t.sandbox.jobs()?.list(&scope).await?;
         let jobs: Vec<Value> = jobs
             .iter()
             .map(|j| {
@@ -724,7 +724,7 @@ impl SandboxMcp {
         let t = self.target().await?;
         let c = t
             .sandbox
-            .jobs()
+            .jobs()?
             .read(&scope, &id, a.offset.unwrap_or(0), max)
             .await?;
         let (state, code) = state_of(c.status);
@@ -752,7 +752,7 @@ impl SandboxMcp {
         let t = self.target().await?;
         let survivors = t
             .sandbox
-            .jobs()
+            .jobs()?
             .kill(&scope, &ids, a.remove.unwrap_or(false))
             .await?;
         let survivors: Vec<Value> = survivors

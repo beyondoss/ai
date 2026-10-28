@@ -45,15 +45,19 @@ fn tenant(secret: &str) -> tempfile::TempDir {
     dir
 }
 
-/// `env -C <dir> {}` stands in for `docker exec`/`ssh` — it runs what follows, somewhere specific.
-fn target_cmd(dir: &std::path::Path) -> String {
-    format!("env -C {} {{}}", dir.display())
+/// An exec endpoint whose root is `dir`, standing in for one tenant's sandbox. It serves on `rt` for
+/// as long as the returned mock lives.
+fn target(rt: &tokio::runtime::Runtime, dir: &std::path::Path) -> common::exec_mock::ExecMock {
+    rt.block_on(common::exec_mock::ExecMock::start(dir))
 }
 
 #[test]
 fn a_session_endpoint_is_set_over_the_protocol_and_cleared_on_session_switch() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let a = tenant("SECRET-AAAA");
+    let ma = target(&rt, a.path());
     let b = tenant("SECRET-BBBB");
+    let mb = target(&rt, b.path());
     let sessions = tempfile::tempdir().unwrap();
 
     // Two scripted turns, each reading the same relative path. Which tenant answers is entirely
@@ -77,7 +81,7 @@ fn a_session_endpoint_is_set_over_the_protocol_and_cleared_on_session_switch() {
     };
 
     // 1. Attach tenant A's sandbox to this session.
-    send(json!({ "id": "1", "type": "set_exec_endpoint", "command": target_cmd(a.path()) }));
+    send(json!({ "id": "1", "type": "set_exec_endpoint", "url": ma.url }));
     let f = read_until_response(&mut out, "set_exec_endpoint");
     let resp = response(&f);
     assert_eq!(
@@ -96,7 +100,7 @@ fn a_session_endpoint_is_set_over_the_protocol_and_cleared_on_session_switch() {
     );
 
     // 3. Re-point at tenant B — the same session, a different sandbox.
-    send(json!({ "id": "3", "type": "set_exec_endpoint", "command": target_cmd(b.path()) }));
+    send(json!({ "id": "3", "type": "set_exec_endpoint", "url": mb.url }));
     assert_eq!(
         response(&read_until_response(&mut out, "set_exec_endpoint"))["success"],
         json!(true)
@@ -135,7 +139,9 @@ fn a_session_endpoint_is_set_over_the_protocol_and_cleared_on_session_switch() {
 fn clearing_the_endpoint_returns_the_session_to_the_host() {
     // Mixed deployment: a session can be handed back to local execution without being torn down, and
     // "cleared" must mean *this host*, not "whatever was attached before".
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let a = tenant("SECRET-AAAA");
+    let ma = target(&rt, a.path());
     let host_dir = tempfile::tempdir().unwrap();
     std::fs::write(host_dir.path().join("host.txt"), "ON-THE-HOST\n").unwrap();
     let sessions = tempfile::tempdir().unwrap();
@@ -158,13 +164,13 @@ fn clearing_the_endpoint_returns_the_session_to_the_host() {
         stdin.flush().unwrap();
     };
 
-    send(json!({ "id": "1", "type": "set_exec_endpoint", "command": target_cmd(a.path()) }));
+    send(json!({ "id": "1", "type": "set_exec_endpoint", "url": ma.url }));
     assert_eq!(
         response(&read_until_response(&mut out, "set_exec_endpoint"))["success"],
         json!(true)
     );
 
-    // No `url` and no `command` detaches, explicitly.
+    // No `url` detaches, explicitly.
     send(json!({ "id": "2", "type": "set_exec_endpoint" }));
     let f = read_until_response(&mut out, "set_exec_endpoint");
     let resp = response(&f);
@@ -207,17 +213,6 @@ fn a_malformed_endpoint_is_rejected_without_attaching_anything() {
         response(&f)
     );
 
-    send(
-        json!({ "id": "2", "type": "set_exec_endpoint", "url": "https://x/", "command": "env {}" }),
-    );
-    let f = read_until_response(&mut out, "set_exec_endpoint");
-    assert_eq!(
-        response(&f)["success"],
-        json!(false),
-        "url+command together must be refused: {:?}",
-        response(&f)
-    );
-
     send(json!({ "id": "3", "type": "shutdown" }));
     let _ = out.read_line(&mut String::new());
 }
@@ -227,7 +222,9 @@ fn a_resumed_session_reattaches_its_endpoint_and_a_sibling_does_not_inherit_it()
     // Persistence completes the story: an endpoint set on a session must come back when that session
     // is resumed — otherwise a sandboxed tenant's work silently moves onto the server after a restart
     // — while a *different* session must still start clean.
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let a = tenant("SECRET-AAAA");
+    let ma = target(&rt, a.path());
     let sessions = tempfile::tempdir().unwrap();
 
     let (base, _bodies) = spawn_model_server(vec![
@@ -248,7 +245,7 @@ fn a_resumed_session_reattaches_its_endpoint_and_a_sibling_does_not_inherit_it()
     };
 
     // Attach on the first session and note its id.
-    send(json!({ "id": "1", "type": "set_exec_endpoint", "command": target_cmd(a.path()) }));
+    send(json!({ "id": "1", "type": "set_exec_endpoint", "url": ma.url }));
     assert_eq!(
         response(&read_until_response(&mut out, "set_exec_endpoint"))["success"],
         json!(true)
@@ -296,7 +293,7 @@ fn a_resumed_session_reattaches_its_endpoint_and_a_sibling_does_not_inherit_it()
 /// doesn't silently move a tenant's work onto the server" — and the one nothing actually covered. The
 /// test above only exercises `switch_session` *within one live process*, where the record is restored
 /// by `reset_exec_endpoint!` and the target never left memory. At process start the record was simply
-/// not read: the cell was wired from the grant or from `--exec-url`/`--exec-cmd` and from nothing
+/// not read: the cell was wired from the grant or from `--exec-url` and from nothing
 /// else, so a daemon restart followed by a reconnect to the same id ran that session's tools on the
 /// host.
 ///
@@ -305,8 +302,11 @@ fn a_resumed_session_reattaches_its_endpoint_and_a_sibling_does_not_inherit_it()
 /// daemon started with one default must not drag every resumed session onto it.
 #[test]
 fn a_cold_restart_reattaches_the_session_endpoint_and_outranks_the_process_default() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let a = tenant("SECRET-AAAA");
+    let ma = target(&rt, a.path());
     let b = tenant("SECRET-BBBB");
+    let mb = target(&rt, b.path());
     let sessions = tempfile::tempdir().unwrap();
 
     let (base, _bodies) = spawn_model_server(vec![
@@ -327,7 +327,7 @@ fn a_cold_restart_reattaches_the_session_endpoint_and_outranks_the_process_defau
             stdin.flush().unwrap();
         };
 
-        send(json!({ "id": "1", "type": "set_exec_endpoint", "command": target_cmd(a.path()) }));
+        send(json!({ "id": "1", "type": "set_exec_endpoint", "url": ma.url }));
         assert_eq!(
             response(&read_until_response(&mut out, "set_exec_endpoint"))["success"],
             json!(true)
@@ -350,12 +350,7 @@ fn a_cold_restart_reattaches_the_session_endpoint_and_outranks_the_process_defau
 
     // ---- Second process: same store, same id, and a *different* process-wide default. -----------
     let mut child = serve_dir_cmd(BIN, &base, sessions.path().to_str().unwrap())
-        .args([
-            "--session-id",
-            &first_id,
-            "--exec-cmd",
-            &target_cmd(b.path()),
-        ])
+        .args(["--session-id", &first_id, "--exec-url", &mb.url])
         .spawn_guarded();
     let mut stdin = child.stdin.take().unwrap();
     let mut out = common::child_frames(&mut child);

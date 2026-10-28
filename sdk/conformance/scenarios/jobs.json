@@ -342,7 +342,7 @@
     },
     {
       "id": "jobs.exit.shell-command-not-found",
-      "description": "A job whose shell cannot find its command ends with 127. (Starting a program that does not exist at all is refused by a native endpoint with an error status and is an ended job with 127 on the baseline: callers wrap commands in sh -c to get one behaviour.)",
+      "description": "A job whose shell cannot find its command ends with 127. (Starting a program that does not exist at all is refused by the endpoint with an error status: callers wrap commands in sh -c to get one behaviour.)",
       "steps": [
         {
           "id": "start",

@@ -248,12 +248,6 @@
 //! ignores `SIGTERM`, and `list`/`wipe` staying inside their scope. `tests/fixtures/exec/jobs.json`
 //! holds the decoding vectors.
 //!
-//! For targets that have no HTTP surface at all (`ssh`, `docker exec`, `kubectl exec`, any CLI), see
-//! [`TemplateRunner`], which is the same idea expressed as an argv template. Its transport is a local
-//! process, so its output streams natively; killing it is the hard part — see `far_kill`. Such a
-//! target has no job operations of its own: the client builds jobs there from plain commands
-//! ([`jobs::ShellJobs`]), without notify.
-//!
 //! ## Sandbox job notify
 //!
 //! A replica holds a stream to every kept job it serves, and the endpoint writes a heartbeat
@@ -745,7 +739,6 @@
 //! | I6: the token is narrow: a callback can only start a live reconcile of the one job it names, in a session open in that process | N21, N22, N23, N24, N43, N44, N45, N46, N47 |
 //! | I7: never worse than today, with one exception: once a job is unheld, an end no callback delivers (the sandbox died or stopped, every attempt failed, or a superseded owner that has not yet noticed took it) is noticed at the next real use, `bash_job` call or open instead of within seconds, and then takes today's path | N1, N2, N3, N5, N17, N24, N29, N33, N34, N36, N38 |
 
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -753,12 +746,8 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
-use crate::exec::{
-    ChunkSink, CommandRunner, ExecResult, JobHooks, Kill, STREAM_HEAD, STREAM_TAIL, SpawnSink,
-    drain_capped, feed_stdin,
-};
+use crate::exec::{ChunkSink, CommandRunner, ExecResult, JobHooks, Kill, SpawnSink};
 
-mod far_kill;
 pub mod jobs;
 pub mod jobs_native;
 pub mod stream;
@@ -856,10 +845,6 @@ pub const STREAM_DEADLINE: Duration = Duration::from_millis(i32::MAX as u64);
 /// What a remote command left running, as `on_orphans` describes it: the runner cannot list the far
 /// side's processes, only that its process group still has some.
 pub(crate) const REMOTE_LEFTOVERS: &str = "processes on the exec target";
-
-/// How long a template command's output may still be in flight once its shell-exit marker has
-/// arrived — the local runner's 100 ms (`bash_proc::SETTLE`).
-const SHELL_EXIT_SETTLE: Duration = Duration::from_millis(100);
 
 /// Where a runner reports a shell that exited leaving processes running — [`JobHooks::on_orphans`].
 type OrphanSink<'a> = &'a (dyn Fn(&ExecResult, String) + Send + Sync);
@@ -1205,12 +1190,7 @@ impl CommandRunner for HttpExecRunner {
         self.answer(resp).await
     }
 
-    /// streaming when the endpoint has proved it streams; otherwise one-shot, which never calls the sink.
-    ///
-    /// The sink gets *every* byte of *both* streams or none: a one-shot answer (or a streaming endpoint that
-    /// answers this request with one object anyway) goes back as `stdout`/`stderr` for `bash` to
-    /// assemble. An earlier override fed the sink stdout alone, told `bash` the output had streamed,
-    /// and every remote command that printed to stdout lost its stderr.
+    /// Streams: the sink gets every byte of both streams, as the command produces them.
     async fn run_streaming(
         &self,
         program: &str,
@@ -1229,8 +1209,7 @@ impl CommandRunner for HttpExecRunner {
     ///
     /// The job has no deadline of its own, but the wire needs a `timeout_ms`: a stream sends
     /// [`STREAM_DEADLINE`], so the connection (closed by a kill, a dropped job or the agent's exit) is
-    /// what ends it; a one-shot endpoint gets [`UNTRACKED_DEADLINE`], the only thing that can end a
-    /// command it cannot stream or stop. See the module doc's "Timeouts".
+    /// what ends it. See the module doc's "Timeouts".
     async fn run_streaming_tracked(
         &self,
         program: &str,
@@ -1254,11 +1233,7 @@ impl CommandRunner for HttpExecRunner {
         .await
     }
 
-    async fn tracks_jobs(&self) -> bool {
-        true
-    }
-
-    /// streaming only: stdout frames to `on_stdout`, stderr frames to `on_stderr`, until the final frame.
+    /// Stdout frames to `on_stdout`, stderr frames to `on_stderr`, until the final frame.
     /// Dropping the future drops the response, which closes the connection — and the endpoint kills
     /// the command's group ("Disconnect kills").
     async fn run_attached(
@@ -1321,11 +1296,7 @@ impl CommandRunner for HttpExecRunner {
         }
     }
 
-    async fn attaches(&self) -> bool {
-        true
-    }
-
-    /// Native (jobs) when the endpoint offers it, the baseline over plain exec commands otherwise.
+    /// The endpoint's own jobs (jobs).
     fn sandbox_jobs(self: Arc<Self>) -> Option<Arc<dyn jobs::SandboxJobs>> {
         Some(Arc::new(jobs_native::HttpJobs::new(self)))
     }
@@ -1485,443 +1456,6 @@ pub fn is_ndjson(resp: &reqwest::Response) -> bool {
         })
 }
 
-/// A [`CommandRunner`] that runs each command through a caller-supplied **argv template**, for targets
-/// with no HTTP surface: `ssh`, `docker exec`, `kubectl exec`, `podman`, a vendor's own CLI.
-///
-/// The template is a list of arguments; the literal `{}` element is replaced by the command and its
-/// arguments. For example `["ssh", "build-host", "--", "{}"]` or
-/// `["docker", "exec", "my-container", "{}"]`.
-///
-/// **The command is never rendered into a string.** `{}` expands to *multiple argv entries*, one per
-/// token, so a path containing spaces, quotes or `;` stays a single argument on the far side and
-/// cannot be reparsed as syntax. A template that pasted the command into a shell string would make
-/// every model-supplied path an injection vector.
-pub struct TemplateRunner {
-    template: Vec<String>,
-    /// Whether the far side can run jobs of its own ([`jobs::ShellJobs`]) — probed once.
-    jobs_probe: Arc<tokio::sync::OnceCell<jobs::Baseline>>,
-}
-
-impl TemplateRunner {
-    /// Build from a template that must contain exactly one `{}` placeholder.
-    pub fn new(template: Vec<String>) -> Result<Self, String> {
-        let holes = template.iter().filter(|t| *t == "{}").count();
-        if holes != 1 {
-            return Err(format!(
-                "exec template needs exactly one `{{}}` placeholder for the command, found {holes} \
-                 in {template:?}"
-            ));
-        }
-        if template.first().is_none_or(|p| p == "{}") {
-            return Err("exec template must start with a program to run".to_string());
-        }
-        Ok(Self {
-            template,
-            jobs_probe: Arc::default(),
-        })
-    }
-
-    /// Parse a whitespace-separated template, the shape a CLI flag carries.
-    pub fn parse(raw: &str) -> Result<Self, String> {
-        Self::new(raw.split_whitespace().map(str::to_string).collect())
-    }
-
-    fn expand(&self, program: &str, args: &[String]) -> Vec<String> {
-        expand(&self.template, program, args)
-    }
-}
-
-#[async_trait]
-impl CommandRunner for TemplateRunner {
-    async fn run(
-        &self,
-        program: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        timeout: Duration,
-    ) -> std::io::Result<ExecResult> {
-        self.exec(
-            program,
-            args,
-            cwd,
-            Some(timeout),
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-    }
-
-    /// The transport is a local process, so its output streams for free: every chunk the far side
-    /// writes arrives on the transport's pipes as it happens.
-    async fn run_streaming(
-        &self,
-        program: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        timeout: Duration,
-        on_chunk: ChunkSink<'_>,
-    ) -> std::io::Result<ExecResult> {
-        self.exec(
-            program,
-            args,
-            cwd,
-            Some(timeout),
-            Some(on_chunk),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-    }
-
-    /// As [`Self::run_streaming`], reporting a [`Kill`] that stops the command **on the far side**,
-    /// not just the local transport — see `far_kill`. No deadline: that kill is how it ends early.
-    /// What the command leaves running in its process group is reported to `on_orphans` and waited
-    /// for, as a local shell's leftovers are (see `far_kill::WRAPPER`).
-    async fn run_streaming_tracked(
-        &self,
-        program: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        hooks: &JobHooks<'_>,
-    ) -> std::io::Result<ExecResult> {
-        self.exec(
-            program,
-            args,
-            cwd,
-            None,
-            Some(hooks.on_chunk),
-            None,
-            None,
-            Some(hooks.on_spawn),
-            Some(hooks.on_orphans),
-        )
-        .await
-    }
-
-    async fn tracks_jobs(&self) -> bool {
-        true
-    }
-
-    /// The transport's two pipes, kept apart. No deadline; dropping the future kills the far side
-    /// (`TemplateKillGuard`), so the held start dies with it — as a stream's does.
-    async fn run_attached(
-        &self,
-        program: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        on_stdout: ChunkSink<'_>,
-        on_stderr: ChunkSink<'_>,
-    ) -> std::io::Result<ExecResult> {
-        self.exec(
-            program,
-            args,
-            cwd,
-            None,
-            Some(on_stdout),
-            Some(on_stderr),
-            None,
-            None,
-            None,
-        )
-        .await
-    }
-
-    async fn attaches(&self) -> bool {
-        true
-    }
-
-    fn sandbox_jobs(self: Arc<Self>) -> Option<Arc<dyn jobs::SandboxJobs>> {
-        let probe = self.jobs_probe.clone();
-        Some(Arc::new(jobs::ShellJobs::with_probe(self, probe)))
-    }
-
-    /// Piped into the *transport* process. Whether it reaches the far side is the transport's
-    /// business: `ssh` forwards stdin, but `docker exec`/`kubectl exec` do so only with `-i`. Without
-    /// it the far command reads nothing, which `ShellFs`'s probe detects — writes then use argv-sized
-    /// chunks instead.
-    async fn run_with_stdin(
-        &self,
-        program: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        timeout: Duration,
-        stdin: &[u8],
-    ) -> std::io::Result<ExecResult> {
-        self.exec(
-            program,
-            args,
-            cwd,
-            Some(timeout),
-            None,
-            None,
-            Some(stdin),
-            None,
-            None,
-        )
-        .await
-    }
-}
-
-/// How long the far-side kill may take before it is abandoned: one more round trip through the
-/// transport, which for `docker exec` is a fraction of a second.
-const FAR_KILL_LIMIT: Duration = Duration::from_secs(10);
-
-/// Stops a template command wherever it is: on the far side through the transport (once its
-/// marker has arrived), then the local transport's own process group. Blocking.
-#[derive(Clone)]
-struct TemplateKill {
-    template: Arc<Vec<String>>,
-    far: far_kill::FarIdCell,
-    local_group: Option<crate::procgroup::GroupId>,
-}
-
-impl TemplateKill {
-    fn kill(&self) {
-        let far = *self.far.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(id) = far {
-            let (program, args) = far_kill::far_kill_argv(id);
-            far_kill::run_bounded(&expand(&self.template, &program, &args), FAR_KILL_LIMIT);
-        }
-        #[cfg(unix)]
-        if let Some(group) = self.local_group {
-            crate::procgroup::kill_process_group(group);
-        }
-    }
-}
-
-/// Runs a [`TemplateKill`] if the command's future is dropped before the command exits — a
-/// cancelled call, an aborted job. Disarmed once the transport has exited on its own.
-struct TemplateKillGuard(Option<TemplateKill>);
-
-impl Drop for TemplateKillGuard {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(kill) = self.0.take() {
-            crate::procgroup::spawn_tracked_cleanup(move || kill.kill());
-        }
-    }
-}
-
-/// `{}` replaced by the command and its arguments, as argv entries.
-fn expand(template: &[String], program: &str, args: &[String]) -> Vec<String> {
-    let mut out = Vec::with_capacity(template.len() + args.len());
-    for part in template {
-        if part == "{}" {
-            out.push(program.to_string());
-            out.extend(args.iter().cloned());
-        } else {
-            out.push(part.clone());
-        }
-    }
-    out
-}
-
-impl TemplateRunner {
-    #[allow(clippy::too_many_arguments)]
-    async fn exec(
-        &self,
-        program: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        timeout: Option<Duration>,
-        on_chunk: Option<ChunkSink<'_>>,
-        on_stderr: Option<ChunkSink<'_>>,
-        stdin: Option<&[u8]>,
-        on_spawn: Option<SpawnSink<'_>>,
-        on_orphans: Option<OrphanSink<'_>>,
-    ) -> std::io::Result<ExecResult> {
-        // `cwd` is expressed by wrapping the command, not by setting the *local* process's directory —
-        // the directory belongs to the far side. Positional parameters to a fixed script, never
-        // substituted text.
-        //
-        // Everything but a stdin-carrying call runs under `far_kill::WRAPPER`, which makes the
-        // command killable on the far side (killing the transport does not reach it — see
-        // `far_kill`). A stdin call cannot: the wrapper backgrounds the command, and a background
-        // job's stdin is `/dev/null`.
-        let killable = stdin.is_none();
-        let (program, args): (String, Vec<String>) = if killable {
-            // A tracked job lingers on the far side while its leftovers run; any other call ends
-            // with its command, as before.
-            let linger = if on_orphans.is_some() { "1" } else { "0" };
-            let mut v = vec![
-                "-c".to_string(),
-                far_kill::WRAPPER.to_string(),
-                "sh".to_string(),
-                linger.to_string(),
-                cwd.unwrap_or("").to_string(),
-                program.to_string(),
-            ];
-            v.extend(args.iter().cloned());
-            ("sh".to_string(), v)
-        } else {
-            match cwd {
-                Some(dir) => {
-                    let mut v = vec![
-                        "-c".to_string(),
-                        r#"cd "$1" || exit 1; shift; exec "$@""#.to_string(),
-                        "sh".to_string(),
-                        dir.to_string(),
-                        program.to_string(),
-                    ];
-                    v.extend(args.iter().cloned());
-                    ("sh".to_string(), v)
-                }
-                None => (program.to_string(), args.to_vec()),
-            }
-        };
-        let argv = self.expand(&program, &args);
-
-        let mut cmd = tokio::process::Command::new(&argv[0]);
-        cmd.args(&argv[1..])
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        // Its own group, so the local half of a kill reaches whatever helpers the transport forks.
-        #[cfg(unix)]
-        cmd.process_group(0);
-        let mut child = cmd.spawn()?;
-        let far = far_kill::FarIdCell::default();
-        let kill = TemplateKill {
-            template: Arc::new(self.template.clone()),
-            far: far.clone(),
-            local_group: child.id().map(crate::procgroup::GroupId::leader),
-        };
-        let mut guard = TemplateKillGuard(Some(kill.clone()));
-        if let Some(report) = on_spawn {
-            let kill = kill.clone();
-            report(Kill::Hook(Arc::new(move || {
-                kill.kill();
-                None
-            })));
-        }
-        let stdout = child.stdout.take();
-        // The wrapper's shell-exit marker, heard on stderr: the command exited leaving processes of
-        // its group running.
-        let (shell_exit_tx, mut shell_exit_rx) = tokio::sync::watch::channel(None::<i32>);
-        let stderr = child.stderr.take().map(|e| {
-            let on_shell_exit = on_orphans.map(|_| -> far_kill::ShellExitSink<'_> {
-                Box::new(move |code| {
-                    let _ = shell_exit_tx.send(Some(code));
-                })
-            });
-            far_kill::MarkerStrip::new(e, far.clone(), on_shell_exit)
-        });
-        // Fed concurrently with the drains, never before them — see `feed_stdin`.
-        let feed = feed_stdin(child.stdin.take(), stdin);
-        // `drain_capped` is the same streaming head+tail accumulator the local runner uses: memory
-        // is bounded at `STREAM_HEAD + STREAM_TAIL` per stream regardless of how much arrives, and
-        // it says honestly whether a middle was dropped (`wait_with_output`, used here once, buffered
-        // everything and reported `truncated: false` regardless). When streaming, every chunk goes to
-        // the sink and nothing is captured, exactly as `RealRunner` does. Not
-        // `HttpExecRunner::read_capped` — that *discards* an over-cap body and errors, which is right
-        // for a response envelope that must parse as a whole, and wrong here: a long-running
-        // command's output is still the answer.
-        //
-        // Both pipes are drained *concurrently* with the wait. A child that fills one pipe's OS
-        // buffer while we read only the other deadlocks, and an unread pipe stalls its exit.
-        let (exited_tx, exited_rx) = tokio::sync::watch::channel(false);
-        let wait = async {
-            let status = child.wait().await;
-            let _ = exited_tx.send(true);
-            status
-        };
-        // Report the leftovers once the marker arrives, after the same 100 ms the local runner gives
-        // output already in flight on the other pipe (`bash_proc::SETTLE`), so what the shell
-        // printed lands in the call's result, not the job's.
-        let orphans = async {
-            let Some(sink) = on_orphans else {
-                return;
-            };
-            let mut exited = exited_rx.clone();
-            tokio::select! {
-                // Each guard is dropped inside its own arm: neither may live across the sleep.
-                code = async { shell_exit_rx.wait_for(Option::is_some).await.ok().and_then(|c| *c) } => {
-                    tokio::time::sleep(SHELL_EXIT_SETTLE).await;
-                    let shell = ExecResult {
-                        code,
-                        ..Default::default()
-                    };
-                    sink(&shell, REMOTE_LEFTOVERS.to_string());
-                }
-                () = async { let _ = exited.wait_for(|e| *e).await; } => {}
-            }
-        };
-        let collect = async {
-            tokio::join!(
-                wait,
-                drain_capped(
-                    stdout,
-                    STREAM_HEAD,
-                    STREAM_TAIL,
-                    on_chunk,
-                    exited_rx.clone()
-                ),
-                drain_capped(
-                    stderr,
-                    STREAM_HEAD,
-                    STREAM_TAIL,
-                    on_stderr.or(on_chunk),
-                    exited_rx.clone()
-                ),
-                feed,
-                orphans,
-            )
-        };
-        // `None`: a tracked job, whose kill is how it ends early.
-        let collected = match timeout {
-            Some(limit) => tokio::time::timeout(limit, collect).await.ok(),
-            None => Some(collect.await),
-        };
-        match collected {
-            Some((status, (stdout, out_truncated), (stderr, err_truncated), fed, ())) => {
-                guard.0 = None;
-                let status = status?;
-                fed?;
-                Ok(ExecResult {
-                    code: status.code(),
-                    // The transport's own exit signal, not the far command's — `ssh` reports a
-                    // remote signal as an exit code, and a local `docker exec` killed by one says
-                    // nothing about what ran inside. Left `None` rather than guessing.
-                    signal: None,
-                    stdout,
-                    stderr,
-                    timed_out: false,
-                    truncated: out_truncated || err_truncated,
-                })
-            }
-            None => {
-                // Reaping the transport is not enough: the far command outlives it. Kill both and
-                // wait for it, so a caller that re-checks side effects sees the command gone.
-                if let Some(kill) = guard.0.take() {
-                    let _ = tokio::task::spawn_blocking(move || kill.kill()).await;
-                }
-                Ok(ExecResult {
-                    code: None,
-                    signal: None,
-                    stdout: Vec::new(),
-                    stderr: format!(
-                        "exec template timed out after {:?}",
-                        timeout.unwrap_or_default()
-                    )
-                    .into_bytes(),
-                    timed_out: true,
-                    truncated: false,
-                })
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -2000,119 +1534,5 @@ mod tests {
         assert_eq!(v, "Bearer abc");
         assert!(HttpExecRunner::parse_header("no-colon").is_err());
         assert!(HttpExecRunner::parse_header(": empty-name").is_err());
-    }
-
-    #[test]
-    fn a_template_needs_exactly_one_placeholder() {
-        assert!(TemplateRunner::parse("ssh host -- {}").is_ok());
-        assert!(TemplateRunner::parse("ssh host").is_err());
-        assert!(TemplateRunner::parse("ssh {} {}").is_err());
-        assert!(TemplateRunner::parse("{} foo").is_err());
-    }
-
-    #[test]
-    fn the_placeholder_expands_to_argv_entries_not_a_string() {
-        // The injection invariant. A path containing `;` and quotes must stay ONE argument on the far
-        // side; if this ever renders to a string, the far side reparses it as syntax.
-        let r = TemplateRunner::parse("docker exec ctr {}").unwrap();
-        let argv = r.expand(
-            "grep",
-            &["-e".into(), "'; rm -rf / #".into(), "/a b.txt".into()],
-        );
-        assert_eq!(
-            argv,
-            vec![
-                "docker",
-                "exec",
-                "ctr",
-                "grep",
-                "-e",
-                "'; rm -rf / #",
-                "/a b.txt"
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn a_template_runner_actually_runs_the_command() {
-        // `env` is a harmless stand-in for a real transport: it runs whatever follows, which is
-        // exactly the shape `ssh host --` / `docker exec ctr` have.
-        let r = TemplateRunner::parse("env {}").unwrap();
-        let out = r
-            .run(
-                "printf",
-                &["%s".into(), "hello".into()],
-                None,
-                Duration::from_secs(10),
-            )
-            .await
-            .unwrap();
-        assert_eq!(out.code, Some(0));
-        assert_eq!(out.stdout, b"hello");
-    }
-
-    #[tokio::test]
-    async fn a_template_runner_honors_cwd_without_splicing_it() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("marker.txt"), "x").unwrap();
-        let r = TemplateRunner::parse("env {}").unwrap();
-        let out = r
-            .run("ls", &[], dir.path().to_str(), Duration::from_secs(10))
-            .await
-            .unwrap();
-        assert_eq!(out.code, Some(0));
-        assert!(out.stdout_text().contains("marker.txt"), "{out:?}");
-    }
-
-    /// The transport's output is bounded by the capture window and truncation is reported honestly.
-    /// `wait_with_output` buffered the whole thing and hardcoded `truncated: false`, so a command
-    /// that printed a gigabyte sized this process — and said nothing about what it had lost.
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn a_template_runner_caps_its_output_and_says_when_it_truncated() {
-        let r = TemplateRunner::parse("env {}").unwrap();
-        let bytes = 2 * (STREAM_HEAD + STREAM_TAIL);
-        let out = r
-            .run(
-                "sh",
-                &[
-                    "-c".into(),
-                    format!("head -c {bytes} /dev/zero | tr '\\0' 'a'"),
-                ],
-                None,
-                Duration::from_secs(30),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(out.code, Some(0), "{out:?}");
-        assert!(out.truncated, "the middle was dropped, so say so: {out:?}");
-        assert!(
-            out.stdout.len() <= STREAM_HEAD + STREAM_TAIL,
-            "kept {} bytes of a {bytes}-byte stream",
-            out.stdout.len()
-        );
-    }
-
-    /// …and output that fits is returned whole, still flagged untruncated.
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn a_template_runner_leaves_output_under_the_cap_alone() {
-        let r = TemplateRunner::parse("env {}").unwrap();
-        let out = r
-            .run(
-                "sh",
-                &[
-                    "-c".into(),
-                    "printf 'hello\\n'; printf 'oops\\n' >&2".into(),
-                ],
-                None,
-                Duration::from_secs(10),
-            )
-            .await
-            .unwrap();
-        assert_eq!(out.stdout, b"hello\n");
-        assert_eq!(out.stderr, b"oops\n");
-        assert!(!out.truncated, "{out:?}");
     }
 }

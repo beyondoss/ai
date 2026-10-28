@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use crate::common::exec_mock::ExecMock;
-use beyond_agent::exec_endpoint::{HttpExecRunner, TemplateRunner};
+use beyond_agent::exec_endpoint::HttpExecRunner;
 use beyond_agent::tools::exec::CommandRunner;
 use beyond_agent::tools::fs::FsBackend;
 use beyond_agent::tools::fs::shell::ShellFs;
@@ -184,22 +184,6 @@ async fn auth_headers_reach_the_endpoint() {
     let req = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
     assert!(req.contains("authorization: Bearer secret-token"), "{req}");
     assert!(req.contains("x-tenant: acme"), "{req}");
-}
-
-#[tokio::test]
-async fn a_command_template_reaches_a_target_with_no_http_surface() {
-    // `env` stands in for `ssh host --` / `docker exec ctr` / `kubectl exec … --`: it runs whatever
-    // follows it, which is the shape every CLI-based provider has.
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("t.txt"), "TEMPLATE-NEEDLE\n").unwrap();
-    let reg = registry_over(Arc::new(TemplateRunner::parse("env {}").unwrap())).await;
-    let out = call(
-        &reg,
-        "grep",
-        json!({ "pattern": "TEMPLATE-NEEDLE", "path": dir.path().to_str().unwrap() }),
-    )
-    .await;
-    assert!(out.contains("t.txt"), "{out}");
 }
 
 #[tokio::test]

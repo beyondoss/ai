@@ -40,7 +40,7 @@ pub struct CapsOverride {
 
 pub struct Driver {
     runner: Arc<dyn CommandRunner>,
-    jobs: beyond_sandbox::Jobs,
+    jobs: Option<beyond_sandbox::Jobs>,
     fs: ShellFs,
     /// The error every op returns when the endpoint could not be reached or refused the first
     /// request: probes that fail at that level are not capabilities, they are an outage.
@@ -251,6 +251,12 @@ impl Driver {
         }
     }
 
+    fn jobs(&self) -> Result<&beyond_sandbox::Jobs, Value> {
+        self.jobs
+            .as_ref()
+            .ok_or_else(|| err("unsupported", "this exec does not own jobs"))
+    }
+
     fn scope(&self, req: &Value) -> Result<JobScope, Value> {
         let name = str_arg(req, "scope")?;
         Ok(match &self.jobs_root {
@@ -432,7 +438,7 @@ impl Driver {
             label: opt_str(req, "label")?.unwrap_or("").to_string(),
         };
         let pgid = self
-            .jobs
+            .jobs()?
             .start_kept(&scope, &id, &spec)
             .await
             .map_err(|e| io_err(&e))?;
@@ -441,7 +447,7 @@ impl Driver {
 
     async fn job_list(&self, req: &Value) -> Out {
         let scope = self.scope(req)?;
-        let jobs = self.jobs.list(&scope).await.map_err(|e| io_err(&e))?;
+        let jobs = self.jobs()?.list(&scope).await.map_err(|e| io_err(&e))?;
         let jobs: Vec<Value> = jobs
             .iter()
             .map(|j| {
@@ -462,7 +468,7 @@ impl Driver {
         let offset = u64_arg(req, "offset")?.unwrap_or(0);
         let max = u64_arg(req, "max")?.unwrap_or(128 * 1024) as usize;
         let c = self
-            .jobs
+            .jobs()?
             .read(&scope, &id, offset, max)
             .await
             .map_err(|e| io_err(&e))?;
@@ -480,7 +486,7 @@ impl Driver {
         let out = Mutex::new(Vec::new());
         let gaps = Mutex::new(0u64);
         let code = self
-            .jobs
+            .jobs()?
             .follow(&scope, &id, offset, &|ev: JobEvent<'_>| match ev {
                 JobEvent::Output(b) => out.lock().unwrap().extend_from_slice(b),
                 JobEvent::Gap(n) => *gaps.lock().unwrap() += n,
@@ -503,7 +509,7 @@ impl Driver {
             .collect::<Result<_, _>>()?;
         let remove = flag(req, "remove")?;
         let survivors = self
-            .jobs
+            .jobs()?
             .kill(&scope, &ids, remove)
             .await
             .map_err(|e| io_err(&e))?;
@@ -520,7 +526,7 @@ impl Driver {
             .iter()
             .filter_map(|s| JobId::parse(s))
             .collect();
-        self.jobs
+        self.jobs()?
             .remove(&scope, &ids)
             .await
             .map_err(|e| io_err(&e))?;
@@ -529,7 +535,7 @@ impl Driver {
 
     async fn job_wipe(&self, req: &Value) -> Out {
         let scope = self.scope(req)?;
-        let survivors = self.jobs.wipe(&scope).await.map_err(|e| io_err(&e))?;
+        let survivors = self.jobs()?.wipe(&scope).await.map_err(|e| io_err(&e))?;
         Ok(json!({ "survivors": survivors }))
     }
 

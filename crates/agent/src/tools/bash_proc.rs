@@ -1029,7 +1029,7 @@ mod tests {
         let survived = group.kill();
         assert!(survived.is_empty(), "{survived:?}");
         // The same window in the other group killers (`exec`'s `GroupKillGuard`, the MCP sweep
-        // after a reap, a template transport's local group): never once the number is recycled.
+        // after a reap): never once the number is recycled.
         crate::tools::exec::kill_process_group(group.leader);
         crate::tools::exec::kill_group_members(group.leader);
         std::thread::sleep(Duration::from_millis(200));

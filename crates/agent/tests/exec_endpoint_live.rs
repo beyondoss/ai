@@ -5,14 +5,10 @@
 //!
 //! ## Vendor-neutral by construction
 //!
-//! The target is whatever you point it at — there is no provider knowledge here, only the two flags
+//! The target is whatever you point it at — there is no provider knowledge here, only the flags
 //! the agent actually ships:
 //!
 //! ```sh
-//! # any transparent transport (docker, ssh, kubectl, podman …)
-//! AGENT_LIVE_EXEC_CMD='docker exec -i my-container {}' \
-//!   cargo nextest run -p beyond-agent -E 'test(/^exec_endpoint_live::/)' --no-capture
-//!
 //! # any HTTP endpoint speaking the exec protocol
 //! AGENT_LIVE_EXEC_URL=https://exec.example/run AGENT_LIVE_EXEC_HEADER='Authorization: Bearer …' \
 //!   cargo nextest run -p beyond-agent -E 'test(/^exec_endpoint_live::/)' --no-capture
@@ -21,13 +17,13 @@
 //! `AGENT_LIVE_WORKDIR` names a directory that exists **on the target and not on this host** (default
 //! `/work`) — that asymmetry is what makes the result meaningful rather than a local no-op.
 //!
-//! **This runs in CI.** The `exec-live` shard stands up an Alpine container and points the tests at
-//! it. Alpine is deliberate: it is busybox, whose `grep` has no `-Z`/`-I`/`--include` and whose
+//! **This runs in CI.** The `exec-live` shard stands up an Alpine container running `execd` and
+//! points the tests at it. Alpine is deliberate: it is busybox, whose `grep` has no `-Z`/`-I`/`--include` and whose
 //! `find` has no `-printf`, so it exercises the hardest capability rung — and it is what a large
 //! share of real sandboxes actually are. Running against a GNU-flavoured image would quietly skip the
 //! code path most likely to be wrong.
 //!
-//! Skipped when neither variable is set, so a local `cargo test` needs no infrastructure. When one
+//! Skipped when the variable is not set, so a local `cargo test` needs no infrastructure. When one
 //! *is* set it fails rather than skips: at that point a target has been asserted to exist, and a
 //! silent pass would be worse than no test.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -52,11 +48,6 @@ fn target() -> Option<Vec<String>> {
         }
         return Some(v);
     }
-    if let Ok(cmd) = std::env::var("AGENT_LIVE_EXEC_CMD")
-        && !cmd.is_empty()
-    {
-        return Some(vec!["--exec-cmd".to_string(), cmd]);
-    }
     None
 }
 
@@ -69,9 +60,7 @@ macro_rules! target_or_skip {
         match target() {
             Some(t) => t,
             None => {
-                eprintln!(
-                    "skipping: set AGENT_LIVE_EXEC_CMD or AGENT_LIVE_EXEC_URL to run live tests"
-                );
+                eprintln!("skipping: set AGENT_LIVE_EXEC_URL to run live tests");
                 return;
             }
         }
@@ -190,7 +179,7 @@ fn bash_runs_on_the_target_not_this_host() {
 fn a_write_past_the_argv_limit_round_trips_through_the_target() {
     // A remote write used to ship the whole file as one argv entry, which Linux caps at 128 KiB, so
     // anything over ~96 KiB failed. The content now travels on stdin, so the transport must forward it
-    // (`docker exec -i`, as CI's does); busybox is the shell most likely to trip on a difference.
+    // (an endpoint in the container, as CI's is); busybox is the shell most likely to trip on a difference.
     use sha2::Digest as _;
     let flags = target_or_skip!();
     let dir = workdir();
@@ -269,35 +258,29 @@ fn write_then_read_round_trips_through_the_target() {
 /// The runner the live flags describe, built in-process — for a test that needs to hold the job
 /// table itself.
 fn live_runner() -> Option<std::sync::Arc<dyn beyond_agent::tools::exec::CommandRunner>> {
-    use beyond_agent::exec_endpoint::{HttpExecRunner, TemplateRunner};
-    if let Ok(url) = std::env::var("AGENT_LIVE_EXEC_URL")
-        && !url.is_empty()
-    {
-        let mut r = HttpExecRunner::new(url).unwrap();
-        if let Ok(h) = std::env::var("AGENT_LIVE_EXEC_HEADER")
-            && !h.is_empty()
-        {
-            let (n, v) = HttpExecRunner::parse_header(&h).unwrap();
-            r = r.with_header(n, v);
-        }
-        return Some(std::sync::Arc::new(r));
-    }
-    let cmd = std::env::var("AGENT_LIVE_EXEC_CMD")
+    use beyond_agent::exec_endpoint::HttpExecRunner;
+    let url = std::env::var("AGENT_LIVE_EXEC_URL")
         .ok()
-        .filter(|c| !c.is_empty())?;
-    Some(std::sync::Arc::new(TemplateRunner::parse(&cmd).unwrap()))
+        .filter(|u| !u.is_empty())?;
+    let mut r = HttpExecRunner::new(url).unwrap();
+    if let Ok(h) = std::env::var("AGENT_LIVE_EXEC_HEADER")
+        && !h.is_empty()
+    {
+        let (n, v) = HttpExecRunner::parse_header(&h).unwrap();
+        r = r.with_header(n, v);
+    }
+    Some(std::sync::Arc::new(r))
 }
 
-/// The kill a `bash_job` reports must be true **on the target**. Against a real `docker exec`
-/// (CI's `exec-live` shard), killing the local transport leaves the command running in the
-/// container, so this fails unless the kill went through the transport. The target's pid 1 is a
-/// plain `sleep` that never reaps, so "dead" is read from `/proc` (a zombie is dead), not `kill -0`.
+/// The kill a `bash_job` reports must be true **on the target**. Against a real endpoint in a
+/// container (CI's `exec-live` shard), it fails unless the kill reached the container. "Dead" is read
+/// from `/proc` (a zombie is dead), not `kill -0`.
 #[tokio::test]
 async fn a_killed_bash_job_dies_on_the_target() {
     use common::remote_bash::{call, job_number, kill_job, remote_bash};
     use std::time::{Duration, Instant};
     let Some(runner) = live_runner() else {
-        eprintln!("skipping: set AGENT_LIVE_EXEC_CMD or AGENT_LIVE_EXEC_URL to run live tests");
+        eprintln!("skipping: set AGENT_LIVE_EXEC_URL to run live tests");
         return;
     };
     let (bash, jobs) = remote_bash(runner.clone(), Duration::from_secs(2));
@@ -365,7 +348,7 @@ async fn a_leftover_on_the_target_is_adopted_and_stopped_with_the_session() {
     use common::remote_bash::{call, remote_bash};
     use std::time::{Duration, Instant};
     let Some(runner) = live_runner() else {
-        eprintln!("skipping: set AGENT_LIVE_EXEC_CMD or AGENT_LIVE_EXEC_URL to run live tests");
+        eprintln!("skipping: set AGENT_LIVE_EXEC_URL to run live tests");
         return;
     };
     let (bash, _jobs) = remote_bash(runner.clone(), Duration::from_secs(60));
@@ -439,25 +422,20 @@ async fn until(what: &str, cond: impl Fn() -> bool) {
 
 /// Sandbox-owned jobs (`exec_endpoint::jobs`) inside the real target — busybox in CI: a held job
 /// streams and dies with its hold, a kept one outlives it and is read back from an offset, a kill
-/// stops it and removes its directory, and a job started kept is polled to its end. The baseline's
-/// whole job is to work on exactly this image.
+/// stops it and removes its directory, and a job started kept is followed to its end.
 #[tokio::test]
 async fn a_sandbox_job_lives_in_the_target_and_outlives_its_hold_once_kept() {
     use beyond_agent::exec_endpoint::jobs::{JobEvent, JobId, JobScope, JobSpec, JobStatus};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     let Some(runner) = live_runner() else {
-        eprintln!("skipping: set AGENT_LIVE_EXEC_CMD or AGENT_LIVE_EXEC_URL to run live tests");
+        eprintln!("skipping: set AGENT_LIVE_EXEC_URL to run live tests");
         return;
     };
     let jobs = runner
         .clone()
         .sandbox_jobs()
         .expect("a remote target has sandbox jobs");
-    assert!(
-        jobs.available().await,
-        "the target lacks a tool the job scripts need"
-    );
     let scope = JobScope::for_session(Some("live"), JobId::fresh().as_str());
     let group_alive = |pgid: u32| {
         let runner = runner.clone();
@@ -544,13 +522,17 @@ async fn a_sandbox_job_lives_in_the_target_and_outlives_its_hold_once_kept() {
         JobStatus::Gone
     );
 
-    // Started kept (no hold) and polled to its end.
-    let polled = JobId::fresh();
-    jobs.start_kept(&scope, &polled, &spec("echo a; sleep 0.5; echo b; exit 6"))
-        .await
-        .unwrap();
+    // Started kept (no hold) and followed to its end.
+    let followed = JobId::fresh();
+    jobs.start_kept(
+        &scope,
+        &followed,
+        &spec("echo a; sleep 0.5; echo b; exit 6"),
+    )
+    .await
+    .unwrap();
     output.lock().unwrap().clear();
-    assert_eq!(jobs.follow(&scope, &polled, 0, &events).await.unwrap(), 6);
+    assert_eq!(jobs.follow(&scope, &followed, 0, &events).await.unwrap(), 6);
     assert_eq!(output.lock().unwrap().as_slice(), b"a\nb\n");
     jobs.wipe(&scope).await.unwrap();
     assert!(jobs.list(&scope).await.unwrap().is_empty());

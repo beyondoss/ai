@@ -13,7 +13,7 @@ mod tls;
 mod token;
 
 pub use exec::{CommandRunner as Exec, ExecOutput, ExecResult};
-pub use exec_endpoint::{HttpExecRunner as HttpExec, TemplateRunner};
+pub use exec_endpoint::HttpExecRunner as HttpExec;
 pub use fs::FsBackend;
 pub use fs::shell::ShellFs as Files;
 pub use sandbox::{Command, Jobs, Sandbox};
