@@ -74,20 +74,20 @@ execd takes no command-line arguments, only environment variables, read once at 
 error that names the variable and the value (exit 2), and so is any argument: execd prints this list and exits. A boolean is
 `1`, `true`, `0` or `false`; an empty variable is unset.
 
-| variable                   | default                                            | meaning                                                                                                  |
-| -------------------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `EXECD_LISTEN`             | `127.0.0.1:8080`                                   | address to listen on                                                                                     |
-| `EXECD_ROOT`               | the current directory                              | where a command runs when its request names no directory                                                 |
-| `EXECD_HOME`               | execd's own `HOME`; the user's with `EXECD_RUN_AS` | `HOME` for every command                                                                                 |
-| `EXECD_BEARER_FILE`        | unset                                              | a file holding the bearer token (mode 0600)                                                              |
+| variable                   | default                                            | meaning                                                                                                                    |
+| -------------------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `EXECD_LISTEN`             | `127.0.0.1:8080`                                   | address to listen on                                                                                                       |
+| `EXECD_ROOT`               | the current directory                              | where a command runs when its request names no directory                                                                   |
+| `EXECD_HOME`               | execd's own `HOME`; the user's with `EXECD_RUN_AS` | `HOME` for every command                                                                                                   |
+| `EXECD_BEARER_FILE`        | unset                                              | a file holding the bearer token (mode 0600)                                                                                |
 | `EXECD_BEARER`             | unset                                              | the bearer token itself, a weaker way: execd re-execs to move it out of its environment, and refuses to start if it cannot |
-| `EXECD_INSECURE_NO_AUTH`   | `false`                                            | serve with no bearer on a non-loopback address; without it execd refuses to start                        |
-| `EXECD_RUN_AS`             | unset                                              | run every command as `user`, `uid`, `user:group` or `uid:gid` with the user's groups; execd must be root |
-| `EXECD_MAX_RESPONSE_BYTES` | 16 MiB                                             | most output one one-shot answer carries; match the agent's `--exec-max-response-bytes`                   |
-| `EXECD_JOBS_DIR`           | `$TMPDIR`, else `/tmp`                             | where a kept job's last 8 MiB of output is spooled; use a disk-backed directory                          |
-| `EXECD_LOG`                | `info`                                             | `off`, `error`, `warn`, `info`, `debug` or `trace`                                                       |
-| `EXECD_WORKER_THREADS`     | `1`                                                | `1` one thread; `0` a worker per CPU; `N` workers                                                        |
-| `EXECD_IDLE_TIMEOUT_MS`    | `0` (off)                                          | close a connection with no request in flight for this long (a stream in flight is never cut)             |
+| `EXECD_INSECURE_NO_AUTH`   | `false`                                            | serve with no bearer on a non-loopback address; without it execd refuses to start                                          |
+| `EXECD_RUN_AS`             | unset                                              | run every command as `user`, `uid`, `user:group` or `uid:gid` with the user's groups; execd must be root                   |
+| `EXECD_MAX_RESPONSE_BYTES` | 16 MiB                                             | most output one one-shot answer carries; match the agent's `--exec-max-response-bytes`                                     |
+| `EXECD_JOBS_DIR`           | `$TMPDIR`, else `/tmp`                             | where a kept job's last 8 MiB of output is spooled; use a disk-backed directory                                            |
+| `EXECD_LOG`                | `info`                                             | `off`, `error`, `warn`, `info`, `debug` or `trace`                                                                         |
+| `EXECD_WORKER_THREADS`     | `1`                                                | `1` one thread; `0` a worker per CPU; `N` workers                                                                          |
+| `EXECD_IDLE_TIMEOUT_MS`    | `0` (off)                                          | close a connection with no request in flight for this long (a stream in flight is never cut)                               |
 
 No `EXECD_*` variable reaches the commands execd runs. The startup line logs execd's version.
 
