@@ -62,6 +62,18 @@ impl Sandbox {
         Ok(Self { exec, files, jobs })
     }
 
+    /// A sandbox over `exec` whose tools are already known, so nothing is probed: to pin the
+    /// fallback rung the file helpers use (a test of a sandbox without `rg`, `grep -Z` or `find
+    /// -printf`).
+    pub fn with_capabilities(
+        exec: Arc<dyn CommandRunner>,
+        caps: crate::fs::shell::Capabilities,
+    ) -> Self {
+        let files = Arc::new(ShellFs::with_capabilities(exec.clone(), caps));
+        let jobs = Jobs::over(exec.clone());
+        Self { exec, files, jobs }
+    }
+
     /// Run `program` with `args`.
     pub fn exec<I, S>(&self, program: impl Into<String>, args: I) -> Command<'_>
     where
