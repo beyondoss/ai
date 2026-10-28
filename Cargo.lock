@@ -646,6 +646,7 @@ name = "beyond-sandbox-mcp"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "beyond-execd",
  "beyond-sandbox",
  "beyond-test-support",
  "hex",

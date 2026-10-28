@@ -42,6 +42,8 @@ tokio.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]
+# The real endpoint, embedded, for the tests that check what execd itself says.
+beyond-execd = { path = "../execd" }
 beyond-test-support = { path = "../test-support" }
 # The streamable-HTTP client, for the test that connects over `SANDBOX_MCP_LISTEN`; reqwest's rustls
 # has no default provider here, so the test installs `ring`.

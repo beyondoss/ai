@@ -39,10 +39,21 @@
 //! `stderr` is missing or is not standard base64, never reads it as empty. `stdin` is standard
 //! base64 too; an endpoint answers `400` to one that is not. Everything else in the answer is as
 //! ever: `exit_code` is the command's, `128 + S` for a command killed by signal `S`, `124` for one
-//! that hit its deadline (with a note, below), `127` for one that could not be started, with the
-//! reason as its stderr; none of these is an error. [`stream`] frames carry their output as base64
+//! that hit its deadline (with a note, below), `127` for one that was not found and `126` for one that could not be run (below), with the
+//! reason as its stderr (see below); none of these is an error. [`stream`] frames carry their output as base64
 //! alike, so every path moves the same bytes. `tests/fixtures/exec/output.json` holds the answer
 //! vectors every client decodes.
+//!
+//! **A command that cannot be started** has the shell's status and a reason on stderr that **names
+//! what failed, as the caller sent it**. `exit_code` is **127** when `command` is not a program the
+//! endpoint can find (`execd: pytest -q: command not found`; the usual cause is a whole command line
+//! in `command`) or when `cwd` cannot be entered (`execd: cwd /no/dir: No such file or directory`,
+//! `... Not a directory`), and **126** when the program is there and cannot be run (`execd: /:
+//! Permission denied`, a script with a bad interpreter, `Argument list too long`). A bare OS error
+//! (`No such file or directory (os error 2)`) names neither and is not conforming. For a missing
+//! program the endpoint MUST put `command` and the words `command not found` in stderr; for the
+//! 126 cases it MUST still name `command`. The streaming surface carries the same text in a
+//! `stderr` frame before the final frame with the same status.
 //!
 //! **Timeouts.** `timeout_ms` is the endpoint's to enforce: at the deadline it MUST kill the
 //! command's whole process group and SHOULD answer 200 with `exit_code` 124 and the note
@@ -104,7 +115,7 @@
 //! - **Exactly one final frame, last.** After it the endpoint MUST end the body. A body that ends
 //!   without one is a broken stream, never a success. Failures *before* answering are non-2xx
 //!   statuses exactly as for a one-shot call; a command that cannot be spawned is an ordinary result (`stderr`
-//!   frame, then `{"exit_code": 127}`), as a shell reports it.
+//!   frame, then `{"exit_code": 127}` or `126`), as a shell reports it.
 //! - **Ordering.** Frames of one stream are in the order the bytes were read; the relative order of
 //!   stdout and stderr is best-effort, as between two local pipes. The final frame comes after all
 //!   output read from both pipes. Once the command's process group is empty, the endpoint SHOULD

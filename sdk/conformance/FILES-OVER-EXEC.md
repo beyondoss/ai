@@ -70,8 +70,10 @@ or fails with a transport-level error (section 3.2).
 - `code` is the exit status. A command killed by signal `S` has
   `code` `128+S`, and a command that hit `timeout_ms` has `code` 124 with stderr
   ending `command exceeded its timeout`. A command that cannot be started (or
-  whose `cwd` is missing) has `code` 127 and the reason on stderr. None of
-  these is a transport error.
+  whose `cwd` is missing) has `code` 127 and a reason on stderr that names what
+  failed as the caller sent it: `execd: pytest -q: command not found`,
+  `execd: cwd /no/dir: No such file or directory` (exec spec: module doc of
+  `crates/sandbox/src/exec_endpoint.rs`). None of these is a transport error.
 - Timeouts: helpers use 120 s per command (`timeout_ms` 120000) and 10 s for
   the environment probe.
 
@@ -295,16 +297,24 @@ resolution, in order:
 3. a target that is a directory is refused (`Is a directory (os error 21)`, exit
    1), before the temp exists, because `mv -f` would move the temp _into_ it
    and report success;
-4. the temp is created empty with `set -C` (no-clobber: a preplanted temp is
+4. a target whose parent directory does not exist is refused before the temp
+   exists, in words that name the directory and not a temp file or a script line:
+   `parent directory DIR does not exist: No such file or directory (os error 2)`
+   (`DIR` is the parent as the path spells it, `/` for a file in the root, `.`
+   for a bare name; kind `not_found`). A parent that exists but is not a
+   directory fails at the temp as before (`not_a_directory`), and so does a parent
+   that cannot be resolved (`Too many levels of symbolic links`): only a parent
+   `ls` reports as missing is named here;
+5. the temp is created empty with `set -C` (no-clobber: a preplanted temp is
    refused, not followed) under `umask 077` (mode 0600), or
    with the default mode when the target does not exist, so the size check in
-   step 5 can read it back whatever the file's mode is: **a write needs no
+   step 6 can read it back whatever the file's mode is: **a write needs no
    read permission on the file** (a mode 0200 file is replaced). Creating the
    temp comes first, so a read-only filesystem reports its own
    `Read-only file system` and a full one its own error. Then, if the target
    exists and `[ -w TARGET ]` is false, the temp is removed and the write is
    refused (`Permission denied (os error 13)`, exit 1);
-5. the content is appended; the temp's size is checked against the expected
+6. the content is appended; the temp's size is checked against the expected
    byte count; the directory check runs again (a directory created meanwhile
    removes the temp and fails); if the target exists the temp gets its mode
    **now, just before the `mv`**: `chmod --reference`, falling back to
@@ -332,8 +342,11 @@ ones it cannot (a timeout).
 
 Further rules:
 
-- The parent directory must exist (`not_found`); `write` does not create
-  directories.
+- The parent directory must exist (`not_found`, detail `write PATH: parent
+  directory DIR does not exist: ...`, never a temp's name); `write` does not
+  create directories. A surface built for agents may create the missing parents
+  itself, with `mkdir -p` (the `create_dir_all` helper), before it writes: the
+  MCP server's `write_file` does.
 - A file the caller may not write is refused with `permission_denied` and
   unchanged: the script tests `[ -w TARGET ]` once the temp exists, and only then.
 - A file the caller may write but not read (mode 0200, 0333) is replaced: the
@@ -915,6 +928,14 @@ case "$t" in */*) tmp="${t%/*}/.tmp.$2" ;; *) tmp=".tmp.$2" ;; esac
 if [ -d "$t" ]; then
   echo "Is a directory (os error 21)" >&2
   exit 1
+fi
+case "$t" in */*) d="${t%/*}"; d="${d:-/}" ;; *) d=. ;; esac
+if [ ! -e "$d" ]; then
+  case $(LC_ALL=C ls -d "$d" 2>&1) in
+    *"No such file or directory"*)
+      echo "parent directory $d does not exist: No such file or directory (os error 2)" >&2
+      exit 1 ;;
+  esac
 fi
 set -C
 if [ -e "$t" ]; then (umask 077; : > "$tmp") || exit 1; else : > "$tmp" || exit 1; fi

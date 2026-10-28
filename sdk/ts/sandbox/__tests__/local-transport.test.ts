@@ -96,6 +96,21 @@ describe("a user's own transport", () => {
     });
   });
 
+  it("says a missing parent directory in plain words, with no temp file or script line", async () => {
+    const files = new Files(new LocalTransport());
+    const missing = `${dir}/no/such/dir`;
+    const err = await files.write(`${missing}/f`, "x").then(
+      () => null,
+      (e) => e,
+    );
+    expect(err).toMatchObject({ kind: "not_found" });
+    expect(err.detail).toBe(
+      `write ${missing}/f: parent directory ${missing} does not exist: No such file or directory (os error 2)`,
+    );
+    expect(err.detail).not.toMatch(/\.tmp\.|sh: \d+/);
+    expect((await files.list(dir)).map((e) => e.name)).not.toContain("no");
+  });
+
   it("reaches the sandbox with one probe round trip, then one per operation", async () => {
     const t = new LocalTransport();
     const files = new Files(t);
