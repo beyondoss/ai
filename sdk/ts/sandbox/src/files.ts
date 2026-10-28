@@ -27,6 +27,7 @@ import {
   windowLongLines,
   withDefaults,
 } from "./search.js";
+import { compileGlob } from "./glob.js";
 import type { SearchEngine, SearchQuery, SearchResult } from "./search.js";
 import type { RunResult, Transport } from "./transport.js";
 
@@ -396,6 +397,11 @@ export class Files {
     const caps = await this.capabilities();
     const engine = caps.searchEngine;
     const program = engine === "rg" ? "rg" : "grep";
+    // `rg` is given only a restricting glob (an excluding one would prune directories), so a bad
+    // excluding glob is rejected here and the exclusion applied to the hits below.
+    const excluded = engine === "rg" && q.glob !== undefined && q.globExclude
+      ? compileGlob(q.glob, false)
+      : null;
     const args = engine === "rg"
       ? rgArgs(q, await this.rootInGitRepo(q.root))
       : grepArgs(q, engine === "grep");
@@ -441,6 +447,9 @@ export class Files {
       }
     }
     hits = hits.filter((h) => !isUnderGitDir(q.root, h.path));
+    // Files only: the glob never decides whether a directory is descended. A root that is itself a
+    // file is searched whatever the glob says.
+    if (excluded) hits = hits.filter((h) => h.path === q.root || !excluded.test(h.path));
     const done = finalize(hits, q.limit);
     const first = stderr.trim().split("\n")[0] ?? "";
     return {

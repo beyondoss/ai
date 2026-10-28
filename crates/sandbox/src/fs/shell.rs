@@ -347,6 +347,16 @@ impl FsBackend for ShellFs {
 
     async fn search(&self, q: &SearchQuery) -> Result<SearchOutcome, FsError> {
         let engine = self.caps().await?.search_engine();
+        // Ripgrep gets only a restricting glob, so an excluding one is checked here: a bad one is
+        // still the caller's `invalid_query`, not a silently unfiltered search.
+        let excluded = match (&q.glob, engine) {
+            (Some((pattern, true)), SearchEngine::Ripgrep) => Some(
+                globset::Glob::new(pattern)
+                    .map_err(|e| FsError::InvalidQuery(format!("bad glob: {e}")))?
+                    .compile_matcher(),
+            ),
+            _ => None,
+        };
         let args = match engine {
             // The git-repo question is asked only on the rung that can act on it: `--no-require-git`
             // is a ripgrep flag, and the POSIX rungs honor no `.gitignore` at all.
@@ -409,6 +419,11 @@ impl FsBackend for ShellFs {
         // The engine was asked to skip `.git` where it can; this is the guarantee for the rungs that
         // can't (busybox `grep`, and a `.git` *file* GNU `--exclude-dir` does not cover).
         hits.retain(|h| !super::is_under_git_dir(&q.root, &h.path));
+        if let Some(matcher) = &excluded {
+            // Files only: the glob never decides whether a directory is descended. A root that is
+            // itself a file is searched whatever the glob says, as ripgrep does for a restricting one.
+            hits.retain(|h| h.path.as_ref() == q.root || !matcher.is_match(&*h.path));
+        }
         // (A line longer than the runner's 128 KiB capture arrives already cut, which is flagged as
         // truncation below.)
         // `ExecResult` keeps only the first and last 128 KiB of each stream and drops the middle. On a
@@ -1501,13 +1516,13 @@ fn rg_args(q: &SearchQuery, in_git_repo: bool) -> Vec<String> {
     if q.literal {
         args.push("--fixed-strings".to_string());
     }
-    if let Some((pattern, negate)) = &q.glob {
+    // Only a restricting glob goes to ripgrep. Its `--glob '!G'` also matches *directories*, so
+    // `!*.txt` would never descend into `d.txt/` and silently skip everything under it; no override
+    // form re-includes the directories without also whitelisting every file and directory past
+    // `.gitignore`. An excluding glob is applied to the hits instead (see [`drop_excluded`]).
+    if let Some((pattern, false)) = &q.glob {
         args.push("--glob".to_string());
-        args.push(if *negate {
-            format!("!{pattern}")
-        } else {
-            pattern.clone()
-        });
+        args.push(pattern.clone());
     }
     // After the caller's glob on purpose: ripgrep gives the *last* matching glob precedence. Never
     // applied to the root itself, so an explicit search of `repo/.git` still searches it.
@@ -2466,12 +2481,13 @@ mod tests {
     }
 
     #[test]
-    fn a_negated_glob_becomes_a_bang_prefixed_rg_glob() {
+    fn a_negated_glob_is_not_an_rg_glob() {
+        // `--glob '!G'` also prunes a directory whose name matches; the hits are filtered instead.
         let mut q = query("x", PathBuf::from("."), 100);
         q.glob = Some(("*.test.rs".into(), true));
         let args = rg_args(&q, false);
-        let g = args.iter().position(|a| a == "--glob").unwrap();
-        assert_eq!(args[g + 1], "!*.test.rs");
+        assert!(!args.iter().any(|a| a.contains("test.rs")), "{args:?}");
+        assert_eq!(args.iter().filter(|a| *a == "--glob").count(), 1, "only !.git");
     }
 
     #[test]
