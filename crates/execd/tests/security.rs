@@ -244,6 +244,77 @@ fn it_refuses_to_start_open_on_a_network() {
     assert!(!status.success() && log.contains("is empty"), "{log}");
 }
 
+/// `EXECD_BEARER` is scrubbed by a memfd and a re-exec before the listener opens. When no new
+/// descriptor can be created, that move fails; execd must exit then, and the message must not
+/// carry the token.
+///
+/// A `nofile` of 3 would also stop the dynamic linker, so the limit is applied from a constructor
+/// after the libraries are mapped: it lowers the soft limit and opens `/dev/null` until nothing
+/// is left. The memfd is then the descriptor that cannot be created.
+#[test]
+fn a_bearer_that_cannot_leave_the_environment_refuses_to_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("fill.c");
+    let so = dir.path().join("fill.so");
+    std::fs::write(
+        &src,
+        r#"
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <sys/resource.h>
+__attribute__((constructor)) static void no_free_fd(void) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur > 64) {
+        rl.rlim_cur = 64;
+        setrlimit(RLIMIT_NOFILE, &rl);
+    }
+    while (open("/dev/null", O_RDONLY) >= 0) {}
+}
+"#,
+    )
+    .unwrap();
+    assert!(
+        Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&so)
+            .arg(&src)
+            .status()
+            .unwrap()
+            .success(),
+        "could not build the descriptor-filling library"
+    );
+
+    let token = "sekret-do-not-print";
+    // `env` sets `LD_PRELOAD` for execd only. `timeout` itself must not load the library: it would
+    // fill its own descriptors and never start the child. Five seconds is a hung listener.
+    let preload = format!("LD_PRELOAD={}", so.display());
+    let out = Command::new("timeout")
+        .args(["--signal=KILL", "5", "env", &preload, support::BIN])
+        .env("EXECD_BEARER", token)
+        .env_remove("EXECD_BEARER_FILE")
+        .env_remove("LD_PRELOAD")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "it started: status {} stdout {stdout} stderr {stderr}",
+        out.status
+    );
+    assert!(
+        stderr.contains("cannot move the bearer"),
+        "stdout {stdout} stderr {stderr}"
+    );
+    assert!(
+        !stderr.contains(token) && !stdout.contains(token),
+        "the token reached the log: stdout {stdout} stderr {stderr}"
+    );
+}
+
 #[tokio::test]
 async fn it_starts_open_on_loopback_and_on_a_network_only_when_told_or_secured() {
     let bearer = token("it_starts_op");

@@ -105,7 +105,7 @@
 //! | `{}` | heartbeat: the connection is alive; never output |
 //! | `{"shell_exit": N}` | the command exited with code N, but processes of its group run on — see "Leftover processes"; not final, never output |
 //! | `{"exit_code": N}` | **final**: the command exited with code N |
-//! | `{"signal": S}` | **final**: the command was killed by signal S (9 for SIGKILL) |
+//! | `{"signal": S}` | **final**: the command was killed by signal S (9 for SIGKILL). `128 + S` must fit an `i32`; a wider S is a broken frame |
 //! | `{"timed_out": true}` | **final**: the endpoint killed the command at `timeout_ms` |
 //! | `{"error": "<message>"}` | **final**: the endpoint failed after answering 200 (lost the sandbox) |
 //!
@@ -113,6 +113,9 @@
 //!   `Content-Type: application/x-ndjson` as `protocol` (FILES-OVER-EXEC.md section 3.2), whatever the
 //!   body holds: it never reads that body as a one-shot answer. A non-2xx answer is an error as for a
 //!   one-shot call.
+//! - **A line that is not a frame** (not a JSON object, an output field that is not standard base64,
+//!   a line past the client's limit with no newline) is `protocol` for a client (FILES-OVER-EXEC.md
+//!   section 3.2); a stream that stops (no final frame, `{"error"}`, silence) is `transport`.
 //! - Output is **standard base64 with padding** (RFC 4648 §4), so arbitrary bytes — invalid UTF-8,
 //!   NULs, terminal escapes — survive. An output frame MUST NOT be empty and MUST carry at most
 //!   64 KiB of decoded bytes ([`stream::MAX_FRAME_PAYLOAD`]); split anything longer.

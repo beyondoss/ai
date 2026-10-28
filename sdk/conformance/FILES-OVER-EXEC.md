@@ -135,6 +135,7 @@ situations.
 | any other non-2xx                                                   | `endpoint`  |
 | 200 whose body is not the expected JSON                             | `protocol`  |
 | a stream request answered 200 without `application/x-ndjson`        | `protocol`  |
+| a stream line that is not a frame (see below)                       | `protocol`  |
 | a stream ends without its final frame, or a `{"error"}` frame       | `transport` |
 
 A stream request is answered by a stream or by an error. A non-2xx answer to it is an error exactly as
@@ -143,6 +144,12 @@ for a one-shot call, by the rows above (`auth`, `too_large`, `endpoint`). A **20
 never read as a one-shot answer (an object that looks like a result would be a clean empty exit 0,
 silent data loss). A client that reads such a body before failing may report its own error
 instead when the body is over the cap (`too_large`) or is not a one-shot answer (`protocol`).
+
+A stream line that is not a frame is `protocol`, not `transport`: the bytes arrived and the endpoint
+spoke something else. That is a line that is not a JSON object, an output field that is not
+standard base64, and a line that grows past the line limit without a newline. `transport` is for
+bytes that stopped coming: a stream that ends without its final frame (in the middle of a line
+included), a `{"error"}` frame, silence past the heartbeat limit, a reset.
 
 A token source is a function or command that gives the bearer (layer 1). It fails when it
 raises or exits non-zero, or gives an empty token. That is `auth`, on every call that needs a
@@ -318,7 +325,8 @@ resolution, in order:
    for a bare name; kind `not_found`). A parent that exists but is not a
    directory fails at the temp as before (`not_a_directory`), and so does a parent
    that cannot be resolved (`Too many levels of symbolic links`): only a parent
-   `ls` reports as missing is named here;
+   `ls` reports as missing is named here, and that text is quoted so a `*` or space in
+   the path is not expanded before the match;
 5. the temp is created empty with `set -C` (no-clobber: a preplanted temp is
    refused, not followed) under `umask 077` (mode 0600), or
    with the default mode when the target does not exist, so the size check in
@@ -982,7 +990,7 @@ if [ -d "$t" ]; then
 fi
 case "$t" in */*) d="${t%/*}"; d="${d:-/}" ;; *) d=. ;; esac
 if [ ! -e "$d" ]; then
-  case $(LC_ALL=C ls -d "$d" 2>&1) in
+  case "$(LC_ALL=C ls -d "$d" 2>&1)" in
     *"No such file or directory"*)
       echo "parent directory $d does not exist: No such file or directory (os error 2)" >&2
       exit 1 ;;

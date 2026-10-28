@@ -100,7 +100,13 @@ pub fn classify(msg: &str, kind: Option<std::io::ErrorKind>) -> ToolError {
     if msg.contains("unreachable") {
         return err("transport");
     }
-    if msg.contains("unparseable JSON") || msg.contains("not a stream") {
+    if msg.contains("unparseable JSON")
+        || msg.contains("not a stream")
+        || msg.contains("unparseable frame")
+        || msg.contains("unparseable job frame")
+        || msg.contains("is not standard base64")
+        || msg.contains("without a newline")
+    {
         return err("protocol");
     }
     if msg.contains("exec endpoint") && msg.contains(" returned ") {
@@ -148,6 +154,18 @@ mod tests {
                 "exec endpoint http://x answered a stream request with something that is not a stream"
             ),
             "protocol"
+        );
+        assert_eq!(
+            k("exec endpoint http://x: unparseable frame (expected value): nope"),
+            "protocol"
+        );
+        assert_eq!(
+            k("job stream: output is not standard base64 (bad)"),
+            "protocol"
+        );
+        assert_eq!(
+            k("exec endpoint x: the stream ended before the command's final frame"),
+            "transport"
         );
         assert_eq!(k("write: Permission denied"), "permission_denied");
         assert_eq!(k("something else"), "io");
