@@ -310,7 +310,8 @@ resolution, in order:
    for a bare name; kind `not_found`). A parent that exists but is not a
    directory fails at the temp as before (`not_a_directory`), and so does a parent
    that cannot be resolved (`Too many levels of symbolic links`): only a parent
-   `ls` reports as missing is named here;
+   `ls` reports as missing is named here, and that text is quoted so a `*` or space in
+   the path is not expanded before the match;
 5. the temp is created empty with `set -C` (no-clobber: a preplanted temp is
    refused, not followed) under `umask 077` (mode 0600), or
    with the default mode when the target does not exist, so the size check in
@@ -974,7 +975,7 @@ if [ -d "$t" ]; then
 fi
 case "$t" in */*) d="${t%/*}"; d="${d:-/}" ;; *) d=. ;; esac
 if [ ! -e "$d" ]; then
-  case $(LC_ALL=C ls -d "$d" 2>&1) in
+  case "$(LC_ALL=C ls -d "$d" 2>&1)" in
     *"No such file or directory"*)
       echo "parent directory $d does not exist: No such file or directory (os error 2)" >&2
       exit 1 ;;

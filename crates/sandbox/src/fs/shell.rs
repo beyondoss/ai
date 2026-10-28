@@ -474,12 +474,29 @@ impl FsBackend for ShellFs {
     async fn stat(&self, path: &Path) -> Result<Option<Meta>, FsError> {
         let args = sh_script(STAT_SCRIPT, &[path.to_string_lossy().into_owned()]);
         let result = self.exec("sh", &args).await?;
-        // A missing path is a non-zero exit with a message on stderr — an ordinary branch, not a
-        // failure, so it maps to `None` exactly as `LocalFs`'s `metadata().ok()?` does.
-        if result.code != Some(0) || result.stdout.trim().is_empty() {
-            return Ok(None);
+        // Exit 1 is the script's `[ -e ]` miss: an ordinary absence, `None`, as `LocalFs`'s
+        // `metadata().ok()?` is. A timeout, a signal, or any other status is a failed stat — mapping
+        // it to absence would let `write_if_unchanged` treat `None` as "unchanged" and write.
+        if result.timed_out {
+            return Err(FsError::Backend(format!(
+                "stat {}: command exceeded its timeout",
+                path.display()
+            )));
         }
-        Ok(parse_stat(&result.stdout))
+        match result.code {
+            Some(0) if !result.stdout.trim().is_empty() => Ok(parse_stat(&result.stdout)),
+            Some(0) | Some(1) => Ok(None),
+            Some(code) => Err(FsError::Backend(format!(
+                "stat {}: command exited {code}: {}",
+                path.display(),
+                first_line_or(&result.stderr, "command failed")
+            ))),
+            None => Err(FsError::Backend(format!(
+                "stat {}: command failed: {}",
+                path.display(),
+                first_line_or(&result.stderr, "command failed")
+            ))),
+        }
     }
 
     /// One command per [`READ_CHUNK`] bytes, so every command's output fits the runner's capture
@@ -1458,7 +1475,7 @@ macro_rules! new_temp {
             not_a_directory!(),
             r#"case "$t" in */*) d="${t%/*}"; d="${d:-/}" ;; *) d=. ;; esac
 if [ ! -e "$d" ]; then
-  case $(LC_ALL=C ls -d "$d" 2>&1) in
+  case "$(LC_ALL=C ls -d "$d" 2>&1)" in
     *"No such file or directory"*)
       echo "parent directory $d does not exist: No such file or directory (os error 2)" >&2
       exit 1 ;;
@@ -2506,6 +2523,91 @@ mod tests {
         ) -> std::io::Result<crate::exec::ExecResult> {
             unreachable!("a test double that only runs to completion")
         }
+    }
+
+    /// A runner that returns one fixed result, for `stat`'s status mapping.
+    struct Canned(ExecResult);
+
+    #[async_trait::async_trait]
+    impl CommandRunner for Canned {
+        async fn run(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<&str>,
+            _: Duration,
+        ) -> std::io::Result<ExecResult> {
+            Ok(self.0.clone())
+        }
+
+        async fn run_streaming(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<&str>,
+            _: std::time::Duration,
+            _: crate::exec::ChunkSink<'_>,
+        ) -> std::io::Result<crate::exec::ExecResult> {
+            unreachable!("a test double that only runs to completion")
+        }
+
+        async fn run_streaming_tracked(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<&str>,
+            _: &crate::exec::JobHooks<'_>,
+        ) -> std::io::Result<crate::exec::ExecResult> {
+            unreachable!("a test double that only runs to completion")
+        }
+
+        async fn run_attached(
+            &self,
+            _: &str,
+            _: &[String],
+            _: Option<&str>,
+            _: crate::exec::ChunkSink<'_>,
+            _: crate::exec::ChunkSink<'_>,
+        ) -> std::io::Result<crate::exec::ExecResult> {
+            unreachable!("a test double that only runs to completion")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_stat_is_an_error_and_a_missing_path_is_absence() {
+        let missing = ShellFs::connect(Arc::new(Canned(ExecResult {
+            code: Some(1),
+            ..ExecResult::default()
+        })))
+        .await
+        .unwrap();
+        assert!(missing.stat(Path::new("/no/such")).await.unwrap().is_none());
+
+        let timed_out = ShellFs::connect(Arc::new(Canned(ExecResult {
+            timed_out: true,
+            ..ExecResult::default()
+        })))
+        .await
+        .unwrap();
+        let err = timed_out.stat(Path::new("/x")).await.unwrap_err();
+        assert!(err.to_string().contains("timeout"), "{err}");
+
+        let other = ShellFs::connect(Arc::new(Canned(ExecResult {
+            code: Some(2),
+            stderr: b"boom".to_vec(),
+            ..ExecResult::default()
+        })))
+        .await
+        .unwrap();
+        let err = other.stat(Path::new("/x")).await.unwrap_err();
+        assert!(err.to_string().contains("exited 2"), "{err}");
+        assert!(err.to_string().contains("boom"), "{err}");
+
+        let killed = ShellFs::connect(Arc::new(Canned(ExecResult::default())))
+            .await
+            .unwrap();
+        let err = killed.stat(Path::new("/x")).await.unwrap_err();
+        assert!(err.to_string().contains("command failed"), "{err}");
     }
 
     #[tokio::test]

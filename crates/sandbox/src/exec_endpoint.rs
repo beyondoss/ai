@@ -105,7 +105,7 @@
 //! | `{}` | heartbeat: the connection is alive; never output |
 //! | `{"shell_exit": N}` | the command exited with code N, but processes of its group run on — see "Leftover processes"; not final, never output |
 //! | `{"exit_code": N}` | **final**: the command exited with code N |
-//! | `{"signal": S}` | **final**: the command was killed by signal S (9 for SIGKILL) |
+//! | `{"signal": S}` | **final**: the command was killed by signal S (9 for SIGKILL). `128 + S` must fit an `i32`; a wider S is a broken frame |
 //! | `{"timed_out": true}` | **final**: the endpoint killed the command at `timeout_ms` |
 //! | `{"error": "<message>"}` | **final**: the endpoint failed after answering 200 (lost the sandbox) |
 //!
