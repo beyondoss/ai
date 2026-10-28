@@ -6,10 +6,9 @@
 //! speaks to it with rmcp's client. It has no sandbox code of its own, so what it proves is the
 //! server: the tools' schemas, their errors, and what a model would get back.
 //!
-//! The ops with no tool are answered `unsupported`, with the reason, and are left out of `hello`'s
-//! list so the harness counts the scenarios that need them as unsupported, never as passes:
-//! `exec_stream` (a tool result is not streamed) and `write_if_unchanged` (no tool takes a
-//! caller-supplied expected mtime; `edit_file` uses one internally).
+//! The one op with no tool is answered `unsupported`, with the reason, and is left out of `hello`'s
+//! list so the harness counts the checks that need it as unsupported, never as passes:
+//! `exec_stream` (a tool result is not streamed).
 //!
 //! Two ops are composed of tool calls because the contract's operation is a loop or a filter over
 //! them: `job_attach` polls `job_output` to the job's end, `job_remove` and `job_wipe` list jobs
@@ -49,6 +48,7 @@ const OPS: &[&str] = &[
     "stat",
     "read",
     "write",
+    "write_if_unchanged",
     "mkdir",
     "list",
     "search",
@@ -59,10 +59,6 @@ fn unsupported_reason(op: &str) -> Option<&'static str> {
         "exec_stream" => Some(
             "sandbox-mcp has no streaming tool: an MCP tool result arrives whole, so there is no live \
              output to compare (use exec, or job_start and job_output)",
-        ),
-        "write_if_unchanged" => Some(
-            "no sandbox-mcp tool takes an expected mtime; edit_file performs a guarded write against \
-             the mtime it read, which the caller cannot supply",
         ),
         _ => None,
     }
@@ -366,6 +362,39 @@ impl Mcp {
                     args(vec![
                         ("path", json!(path)),
                         ("content_base64", json!(str_arg(req, "data_b64")?)),
+                    ]),
+                )
+                .await?;
+                Ok(json!({}))
+            }
+            "write_if_unchanged" => {
+                let path = str_arg(req, "path")?;
+                bytes_arg(req, "data_b64")?;
+                // `expected_mtime` is required; null is "the file must not exist".
+                let guard = match req.get("expected_mtime") {
+                    None => {
+                        return Err(err(
+                            "invalid_request",
+                            "`expected_mtime` is required (null means the file must not exist)",
+                        ));
+                    }
+                    Some(Value::Null) => ("create_only", json!(true)),
+                    Some(v) => match v.as_f64() {
+                        Some(s) if s.is_finite() && s >= 0.0 => ("if_unchanged_since", json!(s)),
+                        _ => {
+                            return Err(err(
+                                "invalid_request",
+                                "`expected_mtime` must be a non-negative number or null",
+                            ));
+                        }
+                    },
+                };
+                self.tool(
+                    "write_file",
+                    args(vec![
+                        ("path", json!(path)),
+                        ("content_base64", json!(str_arg(req, "data_b64")?)),
+                        guard,
                     ]),
                 )
                 .await?;

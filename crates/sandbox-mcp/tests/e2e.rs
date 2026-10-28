@@ -213,6 +213,80 @@ async fn files_edit_list_search_and_stat_work_through_the_tools() {
 }
 
 #[tokio::test]
+async fn write_file_guarded_by_the_mtime_from_stat_refuses_a_lost_update() {
+    tokio::time::timeout(DEADLINE, async {
+        let (dir, mock) = sandbox().await;
+        let root = dir.path().canonicalize().unwrap();
+        let f = format!("{}/g.txt", root.display());
+        let client = connect(&mock.url).await;
+        let peer = client.peer();
+
+        // create_only: the first write makes the file, the second finds it there.
+        ok(&call(
+            peer,
+            "write_file",
+            json!({"path": f, "content": "v1", "create_only": true}),
+        )
+        .await);
+        let r = call(
+            peer,
+            "write_file",
+            json!({"path": f, "content": "x", "create_only": true}),
+        )
+        .await;
+        assert_eq!(error_kind(&r), "conflict");
+
+        // The mtime stat returns is fractional, and writing against it works.
+        let st = call(peer, "stat", json!({"path": f})).await;
+        let m = ok(&st)["mtime"].as_f64().unwrap();
+        assert!(m > 1.0e9);
+        ok(&call(
+            peer,
+            "write_file",
+            json!({"path": f, "content": "v2", "if_unchanged_since": m}),
+        )
+        .await);
+
+        // The file changed, so the same (now stale) mtime is a conflict that writes nothing.
+        let r = call(
+            peer,
+            "write_file",
+            json!({"path": f, "content": "v3", "if_unchanged_since": m}),
+        )
+        .await;
+        assert_eq!(error_kind(&r), "conflict");
+        let r = call(peer, "read_file", json!({"path": f})).await;
+        assert_eq!(ok(&r)["content"], "v2");
+
+        // A removed file is a conflict too; the two guards do not combine; a negative mtime is refused.
+        let gone = format!("{}/none.txt", root.display());
+        let r = call(
+            peer,
+            "write_file",
+            json!({"path": gone, "content": "x", "if_unchanged_since": m}),
+        )
+        .await;
+        assert_eq!(error_kind(&r), "conflict");
+        let r = call(
+            peer,
+            "write_file",
+            json!({"path": f, "content": "x", "if_unchanged_since": m, "create_only": true}),
+        )
+        .await;
+        assert_eq!(error_kind(&r), "invalid_request");
+        let r = call(
+            peer,
+            "write_file",
+            json!({"path": f, "content": "x", "if_unchanged_since": -1.0}),
+        )
+        .await;
+        assert_eq!(error_kind(&r), "invalid_request");
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn binary_files_travel_as_base64_and_a_cut_character_is_left_for_the_next_read() {
     tokio::time::timeout(DEADLINE, async {
         let (dir, mock) = sandbox().await;
