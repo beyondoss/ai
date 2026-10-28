@@ -11,9 +11,6 @@ export function text(b: Uint8Array): string {
   return decoder.decode(b);
 }
 
-const B64_RE =
-  /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
-
 /** Standard base64 (RFC 4648 section 4) with padding. */
 export function toBase64(bytes: Uint8Array): string {
   if (typeof Buffer !== "undefined") {
@@ -27,15 +24,55 @@ export function toBase64(bytes: Uint8Array): string {
   return btoa(s);
 }
 
-/** Strict standard base64 with padding; whitespace is ignored. Returns null if it is not base64. */
+/** Whitespace as JavaScript's `\s` matches it (WhiteSpace and LineTerminator). */
+function isSpace(c: number): boolean {
+  if (c < 128) return c === 32 || (c >= 9 && c <= 13);
+  return (
+    c === 0xa0
+    || c === 0x1680
+    || (c >= 0x2000 && c <= 0x200a)
+    || c === 0x2028
+    || c === 0x2029
+    || c === 0x202f
+    || c === 0x205f
+    || c === 0x3000
+    || c === 0xfeff
+  );
+}
+
+/** Removes every whitespace char in one linear pass. Returns `s` itself when there is none. */
+function stripSpace(s: string): string {
+  let out = "";
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    if (isSpace(s.charCodeAt(i))) {
+      out += s.slice(start, i);
+      start = i + 1;
+    }
+  }
+  return start === 0 ? s : out + s.slice(start);
+}
+
+/**
+ * Strict standard base64 with padding; whitespace is ignored. Returns null if it is not base64.
+ * Decodes with the platform, then re-encodes and compares: that rejects anything the decoder
+ * silently skips (bad characters, wrong padding, bad length) and non-canonical trailing bits,
+ * as the Rust client does. Both calls are native and linear.
+ */
 export function fromBase64(s: string): Uint8Array | null {
-  const clean = s.replace(/\s+/g, "");
-  if (!B64_RE.test(clean)) return null;
+  const clean = stripSpace(s);
   if (typeof Buffer !== "undefined") {
     const b = Buffer.from(clean, "base64");
+    if (b.toString("base64") !== clean) return null;
     return new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
   }
-  const bin = atob(clean);
+  let bin: string;
+  try {
+    bin = atob(clean);
+  } catch {
+    return null;
+  }
+  if (btoa(bin) !== clean) return null;
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
