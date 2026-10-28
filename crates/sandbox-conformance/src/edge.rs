@@ -98,6 +98,7 @@ impl Edge {
             .ok_or("the edge fronts plain http endpoints only")?;
         let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
         let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        // port-0: the edge holds its listener for the run and reads the port it got from it.
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|e| e.to_string())?;
