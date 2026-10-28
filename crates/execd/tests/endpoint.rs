@@ -166,7 +166,7 @@ fn the_request_limit_is_the_largest_file_the_agent_writes_in_base64_plus_an_argv
 /// missing `cwd` is named as the directory, not as the program.
 #[tokio::test]
 async fn a_command_that_cannot_start_names_what_failed() {
-    let (server, _dir) = start(|_| {}).await;
+    let (server, dir) = start(|_| {}).await;
     let addr = server.local_addr();
     let stderr_of = |a: &support::http::Answer| -> String {
         let v = a.json();
@@ -182,6 +182,26 @@ async fn a_command_that_cannot_start_names_what_failed() {
         stderr_of(&a),
         "execd: cwd /no/such/dir: No such file or directory\n"
     );
+    // A program that is there and cannot be run is 126, as a shell says; a cwd that is a file stays 127.
+    let a = post(addr, &[], &run("/", &[])).await;
+    assert_eq!(a.json()["exit_code"], 126, "{}", a.json());
+    assert_eq!(
+        String::from_utf8(bytes(&a.json(), "stderr")).unwrap(),
+        "execd: /: Permission denied\n"
+    );
+    let file = dir.path().join("a-file");
+    std::fs::write(&file, "x").unwrap();
+    let mut req = run("pwd", &[]);
+    req["cwd"] = json!(file.to_str().unwrap());
+    let a = post(addr, &[], &req).await;
+    assert_eq!(
+        stderr_of(&a),
+        format!("execd: cwd {}: Not a directory\n", file.display())
+    );
+    let mut req = run("/", &[]);
+    req["stream"] = json!(true);
+    let frames = post(addr, &[], &req).await.frames();
+    assert_eq!(frames.last().unwrap(), &json!({ "exit_code": 126 }));
     let mut req = run("pytest -q", &[]);
     req["stream"] = json!(true);
     let frames = post(addr, &[], &req).await.frames();

@@ -70,7 +70,7 @@ async fn a_conforming_endpoint_passes_every_check() {
         "{}",
         report.render()
     );
-    assert_eq!(report.checks.len(), 19 + conformance::notify::CHECKS.len());
+    assert_eq!(report.checks.len(), 20 + conformance::notify::CHECKS.len());
 }
 
 /// A conforming mock with one fault: of the notify checks, exactly `check` fails. (The other checks
@@ -343,7 +343,7 @@ async fn an_endpoint_that_reports_a_bare_os_error_fails_the_spawn_check() {
         .collect();
     assert_eq!(
         failed,
-        vec![conformance::SPAWN_FAILURE],
+        vec![conformance::SPAWN_FAILURE, conformance::NOT_RUNNABLE],
         "{}",
         report.render()
     );

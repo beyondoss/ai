@@ -5,7 +5,7 @@
 //! through `sudo -n` (a test that cannot mount says `SKIPPED`).
 //!
 //! The spec's rules these encode (`crates/sandbox/src/exec_endpoint.rs`): a command that cannot be
-//! spawned is an ordinary result (one-shot `exit_code` 127, streaming a `stderr` frame then 127), a job that
+//! spawned is an ordinary result (one-shot `exit_code` 126, streaming a `stderr` frame then 126), a job that
 //! cannot be started is a non-2xx answer, offsets never move (dropped output is a gap, reported in
 //! `offset`), and a failure never ends a job that is running.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -114,10 +114,10 @@ async fn assert_spawn_fails_cleanly(e: &Execd, why: &str) {
         String::from_utf8_lossy(&a.body)
     );
     let v = a.json();
-    assert_eq!(v["exit_code"], 127, "one-shot ({why}): {v}");
+    assert_eq!(v["exit_code"], 126, "one-shot ({why}): {v}");
     assert!(
         !v["stderr"].as_str().unwrap_or("").is_empty(),
-        "one-shot ({why}): 127 with no reason: {v}"
+        "one-shot ({why}): 126 with no reason: {v}"
     );
 
     let a = call(e, stream("echo never")).await;
@@ -125,7 +125,7 @@ async fn assert_spawn_fails_cleanly(e: &Execd, why: &str) {
     let frames = a.frames();
     assert_eq!(
         final_frame(&frames)["exit_code"],
-        127,
+        126,
         "streaming ({why}): {frames:?}"
     );
     assert!(
@@ -470,7 +470,7 @@ async fn running_out_of_descriptors_fails_spawns_cleanly_and_recovers() {
         };
         assert_eq!(a.status, 200, "{}", String::from_utf8_lossy(&a.body));
         let v = a.json();
-        if v["exit_code"] == 127 {
+        if v["exit_code"] == 126 {
             let why = String::from_utf8_lossy(
                 &base64::engine::general_purpose::STANDARD
                     .decode(v["stderr"].as_str().unwrap_or(""))

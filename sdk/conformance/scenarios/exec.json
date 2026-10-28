@@ -162,6 +162,40 @@
       ]
     },
     {
+      "id": "exec.exit.not-executable",
+      "description": "A file that exists but is not executable is the shell's 126, not 127 (not found); stderr names it. execd says `execd: FILE: Permission denied`, a shell `sh: 1: exec: FILE: Permission denied`.",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; : > \"$1/plain\"; chmod 644 \"$1/plain\"",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "a",
+          "op": "exec",
+          "command": "${ROOT}/plain",
+          "args": [],
+          "expect": {
+            "ok": {
+              "exit_code": 126,
+              "stdout_utf8": "",
+              "stderr_utf8": {
+                "$re": "/plain: Permission denied"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
       "id": "exec.exit.signal-is-128-plus-n",
       "description": "Over the one-shot envelope a command killed by signal S has exit_code 128+S.",
       "steps": [

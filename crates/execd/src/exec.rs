@@ -69,24 +69,36 @@ pub(crate) fn command_for(ctx: &Ctx, req: &Request) -> std::process::Command {
     cmd
 }
 
-/// Why `req` could not be started, as the one line a shell would print: `execd: pytest -q: command
-/// not found` for a program that is not there (the caller put a whole command line in `command`, or
-/// misspelled it), `execd: cwd DIR: No such file or directory` for a directory that is not, and
-/// `execd: PROGRAM: REASON` for anything else (`Argument list too long`, `Permission denied`). The
-/// name is always the one the caller sent, because a bare OS error says neither which file nor which
-/// directory. Ends in a newline, like stderr.
-pub(crate) fn spawn_failure(ctx: &Ctx, req: &Request, e: &std::io::Error) -> String {
-    if e.kind() == std::io::ErrorKind::NotFound {
-        let cwd = req
-            .cwd
-            .as_deref()
-            .map_or_else(|| ctx.opts.root.clone(), Into::into);
-        if !cwd.is_dir() {
-            return format!("execd: cwd {}: {}\n", cwd.display(), strip_os_code(e));
-        }
-        return not_found(&req.command);
+/// Why `req` could not be started: the exit status and the one line a shell would print, by the
+/// shell's convention. 127 is a program that is not there (`execd: pytest -q: command not found`: the
+/// caller put a whole command line in `command`, or misspelled it) and a `cwd` that cannot be
+/// entered (`execd: cwd DIR: No such file or directory`, `... Not a directory`). 126 is a program that
+/// is there and cannot be run (`execd: /: Permission denied`, a script with a bad interpreter,
+/// `Argument list too long`). The name is the one the caller sent, because a bare OS error says
+/// neither which file nor which directory. The line ends in a newline, like stderr.
+pub(crate) fn spawn_failure(ctx: &Ctx, req: &Request, e: &std::io::Error) -> (i32, String) {
+    use std::io::ErrorKind::NotFound;
+    let cwd = req
+        .cwd
+        .as_deref()
+        .map_or_else(|| ctx.opts.root.clone(), Into::into);
+    if !cwd.is_dir()
+        && e.raw_os_error().is_some_and(|n| {
+            n == nix::errno::Errno::ENOENT as i32 || n == nix::errno::Errno::ENOTDIR as i32
+        })
+    {
+        return (
+            127,
+            format!("execd: cwd {}: {}\n", cwd.display(), strip_os_code(e)),
+        );
     }
-    format!("execd: {}: {}\n", req.command, strip_os_code(e))
+    if e.kind() == NotFound {
+        return (127, not_found(&req.command));
+    }
+    (
+        126,
+        format!("execd: {}: {}\n", req.command, strip_os_code(e)),
+    )
 }
 
 /// The line for a program that is not there.
@@ -199,8 +211,8 @@ pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
         // `Argument list too long` lands here: an ordinary result, as a shell reports it.
         Err(e) => {
             line.done(200, "spawn failed");
-            let why = spawn_failure(ctx, &req, &e);
-            return http::json_response(200, &answer(127, b"", why.as_bytes()));
+            let (code, why) = spawn_failure(ctx, &req, &e);
+            return http::json_response(200, &answer(code, b"", why.as_bytes()));
         }
     };
     // Killed on every way out, including this future being dropped when the client leaves (one-shot: a
@@ -429,12 +441,12 @@ async fn run_stream(ctx: Arc<Ctx>, req: Request, out: mpsc::Sender<Bytes>) {
         Ok(p) => p,
         Err(e) => {
             // A command that cannot be spawned is an ordinary result, as a shell reports it.
-            let why = spawn_failure(&ctx, &req, &e);
+            let (code, why) = spawn_failure(&ctx, &req, &e);
             let _ = sink
                 .put_final(frame::output("stderr", why.as_bytes()))
                 .await;
             let _ = sink
-                .put_final(frame::json(&json!({ "exit_code": 127 })))
+                .put_final(frame::json(&json!({ "exit_code": code })))
                 .await;
             line.done(200, "spawn failed");
             return;

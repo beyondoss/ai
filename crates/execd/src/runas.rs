@@ -246,16 +246,18 @@ fn helper(args: &[OsString]) -> ExitCode {
                 return ExitCode::from(127);
             }
             let err = std::process::Command::new(command).args(argv).exec();
+            // 127: not there; 126: there and cannot be run (see `exec::spawn_failure`).
             if err.kind() == std::io::ErrorKind::NotFound {
                 eprint!("{}", crate::exec::not_found(&command.to_string_lossy()));
+                ExitCode::from(127)
             } else {
                 eprintln!(
                     "execd: {}: {}",
                     command.to_string_lossy(),
                     crate::exec::strip_os_code(&err)
                 );
+                ExitCode::from(126)
             }
-            ExitCode::from(127)
         }
         _ => fail("bad helper mode".into()),
     }
