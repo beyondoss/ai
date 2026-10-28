@@ -95,7 +95,12 @@ fn classify(msg: &str, kind: Option<std::io::ErrorKind>) -> Value {
     if msg.contains("unreachable") {
         return err("transport", msg);
     }
-    if msg.contains("unparseable JSON") {
+    if msg.contains("unparseable JSON")
+        || msg.contains("unparseable frame")
+        || msg.contains("unparseable job frame")
+        || msg.contains("is not standard base64")
+        || msg.contains("without a newline")
+    {
         return err("protocol", msg);
     }
     if msg.contains("exec endpoint") && msg.contains(" returned ") {

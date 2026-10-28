@@ -134,7 +134,14 @@ situations.
 | HTTP 422 whose body says the output exceeded the cap, or client cap | `too_large` |
 | any other non-2xx                                                   | `endpoint`  |
 | 200 whose body is not the expected JSON                             | `protocol`  |
+| a stream line that is not a frame (see below)                       | `protocol`  |
 | a stream ends without its final frame, or a `{"error"}` frame       | `transport` |
+
+A stream line that is not a frame is `protocol`, not `transport`: the bytes arrived and the endpoint
+spoke something else. That is a line that is not a JSON object, an output field that is not
+standard base64, and a line that grows past the line limit without a newline. `transport` is for
+bytes that stopped coming: a stream that ends without its final frame (in the middle of a line
+included), a `{"error"}` frame, silence past the heartbeat limit, a reset.
 
 A call renews its token at most once. On a `401` with a token source that can give another, the
 client asks the source again and repeats that request once with whatever it gave, even the same
@@ -316,7 +323,8 @@ resolution, in order:
    for a bare name; kind `not_found`). A parent that exists but is not a
    directory fails at the temp as before (`not_a_directory`), and so does a parent
    that cannot be resolved (`Too many levels of symbolic links`): only a parent
-   `ls` reports as missing is named here;
+   `ls` reports as missing is named here, and that text is quoted so a `*` or space in
+   the path is not expanded before the match;
 5. the temp is created empty with `set -C` (no-clobber: a preplanted temp is
    refused, not followed) under `umask 077` (mode 0600), or
    with the default mode when the target does not exist, so the size check in
@@ -980,7 +988,7 @@ if [ -d "$t" ]; then
 fi
 case "$t" in */*) d="${t%/*}"; d="${d:-/}" ;; *) d=. ;; esac
 if [ ! -e "$d" ]; then
-  case $(LC_ALL=C ls -d "$d" 2>&1) in
+  case "$(LC_ALL=C ls -d "$d" 2>&1)" in
     *"No such file or directory"*)
       echo "parent directory $d does not exist: No such file or directory (os error 2)" >&2
       exit 1 ;;

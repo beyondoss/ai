@@ -112,6 +112,12 @@ def test_a_frame_naming_more_than_one_field_is_split_output_first() -> None:
     assert frames == [Stdout(b"a"), Exit(1)]
 
 
+@pytest.mark.parametrize("line", [b"not json", b"[1]", b'{"stdout":"!!not base64!!"}'])
+def test_a_line_that_is_not_a_frame_is_a_protocol_error(line: bytes) -> None:
+    with pytest.raises(ProtocolError):
+        _wire.decode_line(line)
+
+
 def test_an_overlong_line_is_refused() -> None:
     with pytest.raises(ProtocolError):
         _wire.LineSplitter().feed(b"x" * (_wire.MAX_FRAME_LINE + 1))

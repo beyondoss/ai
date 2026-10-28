@@ -18,9 +18,12 @@ const BEARER_FD: &str = "EXECD_BEARER_FD";
 /// later does to its variables, and a command that runs as execd's uid can read it. So the token is
 /// written to a memfd and execd re-executes itself without the variable; the new image's environ
 /// never held the token. The descriptor is read and closed at once ([`take_inherited_bearer`]).
-fn move_bearer_out_of_environ() {
+///
+/// `Ok` when there was nothing to move (this image is the one that listens). A memfd or exec that
+/// fails is `Err`: serving would leave the token in environ, so the process must exit instead.
+fn move_bearer_out_of_environ() -> Result<(), String> {
     let Ok(token) = std::env::var("EXECD_BEARER") else {
-        return;
+        return Ok(());
     };
     let stash = || -> Result<i32, String> {
         let fd = nix::sys::memfd::memfd_create(c"execd-bearer", nix::sys::memfd::MFdFlags::empty())
@@ -31,10 +34,9 @@ fn move_bearer_out_of_environ() {
     let fd = match stash() {
         Ok(fd) => fd,
         Err(e) => {
-            eprintln!(
-                "execd: cannot move the bearer out of the environment ({e}); it stays in /proc/<execd>/environ"
-            );
-            return;
+            return Err(format!(
+                "cannot move the bearer out of the environment ({e})"
+            ));
         }
     };
     let mut args = std::env::args_os();
@@ -47,9 +49,10 @@ fn move_bearer_out_of_environ() {
         .env_remove("EXECD_BEARER")
         .env(BEARER_FD, fd.to_string())
         .exec();
-    // Not replaced: carry on with the environment as it was.
-    eprintln!("execd: cannot re-execute to scrub the environment: {err}");
     let _ = nix::unistd::close(fd);
+    Err(format!(
+        "cannot re-execute to scrub the bearer from the environment: {err}"
+    ))
 }
 
 /// `mimalloc` is a build option for measuring against the platform's malloc (a static musl
@@ -127,7 +130,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    move_bearer_out_of_environ();
+    if let Err(e) = move_bearer_out_of_environ() {
+        eprintln!("execd: {e}");
+        return ExitCode::FAILURE;
+    }
     let inherited = take_inherited_bearer();
     execd::log::set_level(cli.log_level);
     let runtime = match runtime(cli.worker_threads) {

@@ -371,14 +371,31 @@ describe("HttpTransport.stream", () => {
     expect(await kindOf(run())).toBe("transport");
   });
 
-  it("fails with transport on an error frame, and on a line that is not a frame", async () => {
-    for (const line of ["{\"error\":\"lost the sandbox\"}", "not json"]) {
+  it("fails with transport on an error frame", async () => {
+    const e = await streamingEndpoint((res) =>
+      res.end("{\"error\":\"lost the sandbox\"}\n")
+    );
+    const t = new HttpTransport({ url: e.url });
+    const run = async () => {
+      for await (const f of t.stream("x", [])) void f;
+    };
+    expect(await kindOf(run())).toBe("transport");
+  });
+
+  it("fails with protocol on a line that is not a frame", async () => {
+    for (
+      const line of [
+        "not json",
+        "[1]",
+        JSON.stringify({ stdout: "!!not base64!!" }),
+      ]
+    ) {
       const e = await streamingEndpoint((res) => res.end(line + "\n"));
       const t = new HttpTransport({ url: e.url });
       const run = async () => {
         for await (const f of t.stream("x", [])) void f;
       };
-      expect(await kindOf(run()), line).toBe("transport");
+      expect(await kindOf(run()), line).toBe("protocol");
     }
   });
 

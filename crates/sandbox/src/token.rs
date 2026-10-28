@@ -4,12 +4,53 @@
 //! so a long-lived client gives the source a way to mint another ([`TokenSource::from_fn`],
 //! [`TokenSource::command`]). The client asks it for a token before its first request, and, on a
 //! `401`, once for a new one and then repeats that request once. That is the whole auth logic.
+//!
+//! A [`TokenSource::command`] mint holds the bearer lock so concurrent callers share one command,
+//! and that wait is bounded by [`TOKEN_COMMAND_TIMEOUT`]. A [`TokenSource::from_fn`] mint is the
+//! caller's to bound.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 type Mint = dyn Fn() -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> + Send + Sync;
+
+/// How long [`TokenSource::command`] waits for the mint command before killing it.
+pub const TOKEN_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn token_from_command(
+    argv: &[String],
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    let (program, args) = argv.split_first().ok_or("the token command is empty")?;
+    let run = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let out = match tokio::time::timeout(timeout, run).await {
+        Ok(result) => {
+            result.map_err(|e| format!("could not run the token command {program:?}: {e}"))?
+        }
+        Err(_) => return Err(format!("the token command {program:?} timed out")),
+    };
+    if !out.status.success() {
+        let said = String::from_utf8_lossy(&out.stderr);
+        let said = said.trim();
+        return Err(format!(
+            "the token command {program:?} exited with {}{}{said}",
+            out.status,
+            if said.is_empty() { "" } else { ": " },
+        ));
+    }
+    let token = String::from_utf8(out.stdout)
+        .map_err(|_| format!("the token command {program:?} printed a token that is not UTF-8"))?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err(format!("the token command {program:?} printed nothing"));
+    }
+    Ok(token)
+}
 
 /// A bearer token, or a way to get a fresh one. Cheap to clone.
 #[derive(Clone)]
@@ -38,7 +79,9 @@ impl TokenSource {
     }
 
     /// A token printed by a command (`argv[0]` with the rest as arguments), run when one is needed:
-    /// stdout, trimmed. A non-zero exit (stderr is in the error), or empty output, is an error.
+    /// stdout, trimmed, and valid UTF-8. A non-zero exit (stderr is in the error), empty output, a
+    /// token that is not UTF-8, or no exit within [`TOKEN_COMMAND_TIMEOUT`] is an error. The child
+    /// is killed when the deadline fires.
     pub fn command<I, S>(argv: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -47,29 +90,7 @@ impl TokenSource {
         let argv: Arc<[String]> = argv.into_iter().map(Into::into).collect();
         Self::from_fn(move || {
             let argv = argv.clone();
-            async move {
-                let (program, args) = argv.split_first().ok_or("the token command is empty")?;
-                let out = tokio::process::Command::new(program)
-                    .args(args)
-                    .stdin(std::process::Stdio::null())
-                    .output()
-                    .await
-                    .map_err(|e| format!("could not run the token command {program:?}: {e}"))?;
-                if !out.status.success() {
-                    let said = String::from_utf8_lossy(&out.stderr);
-                    let said = said.trim();
-                    return Err(format!(
-                        "the token command {program:?} exited with {}{}{said}",
-                        out.status,
-                        if said.is_empty() { "" } else { ": " },
-                    ));
-                }
-                let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if token.is_empty() {
-                    return Err(format!("the token command {program:?} printed nothing"));
-                }
-                Ok(token)
-            }
+            async move { token_from_command(&argv, TOKEN_COMMAND_TIMEOUT).await }
         })
     }
 
@@ -155,5 +176,60 @@ impl Bearer {
             .get()
             .await
             .map_err(|e| std::io::Error::other(format!("token source failed: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_token_command_must_print_utf8_and_must_finish() {
+        let err = token_from_command(
+            &["sh".into(), "-c".into(), r"printf '\377'".into()],
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("UTF-8"), "{err}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let script = format!("echo $$ > {}; exec sleep 30", pidfile.display());
+        let err = token_from_command(
+            &["sh".into(), "-c".into(), script],
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        let pid = std::fs::read_to_string(&pidfile).unwrap();
+        let stat_path = format!("/proc/{}/stat", pid.trim());
+        // A killed child stays in `/proc` as a zombie until the runtime reaps it. Blocking this
+        // thread would stall that reaper, so poll with the runtime and treat `Z` as already dead.
+        let mut last = String::new();
+        for _ in 0..50 {
+            match std::fs::read_to_string(&stat_path) {
+                Err(_) => return,
+                Ok(stat) if !live_sleep(&stat) => return,
+                Ok(stat) => last = stat,
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the token command was not killed: {last}");
+    }
+
+    /// `pid (comm) state …` from `/proc`. Ours is still running only while `comm` is `sleep` and the
+    /// state is a live one. `Z` and `X` mean the signal landed; a missing file or another comm means
+    /// the pid was reaped or reused.
+    fn live_sleep(stat: &str) -> bool {
+        let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else {
+            return false;
+        };
+        if close <= open || &stat[open + 1..close] != "sleep" {
+            return false;
+        }
+        let state = stat[close + 1..].split_whitespace().next().unwrap_or("");
+        state != "Z" && state != "X"
     }
 }

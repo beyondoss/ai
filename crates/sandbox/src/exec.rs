@@ -65,9 +65,11 @@ impl ExecResult {
 /// A finished command as a client reports it: the exit code and the bytes the command wrote.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExecOutput {
-    /// The exit code. As over one-shot: `128 + N` for a command killed by signal `N`, `124` for one that
-    /// hit its timeout (the stderr then ends `command exceeded its timeout`), `127` for one that
-    /// could not be started. None of these is an error.
+    /// The exit code. As over one-shot: `128 + N` for a command killed by signal `N` when that sum
+    /// fits an `i32`, `124` for one that hit its timeout (the stderr then ends `command exceeded
+    /// its timeout`), `127` for one that could not be started. A signal whose `128 + N` does not
+    /// fit leaves this `-1` rather than panicking; a stream frame with that signal is a protocol
+    /// error and never becomes an [`ExecResult`]. None of these is an error.
     pub code: i32,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
@@ -91,7 +93,7 @@ impl From<ExecResult> for ExecOutput {
         Self {
             code: r
                 .code
-                .or_else(|| r.signal.map(|s| 128 + s))
+                .or_else(|| r.signal.and_then(|s| s.checked_add(128)))
                 .or(r.timed_out.then_some(124))
                 .unwrap_or(-1),
             stdout: r.stdout,
@@ -493,6 +495,20 @@ mod tests {
         let (out, dropped) = cap.finish();
         assert!(dropped, "middle should be reported as dropped");
         assert_eq!(&out, b"abcdwxyz", "kept first 4 + last 4 bytes");
+    }
+
+    #[test]
+    fn a_signal_status_that_overflows_is_not_a_panic() {
+        let overflowed = ExecOutput::from(ExecResult {
+            signal: Some(i32::MAX),
+            ..ExecResult::default()
+        });
+        assert_eq!(overflowed.code, -1);
+        let killed = ExecOutput::from(ExecResult {
+            signal: Some(9),
+            ..ExecResult::default()
+        });
+        assert_eq!(killed.code, 137);
     }
 
     #[test]

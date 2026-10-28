@@ -95,6 +95,15 @@ fn structured(u: &mut Unstructured<'_>) -> libfuzzer_sys::arbitrary::Result<()> 
         1 => {
             let s = u.arbitrary::<i32>()?;
             obj.insert("signal".into(), s.into());
+            // `128 + s` is the shell status. A sum that does not fit an `i32` is a broken frame.
+            if s.checked_add(128).is_none() {
+                let line = serde_json::to_vec(&Value::Object(obj)).expect("serializes");
+                assert!(
+                    decode_line(&line).is_err(),
+                    "a signal whose 128 + n overflows was accepted"
+                );
+                return Ok(());
+            }
             want.push(Frame::Signal(s));
         }
         2 => {

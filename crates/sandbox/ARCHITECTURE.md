@@ -59,6 +59,8 @@ raw `Exec` back (`.raw()`), so nothing the helpers do is out of reach of a calle
   asks it; on a `401` the client asks again once and repeats that request once, and a source that returns the token it
   was already using, or a fixed source, ends it there. Concurrent requests compare the token they failed with against
   the current one, so a renewal is shared, not repeated. Error text never contains a token (`Debug` is redacted).
+  A command source's stdout must be UTF-8. A non-zero exit includes the command's stderr. The command is killed if it has not exited within 30 s, which is also
+  the bound on how long that shared mint holds the bearer lock. A closure source is the caller's to bound.
 - **Bounded.** A one-shot answer is read incrementally up to the base64 of `with_max_response_bytes` (16 MiB of decoded bytes by
   default) and an over-cap answer is an error; a stream frame is at most 64 KiB and a line at most 1 MiB; a silent stream is abandoned after 30 s
   (heartbeats are every 5 s).
@@ -70,7 +72,8 @@ raw `Exec` back (`.raw()`), so nothing the helpers do is out of reach of a calle
 `FsBackend` is the seam the agent's `read`/`write`/`edit`/`ls`/`grep`/`find` use; `ShellFs` is its implementation over
 `Exec`. It looks at the target's tools once, in one `sh -c` the first operation that needs it sends (`Capabilities`: `rg`, GNU
 or busybox `grep`, `find -printf`, read windows; a write never probes) and picks the best rung of the search ladder; the exact commands, parsing and error kinds are
-`sdk/conformance/FILES-OVER-EXEC.md`, and `ShellFs` is its reference implementation. The impl-independent tail every
+`sdk/conformance/FILES-OVER-EXEC.md`, and `ShellFs` is its reference implementation. `stat` maps the script's exit 1 to absence; a timeout, a signal, or any
+other status is an error, so a failed stat is not "the file is gone". The impl-independent tail every
 backend shares (`clip`, `finalize`, `finalize_glob`) is in `fs.rs`, so a result's shape holds by construction. The
 agent's `LocalFs` implements the same trait on the host's disk.
 
@@ -91,7 +94,9 @@ stream built only on `Exec` (spec: `sdk/conformance/FILES-OVER-EXEC.md` 5.8). Th
   reads them with `tar::Archive` and feeds `extract::Extractor`, with stderr kept to 64 KiB). An unsafe
   member closes the stream. The extractor lstat-walks every parent, creates files `O_EXCL`, replaces (never follows) a link
   in the way, applies directory modes and mtimes last, and refuses names with `..`, absolute names, hard links to anything
-  the archive did not write, and unsupported member types.
+  the archive did not write, and unsupported member types. An mtime `SystemTime` cannot represent is an archive error.
+  The download's stdout callback blocks on a bounded pipe to the extract thread; on a multi-thread runtime that wait
+  uses `block_in_place` so other tasks keep running.
 - **Errors** are `BulkError`: `InvalidRequest` (nothing sent), `Archive` (`protocol`: unsafe or malformed), `Command`
   (a failed script, classified from its stderr like the file helpers), `Io` (transport or local).
 - **Tests**: `tests/bulk.rs` (wire shape, the staged path, the cleanup, over a transport written in the test),
@@ -108,7 +113,8 @@ the processes, the output and the notify sender (`execd` is the reference); the 
 The agent's host runner spawns a child as its own process-group leader and must kill the whole
 group if the owning future is dropped. `GroupId` names a group in a way that survives pid recycling, `GroupKillGuard`
 kills it on drop, and `spawn_tracked_cleanup` runs the blocking kill on its own thread that the exit path can wait for
-(`wait_for_pending_group_kills`). `Kill` is either a hook (a stream close, a sandbox job's kill) or a
+(`wait_for_pending_group_kills`). The member sweep re-reads each pid's start time immediately before signalling it, and
+skips a pid that is no longer that process. A pid can still be recycled in the instant after that read and before the kill. `Kill` is either a hook (a stream close, a sandbox job's kill) or a
 `LocalKill`, which the embedding program implements for its own local jobs; `kill_all` spends one SIGTERM grace for any
 number of them.
 
@@ -117,8 +123,9 @@ number of them.
 `CommandRunner::run` returns an `ExecResult` whose `stdout` and `stderr` are `Vec<u8>`: exactly what the command wrote.
 The one-shot answer carries them as standard base64, so there is no lossy path. Text is
 `ExecResult::stdout_text`/`stderr_text` (UTF-8, invalid sequences replaced), which is what the helpers parse and the
-agent's `bash` tool shows. `Sandbox::exec().run()` returns `ExecOutput`: the exit code (`128 + N` for a signal, `124`
-for a deadline) and the bytes. The response cap is on the decoded bytes of both streams together.
+agent's `bash` tool shows. `Sandbox::exec().run()` returns `ExecOutput`: the exit code (`128 + N` for a signal, when that sum fits an
+`i32`; `-1` when it does not), `124` for a deadline, and the bytes. A stream `signal` whose `128 + S` does not fit is a
+broken frame and never becomes an `ExecResult`. The response cap is on the decoded bytes of both streams together.
 
 A job's `read` (`ReadChunk`) and `list` (`JobInfo`) carry `signal: Option<i32>` beside `status`: the signal that killed the shell,
 whose code is then `128 + signal`; `None` for a shell that exited, even with 137. `JobStatus` stays the code, so followers that
