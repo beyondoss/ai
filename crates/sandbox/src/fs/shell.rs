@@ -2487,7 +2487,11 @@ mod tests {
         q.glob = Some(("*.test.rs".into(), true));
         let args = rg_args(&q, false);
         assert!(!args.iter().any(|a| a.contains("test.rs")), "{args:?}");
-        assert_eq!(args.iter().filter(|a| *a == "--glob").count(), 1, "only !.git");
+        assert_eq!(
+            args.iter().filter(|a| *a == "--glob").count(),
+            1,
+            "only !.git"
+        );
     }
 
     #[test]

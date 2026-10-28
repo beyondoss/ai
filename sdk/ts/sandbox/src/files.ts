@@ -8,6 +8,7 @@ import {
   SandboxError,
   TimeoutError,
 } from "./errors.js";
+import { compileGlob } from "./glob.js";
 import {
   GIT_SCRIPT,
   READ_SCRIPT,
@@ -27,7 +28,6 @@ import {
   windowLongLines,
   withDefaults,
 } from "./search.js";
-import { compileGlob } from "./glob.js";
 import type { SearchEngine, SearchQuery, SearchResult } from "./search.js";
 import type { RunResult, Transport } from "./transport.js";
 
@@ -449,7 +449,9 @@ export class Files {
     hits = hits.filter((h) => !isUnderGitDir(q.root, h.path));
     // Files only: the glob never decides whether a directory is descended. A root that is itself a
     // file is searched whatever the glob says.
-    if (excluded) hits = hits.filter((h) => h.path === q.root || !excluded.test(h.path));
+    if (excluded) {
+      hits = hits.filter((h) => h.path === q.root || !excluded.test(h.path));
+    }
     const done = finalize(hits, q.limit);
     const first = stderr.trim().split("\n")[0] ?? "";
     return {
