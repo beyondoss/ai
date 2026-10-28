@@ -435,7 +435,7 @@ async fn remove_deletes_only_jobs_whose_processes_are_gone() {
 }
 
 #[tokio::test]
-async fn a_job_runs_in_its_directory_and_a_bad_one_fails_inside_the_job() {
+async fn a_job_runs_in_its_directory_and_a_missing_one_is_refused() {
     let sb = Sandbox::new().await;
     let work = tempfile::tempdir().unwrap();
     std::fs::write(work.path().join("marker.txt"), "x").unwrap();
@@ -452,21 +452,18 @@ async fn a_job_runs_in_its_directory_and_a_bad_one_fails_inside_the_job() {
         0
     );
     assert_eq!(heard.lock().unwrap().output, b"marker.txt\n");
+    // A directory that does not exist is refused at the start, not run as a job that fails.
     let id = JobId::fresh();
     spec.cwd = Some("/definitely/not/here".into());
     let heard = Mutex::new(Heard::default());
     let events = recorder(&heard);
-    assert_eq!(
+    assert!(
         sb.jobs
             .run_held(&sb.scope, &id, &spec, &events)
             .await
-            .unwrap(),
-        1
+            .is_err()
     );
-    assert!(
-        String::from_utf8_lossy(&heard.lock().unwrap().output).contains("/definitely/not/here"),
-        "the shell says why"
-    );
+    assert!(heard.lock().unwrap().started.is_none());
 }
 
 #[tokio::test]
@@ -490,7 +487,7 @@ async fn a_job_id_that_already_exists_is_not_started_twice() {
         .run_held(&sb.scope, &id, &sh("echo no"), &events)
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("did not start"), "{err}");
+    assert!(err.to_string().contains("the job exists"), "{err}");
     assert!(heard.lock().unwrap().started.is_none());
     sb.jobs.wipe(&sb.scope).await.unwrap();
 }

@@ -270,19 +270,26 @@ impl Driver {
         JobId::parse(s).ok_or_else(|| err("invalid_request", format!("bad job id {s:?}")))
     }
 
-    pub fn ops() -> Vec<&'static str> {
-        vec![
-            "hello",
-            "capabilities",
-            "exec",
-            "exec_stream",
-            "job_start",
-            "job_list",
-            "job_read",
-            "job_attach",
-            "job_kill",
-            "job_remove",
-            "job_wipe",
+    /// The ops this driver offers: the job ops only over an exec that owns jobs.
+    pub fn ops(&self) -> Vec<&'static str> {
+        Self::ops_with(self.jobs.is_some())
+    }
+
+    /// [`Self::ops`] for an exec that owns jobs, or not.
+    pub fn ops_with(jobs: bool) -> Vec<&'static str> {
+        let mut ops = vec!["hello", "capabilities", "exec", "exec_stream"];
+        if jobs {
+            ops.extend([
+                "job_start",
+                "job_list",
+                "job_read",
+                "job_attach",
+                "job_kill",
+                "job_remove",
+                "job_wipe",
+            ]);
+        }
+        ops.extend([
             "stat",
             "read",
             "write",
@@ -290,7 +297,8 @@ impl Driver {
             "mkdir",
             "list",
             "search",
-        ]
+        ]);
+        ops
     }
 
     /// One request line in, one response line out.
@@ -299,7 +307,7 @@ impl Driver {
         let op = req["op"].as_str().unwrap_or("");
         let out = if op == "hello" || op == "capabilities" {
             self.meta(op).await
-        } else if !Self::ops().contains(&op) {
+        } else if !self.ops().contains(&op) {
             Err(err("unsupported", format!("no such op {op:?}")))
         } else if let Some(e) = &self.connect_error {
             Err(e.clone())
@@ -317,7 +325,7 @@ impl Driver {
             return Ok(json!({
                 "driver": "agent-reference",
                 "protocol": 1,
-                "ops": Self::ops(),
+                "ops": self.ops(),
             }));
         }
         if let Some(e) = &self.connect_error {

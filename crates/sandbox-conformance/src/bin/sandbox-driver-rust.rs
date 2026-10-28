@@ -53,7 +53,7 @@ async fn main() {
             }
             Ok(req) if req["op"] == "hello" => {
                 json!({"id": req["id"], "ok": {"driver": "agent-reference", "protocol": 1,
-                    "ops": Driver::ops()}})
+                    "ops": Driver::ops_with(true)}})
             }
             Ok(req) => {
                 if driver.is_none() {

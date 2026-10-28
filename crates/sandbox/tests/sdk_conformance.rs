@@ -230,7 +230,11 @@ async fn reference_agent_passes_every_scenario() {
             tally.skipped,
         );
         grand.known_defect += tally.known_defect;
-        grand.unsupported += tally.unsupported;
+        // A transport that owns no jobs does not offer the job ops: the scenarios that use them are
+        // unsupported for it, and for no other profile.
+        if !profile.local {
+            grand.unsupported += tally.unsupported;
+        }
         grand.passed += tally.passed;
         grand.failed += tally.failed;
         grand.skipped += tally.skipped;

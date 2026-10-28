@@ -88,23 +88,26 @@ impl CommandRunner for Recorder {
 
     async fn run_streaming(
         &self,
-        _: &str,
-        _: &[String],
-        _: Option<&str>,
-        _: std::time::Duration,
-        _: beyond_agent::tools::exec::ChunkSink<'_>,
-    ) -> std::io::Result<beyond_agent::tools::exec::ExecResult> {
-        unreachable!("a test double that only runs to completion")
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        on_chunk: beyond_agent::tools::exec::ChunkSink<'_>,
+    ) -> std::io::Result<ExecResult> {
+        let result = self.run(program, args, cwd, timeout).await?;
+        on_chunk(&result.stdout);
+        Ok(result)
     }
 
     async fn run_streaming_tracked(
         &self,
-        _: &str,
-        _: &[String],
-        _: Option<&str>,
-        _: &beyond_agent::tools::exec::JobHooks<'_>,
-    ) -> std::io::Result<beyond_agent::tools::exec::ExecResult> {
-        unreachable!("a test double that only runs to completion")
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        hooks: &beyond_agent::tools::exec::JobHooks<'_>,
+    ) -> std::io::Result<ExecResult> {
+        self.run_streaming(program, args, cwd, Duration::ZERO, hooks.on_chunk)
+            .await
     }
 
     async fn run_attached(

@@ -1747,12 +1747,10 @@ mod tests {
             desc.contains("after its `timeout_ms` returns early"),
             "{desc}"
         );
-        // Over one-shot a background job is the sandbox's (it starts kept and is polled); only a
-        // foreground call still has to wait for its command.
         assert!(
-            desc.contains("a call waits for its command to exit")
+            !desc.contains("waits for its command to exit")
                 && !desc.contains("`run_in_background` is unavailable"),
-            "the one-shot exception: {desc}"
+            "no exception for a runner that cannot stream: {desc}"
         );
         assert!(
             desc.contains(&DEFAULT_MAX_LINES.to_string())

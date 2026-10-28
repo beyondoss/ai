@@ -37,11 +37,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## What is proven
 
-- **One shared conformance matrix passes: 2,245 checks, 0 failures,** across four backend profiles (a conforming `execd` with
+- **One shared conformance matrix passes: 2,164 checks, 0 failures,** across four backend profiles (a conforming `execd` with
   and without bearer, `rg` / GNU `grep` / busybox `grep`) plus a transport that is nothing but `sh`. The scenarios are the
   ones in [`sdk/conformance`](../../sdk/conformance), which the TypeScript, Python and MCP clients are held to as well.
-- **The layers compose.** The same files, jobs, helpers and bulk scenarios run over a transport that is nothing but
-  `sh` on this host (written inside the test, no HTTP anywhere): 374 checks pass, 15 skipped
+- **The layers compose.** The same files, helpers and bulk scenarios run over a transport that is nothing but
+  `sh` on this host (written inside the test, no HTTP anywhere, and no jobs): 263 checks pass, 22 skipped
   ([`tests/sdk_conformance.rs`](tests/sdk_conformance.rs)).
 - **A user-written helper needs only `run`.** A `git status` helper written on raw `Exec` runs unchanged over any
   transport ([`tests/sandbox_surface.rs`](tests/sandbox_surface.rs)).
