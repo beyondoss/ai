@@ -13,6 +13,15 @@
 //! | `list.entries` order          | sorted, as `$unordered`          | "order unspecified" (FILES-OVER-EXEC 5.6)      |
 //! | `search.note` (when present)  | `{"$type":"string"}`             | text of the engine's first error, has paths    |
 //!
+//! One rule depends on who answered. The MCP driver runs every `exec` through `sh -c`, so a command
+//! that cannot be started answers with the shell's words and codes (`sh: 1: x: not found`, 127;
+//! `sh: 1: exec: x: Permission denied`, 126), where the argv clients get execd's (`execd: x: command
+//! not found` and `execd: x: Permission denied`, both 127). When the MCP driver's answer to an `exec`
+//! is exit 126 or 127, every driver's answer to that step is compared as: exit code 126 or 127 both
+//! `{"$class":"not started"}`, and stderr by the reason it names (`not found`, `No such file or directory`, `Permission denied`,
+//! `Not a directory`; else the bytes); `stdout` stays strict. Every other comparison, 127 from the argv clients alone included,
+//! stays byte for byte.
+//!
 //! The result is a valid `expect` for a scenario step, which is how a divergence is printed.
 use base64::Engine as _;
 use sandbox_conformance::eval::B64;
@@ -64,7 +73,14 @@ fn any_number() -> Value {
     json!({"$type": "number"})
 }
 
-pub fn canon(op: &str, resp: &Value, root: &str) -> Value {
+/// Whether `resp` is an `exec` answer of exit 126 or 127: the answers the MCP driver's shell words
+/// differently.
+pub fn is_exec_not_started(op: &str, resp: &Value) -> bool {
+    op == "exec" && (resp["ok"]["exit_code"] == 127 || resp["ok"]["exit_code"] == 126)
+}
+
+/// `loose`: compare a 126 or 127 `exec` answer by class (see the module doc).
+pub fn canon(op: &str, resp: &Value, root: &str, loose: bool) -> Value {
     if let Some(e) = resp.get("error") {
         return json!({"error": {"kind": e["kind"]}});
     }
@@ -86,6 +102,27 @@ pub fn canon(op: &str, resp: &Value, root: &str) -> Value {
                 entries.sort_by_key(|e| e["name"].as_str().unwrap_or("").as_bytes().to_vec());
                 let sorted = std::mem::take(entries);
                 ok["entries"] = json!({"$unordered": sorted});
+            }
+        }
+        "exec" if loose && (ok["exit_code"] == 127 || ok["exit_code"] == 126) => {
+            let text = ok["stderr_b64"]
+                .as_str()
+                .and_then(|b| B64.decode(b.as_bytes()).ok())
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default();
+            ok["exit_code"] = json!({"$class": "not started"});
+            // The reason, not the words around it: which program is named differs too (`pwd` for
+            // the argv clients, `sh` for the one that runs a shell).
+            if let Some(why) = [
+                "not found",
+                "No such file or directory",
+                "Permission denied",
+                "Not a directory",
+            ]
+            .into_iter()
+            .find(|w| text.contains(w))
+            {
+                ok["stderr_b64"] = json!({"$class": why});
             }
         }
         "search" if !ok["note"].is_null() => ok["note"] = json!({"$type": "string"}),
