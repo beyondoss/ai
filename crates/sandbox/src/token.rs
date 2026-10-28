@@ -154,9 +154,10 @@ impl Bearer {
         Ok(t)
     }
 
-    /// After a `401` on `stale`: a different token to retry with, or `None` when there is none to
-    /// try (a fixed source, or the source gave the same one back). A request that finds another
-    /// already replaced `stale` takes that one without asking the source again.
+    /// After a `401` on `stale`: the token to repeat the request with, or `None` for a fixed
+    /// source, which has nothing to ask again. The repeat is made whatever the source gives, even
+    /// `stale` again, so a call is rejected at most twice. A request that finds another already
+    /// replaced `stale` takes that one without asking the source again.
     pub(crate) async fn renew(&self, stale: &str) -> std::io::Result<Option<String>> {
         if !self.source.renews() {
             return Ok(None);
@@ -166,9 +167,8 @@ impl Bearer {
             return Ok(Some(t.clone()));
         }
         let t = self.mint().await?;
-        let changed = t != stale;
         *cur = Some(t.clone());
-        Ok(changed.then_some(t))
+        Ok(Some(t))
     }
 
     async fn mint(&self) -> std::io::Result<String> {

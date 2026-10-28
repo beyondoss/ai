@@ -118,6 +118,26 @@ async fn a_second_401_is_final() {
 }
 
 #[tokio::test]
+async fn a_source_that_gives_the_same_token_again_is_still_repeated_once() {
+    let ep = endpoint(Some("other")).await;
+    let mints = Arc::new(AtomicUsize::new(0));
+    let counted = mints.clone();
+    let source = TokenSource::from_fn(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        async { Ok("same".to_string()) }
+    });
+    let exec = HttpExec::new(&ep.url).unwrap().bearer(source);
+    let err = run(&exec).await.unwrap_err().to_string();
+    assert!(err.contains("returned 401"), "{err}");
+    assert_eq!(
+        mints.load(Ordering::SeqCst),
+        2,
+        "the first token, one renewal"
+    );
+    assert_eq!(*ep.seen.lock().unwrap(), ["Bearer same", "Bearer same"]);
+}
+
+#[tokio::test]
 async fn a_fixed_token_has_nothing_to_ask_again() {
     let ep = endpoint(Some("other")).await;
     let exec = HttpExec::new(&ep.url).unwrap().bearer("stale");

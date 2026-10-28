@@ -151,6 +151,12 @@ standard base64, and a line that grows past the line limit without a newline. `t
 bytes that stopped coming: a stream that ends without its final frame (in the middle of a line
 included), a `{"error"}` frame, silence past the heartbeat limit, a reset.
 
+A call renews its token at most once. On a `401` with a token source that can give another, the
+client asks the source again and repeats that request once with whatever it gave, even the same
+token. If the repeat is refused too, the call fails `auth` (HTTP 401 or 403 as above): two
+refusals at most, one mint, never a loop. A fixed token has nothing to ask again, so its `401` is
+final after one request. Concurrent calls refused with the same token share one renewal.
+
 A token source is a function or command that gives the bearer (layer 1). It fails when it
 raises or exits non-zero, or gives an empty token. That is `auth`, on every call that needs a
 token, with the source's own message (a command's stderr) in `detail` and nothing sent to the
