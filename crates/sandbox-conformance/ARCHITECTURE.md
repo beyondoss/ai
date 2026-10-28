@@ -23,6 +23,7 @@ test (`crates/agent/tests/sdk_conformance.rs`) reaches the in-process reference 
 | `link.rs`                         | `ProcessLink`: `sh -c "exec CMD"` with the `CONFORMANCE_*` environment, one request in flight, a named call timeout, stderr kept for the death note.                |
 | `backends.rs`                     | Starts a backend and returns a `Started` (URL, bearer, work directory, extra variables, a guard that stops it).                                                     |
 | `reaper.rs`                       | Every child is its own process group, killed on drop; a registry file plus one watchdog kill the groups and remove the containers when the harness dies by SIGKILL. |
+| `e2b.rs`                          | The opt-in `e2b` backend: one E2B VM with a hard create-time timeout, execd from the GitHub release (sha256-checked), deleted on drop and by the watchdog.          |
 | `matrix.rs`                       | The plan: backends in parallel, each started once, its drivers one after another, then every ordered pair of them for the relay scenarios; the registry.            |
 | `report.rs`                       | The table and the JSON cell.                                                                                                                                        |
 | `bin/sandbox-driver-rust.rs`      | The Rust client's driver. Includes `crates/sandbox/tests/sdk_conformance/driver.rs` by path.                                                                        |
