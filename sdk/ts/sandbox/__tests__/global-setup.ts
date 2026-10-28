@@ -86,7 +86,9 @@ function execdBinary(): string | null {
   if (!existsSync(bin)) {
     const lock = buildLock();
     const build = ["cargo", "build", "-p", "beyond-execd"];
-    const [prog, ...args] = lock ? ["flock", "-o", lock, ...build] : build;
+    const [prog = "cargo", ...args] = lock
+      ? ["flock", "-o", lock, ...build]
+      : build;
     const r = spawnSync(prog, args, {
       cwd: repo,
       stdio: "inherit",
