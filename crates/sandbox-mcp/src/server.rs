@@ -108,6 +108,13 @@ pub struct WriteFileArgs {
     content: Option<String>,
     /// The new contents as base64, for binary files.
     content_base64: Option<String>,
+    /// Write only if the file's mtime is still this: the `mtime` that `stat` returned, fraction
+    /// included. If the file changed since (or was removed), nothing is written and the call fails
+    /// with kind `conflict`. Leave out to write unconditionally.
+    if_unchanged_since: Option<f64>,
+    /// Write only if no file exists at `path` yet (kind `conflict` if one does). Default false.
+    /// Not combinable with `if_unchanged_since`.
+    create_only: Option<bool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -410,7 +417,7 @@ impl SandboxMcp {
 
     #[tool(
         name = "write_file",
-        description = "Create a file or replace it entirely, atomically; an existing file keeps its permissions. Give content (text) or content_base64 (binary). The parent directory must exist (see mkdir). To change part of a file use edit_file."
+        description = "Create a file or replace it entirely, atomically; an existing file keeps its permissions. Give content (text) or content_base64 (binary). The parent directory must exist (see mkdir). To change part of a file use edit_file. To avoid overwriting a concurrent change, pass if_unchanged_since (the mtime from stat): a changed file fails with kind conflict and nothing is written. create_only refuses to replace a file that exists."
     )]
     async fn write_file(&self, Parameters(a): Parameters<WriteFileArgs>) -> ToolReply {
         Ok(reply(self.do_write(a).await))
@@ -554,8 +561,40 @@ impl SandboxMcp {
             (None, None) => return Err(ToolError::invalid("give content or content_base64")),
         };
         let n = bytes.len();
+        let create_only = a.create_only.unwrap_or(false);
+        let expected = match (a.if_unchanged_since, create_only) {
+            (Some(_), true) => {
+                return Err(ToolError::invalid(
+                    "give if_unchanged_since or create_only, not both",
+                ));
+            }
+            (Some(secs), false) => Some(Some(
+                std::time::Duration::try_from_secs_f64(secs)
+                    .ok()
+                    .and_then(|d| std::time::UNIX_EPOCH.checked_add(d))
+                    .ok_or_else(|| {
+                        ToolError::invalid("if_unchanged_since must be a mtime from stat")
+                    })?,
+            )),
+            (None, true) => Some(None),
+            (None, false) => None,
+        };
         let t = self.target().await?;
-        t.files().write_bytes(Path::new(&a.path), bytes).await?;
+        match expected {
+            None => t.files().write_bytes(Path::new(&a.path), bytes).await?,
+            Some(mtime) => {
+                if !t
+                    .files()
+                    .write_if_unchanged(Path::new(&a.path), bytes, mtime)
+                    .await?
+                {
+                    return Err(ToolError::new(
+                        "conflict",
+                        format!("{} changed since it was read; nothing was written", a.path),
+                    ));
+                }
+            }
+        }
         Ok(json!({ "path": a.path, "bytes": n }))
     }
 
