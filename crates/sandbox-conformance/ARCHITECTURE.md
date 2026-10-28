@@ -23,6 +23,7 @@ test (`crates/agent/tests/sdk_conformance.rs`) reaches the in-process reference 
 | `link.rs`                         | `ProcessLink`: `sh -c "exec CMD"` with the `CONFORMANCE_*` environment, one request in flight, a named call timeout, stderr kept for the death note.                |
 | `backends.rs`                     | Starts a backend and returns a `Started` (URL, bearer, work directory, extra variables, a guard that stops it).                                                     |
 | `reaper.rs`                       | Every child is its own process group, killed on drop; a registry file plus one watchdog kill the groups and remove the containers when the harness dies by SIGKILL. |
+| `e2b.rs`                          | The opt-in `e2b` backend: one E2B VM with a hard create-time timeout, execd from the GitHub release (sha256-checked), deleted on drop and by the watchdog.          |
 | `matrix.rs`                       | The plan: backends in parallel, each started once, its drivers one after another, then every ordered pair of them for the relay scenarios; the registry.            |
 | `report.rs`                       | The table and the JSON cell.                                                                                                                                        |
 | `bin/sandbox-driver-rust.rs`      | The Rust client's driver. Includes `crates/sandbox/tests/sdk_conformance/driver.rs` by path.                                                                        |
@@ -90,10 +91,20 @@ A backend is a URL plus how to start and stop it. `Started` holds the guard; dro
 | `debian-runas`                     | static `execd` in Debian with `EXECD_RUN_AS=sandbox`                                      |
 | `readonly`                         | Debian, run-as: `${RO}` a read-only mount, `${LOCKED}` a directory the user may not write |
 | `tinydisk`                         | Debian, run-as: `${TINY}` a 1 MiB tmpfs that fills                                        |
+| `e2b` (opt-in)                     | the released `execd` in a real E2B microVM, over E2B's port forwarding and TLS            |
 
 The container backends mount a static (musl) `execd` read-only into the image, so no image is built; the only network use is
 pulling `alpine:3.20` and `debian:12-slim`. Each container is named after the process and removed on drop. Readiness is
 execd's own `listening` line in `docker logs`, never a port probe (docker-proxy accepts before execd listens).
+
+`e2b` (`e2b.rs`) is never in a group or a glob: `--backend e2b` by exact name, and only with `E2B_API_KEY` set (`expand` refuses
+otherwise). It creates one VM with a hard auto-kill (`LIFETIME_SECS`, 25 minutes, set at create time), installs `execd` with the
+release's own `install-execd.sh` (`E2B_EXECD_VERSION`, default `v0.1.16`; the script checks the tarball's sha256, and the
+installed binary's is printed), runs it as root with `EXECD_RUN_AS=user` and a random bearer, and waits for the public URL
+`https://8081-<id>.e2b.app/exec` to answer 401. The VM is created and driven with `curl`, the key handed over as a config on stdin so
+it is never in a process listing. The guard deletes the VM on drop; its id is also on the reaper registry (`e <id>`), so the
+watchdog deletes it through the API if the harness is killed. `mise run test:clients:e2b` runs it; the differential test runs
+against it only with `DIFFERENTIAL_BACKENDS=e2b`.
 
 A backend's extra directories are variables (`${RO}`, `${LOCKED}`, `${TINY}`) that a scenario names in `requires.vars`; the
 `environments` suite is skipped, visibly, everywhere else.
@@ -109,5 +120,5 @@ A backend's extra directories are variables (`${RO}`, `${LOCKED}`, `${TINY}`) th
 
 ## Adding a live backend
 
-A live backend (a VM, a vendor sandbox) is a function returning `Started` from a URL and a bearer in the environment, with a
+A live backend (a VM, a vendor sandbox; `e2b.rs` is the example) is a function returning `Started` from a URL and a bearer in the environment, with a
 work directory the sandbox user may write; the guard is whatever stops it. Register its name in `backends::start`.

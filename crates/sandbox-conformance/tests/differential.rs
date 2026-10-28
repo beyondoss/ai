@@ -141,3 +141,16 @@ fn alpine() {
 fn debian_runas() {
     drive("debian-runas", 40, 0xd1ff_0006);
 }
+
+/// A real E2B VM running the released execd. Runs only when asked for by name
+/// (`DIFFERENTIAL_BACKENDS=e2b`) and when `E2B_API_KEY` is set; `DIFFERENTIAL_CASES` sets the count.
+#[test]
+#[ignore = "opt-in and billed: DIFFERENTIAL_BACKENDS=e2b with E2B_API_KEY (mise run test:clients:e2b)"]
+fn e2b() {
+    let asked =
+        std::env::var("DIFFERENTIAL_BACKENDS").is_ok_and(|v| v.split(',').any(|b| b == "e2b"));
+    if !asked || sandbox_conformance::e2b::key().is_none() {
+        return;
+    }
+    drive("e2b", 8, 0xd1ff_0007);
+}

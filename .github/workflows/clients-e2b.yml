@@ -1,0 +1,35 @@
+name: Clients on E2B
+# The client conformance matrix against a real E2B VM running the released execd. Manual only: it
+# is billed (one VM, deleted at the end, hard 25 minute auto-kill) and needs the E2B_API_KEY secret.
+on:
+  workflow_dispatch:
+    inputs:
+      execd_version:
+        description: "execd release tag to install in the VM"
+        required: false
+        default: "v0.1.16"
+permissions:
+  contents: read
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clients
+          save-if: "false"
+      - name: matrix on E2B
+        env:
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+          E2B_EXECD_VERSION: ${{ inputs.execd_version }}
+        run: mise run test:clients:e2b
+        timeout-minutes: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sandbox-matrix-e2b-report
+          path: target/sandbox-matrix/report-e2b.json
+          retention-days: 7

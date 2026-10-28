@@ -4,7 +4,7 @@
 //! `GroupKillGuard` the sandbox crate's test transports use). That does not run when the harness dies
 //! by SIGKILL, so every leader and every container is also written to a small registry file, and one
 //! watchdog process, started on first use in a group of its own, waits for the harness to be gone
-//! and then kills the registered groups and removes the registered containers. The registry holds
+//! and then kills the registered groups, removes the registered containers and deletes the registered E2B sandboxes. The registry holds
 //! only what is running: [`Leader`]'s drop and [`forget_container`] take their entries out, so a
 //! recycled pid is never signalled.
 use std::collections::BTreeSet;
@@ -30,6 +30,7 @@ if [ -f "$2" ]; then
   while read -r k v; do
     case "$k" in
       g) kill -s KILL -- "-$v" 2>/dev/null ;;
+      e) printf 'header = "X-API-Key: %s"\n' "$E2B_API_KEY" | curl -sS -m 30 -K - -o /dev/null -X DELETE "https://api.e2b.dev/sandboxes/$v" >/dev/null 2>&1 ;;
       c) docker rm -f "$v" >/dev/null 2>&1 ;;
     esac
   done < "$2"
@@ -116,5 +117,20 @@ pub fn watch_container(name: &str) {
 pub fn forget_container(name: &str) {
     update(|e| {
         e.remove(&format!("c {name}"));
+    });
+}
+
+/// Register an E2B sandbox id as soon as it exists. The watchdog deletes it through the API with
+/// `$E2B_API_KEY` from its inherited environment.
+pub fn watch_sandbox(id: &str) {
+    update(|e| {
+        e.insert(format!("e {id}"));
+    });
+}
+
+/// The sandbox is deleted.
+pub fn forget_sandbox(id: &str) {
+    update(|e| {
+        e.remove(&format!("e {id}"));
     });
 }
