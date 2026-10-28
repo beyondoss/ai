@@ -22,6 +22,7 @@ describe("the scripts are the spec's appendix", () => {
     "UPLOAD_SCRIPT",
     "DOWNLOAD_SCRIPT",
     "STAGE_SCRIPT",
+    "DIRS_SCRIPT",
   ];
   for (const name of names) {
     it(name, () => {

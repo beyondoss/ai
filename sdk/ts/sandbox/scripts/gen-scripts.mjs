@@ -35,6 +35,7 @@ for (
     "UPLOAD_SCRIPT",
     "DOWNLOAD_SCRIPT",
     "STAGE_SCRIPT",
+    "DIRS_SCRIPT",
   ]
 ) out[name] = mdScript(name);
 let ts =

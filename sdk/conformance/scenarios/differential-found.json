@@ -366,6 +366,313 @@
           }
         }
       ]
+    },
+    {
+      "id": "differential-found.search.glob-reports-an-unsearchable-subtree",
+      "description": "A directory that can be listed but not entered (mode 444) hides everything below it from the search. With a restricting glob the answer must still carry a note: GNU grep stats nothing it cannot enter, so with `--include` it skips the unsearchable entry `bb` in silence when its name does not satisfy the glob. The matches that can be read (`d/top.txt`) are returned.",
+      "requires": {
+        "not_root": true
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir -p d/sub/bb; echo foo > d/top.txt; echo foo > d/sub/bb/y.txt; chmod 444 d/sub",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "search",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "foo",
+          "literal": true,
+          "ignore_case": false,
+          "glob": "*.txt",
+          "glob_exclude": false,
+          "limit": 100,
+          "before": 0,
+          "after": 0,
+          "expect": {
+            "ok": {
+              "truncated": false,
+              "note": {
+                "$any": true
+              },
+              "hits": [
+                {
+                  "path": "${ROOT}/d/top.txt",
+                  "line": 1,
+                  "text": "foo",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "restore",
+          "op": "exec",
+          "command": "chmod",
+          "args": [
+            "755",
+            "--",
+            "${ROOT}/d/sub"
+          ],
+          "expect": {
+            "ok": {}
+          }
+        }
+      ]
+    },
+    {
+      "id": "differential-found.search.exclude-glob-reports-an-unsearchable-subtree",
+      "description": "The same with an excluding glob: GNU grep `--exclude` skips an entry it cannot stat when its name matches the glob, whatever the entry is, so an unsearchable directory named like the glob (`bb`) hides its subtree in silence.",
+      "requires": {
+        "not_root": true
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; mkdir -p d/sub/bb; echo foo > d/top.txt; echo foo > d/sub/bb/y.txt; chmod 444 d/sub",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "search",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "foo",
+          "literal": true,
+          "ignore_case": false,
+          "glob": "bb",
+          "glob_exclude": true,
+          "limit": 100,
+          "before": 0,
+          "after": 0,
+          "expect": {
+            "ok": {
+              "truncated": false,
+              "note": {
+                "$any": true
+              },
+              "hits": [
+                {
+                  "path": "${ROOT}/d/top.txt",
+                  "line": 1,
+                  "text": "foo",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "restore",
+          "op": "exec",
+          "command": "chmod",
+          "args": [
+            "755",
+            "--",
+            "${ROOT}/d/sub"
+          ],
+          "expect": {
+            "ok": {}
+          }
+        }
+      ]
+    },
+    {
+      "id": "differential-found.search.exclude-glob-does-not-note-an-excluded-unreadable-file",
+      "description": "A file the excluding glob skips is not searched, so it cannot be a reason for a note. An unreadable `x.txt` under `glob: \"*.txt\"` excluded leaves the search complete: no note. (ripgrep opens the file, since the exclusion is applied to its hits, and so reports it; the client drops that report.)",
+      "requires": {
+        "not_root": true
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo foo > ok.md; echo foo > x.txt; chmod 000 x.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "search",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "foo",
+          "literal": true,
+          "ignore_case": false,
+          "glob": "*.txt",
+          "glob_exclude": true,
+          "limit": 100,
+          "before": 0,
+          "after": 0,
+          "expect": {
+            "ok": {
+              "truncated": false,
+              "note": null,
+              "hits": [
+                {
+                  "path": "${ROOT}/ok.md",
+                  "line": 1,
+                  "text": "foo",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "restore",
+          "op": "exec",
+          "command": "chmod",
+          "args": [
+            "644",
+            "--",
+            "${ROOT}/x.txt"
+          ],
+          "expect": {
+            "ok": {}
+          }
+        }
+      ]
+    },
+    {
+      "id": "differential-found.search.exclude-glob-keeps-the-note-for-an-unreadable-directory",
+      "description": "An excluding glob selects files only, so a directory named like the glob is still entered and searched. An unreadable `d.txt/` holding a file hides that file, and the search must say so even though its name matches `*.txt` (contrast: an unreadable excluded FILE is not a reason for a note).",
+      "requires": {
+        "not_root": true
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo foo > ok.md; mkdir d.txt; echo foo > d.txt/in.md; chmod 000 d.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "search",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "foo",
+          "literal": true,
+          "ignore_case": false,
+          "glob": "*.txt",
+          "glob_exclude": true,
+          "limit": 100,
+          "before": 0,
+          "after": 0,
+          "expect": {
+            "ok": {
+              "truncated": false,
+              "note": {
+                "$any": true
+              },
+              "hits": [
+                {
+                  "path": "${ROOT}/ok.md",
+                  "line": 1,
+                  "text": "foo",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "restore",
+          "op": "exec",
+          "command": "chmod",
+          "args": [
+            "755",
+            "--",
+            "${ROOT}/d.txt"
+          ],
+          "expect": {
+            "ok": {}
+          }
+        }
+      ]
+    },
+    {
+      "id": "differential-found.search.exclude-glob-never-hides-a-missing-root",
+      "description": "The root's own error decides the whole search. A missing root whose name matches the excluding glob is still not_found, and a root below a regular file whose name matches is still not_a_directory (not a success with no hits).",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "write",
+          "path": "${ROOT}/alpha.txt",
+          "data_b64": "Zm9vCg==",
+          "expect": {
+            "ok": {}
+          }
+        }
+      ],
+      "steps": [
+        {
+          "id": "missing",
+          "op": "search",
+          "root": "${ROOT}/gone.txt",
+          "pattern": "foo",
+          "literal": true,
+          "ignore_case": false,
+          "glob": "*.txt",
+          "glob_exclude": true,
+          "limit": 100,
+          "before": 0,
+          "after": 0,
+          "expect": {
+            "error": {
+              "kind": "not_found"
+            }
+          }
+        },
+        {
+          "id": "below-file",
+          "op": "search",
+          "root": "${ROOT}/alpha.txt/note.txt",
+          "pattern": "foo",
+          "literal": true,
+          "ignore_case": false,
+          "glob": "*.txt",
+          "glob_exclude": true,
+          "limit": 100,
+          "before": 0,
+          "after": 0,
+          "expect": {
+            "error": {
+              "kind": "not_a_directory"
+            }
+          }
+        }
+      ]
     }
   ]
 }
