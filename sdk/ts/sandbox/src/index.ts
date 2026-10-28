@@ -18,6 +18,16 @@ export type {
   Transport,
 } from "./transport.js";
 
+export {
+  BULK_CHUNK_BYTES,
+  BULK_STDERR_BYTES,
+  BULK_TIMEOUT_MS,
+  download,
+  extract,
+  upload,
+} from "./bulk.js";
+export type { Transfer, UploadOptions } from "./bulk.js";
+
 export { Files, sh } from "./files.js";
 export type {
   Capabilities,

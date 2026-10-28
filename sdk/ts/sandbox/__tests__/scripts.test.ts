@@ -19,6 +19,9 @@ describe("the scripts are the spec's appendix", () => {
     "WRITE_STDIN_SCRIPT",
     "REMOVE_TEMP_SCRIPT",
     "GIT_SCRIPT",
+    "UPLOAD_SCRIPT",
+    "DOWNLOAD_SCRIPT",
+    "STAGE_SCRIPT",
   ];
   for (const name of names) {
     it(name, () => {

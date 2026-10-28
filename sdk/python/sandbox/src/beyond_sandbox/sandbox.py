@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import os
 import ssl
 from typing import Sequence
 
+from . import _bulk
+from ._drive import adrive, drive
 from .atransport import AsyncFrameStream, AsyncHttpTransport, AsyncJobTransport, AsyncToken
 from .files import AsyncFiles, CapsOverride, Files
 from .jobs import AsyncJobs, Jobs
-from .models import Capabilities, ExecResult, Frame
+from .models import Capabilities, ExecResult, Frame, Transfer
 from .transport import DEFAULT_TIMEOUT_MS, FrameStream, HttpTransport, JobTransport, Token
 
 
@@ -110,6 +113,27 @@ class Sandbox:
         """Run a command and iterate its frames as they arrive. ``close()`` kills it."""
         return Frames(self.transport.stream(command, args, cwd=cwd, timeout_ms=timeout_ms))
 
+    def upload(
+        self,
+        sources: str | os.PathLike[str] | Sequence[str | os.PathLike[str]],
+        remote_dir: str,
+        *,
+        chunk_bytes: int | None = None,
+    ) -> Transfer:
+        """Copy local files into the sandbox directory ``remote_dir`` as a tar stream.
+
+        ``sources`` is a local directory (its contents land directly in ``remote_dir``) or a list
+        of paths (each lands under its base name). Modes, symlinks and mtimes are kept; a link is
+        never followed. One request when the archive fits ``chunk_bytes`` (default 16 MiB), else
+        a staged upload in chunks.
+        """
+        return drive(_bulk.upload(sources, remote_dir, chunk_bytes), self.transport)
+
+    def download(self, remote_path: str, local_dir: str | os.PathLike[str]) -> Transfer:
+        """Copy a sandbox directory's contents (or one file) into ``local_dir`` (created if
+        missing), streaming. Nothing is ever written through a link."""
+        return drive(_bulk.download(remote_path, local_dir), self.transport)
+
     def capabilities(self) -> Capabilities:
         """What the sandbox's environment offers (probed once, cached)."""
         return self.files.capabilities()
@@ -174,6 +198,27 @@ class AsyncSandbox:
         return AsyncFrames(
             await self.transport.stream(command, args, cwd=cwd, timeout_ms=timeout_ms)
         )
+
+    async def upload(
+        self,
+        sources: str | os.PathLike[str] | Sequence[str | os.PathLike[str]],
+        remote_dir: str,
+        *,
+        chunk_bytes: int | None = None,
+    ) -> Transfer:
+        """Copy local files into the sandbox directory ``remote_dir`` as a tar stream.
+
+        ``sources`` is a local directory (its contents land directly in ``remote_dir``) or a list
+        of paths (each lands under its base name). Modes, symlinks and mtimes are kept; a link is
+        never followed. One request when the archive fits ``chunk_bytes`` (default 16 MiB), else
+        a staged upload in chunks.
+        """
+        return await adrive(_bulk.upload(sources, remote_dir, chunk_bytes), self.transport)
+
+    async def download(self, remote_path: str, local_dir: str | os.PathLike[str]) -> Transfer:
+        """Copy a sandbox directory's contents (or one file) into ``local_dir`` (created if
+        missing), streaming. Nothing is ever written through a link."""
+        return await adrive(_bulk.download(remote_path, local_dir), self.transport)
 
     async def capabilities(self) -> Capabilities:
         return await self.files.capabilities()

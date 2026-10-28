@@ -34,6 +34,8 @@ only others. The checks that need streaming or a caller-chosen mtime are reporte
 | `stat`       | exists, kind, size, mtime, writable                                                                           |
 | `search`     | regular-expression search under a directory, with `context`, `glob`, `literal`, `ignore_case`, `limit`        |
 | `mkdir`      | create a directory and its parents                                                                            |
+| `upload`     | copy a directory or file of this machine into a sandbox directory as tar (needs `SANDBOX_LOCAL_ROOT`)         |
+| `download`   | copy a sandbox directory or file to a directory of this machine, never writing through a link (same)          |
 | `job_start`  | start a command that outlives the call; the sandbox keeps it and its output                                   |
 | `job_list`   | jobs and their state: `running`, `exited`, `ended`, `lost`                                                    |
 | `job_output` | a job's output from an offset; follow it by passing back `next_offset`                                        |
@@ -59,6 +61,7 @@ Environment variables only, as `execd` does; there are no flags.
 | `SANDBOX_JOBS_SCOPE`           | the name jobs are kept under (default `mcp`); a later server with the same scope sees them            |
 | `SANDBOX_MCP_LISTEN`           | `127.0.0.1:PORT`: serve streamable HTTP at `/mcp` instead of stdio                                    |
 | `SANDBOX_MCP_INSECURE_NO_AUTH` | allow a non-loopback `SANDBOX_MCP_LISTEN`; the server then checks nobody (default 0)                  |
+| `SANDBOX_LOCAL_ROOT`           | an absolute directory of this machine; turns on `upload` and `download`, confined to it               |
 | `SANDBOX_CAPS`                 | JSON that overrides the probe (`find_printf`, `search_engine`), to test a search rung                 |
 
 The server holds the sandbox's token, so over HTTP it listens on loopback only unless told otherwise, and rejects a `Host`

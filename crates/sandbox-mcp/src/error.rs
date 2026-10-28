@@ -46,6 +46,18 @@ impl From<std::io::Error> for ToolError {
     }
 }
 
+impl From<beyond_sandbox::BulkError> for ToolError {
+    fn from(e: beyond_sandbox::BulkError) -> Self {
+        use beyond_sandbox::BulkError;
+        match e {
+            BulkError::InvalidRequest(m) => Self::invalid(m),
+            BulkError::Archive(m) => Self::new("protocol", m),
+            BulkError::Command(m) => classify(&m, None),
+            BulkError::Io(e) => Self::from(e),
+        }
+    }
+}
+
 impl From<FsError> for ToolError {
     fn from(e: FsError) -> Self {
         match e {

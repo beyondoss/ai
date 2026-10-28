@@ -92,6 +92,26 @@ impl Sandbox {
         &self.jobs
     }
 
+    /// Copy local files and directories into the sandbox directory `remote_dir` as a tar stream
+    /// ([`crate::bulk`]).
+    pub async fn upload(
+        &self,
+        sources: crate::bulk::Sources,
+        remote_dir: &str,
+    ) -> Result<crate::bulk::Transfer, crate::bulk::BulkError> {
+        crate::bulk::upload(&*self.exec, sources, remote_dir).await
+    }
+
+    /// Copy a sandbox directory's contents (or one file) into the local directory `local_dir`
+    /// ([`crate::bulk`]).
+    pub async fn download(
+        &self,
+        remote_path: &str,
+        local_dir: &std::path::Path,
+    ) -> Result<crate::bulk::Transfer, crate::bulk::BulkError> {
+        crate::bulk::download(&*self.exec, remote_path, local_dir).await
+    }
+
     /// The exec this sandbox runs on, for anything the helpers do not cover.
     pub fn raw(&self) -> &Arc<dyn CommandRunner> {
         &self.exec

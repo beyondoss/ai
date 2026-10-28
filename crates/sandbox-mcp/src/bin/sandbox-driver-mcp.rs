@@ -29,6 +29,10 @@ use rmcp::{RoleClient, ServiceExt as _};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 
+// The local trees of the bulk-copy ops, shared with the Rust driver.
+#[path = "../../../sandbox-conformance/src/trees.rs"]
+mod trees;
+
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 const DRIVER: &str = "sandbox-mcp";
 
@@ -52,6 +56,8 @@ const OPS: &[&str] = &[
     "mkdir",
     "list",
     "search",
+    "upload",
+    "download",
 ];
 
 fn unsupported_reason(op: &str) -> Option<&'static str> {
@@ -63,6 +69,10 @@ fn unsupported_reason(op: &str) -> Option<&'static str> {
         "write_if_unchanged" => Some(
             "no sandbox-mcp tool takes an expected mtime; edit_file performs a guarded write against \
              the mtime it read, which the caller cannot supply",
+        ),
+        "extract" => Some(
+            "sandbox-mcp has no tool that extracts an archive it is handed: the local half of a \
+             download is inside its download tool",
         ),
         _ => None,
     }
@@ -126,6 +136,10 @@ fn strings(req: &Value, key: &str) -> Result<Vec<String>, Value> {
     }
 }
 
+fn counts(r: &Value) -> Value {
+    json!({"files": r["files"], "dirs": r["dirs"], "links": r["links"], "bytes": r["bytes"]})
+}
+
 fn bytes_arg(req: &Value, key: &str) -> Result<Vec<u8>, Value> {
     B64.decode(str_arg(req, key)?)
         .map_err(|e| err("invalid_request", format!("`{key}` is not base64: {e}")))
@@ -144,6 +158,8 @@ struct Mcp {
     // Held so the server (a child process) lives as long as the driver.
     _service: RunningService<RoleClient, ()>,
     peer: Peer<RoleClient>,
+    /// The server's `SANDBOX_LOCAL_ROOT`: the trees of upload and download live below it.
+    root: tempfile::TempDir,
 }
 
 impl Mcp {
@@ -160,9 +176,12 @@ impl Mcp {
             "SANDBOX_TOKEN_CMD",
             "SANDBOX_CAPS",
             "SANDBOX_JOBS_SCOPE",
+            "SANDBOX_LOCAL_ROOT",
         ] {
             cmd.env_remove(k);
         }
+        let root = tempfile::tempdir().map_err(|e| err("io", e.to_string()))?;
+        cmd.env("SANDBOX_LOCAL_ROOT", root.path());
         cmd.env("SANDBOX_URL", &url);
         if let Some(b) = std::env::var("CONFORMANCE_BEARER")
             .ok()
@@ -186,6 +205,7 @@ impl Mcp {
         Ok(Self {
             _service: service,
             peer,
+            root,
         })
     }
 
@@ -370,6 +390,50 @@ impl Mcp {
                 )
                 .await?;
                 Ok(json!({}))
+            }
+            "upload" => {
+                let tree = trees::Tree::build_in(Some(self.root.path()), req)?;
+                let rel = tree.dir();
+                let rel = rel
+                    .strip_prefix(self.root.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let only = match &req["sources"] {
+                    Value::Null => Value::Null,
+                    _ => json!(strings(req, "sources")?),
+                };
+                let r = self
+                    .tool(
+                        "upload",
+                        args(vec![
+                            ("local", json!(rel)),
+                            ("remote_dir", json!(str_arg(req, "path")?)),
+                            ("only", only),
+                        ]),
+                    )
+                    .await?;
+                Ok(counts(&r))
+            }
+            "download" => {
+                let layout = trees::Layout::new_in(Some(self.root.path()), &req["prefill"])?;
+                let rel = layout
+                    .local
+                    .strip_prefix(self.root.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let r = self
+                    .tool(
+                        "download",
+                        args(vec![
+                            ("remote_path", json!(str_arg(req, "path")?)),
+                            ("local_dir", json!(rel)),
+                        ]),
+                    )
+                    .await
+                    .map(|r| counts(&r));
+                layout.finish(r)
             }
             "mkdir" => {
                 self.tool("mkdir", args(vec![("path", json!(str_arg(req, "path")?))]))

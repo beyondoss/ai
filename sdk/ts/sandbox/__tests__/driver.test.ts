@@ -18,7 +18,7 @@ describe("driver without an endpoint", () => {
   });
 
   it("answers unsupported for an op it does not know, never a silent pass", async () => {
-    for (const op of ["remove", "upload_dir", "download_dir", "nonsense", ""]) {
+    for (const op of ["remove", "copy_dir", "sync_dir", "nonsense", ""]) {
       const r = await ask(dead, { id: 1, op });
       expect(r, op).toMatchObject({ id: 1, error: { kind: "unsupported" } });
       expect(OPS as readonly string[]).not.toContain(op);

@@ -34,8 +34,8 @@ here as a scenario, `xfail` for the clients that fail it.
 
 The three layers are tested separately: `exec`, `exec-bytes`, `stream` and `jobs` are the
 transport, `files` the helpers, `helpers` is code a user wrote on the raw exec
-calls alone, which every client must be able to run. `bulk` is planned (T7) and
-skipped.
+calls alone, which every client must be able to run. `bulk` is the tar helpers (`upload`, `download`) and the
+hostile-archive cases of the local extractor (`extract`); `sdk/conformance/tools/gen_bulk.py` generates it.
 
 ## The reference check
 

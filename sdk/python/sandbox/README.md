@@ -93,6 +93,28 @@ Pass anything variable as its own argument. A pipeline is a fixed script run as
 `sh -c SCRIPT sh ARG...` with the variable parts arriving as `$1`, `$2`; never build a command line
 from a path.
 
+## Copy whole trees
+
+`upload` and `download` move a directory between this machine and the sandbox as a tar stream over
+plain exec, so the sandbox needs only `sh` and a `tar` (GNU or busybox), and this machine none.
+Modes, mtimes and symlinks survive; a link is stored, never followed.
+
+```python
+sb.upload("./project", "/work/project")            # a directory's contents, or a list of paths
+sb.download("/work/project", "./out")              # a directory's contents, or one file
+```
+
+- **One request** when the archive fits `chunk_bytes` (16 MiB); larger trees are staged in chunks
+  and extracted by one last command. Memory held is about two chunks, however big the tree.
+- **Downloads stream**: stdout frames feed the extractor as they arrive, so size is not capped by the
+  one-shot response limit.
+- **The sandbox is not trusted.** A member with `..`, an absolute name, or a path below a symlink is
+  refused (`protocol`, `unsafe archive member NAME: ...`); nothing is written through a link.
+- **Failures are reported**: a destination that is a file is `not_a_directory`, a read-only or full
+  filesystem is `io` naming it, a directory this call created is removed on failure.
+
+Both return a `Transfer(files, dirs, links, bytes)`; `AsyncSandbox` has the same two methods.
+
 ## Behaviour worth knowing
 
 - `files.write` replaces a file atomically (temp beside the file, then `mv`), keeps its mode, writes

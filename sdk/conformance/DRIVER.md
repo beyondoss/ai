@@ -124,27 +124,69 @@ is `invalid_request` without sending anything.
 | `list`               | `path`, `include_hidden?` (false), `limit?` (10000)                                                                              | `{entries: [{name, kind, size}]}` (order unspecified)                                                                                                                     |
 | `search`             | `pattern`, `root`, `literal?`, `ignore_case?`, `glob?`, `glob_exclude?`, `limit?` (100), `before?`, `after?`                     | `{hits: [{path, line, text, is_match}], truncated, note}`                                                                                                                 |
 | `remove`             | `path`                                                                                                                           | planned: no counterpart in the reference                                                                                                                                  |
-| `upload_dir`         | `path`, `tar_b64`                                                                                                                | **planned, T7**                                                                                                                                                           |
-| `download_dir`       | `path`                                                                                                                           | **planned, T7**: `{tar_b64}`                                                                                                                                              |
+| `upload`             | `path` (remote dir), `entries` (a tree), `sources?` (names in the tree), `chunk_bytes?`                                          | `{files, dirs, links, bytes}`: section 5.8                                                                                                                                |
+| `download`           | `path` (remote path), `prefill?` (a tree)                                                                                        | `{files, dirs, links, bytes, entries}`: what was extracted, as a tree listing                                                                                             |
+| `extract`            | `tar_b64`, `prefill?`                                                                                                            | as `download`, for an archive the harness supplies: the local half of a download, with a hostile archive standing in for a hostile sandbox. No endpoint is reached        |
 
 A write that fails its precondition is an error, never `{written: false}`: the
 reference returns a boolean, and the driver turns `false` into `conflict`.
 
+### Trees (bulk copy)
+
+The driver's own machine is the _local_ side of a copy. A request describes a
+local tree and the driver builds it in a fresh temporary directory, calls the
+client's `upload` on it, or extracts into a fresh temporary directory and
+reports what it finds. A **tree** is a list of entries:
+
+```json
+{ "path": "d/f.txt", "type": "file", "mode": "0644", "data_b64": "aGk=", "mtime": 1500000000 }
+{ "path": "big.bin", "type": "file", "pattern_b64": "AAEC", "size": 52428800 }
+{ "path": "d", "type": "dir", "mode": "0755" }
+{ "path": "l", "type": "symlink", "target": "d/f.txt" }
+{ "path": "pipe", "type": "fifo" }
+```
+
+`type` is `file` (the default), `dir`, `symlink` or `fifo`. `mode` is an octal
+string (files default `0644`, directories `0755`). A file's content is
+`data_b64`, or `pattern_b64` repeated and cut to `size` bytes (so a 50 MB file
+is not a 67 MB line). `mtime` is epoch seconds. Parent directories not listed
+are created `0755`. In a symlink `target`, `${OUTSIDE}` is the absolute path of
+an empty directory beside the extraction directory (see below). Directory modes
+are applied last, deepest first.
+
+`upload`'s `sources`, when present, is a list of paths in the tree to upload by
+base name instead of the whole tree's contents; `chunk_bytes` lowers the chunk
+size (at least 512) so a small tree walks the staged path. `download` and
+`extract` extract into an empty directory `local`, first building `prefill`
+(a tree) in it, and answer with the counts and `entries`, a listing of `local`
+sorted by path:
+
+```json
+{ "path": "d/f.txt", "type": "file", "mode": "0644", "size": 2, "sha256": "...", "mtime": 1500000000 }
+{ "path": "d", "type": "dir", "mode": "0755", "mtime": 1500000000 }
+{ "path": "l", "type": "symlink", "target": "d/f.txt" }
+```
+
+The directory holding `local` also holds `outside`, empty. **After the call, a
+driver MUST fail the op with `io` if anything else is in that directory or if
+`outside` is not empty**: that is how a scenario sees a write that escaped its
+target, whatever the client answered.
+
 ## 4. Errors
 
-| kind                                                                      | when                                                    |
-| ------------------------------------------------------------------------- | ------------------------------------------------------- |
-| `not_found`, `is_directory`, `not_a_directory`, `permission_denied`, `io` | a command ran and failed (FILES-OVER-EXEC section 3.3)  |
-| `invalid_query`                                                           | the search pattern or glob was rejected                 |
-| `conflict`                                                                | `write_if_unchanged`: the mtime is not the expected one |
-| `too_large`                                                               | the endpoint's answer exceeded the response cap         |
-| `auth`                                                                    | HTTP 401 or 403                                         |
-| `timeout`                                                                 | the request deadline passed                             |
-| `transport`                                                               | unreachable, reset, or a stream that broke              |
-| `protocol`                                                                | the answer is not the protocol                          |
-| `endpoint`                                                                | any other non-2xx status                                |
-| `invalid_request`                                                         | the **request** cannot be formed; nothing was sent      |
-| `unsupported`                                                             | the **driver** does not implement the op                |
+| kind                                                                      | when                                                                                |
+| ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `not_found`, `is_directory`, `not_a_directory`, `permission_denied`, `io` | a command ran and failed (FILES-OVER-EXEC section 3.3)                              |
+| `invalid_query`                                                           | the search pattern or glob was rejected                                             |
+| `conflict`                                                                | `write_if_unchanged`: the mtime is not the expected one                             |
+| `too_large`                                                               | the endpoint's answer exceeded the response cap                                     |
+| `auth`                                                                    | HTTP 401 or 403                                                                     |
+| `timeout`                                                                 | the request deadline passed                                                         |
+| `transport`                                                               | unreachable, reset, or a stream that broke                                          |
+| `protocol`                                                                | the answer is not the protocol; a tar from the sandbox is unsafe or malformed (5.8) |
+| `endpoint`                                                                | any other non-2xx status                                                            |
+| `invalid_request`                                                         | the **request** cannot be formed; nothing was sent                                  |
+| `unsupported`                                                             | the **driver** does not implement the op                                            |
 
 `unsupported` is how a driver reports a capability it does not have. It is never
 a pass: see section 6.

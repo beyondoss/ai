@@ -36,6 +36,9 @@ pub struct Config {
     /// `SANDBOX_MCP_LISTEN`: serve streamable HTTP here instead of stdio.
     pub listen: Option<String>,
     pub insecure_no_auth: bool,
+    /// `SANDBOX_LOCAL_ROOT`: the directory of the server's own machine that `upload` and
+    /// `download` may read and write. Unset, the two tools do not exist.
+    pub local_root: Option<std::path::PathBuf>,
 }
 
 pub const USAGE: &str = "\
@@ -49,6 +52,8 @@ sandbox-mcp takes no arguments; it is configured by environment variables:
   SANDBOX_MCP_LISTEN           host:port: serve streamable HTTP there instead of stdio
   SANDBOX_MCP_INSECURE_NO_AUTH 1|true|0|false: allow SANDBOX_MCP_LISTEN on a non-loopback address
                                (the server holds the sandbox token and checks nobody; default 0)
+  SANDBOX_LOCAL_ROOT           an absolute directory of this machine: turns on the upload and download
+                               tools (tar over exec), confined to it. Unset, they are not offered
   SANDBOX_CAPS                 JSON {\"find_printf\":bool,\"search_engine\":\"rg|grep|busybox-grep\"}:
                                force a search rung of the file helpers (for testing)
 ";
@@ -99,6 +104,16 @@ impl Config {
                 }
             }
         };
+        let local_root = match get("SANDBOX_LOCAL_ROOT") {
+            None => None,
+            Some(r) => {
+                let p = std::path::PathBuf::from(&r);
+                if !p.is_absolute() {
+                    return Err(format!("SANDBOX_LOCAL_ROOT={r:?} must be an absolute path"));
+                }
+                Some(p)
+            }
+        };
         Ok(Self {
             url,
             token,
@@ -109,6 +124,7 @@ impl Config {
                 "SANDBOX_MCP_INSECURE_NO_AUTH",
                 get("SANDBOX_MCP_INSECURE_NO_AUTH"),
             )?,
+            local_root,
         })
     }
 }
@@ -147,6 +163,21 @@ mod tests {
         assert_eq!(
             Config::from_env(cmd).unwrap().token,
             Token::Command("echo a".into())
+        );
+    }
+
+    #[test]
+    fn the_local_root_must_be_absolute() {
+        let bad = env(&[("SANDBOX_URL", "u"), ("SANDBOX_LOCAL_ROOT", "work")]);
+        assert!(
+            Config::from_env(bad)
+                .unwrap_err()
+                .contains("SANDBOX_LOCAL_ROOT")
+        );
+        let ok = env(&[("SANDBOX_URL", "u"), ("SANDBOX_LOCAL_ROOT", "/work")]);
+        assert_eq!(
+            Config::from_env(ok).unwrap().local_root,
+            Some("/work".into())
         );
     }
 
