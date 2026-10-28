@@ -75,13 +75,25 @@ fn any_number() -> Value {
 
 /// Whether `resp` is an `exec` answer of exit 126 or 127: the answers the MCP driver's shell words
 /// differently.
+///
+/// An `exec_stream` of the MCP driver is a job, so besides 126 and 127 a command that cannot be
+/// started may be a refused `job_start` (`endpoint`, a working directory that is not one), and the
+/// shell's or execd's words are in the job's one log (`stdout_b64`).
 pub fn is_exec_not_started(op: &str, resp: &Value) -> bool {
-    op == "exec" && (resp["ok"]["exit_code"] == 127 || resp["ok"]["exit_code"] == 126)
+    let code = &resp["ok"]["exit_code"];
+    match op {
+        "exec" => *code == 127 || *code == 126,
+        "exec_stream" => *code == 127 || *code == 126 || resp["error"]["kind"] == "endpoint",
+        _ => false,
+    }
 }
 
 /// `loose`: compare a 126 or 127 `exec` answer by class (see the module doc).
 pub fn canon(op: &str, resp: &Value, root: &str, loose: bool) -> Value {
     if let Some(e) = resp.get("error") {
+        if loose && op == "exec_stream" && e["kind"] == "endpoint" {
+            return json!({"ok": {"exit_code": {"$class": "not started"}}});
+        }
         return json!({"error": {"kind": e["kind"]}});
     }
     let mut ok = resp.get("ok").cloned().unwrap_or(Value::Null);
@@ -116,6 +128,10 @@ pub fn canon(op: &str, resp: &Value, root: &str, loose: bool) -> Value {
             {
                 ok["stderr_b64"] = json!({"$class": why});
             }
+        }
+        // A refused job start has no words to compare, so the class is all that is.
+        "exec_stream" if loose && (ok["exit_code"] == 127 || ok["exit_code"] == 126) => {
+            ok = json!({"exit_code": {"$class": "not started"}});
         }
         "search" if !ok["note"].is_null() => ok["note"] = json!({"$type": "string"}),
         _ => {}
