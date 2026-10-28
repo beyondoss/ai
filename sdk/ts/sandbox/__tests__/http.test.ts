@@ -91,6 +91,30 @@ describe("HttpTransport.run", () => {
     expect(e.requests).toHaveLength(2);
   });
 
+  it("reports a token source that throws or gives nothing as auth, sending nothing", async () => {
+    const e = await endpoint((_, res) => json(res, 200, {}));
+    for (
+      const token of [
+        async () => {
+          throw new Error("vault sealed");
+        },
+        async () => "  ",
+      ]
+    ) {
+      const t = new HttpTransport({ url: e.url, token });
+      expect(await kindOf(t.run("x", []))).toBe("auth");
+    }
+    await expect(
+      new HttpTransport({
+        url: e.url,
+        token: async () => {
+          throw new Error("vault sealed");
+        },
+      }).run("x", []),
+    ).rejects.toThrow(/token source failed: vault sealed/);
+    expect(e.requests).toHaveLength(0);
+  });
+
   it("never retries with a string token, or on 403", async () => {
     const e = await endpoint((_, res) => json(res, 401, {}));
     expect(

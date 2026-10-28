@@ -130,6 +130,7 @@ situations.
 | connection refused, reset, DNS failure                              | `transport` |
 | the request deadline passed                                         | `timeout`   |
 | HTTP 401 or 403                                                     | `auth`      |
+| the token source fails (see below)                                  | `auth`      |
 | HTTP 422 whose body says the output exceeded the cap, or client cap | `too_large` |
 | any other non-2xx                                                   | `endpoint`  |
 | 200 whose body is not the expected JSON                             | `protocol`  |
@@ -141,6 +142,11 @@ spoke something else. That is a line that is not a JSON object, an output field 
 standard base64, and a line that grows past the line limit without a newline. `transport` is for
 bytes that stopped coming: a stream that ends without its final frame (in the middle of a line
 included), a `{"error"}` frame, silence past the heartbeat limit, a reset.
+
+A token source is a function or command that gives the bearer (layer 1). It fails when it
+raises or exits non-zero, or gives an empty token. That is `auth`, on every call that needs a
+token, with the source's own message (a command's stderr) in `detail` and nothing sent to the
+endpoint: not `io`, and never the source's own exception escaping the client.
 
 A transport-level failure is never a capability: see
 [probe errors](#42-probe-errors).
