@@ -11,9 +11,6 @@ export function text(b: Uint8Array): string {
   return decoder.decode(b);
 }
 
-const B64_RE =
-  /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
-
 /** Standard base64 (RFC 4648 section 4) with padding. */
 export function toBase64(bytes: Uint8Array): string {
   if (typeof Buffer !== "undefined") {
@@ -27,10 +24,62 @@ export function toBase64(bytes: Uint8Array): string {
   return btoa(s);
 }
 
+/** Whitespace as JavaScript's `\s` matches it (WhiteSpace and LineTerminator). */
+function isSpace(c: number): boolean {
+  if (c < 128) return c === 32 || (c >= 9 && c <= 13);
+  return (
+    c === 0xa0
+    || c === 0x1680
+    || (c >= 0x2000 && c <= 0x200a)
+    || c === 0x2028
+    || c === 0x2029
+    || c === 0x202f
+    || c === 0x205f
+    || c === 0x3000
+    || c === 0xfeff
+  );
+}
+
+/** Removes every whitespace char in one linear pass. Returns `s` itself when there is none. */
+function stripSpace(s: string): string {
+  let out = "";
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    if (isSpace(s.charCodeAt(i))) {
+      out += s.slice(start, i);
+      start = i + 1;
+    }
+  }
+  return start === 0 ? s : out + s.slice(start);
+}
+
+/**
+ * Strict base64 check in one linear pass, no regex: the length is a multiple of 4, and the
+ * alphabet is `A-Za-z0-9+/` except for up to two `=` at the very end.
+ */
+function isStrictBase64(s: string): boolean {
+  const n = s.length;
+  if (n % 4 !== 0) return false;
+  let end = n;
+  for (let pad = 0; pad < 2 && end > 0 && s.charCodeAt(end - 1) === 61; pad++) {
+    end--;
+  }
+  for (let i = 0; i < end; i++) {
+    const c = s.charCodeAt(i);
+    const ok = (c >= 65 && c <= 90)
+      || (c >= 97 && c <= 122)
+      || (c >= 48 && c <= 57)
+      || c === 43
+      || c === 47;
+    if (!ok) return false;
+  }
+  return true;
+}
+
 /** Strict standard base64 with padding; whitespace is ignored. Returns null if it is not base64. */
 export function fromBase64(s: string): Uint8Array | null {
-  const clean = s.replace(/\s+/g, "");
-  if (!B64_RE.test(clean)) return null;
+  const clean = stripSpace(s);
+  if (!isStrictBase64(clean)) return null;
   if (typeof Buffer !== "undefined") {
     const b = Buffer.from(clean, "base64");
     return new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
