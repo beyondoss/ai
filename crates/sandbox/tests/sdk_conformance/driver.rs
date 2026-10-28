@@ -478,11 +478,15 @@ impl Driver {
             .iter()
             .map(|j| {
                 let (state, code) = state_of(j.status);
-                json!({
+                let mut entry = json!({
                     "id": j.id.as_str(), "state": state, "code": code, "kept": j.kept,
                     "num": j.num, "kind": j.kind, "seen": j.seen,
                     "started": j.started, "ended": j.ended, "label": j.label,
-                })
+                });
+                if let Some(s) = j.signal {
+                    entry["signal"] = json!(s);
+                }
+                entry
             })
             .collect();
         Ok(json!({ "jobs": jobs }))
@@ -499,10 +503,14 @@ impl Driver {
             .await
             .map_err(|e| io_err(&e))?;
         let (state, code) = state_of(c.status);
-        Ok(json!({
+        let mut out = json!({
             "state": state, "code": code, "offset": c.offset, "end": c.end,
             "data_b64": b64(&c.data),
-        }))
+        });
+        if let Some(s) = c.signal {
+            out["signal"] = json!(s);
+        }
+        Ok(out)
     }
 
     async fn job_attach(&self, req: &Value) -> Out {

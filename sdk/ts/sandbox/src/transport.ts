@@ -48,8 +48,10 @@ export type JobState = "running" | "exited" | "ended" | "lost" | "gone";
 export interface JobInfo {
   id: string;
   state: JobState;
-  /** The exit code; null unless `exited` or `ended`. */
+  /** The exit code (128+N when signal N killed the shell); null unless `exited` or `ended`. */
   code: number | null;
+  /** The signal that killed the shell; absent for a shell that exited, whatever its code. */
+  signal?: number;
   kept: boolean;
   num: number | null;
   kind: string | null;
@@ -66,6 +68,8 @@ export interface JobInfo {
 export interface JobChunk {
   state: JobState;
   code: number | null;
+  /** The signal that killed the shell; absent for a shell that exited, whatever its code. */
+  signal?: number;
   /** Where `data` starts: later than asked when old output was dropped. */
   offset: number;
   /** The end of the job's output so far, whatever `max` was. */

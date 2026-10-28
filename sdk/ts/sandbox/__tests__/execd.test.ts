@@ -274,6 +274,46 @@ d("against a loopback execd", () => {
         }
       });
 
+      it("tells a job killed by a signal from one that exited 137", async () => {
+        const sb = await connect();
+        const scope = `ts-signal-${process.pid}`;
+        try {
+          await sb.jobs.start(scope, "sig", {
+            command: "sh",
+            args: ["-c", "kill -9 $$"],
+          });
+          await sb.jobs.start(scope, "exit", {
+            command: "sh",
+            args: ["-c", "exit 137"],
+          });
+          for (let i = 0; i < 100; i++) {
+            const states = await sb.jobs.list(scope);
+            if (
+              states.length === 2 && states.every((j) => j.state === "ended")
+            ) break;
+            await sleep(50);
+          }
+          const killed = await sb.jobs.read(scope, "sig");
+          const exited = await sb.jobs.read(scope, "exit");
+          expect(killed).toMatchObject({
+            state: "ended",
+            code: 137,
+            signal: 9,
+          });
+          expect(exited).toMatchObject({ state: "ended", code: 137 });
+          expect("signal" in exited).toBe(false);
+          const listed = Object.fromEntries(
+            (await sb.jobs.list(scope)).map((j) => [j.id, j]),
+          );
+          expect(listed.sig).toMatchObject({ code: 137, signal: 9 });
+          expect(listed.exit !== undefined && "signal" in listed.exit).toBe(
+            false,
+          );
+        } finally {
+          await sb.jobs.wipe(scope);
+        }
+      });
+
       it("kills the whole group, and refuses a bad id before sending anything", async () => {
         const sb = await connect();
         const scope = `ts-kill-${process.pid}`;
@@ -295,6 +335,7 @@ d("against a loopback execd", () => {
           const after = await sb.jobs.read(scope, "sleeper");
           expect(after.state).toBe("ended");
           expect(after.code).toBe(143);
+          expect(after.signal).toBe(15);
           await expect(sb.jobs.start(scope, "BAD ID", { command: "true" }))
             .rejects.toMatchObject({
               kind: "invalid_request",

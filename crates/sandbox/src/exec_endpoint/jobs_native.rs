@@ -534,11 +534,30 @@ fn code_field(v: &Value) -> std::io::Result<Option<i32>> {
     }
 }
 
+/// The `signal` of a job answer: present only for a job whose state has a code (`exited`, `ended`).
+/// Absent or null is `None`; an integer that does not fit an `i32` is a protocol error.
+fn signal_field(v: &Value, status: JobStatus) -> std::io::Result<Option<i32>> {
+    match v.get("signal") {
+        None | Some(Value::Null) => Ok(None),
+        Some(s) => {
+            let n = s
+                .as_i64()
+                .and_then(|n| i32::try_from(n).ok())
+                .ok_or_else(|| {
+                    std::io::Error::other(format!(
+                        "unreadable job answer: `signal` is not an i32: {s}"
+                    ))
+                })?;
+            Ok(matches!(status, JobStatus::ShellExited(_) | JobStatus::Ended(_)).then_some(n))
+        }
+    }
+}
+
 fn bad(what: &str, v: &Value) -> std::io::Error {
     std::io::Error::other(format!("unreadable job {what}: {v}"))
 }
 
-/// A `read` answer: `{"state", "code", "offset", "end", "data"}`.
+/// A `read` answer: `{"state", "code", "signal"?, "offset", "end", "data"}`.
 pub fn parse_read(v: &Value) -> std::io::Result<ReadChunk> {
     let code = code_field(v)?;
     let st = v
@@ -546,19 +565,21 @@ pub fn parse_read(v: &Value) -> std::io::Result<ReadChunk> {
         .and_then(Value::as_str)
         .and_then(|s| status(s, code))
         .ok_or_else(|| bad("read", v))?;
+    let signal = signal_field(v, st)?;
     let num = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
     let data = base64::engine::general_purpose::STANDARD
         .decode(v.get("data").and_then(Value::as_str).unwrap_or(""))
         .map_err(|_| bad("read", v))?;
     Ok(ReadChunk {
         status: st,
+        signal,
         offset: num("offset"),
         end: num("end"),
         data,
     })
 }
 
-/// A `list` answer: `{"jobs": [{"id", "state", "code", "kept", "num", "kind", "seen", "started",
+/// A `list` answer: `{"jobs": [{"id", "state", "code", "signal"?, "kept", "num", "kind", "seen", "started",
 /// "ended", "label"}]}`. A job whose id is not one is skipped, never followed.
 pub fn parse_list(v: &Value) -> std::io::Result<Vec<JobInfo>> {
     let jobs = v
@@ -578,10 +599,12 @@ pub fn parse_list(v: &Value) -> std::io::Result<Vec<JobInfo>> {
         let Some(status) = status(state, code) else {
             continue;
         };
+        let signal = signal_field(j, status)?;
         let num = |k: &str| j.get(k).and_then(Value::as_u64);
         out.push(JobInfo {
             id,
             status,
+            signal,
             kept: j.get("kept").and_then(Value::as_bool).unwrap_or(false),
             num: num("num"),
             kind: j.get("kind").and_then(Value::as_str).map(str::to_string),

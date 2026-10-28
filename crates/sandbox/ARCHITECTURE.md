@@ -120,6 +120,10 @@ The one-shot answer carries them as standard base64, so there is no lossy path. 
 agent's `bash` tool shows. `Sandbox::exec().run()` returns `ExecOutput`: the exit code (`128 + N` for a signal, `124`
 for a deadline) and the bytes. The response cap is on the decoded bytes of both streams together.
 
+A job's `read` (`ReadChunk`) and `list` (`JobInfo`) carry `signal: Option<i32>` beside `status`: the signal that killed the shell,
+whose code is then `128 + signal`; `None` for a shell that exited, even with 137. `JobStatus` stays the code, so followers that
+want only the status are unchanged; the signal is read only where a state has a code (`exited`, `ended`).
+
 ## What is not here
 
 The host command runner (`RealRunner`), `LocalFs`, the model-facing tools, the lazily attached `ExecCell`, the notify

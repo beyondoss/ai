@@ -2009,6 +2009,214 @@
           }
         }
       ]
+    },
+    {
+      "id": "jobs.signal.killed-by-a-signal",
+      "description": "A job whose shell is killed by signal S reports `signal` S beside `code` 128 + S, in read and in list, as a stream's signal frame does.",
+      "requires": {
+        "features": [
+          "exit_signal"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "ak01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "kill -9 $$"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "ak01",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 137,
+              "signal": 9
+            }
+          }
+        },
+        {
+          "id": "list",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "jobs": [
+                {
+                  "id": "ak01",
+                  "state": "ended",
+                  "code": 137,
+                  "signal": 9
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.signal.exit-137-is-not-a-signal",
+      "description": "A job that exits 137 by itself reports `code` 137 and no `signal`: an exit of 128 + S is not told from a signal by the number.",
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "ak02",
+          "command": "sh",
+          "args": [
+            "-c",
+            "exit 137"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "ak02",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 137,
+              "signal": {
+                "$absent": true
+              }
+            }
+          }
+        },
+        {
+          "id": "list",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "jobs": [
+                {
+                  "id": "ak02",
+                  "state": "ended",
+                  "code": 137,
+                  "signal": {
+                    "$absent": true
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.signal.kill-reports-the-signal",
+      "description": "A job stopped with kill reports the signal it was killed with: 15, or 9 when it ignored the grace period.",
+      "requires": {
+        "features": [
+          "exit_signal"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "ak03",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 30"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "kill",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "ak03"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        },
+        {
+          "id": "ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "ak03",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": {
+                "$oneof": [
+                  143,
+                  137
+                ]
+              },
+              "signal": {
+                "$oneof": [
+                  15,
+                  9
+                ]
+              }
+            }
+          }
+        }
+      ]
     }
   ]
 }

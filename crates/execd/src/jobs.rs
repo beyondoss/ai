@@ -169,6 +169,9 @@ pub(crate) struct Job {
     out: Ring,
     shell_exit: Option<i32>,
     end: Option<i32>,
+    /// The signal that killed the shell, once it is dead; `None` if it exited (or is running). Set
+    /// together with `shell_exit` / `end`, whose code is then `128 + signal`.
+    signal: Option<i32>,
     kept: bool,
     num: Option<u64>,
     kind: Option<String>,
@@ -278,6 +281,17 @@ fn state_of(j: &Job) -> (&'static str, Value) {
         (Some(c), _) => ("ended", json!(c)),
         (None, Some(c)) => ("exited", json!(c)),
         (None, None) => ("running", Value::Null),
+    }
+}
+
+/// `signal`, when a signal killed the shell: a member of `read` and `list` answers only once the
+/// job has a code.
+fn put_signal(j: &Job, obj: &mut Value) {
+    if let Some(sig) = j
+        .signal
+        .filter(|_| j.end.is_some() || j.shell_exit.is_some())
+    {
+        obj["signal"] = json!(sig);
     }
 }
 
@@ -444,13 +458,15 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
                     let (from, data) = j
                         .out
                         .read(job.offset, usize::try_from(job.max).unwrap_or(usize::MAX));
-                    json!({
+                    let mut body = json!({
                         "state": state,
                         "code": code,
                         "offset": from,
                         "end": j.out.end(),
                         "data": frame::b64(&data),
-                    })
+                    });
+                    put_signal(&j, &mut body);
+                    body
                 }
             };
             http::json_response(200, &body)
@@ -518,7 +534,7 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
                 .map(|((_, id), c)| {
                     let j = locked(&c);
                     let (state, code) = state_of(&j);
-                    json!({
+                    let mut entry = json!({
                         "id": id,
                         "state": state,
                         "code": code,
@@ -529,7 +545,9 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
                         "started": j.started,
                         "ended": j.ended,
                         "label": j.label,
-                    })
+                    });
+                    put_signal(&j, &mut entry);
+                    entry
                 })
                 .collect();
             http::json_response(200, &json!({ "jobs": list }))
@@ -610,6 +628,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
             ended: 0,
             out: Ring::new(ctx.opts.job_output_retention, ctx.spool.new_job()),
             shell_exit: None,
+            signal: None,
             end: None,
             kept: !job.hold,
             num: None,
@@ -755,9 +774,15 @@ async fn supervise(
 ) {
     let pgid = proc.pgid;
     let status = proc.wait().await;
-    let code = status.map_or(-1, |s| {
+    let (code, signal) = status.map_or((-1, None), |s| {
         use std::os::unix::process::ExitStatusExt as _;
-        s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
+        match s.code() {
+            Some(c) => (c, None),
+            None => {
+                let sig = s.signal().unwrap_or(0);
+                (128 + sig, Some(sig).filter(|&n| n > 0))
+            }
+        }
     });
     drain_pumps(&mut pipes, &progress, cap).await;
     let mut exits = proc::ChildEvents::new();
@@ -766,6 +791,7 @@ async fn supervise(
         {
             let mut j = locked(&cell);
             j.shell_exit = Some(code);
+            j.signal = signal;
             notify::change(&ctx, &cell, &key, &mut j);
         }
         ctx.jobs.bump();
@@ -784,6 +810,7 @@ async fn supervise(
     {
         let mut j = locked(&cell);
         j.end = Some(code);
+        j.signal = signal;
         j.ended = epoch();
         if !j.removed {
             notify::change(&ctx, &cell, &key, &mut j);
@@ -840,7 +867,7 @@ async fn follow(
         changed.mark_unchanged();
         enum Next {
             Frame(Bytes),
-            End(i32),
+            End(i32, Option<i32>),
             Wait,
             Missing,
         }
@@ -868,7 +895,7 @@ async fn follow(
                     shell_told = true;
                     Next::Frame(frame::json(&json!({ "shell_exit": c })))
                 } else if let Some(c) = j.end {
-                    Next::End(c)
+                    Next::End(c, j.signal)
                 } else {
                     Next::Wait
                 }
@@ -876,9 +903,13 @@ async fn follow(
         };
         match next {
             Next::Frame(f) => sink.put(f).await?,
-            Next::End(c) => {
-                sink.put_final(frame::json(&json!({ "exit_code": c })))
-                    .await?;
+            Next::End(c, signal) => {
+                // As a stream reports it: `signal` in place of `exit_code` for a death by signal.
+                let last = match signal {
+                    Some(s) => json!({ "signal": s }),
+                    None => json!({ "exit_code": c }),
+                };
+                sink.put_final(frame::json(&last)).await?;
                 return Ok(StreamEnd::Finished);
             }
             Next::Missing => {

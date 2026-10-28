@@ -68,7 +68,18 @@ def test_jobs(execd_url: str) -> None:
         assert (j.id, j.state, j.code, j.label) == ("a1", "ended", 5, "x")
         sb.jobs.start(scope, "a2", "sleep", ["30"])
         assert sb.jobs.kill(scope, ["a2"]) == []
-        assert sb.jobs.read(scope, "a2").state == "ended"
+        r = sb.jobs.read(scope, "a2")
+        assert (r.state, r.code, r.signal) == ("ended", 143, 15)
+        # A signal and an exit of 128 + S are told apart, in read and in list.
+        sb.jobs.start(scope, "a3", "sh", ["-c", "kill -9 $$"])
+        sb.jobs.start(scope, "a4", "sh", ["-c", "exit 137"])
+        sb.jobs.attach(scope, "a3")
+        sb.jobs.attach(scope, "a4")
+        by_id = {j.id: j for j in sb.jobs.list(scope)}
+        assert (by_id["a3"].code, by_id["a3"].signal) == (137, 9)
+        assert (by_id["a4"].code, by_id["a4"].signal) == (137, None)
+        assert sb.jobs.read(scope, "a3").signal == 9
+        assert sb.jobs.read(scope, "a4").signal is None
     finally:
         sb.jobs.wipe(scope)
     assert sb.jobs.list(scope) == []

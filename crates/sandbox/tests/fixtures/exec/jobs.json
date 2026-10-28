@@ -3,7 +3,7 @@
   "notes": [
     "streams: the body of one application/x-ndjson job stream (a held start or an attach), one string per line, without the trailing newline.",
     "expect.started is the job's process group from the started frame; expect.output_base64 is the job's combined output in order (stdout and stderr frames alike); expect.gap sums the gap frames; expect.shell_exits lists shell_exit codes; expect.end is the job's status from the final frame (128 + N for a signal frame), null when the body is broken; expect.error is a final error frame.",
-    "answers: one JSON answer to a non-streamed job operation, and what a conforming client reads from it."
+    "answers: one JSON answer to a non-streamed job operation, and what a conforming client reads from it. expect.signal is the signal that killed the shell (read and list), null when the answer carries none or the job is still running (a signal on a running job is ignored)."
   ],
   "streams": [
     {
@@ -94,6 +94,135 @@
         "offset": 10,
         "end": 14,
         "data_base64": "dHdvCg=="
+      }
+    },
+    {
+      "op": "read",
+      "answer": {
+        "state": "ended",
+        "code": 137,
+        "signal": 9,
+        "offset": 0,
+        "end": 0,
+        "data": ""
+      },
+      "expect": {
+        "state": "ended",
+        "code": 137,
+        "signal": 9,
+        "offset": 0,
+        "end": 0,
+        "data_base64": ""
+      }
+    },
+    {
+      "op": "read",
+      "answer": {
+        "state": "ended",
+        "code": 137,
+        "offset": 0,
+        "end": 0,
+        "data": ""
+      },
+      "expect": {
+        "state": "ended",
+        "code": 137,
+        "signal": null,
+        "offset": 0,
+        "end": 0,
+        "data_base64": ""
+      }
+    },
+    {
+      "op": "read",
+      "answer": {
+        "state": "exited",
+        "code": 143,
+        "signal": 15,
+        "offset": 0,
+        "end": 0,
+        "data": ""
+      },
+      "expect": {
+        "state": "exited",
+        "code": 143,
+        "signal": 15,
+        "offset": 0,
+        "end": 0,
+        "data_base64": ""
+      }
+    },
+    {
+      "op": "list",
+      "answer": {
+        "jobs": [
+          {
+            "id": "aa",
+            "state": "ended",
+            "code": 137,
+            "signal": 9,
+            "kept": true,
+            "ended": 5,
+            "label": "killed"
+          },
+          {
+            "id": "bb",
+            "state": "ended",
+            "code": 137,
+            "kept": true,
+            "ended": 6,
+            "label": "exited"
+          },
+          {
+            "id": "cc",
+            "state": "running",
+            "code": null,
+            "signal": 9,
+            "kept": true,
+            "ended": 0,
+            "label": "running"
+          }
+        ]
+      },
+      "expect": {
+        "jobs": [
+          {
+            "id": "aa",
+            "state": "ended",
+            "code": 137,
+            "signal": 9,
+            "kept": true,
+            "num": null,
+            "kind": null,
+            "seen": 0,
+            "ended": 5,
+            "label": "killed"
+          },
+          {
+            "id": "bb",
+            "state": "ended",
+            "code": 137,
+            "signal": null,
+            "kept": true,
+            "num": null,
+            "kind": null,
+            "seen": 0,
+            "ended": 6,
+            "label": "exited"
+          },
+          {
+            "id": "cc",
+            "state": "running",
+            "code": null,
+            "signal": null,
+            "kept": true,
+            "num": null,
+            "kind": null,
+            "seen": 0,
+            "ended": 0,
+            "label": "running"
+          }
+        ]
       }
     },
     {

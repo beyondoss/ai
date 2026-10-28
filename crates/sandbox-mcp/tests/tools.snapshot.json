@@ -118,7 +118,7 @@
     "name": "job_kill"
   },
   {
-    "description": "List jobs: id, state (running, exited, ended, lost or gone), code (the exit status once ended), label, started and ended (epoch seconds). exited means the shell is done but processes it started still run.",
+    "description": "List jobs: id, state (running, exited, ended, lost or gone), code (the exit status once ended), signal (only when a signal killed the job's shell: code is then 128 + signal, and a job that merely exited 137 has no signal), label, started and ended (epoch seconds). exited means the shell is done but processes it started still run.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -136,7 +136,7 @@
     "name": "job_list"
   },
   {
-    "description": "Read a job's output (stdout and stderr together) from a byte offset. Returns state, code, content, encoding (utf8, or base64 when the bytes are not UTF-8), offset, next_offset and end (the output's length so far). At most max bytes (default 131072) per call: to follow a job, call again with offset = next_offset until state is ended.",
+    "description": "Read a job's output (stdout and stderr together) from a byte offset. Returns state, code, signal (only when a signal killed the job's shell: code is then 128 + signal; a job that exited on its own has none), content, encoding (utf8, or base64 when the bytes are not UTF-8), offset, next_offset and end (the output's length so far). At most max bytes (default 131072) per call: to follow a job, call again with offset = next_offset until state is ended.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,

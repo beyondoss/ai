@@ -77,7 +77,6 @@ fn missing_features() -> Value {
     json!({
         "frames": "an MCP tool result arrives whole, so there are no frames or heartbeats to see",
         "unbounded_stream": "exec_stream is job_output over a job's log, which keeps the last 8 MiB of output (a bound of the job protocol): a longer stream loses its head",
-        "exit_signal": "a job's status is the shell's, 128 + N for signal N, and job_output and job_list carry no separate signal: a kill by signal 9 reads as an exit of 137",
     })
 }
 
@@ -270,6 +269,8 @@ struct Followed {
     /// Bytes the sandbox no longer had (a jump in the offset).
     gap: u64,
     code: Option<i64>,
+    /// The signal that killed the job's shell, from `job_output`'s `signal`.
+    signal: Option<i64>,
     /// The deadline passed and the job was killed.
     timed_out: bool,
 }
@@ -444,10 +445,14 @@ impl Mcp {
                         ]),
                     )
                     .await?;
-                Ok(json!({
+                let mut out = json!({
                     "state": r["state"], "code": r["code"], "offset": r["offset"], "end": r["end"],
                     "data_b64": r["content"],
-                }))
+                });
+                if let Some(s) = r.get("signal").filter(|s| !s.is_null()) {
+                    out["signal"] = s.clone();
+                }
+                Ok(out)
             }
             "job_attach" => self.job_attach(req).await,
             "job_kill" => {
@@ -686,12 +691,12 @@ impl Mcp {
         let f = followed?;
         let stderr = stderr.map(|v| v["data_b64"].clone()).unwrap_or(json!(""));
         let mut out = json!({ "stdout_b64": b64(&f.output), "stderr_b64": stderr });
-        // A job's status is the shell's: 128 + N for a command killed by signal N, which
-        // `job_output` cannot tell from an exit of that number. The `exit_signal` feature is
-        // left out of `hello` for it.
-        match f.code {
+        // `exec` made the command the job's shell, so a death by signal N is `job_output`'s
+        // `signal`, as a stream's `{"signal": N}` is.
+        match (f.code, f.signal) {
             _ if f.timed_out => out["timed_out"] = json!(true),
-            c => out["exit_code"] = json!(c.unwrap_or(-1)),
+            (_, Some(s)) => out["signal"] = json!(s),
+            (c, None) => out["exit_code"] = json!(c.unwrap_or(-1)),
         }
         Ok(out)
     }
@@ -814,6 +819,7 @@ impl Mcp {
                         output: out,
                         gap,
                         code: r["code"].as_i64(),
+                        signal: r["signal"].as_i64(),
                         timed_out,
                     });
                 }
@@ -883,7 +889,7 @@ async fn main() {
                 let result = if op == "hello" {
                     Ok(json!({
                         "driver": DRIVER, "protocol": 1, "ops": OPS,
-                        "features": [], "missing": missing_features(),
+                        "features": ["exit_signal"], "missing": missing_features(),
                     }))
                 } else if !OPS.contains(&op.as_str()) {
                     Err(err("unsupported", "no such op"))

@@ -98,18 +98,20 @@ Every job op carries `scope`, a string of 1 to 64 characters of `[0-9a-z-]`
 naming one session's jobs; the harness sends a scope unique to the scenario.
 `job` is the job id, 1 to 32 characters of `[0-9a-z]`, chosen by the caller.
 
-| op           | request                                             | result                                                                           |
-| ------------ | --------------------------------------------------- | -------------------------------------------------------------------------------- |
-| `job_start`  | `scope`, `job`, `command`, `args`, `cwd?`, `label?` | `{pgid}`: the job is kept by the sandbox from the start                          |
-| `job_list`   | `scope`                                             | `{jobs: [{id, state, code, kept, num, kind, seen, started, ended, label}]}`      |
-| `job_read`   | `scope`, `job`, `offset` (0), `max` (131072)        | `{state, code, offset, end, data_b64}`                                           |
-| `job_attach` | `scope`, `job`, `offset` (0)                        | `{exit_code, output_b64, gap}`: follows to the job's end; `gap` is bytes dropped |
-| `job_kill`   | `scope`, `jobs: [ids]`, `remove?`                   | `{survivors: [{id, detail}]}`: groups still alive after TERM, grace and KILL     |
-| `job_remove` | `scope`, `jobs: [ids]`                              | `{}`                                                                             |
-| `job_wipe`   | `scope`                                             | `{survivors: [..]}`                                                              |
+| op           | request                                             | result                                                                               |
+| ------------ | --------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `job_start`  | `scope`, `job`, `command`, `args`, `cwd?`, `label?` | `{pgid}`: the job is kept by the sandbox from the start                              |
+| `job_list`   | `scope`                                             | `{jobs: [{id, state, code, signal?, kept, num, kind, seen, started, ended, label}]}` |
+| `job_read`   | `scope`, `job`, `offset` (0), `max` (131072)        | `{state, code, signal?, offset, end, data_b64}`                                      |
+| `job_attach` | `scope`, `job`, `offset` (0)                        | `{exit_code, output_b64, gap}`: follows to the job's end; `gap` is bytes dropped     |
+| `job_kill`   | `scope`, `jobs: [ids]`, `remove?`                   | `{survivors: [{id, detail}]}`: groups still alive after TERM, grace and KILL         |
+| `job_remove` | `scope`, `jobs: [ids]`                              | `{}`                                                                                 |
+| `job_wipe`   | `scope`                                             | `{survivors: [..]}`                                                                  |
 
 `state` is `running`, `exited` (the shell exited, its group runs on), `ended`,
-`lost` or `gone`; `code` is null unless `exited` or `ended`. An invalid job id
+`lost` or `gone`; `code` is null unless `exited` or `ended`. `signal` is present
+only then, and only when a signal killed the job's shell (`code` is 128 + `signal`);
+a job that exited reports no `signal`, whatever its code. An invalid job id
 is `invalid_request` without sending anything.
 
 ### Files (layer 2)
@@ -298,11 +300,11 @@ whose `requires.features` names a feature that the driver's `hello.features` lac
 `hello.missing`. A driver that lists no `features` lacks them all. A feature marks a
 scenario whose point is something a driver's transport cannot show, however the outcome reads:
 
-| feature            | the scenario needs                                                                               |
-| ------------------ | ------------------------------------------------------------------------------------------------ |
-| `frames`           | the stream's own frames (heartbeats, splitting of output into frames), not only its final answer |
-| `unbounded_stream` | a stream longer than any retention window: output beyond 8 MiB arrives whole, with no head lost  |
-| `exit_signal`      | a kill by signal N told apart from an exit of 128+N (`signal` in place of `exit_code`)           |
+| feature            | the scenario needs                                                                                                       |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| `frames`           | the stream's own frames (heartbeats, splitting of output into frames), not only its final answer                         |
+| `unbounded_stream` | a stream longer than any retention window: output beyond 8 MiB arrives whole, with no head lost                          |
+| `exit_signal`      | a kill by signal N told apart from an exit of 128+N (`signal` in place of `exit_code`; for jobs, `signal` beside `code`) |
 
 A backend may define directories beyond `${ROOT}` and `${WORK}`, as variables:
 `${RO}` (a read-only mount holding one file, `existing`, with content `old`),

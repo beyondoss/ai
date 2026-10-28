@@ -75,6 +75,7 @@ fn job_answers_read_as_the_vectors_say() {
                 let (state, code) = state_name(r.status);
                 assert_eq!(state, want["state"].as_str().unwrap());
                 assert_eq!(code, want["code"].as_i64());
+                assert_eq!(r.signal, want["signal"].as_i64().map(|s| s as i32));
                 assert_eq!(r.offset, want["offset"].as_u64().unwrap());
                 assert_eq!(r.end, want["end"].as_u64().unwrap());
                 assert_eq!(r.data, b64(want["data_base64"].as_str().unwrap()));
@@ -88,6 +89,7 @@ fn job_answers_read_as_the_vectors_say() {
                     assert_eq!(j.id.as_str(), w["id"].as_str().unwrap());
                     assert_eq!(state, w["state"].as_str().unwrap());
                     assert_eq!(code, w["code"].as_i64());
+                    assert_eq!(j.signal, w["signal"].as_i64().map(|s| s as i32));
                     assert_eq!(j.kept, w["kept"].as_bool().unwrap());
                     assert_eq!(j.num, w["num"].as_u64());
                     assert_eq!(j.kind.as_deref(), w["kind"].as_str());

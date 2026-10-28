@@ -129,6 +129,10 @@ pub struct MockOptions {
     /// answer 200 with `exit_code` 124. `false` is the endpoint that ignores it (a hung command
     /// runs until the client leaves), which the conformance verifier has to catch.
     pub enforces_timeout: bool,
+    /// Report a job a signal killed as `signal: S` beside `code` 128 + S, in `read`, `list` and the
+    /// job stream's final frame. `false` is the endpoint that collapses it into the code alone, so
+    /// a kill by signal 9 and an exit of 137 look alike, which the conformance verifier has to catch.
+    pub reports_job_signal: bool,
 }
 
 /// One way per notify conformance check for an endpoint to get the spec wrong. Each is a change to
@@ -195,6 +199,7 @@ impl Default for MockOptions {
             faults: NotifyFaults::default(),
             require_bearer: None,
             enforces_timeout: true,
+            reports_job_signal: true,
         }
     }
 }
@@ -217,6 +222,7 @@ impl MockOptions {
             && self.keep_delay.is_zero()
             && self.faults == NotifyFaults::default()
             && self.enforces_timeout
+            && self.reports_job_signal
     }
 }
 
@@ -950,6 +956,8 @@ struct MockJob {
     base: u64,
     shell_exit: Option<i32>,
     end: Option<i32>,
+    /// The signal that killed the shell, set with `shell_exit` / `end`.
+    signal: Option<i32>,
     kept: bool,
     num: Option<u64>,
     kind: Option<String>,
@@ -1051,6 +1059,16 @@ async fn respond_json(mut sock: tokio::net::TcpStream, status: u16, body: &Value
     let _ = sock.shutdown().await;
 }
 
+/// `signal` in a `read` or `list` answer, once the job has a code.
+fn put_signal(j: &MockJob, obj: &mut Value) {
+    if let Some(s) = j
+        .signal
+        .filter(|_| j.end.is_some() || j.shell_exit.is_some())
+    {
+        obj["signal"] = json!(s);
+    }
+}
+
 fn state_of(j: &MockJob) -> (&'static str, Value) {
     match (j.end, j.shell_exit) {
         (Some(c), _) => ("ended", json!(c)),
@@ -1099,13 +1117,15 @@ async fn serve_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
                     } else {
                         &[][..]
                     };
-                    json!({
+                    let mut body = json!({
                         "state": state,
                         "code": code,
                         "offset": from,
                         "end": j.base + j.out.len() as u64,
                         "data": b64(data),
-                    })
+                    });
+                    put_signal(j, &mut body);
+                    body
                 }
             };
             respond_json(sock, 200, &body).await;
@@ -1235,7 +1255,7 @@ async fn serve_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
                 .filter(|((sc, _), _)| *sc == scope)
                 .map(|((_, id), j)| {
                     let (state, code) = state_of(j);
-                    json!({
+                    let mut entry = json!({
                         "id": id,
                         "state": state,
                         "code": code,
@@ -1248,7 +1268,9 @@ async fn serve_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
                         "label": j.label,
                         "notify": j.notify.as_ref().filter(|_| shared.opts.faults.token_in_list)
                             .map(|n| json!({ "url": n.url, "token": n.token })),
-                    })
+                    });
+                    put_signal(j, &mut entry);
+                    entry
                 })
                 .collect();
             respond_json(sock, 200, &json!({ "jobs": list })).await;
@@ -1295,6 +1317,7 @@ async fn start_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
             base: 0,
             shell_exit: None,
             end: None,
+            signal: None,
             kept: !hold,
             num: None,
             kind: (!hold).then(|| "background".to_string()),
@@ -1336,6 +1359,12 @@ async fn start_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
         tokio::spawn(async move {
             use std::os::unix::process::ExitStatusExt as _;
             let status = child.wait().await;
+            let signal = status
+                .as_ref()
+                .ok()
+                .filter(|s| s.code().is_none())
+                .and_then(|s| s.signal())
+                .filter(|_| shared.opts.reports_job_signal);
             let code = status
                 .map(|s| s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0)))
                 .unwrap_or(-1);
@@ -1343,6 +1372,7 @@ async fn start_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
                 // The moment a held stream would send `shell_exit`: notify calls back.
                 if let Some(j) = jobs.map.lock().unwrap().get_mut(&key) {
                     j.shell_exit = Some(code);
+                    j.signal = signal;
                     if !shared.opts.faults.no_shell_exit_callback {
                         change(&shared, j, &key);
                     }
@@ -1360,6 +1390,7 @@ async fn start_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
             // The end is observable from here on: notify calls back.
             if let Some(j) = jobs.map.lock().unwrap().get_mut(&key) {
                 j.end = Some(code);
+                j.signal = signal;
                 j.ended = epoch();
                 change(&shared, j, &key);
             }
@@ -1413,7 +1444,7 @@ async fn stream_job(
         changed.mark_unchanged();
         enum Next {
             Frame(Value),
-            End(i32),
+            End(i32, Option<i32>),
             Wait,
             Missing,
         }
@@ -1436,7 +1467,7 @@ async fn stream_job(
                         shell_told = true;
                         Next::Frame(json!({ "shell_exit": c }))
                     } else if let Some(c) = j.end {
-                        Next::End(c)
+                        Next::End(c, j.signal)
                     } else {
                         Next::Wait
                     }
@@ -1445,8 +1476,11 @@ async fn stream_job(
         };
         match next {
             Next::Frame(f) => gone = wr.write_all(&chunk(&f)).await.is_err(),
-            Next::End(c) => {
-                let mut tail = chunk(&json!({ "exit_code": c }));
+            Next::End(c, signal) => {
+                let mut tail = chunk(&match signal {
+                    Some(s) => json!({ "signal": s }),
+                    None => json!({ "exit_code": c }),
+                });
                 tail.extend_from_slice(b"0\r\n\r\n");
                 let _ = wr.write_all(&tail).await;
                 let _ = wr.shutdown().await;

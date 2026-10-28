@@ -122,7 +122,7 @@ class Capabilities:
 class JobInfo:
     id: str
     state: str  # running | exited | ended | lost | gone
-    code: int | None
+    code: int | None  # 128 + N when signal N killed the shell
     kept: bool
     num: int | None
     kind: str | None
@@ -130,6 +130,7 @@ class JobInfo:
     started: int
     ended: int
     label: str
+    signal: int | None = None  # the signal that killed the shell; None for a shell that exited
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +140,7 @@ class JobRead:
     offset: int  # where ``data`` starts (later than asked when old output was dropped)
     end: int  # the end of the job's output so far
     data: bytes
+    signal: int | None = None  # the signal that killed the shell; None for a shell that exited
 
 
 @dataclass(frozen=True, slots=True)

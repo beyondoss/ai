@@ -166,6 +166,7 @@ def test_the_v13_answer_vectors() -> None:
             assert (r.state, r.code, r.offset, r.end, r.data) == (
                 want["state"], want["code"], want["offset"], want["end"], b64(want["data_base64"]),
             )  # fmt: skip
+            assert r.signal == want.get("signal")
         elif case["op"] == "list":
             got = _wire.parse_list(answer)
             assert [j.id for j in got] == [j["id"] for j in want["jobs"]]
@@ -174,6 +175,7 @@ def test_the_v13_answer_vectors() -> None:
                     w["state"], w["code"], w["kept"], w["num"], w["kind"], w["seen"],
                     w["ended"], w["label"],
                 )  # fmt: skip
+                assert g.signal == w.get("signal")
         elif case["op"] == "kill":
             got_s = _wire.parse_survivors(answer)
             assert [(s.id, s.detail) for s in got_s] == [

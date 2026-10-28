@@ -250,12 +250,22 @@ def _state(state: Any, code: Any) -> tuple[str, int | None] | None:
     return None
 
 
+def _signal(v: dict[str, Any], state: str) -> int | None:
+    """A job answer's ``signal``, kept only where the state has a code to go with it."""
+    return _int(v, "signal") if state in ("exited", "ended") else None
+
+
 def parse_read(v: Any) -> JobRead:
     st = _state(v.get("state"), v.get("code")) if isinstance(v, dict) else None
     if st is None:
         raise ProtocolError(f"unreadable job read: {v!r}"[:300])
     return JobRead(
-        st[0], st[1], _int(v, "offset") or 0, _int(v, "end") or 0, _b64("data", v.get("data", ""))
+        st[0],
+        st[1],
+        _int(v, "offset") or 0,
+        _int(v, "end") or 0,
+        _b64("data", v.get("data", "")),
+        _signal(v, st[0]),
     )
 
 
@@ -282,6 +292,7 @@ def parse_list(v: Any) -> list[JobInfo]:
                 started=_int(j, "started") or 0,
                 ended=_int(j, "ended") or 0,
                 label=j["label"] if isinstance(j.get("label"), str) else "",
+                signal=_signal(j, st[0]),
             )
         )
     return out

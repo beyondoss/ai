@@ -100,9 +100,9 @@ built beside it, and the harness crate should not depend on the thing it judges.
 | `extract`                                                                               | `write_file` of the archive into a private `execd` whose `tar` prints it, then `download` from there                              |
 | `write_if_unchanged`                                                                    | `write_file` with `if_unchanged_since` (a number) or `create_only` (null)                                                         |
 
-The driver lists every op, and none of the `requires.features` (`frames`, `unbounded_stream`, `exit_signal`), so the four
-scenarios that need one are `unsupported` with the driver's reason: a tool result has no frames, a job keeps the last 8 MiB of its
-output, and `job_output` reports a signal only as the shell's 128 + N. `extract` runs the real
+The driver lists every op and the `exit_signal` feature (`job_output` and `job_list` carry `signal`, which `exec_stream` maps to
+`{"signal": N}` in place of `exit_code`), and lacks `frames` and `unbounded_stream`, so the three scenarios that need one are
+`unsupported` with the driver's reason: a tool result has no frames, and a job keeps the last 8 MiB of its output. `extract` runs the real
 `download` tool and its extractor under `SANDBOX_LOCAL_ROOT`; only the sandbox's `tar` is a stand-in.
 
 ## Release

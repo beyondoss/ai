@@ -133,6 +133,7 @@ const jobJson = (j: JobInfo): Json => ({
   id: j.id,
   state: j.state,
   code: j.code,
+  ...(j.signal === undefined ? {} : { signal: j.signal }),
   kept: j.kept,
   num: j.num,
   kind: j.kind,
@@ -283,6 +284,7 @@ export class Driver {
         return {
           state: c.state,
           code: c.code,
+          ...(c.signal === undefined ? {} : { signal: c.signal }),
           offset: c.offset,
           end: c.end,
           data_b64: b64(c.data),

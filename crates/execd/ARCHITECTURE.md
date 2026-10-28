@@ -117,6 +117,12 @@ it only ever sees the jobs of its own scope.
 The supervisor waits for the shell, and when the shell exits leaving its group alive records `shell_exit`, waits for the group to
 empty, and records the end. Each of those is a state change that notify calls back about.
 
+The supervisor keeps the shell's real wait status, not only a number: when a signal killed the shell the job records `signal: S`
+beside `code` 128 + S, set in the same step as `shell_exit` or the end, so no reader can see a code without its signal. `read` and
+`list` answer `signal` only for such a job (absent for an exit, even of 137), and the job stream's final frame is `{"signal": S}`
+in place of `{"exit_code": 128 + S}`, as a one-shot stream's is. A job stopped by `kill` therefore reports the signal that
+killed its shell (15, or 9 after the grace). Nothing is persisted: a job lives in the table and is gone with execd.
+
 notify is the `notify` module driving `crates/exec-notify`, the pure timing kernel every endpoint shares. The kernel says when an
 attempt begins, when to wait, and when to stop; `notify` makes the request (one `POST`, no redirect, the server's certificate
 verified, 30 s at most) and feeds back what happened. A job's latest `keep` governs, a `keep` abandons the attempt in flight,

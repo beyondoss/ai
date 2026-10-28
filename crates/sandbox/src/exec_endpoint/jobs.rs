@@ -130,6 +130,9 @@ impl JobStatus {
 pub struct JobInfo {
     pub id: JobId,
     pub status: JobStatus,
+    /// The signal that killed the shell, when `status` carries a code and a signal produced it
+    /// (the code is then `128 + signal`); `None` for a shell that exited, whatever its code.
+    pub signal: Option<i32>,
     /// Kept: the sandbox owns it. Its number and kind, once the agent recorded them.
     pub kept: bool,
     pub num: Option<u64>,
@@ -148,6 +151,8 @@ pub struct JobInfo {
 #[derive(Clone, Debug)]
 pub struct ReadChunk {
     pub status: JobStatus,
+    /// As [`JobInfo::signal`].
+    pub signal: Option<i32>,
     pub offset: u64,
     pub end: u64,
     pub data: Vec<u8>,

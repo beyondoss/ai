@@ -70,7 +70,7 @@ async fn a_conforming_endpoint_passes_every_check() {
         "{}",
         report.render()
     );
-    assert_eq!(report.checks.len(), 20 + conformance::notify::CHECKS.len());
+    assert_eq!(report.checks.len(), 21 + conformance::notify::CHECKS.len());
 }
 
 /// A conforming mock with one fault: of the notify checks, exactly `check` fails. (The other checks
@@ -315,6 +315,42 @@ async fn an_endpoint_that_ignores_the_one_shot_timeout_fails_that_check_alone() 
             .unwrap()
             .detail
             .contains("ignores the deadline"),
+        "{}",
+        report.render()
+    );
+}
+
+/// An endpoint that reports a job's death by signal as a bare code cannot be told from one that
+/// exited 137: the verifier must catch it, and only it.
+#[tokio::test]
+async fn an_endpoint_that_collapses_a_jobs_signal_fails_that_check_alone() {
+    let (opts, expect) = quick();
+    let report = verify_mock(
+        MockOptions {
+            reports_job_signal: false,
+            ..opts
+        },
+        &expect,
+    )
+    .await;
+    let failed: Vec<&str> = report
+        .checks
+        .iter()
+        .filter(|c| c.verdict == Verdict::Fail)
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(
+        failed,
+        vec![conformance::JOBS_SIGNAL],
+        "{}",
+        report.render()
+    );
+    assert!(
+        report
+            .check(conformance::JOBS_SIGNAL)
+            .unwrap()
+            .detail
+            .contains("`signal` 9"),
         "{}",
         report.render()
     );

@@ -146,6 +146,7 @@ pub const JOBS_HELD: &str = "a held job streams its output and ends";
 pub const JOBS_HOLD: &str = "a dropped hold kills a job nobody kept";
 pub const JOBS_KEEP: &str = "a kept job outlives its hold and reads back from an offset";
 pub const JOBS_KILL: &str = "kill stops a job's group and removes it";
+pub const JOBS_SIGNAL: &str = "a job's end tells a signal from an exit of 128 + S";
 pub const JOBS_SCOPE: &str = "list and wipe stay inside their scope";
 
 /// Run every check against the endpoint at `url`.
@@ -205,14 +206,15 @@ pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectatio
     // The slow checks wait on timers, not on each other.
     let (t, h, d, l) = tokio::join!(v.timeout(), v.heartbeat(), v.disconnect(), v.leftovers());
     checks.extend([t, h, d, l]);
-    let (held, hold, keep, kill, scope) = tokio::join!(
+    let (held, hold, keep, kill, signal, scope) = tokio::join!(
         v.jobs_held(),
         v.jobs_hold(),
         v.jobs_keep(),
         v.jobs_kill(),
+        v.jobs_signal(),
         v.jobs_scope()
     );
-    checks.extend([held, hold, keep, kill, scope]);
+    checks.extend([held, hold, keep, kill, signal, scope]);
     notify::checks(&v, &mut checks).await;
     Report { checks }
 }
@@ -1336,6 +1338,94 @@ impl Verifier {
             ),
             Ok(false) => fail(JOBS_KEEP, "closing an attach killed the job"),
             Err(e) => fail(JOBS_KEEP, e),
+        }
+    }
+
+    /// A job a signal killed reports `signal: S` beside `code` 128 + S, in `read` and in `list`; a job
+    /// that exits 137 by itself reports no `signal`; a job stopped with `kill` reports the signal
+    /// it was stopped with.
+    async fn jobs_signal(&self) -> Check {
+        let jobs = NativeJobs::over(&self.runner);
+        let scope = self.scope("signal");
+        let (killed, exited, stopped) = (JobId::fresh(), JobId::fresh(), JobId::fresh());
+        let check = async {
+            for (id, script) in [
+                (&killed, "kill -9 $$"),
+                (&exited, "exit 137"),
+                (&stopped, "sleep 60"),
+            ] {
+                jobs.start_kept(&scope, id, &Self::spec(script))
+                    .await
+                    .map_err(|e| format!("start: {e}"))?;
+            }
+            let survivors = jobs
+                .kill(&scope, std::slice::from_ref(&stopped), false)
+                .await
+                .map_err(|e| format!("kill: {e}"))?;
+            if !survivors.is_empty() {
+                return Err(format!("survivors reported: {survivors:?}"));
+            }
+            // Each ends: wait (bounded) until `read` says so, then compare it with `list`.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut read = Vec::new();
+            for id in [&killed, &exited, &stopped] {
+                let chunk = loop {
+                    let c = jobs
+                        .read(&scope, id, 0, 1)
+                        .await
+                        .map_err(|e| format!("read: {e}"))?;
+                    if matches!(c.status, JobStatus::Ended(_)) {
+                        break c;
+                    }
+                    if Instant::now() > deadline {
+                        return Err(format!("a job did not end within 10 s: {:?}", c.status));
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                };
+                read.push((id, chunk.status, chunk.signal));
+            }
+            let listed = jobs.list(&scope).await.map_err(|e| format!("list: {e}"))?;
+            let [(_, k, ks), (_, e, es), (_, t, ts)] = read[..] else {
+                return Err("internal: three reads".to_string());
+            };
+            if (k, ks) != (JobStatus::Ended(137), Some(9)) {
+                return Err(format!(
+                    "a job that killed itself with SIGKILL reads as {k:?}, signal {ks:?}; want \
+                     `code` 137 and `signal` 9"
+                ));
+            }
+            if (e, es) != (JobStatus::Ended(137), None) {
+                return Err(format!(
+                    "a job that exited 137 reads as {e:?}, signal {es:?}; want `code` 137 and no \
+                     `signal`: a signal and an exit of 128 + S must be told apart"
+                ));
+            }
+            if !(t == JobStatus::Ended(143) && ts == Some(15)
+                || t == JobStatus::Ended(137) && ts == Some(9))
+            {
+                return Err(format!(
+                    "a job stopped by `kill` reads as {t:?}, signal {ts:?}; want the signal it was \
+                     killed with (15, or 9 after the grace)"
+                ));
+            }
+            for (id, status, signal) in &read {
+                let in_list = listed.iter().find(|j| &j.id == *id);
+                if in_list.map(|j| (j.status, j.signal)) != Some((*status, *signal)) {
+                    return Err(format!(
+                        "`list` shows {:?} for a job `read` shows as {status:?}, signal {signal:?}",
+                        in_list.map(|j| (j.status, j.signal))
+                    ));
+                }
+            }
+            Ok("`signal` 9 beside `code` 137 for a SIGKILL, none for an exit of 137, the signal of \
+                a `kill`; `list` agrees with `read`"
+                .to_string())
+        }
+        .await;
+        let _ = jobs.wipe(&scope).await;
+        match check {
+            Ok(d) => pass(JOBS_SIGNAL, d),
+            Err(e) => fail(JOBS_SIGNAL, e),
         }
     }
 
