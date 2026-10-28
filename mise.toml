@@ -325,6 +325,16 @@ if [ -n "${DIFFERENTIAL_E2B:-}" ]; then
 fi
 """
 
+[tasks."test:clients:beyond"]
+description = "The client conformance matrix against an existing Beyond sandbox through the Beyond edge (every driver, plus relay pairs). Opt-in, never in CI: needs BEYOND_EXEC_URL (the exec_url of POST /sandboxes/{id}/exec-token) and BEYOND_EXEC_TOKEN_CMD (a shell command that prints a fresh bagt_v1 token); BEYOND_EXEC_WORK picks the writable directory in the sandbox. Run it under the homelab-live lock when the sandbox is on the shared homelab. Extra arguments go to sandbox-matrix."
+run = """
+set -e
+cargo build -q -p beyond-execd -p beyond-sandbox-conformance -p beyond-sandbox-mcp
+mkdir -p target/sandbox-matrix
+target/debug/sandbox-matrix --registry sdk/conformance/drivers.toml --backend beyond \
+  --report target/sandbox-matrix/report-beyond.json "$@"
+"""
+
 [tasks."test:differential"]
 description = "Randomized differential testing across every client: Hegel generates operation sequences, each runs through every driver in sdk/conformance/drivers.toml on its own fresh root, and the answers are compared with each other and (local backends) with the filesystem. Fixed seeds and case counts; widen with DIFFERENTIAL_CASES, DIFFERENTIAL_SEED, DIFFERENTIAL_STEPS, DIFFERENTIAL_BACKENDS, DIFFERENTIAL_DRIVERS, DIFFERENTIAL_SHRINK=0. The container backends run when docker is available."
 depends = ["build:execd-static"]

@@ -7,6 +7,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod backends;
+pub mod beyond;
 pub mod e2b;
 pub mod eval;
 pub mod link;
