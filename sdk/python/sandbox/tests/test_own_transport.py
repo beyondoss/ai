@@ -142,6 +142,19 @@ def test_files_over_a_subprocess(tmp_path: Path) -> None:
     assert sorted(x.name for x in tmp_path.iterdir()) == ["a.txt", "d"]
 
 
+def test_a_missing_parent_is_said_in_plain_words(tmp_path: Path) -> None:
+    f = Files(LocalTransport())
+    missing = str(tmp_path / "no" / "such" / "dir")
+    with pytest.raises(NotFound) as e:
+        f.write(f"{missing}/f", b"x")
+    assert e.value.detail == (
+        f"write {missing}/f: parent directory {missing} does not exist: "
+        "No such file or directory (os error 2)"
+    )
+    assert ".tmp." not in e.value.detail
+    assert not (tmp_path / "no").exists()
+
+
 def test_a_large_write_is_one_request_with_stdin(tmp_path: Path) -> None:
     t = LocalTransport()
     f = Files(t)

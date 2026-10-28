@@ -125,7 +125,7 @@
             "ok": {
               "exit_code": 127,
               "stderr_utf8": {
-                "$re": "No such file or directory"
+                "$re": "no-such-command-xyz: (command )?not found"
               }
             }
           }

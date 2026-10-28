@@ -2127,7 +2127,7 @@
     },
     {
       "id": "files.write.missing-parent",
-      "description": "The parent directory must exist: the write is not_found and creates nothing.",
+      "description": "The parent directory must exist: the write is not_found, creates nothing, and says so in plain words: the detail names the missing directory and never a temp file.",
       "steps": [
         {
           "id": "w",
@@ -2136,7 +2136,10 @@
           "data_b64": "eA==",
           "expect": {
             "error": {
-              "kind": "not_found"
+              "kind": "not_found",
+              "detail": {
+                "$re": "^write [^\\n]*: parent directory [^\\n]*/no/such/dir does not exist: No such file or directory \\(os error 2\\)$"
+              }
             }
           }
         },

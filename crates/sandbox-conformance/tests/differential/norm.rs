@@ -13,6 +13,15 @@
 //! | `list.entries` order          | sorted, as `$unordered`          | "order unspecified" (FILES-OVER-EXEC 5.6)      |
 //! | `search.note` (when present)  | `{"$type":"string"}`             | text of the engine's first error, has paths    |
 //!
+//! One rule depends on who answered. The MCP driver runs every `exec` through `sh -c`, so a command
+//! that cannot be started says it in the shell's words where the argv clients get execd's
+//! (`sh: 1: exec: x: not found` against `execd: x: command not found`; `sh: 1: exec: x: Permission
+//! denied` against `execd: x: Permission denied`). The statuses agree (127 and 126, the shell's own
+//! convention, which execd follows), so they stay strict. When the MCP driver's answer to an `exec` is
+//! exit 126 or 127, every driver's answer to that step compares its stderr by the reason it names
+//! (`not found`, `Permission denied`; else the bytes). `stdout` and every other comparison stay
+//! byte for byte, and so do the cwd errors, which execd words the same for both.
+//!
 //! The result is a valid `expect` for a scenario step, which is how a divergence is printed.
 use base64::Engine as _;
 use sandbox_conformance::eval::B64;
@@ -64,7 +73,14 @@ fn any_number() -> Value {
     json!({"$type": "number"})
 }
 
-pub fn canon(op: &str, resp: &Value, root: &str) -> Value {
+/// Whether `resp` is an `exec` answer of exit 126 or 127: the answers the MCP driver's shell words
+/// differently.
+pub fn is_exec_not_started(op: &str, resp: &Value) -> bool {
+    op == "exec" && (resp["ok"]["exit_code"] == 127 || resp["ok"]["exit_code"] == 126)
+}
+
+/// `loose`: compare a 126 or 127 `exec` answer by class (see the module doc).
+pub fn canon(op: &str, resp: &Value, root: &str, loose: bool) -> Value {
     if let Some(e) = resp.get("error") {
         return json!({"error": {"kind": e["kind"]}});
     }
@@ -86,6 +102,19 @@ pub fn canon(op: &str, resp: &Value, root: &str) -> Value {
                 entries.sort_by_key(|e| e["name"].as_str().unwrap_or("").as_bytes().to_vec());
                 let sorted = std::mem::take(entries);
                 ok["entries"] = json!({"$unordered": sorted});
+            }
+        }
+        "exec" if loose && (ok["exit_code"] == 127 || ok["exit_code"] == 126) => {
+            let text = ok["stderr_b64"]
+                .as_str()
+                .and_then(|b| B64.decode(b.as_bytes()).ok())
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default();
+            if let Some(why) = ["not found", "Permission denied"]
+                .into_iter()
+                .find(|w| text.contains(w))
+            {
+                ok["stderr_b64"] = json!({"$class": why});
             }
         }
         "search" if !ok["note"].is_null() => ok["note"] = json!({"$type": "string"}),

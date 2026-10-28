@@ -12,7 +12,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use beyond_sandbox::exec_endpoint::jobs::{JobId, JobScope, JobSpec, JobStatus, READ_MAX};
 use beyond_sandbox::fs::shell::{Capabilities, SearchEngine, ShellFs};
-use beyond_sandbox::fs::{FileKind, FsBackend, SearchQuery};
+use beyond_sandbox::fs::{FileKind, FsBackend, FsError, SearchQuery};
 use beyond_sandbox::{HttpExec, Sandbox, TokenSource};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -70,6 +70,7 @@ pub struct SandboxMcp {
 // ---- arguments ------------------------------------------------------------------------------
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UploadArgs {
     /// A directory or file of this machine, relative to the server's local root. A directory
     /// uploads its contents; a file uploads that file.
@@ -81,6 +82,7 @@ pub struct UploadArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DownloadArgs {
     /// A directory (its contents) or file of the sandbox (absolute).
     remote_path: String,
@@ -90,12 +92,12 @@ pub struct DownloadArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExecArgs {
-    /// The program to run, e.g. `git`. It is not a shell: for pipes or `&&`, run `sh` with `["-c", "..."]`.
+    /// The whole shell command line, run with `sh -c`: pipes, `&&`, redirects, quoting, `cd` and
+    /// environment variables all work, e.g. `cd app && python -m pytest -q 2>&1 | tail -20`. This is
+    /// the one string you would type at a prompt; there is no separate argument list.
     command: String,
-    /// Arguments, one per element.
-    #[serde(default)]
-    args: Vec<String>,
     /// Working directory. Default: the sandbox's own.
     cwd: Option<String>,
     /// Kill the command after this many milliseconds. Default 120000.
@@ -107,6 +109,7 @@ pub struct ExecArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReadFileArgs {
     /// Absolute path, or relative to the sandbox's working directory.
     path: String,
@@ -115,12 +118,13 @@ pub struct ReadFileArgs {
     /// The most bytes to return. Default 131072. When the file is longer, `eof` is false: call
     /// again with `offset` set to the `next_offset` you were given.
     max: Option<u64>,
-    /// `auto` (default) returns text when the bytes are UTF-8 and base64 otherwise; `base64`
-    /// always returns base64.
+    /// `utf8` (default) returns text when the bytes are valid UTF-8 and base64 otherwise; `base64`
+    /// always returns base64. The result's `encoding` says which you got.
     encoding: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WriteFileArgs {
     /// Absolute path, or relative to the sandbox's working directory.
     path: String,
@@ -135,9 +139,13 @@ pub struct WriteFileArgs {
     /// Write only if no file exists at `path` yet (kind `conflict` if one does). Default false.
     /// Not combinable with `if_unchanged_since`.
     create_only: Option<bool>,
+    /// Create missing parent directories (`mkdir -p`). Default true. With false, a missing parent
+    /// fails with kind `not_found` and a detail naming the directory.
+    create_parents: Option<bool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EditFileArgs {
     /// Path of an existing text file.
     path: String,
@@ -150,6 +158,7 @@ pub struct EditFileArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListDirArgs {
     /// The directory.
     path: String,
@@ -160,12 +169,14 @@ pub struct ListDirArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PathArgs {
     /// Absolute path, or relative to the sandbox's working directory.
     path: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SearchArgs {
     /// What to find: a regular expression, or plain text with `literal`.
     pattern: String,
@@ -190,12 +201,11 @@ pub struct SearchArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct JobStartArgs {
-    /// The program to run. It is not a shell: for pipes or `&&`, run `sh` with `["-c", "..."]`.
+    /// The whole shell command line, run with `sh -c`: pipes, `&&`, redirects, quoting and `cd` all
+    /// work, e.g. `npm run dev` or `cd app && make 2>&1`. There is no separate argument list.
     command: String,
-    /// Arguments, one per element.
-    #[serde(default)]
-    args: Vec<String>,
     /// Working directory. Default: the sandbox's own.
     cwd: Option<String>,
     /// A short note shown in `job_list`.
@@ -207,12 +217,14 @@ pub struct JobStartArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct JobListArgs {
     /// The group to list. Default: this server's.
     scope: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct JobOutputArgs {
     /// The job's id, from `job_start` or `job_list`.
     id: String,
@@ -220,14 +232,15 @@ pub struct JobOutputArgs {
     offset: Option<u64>,
     /// The most bytes to return. Default 131072. Call again with `offset` set to `next_offset`.
     max: Option<u64>,
-    /// `auto` (default) returns text when the bytes are UTF-8 and base64 otherwise; `base64`
-    /// always returns base64.
+    /// `utf8` (default) returns text when the bytes are valid UTF-8 and base64 otherwise; `base64`
+    /// always returns base64. The result's `encoding` says which you got.
     encoding: Option<String>,
     /// The group the job belongs to. Default: this server's.
     scope: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct JobKillArgs {
     /// The jobs to stop.
     ids: Vec<String>,
@@ -272,7 +285,7 @@ fn payload(
     encoding: Option<&str>,
 ) -> Result<(&'static str, String, usize), ToolError> {
     match encoding {
-        None | Some("auto") => match std::str::from_utf8(bytes) {
+        None | Some("utf8") => match std::str::from_utf8(bytes) {
             Ok(s) => Ok(("utf8", s.to_string(), bytes.len())),
             Err(e) if e.error_len().is_none() && e.valid_up_to() > 0 => {
                 let n = e.valid_up_to();
@@ -282,7 +295,7 @@ fn payload(
         },
         Some("base64") => Ok(("base64", B64.encode(bytes), bytes.len())),
         Some(other) => Err(ToolError::invalid(format!(
-            "`encoding` must be \"auto\" or \"base64\", not {other:?}"
+            "`encoding` must be \"utf8\" or \"base64\", not {other:?}"
         ))),
     }
 }
@@ -303,6 +316,11 @@ fn state_of(s: JobStatus) -> (&'static str, Option<i32>) {
         JobStatus::Lost => ("lost", None),
         JobStatus::Gone => ("gone", None),
     }
+}
+
+/// Whether a failed write says its parent directory does not exist (FILES-OVER-EXEC.md section 5.3).
+fn is_missing_parent(detail: &str) -> bool {
+    detail.contains(": parent directory ") && detail.contains(" does not exist")
 }
 
 fn transfer(t: beyond_sandbox::Transfer) -> Value {
@@ -433,7 +451,7 @@ type ToolReply = Result<rmcp::model::CallToolResult, ErrorData>;
 impl SandboxMcp {
     #[tool(
         name = "exec",
-        description = "Run a program in the sandbox and wait for it. Returns exit_code, stdout and stderr (text, or base64 with stdout_encoding/stderr_encoding set when the bytes are not UTF-8); a non-zero exit is a normal result, not an error. Not a shell: use sh with [\"-c\", \"...\"] for pipes. The whole output comes back, so for long-running or noisy commands use job_start and page the output with job_output."
+        description = "Run a shell command line in the sandbox (sh -c) and wait for it. `command` is the one string you would type at a prompt, e.g. `cd app && python -m pytest -q 2>&1 | tail -20`; pipes, &&, redirects and quotes work, and there is no separate args parameter. Returns exit_code, stdout and stderr, each with its encoding (utf8, or base64 when the bytes are not UTF-8); a non-zero exit is a normal result, not an error, and 127 means the command was not found. The whole output comes back, so for long-running or noisy commands use job_start and page the output with job_output."
     )]
     async fn exec(&self, Parameters(a): Parameters<ExecArgs>) -> ToolReply {
         Ok(reply(self.do_exec(a).await))
@@ -441,7 +459,7 @@ impl SandboxMcp {
 
     #[tool(
         name = "read_file",
-        description = "Read bytes of a file. Returns content (text, or base64 when the bytes are not UTF-8), bytes, eof and next_offset. At most max bytes (default 131072) come back: if eof is false, call again with offset = next_offset. Fails with not_found, is_directory or permission_denied."
+        description = "Read bytes of a file. Returns content, encoding (utf8, or base64 when the bytes are not UTF-8), bytes, eof and next_offset. At most max bytes (default 131072) come back: if eof is false, call again with offset = next_offset. Fails with not_found, is_directory or permission_denied."
     )]
     async fn read_file(&self, Parameters(a): Parameters<ReadFileArgs>) -> ToolReply {
         Ok(reply(self.do_read(a).await))
@@ -449,7 +467,7 @@ impl SandboxMcp {
 
     #[tool(
         name = "write_file",
-        description = "Create a file or replace it entirely, atomically; an existing file keeps its permissions. Give content (text) or content_base64 (binary). The parent directory must exist (see mkdir). To change part of a file use edit_file. To avoid overwriting a concurrent change, pass if_unchanged_since (the mtime from stat): a changed file fails with kind conflict and nothing is written. create_only refuses to replace a file that exists."
+        description = "Create a file or replace it entirely, atomically; an existing file keeps its permissions. Missing parent directories are created (create_parents: false to fail instead). Give content (text) or content_base64 (binary). To change part of a file use edit_file. To avoid overwriting a concurrent change, pass if_unchanged_since (the mtime from stat): a changed file fails with kind conflict and nothing is written. create_only refuses to replace a file that exists."
     )]
     async fn write_file(&self, Parameters(a): Parameters<WriteFileArgs>) -> ToolReply {
         Ok(reply(self.do_write(a).await))
@@ -513,7 +531,7 @@ impl SandboxMcp {
 
     #[tool(
         name = "job_start",
-        description = "Start a command that keeps running after this call returns; the sandbox keeps it and its output. Returns the job id. Read output with job_output, check on it with job_list, stop it with job_kill. Use this for servers, builds and anything slower than a few seconds."
+        description = "Start a shell command line (sh -c, like exec) that keeps running after this call returns; the sandbox keeps it and its output. Returns the job id. Read output with job_output, check on it with job_list, stop it with job_kill. Use this for servers, builds and anything slower than a few seconds."
     )]
     async fn job_start(&self, Parameters(a): Parameters<JobStartArgs>) -> ToolReply {
         Ok(reply(self.do_job_start(a).await))
@@ -529,7 +547,7 @@ impl SandboxMcp {
 
     #[tool(
         name = "job_output",
-        description = "Read a job's output (stdout and stderr together) from a byte offset. Returns state, code, content (text, or base64), offset, next_offset and end (the output's length so far). At most max bytes (default 131072) per call: to follow a job, call again with offset = next_offset until state is ended."
+        description = "Read a job's output (stdout and stderr together) from a byte offset. Returns state, code, content, encoding (utf8, or base64 when the bytes are not UTF-8), offset, next_offset and end (the output's length so far). At most max bytes (default 131072) per call: to follow a job, call again with offset = next_offset until state is ended."
     )]
     async fn job_output(&self, Parameters(a): Parameters<JobOutputArgs>) -> ToolReply {
         Ok(reply(self.do_job_output(a).await))
@@ -555,7 +573,7 @@ impl SandboxMcp {
             (None, None) => None,
         };
         let t = self.target().await?;
-        let mut cmd = t.sandbox.exec(a.command, a.args);
+        let mut cmd = t.sandbox.exec("sh", ["-c".to_string(), a.command]);
         if let Some(cwd) = a.cwd {
             cmd = cmd.cwd(cwd);
         }
@@ -628,19 +646,42 @@ impl SandboxMcp {
             (None, false) => None,
         };
         let t = self.target().await?;
-        match expected {
-            None => t.files().write_bytes(Path::new(&a.path), bytes).await?,
-            Some(mtime) => {
-                if !t
-                    .files()
-                    .write_if_unchanged(Path::new(&a.path), bytes, mtime)
-                    .await?
-                {
+        let files = t.files();
+        let path = Path::new(&a.path);
+        // Agents write `a/b/c.py` without making `a/b` first, so a missing parent is made, not
+        // reported: try the write, and only when it says the parent is missing, `mkdir -p` and retry
+        // once (a write into an existing directory costs no extra command).
+        let create_parents = a.create_parents.unwrap_or(true);
+        let mut made_parents = false;
+        let mut bytes = bytes;
+        loop {
+            // The first attempt keeps a copy for the retry; the retry spends the original.
+            let body = if made_parents {
+                std::mem::take(&mut bytes)
+            } else {
+                bytes.clone()
+            };
+            let done = match expected {
+                None => files.write_bytes(path, body).await.map(|()| true),
+                Some(mtime) => files.write_if_unchanged(path, body, mtime).await,
+            };
+            match done {
+                Ok(true) => break,
+                Ok(false) => {
                     return Err(ToolError::new(
                         "conflict",
                         format!("{} changed since it was read; nothing was written", a.path),
                     ));
                 }
+                Err(FsError::Backend(m))
+                    if create_parents && !made_parents && is_missing_parent(&m) =>
+                {
+                    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                        files.create_dir_all(parent).await?;
+                    }
+                    made_parents = true;
+                }
+                Err(e) => return Err(e.into()),
             }
         }
         Ok(json!({ "path": a.path, "bytes": n }))
@@ -848,8 +889,8 @@ impl SandboxMcp {
             None => JobId::fresh(),
         };
         let spec = JobSpec {
-            program: a.command,
-            args: a.args,
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), a.command],
             cwd: a.cwd,
             label: a.label.unwrap_or_default(),
         };

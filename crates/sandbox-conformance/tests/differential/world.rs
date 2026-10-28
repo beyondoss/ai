@@ -13,7 +13,7 @@ use sandbox_conformance::matrix;
 use sandbox_conformance::run::Backend;
 use serde_json::{Value, json};
 
-use super::norm::canon;
+use super::norm::{canon, is_exec_not_started};
 use super::ops::{Guard, Op};
 use super::oracle::{self, Ctx, search_truth::Engine};
 
@@ -262,12 +262,17 @@ async fn lockstep(world: &World, runs: &mut [Run<'_>], ops: &[Op]) -> Result<(),
                 .map(|(_, r)| r.call(&step)),
         )
         .await;
+        // The MCP driver words a missing command differently (norm.rs): its 126 or 127 loosens the step.
+        let loose = ks
+            .iter()
+            .zip(&answers)
+            .any(|(&k, (_, resp))| runs[k].d.name == "mcp" && is_exec_not_started(op.name(), resp));
         let mut canons = vec![];
         let mut known: Option<&'static str> = None;
         let mut oracle_msgs: Vec<String> = vec![];
         for (j, (&k, (req, resp))) in ks.iter().zip(&answers).enumerate() {
             let r = &runs[k];
-            canons.push(canon(op.name(), resp, &r.root));
+            canons.push(canon(op.name(), resp, &r.root, loose));
             if let Op::Stat { .. } = op {
                 mtimes[k].insert(i, resp["ok"]["mtime"].clone());
             }

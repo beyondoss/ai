@@ -1433,6 +1433,12 @@ fi
     };
 }
 
+/// Refuse a target whose parent directory is missing, in plain words that name the directory (and
+/// end in the OS message, so every client classifies it `not_found`). Without it the failure is the
+/// shell's own `cannot create DIR/.tmp.SUFFIX: Directory nonexistent`, which names a temp file and
+/// a script line number the caller never wrote. Only a parent that `ls` reports missing is named: one that exists
+/// but is not a directory, or that cannot be resolved (a symlink loop), still fails at the temp with its own error.
+///
 /// Create the empty temp `$tmp`, mode 0600 when `$t` exists (a new file's temp gets the default mode,
 /// which is the file's mode), then refuse a target the caller may not write, by `[ -w ]`, with the
 /// message `std` gives. The refusal comes after the temp is created so that a read-only or full
@@ -1447,7 +1453,15 @@ macro_rules! new_temp {
     () => {
         concat!(
             not_a_directory!(),
-            r#"set -C
+            r#"case "$t" in */*) d="${t%/*}"; d="${d:-/}" ;; *) d=. ;; esac
+if [ ! -e "$d" ]; then
+  case $(LC_ALL=C ls -d "$d" 2>&1) in
+    *"No such file or directory"*)
+      echo "parent directory $d does not exist: No such file or directory (os error 2)" >&2
+      exit 1 ;;
+  esac
+fi
+set -C
 if [ -e "$t" ]; then (umask 077; : > "$tmp") || exit 1; else : > "$tmp" || exit 1; fi
 set +C
 if [ -e "$t" ] && [ ! -w "$t" ]; then

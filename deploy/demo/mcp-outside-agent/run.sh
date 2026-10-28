@@ -2,6 +2,8 @@
 # An outside agent (OpenAI Agents SDK, which we did not write) does a coding task in a real E2B VM through
 # sandbox-mcp alone. Needs E2B_API_KEY and OPENAI_API_KEY in the environment (nothing is read from a file).
 #   MODEL=gpt-5-mini  COST_CAP_USD=0.25  VERSION=v0.1.16  E2B_TIMEOUT=1200  ./run.sh
+# To try unreleased code, point at local builds (each skips that download): SANDBOX_MCP_BIN=/path/to/sandbox-mcp and
+# EXECD_BIN=/path/to/execd (a static one: `cargo build --release -p beyond-execd --target x86_64-unknown-linux-musl`).
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 : "${E2B_API_KEY:?}" "${OPENAI_API_KEY:?}"
@@ -10,13 +12,17 @@ WORK=${WORK:-$(mktemp -d)}; export OUT_DIR=$WORK/out; mkdir -p "$OUT_DIR" "$WORK
 REL=https://github.com/beyondoss/ai/releases/download/$VERSION
 e2b() { printf 'header = "X-API-Key: %s"\n' "$E2B_API_KEY" | curl -sS -m 60 -K - "$@"; }
 
-for n in execd sandbox-mcp; do
-  f=$n-$VERSION-linux-amd64.tar.gz
+fetch() {  # fetch NAME: download and verify the release binary unless a local one was given
+  local n=$1 f=$1-$VERSION-linux-amd64.tar.gz
   curl -fsSL -o "$WORK/dl/$f" "$REL/$f"; curl -fsSL -o "$WORK/dl/$f.sha256" "$REL/$f.sha256"
   (cd "$WORK/dl" && sha256sum -c "$f.sha256") >&2
   mkdir -p "$WORK/$n" && tar -xzf "$WORK/dl/$f" -C "$WORK/$n"
-done
-EXECD=$(find "$WORK/execd" -type f -name execd | head -1); export SANDBOX_MCP_BIN=$(find "$WORK/sandbox-mcp" -type f -name sandbox-mcp | head -1)
+  find "$WORK/$n" -type f -name "$n" | head -1
+}
+EXECD=${EXECD_BIN:-$(fetch execd)}
+export SANDBOX_MCP_BIN=${SANDBOX_MCP_BIN:-$(fetch sandbox-mcp)}
+[ -x "$EXECD" ] && [ -x "$SANDBOX_MCP_BIN" ] || { echo "execd or sandbox-mcp binary missing" >&2; exit 1; }
+echo "execd: $EXECD  sandbox-mcp: $SANDBOX_MCP_BIN" >&2
 
 [ -d "$WORK/venv" ] || { python3 -m venv "$WORK/venv"; "$WORK/venv/bin/pip" install -q openai-agents; }
 
