@@ -362,6 +362,67 @@ const OS_ERRORS = [
   "stream did not contain valid UTF-8",
 ];
 
+/** `rg` appends ` (os error N)` to the OS message; the message is what a record ends in. */
+function stripOsError(raw: string): string {
+  let l = raw.trimEnd();
+  if (l.endsWith(")")) {
+    const at = l.lastIndexOf(" (os error ");
+    if (at >= 0) l = l.slice(0, at);
+  }
+  return l;
+}
+
+/**
+ * stderr as records that each end in an OS error (a path may contain a newline, so not lines);
+ * null when there are none, or text follows the last one (the engine complaining about something
+ * else).
+ */
+function osErrorRecords(stderr: string): string[] | null {
+  const records: string[] = [];
+  let start = 0;
+  for (const m of stderr.matchAll(/[^\n]*\n|[^\n]+$/g)) {
+    const end = m.index! + m[0].length;
+    const l = stripOsError(m[0]);
+    if (OS_ERRORS.some((e) => l.endsWith(e))) {
+      records.push(stderr.slice(start, end).trim());
+      start = end;
+    }
+  }
+  return records.length === 0 || stderr.slice(start).trim() !== ""
+    ? null
+    : records;
+}
+
+/**
+ * The per-path errors of stderr, each with its path when `excluded` matches it: `rg` and busybox
+ * `grep` open the files the glob skips (it is applied to their hits), so an unreadable excluded
+ * file is no reason for a note. Null when stderr is not purely per-path errors.
+ */
+export function excludedErrorRecords(
+  stderr: string,
+  excluded: (path: string) => boolean,
+  root: string,
+): Array<{ record: string; path: string | null }> | null {
+  const records = osErrorRecords(stderr);
+  if (records === null) return null;
+  return records.map((record) => {
+    const msg = stripOsError(record);
+    for (const e of OS_ERRORS) {
+      if (!msg.endsWith(e)) continue;
+      let path = msg.slice(0, msg.length - e.length);
+      if (!path.endsWith(": ")) break;
+      path = path.slice(0, -2);
+      if (path.startsWith("rg: ")) path = path.slice(4);
+      else if (path.startsWith("grep: ")) path = path.slice(6);
+      // The root's own error decides not_found / not_a_directory for the whole search: never
+      // dropped (rg adds `: IO error for operation on ROOT` after the root for some of them).
+      const isRoot = path === root || path.startsWith(`${root}: `);
+      return { record, path: !isRoot && excluded(path) ? path : null };
+    }
+    return { record, path: null };
+  });
+}
+
 /**
  * Exit 2 is shared by three situations: the engine rejecting the pattern, a missing root, and
  * per-path read errors. A path may contain a newline, so stderr is read as records that end at an
@@ -371,26 +432,8 @@ export function classifySearchFailure(
   stderr: string,
   root: string,
 ): SearchFailure {
-  const endsInOsError = (raw: string): boolean => {
-    let l = raw.trimEnd();
-    if (l.endsWith(")")) {
-      const at = l.lastIndexOf(" (os error ");
-      if (at >= 0) l = l.slice(0, at);
-    }
-    return OS_ERRORS.some((e) => l.endsWith(e));
-  };
-  const records: string[] = [];
-  let start = 0;
-  for (const m of stderr.matchAll(/[^\n]*\n|[^\n]+$/g)) {
-    const end = m.index! + m[0].length;
-    if (endsInOsError(m[0])) {
-      records.push(stderr.slice(start, end).trim());
-      start = end;
-    }
-  }
-  if (records.length === 0 || stderr.slice(start).trim() !== "") {
-    return { kind: "bad_regex" };
-  }
+  const records = osErrorRecords(stderr);
+  if (records === null) return { kind: "bad_regex" };
   const rootPrefix = `: ${root}: `;
   const ioPrefix = `IO error for operation on ${root}: `;
   const missing = records.find((r) => {

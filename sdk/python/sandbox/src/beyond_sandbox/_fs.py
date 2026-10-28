@@ -414,6 +414,62 @@ class SearchFailure:
     note: str = ""
 
 
+def _strip_os_error(line: str) -> str:
+    """``rg`` appends `` (os error N)`` to the OS message; the message is what a record ends in."""
+    line = line.rstrip()
+    if line.endswith(")") and " (os error " in line:
+        line = line[: line.rindex(" (os error ")]
+    return line
+
+
+def os_error_records(stderr: str) -> list[str] | None:
+    """stderr as records that each end in an OS error; None when there are none, or text follows
+    the last one (the engine complaining about something else)."""
+    records: list[str] = []
+    start = end = 0
+    for line in _split_lf(stderr):
+        end += len(line)
+        if any(_strip_os_error(line).endswith(e) for e in _OS_ERRORS):
+            records.append(stderr[start:end].strip())
+            start = end
+    return None if not records or stderr[start:].strip() else records
+
+
+def drop_excluded_errors(stderr: str, excluded: re.Pattern[str], root: str) -> Op[str]:
+    """``stderr`` without the per-path errors about files an excluding glob skips: ``rg`` and busybox
+    ``grep`` open them (the exclusion is applied to their hits), so an unreadable excluded file is
+    no reason for a note. The glob never excludes a directory, though, and an unreadable directory
+    named like it still hides files the caller wanted, so the matching paths are asked about in one
+    more command and the errors about directories stay. A failed command keeps every error. Stderr
+    that is not purely per-path errors is returned unchanged."""
+    records = os_error_records(stderr)
+    if records is None:
+        return stderr
+    parsed: list[tuple[str, str | None]] = []
+    for rec in records:
+        msg = _strip_os_error(rec)
+        path = None
+        for e in _OS_ERRORS:
+            if msg.endswith(e) and msg[: -len(e)].endswith(": "):
+                p = msg[: -len(e) - 2].removeprefix("rg: ").removeprefix("grep: ")
+                # the root's own error decides not_found / not_a_directory for the whole search:
+                # never dropped (rg adds ": IO error for operation on ROOT" after it for some)
+                is_root = p == root or p.startswith(f"{root}: ")
+                path = p if not is_root and excluded.fullmatch(p) is not None else None
+                break
+        parsed.append((rec, path))
+    matching = [p for _, p in parsed if p is not None]
+    if not matching:
+        return stderr
+    dirs: set[str] | None
+    try:
+        r = yield Run("sh", sh(_scripts.DIRS, *matching))
+        dirs = {d for d in r.stdout_text.split("\0") if d}
+    except SandboxError:
+        dirs = None
+    return "\n".join(rec for rec, p in parsed if p is None or dirs is None or p in dirs)
+
+
 def classify_search_failure(stderr: str, root: str) -> SearchFailure:
     """The three causes share exit 2; only stderr tells them apart.
 
@@ -421,21 +477,8 @@ def classify_search_failure(stderr: str, root: str) -> SearchFailure:
     lines; the root's own error is found by its exact string (newlines included).
     """
 
-    def ends_in_os_error(line: str) -> bool:
-        line = line.rstrip()
-        if line.endswith(")") and " (os error " in line:
-            line = line[: line.rindex(" (os error ")]
-        return any(line.endswith(e) for e in _OS_ERRORS)
-
-    records: list[str] = []
-    start = 0
-    end = 0
-    for line in _split_lf(stderr):
-        end += len(line)
-        if ends_in_os_error(line):
-            records.append(stderr[start:end].strip())
-            start = end
-    if not records or stderr[start:].strip():
+    records = os_error_records(stderr)
+    if records is None:
         return SearchFailure("bad_regex")
     marker = f": {root}: "
     io_prefix = f"IO error for operation on {root}: "
@@ -821,16 +864,25 @@ def search(q: Query, state: FsState, caps: Capabilities) -> Op[SearchResult]:
             excluded = re.compile(_glob_regex(q.glob), re.S)
         except (ValueError, re.error) as e:
             raise InvalidQuery(f"bad glob: {e}") from e
+    skipped_errors = excluded  # whose per-path errors are not worth a note
+    if engine == "busybox-grep" and q.glob is not None and q.glob_exclude:
+        skipped_errors = compile_glob(q.glob, q.ignore_case)
     if engine == "rg":
         args, program = rg_args(q, (yield from root_in_git_repo(state, q.root))), "rg"
     else:
         args, program = posix_grep_args(q, engine == "grep"), "grep"
     r = yield Run(program, args)
     stderr = r.stderr_text
+    exit_code = r.exit_code
+    if skipped_errors is not None and stderr:
+        kept = yield from drop_excluded_errors(stderr, skipped_errors, q.root)
+        if not kept and exit_code == 2:  # every complaint was about an excluded file: a success
+            exit_code = 0
+        stderr = kept
     note: str | None = None
-    if r.exit_code in (0, 1):
+    if exit_code in (0, 1):
         pass
-    elif r.exit_code == 124:
+    elif exit_code == 124:
         raise Timeout(f"{program} timed out")
     else:
         failure = classify_search_failure(stderr, q.root)
@@ -860,7 +912,27 @@ def search(q: Query, state: FsState, caps: Capabilities) -> Op[SearchResult]:
     if note is None:
         detail = stderr.strip()
         note = detail.split("\n", 1)[0] if detail else None
+    if note is None and engine == "grep" and q.glob is not None:
+        note = yield from unsearchable_dirs_note(q.root)
     return SearchResult(hits, truncated, note)
+
+
+def unsearchable_dirs_note(root: str) -> Op[str | None]:
+    """The note GNU ``grep`` does not give: a directory that can be listed but not entered.
+
+    ``grep`` cannot stat what is inside one and judges it by name alone, as a file, so with
+    ``--include`` (or ``--exclude``) it skips the entry in silence. ``find ! -executable`` lists such
+    directories (the unreadable ones ``grep`` reports itself, so this is asked only when it said
+    nothing and the search had a glob). A ``find`` without ``-executable``, or a transport error,
+    gives no note."""
+    try:
+        r = yield Run("find", ["-H", root, "-type", "d", "!", "-executable", "-print0"])
+    except SandboxError:
+        return None
+    dirs = [d for d in r.stdout_text.split("\0") if d and not is_under_git_dir(root, d)]
+    if not dirs:
+        return None
+    return f"{len(dirs)} path(s) could not be searched; first: grep: {dirs[0]}: Permission denied"
 
 
 __all__: Sequence[str] = [

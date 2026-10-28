@@ -357,6 +357,19 @@ impl FsBackend for ShellFs {
             ),
             _ => None,
         };
+        // Whose per-path errors are not worth a note: rg and busybox grep open the files an excluding
+        // glob skips (it is applied to their hits), so an unreadable one is not the caller's concern.
+        let skipped_errors = match (&q.glob, engine) {
+            (Some((_, true)), SearchEngine::Ripgrep) => excluded.clone(),
+            (Some((pattern, true)), SearchEngine::BusyboxGrep) => {
+                globset::GlobBuilder::new(pattern)
+                    .case_insensitive(q.ignore_case)
+                    .build()
+                    .ok()
+                    .map(|g| g.compile_matcher())
+            }
+            _ => None,
+        };
         let args = match engine {
             // The git-repo question is asked only on the rung that can act on it: `--no-require-git`
             // is a ripgrep flag, and the POSIX rungs honor no `.gitignore` at all.
@@ -369,7 +382,19 @@ impl FsBackend for ShellFs {
             SearchEngine::PosixGrep | SearchEngine::BusyboxGrep => "grep",
         };
 
-        let result = self.exec(program, &args).await?;
+        let mut result = self.exec(program, &args).await?;
+        if let Some(matcher) = &skipped_errors
+            && !result.stderr.is_empty()
+        {
+            let stderr = std::mem::take(&mut result.stderr);
+            result.stderr = self
+                .drop_excluded_errors(stderr, matcher, &q.root.to_string_lossy())
+                .await;
+            // Every complaint was about an excluded file: the run was a success.
+            if result.stderr.is_empty() && result.code == Some(2) {
+                result.code = Some(0);
+            }
+        }
 
         // Both `rg` and `grep` use exit 1 for "no matches" — a perfectly ordinary outcome, not a
         // failure. Exit 2 is shared by three different situations that must not be conflated: a
@@ -431,6 +456,10 @@ impl FsBackend for ShellFs {
         // must reach the outcome, or this backend would report a confidently incomplete result as
         // complete. Treated as "stopped early", which is exactly what it is.
         let (hits, truncated) = finalize(hits, q.limit, result.truncated);
+        let mut first_error = skipped_note.or_else(|| incomplete_note(&result));
+        if first_error.is_none() && engine == SearchEngine::PosixGrep && q.glob.is_some() {
+            first_error = self.unsearchable_dirs_note(&q.root).await;
+        }
         Ok(SearchOutcome {
             hits,
             truncated,
@@ -438,7 +467,7 @@ impl FsBackend for ShellFs {
             // unreadable subdirectory shows up only as noise on stderr, in a format that varies by
             // implementation. Reported when the command still succeeded but said something — enough
             // for the "search was incomplete" notice to fire, without pretending to name the path.
-            first_error: skipped_note.or_else(|| incomplete_note(&result)),
+            first_error,
         })
     }
 
@@ -901,6 +930,81 @@ impl ShellFs {
         answer
     }
 
+    /// The note GNU `grep` does not give: a directory that can be listed but not entered.
+    ///
+    /// `grep` cannot stat what is inside such a directory, and a path it cannot stat is judged by
+    /// name alone, as a file: with `--include` it is skipped, without a word, unless its name
+    /// satisfies the glob; with `--exclude` it is skipped when its name matches. Either way a whole
+    /// subtree vanishes with no stderr. `find ! -executable` lists the directories the sandbox user
+    /// cannot enter (the unreadable ones `grep` reports itself, so this is asked only when it said
+    /// nothing, and only when the search had a glob). It costs one more command and about a
+    /// twentieth of the grep's own walk. A `find` without `-executable`, or a transport error, gives
+    /// no note, which is the old behavior.
+    async fn unsearchable_dirs_note(&self, root: &Path) -> Option<String> {
+        let args = [
+            "-H".to_string(),
+            root.to_string_lossy().into_owned(),
+            "-type".into(),
+            "d".into(),
+            "!".into(),
+            "-executable".into(),
+            "-print0".into(),
+        ];
+        let found = self.exec("find", &args).await.ok()?;
+        let dirs: Vec<&str> = found
+            .stdout
+            .split('\0')
+            .filter(|d| !d.is_empty() && !super::is_under_git_dir(root, Path::new(d)))
+            .collect();
+        let first = dirs.first()?;
+        Some(format!(
+            "{} path(s) could not be searched; first: grep: {first}: Permission denied",
+            dirs.len()
+        ))
+    }
+
+    /// `stderr` without the per-path errors about files an excluding glob skips. The glob never
+    /// excludes a directory, though, and an unreadable directory named like it still hides files the
+    /// caller wanted, so the matching paths are asked about in one more command and the errors about
+    /// directories stay. A failed command keeps every error. Only when something matched.
+    async fn drop_excluded_errors(
+        &self,
+        stderr: String,
+        excluded: &globset::GlobMatcher,
+        root: &str,
+    ) -> String {
+        let Some(records) = excluded_error_records(&stderr, excluded, root) else {
+            return stderr;
+        };
+        let matching: Vec<String> = records
+            .iter()
+            .filter_map(|(_, p)| p.map(str::to_string))
+            .collect();
+        if matching.is_empty() {
+            return stderr;
+        }
+        let dirs: Option<std::collections::HashSet<String>> =
+            match self.exec("sh", &sh_script(DIRS_SCRIPT, &matching)).await {
+                Ok(r) => Some(
+                    r.stdout
+                        .split('\0')
+                        .filter(|d| !d.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                ),
+                Err(_) => None,
+            };
+        records
+            .iter()
+            .filter(|(_, p)| match (p, &dirs) {
+                (Some(p), Some(dirs)) => dirs.contains(*p),
+                _ => true,
+            })
+            .map(|(r, _)| *r)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// One command, one place: every operation's timeout, error wrapping and argv discipline.
     async fn exec(&self, program: &str, args: &[String]) -> Result<Text, FsError> {
         self.runner
@@ -1232,6 +1336,9 @@ fi
 printf '
 '"#;
 
+/// Which of the arguments are directories, NUL-terminated (appendix J).
+const DIRS_SCRIPT: &str = r#"for p; do [ -d "$p" ] && printf '%s\0' "$p"; done"#;
+
 /// Walk `$1` and its ancestors looking for a `.git`, exiting 0 the moment one is found — the
 /// target-side twin of [`crate::tools::root_is_inside_git_repo`], step for step, so the two backends
 /// make the same `--no-require-git` decision about the same tree.
@@ -1428,6 +1535,77 @@ enum SearchFailure {
     Skipped(String),
 }
 
+const OS_ERRORS: [&str; 7] = [
+    "No such file or directory",
+    "Permission denied",
+    "Is a directory",
+    "Not a directory",
+    "Too many levels of symbolic links",
+    "Input/output error",
+    // rg reading a `.git` file (a gitdir pointer) that is not text.
+    "stream did not contain valid UTF-8",
+];
+
+/// `rg` appends ` (os error N)` to the OS message; the message is what a record ends in.
+fn strip_os_error(l: &str) -> &str {
+    let l = l.trim_end();
+    l.strip_suffix(')')
+        .and_then(|x| x.rsplit_once(" (os error ").map(|p| p.0))
+        .unwrap_or(l)
+}
+
+/// stderr as records that each end in an OS error (see [`classify_search_failure`]); `None` when it
+/// has none, or has text after the last one (the engine complaining about something else).
+fn os_error_records(stderr: &str) -> Option<Vec<&str>> {
+    let mut records: Vec<&str> = Vec::new();
+    let mut start = 0;
+    for line in stderr.split_inclusive('\n') {
+        let end = (line.as_ptr() as usize - stderr.as_ptr() as usize) + line.len();
+        let l = strip_os_error(line);
+        if OS_ERRORS.iter().any(|e| l.ends_with(e)) {
+            records.push(stderr[start..end].trim());
+            start = end;
+        }
+    }
+    (!records.is_empty() && stderr[start..].trim().is_empty()).then_some(records)
+}
+
+/// The per-path errors of stderr, each with its path when the excluding glob matches it: ripgrep and
+/// busybox `grep` open the files the glob skips (it is applied to their hits), so an unreadable
+/// excluded file is no reason for a note. `None` when stderr is not purely per-path errors.
+fn excluded_error_records<'a>(
+    stderr: &'a str,
+    excluded: &globset::GlobMatcher,
+    root: &str,
+) -> Option<Vec<(&'a str, Option<&'a str>)>> {
+    let records = os_error_records(stderr)?;
+    Some(
+        records
+            .into_iter()
+            .map(|r| {
+                let msg = strip_os_error(r);
+                let path = OS_ERRORS
+                    .iter()
+                    .find_map(|e| msg.strip_suffix(e))
+                    .and_then(|m| m.strip_suffix(": "))
+                    .map(|m| {
+                        let m = m.strip_prefix("rg: ").unwrap_or(m);
+                        m.strip_prefix("grep: ").unwrap_or(m)
+                    })
+                    // The root's own error decides not_found / not_a_directory for the whole search:
+                    // never dropped, whatever the root is called (rg adds `: IO error for operation
+                    // on ROOT` after the root for some of them).
+                    .filter(|p| {
+                        excluded.is_match(p)
+                            && *p != root
+                            && !p.strip_prefix(root).is_some_and(|r| r.starts_with(": "))
+                    });
+                (r, path)
+            })
+            .collect(),
+    )
+}
+
 /// Per-path read errors name the path and end in the OS message (`rg` appends ` (os error N)`).
 /// Anything else on stderr is the engine complaining about the pattern.
 ///
@@ -1436,36 +1614,9 @@ enum SearchFailure {
 /// through the first line that ends in an OS message. The search root is known, so its own error is
 /// found by looking for that exact string, newlines and all.
 fn classify_search_failure(stderr: &str, root: &str) -> SearchFailure {
-    const OS_ERRORS: [&str; 7] = [
-        "No such file or directory",
-        "Permission denied",
-        "Is a directory",
-        "Not a directory",
-        "Too many levels of symbolic links",
-        "Input/output error",
-        // rg reading a `.git` file (a gitdir pointer) that is not text.
-        "stream did not contain valid UTF-8",
-    ];
-    let ends_in_os_error = |l: &str| {
-        let l = l.trim_end();
-        let l = l
-            .strip_suffix(')')
-            .and_then(|x| x.rsplit_once(" (os error ").map(|p| p.0))
-            .unwrap_or(l);
-        OS_ERRORS.iter().any(|e| l.ends_with(e))
-    };
-    let mut records: Vec<&str> = Vec::new();
-    let mut start = 0;
-    for line in stderr.split_inclusive('\n') {
-        let end = (line.as_ptr() as usize - stderr.as_ptr() as usize) + line.len();
-        if ends_in_os_error(line) {
-            records.push(stderr[start..end].trim());
-            start = end;
-        }
-    }
-    if records.is_empty() || !stderr[start..].trim().is_empty() {
+    let Some(records) = os_error_records(stderr) else {
         return SearchFailure::BadRegex;
-    }
+    };
     // The root's own error is `PROGRAM: ROOT: [IO error for operation on ROOT: ]No such file or
     // directory`; a path under the root carries more path after ROOT, so matching the exact
     // `: ROOT: ` form tells them apart.
@@ -1929,13 +2080,14 @@ mod appendix_tests {
 
     #[test]
     fn the_appendix_scripts_are_the_scripts_sent() {
-        let scripts: [(char, &str); 6] = [
+        let scripts: [(char, &str); 7] = [
             ('A', super::STAT_SCRIPT),
             ('B', super::READ_WINDOW_SCRIPT),
             ('C', super::WRITE_STDIN_SCRIPT),
             ('D', super::REMOVE_TEMP_SCRIPT),
             ('E', super::GIT_REPO_SCRIPT),
             ('F', super::PROBE_SCRIPT),
+            ('J', super::DIRS_SCRIPT),
         ];
         let mut wrong = Vec::new();
         for (letter, code) in scripts {

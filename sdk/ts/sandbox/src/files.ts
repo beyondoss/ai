@@ -10,6 +10,7 @@ import {
 } from "./errors.js";
 import { compileGlob } from "./glob.js";
 import {
+  DIRS_SCRIPT,
   GIT_SCRIPT,
   READ_SCRIPT,
   REMOVE_TEMP_SCRIPT,
@@ -18,6 +19,7 @@ import {
 } from "./scripts.js";
 import {
   classifySearchFailure,
+  excludedErrorRecords,
   finalize,
   grepArgs,
   isUnderGitDir,
@@ -402,16 +404,33 @@ export class Files {
     const excluded = engine === "rg" && q.glob !== undefined && q.globExclude
       ? compileGlob(q.glob, false)
       : null;
+    // Whose per-path errors are not worth a note: `rg` and busybox `grep` open the files an
+    // excluding glob skips (it is applied to their hits).
+    const skippedErrors = excluded
+      ?? (engine === "busybox-grep" && q.glob !== undefined && q.globExclude
+        ? compileGlob(q.glob, q.ignoreCase)
+        : null);
     const args = engine === "rg"
       ? rgArgs(q, await this.rootInGitRepo(q.root))
       : grepArgs(q, engine === "grep");
     const r = await this.exec(program, args);
 
     const stdout = text(r.stdout);
-    const stderr = text(r.stderr);
+    let stderr = text(r.stderr);
+    let exitCode = r.exitCode;
+    if (skippedErrors && stderr !== "") {
+      const kept = await this.dropExcludedErrors(
+        stderr,
+        (p) => skippedErrors.test(p),
+        q.root,
+      );
+      // Every complaint was about an excluded file: the run was a success.
+      if (kept === "" && exitCode === 2) exitCode = 0;
+      stderr = kept;
+    }
     let skipped: string | null = null;
-    if (r.exitCode !== 0 && r.exitCode !== 1) {
-      if (r.exitCode === 124) {
+    if (exitCode !== 0 && exitCode !== 1) {
+      if (exitCode === 124) {
         throw new TimeoutError(
           `${program} timed out after ${COMMAND_TIMEOUT_MS / 1000}s`,
         );
@@ -454,11 +473,72 @@ export class Files {
     }
     const done = finalize(hits, q.limit);
     const first = stderr.trim().split("\n")[0] ?? "";
-    return {
-      hits: done.hits,
-      truncated: done.truncated,
-      note: skipped ?? (first === "" ? null : first),
-    };
+    let note = skipped ?? (first === "" ? null : first);
+    if (
+      note === null && engine === "grep" && q.glob !== undefined
+    ) note = await this.unsearchableDirsNote(q.root);
+    return { hits: done.hits, truncated: done.truncated, note };
+  }
+
+  /**
+   * The note GNU `grep` does not give: a directory that can be listed but not entered. `grep`
+   * cannot stat what is inside one and judges it by name alone, as a file, so with `--include` (or
+   * `--exclude`) it skips the entry in silence. `find ! -executable` lists such directories (the
+   * unreadable ones `grep` reports itself, so this is asked only when it said nothing and the search
+   * had a glob). A `find` without `-executable`, or a transport error, gives no note.
+   */
+  private async unsearchableDirsNote(root: string): Promise<string | null> {
+    let out: string;
+    try {
+      const r = await this.exec("find", [
+        "-H",
+        root,
+        "-type",
+        "d",
+        "!",
+        "-executable",
+        "-print0",
+      ]);
+      out = text(r.stdout);
+    } catch {
+      return null;
+    }
+    const dirs = out.split("\0").filter((d) =>
+      d !== "" && !isUnderGitDir(root, d)
+    );
+    return dirs.length === 0
+      ? null
+      : `${dirs.length} path(s) could not be searched; first: grep: ${
+        dirs[0]
+      }: Permission denied`;
+  }
+
+  /**
+   * `stderr` without the per-path errors about files an excluding glob skips. The glob never
+   * excludes a directory, though, and an unreadable directory named like it still hides files the
+   * caller wanted, so the matching paths are asked about in one more command and the errors about
+   * directories stay. A failed command keeps every error. Only when something matched.
+   */
+  private async dropExcludedErrors(
+    stderr: string,
+    excluded: (path: string) => boolean,
+    root: string,
+  ): Promise<string> {
+    const records = excludedErrorRecords(stderr, excluded, root);
+    if (records === null) return stderr;
+    const matching = records.flatMap((r) => r.path === null ? [] : [r.path]);
+    if (matching.length === 0) return stderr;
+    let dirs: Set<string> | null = null;
+    try {
+      const r = await this.exec("sh", sh(DIRS_SCRIPT, matching));
+      dirs = new Set(text(r.stdout).split("\0").filter((d) => d !== ""));
+    } catch {
+      dirs = null;
+    }
+    return records
+      .filter((r) => r.path === null || dirs === null || dirs.has(r.path))
+      .map((r) => r.record)
+      .join("\n");
   }
 
   /** Whether `root` or an ancestor holds a `.git`, asked in the sandbox and cached per root. */
