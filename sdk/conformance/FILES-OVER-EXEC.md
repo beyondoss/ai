@@ -135,6 +135,12 @@ situations.
 | 200 whose body is not the expected JSON                             | `protocol`  |
 | a stream ends without its final frame, or a `{"error"}` frame       | `transport` |
 
+A call renews its token at most once. On a `401` with a token source that can give another, the
+client asks the source again and repeats that request once with whatever it gave, even the same
+token. If the repeat is refused too, the call fails `auth` (HTTP 401 or 403 as above): two
+refusals at most, one mint, never a loop. A fixed token has nothing to ask again, so its `401` is
+final after one request. Concurrent calls refused with the same token share one renewal.
+
 A transport-level failure is never a capability: see
 [probe errors](#42-probe-errors).
 
