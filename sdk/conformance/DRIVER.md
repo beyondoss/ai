@@ -18,11 +18,12 @@ talks to it over its stdin and stdout. The driver:
 
 - MUST read its configuration from the environment:
 
-| variable             | meaning                                                                                                             |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `CONFORMANCE_URL`    | the exec endpoint's URL (required)                                                                                  |
-| `CONFORMANCE_BEARER` | the bearer token; absent or empty means no `Authorization` header                                                   |
-| `CONFORMANCE_CAPS`   | optional JSON object overriding probe results: `find_printf` (bool), `search_engine` (`rg`, `grep`, `busybox-grep`) |
+| variable                | meaning                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CONFORMANCE_URL`       | the exec endpoint's URL (required)                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `CONFORMANCE_BEARER`    | the bearer token; absent or empty means no `Authorization` header                                                                                                                                                                                                                                                                                                                                                                     |
+| `CONFORMANCE_TOKEN_CMD` | optional: a shell command (`sh -c`) whose stdout, trimmed, is the bearer. The driver hands the client a token _source_ over it, so the client runs it before its first request and again after a `401`. The harness never sets it together with `CONFORMANCE_BEARER`; if both are present the command wins. A command that exits non-zero or prints nothing is the source failing, and must surface as the client reports it (`auth`) |
+| `CONFORMANCE_CAPS`      | optional JSON object overriding probe results: `find_printf` (bool), `search_engine` (`rg`, `grep`, `busybox-grep`)                                                                                                                                                                                                                                                                                                                   |
 
 - MUST read requests one line at a time, answer each with exactly one line on
   stdout, **in order**, and never have two requests in flight. stdout carries
@@ -239,7 +240,8 @@ and the op's own fields go to the driver. The harness fields are not sent:
    rest run.
 4. Use the backend's driver, or if `connect` is present a fresh driver whose
    `CONFORMANCE_BEARER` and `CONFORMANCE_URL` are replaced by `connect.bearer`
-   (`null` meaning none) and `connect.url`.
+   (`null` meaning none) and `connect.url`, or, with `connect.edge`, by an edge
+   (below).
 5. Make the scenario's directory `${ROOT}` (`mkdir -p` through `exec`), run
    `setup` steps (each must reach the driver and return `ok` or `error`;
    `setup` is not counted), then the `steps` in order, each a check.
@@ -294,6 +296,9 @@ backend demands a bearer); `not_root` (the sandbox user is not uid 0, so
 permission checks mean something); `commands` (a list that `command -v` finds in
 the sandbox); `vars` (a list of variable names the backend defines, see below).
 
+`backend` (a list of backend names, such as `local-plain`) limits a scenario that does not depend on
+the sandbox, only on the client (its own deadline), to those backends; it is skipped elsewhere.
+
 `features` (a list of names) is judged against the **driver**, not the backend: a scenario
 whose `requires.features` names a feature that the driver's `hello.features` lacks is
 **unsupported** as a whole (never skipped, never a pass), with the driver's reason from
@@ -311,6 +316,35 @@ A backend may define directories beyond `${ROOT}` and `${WORK}`, as variables:
 `${LOCKED}` (a directory the sandbox user may not write, holding the same file)
 and `${TINY}` (a 1 MiB filesystem). The `environments` suite uses them and is
 skipped, visibly, where a backend does not provide them.
+
+### Edge
+
+`"connect": {"edge": {...}}` puts a proxy owned by the harness between a fresh driver and the
+backend's endpoint (plain `http://` only; a scenario is skipped where the backend has no such
+endpoint). The edge talks to the backend with the backend's own bearer, so the same scenario runs on
+every backend. Configuration:
+
+- `tokens`: the edge issues the bearer. The driver gets `CONFORMANCE_TOKEN_CMD` (no
+  `CONFORMANCE_BEARER`), and the edge answers `401` to every token but the current one. `true` is a
+  command that prints it, `"fail"` one that exits 1, `"empty"` one that prints nothing. Without
+  `tokens` the driver sends no bearer and the edge accepts anything.
+
+A step with an `edge` key in place of `op` drives the edge between driver operations; it is not sent to
+the driver and needs no `hello.ops`. Its keys, all optional, and its answer:
+
+- `expire`: the current token stops working. `true` also makes the token command print a new one;
+  `{"mint": false}` leaves it printing the dead one.
+- `set`: `delay_ms` (wait this long before passing each request on: a sandbox waking up) and
+  `fault`, applied to every request until changed, `null` clearing it: `{"kind": "status", "status",
+  "body"}` answers that status; `{"kind": "garbage", "body", "ndjson"}` answers `200` with a body that
+  is not the protocol; `{"kind": "drop"}` closes the connection without an answer; `{"kind": "hang"}`
+  never answers; `{"kind": "cut", "body_bytes": N}` passes the answer's head and N bytes of its body,
+  then closes.
+- `reset`: zero the counters after reading them.
+
+The answer (`ok`) is the counters since the last `reset`: `requests` (received), `rejected` (answered
+`401`), `faulted`, `forwarded`, `mints` (runs of the token command), to be matched like any result.
+Setup should send one op first (`capabilities`) so the client's one-time probe is not counted.
 
 ### Relay
 

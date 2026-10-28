@@ -35,9 +35,12 @@ async fn token_from_command(
         Err(_) => return Err(format!("the token command {program:?} timed out")),
     };
     if !out.status.success() {
+        let said = String::from_utf8_lossy(&out.stderr);
+        let said = said.trim();
         return Err(format!(
-            "the token command {program:?} exited with {}",
-            out.status
+            "the token command {program:?} exited with {}{}{said}",
+            out.status,
+            if said.is_empty() { "" } else { ": " },
         ));
     }
     let token = String::from_utf8(out.stdout)
@@ -66,7 +69,7 @@ impl TokenSource {
     }
 
     /// A token minted by `mint`, called for the first request and again after a `401`. The error
-    /// text becomes the request's error.
+    /// text becomes the request's error, of kind `auth` (`token source failed: ...`).
     pub fn from_fn<F, Fut>(mint: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
@@ -76,9 +79,9 @@ impl TokenSource {
     }
 
     /// A token printed by a command (`argv[0]` with the rest as arguments), run when one is needed:
-    /// stdout, trimmed, and valid UTF-8. A non-zero exit, empty output, a token that is not UTF-8,
-    /// or no exit within [`TOKEN_COMMAND_TIMEOUT`] is an error. The child is killed when the
-    /// deadline fires.
+    /// stdout, trimmed, and valid UTF-8. A non-zero exit (stderr is in the error), empty output, a
+    /// token that is not UTF-8, or no exit within [`TOKEN_COMMAND_TIMEOUT`] is an error. The child
+    /// is killed when the deadline fires.
     pub fn command<I, S>(argv: I) -> Self
     where
         I: IntoIterator<Item = S>,

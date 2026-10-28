@@ -59,7 +59,7 @@ raw `Exec` back (`.raw()`), so nothing the helpers do is out of reach of a calle
   asks it; on a `401` the client asks again once and repeats that request once, and a source that returns the token it
   was already using, or a fixed source, ends it there. Concurrent requests compare the token they failed with against
   the current one, so a renewal is shared, not repeated. Error text never contains a token (`Debug` is redacted).
-  A command source's stdout must be UTF-8. The command is killed if it has not exited within 30 s, which is also
+  A command source's stdout must be UTF-8. A non-zero exit includes the command's stderr. The command is killed if it has not exited within 30 s, which is also
   the bound on how long that shared mint holds the bearer lock. A closure source is the caller's to bound.
 - **Bounded.** A one-shot answer is read incrementally up to the base64 of `with_max_response_bytes` (16 MiB of decoded bytes by
   default) and an over-cap answer is an error; a stream frame is at most 64 KiB and a line at most 1 MiB; a silent stream is abandoned after 30 s

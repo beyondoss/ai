@@ -136,7 +136,16 @@ pub struct ProcessConnector {
 
 #[async_trait]
 impl Connector for ProcessConnector {
-    async fn connect(&self, bearer: Option<Option<String>>, url: Option<String>) -> Box<dyn Link> {
+    fn upstream(&self) -> Option<(String, Option<String>)> {
+        Some((self.url.clone(), self.bearer.clone()))
+    }
+
+    async fn connect(
+        &self,
+        bearer: Option<Option<String>>,
+        url: Option<String>,
+        token_cmd: Option<String>,
+    ) -> Box<dyn Link> {
         let mut env = BTreeMap::new();
         env.insert(
             "CONFORMANCE_URL".to_string(),
@@ -146,6 +155,11 @@ impl Connector for ProcessConnector {
             "CONFORMANCE_BEARER".to_string(),
             bearer.unwrap_or_else(|| self.bearer.clone()),
         );
+        if token_cmd.is_some() {
+            // The token source replaces the fixed bearer: a driver given both would be ambiguous.
+            env.insert("CONFORMANCE_BEARER".to_string(), None);
+        }
+        env.insert("CONFORMANCE_TOKEN_CMD".to_string(), token_cmd);
         env.insert(
             "CONFORMANCE_CAPS".to_string(),
             Some(self.caps.as_ref().map(Value::to_string).unwrap_or_default()),

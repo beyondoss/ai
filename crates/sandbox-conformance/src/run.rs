@@ -15,10 +15,22 @@ pub trait Link: Send + Sync {
 }
 
 /// How a backend starts a driver. A scenario with `connect` asks for one with its own credentials:
-/// `bearer: Some(None)` means no bearer, `None` keeps the backend's own.
+/// `bearer: Some(None)` means no bearer, `None` keeps the backend's own. `token_cmd` is
+/// `CONFORMANCE_TOKEN_CMD` (it replaces the bearer).
 #[async_trait]
 pub trait Connector: Send + Sync {
-    async fn connect(&self, bearer: Option<Option<String>>, url: Option<String>) -> Box<dyn Link>;
+    /// The endpoint's URL and bearer, when there is one a proxy can be put in front of
+    /// (`connect.edge`); `None` for a driver that reaches the sandbox some other way.
+    fn upstream(&self) -> Option<(String, Option<String>)> {
+        None
+    }
+
+    async fn connect(
+        &self,
+        bearer: Option<Option<String>>,
+        url: Option<String>,
+        token_cmd: Option<String>,
+    ) -> Box<dyn Link>;
 }
 
 /// A started backend with its driver connected and probed.
@@ -52,7 +64,7 @@ impl Backend {
         auth: bool,
         work: &str,
     ) -> Backend {
-        let link = connector.connect(None, None).await;
+        let link = connector.connect(None, None, None).await;
         let hello = link.call(&json!({"id": 0, "op": "hello"})).await;
         let ops = hello["ok"]["ops"]
             .as_array()
@@ -146,7 +158,7 @@ fn request(id: u64, step: &Value, vars: &Vars) -> Value {
     for (k, v) in step.as_object().unwrap() {
         if !matches!(
             k.as_str(),
-            "id" | "expect" | "save" | "poll" | "note" | "xfail" | "via"
+            "id" | "expect" | "save" | "poll" | "note" | "xfail" | "via" | "edge"
         ) {
             req.insert(k.clone(), subst(v, vars));
         }
@@ -179,6 +191,18 @@ async fn unmet(req: &Value, be: &Backend) -> Option<String> {
                 };
                 if !ok {
                     return Some(format!("requires search_engine={want}, backend has {have}"));
+                }
+            }
+            // The cells are named `<driver>__<backend>`; a scenario that does not depend on the sandbox
+            // (the client's own timeout, a proxy fault) names the one backend it is worth running on.
+            "backend" => {
+                let here = be
+                    .name
+                    .split_once("__")
+                    .map_or(be.name.as_str(), |(_, b)| b);
+                let names = want.as_array().into_iter().flatten();
+                if !names.clone().any(|n| n.as_str() == Some(here)) {
+                    return Some(format!("requires backend in {want}, this is {here}"));
                 }
             }
             // Judged for the driver, not the backend (see `lacks_feature`).
@@ -248,6 +272,7 @@ fn decode_utf8(v: &Value) -> String {
 /// One step: send, optionally poll until it matches, save, return the failure if any.
 async fn run_step(
     link: &dyn Link,
+    edge: Option<&crate::edge::Edge>,
     step: &Value,
     vars: &mut Vars,
     seq: &mut u64,
@@ -260,7 +285,15 @@ async fn run_step(
     loop {
         *seq += 1;
         let req = request(*seq, step, vars);
-        let mut resp = link.call(&req).await;
+        let mut resp = match (step.get("edge"), edge) {
+            (Some(ctl), Some(edge)) => {
+                json!({"id": req["id"], "ok": edge.control(&subst(ctl, vars))})
+            }
+            (Some(_), None) => {
+                json!({"id": req["id"], "error": {"kind": "io", "detail": "an edge step in a scenario without connect.edge"}})
+            }
+            _ => link.call(&req).await,
+        };
         let clip = |v: &Value, n: usize| v.to_string().chars().take(n).collect::<String>();
         if resp["id"] != req["id"] {
             return Err(format!(
@@ -386,16 +419,43 @@ pub async fn run_scenario_via(sc: &Value, be: &Backend, peer: Option<&Backend>) 
         }
     }
 
-    // A scenario may connect with its own credentials (a wrong bearer); the rest share the
-    // backend's driver.
+    // A scenario may connect with its own credentials (a wrong bearer), or through an edge it drives;
+    // the rest share the backend's driver.
     let own;
+    let mut edge = None;
     let link: &dyn Link = match sc.get("connect") {
         Some(c) => {
-            let bearer = c.get("bearer").map(|b| b.as_str().map(str::to_string));
-            own = be
-                .connector
-                .connect(bearer, c["url"].as_str().map(str::to_string))
-                .await;
+            let mut bearer = c.get("bearer").map(|b| b.as_str().map(str::to_string));
+            let mut url = c["url"].as_str().map(str::to_string);
+            let mut token_cmd = None;
+            if let Some(cfg) = c.get("edge") {
+                let Some((up, up_bearer)) = be.connector.upstream() else {
+                    return all(
+                        sid,
+                        steps,
+                        Status::Skipped,
+                        "requires an HTTP endpoint behind the driver",
+                    );
+                };
+                match crate::edge::Edge::start(&up, up_bearer, cfg).await {
+                    Ok(e) => {
+                        url = Some(e.url.clone());
+                        token_cmd = e.token_cmd.clone();
+                        // The edge issues the credentials: the backend's bearer is not the driver's.
+                        bearer = Some(None);
+                        edge = Some(e);
+                    }
+                    Err(why) => {
+                        return all(
+                            sid,
+                            steps,
+                            Status::Skipped,
+                            &format!("requires an edge: {why}"),
+                        );
+                    }
+                }
+            }
+            own = be.connector.connect(bearer, url, token_cmd).await;
             own.as_ref()
         }
         None => be.link.as_ref(),
@@ -421,7 +481,7 @@ pub async fn run_scenario_via(sc: &Value, be: &Backend, peer: Option<&Backend>) 
     let _ = exec(be, "rm", &["-rf", &root]).await;
     let mut seq = 0u64;
     let boot = json!({"op": "exec", "command": "mkdir", "args": ["-p", "${ROOT}"]});
-    if let Err(why) = run_step(be.link.as_ref(), &boot, &mut vars, &mut seq, true).await {
+    if let Err(why) = run_step(be.link.as_ref(), None, &boot, &mut vars, &mut seq, true).await {
         let mut out = vec![Check {
             id: format!("{sid}/boot"),
             status: Status::Fail,
@@ -433,7 +493,7 @@ pub async fn run_scenario_via(sc: &Value, be: &Backend, peer: Option<&Backend>) 
     for (i, s) in sc["setup"].as_array().into_iter().flatten().enumerate() {
         let l = crate::relay::side(s, be, peer).link.as_ref();
         let l = if peer.is_some() { l } else { link };
-        if let Err(why) = run_step(l, s, &mut vars, &mut seq, true).await {
+        if let Err(why) = run_step(l, edge.as_ref(), s, &mut vars, &mut seq, true).await {
             let mut out = vec![Check {
                 id: format!("{sid}/setup[{i}]"),
                 status: Status::Fail,
@@ -476,6 +536,7 @@ pub async fn run_scenario_via(sc: &Value, be: &Backend, peer: Option<&Backend>) 
                 } else {
                     link
                 },
+                edge.as_ref(),
                 step,
                 &mut vars,
                 &mut seq,
