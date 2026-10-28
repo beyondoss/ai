@@ -45,8 +45,8 @@ export class TimeoutError extends SandboxError {
 
 /** HTTP 401 or 403. */
 export class AuthError extends SandboxError {
-  constructor(detail: string) {
-    super("auth", detail);
+  constructor(detail: string, options?: { cause?: unknown }) {
+    super("auth", detail, options);
   }
 }
 

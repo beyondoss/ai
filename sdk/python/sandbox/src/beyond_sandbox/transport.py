@@ -230,7 +230,12 @@ class HttpTransport:
     def _bearer(self, refresh: bool) -> list[tuple[str, str]]:
         with self._lock:
             if callable(self._token) and (refresh or self._token_value is None):
-                self._token_value = self._token()
+                try:
+                    self._token_value = _wire.checked_token(self._token())
+                except SandboxError:
+                    raise
+                except Exception as e:
+                    raise _wire.token_failed(e) from e
             value = self._token_value
         return [("Authorization", f"Bearer {value}")] if value else []
 
