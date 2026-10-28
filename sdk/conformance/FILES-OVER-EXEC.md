@@ -133,7 +133,7 @@ situations.
 | HTTP 422 whose body says the output exceeded the cap, or client cap | `too_large` |
 | any other non-2xx                                                   | `endpoint`  |
 | 200 whose body is not the expected JSON                             | `protocol`  |
-| a stream request answered 200 without `application/x-ndjson`       | `protocol`  |
+| a stream request answered 200 without `application/x-ndjson`        | `protocol`  |
 | a stream ends without its final frame, or a `{"error"}` frame       | `transport` |
 
 A stream request is answered by a stream or not at all. A 200 to it whose `Content-Type` is not
