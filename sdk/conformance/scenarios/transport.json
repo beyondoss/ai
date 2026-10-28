@@ -933,11 +933,9 @@
           },
           "xfail": {
             "drivers": [
-              "agent-reference",
-              "beyond-sandbox-ts",
               "sandbox-mcp"
             ],
-            "reason": "an unparseable stream frame is reported as transport; Python reports protocol; the MCP driver's stream is a job, whose start answer it cannot read (io)"
+            "reason": "the MCP driver's stream is a job, whose start answer it cannot read (io)"
           }
         },
         {
