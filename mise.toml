@@ -309,6 +309,22 @@ target/debug/sandbox-matrix --registry sdk/conformance/drivers.toml $backends \
   --report target/sandbox-matrix/report.json "$@"
 """
 
+[tasks."test:clients:e2b"]
+description = "The client conformance matrix against a real E2B VM running the released execd (every driver, plus relay pairs). Opt-in and billed (about $0.10/hour, one VM, hard 25 minute lifetime): needs E2B_API_KEY in the environment. E2B_EXECD_VERSION picks the release tag. Extra arguments go to sandbox-matrix. Set DIFFERENTIAL_E2B=1 to also run the differential test against it (DIFFERENTIAL_CASES sets the count)."
+run = """
+set -e
+cargo build -q -p beyond-sandbox-conformance -p beyond-sandbox-mcp
+mkdir -p target/sandbox-matrix
+target/debug/sandbox-matrix --registry sdk/conformance/drivers.toml --backend e2b \
+  --report target/sandbox-matrix/report-e2b.json "$@"
+if [ -n "${DIFFERENTIAL_E2B:-}" ]; then
+  if [ ! -f sdk/ts/sandbox/dist/driver.mjs ]; then
+    npm ci --prefix sdk/ts --silent && npm run build --prefix sdk/ts --silent
+  fi
+  DIFFERENTIAL_BACKENDS=e2b cargo test -q -p beyond-sandbox-conformance --test differential -- --include-ignored --nocapture e2b
+fi
+"""
+
 [tasks."test:differential"]
 description = "Randomized differential testing across every client: Hegel generates operation sequences, each runs through every driver in sdk/conformance/drivers.toml on its own fresh root, and the answers are compared with each other and (local backends) with the filesystem. Fixed seeds and case counts; widen with DIFFERENTIAL_CASES, DIFFERENTIAL_SEED, DIFFERENTIAL_STEPS, DIFFERENTIAL_BACKENDS, DIFFERENTIAL_DRIVERS, DIFFERENTIAL_SHRINK=0. The container backends run when docker is available."
 depends = ["build:execd-static"]

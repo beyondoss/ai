@@ -57,6 +57,10 @@ and `tinydisk`. The container backends need docker. It prints a table
 a `fail`, including an `xfail` that passes, exits non-zero. `BACKENDS="local alpine" mise run test:clients` picks backends;
 extra arguments reach `sandbox-matrix` (`--filter 'files.*'`, `--verbose` to list every skip with its reason).
 
+`E2B_API_KEY=... mise run test:clients:e2b` runs every driver, and every relay pair, against a real E2B VM running the released
+`execd` (installed by `install-execd.sh`), over the internet. It is opt-in and billed (one VM, about $0.10/hour, deleted at the end
+and by a 25 minute auto-kill); it is not part of `test:clients` or of PR CI.
+
 CI runs the matrix on a PR that touches `sdk/`, `crates/sandbox*`, `crates/execd` or the agent's exec endpoint and file helpers.
 
 ## Adding a client

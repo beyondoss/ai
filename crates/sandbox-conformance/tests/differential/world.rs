@@ -98,8 +98,7 @@ impl World {
         }
         Ok(World {
             backend: backend.to_string(),
-            local: !matches!(backend, "alpine" | "debian-runas" | "readonly" | "tinydisk")
-                && !backend.starts_with("fault"),
+            local: backend.starts_with("local") || backend == "embedded",
             started,
             drivers,
             cases: AtomicU64::new(0),
