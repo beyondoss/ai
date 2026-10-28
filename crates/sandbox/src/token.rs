@@ -28,7 +28,7 @@ impl TokenSource {
     }
 
     /// A token minted by `mint`, called for the first request and again after a `401`. The error
-    /// text becomes the request's error.
+    /// text becomes the request's error, of kind `auth` (`token source failed: ...`).
     pub fn from_fn<F, Fut>(mint: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
@@ -38,7 +38,7 @@ impl TokenSource {
     }
 
     /// A token printed by a command (`argv[0]` with the rest as arguments), run when one is needed:
-    /// stdout, trimmed. A non-zero exit, or empty output, is an error.
+    /// stdout, trimmed. A non-zero exit (stderr is in the error), or empty output, is an error.
     pub fn command<I, S>(argv: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -56,9 +56,12 @@ impl TokenSource {
                     .await
                     .map_err(|e| format!("could not run the token command {program:?}: {e}"))?;
                 if !out.status.success() {
+                    let said = String::from_utf8_lossy(&out.stderr);
+                    let said = said.trim();
                     return Err(format!(
-                        "the token command {program:?} exited with {}",
-                        out.status
+                        "the token command {program:?} exited with {}{}{said}",
+                        out.status,
+                        if said.is_empty() { "" } else { ": " },
                     ));
                 }
                 let token = String::from_utf8_lossy(&out.stdout).trim().to_string();

@@ -366,3 +366,16 @@ def not_a_stream(url: str) -> ProtocolError:
     return ProtocolError(
         f"exec endpoint {url} answered a stream request with something that is not a stream"
     )
+
+
+def token_failed(e: BaseException) -> SandboxError:
+    """A token source that raised: the call cannot be authorised, so it is ``auth`` (detail: the
+    source's own message), never the source's exception."""
+    return AuthError(f"token source failed: {e}")
+
+
+def checked_token(value: object) -> str:
+    """What a token source returned, or ``auth`` when it is not a token (empty, not text)."""
+    if not isinstance(value, str) or not value.strip():
+        raise AuthError("token source failed: it gave no token")
+    return value

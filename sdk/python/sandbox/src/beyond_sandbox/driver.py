@@ -594,21 +594,30 @@ def _fail(id_: Any, e: BaseException) -> Result:
     return {"id": id_, "error": {"kind": "io", "detail": f"driver bug: {type(e).__name__}: {e}"}}
 
 
+def _command_failure(code: int | None, stderr: str) -> str:
+    detail = stderr.strip()
+    return f"the token command exited with {code}" + (f": {detail}" if detail else "")
+
+
 def _token_from(cmd: str, use_async: bool) -> Callable[[], Any]:
     """A token function over a shell command: its stdout, trimmed (CONFORMANCE_TOKEN_CMD)."""
 
     def sync() -> str:
-        out = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, check=True).stdout
-        token = out.strip()
+        done = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True)
+        if done.returncode != 0:
+            raise RuntimeError(_command_failure(done.returncode, done.stderr))
+        token = done.stdout.strip()
         if not token:
             raise RuntimeError("the token command printed nothing")
         return token
 
     async def asynchronous() -> str:
-        proc = await asyncio.create_subprocess_exec("sh", "-c", cmd, stdout=asyncio.subprocess.PIPE)
-        out, _ = await proc.communicate()
+        proc = await asyncio.create_subprocess_exec(
+            "sh", "-c", cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        out, err = await proc.communicate()
         if proc.returncode != 0:
-            raise RuntimeError(f"the token command exited with {proc.returncode}")
+            raise RuntimeError(_command_failure(proc.returncode, err.decode(errors="replace")))
         token = out.decode().strip()
         if not token:
             raise RuntimeError("the token command printed nothing")

@@ -218,8 +218,15 @@ class AsyncHttpTransport:
     async def _bearer(self, refresh: bool) -> list[tuple[str, str]]:
         async with self._lock:
             if callable(self._token) and (refresh or self._token_value is None):
-                value = self._token()
-                self._token_value = await value if isinstance(value, Awaitable) else value
+                try:
+                    value = self._token()
+                    if isinstance(value, Awaitable):
+                        value = await value
+                    self._token_value = _wire.checked_token(value)
+                except SandboxError:
+                    raise
+                except Exception as e:
+                    raise _wire.token_failed(e) from e
             value_ = self._token_value
         return [("Authorization", f"Bearer {value_}")] if value_ else []
 

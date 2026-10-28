@@ -130,6 +130,7 @@ situations.
 | connection refused, reset, DNS failure                              | `transport` |
 | the request deadline passed                                         | `timeout`   |
 | HTTP 401 or 403                                                     | `auth`      |
+| the token source fails (see below)                                  | `auth`      |
 | HTTP 422 whose body says the output exceeded the cap, or client cap | `too_large` |
 | any other non-2xx                                                   | `endpoint`  |
 | 200 whose body is not the expected JSON                             | `protocol`  |
@@ -142,6 +143,11 @@ for a one-shot call, by the rows above (`auth`, `too_large`, `endpoint`). A **20
 never read as a one-shot answer (an object that looks like a result would be a clean empty exit 0,
 silent data loss). A client that reads such a body before failing may report its own error
 instead when the body is over the cap (`too_large`) or is not a one-shot answer (`protocol`).
+
+A token source is a function or command that gives the bearer (layer 1). It fails when it
+raises or exits non-zero, or gives an empty token. That is `auth`, on every call that needs a
+token, with the source's own message (a command's stderr) in `detail` and nothing sent to the
+endpoint: not `io`, and never the source's own exception escaping the client.
 
 A transport-level failure is never a capability: see
 [probe errors](#42-probe-errors).
