@@ -2,6 +2,7 @@
 //! parser must survive anything a command or an endpoint can print) and as a structured value that
 //! is serialized exactly as the real tool prints it, parsed, and required to come back equal.
 
+use beyond_sandbox::fs::{Hit, LINE_TRUNCATED_SUFFIX, MAX_LINE};
 use libfuzzer_sys::arbitrary::{Result, Unstructured};
 
 /// Fragments that have broken, or nearly broken, these parsers: group separators, separators that
@@ -42,4 +43,19 @@ fn floor_boundary(s: &str, mut i: usize) -> usize {
 pub fn name(u: &mut Unstructured<'_>, newlines: bool) -> Result<String> {
     let s = text(u, 24, newlines)?;
     Ok(if s.is_empty() { "p".to_string() } else { s })
+}
+
+/// Bytes a parser may add to its hits beyond its input: [`LINE_TRUNCATED_SUFFIX`] for each line it
+/// clipped to [`MAX_LINE`] characters. A head clip keeps the first `MAX_LINE` characters of a line
+/// that has more, so the suffix is the only growth; a clipped text is exactly those characters followed
+/// by the suffix, which is what this counts.
+pub fn clip_slack(hits: &[Hit]) -> usize {
+    let clipped_chars = MAX_LINE + LINE_TRUNCATED_SUFFIX.chars().count();
+    let clipped = hits
+        .iter()
+        .filter(|h| {
+            h.text.chars().count() == clipped_chars && h.text.ends_with(LINE_TRUNCATED_SUFFIX)
+        })
+        .count();
+    clipped * LINE_TRUNCATED_SUFFIX.len()
 }

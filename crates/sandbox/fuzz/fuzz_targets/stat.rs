@@ -19,10 +19,13 @@ fn structured(u: &mut Unstructured<'_>) -> libfuzzer_sys::arbitrary::Result<()> 
     // Seconds `stat -c %Y`/`find -printf %T@` can really report: a signed 64-bit count, and a real
     // clock never reads past a few billion.
     let secs = u.int_in_range(0..=4_102_444_800u64)?;
-    let frac = if u.ratio(1, 2)? {
-        format!(".{:010}", u.int_in_range(0..=9_999_999_999u64)?)
+    // The fraction is kept to nine digits: the parser truncates, it does not round.
+    let (frac, nanos) = if u.ratio(1, 2)? {
+        let digits = format!("{:010}", u.int_in_range(0..=9_999_999_999u64)?);
+        let nanos: u32 = digits[..9].parse().unwrap();
+        (format!(".{digits}"), nanos)
     } else {
-        String::new()
+        (String::new(), 0)
     };
     let line = format!(
         "{}\t{kind}\t{len}\t{secs}{frac}\n",
@@ -33,7 +36,7 @@ fn structured(u: &mut Unstructured<'_>) -> libfuzzer_sys::arbitrary::Result<()> 
     assert_eq!(m.len, len, "{line:?}");
     assert_eq!(
         m.mtime,
-        Some(UNIX_EPOCH + Duration::from_secs(secs)),
+        Some(UNIX_EPOCH + Duration::new(secs, nanos)),
         "{line:?}"
     );
     let want = match kind {
