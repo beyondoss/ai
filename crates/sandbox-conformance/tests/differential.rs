@@ -66,15 +66,19 @@ fn drive(backend: &str, default_cases: u64, seed: u64) {
         eprintln!("differential {backend}: skipped, docker is not available");
         return;
     }
-    // A deadline for the whole backend run. Aborting skips every destructor on purpose: the
-    // harness's watchdog (`sandbox_conformance::reaper`) sees the process gone and kills what is left.
+    // A deadline on this backend's own clock, started now. Tests in one process each get their own:
+    // the watchdog aborts only if this run is still going when the deadline passes, and it is released
+    // (its sender dropped) when `drive` returns or unwinds. Aborting skips every destructor on purpose:
+    // the harness's watchdog (`sandbox_conformance::reaper`) sees the process gone and kills what is left.
     let deadline =
         std::time::Duration::from_secs(env_u64("DIFFERENTIAL_DEADLINE_SECS").unwrap_or(1800));
+    let (_release_watchdog, released) = std::sync::mpsc::channel::<()>();
     let name = backend.to_string();
     std::thread::spawn(move || {
-        std::thread::sleep(deadline);
-        eprintln!("differential {name}: deadline of {deadline:?} passed, aborting");
-        std::process::abort();
+        if released.recv_timeout(deadline) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+            eprintln!("differential {name}: deadline of {deadline:?} passed, aborting");
+            std::process::abort();
+        }
     });
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

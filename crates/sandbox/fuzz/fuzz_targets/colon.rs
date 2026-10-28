@@ -6,7 +6,7 @@
 #![no_main]
 
 use beyond_sandbox::fs::shell::__fuzz::colon_records;
-use beyond_sandbox_fuzz::{name, text};
+use beyond_sandbox_fuzz::{clip_slack, name, text};
 use libfuzzer_sys::arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
 
@@ -58,13 +58,15 @@ fn structured(u: &mut Unstructured<'_>) -> libfuzzer_sys::arbitrary::Result<()> 
 fn raw(data: &[u8]) {
     let input = String::from_utf8_lossy(data);
     let hits = colon_records(&input);
+    // Each hit is a distinct line, so only the clip suffix on a truncated line can outweigh it.
     let total: usize = hits
         .iter()
         .map(|h| h.path.as_os_str().len() + h.text.len())
         .sum();
+    let allowed = input.len() + clip_slack(&hits);
     assert!(
-        total <= input.len(),
-        "returned {total} bytes from {} bytes",
+        total <= allowed,
+        "returned {total} bytes from {} bytes (allowed {allowed})",
         input.len()
     );
     assert!(hits.len() <= input.lines().count());

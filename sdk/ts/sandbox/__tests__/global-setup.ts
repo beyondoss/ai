@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -32,6 +32,49 @@ function freePort(): Promise<number> {
   });
 }
 
+/**
+ * The host's cargo build lock: `$BEYOND_BUILD_LOCK`, else `$HOME/.cache/beyond-locks/rust-build.lock`.
+ * Present only when its directory exists and `flock` is on PATH (CI has neither).
+ */
+function buildLock(): string | null {
+  const lock = process.env.BEYOND_BUILD_LOCK
+    ?? (process.env.HOME
+      ? join(process.env.HOME, ".cache/beyond-locks/rust-build.lock")
+      : undefined);
+  if (!lock || !existsSync(dirname(lock))) return null;
+  const onPath = (process.env.PATH ?? "")
+    .split(":")
+    .some((d) => d && existsSync(join(d, "flock")));
+  return onPath && !heldByAncestor(lock) ? lock : null;
+}
+
+/**
+ * Whether an ancestor already runs `flock ... LOCK` (`flock -o LOCK mise run test:ts`, say).
+ * Taking the lock again would wait on the process that holds it, forever.
+ */
+function heldByAncestor(lock: string): boolean {
+  let pid = process.pid;
+  while (pid > 1) {
+    let stat: string;
+    try {
+      stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    } catch {
+      return false;
+    }
+    // Field 4 of /proc/PID/stat is the parent pid; it follows the parenthesised command name.
+    const ppid = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
+    if (!(ppid > 0)) return false;
+    try {
+      const argv = readFileSync(`/proc/${ppid}/cmdline`, "utf8").split("\0");
+      if (argv[0]?.endsWith("flock") && argv.includes(lock)) return true;
+    } catch {
+      // The parent is gone or not readable; keep walking up.
+    }
+    pid = ppid;
+  }
+  return false;
+}
+
 /** `$EXECD_BIN`, else the repository's debug build, building it (`cargo build -p beyond-execd`) if absent. */
 function execdBinary(): string | null {
   if (process.env.EXECD_BIN) return process.env.EXECD_BIN;
@@ -41,7 +84,12 @@ function execdBinary(): string | null {
     "execd",
   );
   if (!existsSync(bin)) {
-    const r = spawnSync("cargo", ["build", "-p", "beyond-execd"], {
+    const lock = buildLock();
+    const build = ["cargo", "build", "-p", "beyond-execd"];
+    const [prog = "cargo", ...args] = lock
+      ? ["flock", "-o", lock, ...build]
+      : build;
+    const r = spawnSync(prog, args, {
       cwd: repo,
       stdio: "inherit",
     });
