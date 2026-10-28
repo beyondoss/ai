@@ -22,7 +22,7 @@ fn ops_by_check() -> std::collections::BTreeMap<String, String> {
             for st in sc["steps"].as_array().unwrap() {
                 out.insert(
                     format!("{sid}/{}", st["id"].as_str().unwrap()),
-                    st["op"].as_str().unwrap().to_string(),
+                    st["op"].as_str().unwrap_or("").to_string(),
                 );
             }
         }

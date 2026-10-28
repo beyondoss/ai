@@ -5,12 +5,14 @@
  *
  *   CONFORMANCE_URL       the exec endpoint's URL (required)
  *   CONFORMANCE_BEARER    the bearer token; absent or empty means none
+ *   CONFORMANCE_TOKEN_CMD a shell command whose output is the bearer; run again after a 401
  *   CONFORMANCE_CAPS      JSON overriding probes: find_printf, search_engine
  */
+import { execFile } from "node:child_process";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { download, extract, upload } from "./bulk.js";
+import { extract } from "./bulk.js";
 import { fromBase64, toBase64 } from "./bytes.js";
 import {
   BulkReject,
@@ -20,10 +22,8 @@ import {
 } from "./driver-bulk.js";
 import { SandboxError } from "./errors.js";
 import type { ErrorKind } from "./errors.js";
-import { Files } from "./files.js";
 import type { CapabilityOverrides } from "./files.js";
-import { HttpTransport } from "./http.js";
-import { Jobs } from "./jobs.js";
+import { Sandbox } from "./sandbox.js";
 import type { SearchEngine } from "./search.js";
 import type { JobInfo, Survivor } from "./transport.js";
 
@@ -57,6 +57,8 @@ export const OPS = [
 export interface DriverConfig {
   url: string;
   bearer?: string | undefined;
+  /** A shell command whose stdout is the bearer; it takes the place of `bearer`. */
+  tokenCmd?: string | undefined;
   caps?: CapabilityOverrides | undefined;
 }
 
@@ -147,7 +149,7 @@ export class Driver {
   private readonly cfg: DriverConfig;
   private connected:
     | Promise<
-      { files: Files; jobs: Jobs; transport: HttpTransport } | DriverError
+      Sandbox | DriverError
     >
     | undefined;
 
@@ -155,22 +157,18 @@ export class Driver {
     this.cfg = cfg;
   }
 
-  /** Connect and probe on the first request that needs it; a failure is every op's answer. */
+  /**
+   * Connect and probe on the first request that needs it; a failure is every op's answer. The
+   * driver goes through `Sandbox`, the surface a user holds, so its wiring is under test too.
+   */
   private connect() {
-    this.connected ??= (async () => {
-      const transport = new HttpTransport({
-        url: this.cfg.url,
-        token: this.cfg.bearer || undefined,
-      });
-      const files = new Files(transport, { overrides: this.cfg.caps });
-      const jobs = new Jobs(transport);
-      try {
-        await files.capabilities();
-      } catch (e) {
-        return toError(e);
-      }
-      return { files, jobs, transport };
-    })();
+    this.connected ??= Sandbox.connect({
+      url: this.cfg.url,
+      token: this.cfg.tokenCmd
+        ? tokenFromCommand(this.cfg.tokenCmd)
+        : this.cfg.bearer || undefined,
+      files: { overrides: this.cfg.caps },
+    }).catch(toError);
     return this.connected;
   }
 
@@ -206,12 +204,9 @@ export class Driver {
   private async dispatch(
     op: string,
     req: Json,
-    { files, jobs, transport }: {
-      files: Files;
-      jobs: Jobs;
-      transport: HttpTransport;
-    },
+    sb: Sandbox,
   ): Promise<Json> {
+    const { files, jobs } = sb;
     switch (op) {
       case "capabilities": {
         const c = await files.capabilities();
@@ -226,7 +221,7 @@ export class Driver {
           ? undefined
           : bytes(req, "stdin_b64");
         const cwd = optStr(req, "cwd");
-        const r = await transport.run(
+        const r = await sb.exec(
           str(req, "command"),
           strings(req, "args"),
           {
@@ -250,7 +245,7 @@ export class Driver {
         const err: Uint8Array[] = [];
         let end: Json | undefined;
         for await (
-          const f of transport.stream(command, args, {
+          const f of sb.stream(command, args, {
             ...(cwd !== undefined ? { cwd } : {}),
             ...(timeoutMs !== undefined ? { timeoutMs } : {}),
           })
@@ -409,7 +404,7 @@ export class Driver {
             ? src
             : strings(req, "sources").map((n) => join(src, n));
           return {
-            ...await upload(transport, sources, dest, { chunkBytes: chunk }),
+            ...await sb.upload(sources, dest, { chunkBytes: chunk }),
           };
         } finally {
           forceRemove(tmp);
@@ -419,7 +414,7 @@ export class Driver {
         const remote = str(req, "path");
         return withSandboxDir(
           req,
-          (local) => download(transport, remote, local),
+          (local) => sb.download(remote, local),
         );
       }
       case "extract": {
@@ -442,6 +437,21 @@ function cat(chunks: Uint8Array[]): Uint8Array {
     o += c.length;
   }
   return out;
+}
+
+/** A token function over a shell command: its stdout, trimmed. */
+function tokenFromCommand(cmd: string): () => Promise<string> {
+  return () =>
+    new Promise((resolve, reject) => {
+      execFile("sh", ["-c", cmd], (err, stdout) => {
+        if (err) return reject(err);
+        const token = stdout.trim();
+        if (token === "") {
+          return reject(new Error("the token command printed nothing"));
+        }
+        resolve(token);
+      });
+    });
 }
 
 function toError(e: unknown): DriverError {

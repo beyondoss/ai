@@ -1,0 +1,1008 @@
+{
+  "suite": "transport",
+  "version": 1,
+  "description": "Transport behaviour through an edge that misbehaves: a slow first byte, a hung endpoint, error statuses, a dropped connection, an answer cut short, an answer that is not the protocol.",
+  "scenarios": [
+    {
+      "id": "transport.slow-first-byte.waits-for-the-answer",
+      "description": "An endpoint that takes seconds to start answering (a sandbox waking up) is waited for. The client's deadline is the command's own timeout_ms plus a grace, not the timeout alone, and not a fixed few seconds: a command with a 2 s timeout answered after 5 s is a result, for the one-shot, the stream and a file helper.",
+      "requires": {
+        "backend": [
+          "local-plain",
+          "debian-runas"
+        ]
+      },
+      "connect": {
+        "edge": {}
+      },
+      "setup": [
+        {
+          "id": "warm",
+          "op": "capabilities"
+        }
+      ],
+      "steps": [
+        {
+          "id": "sleepy",
+          "edge": {
+            "set": {
+              "delay_ms": 5000
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "exec-with-a-short-timeout",
+          "op": "exec",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "timeout_ms": 2000,
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "hi\n"
+            }
+          }
+        },
+        {
+          "id": "stream-with-a-short-timeout",
+          "op": "exec_stream",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "timeout_ms": 2000,
+          "expect": {
+            "ok": {
+              "stdout_utf8": "hi\n",
+              "exit_code": 0
+            }
+          }
+        },
+        {
+          "id": "read",
+          "op": "read",
+          "path": "/etc/hostname",
+          "expect": {
+            "ok": {
+              "data_len": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "each-answered",
+          "edge": {
+            "reset": true
+          },
+          "expect": {
+            "ok": {
+              "requests": {
+                "$gte": 3
+              },
+              "faulted": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "transport.deadline.a-hung-endpoint-times-out",
+      "description": "An endpoint that takes the request and never answers ends in a timeout error once the command's timeout_ms plus the client's grace has passed; the client does not hang and does not report it as an unreachable endpoint.",
+      "requires": {
+        "backend": [
+          "local-plain"
+        ]
+      },
+      "connect": {
+        "edge": {}
+      },
+      "setup": [
+        {
+          "id": "warm",
+          "op": "capabilities"
+        }
+      ],
+      "steps": [
+        {
+          "id": "hang",
+          "edge": {
+            "set": {
+              "fault": {
+                "kind": "hang"
+              }
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "exec",
+          "op": "exec",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "timeout_ms": 1000,
+          "expect": {
+            "error": {
+              "kind": "timeout"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "transport.status.is-an-error-and-is-never-retried",
+      "description": "A non-2xx answer is endpoint (401 and 403: auth), carries the status in its detail, and the request is made once: a client with a fixed bearer, or a failing endpoint, does not retry. The next call, once the endpoint is well, works.",
+      "connect": {
+        "edge": {}
+      },
+      "setup": [
+        {
+          "id": "warm",
+          "op": "capabilities"
+        },
+        {
+          "id": "zero",
+          "edge": {
+            "reset": true
+          }
+        }
+      ],
+      "steps": [
+        {
+          "id": "500",
+          "edge": {
+            "set": {
+              "fault": {
+                "kind": "status",
+                "status": 500,
+                "body": "{\"error\":\"edge says 500\"}"
+              }
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "exec-500",
+          "op": "exec",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "error": {
+              "kind": "endpoint",
+              "detail": {
+                "$contains": "500"
+              }
+            }
+          }
+        },
+        {
+          "id": "exec-500-sent-once",
+          "edge": {
+            "reset": true
+          },
+          "expect": {
+            "ok": {
+              "requests": 1
+            }
+          }
+        },
+        {
+          "id": "502",
+          "edge": {
+            "set": {
+              "fault": {
+                "kind": "status",
+                "status": 502,
+                "body": "{\"error\":\"edge says 502\"}"
+              }
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "exec-502",
+          "op": "exec",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "error": {
+              "kind": "endpoint",
+              "detail": {
+                "$contains": "502"
+              }
+            }
+          }
+        },
+        {
+          "id": "exec-502-sent-once",
+          "edge": {
+            "reset": true
+          },
+          "expect": {
+            "ok": {
+              "requests": 1
+            }
+          }
+        },
+        {
+          "id": "503",
+          "edge": {
+            "set": {
+              "fault": {
+                "kind": "status",
+                "status": 503,
+                "body": "{\"error\":\"edge says 503\"}"
+              }
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "exec-503",
+          "op": "exec",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "error": {
+              "kind": "endpoint",
+              "detail": {
+                "$contains": "503"
+              }
+            }
+          }
+        },
+        {
+          "id": "exec-503-sent-once",
+          "edge": {
+            "reset": true
+          },
+          "expect": {
+            "ok": {
+              "requests": 1
+            }
+          }
+        },
+        {
+          "id": "404",
+          "edge": {
+            "set": {
+              "fault": {
+                "kind": "status",
+                "status": 404,
+                "body": "{\"error\":\"edge says 404\"}"
+              }
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "exec-404",
+          "op": "exec",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "error": {
+              "kind": "endpoint",
+              "detail": {
+                "$contains": "404"
+              }
+            }
+          }
+        },
+        {
+          "id": "exec-404-sent-once",
+          "edge": {
+            "reset": true
+          },
+          "expect": {
+            "ok": {
+              "requests": 1
+            }
+          }
+        },
+        {
+          "id": "429",
+          "edge": {
+            "set": {
+              "fault": {
+                "kind": "status",
+                "status": 429,
+                "body": "{\"error\":\"edge says 429\"}"
+              }
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "exec-429",
+          "op": "exec",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "error": {
+              "kind": "endpoint",
+              "detail": {
+                "$contains": "429"
+              }
+            }
+          }
+        },
+        {
+          "id": "exec-429-sent-once",
+          "edge": {
+            "reset": true
+          },
+          "expect": {
+            "ok": {
+              "requests": 1
+            }
+          }
+        },
+        {
+          "id": "403",
+          "edge": {
+            "set": {
+              "fault": {
+                "kind": "status",
+                "status": 403,
+                "body": "{\"error\":\"edge says 403\"}"
+              }
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "exec-403",
+          "op": "exec",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "error": {
+              "kind": "auth",
+              "detail": {
+                "$contains": "403"
+              }
+            }
+          }
+        },
+        {
+          "id": "exec-403-sent-once",
+          "edge": {
+            "reset": true
+          },
+          "expect": {
+            "ok": {
+              "requests": 1
+            }
+          }
+        },
+        {
+          "id": "401",
+          "edge": {
+            "set": {
+              "fault": {
+                "kind": "status",
+                "status": 401,
+                "body": "{\"error\":\"edge says 401\"}"
+              }
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "exec-401",
+          "op": "exec",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "error": {
+              "kind": "auth",
+              "detail": {
+                "$contains": "401"
+              }
+            }
+          }
+        },
+        {
+          "id": "exec-401-sent-once",
+          "edge": {
+            "reset": true
+          },
+          "expect": {
+            "ok": {
+              "requests": 1
+            }
+          }
+        },
+        {
+          "id": "unavailable",
+          "edge": {
+            "set": {
+              "fault": {
+                "kind": "status",
+                "status": 503,
+                "body": "{\"error\":\"waking\"}"
+              }
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "stream-503",
+          "op": "exec_stream",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "error": {
+              "kind": "endpoint"
+            }
+          }
+        },
+        {
+          "id": "stat-503",
+          "op": "stat",
+          "path": "${ROOT}",
+          "expect": {
+            "error": {
+              "kind": "endpoint"
+            }
+          }
+        },
+        {
+          "id": "job-list-503",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "error": {
+              "kind": "endpoint"
+            }
+          }
+        },
+        {
+          "id": "clear",
+          "edge": {
+            "set": {
+              "fault": null,
+              "delay_ms": 0
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "recovers",
+          "op": "exec",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "hi\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "transport.drop.connection-closed-without-an-answer",
+      "description": "An endpoint that closes the connection after taking the request is transport, for every kind of call; the request is not repeated (the command may have run), and the next call works.",
+      "connect": {
+        "edge": {}
+      },
+      "setup": [
+        {
+          "id": "warm",
+          "op": "capabilities"
+        },
+        {
+          "id": "zero",
+          "edge": {
+            "reset": true
+          }
+        }
+      ],
+      "steps": [
+        {
+          "id": "drop",
+          "edge": {
+            "set": {
+              "fault": {
+                "kind": "drop"
+              }
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "exec",
+          "op": "exec",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "error": {
+              "kind": "transport"
+            }
+          }
+        },
+        {
+          "id": "exec-sent-once",
+          "edge": {
+            "reset": true
+          },
+          "expect": {
+            "ok": {
+              "requests": 1
+            }
+          }
+        },
+        {
+          "id": "stream",
+          "op": "exec_stream",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "error": {
+              "kind": "transport"
+            }
+          }
+        },
+        {
+          "id": "stream-sent-once",
+          "edge": {
+            "reset": true
+          },
+          "expect": {
+            "ok": {
+              "requests": 1
+            }
+          }
+        },
+        {
+          "id": "stat",
+          "op": "stat",
+          "path": "${ROOT}",
+          "expect": {
+            "error": {
+              "kind": "transport"
+            }
+          }
+        },
+        {
+          "id": "job-list",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "error": {
+              "kind": "transport"
+            }
+          }
+        },
+        {
+          "id": "clear",
+          "edge": {
+            "set": {
+              "fault": null,
+              "delay_ms": 0
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "recovers",
+          "op": "exec",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "hi\n"
+            }
+          }
+        },
+        {
+          "id": "stream-recovers",
+          "op": "exec_stream",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "ok": {
+              "stdout_utf8": "hi\n",
+              "exit_code": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "transport.cut.answer-ends-early",
+      "description": "A connection that dies while the answer is on the way is transport, never a short success: the one-shot's body shorter than its length, and a stream that ends before its final frame (the output so far is not a result).",
+      "connect": {
+        "edge": {}
+      },
+      "setup": [
+        {
+          "id": "warm",
+          "op": "capabilities"
+        },
+        {
+          "id": "zero",
+          "edge": {
+            "reset": true
+          }
+        }
+      ],
+      "steps": [
+        {
+          "id": "cut-the-body",
+          "edge": {
+            "set": {
+              "fault": {
+                "kind": "cut",
+                "body_bytes": 10
+              }
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "exec-body",
+          "op": "exec",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "error": {
+              "kind": "transport"
+            }
+          }
+        },
+        {
+          "id": "cut-after-the-head",
+          "edge": {
+            "set": {
+              "fault": {
+                "kind": "cut",
+                "body_bytes": 0
+              }
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "exec-head",
+          "op": "exec",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "error": {
+              "kind": "transport"
+            }
+          }
+        },
+        {
+          "id": "read",
+          "op": "read",
+          "path": "/etc/hostname",
+          "expect": {
+            "error": {
+              "kind": "transport"
+            }
+          }
+        },
+        {
+          "id": "stream-head",
+          "op": "exec_stream",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "error": {
+              "kind": "transport"
+            }
+          }
+        },
+        {
+          "id": "cut-the-stream",
+          "edge": {
+            "set": {
+              "fault": {
+                "kind": "cut",
+                "body_bytes": 40
+              }
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "stream-body",
+          "op": "exec_stream",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo started; sleep 20"
+          ],
+          "expect": {
+            "error": {
+              "kind": "transport"
+            }
+          }
+        },
+        {
+          "id": "clear",
+          "edge": {
+            "set": {
+              "fault": null,
+              "delay_ms": 0
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "recovers",
+          "op": "exec",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "hi\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "transport.malformed.answer-that-is-not-the-protocol",
+      "description": "A 200 whose body is not the protocol is protocol: text where JSON should be, JSON of the wrong shape, a stream of lines that are not frames, and a stream request answered with a one-shot body. Nothing is guessed and nothing is a success.",
+      "connect": {
+        "edge": {}
+      },
+      "setup": [
+        {
+          "id": "warm",
+          "op": "capabilities"
+        },
+        {
+          "id": "zero",
+          "edge": {
+            "reset": true
+          }
+        }
+      ],
+      "steps": [
+        {
+          "id": "text",
+          "edge": {
+            "set": {
+              "fault": {
+                "kind": "garbage",
+                "body": "this is not json"
+              }
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "exec-text",
+          "op": "exec",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "error": {
+              "kind": "protocol"
+            }
+          }
+        },
+        {
+          "id": "wrong-shape",
+          "edge": {
+            "set": {
+              "fault": {
+                "kind": "garbage",
+                "body": "{\"nope\":1}"
+              }
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "exec-wrong-shape",
+          "op": "exec",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "error": {
+              "kind": "protocol"
+            }
+          }
+        },
+        {
+          "id": "stat-wrong-shape",
+          "op": "stat",
+          "path": "${ROOT}",
+          "expect": {
+            "error": {
+              "kind": "protocol"
+            }
+          }
+        },
+        {
+          "id": "bad-frames",
+          "edge": {
+            "set": {
+              "fault": {
+                "kind": "garbage",
+                "ndjson": true,
+                "body": "not a frame"
+              }
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "stream-bad-frames",
+          "op": "exec_stream",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "error": {
+              "kind": "protocol"
+            }
+          },
+          "xfail": {
+            "drivers": [
+              "agent-reference",
+              "beyond-sandbox-ts",
+              "sandbox-mcp"
+            ],
+            "reason": "an unparseable stream frame is reported as transport; Python reports protocol; the MCP driver's stream is a job, whose start answer it cannot read (io)"
+          }
+        },
+        {
+          "id": "not-a-stream",
+          "edge": {
+            "set": {
+              "fault": {
+                "kind": "garbage",
+                "body": "{\"exit_code\":0,\"stdout\":\"\",\"stderr\":\"\"}"
+              }
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "stream-answered-with-a-body",
+          "op": "exec_stream",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "error": {
+              "kind": "protocol"
+            }
+          },
+          "xfail": {
+            "drivers": [
+              "agent-reference",
+              "python",
+              "python-async",
+              "sandbox-mcp"
+            ],
+            "reason": "a stream request answered with a one-shot JSON body is a clean empty exit 0; TS reports protocol; the MCP driver's stream is a job, whose start answer it cannot read (io)"
+          }
+        },
+        {
+          "id": "clear",
+          "edge": {
+            "set": {
+              "fault": null,
+              "delay_ms": 0
+            }
+          },
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "recovers",
+          "op": "exec",
+          "command": "echo",
+          "args": [
+            "hi"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "hi\n"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

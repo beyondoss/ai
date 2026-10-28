@@ -27,6 +27,9 @@ pub const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose:
 pub struct Config {
     pub url: String,
     pub bearer: Option<String>,
+    /// `CONFORMANCE_TOKEN_CMD`: a shell command whose output is the bearer, run again after a `401`.
+    /// It takes the place of `bearer`.
+    pub token_cmd: Option<String>,
     /// `CONFORMANCE_CAPS`: overrides of what the probes found.
     pub caps: CapsOverride,
     /// Where a job lives when the jobs run over plain commands, standing in for `/tmp/beyond-jobs`.
@@ -212,8 +215,10 @@ impl Driver {
     /// The reference driver over the HTTP exec client: what the shared matrix runs.
     pub async fn connect(cfg: &Config) -> Self {
         let mut runner = HttpExecRunner::new(&cfg.url).expect("exec url");
-        if let Some(token) = &cfg.bearer {
-            runner = runner.with_header("Authorization", format!("Bearer {token}"));
+        if let Some(cmd) = &cfg.token_cmd {
+            runner = runner.bearer(beyond_sandbox::TokenSource::command(["sh", "-c", cmd]));
+        } else if let Some(token) = &cfg.bearer {
+            runner = runner.bearer(beyond_sandbox::TokenSource::fixed(token.clone()));
         }
         let runner = Arc::new(runner);
         Self::build(runner, cfg).await
