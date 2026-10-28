@@ -619,7 +619,7 @@ pub async fn download(
     let args = sh(DOWNLOAD_SCRIPT, &[remote_path]);
     let stderr = Mutex::new(Vec::<u8>::new());
 
-    let out: Result<ExecOutput, BulkError> = if exec.attaches().await {
+    let out: Result<ExecOutput, BulkError> = {
         let on_err = |b: &[u8]| {
             let mut s = stderr
                 .lock()
@@ -638,21 +638,6 @@ pub async fn download(
             },
             // A bad member closes the stream: dropping `run` kills the command.
             () = bad.notified() => Ok(ExecOutput::default()),
-        }
-    } else {
-        match exec.run("sh", &args, None, BULK_TIMEOUT).await {
-            Ok(r) => {
-                let r: ExecOutput = r.into();
-                feed(&r.stdout);
-                *stderr
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = r.stderr.clone();
-                Ok(ExecOutput {
-                    stdout: Vec::new(),
-                    ..r
-                })
-            }
-            Err(e) => Err(BulkError::Io(e)),
         }
     };
     // No more input: the thread sees the end of the archive (or its absence).

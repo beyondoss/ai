@@ -87,8 +87,8 @@ stream built only on `Exec` (spec: `sdk/conformance/FILES-OVER-EXEC.md` 5.8). Th
   the archive on stdin; a larger one is appended to a stage file beside the destination (each append checks the stage's
   size first, so a repeated or lost chunk fails) and extracted once. Memory is about two chunks. A failure removes the stage
   (`rm -f`) and, for a destination this call created, the script removes the destination.
-- **Download** streams: `run_attached` when the runner has it (stdout frames go down a bounded channel to a blocking thread that
-  reads them with `tar::Archive` and feeds `extract::Extractor`, with stderr kept to 64 KiB), else one `run` whose answer must fit the response cap. An unsafe
+- **Download** streams through `run_attached` (stdout frames go down a bounded channel to a blocking thread that
+  reads them with `tar::Archive` and feeds `extract::Extractor`, with stderr kept to 64 KiB). An unsafe
   member closes the stream. The extractor lstat-walks every parent, creates files `O_EXCL`, replaces (never follows) a link
   in the way, applies directory modes and mtimes last, and refuses names with `..`, absolute names, hard links to anything
   the archive did not write, and unsupported member types.

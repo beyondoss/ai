@@ -761,8 +761,7 @@ path is `No such file or directory (os error 2)` on stderr and exit 1.
 The archive's size is not known in advance, so the client **streams** it: the
 stream form of the exec call, stdout frames fed to the extractor as they arrive
 (never held whole), stderr kept up to `BULK_STDERR_BYTES`, `timeout_ms`
-`BULK_TIMEOUT_MS`. A transport that has no stream falls back to one `run`, whose
-answer must fit the one-shot response cap: over it the call fails `too_large`.
+`BULK_TIMEOUT_MS`.
 A client reports a failed command (a non-zero final status, a signal, a
 timeout) as `download PATH: LINE` classified by section 3.3 **before** it
 reports anything about the archive's content, but an unsafe member is reported
