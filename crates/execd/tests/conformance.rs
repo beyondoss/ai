@@ -36,7 +36,7 @@ async fn the_binary_passes_every_check_v11_to_v14() {
         .map(|c| (c.name, c.verdict))
         .collect();
     assert!(not_passed.is_empty(), "{not_passed:?}\n{}", report.render());
-    assert_eq!(report.checks.len(), 20 + conformance::notify::CHECKS.len());
+    assert_eq!(report.checks.len(), 21 + conformance::notify::CHECKS.len());
     // The whole run's log, at its most verbose, never held the bearer; and it is a real log, not an empty one.
     let log = execd.log();
     assert!(
@@ -74,6 +74,6 @@ async fn the_binary_passes_every_check_under_run_as() {
         .map(|c| (c.name, c.verdict))
         .collect();
     assert!(not_passed.is_empty(), "{not_passed:?}\n{}", report.render());
-    assert_eq!(report.checks.len(), 20 + conformance::notify::CHECKS.len());
+    assert_eq!(report.checks.len(), 21 + conformance::notify::CHECKS.len());
     assert!(!execd.log().contains("s3cret-run-as-bearer"));
 }

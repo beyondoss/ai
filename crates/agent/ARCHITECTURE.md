@@ -2522,11 +2522,11 @@ every operation is a request plus a `"job"` object (`start` held or kept, `attac
 and `gap` frames. `HttpExecRunner::sandbox_jobs` hands out `jobs_native::HttpJobs`, which sends each
 operation to `NativeJobs`: no probe, no fallback. These jobs are what a vendor adapter (E2B
 background commands, Daytona session commands — mapped in the spec) or the platform's own guest
-(`execd`) implements. `exec_mock` is `execd`, and `conformance::verify` adds five checks: a held
+(`execd`) implements. `exec_mock` is `execd`, and `conformance::verify` adds six checks: a held
 job's live output and end, a dropped hold killing an unkept job (measured on the far side), a kept
 job surviving its hold and reading back by `read` and `attach` from an offset (closing the attach
-must not kill), `kill` reaching a `SIGTERM`-ignoring job and removing it, and `list`/`wipe` staying
-in their scope. The decoding vectors are `crates/sandbox/tests/fixtures/exec/jobs.json`
+must not kill), `kill` reaching a `SIGTERM`-ignoring job and removing it, a job's `signal` (`read` and `list`) told from
+an exit of 128 + S, and `list`/`wipe` staying in their scope. The decoding vectors are `crates/sandbox/tests/fixtures/exec/jobs.json`
 (`crates/sandbox/tests/exec_jobs_vectors.rs`). A number that does not fit its field (a status or code beyond `i32`, a start beyond `u32`, a `128 + signal` past `i32::MAX`) is a protocol error in both decoders, never a panic or a truncated value.
 
 **Job-end notify.** A replica holds a stream to every kept

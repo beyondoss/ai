@@ -200,7 +200,8 @@
 //! `"job"` object naming `op` and `scope`. A **scope** is an opaque name for one session's jobs
 //! (the agent sends a digest of tenant and session); an operation MUST only ever see the jobs of
 //! its own scope. A job **id** is chosen by the agent (lowercase hex, at most 32 characters) and is
-//! unique within its scope. A **status** is a job's exit code, or 128 + N for signal N. Except for
+//! unique within its scope. A **status** is a job's exit code, or 128 + N for signal N; a job a signal
+//! killed also reports **`signal`**: N (see "States"). Except for
 //! `start`, the request's `command` is `true` with no arguments: harmless if run. Unknown fields are
 //! ignored. A refusal before answering (an unknown job for `attach`, a bad request) is a non-2xx
 //! status, as for a one-shot call.
@@ -209,11 +210,11 @@
 //! |---|---|---|
 //! | `start` | `id`, `hold`, `label` — the command is the request's `command`/`args`/`cwd` | `hold: true` (with `"stream": true`): a job stream; `hold: false`: `{"started": pgid}` |
 //! | `attach` | `id`, `offset` (with `"stream": true`) | a job stream from `offset` |
-//! | `read` | `id`, `offset`, `max` | `{"state", "code", "offset", "end", "data"}` |
+//! | `read` | `id`, `offset`, `max` | `{"state", "code", "signal"?, "offset", "end", "data"}` |
 //! | `keep` | `id`, `num`, `kind`, `seen` | `{}` |
 //! | `seen` | `id`, `offset` | `{}` |
 //! | `kill` | `ids`, `remove`, `grace_ms` | `{"survivors": [{"id", "pids": [..]}]}` |
-//! | `list` | | `{"jobs": [{"id", "state", "code", "kept", "num", "kind", "seen", "started", "ended", "label"}]}` |
+//! | `list` | | `{"jobs": [{"id", "state", "code", "signal"?, "kept", "num", "kind", "seen", "started", "ended", "label"}]}` |
 //! | `remove` | `ids` | `{}` |
 //! | `wipe` | `grace_ms` | `{"survivors": [{"pids": [..]}]}` |
 //!
@@ -224,6 +225,15 @@
 //!   processes of its group run on; `ended` — the group is empty, `code` the shell's status and
 //!   `ended` its epoch second; `lost` — the endpoint no longer knows how it ended; `gone` — no such
 //!   job. `started` is the job's epoch second, `label` what `start` sent.
+//! - **Signal.** `signal` is an integer member of a `read` answer and of a `list` entry, present
+//!   only in `exited` and `ended`, and only when a signal killed the shell: `signal` is that signal
+//!   (9 for SIGKILL) and `code` is `128 + signal`, the shell's convention. A shell that exited
+//!   reports `code` and no `signal` (the member is absent, never `null` or `0`), whatever the code:
+//!   an exit of 137 and a death by signal 9 differ only by `signal`. A job stopped by `kill` reports
+//!   the signal that killed it (15, or 9 when it outlived the grace period). It is the same fact a
+//!   stream's `{"signal": S}` final frame carries, and a job stream ends with that frame, in place of
+//!   `{"exit_code": 128 + S}`, for such a job. `shell_exit` stays a code (`128 + S`). The callback
+//!   body carries no status, so it has no `signal`.
 //! - **Held.** A job started with `hold: true` lives as long as its stream unless it is **kept**: if
 //!   the connection closes before the job's final frame and no `keep` arrived, the endpoint MUST kill
 //!   its whole group, exactly as "Disconnect kills". `keep` hands it to the endpoint for good
@@ -235,7 +245,7 @@
 //!   frames (`stdout`; `stderr` is accepted too) carry the combined output in order. `{"shell_exit":
 //!   N}` follows the output read up to the shell's exit when the shell exits leaving its group alive,
 //!   once per stream. The final frame — after all output up to the job's end — is the job's status:
-//!   `{"exit_code": N}` (or `{"signal": S}`), or `{"error"}`. An `attach` of an ended job streams
+//!   `{"exit_code": N}` (or `{"signal": S}` for a shell a signal killed), or `{"error"}`. An `attach` of an ended job streams
 //!   what is left from `offset` and the final frame at once.
 //! - **`read`** returns up to `max` bytes from `offset` (or from the oldest byte kept, reported in
 //!   `offset`, when that is later) as `data` in base64, and `end`, the offset of the next byte.
@@ -256,7 +266,8 @@
 //! [`conformance::verify`] checks it: a held job's
 //! live output and end, a dropped hold killing an unkept job (measured on the far side), a kept job
 //! surviving its hold and reading back from an offset (read and attach), `kill` reaching a job that
-//! ignores `SIGTERM`, and `list`/`wipe` staying inside their scope. `tests/fixtures/exec/jobs.json`
+//! ignores `SIGTERM`, a job's `signal` told from an exit of 128 + S, and `list`/`wipe` staying inside
+//! their scope. `tests/fixtures/exec/jobs.json`
 //! holds the decoding vectors.
 //!
 //! ## Sandbox job notify

@@ -130,6 +130,9 @@ impl JobStatus {
 pub struct JobInfo {
     pub id: JobId,
     pub status: JobStatus,
+    /// The signal that killed the shell, when `status` carries a code and a signal produced it
+    /// (the code is then `128 + signal`); `None` for a shell that exited, whatever its code.
+    pub signal: Option<i32>,
     /// Kept: the sandbox owns it. Its number and kind, once the agent recorded them.
     pub kept: bool,
     pub num: Option<u64>,
@@ -148,9 +151,37 @@ pub struct JobInfo {
 #[derive(Clone, Debug)]
 pub struct ReadChunk {
     pub status: JobStatus,
+    /// As [`JobInfo::signal`].
+    pub signal: Option<i32>,
     pub offset: u64,
     pub end: u64,
     pub data: Vec<u8>,
+}
+
+/// How a job ended, as a stream's final frame says it: the shell exited with a code, or a signal
+/// killed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobEnd {
+    Exit(i32),
+    Signal(i32),
+}
+
+impl JobEnd {
+    /// The shell's status: the exit code, or `128 + N` for signal `N`.
+    pub fn code(self) -> i32 {
+        match self {
+            Self::Exit(c) => c,
+            Self::Signal(n) => n.saturating_add(128),
+        }
+    }
+
+    /// The signal that killed the shell, if one did.
+    pub fn signal(self) -> Option<i32> {
+        match self {
+            Self::Exit(_) => None,
+            Self::Signal(n) => Some(n),
+        }
+    }
 }
 
 /// What a running job reports, as it happens.
@@ -190,7 +221,7 @@ impl std::fmt::Debug for JobNotify {
 /// kept job, removing a removed one and killing an ended one are no-ops.
 #[async_trait]
 pub trait SandboxJobs: Send + Sync {
-    /// Start a held job and stream it until it ends, returning its status. `events` hears
+    /// Start a held job and stream it until it ends, returning how it ended. `events` hears
     /// [`JobEvent::Started`] once it runs, before any of its output. Dropping the future drops the hold: a job not kept by
     /// then is killed by the sandbox; a kept one runs on. An error after `Started` means the stream
     /// broke, not that the job ended — a kept job is followed with [`Self::follow`] from there.
@@ -200,7 +231,7 @@ pub trait SandboxJobs: Send + Sync {
         id: &JobId,
         spec: &JobSpec,
         events: EventSink<'_>,
-    ) -> std::io::Result<i32>;
+    ) -> std::io::Result<JobEnd>;
 
     /// Start a job already kept (no hold), returning its process group once it runs.
     async fn start_kept(
@@ -210,14 +241,14 @@ pub trait SandboxJobs: Send + Sync {
         spec: &JobSpec,
     ) -> std::io::Result<u32>;
 
-    /// Follow a job's output from `from` until it ends, returning its status.
+    /// Follow a job's output from `from` until it ends, returning how it ended.
     async fn follow(
         &self,
         scope: &JobScope,
         id: &JobId,
         from: u64,
         events: EventSink<'_>,
-    ) -> std::io::Result<i32>;
+    ) -> std::io::Result<JobEnd>;
 
     /// Up to `max` bytes of output from `offset`, and the job's status.
     async fn read(

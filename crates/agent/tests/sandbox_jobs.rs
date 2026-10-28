@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use beyond_agent::exec_endpoint::HttpExecRunner;
 use beyond_agent::exec_endpoint::jobs::{
-    JobEvent, JobId, JobScope, JobSpec, JobStatus, SandboxJobs,
+    JobEnd, JobEvent, JobId, JobScope, JobSpec, JobStatus, SandboxJobs,
 };
 use beyond_agent::tools::exec::CommandRunner;
 use common::exec_mock::{ExecMock, MockOptions, group_alive, wait_group_gone};
@@ -140,7 +140,7 @@ async fn a_held_job_streams_its_output_live_and_reports_its_end() {
         )
         .await
         .unwrap();
-    assert_eq!(code, 3);
+    assert_eq!(code, JobEnd::Exit(3));
     {
         let h = heard.lock().unwrap();
         assert!(h.started.is_some());
@@ -245,7 +245,7 @@ async fn leftovers_are_reported_at_the_shells_exit_and_the_job_ends_with_them() 
         )
         .await
         .unwrap();
-    assert_eq!(code, 4, "the shell's own status");
+    assert_eq!(code, JobEnd::Exit(4), "the shell's own status");
     assert!(started.elapsed() >= Duration::from_millis(900));
     let h = heard.lock().unwrap();
     assert_eq!(h.shell_exit, Some(4));
@@ -267,7 +267,7 @@ async fn a_job_started_kept_is_followed_by_polling() {
     let heard = Mutex::new(Heard::default());
     let events = recorder(&heard);
     let code = sb.jobs.follow(&sb.scope, &id, 0, &events).await.unwrap();
-    assert_eq!(code, 5);
+    assert_eq!(code, JobEnd::Exit(5));
     assert_eq!(heard.lock().unwrap().output, b"a\nb\n");
 }
 
@@ -282,7 +282,7 @@ async fn polling_reports_leftovers_and_follows_them_to_the_end() {
     let heard = Mutex::new(Heard::default());
     let events = recorder(&heard);
     let code = sb.jobs.follow(&sb.scope, &id, 0, &events).await.unwrap();
-    assert_eq!(code, 0);
+    assert_eq!(code, JobEnd::Exit(0));
     let h = heard.lock().unwrap();
     assert_eq!(h.shell_exit, Some(0));
     assert_eq!(h.output, b"early\nlate\n");
@@ -449,7 +449,7 @@ async fn a_job_runs_in_its_directory_and_a_missing_one_is_refused() {
             .run_held(&sb.scope, &id, &spec, &events)
             .await
             .unwrap(),
-        0
+        JobEnd::Exit(0)
     );
     assert_eq!(heard.lock().unwrap().output, b"marker.txt\n");
     // A directory that does not exist is refused at the start, not run as a job that fails.

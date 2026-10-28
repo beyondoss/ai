@@ -455,6 +455,68 @@ async fn job_output_past_the_retention_is_a_gap() {
     server.shutdown().await;
 }
 
+/// A job a signal killed reports `signal` beside `code` 128 + S in `read`, `list` and its stream's
+/// final frame; one that exited 137 by itself reports none. A job stopped by `kill` reports the
+/// signal that stopped it.
+#[tokio::test]
+async fn a_job_reports_the_signal_that_killed_it_and_not_an_exit_of_the_same_number() {
+    let (server, _dir) = start(|_| {}).await;
+    let addr = server.local_addr();
+    for (id, script) in [("01", "kill -9 $$"), ("02", "exit 137"), ("03", "sleep 60")] {
+        let mut req = run("sh", &["-c", script]);
+        req["job"] = json!({ "op": "start", "scope": "s", "id": id, "hold": false, "label": "" });
+        post(addr, &[], &req).await;
+    }
+    let mut kill = run("true", &[]);
+    kill["job"] = json!({ "op": "kill", "scope": "s", "ids": ["03"], "grace_ms": 300 });
+    post(addr, &[], &kill).await;
+    let job = |op: &str, id: &str| {
+        let mut r = run("true", &[]);
+        r["job"] = json!({ "op": op, "scope": "s", "id": id, "offset": 0, "max": 10 });
+        r
+    };
+    let read = |id: &'static str| async move {
+        loop {
+            let v = post(addr, &[], &job("read", id)).await.json();
+            if v["state"] == "ended" {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let (killed, exited, stopped) = (read("01").await, read("02").await, read("03").await);
+    assert_eq!(
+        (&killed["code"], &killed["signal"]),
+        (&json!(137), &json!(9))
+    );
+    assert_eq!(exited["code"], 137);
+    assert!(exited.get("signal").is_none(), "{exited}");
+    assert_eq!(
+        (&stopped["code"], &stopped["signal"]),
+        (&json!(143), &json!(15))
+    );
+    let listed = post(addr, &[], &job("list", "")).await.json();
+    for j in listed["jobs"].as_array().unwrap() {
+        let want = match j["id"].as_str().unwrap() {
+            "01" => Some(json!(9)),
+            "02" => None,
+            _ => Some(json!(15)),
+        };
+        assert_eq!(j.get("signal"), want.as_ref(), "{j}");
+    }
+    // The stream's final frame is the same fact, as a one-shot stream's is.
+    for (id, last) in [
+        ("01", json!({ "signal": 9 })),
+        ("02", json!({ "exit_code": 137 })),
+    ] {
+        let mut r = job("attach", id);
+        r["stream"] = json!(true);
+        let frames = post(addr, &[], &r).await.frames();
+        assert_eq!(frames.last(), Some(&last), "{id}: {frames:?}");
+    }
+    server.shutdown().await;
+}
+
 /// Output past the cap is never answered as the result: a 422 that says the command ran, and its
 /// group is gone. Exactly at the cap is a 200 with everything.
 #[tokio::test]

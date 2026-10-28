@@ -318,6 +318,13 @@ fn state_of(s: JobStatus) -> (&'static str, Option<i32>) {
     }
 }
 
+/// `signal` in a job answer: present only for a job a signal killed (its `code` is then 128 + signal).
+fn put_signal(obj: &mut Value, signal: Option<i32>) {
+    if let Some(s) = signal {
+        obj["signal"] = json!(s);
+    }
+}
+
 /// Whether a failed write says its parent directory does not exist (FILES-OVER-EXEC.md section 5.3).
 fn is_missing_parent(detail: &str) -> bool {
     detail.contains(": parent directory ") && detail.contains(" does not exist")
@@ -539,7 +546,7 @@ impl SandboxMcp {
 
     #[tool(
         name = "job_list",
-        description = "List jobs: id, state (running, exited, ended, lost or gone), code (the exit status once ended), label, started and ended (epoch seconds). exited means the shell is done but processes it started still run."
+        description = "List jobs: id, state (running, exited, ended, lost or gone), code (the exit status once ended), signal (only when a signal killed the job's shell: code is then 128 + signal, and a job that merely exited 137 has no signal), label, started and ended (epoch seconds). exited means the shell is done but processes it started still run."
     )]
     async fn job_list(&self, Parameters(a): Parameters<JobListArgs>) -> ToolReply {
         Ok(reply(self.do_job_list(a).await))
@@ -547,7 +554,7 @@ impl SandboxMcp {
 
     #[tool(
         name = "job_output",
-        description = "Read a job's output (stdout and stderr together) from a byte offset. Returns state, code, content, encoding (utf8, or base64 when the bytes are not UTF-8), offset, next_offset and end (the output's length so far). At most max bytes (default 131072) per call: to follow a job, call again with offset = next_offset until state is ended."
+        description = "Read a job's output (stdout and stderr together) from a byte offset. Returns state, code, signal (only when a signal killed the job's shell: code is then 128 + signal; a job that exited on its own has none), content, encoding (utf8, or base64 when the bytes are not UTF-8), offset, next_offset and end (the output's length so far). At most max bytes (default 131072) per call: to follow a job, call again with offset = next_offset until state is ended."
     )]
     async fn job_output(&self, Parameters(a): Parameters<JobOutputArgs>) -> ToolReply {
         Ok(reply(self.do_job_output(a).await))
@@ -907,11 +914,13 @@ impl SandboxMcp {
             .iter()
             .map(|j| {
                 let (state, code) = state_of(j.status);
-                json!({
+                let mut entry = json!({
                     "id": j.id.as_str(), "state": state, "code": code, "kept": j.kept,
                     "num": j.num, "kind": j.kind, "seen": j.seen,
                     "started": j.started, "ended": j.ended, "label": j.label,
-                })
+                });
+                put_signal(&mut entry, j.signal);
+                entry
             })
             .collect();
         Ok(json!({ "scope": scope.name(), "jobs": jobs }))
@@ -929,7 +938,7 @@ impl SandboxMcp {
             .await?;
         let (state, code) = state_of(c.status);
         let (encoding, content, used) = payload(&c.data, a.encoding.as_deref())?;
-        Ok(json!({
+        let mut out = json!({
             "id": id.as_str(),
             "state": state,
             "code": code,
@@ -939,7 +948,9 @@ impl SandboxMcp {
             "bytes": used,
             "next_offset": c.offset + used as u64,
             "end": c.end,
-        }))
+        });
+        put_signal(&mut out, c.signal);
+        Ok(out)
     }
 
     async fn do_job_kill(&self, a: JobKillArgs) -> Out {

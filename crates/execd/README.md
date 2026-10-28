@@ -7,12 +7,12 @@ same schemas, same descriptions, so the prompt cache stays warm.
 A hand-written endpoint usually stops at one POST and one answer, where `bash` cannot stream, cannot tell a silent command
 from a hung one, and cannot kill. execd implements all of it, and a client sends what it needs without asking first:
 
-| what      | what the agent gets                                                                                                                                                                               |
-| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| one-shot  | one request, one answer, with stdin in and the command's bytes out: `stdin`, `stdout` and `stderr` are standard base64, so nothing is lost to text                                                |
-| streaming | the connection is the command's lifetime. `bash` shows progress, a silent command is handed back as a background job instead of blocking the turn, and closing the stream kills the process group |
-| jobs      | sandbox-native jobs: jobs live in the endpoint, survive the agent replica moving, and their output is readable from an offset                                                                     |
-| notify    | job-end notify: the sandbox calls back when a kept job ends                                                                                                                                       |
+| what      | what the agent gets                                                                                                                                                                                                                     |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| one-shot  | one request, one answer, with stdin in and the command's bytes out: `stdin`, `stdout` and `stderr` are standard base64, so nothing is lost to text                                                                                      |
+| streaming | the connection is the command's lifetime. `bash` shows progress, a silent command is handed back as a background job instead of blocking the turn, and closing the stream kills the process group                                       |
+| jobs      | sandbox-native jobs: jobs live in the endpoint, survive the agent replica moving, and their output is readable from an offset; a job a signal killed reports `signal` beside `code` 128 + S, so a kill by 9 differs from an exit of 137 |
+| notify    | job-end notify: the sandbox calls back when a kept job ends                                                                                                                                                                             |
 
 **Proven:** exec conformance 32/32 live on AWS Fargate and E2B; a 5 MB static binary; 2,372 KiB idle PSS and zero
 idle wakeups ([measurements](ARCHITECTURE.md#performance)); commands isolated from execd's token and memory under `EXECD_RUN_AS`;

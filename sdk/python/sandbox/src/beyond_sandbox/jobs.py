@@ -60,7 +60,7 @@ class Jobs:
         op = _jobs.follow(scope, job, offset)
         for item in drive_iter(op, self._t):
             if isinstance(item, tuple) and item and item[0] is _DONE:
-                yield JobEnd(item[1])
+                yield item[1]
             else:
                 yield item
 
@@ -69,7 +69,7 @@ class Jobs:
         result = Attached(-1)
         for ev in self.follow(scope, job, offset):
             if isinstance(ev, JobEnd):
-                result.exit_code = ev.code
+                result.exit_code, result.signal = ev.code, ev.signal
             else:
                 _collect(result, ev)
         return result
@@ -121,7 +121,7 @@ class AsyncJobs:
         try:
             async for item in events:
                 if isinstance(item, tuple) and item and item[0] is _DONE:
-                    yield JobEnd(item[1])
+                    yield item[1]
                 else:
                     yield item
         finally:
@@ -134,7 +134,8 @@ class AsyncJobs:
         async def collect(ev: Any) -> None:
             _collect(result, ev)
 
-        result.exit_code = await adrive_emit(op, self._t, collect)
+        end = await adrive_emit(op, self._t, collect)
+        result.exit_code, result.signal = end.code, end.signal
         return result
 
     async def kill(

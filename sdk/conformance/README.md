@@ -23,6 +23,7 @@ environment variables, and replays every scenario step as a JSON line. Each
 check is `pass`, `fail`, `skip` (planned, or the backend lacks something the
 scenario `requires`), `unsupported` (the driver lacks the op) or `known defect`.
 Skipped and unsupported checks are printed and never counted as passes.
+A scenario that needs a `requires.features` name (`frames`, `unbounded_stream`, `exit_signal`) is unsupported for a driver whose `hello` lacks it; jobs report a signal death as `signal` beside `code` 128 + S (`jobs.signal.*`).
 
 `relay` runs two clients on one sandbox, every ordered pair of drivers (DRIVER.md, Relay):
 one writes, starts or changes something and the other must see it exactly.

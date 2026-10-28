@@ -4,7 +4,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use base64::Engine as _;
-use beyond_sandbox::exec_endpoint::jobs::JobStatus;
+use beyond_sandbox::exec_endpoint::jobs::{JobEnd, JobStatus};
 use beyond_sandbox::exec_endpoint::jobs_native::{
     Event, JobFrame, decode_job_frame, parse_list, parse_read, parse_survivors,
 };
@@ -41,7 +41,7 @@ fn job_streams_decode_as_the_vectors_say() {
                 JobFrame::Event(Event::Gap(n)) => gap += n,
                 JobFrame::Event(Event::ShellExit(c)) => shell.push(c),
                 JobFrame::Heartbeat => {}
-                JobFrame::End(c) => end = Some(c),
+                JobFrame::End(e) => end = Some(e),
                 JobFrame::Error(e) => error = Some(e),
             }
         }
@@ -60,7 +60,16 @@ fn job_streams_decode_as_the_vectors_say() {
             .map(|c| c.as_i64().unwrap() as i32)
             .collect();
         assert_eq!(shell, shells, "{name}");
-        assert_eq!(end.map(i64::from), want["end"].as_i64(), "{name}");
+        assert_eq!(
+            end.map(|e: JobEnd| i64::from(e.code())),
+            want["end"].as_i64(),
+            "{name}"
+        );
+        assert_eq!(
+            end.and_then(JobEnd::signal).map(i64::from),
+            want["end_signal"].as_i64(),
+            "{name}"
+        );
         assert_eq!(error.as_deref(), want["error"].as_str(), "{name}");
     }
 }
@@ -75,6 +84,7 @@ fn job_answers_read_as_the_vectors_say() {
                 let (state, code) = state_name(r.status);
                 assert_eq!(state, want["state"].as_str().unwrap());
                 assert_eq!(code, want["code"].as_i64());
+                assert_eq!(r.signal, want["signal"].as_i64().map(|s| s as i32));
                 assert_eq!(r.offset, want["offset"].as_u64().unwrap());
                 assert_eq!(r.end, want["end"].as_u64().unwrap());
                 assert_eq!(r.data, b64(want["data_base64"].as_str().unwrap()));
@@ -88,6 +98,7 @@ fn job_answers_read_as_the_vectors_say() {
                     assert_eq!(j.id.as_str(), w["id"].as_str().unwrap());
                     assert_eq!(state, w["state"].as_str().unwrap());
                     assert_eq!(code, w["code"].as_i64());
+                    assert_eq!(j.signal, w["signal"].as_i64().map(|s| s as i32));
                     assert_eq!(j.kept, w["kept"].as_bool().unwrap());
                     assert_eq!(j.num, w["num"].as_u64());
                     assert_eq!(j.kind.as_deref(), w["kind"].as_str());

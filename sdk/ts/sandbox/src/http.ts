@@ -575,6 +575,17 @@ function jobState(
   }
 }
 
+/** A job answer's `signal`, kept only where the state has a code to go with it. */
+function jobSignal(
+  v: Record<string, unknown>,
+  st: { state: JobState },
+): { signal: number } | Record<string, never> {
+  return (st.state === "exited" || st.state === "ended")
+      && typeof v.signal === "number" && Number.isInteger(v.signal)
+    ? { signal: v.signal }
+    : {};
+}
+
 function badJob(what: string, v: unknown): ProtocolError {
   return new ProtocolError(
     `unreadable job ${what}: ${JSON.stringify(v)?.slice(0, 200)}`,
@@ -661,6 +672,7 @@ class HttpJobs implements JobOps {
         id: j.id,
         state: st.state,
         code: st.code,
+        ...jobSignal(j, st),
         kept: j.kept === true,
         num: typeof j.num === "number" ? j.num : null,
         kind: typeof j.kind === "string" ? j.kind : null,
@@ -685,7 +697,13 @@ class HttpJobs implements JobOps {
     const st = jobState(v.state, v.code);
     const data = fromBase64(typeof v.data === "string" ? v.data : "");
     if (!st || !data) throw badJob("read", v);
-    return { ...st, offset: count(v.offset), end: count(v.end), data };
+    return {
+      ...st,
+      ...jobSignal(v, st),
+      offset: count(v.offset),
+      end: count(v.end),
+      data,
+    };
   }
 
   async *attach(
@@ -705,7 +723,7 @@ class HttpJobs implements JobOps {
         const f = decodeJobFrame(line);
         if (f === "heartbeat") continue;
         yield f;
-        if (f.type === "exit") return;
+        if (f.type === "exit" || f.type === "signal") return;
       }
       throw new TransportError(
         "job stream: the stream ended before the job's final frame",
@@ -790,7 +808,7 @@ export function decodeJobFrame(line: Uint8Array): JobFrame | "heartbeat" {
     return { type: "exit", code: v.exit_code };
   }
   if (typeof v.signal === "number") {
-    return { type: "exit", code: 128 + v.signal };
+    return { type: "signal", signal: v.signal };
   }
   if (v.timed_out === true) {
     throw new TransportError("job stream: the endpoint timed the job out");

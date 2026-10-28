@@ -19,8 +19,8 @@ Paste that into `.mcp.json` (Claude Code), `claude_desktop_config.json`, or any 
 `cargo install --path crates/sandbox-mcp`.
 
 It passes the shared conformance matrix (`mise run test:clients`) with 0 failures on every backend, through a real MCP
-session, with 4 scenarios (4 checks) reported `unsupported`: `exec_stream` runs as `job_start` plus `job_output`, and `extract` runs the
-real `download` tool against a private `execd` that serves the archive.
+session, with 3 scenarios reported `unsupported` (those that need frames, or a stream beyond 8 MiB). `exec_stream` runs as `job_start` plus
+`job_output` and reports a signal death as `signal`; `extract` runs the real `download` tool against a private `execd` that serves the archive.
 
 ## Tools
 
@@ -37,7 +37,7 @@ real `download` tool against a private `execd` that serves the archive.
 | `upload`     | copy a directory or file of this machine into a sandbox directory as tar (needs `SANDBOX_LOCAL_ROOT`)                                                                                                                                                                                      |
 | `download`   | copy a sandbox directory or file to a directory of this machine, never writing through a link (same)                                                                                                                                                                                       |
 | `job_start`  | start a shell command line that outlives the call; the sandbox keeps it and its output                                                                                                                                                                                                     |
-| `job_list`   | jobs and their state: `running`, `exited`, `ended`, `lost`                                                                                                                                                                                                                                 |
+| `job_list`   | jobs and their state: `running`, `exited`, `ended`, `lost`; `code`, and `signal` when a signal killed the job                                                                                                                                                                              |
 | `job_output` | a job's output from an offset; follow it by passing back `next_offset`; `encoding` as for `read_file`                                                                                                                                                                                      |
 | `job_kill`   | SIGTERM, a grace, SIGKILL; `remove` also deletes the job                                                                                                                                                                                                                                   |
 
@@ -76,9 +76,9 @@ that is not a loopback name.
 
 `exec` returns the whole output at once: there is no streaming tool, because an MCP tool result is not streamed. Use
 `job_start` and `job_output` for anything long or noisy. A job keeps the last 8 MiB of its output, so a command that writes more than that
-faster than it is read loses the head. A job's status is the shell's, so a command killed by signal 9 reads as an exit of
-137: `job_output` and `job_list` have no separate signal. The conformance matrix reports the scenarios that depend on frames,
-on a stream longer than 8 MiB, or on telling those apart as `unsupported` for this driver.
+faster than it is read loses the head. A job's `code` is the shell's, 128 + N for a command killed by signal N; `job_output` and
+`job_list` also return `signal` (N) for such a job, and omit it for one that exited, so a kill by signal 9 and an exit of 137 differ.
+The conformance matrix reports the scenarios that depend on frames or on a stream longer than 8 MiB as `unsupported` for this driver.
 
 To write without losing a concurrent change, pass `write_file` the `mtime` that `stat` returned, as `if_unchanged_since`
 (fractional seconds, exactly as `stat` gave it): a file changed in the meantime, even within the same second, or removed,

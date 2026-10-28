@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 
 use super::HttpExecRunner;
 use super::jobs::{
-    EventSink, JobEvent, JobId, JobInfo, JobNotify, JobScope, JobSpec, JobStatus, ReadChunk,
-    SandboxJobs,
+    EventSink, JobEnd, JobEvent, JobId, JobInfo, JobNotify, JobScope, JobSpec, JobStatus,
+    ReadChunk, SandboxJobs,
 };
 use super::stream::{FRAME_SILENCE_LIMIT, FrameReader};
 
@@ -58,7 +58,7 @@ impl SandboxJobs for HttpJobs {
         id: &JobId,
         spec: &JobSpec,
         events: EventSink<'_>,
-    ) -> std::io::Result<i32> {
+    ) -> std::io::Result<JobEnd> {
         dispatch!(self, run_held(scope, id, spec, events))
     }
 
@@ -77,7 +77,7 @@ impl SandboxJobs for HttpJobs {
         id: &JobId,
         from: u64,
         events: EventSink<'_>,
-    ) -> std::io::Result<i32> {
+    ) -> std::io::Result<JobEnd> {
         dispatch!(self, follow(scope, id, from, events))
     }
 
@@ -188,7 +188,7 @@ impl<'a> NativeJobs<'a> {
         cwd: Option<&str>,
         job: Value,
         events: EventSink<'_>,
-    ) -> std::io::Result<i32> {
+    ) -> std::io::Result<JobEnd> {
         let resp = self
             .runner
             .send_job(
@@ -219,9 +219,9 @@ impl<'a> NativeJobs<'a> {
                 JobFrame::Event(Event::Gap(n)) => events(JobEvent::Gap(n)),
                 JobFrame::Event(Event::ShellExit(c)) => events(JobEvent::ShellExit(c)),
                 JobFrame::Heartbeat => {}
-                JobFrame::End(code) => {
+                JobFrame::End(end) => {
                     reader.finish().await;
-                    return Ok(code);
+                    return Ok(end);
                 }
                 JobFrame::Error(e) => return Err(broken(e)),
             }
@@ -237,7 +237,7 @@ impl SandboxJobs for NativeJobs<'_> {
         id: &JobId,
         spec: &JobSpec,
         events: EventSink<'_>,
-    ) -> std::io::Result<i32> {
+    ) -> std::io::Result<JobEnd> {
         let job = Self::op(
             "start",
             scope,
@@ -293,7 +293,7 @@ impl SandboxJobs for NativeJobs<'_> {
         id: &JobId,
         from: u64,
         events: EventSink<'_>,
-    ) -> std::io::Result<i32> {
+    ) -> std::io::Result<JobEnd> {
         let job = Self::op(
             "attach",
             scope,
@@ -422,8 +422,8 @@ impl SandboxJobs for NativeJobs<'_> {
 pub enum JobFrame {
     Event(Event),
     Heartbeat,
-    /// Final: the job ended with this status (128 + N for signal N).
-    End(i32),
+    /// Final: the job ended, with an exit code or by a signal.
+    End(JobEnd),
     /// Final: the endpoint failed.
     Error(String),
 }
@@ -484,14 +484,14 @@ pub fn decode_job_frame(line: &[u8]) -> Result<JobFrame, String> {
     } else if let Some(c) = w.shell_exit {
         JobFrame::Event(Event::ShellExit(wire_i32("shell_exit", c)?))
     } else if let Some(c) = w.exit_code {
-        JobFrame::End(wire_i32("exit_code", c)?)
+        JobFrame::End(JobEnd::Exit(wire_i32("exit_code", c)?))
     } else if let Some(s) = w.signal {
         let s = wire_i32("signal", s)?;
-        JobFrame::End(
-            128i32
-                .checked_add(s)
-                .ok_or_else(|| wire_out_of_range("signal", s))?,
-        )
+        // The status `128 + s` must fit too: a signal past it is a protocol error.
+        128i32
+            .checked_add(s)
+            .ok_or_else(|| wire_out_of_range("signal", s))?;
+        JobFrame::End(JobEnd::Signal(s))
     } else if w.timed_out {
         JobFrame::Error("the endpoint timed the job out".into())
     } else {
@@ -534,11 +534,30 @@ fn code_field(v: &Value) -> std::io::Result<Option<i32>> {
     }
 }
 
+/// The `signal` of a job answer: present only for a job whose state has a code (`exited`, `ended`).
+/// Absent or null is `None`; an integer that does not fit an `i32` is a protocol error.
+fn signal_field(v: &Value, status: JobStatus) -> std::io::Result<Option<i32>> {
+    match v.get("signal") {
+        None | Some(Value::Null) => Ok(None),
+        Some(s) => {
+            let n = s
+                .as_i64()
+                .and_then(|n| i32::try_from(n).ok())
+                .ok_or_else(|| {
+                    std::io::Error::other(format!(
+                        "unreadable job answer: `signal` is not an i32: {s}"
+                    ))
+                })?;
+            Ok(matches!(status, JobStatus::ShellExited(_) | JobStatus::Ended(_)).then_some(n))
+        }
+    }
+}
+
 fn bad(what: &str, v: &Value) -> std::io::Error {
     std::io::Error::other(format!("unreadable job {what}: {v}"))
 }
 
-/// A `read` answer: `{"state", "code", "offset", "end", "data"}`.
+/// A `read` answer: `{"state", "code", "signal"?, "offset", "end", "data"}`.
 pub fn parse_read(v: &Value) -> std::io::Result<ReadChunk> {
     let code = code_field(v)?;
     let st = v
@@ -546,19 +565,21 @@ pub fn parse_read(v: &Value) -> std::io::Result<ReadChunk> {
         .and_then(Value::as_str)
         .and_then(|s| status(s, code))
         .ok_or_else(|| bad("read", v))?;
+    let signal = signal_field(v, st)?;
     let num = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
     let data = base64::engine::general_purpose::STANDARD
         .decode(v.get("data").and_then(Value::as_str).unwrap_or(""))
         .map_err(|_| bad("read", v))?;
     Ok(ReadChunk {
         status: st,
+        signal,
         offset: num("offset"),
         end: num("end"),
         data,
     })
 }
 
-/// A `list` answer: `{"jobs": [{"id", "state", "code", "kept", "num", "kind", "seen", "started",
+/// A `list` answer: `{"jobs": [{"id", "state", "code", "signal"?, "kept", "num", "kind", "seen", "started",
 /// "ended", "label"}]}`. A job whose id is not one is skipped, never followed.
 pub fn parse_list(v: &Value) -> std::io::Result<Vec<JobInfo>> {
     let jobs = v
@@ -578,10 +599,12 @@ pub fn parse_list(v: &Value) -> std::io::Result<Vec<JobInfo>> {
         let Some(status) = status(state, code) else {
             continue;
         };
+        let signal = signal_field(j, status)?;
         let num = |k: &str| j.get(k).and_then(Value::as_u64);
         out.push(JobInfo {
             id,
             status,
+            signal,
             kept: j.get("kept").and_then(Value::as_bool).unwrap_or(false),
             num: num("num"),
             kind: j.get("kind").and_then(Value::as_str).map(str::to_string),
@@ -645,7 +668,10 @@ mod tests {
             "{err}"
         );
         assert!(decode_job_frame(br#"{"signal":4294967297}"#).is_err());
-        assert_eq!(decode_job_frame(br#"{"signal":9}"#), Ok(JobFrame::End(137)));
+        assert_eq!(
+            decode_job_frame(br#"{"signal":9}"#),
+            Ok(JobFrame::End(JobEnd::Signal(9)))
+        );
     }
 
     #[test]
@@ -658,7 +684,7 @@ mod tests {
         assert!(decode_job_frame(br#"{"shell_exit":4294967297}"#).is_err());
         assert_eq!(
             decode_job_frame(br#"{"exit_code":3}"#),
-            Ok(JobFrame::End(3))
+            Ok(JobFrame::End(JobEnd::Exit(3)))
         );
         assert!(decode_job_frame(br#"{"started":4294967297}"#).is_err());
     }

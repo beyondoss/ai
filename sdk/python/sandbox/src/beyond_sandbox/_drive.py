@@ -152,7 +152,7 @@ def drive_iter(op: Op[T], transport: Any) -> Iterator[Any]:
                         answer = None
                         for frame in stream:
                             if isinstance(frame, JobEnd):
-                                answer = frame.code
+                                answer = frame
                                 break
                             yield frame
                     finally:
@@ -216,7 +216,7 @@ async def adrive_emit(
                         answer = None
                         async for frame in stream:
                             if isinstance(frame, JobEnd):
-                                answer = frame.code
+                                answer = frame
                                 break
                             if emit is not None:
                                 await emit(frame)

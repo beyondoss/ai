@@ -27,6 +27,8 @@ export interface KillOptions {
 export interface JobOutput {
   /** The job's status: its exit code, or 128+N for signal N. */
   exitCode: number;
+  /** The signal that killed the shell; absent for a shell that exited, whatever its code. */
+  signal?: number;
   output: Uint8Array;
   /** Bytes of output dropped before they could be read. */
   gap: number;
@@ -118,6 +120,13 @@ export class Jobs {
       else if (f.type === "gap") gap += f.bytes;
       else if (f.type === "exit") {
         return { exitCode: f.code, output: concat(chunks), gap };
+      } else if (f.type === "signal") {
+        return {
+          exitCode: 128 + f.signal,
+          signal: f.signal,
+          output: concat(chunks),
+          gap,
+        };
       }
     }
     throw new ProtocolError(

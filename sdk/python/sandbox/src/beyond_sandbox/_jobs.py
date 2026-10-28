@@ -12,7 +12,7 @@ from typing import Sequence
 from . import _wire
 from ._drive import Call, Follow, Op
 from .errors import InvalidRequest, IoError
-from .models import JobInfo, JobRead, Survivor
+from .models import JobEnd, JobInfo, JobRead, Survivor
 
 #: The most one ``read`` returns by default: its base64 fits the smallest answer a runner keeps whole.
 READ_MAX = 128 * 1024
@@ -61,12 +61,12 @@ def read(scope: str, job: str, offset: int = 0, max_bytes: int = READ_MAX) -> Op
     return _wire.parse_read(v)
 
 
-def follow(scope: str, job: str, offset: int = 0) -> Op[int]:
-    """Emits the job's events; returns its status."""
+def follow(scope: str, job: str, offset: int = 0) -> Op[JobEnd]:
+    """Emits the job's events; returns how it ended."""
     check_scope(scope)
     check_id(job)
-    code = yield Follow(_wire.job_op("attach", scope, id=job, offset=offset))
-    return int(code)
+    end: JobEnd = yield Follow(_wire.job_op("attach", scope, id=job, offset=offset))
+    return end
 
 
 def list_jobs(scope: str) -> Op[list[JobInfo]]:
