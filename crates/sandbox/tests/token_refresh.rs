@@ -176,7 +176,10 @@ async fn a_failing_source_is_the_requests_error() {
             Err("vault is sealed".to_string())
         }));
     let err = run(&exec).await.unwrap_err().to_string();
-    assert!(err.contains("vault is sealed"), "{err}");
+    assert!(
+        err.contains("token source failed: vault is sealed"),
+        "{err}"
+    );
     assert!(
         ep.seen.lock().unwrap().is_empty(),
         "no request without a token"
@@ -190,13 +193,10 @@ async fn a_token_command_prints_the_token() {
         .unwrap()
         .bearer(TokenSource::command(["sh", "-c", "echo from-cmd"]));
     assert_eq!(run(&exec).await.unwrap(), "hi");
-    let failing = TokenSource::command(["sh", "-c", "exit 3"]);
+    let failing = TokenSource::command(["sh", "-c", "echo vault sealed >&2; exit 3"]);
     let exec = HttpExec::new(&ep.url).unwrap().bearer(failing);
-    assert!(
-        run(&exec)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("exited with")
-    );
+    let err = run(&exec).await.unwrap_err().to_string();
+    assert!(err.contains("token source failed"), "{err}");
+    assert!(err.contains("exited with"), "{err}");
+    assert!(err.contains("vault sealed"), "the command's stderr: {err}");
 }

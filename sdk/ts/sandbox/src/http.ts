@@ -181,10 +181,25 @@ export class HttpTransport implements Transport {
       typeof this.tokenSource === "function"
       && (refresh || this.tokenValue === undefined)
     ) {
-      this.tokenValue = await this.tokenSource();
+      this.tokenValue = await this.mint(this.tokenSource);
     }
     if (this.tokenValue) h.authorization = `Bearer ${this.tokenValue}`;
     return h;
+  }
+
+  /** A token from the source. One that throws, or gives no token, cannot authorise the call: `auth`. */
+  private async mint(source: () => Promise<string>): Promise<string> {
+    let token: unknown;
+    try {
+      token = await source();
+    } catch (e) {
+      if (e instanceof SandboxError) throw e;
+      throw new AuthError(`token source failed: ${errorText(e)}`, { cause: e });
+    }
+    if (typeof token !== "string" || token.trim() === "") {
+      throw new AuthError("token source failed: it gave no token");
+    }
+    return token;
   }
 
   /** POST one request. Resolves once the status is known to be a success. */
