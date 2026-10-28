@@ -33,6 +33,14 @@ pub const SINGLES: &[&str] = &["alpine", "debian-runas", "readonly", "tinydisk"]
 
 /// Expand group names and `*` globs to backend names, in a stable order, without duplicates.
 pub fn expand(requested: &[String]) -> Result<Vec<String>, String> {
+    // `e2b` costs money and needs the internet: only ever by its exact name, never in a group or a glob.
+    let (live, requested): (Vec<&String>, Vec<&String>) =
+        requested.iter().partition(|w| *w == "e2b");
+    if !live.is_empty() && crate::e2b::key().is_none() {
+        return Err("backend e2b needs E2B_API_KEY in the environment".into());
+    }
+    let requested: Vec<String> = requested.into_iter().cloned().collect();
+    let requested = &requested[..];
     let all: Vec<&str> = GROUPS
         .iter()
         .flat_map(|(_, m)| m.iter().copied())
@@ -60,6 +68,9 @@ pub fn expand(requested: &[String]) -> Result<Vec<String>, String> {
             }
         }
     }
+    if !live.is_empty() {
+        out.push("e2b".into());
+    }
     Ok(out)
 }
 
@@ -73,7 +84,7 @@ pub struct Started {
     /// The suites this backend runs; `None` is all of them.
     pub suites: Option<&'static [&'static str]>,
     pub vars: BTreeMap<String, String>,
-    _guard: Box<dyn Any + Send + Sync>,
+    pub(crate) _guard: Box<dyn Any + Send + Sync>,
 }
 
 /// Where the binaries come from.
@@ -144,6 +155,7 @@ pub async fn start(name: &str, bins: &Binaries) -> Result<Started, String> {
         // execd's own library behind a loopback listener, in this process: for the harness's own tests,
         // which need no binary. Not part of any group.
         "embedded" => embedded(name).await,
+        "e2b" => crate::e2b::start(name).await,
         "alpine" => {
             docker(
                 name,
