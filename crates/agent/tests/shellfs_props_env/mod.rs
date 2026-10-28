@@ -266,6 +266,38 @@ impl CommandRunner for NsRunner {
     ) -> std::io::Result<beyond_agent::tools::exec::ExecResult> {
         self.go(program, args, cwd, timeout, Some(stdin)).await
     }
+
+    async fn run_streaming(
+        &self,
+        _: &str,
+        _: &[String],
+        _: Option<&str>,
+        _: std::time::Duration,
+        _: beyond_agent::tools::exec::ChunkSink<'_>,
+    ) -> std::io::Result<beyond_agent::tools::exec::ExecResult> {
+        unreachable!("a test double that only runs to completion")
+    }
+
+    async fn run_streaming_tracked(
+        &self,
+        _: &str,
+        _: &[String],
+        _: Option<&str>,
+        _: &beyond_agent::tools::exec::JobHooks<'_>,
+    ) -> std::io::Result<beyond_agent::tools::exec::ExecResult> {
+        unreachable!("a test double that only runs to completion")
+    }
+
+    async fn run_attached(
+        &self,
+        _: &str,
+        _: &[String],
+        _: Option<&str>,
+        _: beyond_agent::tools::exec::ChunkSink<'_>,
+        _: beyond_agent::tools::exec::ChunkSink<'_>,
+    ) -> std::io::Result<beyond_agent::tools::exec::ExecResult> {
+        unreachable!("a test double that only runs to completion")
+    }
 }
 
 impl NsRunner {

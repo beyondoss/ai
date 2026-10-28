@@ -417,46 +417,6 @@ async fn run_in_background_must_be_a_boolean() {
     assert_eq!(out, "hi\n");
 }
 
-/// A runner that cannot track a job (a one-shot exec endpoint; here the default trait methods) is
-/// refused before anything runs.
-#[tokio::test]
-async fn a_runner_that_cannot_track_jobs_refuses_background_without_running_it() {
-    struct Untracked(std::sync::atomic::AtomicBool);
-    #[async_trait]
-    impl CommandRunner for Untracked {
-        async fn run(
-            &self,
-            _program: &str,
-            _args: &[String],
-            _cwd: Option<&str>,
-            _timeout: Duration,
-        ) -> std::io::Result<ExecResult> {
-            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
-            Ok(ExecResult::default())
-        }
-    }
-    let runner = Arc::new(Untracked(std::sync::atomic::AtomicBool::new(false)));
-    let err = Bash::with_runner(runner.clone())
-        .run(background("npm run dev"))
-        .await
-        .unwrap_err();
-    let ToolError::InvalidInput(msg) = err else {
-        panic!("a refusal the model must act on: {err:?}")
-    };
-    assert!(
-        msg.starts_with("`run_in_background` is unavailable here"),
-        "{msg}"
-    );
-    assert!(
-        msg.contains("the call then waits for the command to exit"),
-        "{msg}"
-    );
-    assert!(
-        !runner.0.load(std::sync::atomic::Ordering::Relaxed),
-        "nothing ran"
-    );
-}
-
 // `bash_job`'s `timeout_ms`: the same meaning as on `bash` (when this call returns; the job keeps
 // running), plus 0, a peek. The background A/B's waits on servers and watchers wanted the latest
 // output, not an exit, and each blocked for the whole silence window.

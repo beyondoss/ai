@@ -5,28 +5,24 @@ use std::time::Duration;
 
 use crate::exec::{ChunkSink, CommandRunner, ExecOutput, ExecResult};
 use crate::exec_endpoint::HttpExecRunner;
-use crate::exec_endpoint::jobs::{SandboxJobs, ShellJobs};
+use crate::exec_endpoint::jobs::SandboxJobs;
 use crate::fs::shell::ShellFs;
 use crate::token::TokenSource;
 
 /// How long [`Command`] lets a command run unless told otherwise.
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Jobs over any [`Exec`](crate::Exec): commands that outlive the call that started them, are listed,
-/// read, followed and killed by id. An HTTP endpoint runs them itself; any other exec (a template,
-/// this host) gets the baseline built from plain exec calls. Derefs to [`SandboxJobs`],
-/// whose methods are the operations.
+/// Jobs on the target an [`Exec`](crate::Exec) reaches: commands that outlive the call that started
+/// them, are listed, read, followed and killed by id. The exec endpoint owns them (the target's
+/// `execd`). Derefs to [`SandboxJobs`], whose methods are the operations.
 #[derive(Clone)]
 pub struct Jobs(Arc<dyn SandboxJobs>);
 
 impl Jobs {
-    /// Jobs on the target `exec` reaches.
-    pub fn over(exec: Arc<dyn CommandRunner>) -> Self {
-        Self(
-            exec.clone()
-                .sandbox_jobs()
-                .unwrap_or_else(|| Arc::new(ShellJobs::new(exec))),
-        )
+    /// Jobs on the target `exec` reaches, or `None` when it has none of its own (an exec that runs
+    /// commands on this host).
+    pub fn over(exec: Arc<dyn CommandRunner>) -> Option<Self> {
+        exec.sandbox_jobs().map(Self)
     }
 }
 
@@ -43,7 +39,7 @@ impl std::ops::Deref for Jobs {
 pub struct Sandbox {
     exec: Arc<dyn CommandRunner>,
     files: Arc<ShellFs>,
-    jobs: Jobs,
+    jobs: Option<Jobs>,
 }
 
 impl Sandbox {
@@ -59,7 +55,7 @@ impl Sandbox {
         Self::over(Arc::new(exec)).await
     }
 
-    /// A sandbox over any [`Exec`](crate::Exec): `ssh`, `docker exec`, a vendor SDK, a test double.
+    /// A sandbox over any [`Exec`](crate::Exec): a vendor SDK, a test double.
     pub async fn over(exec: Arc<dyn CommandRunner>) -> std::io::Result<Self> {
         let files = Arc::new(ShellFs::connect(exec.clone()).await?);
         let jobs = Jobs::over(exec.clone());
@@ -87,9 +83,15 @@ impl Sandbox {
         &self.files
     }
 
-    /// Long-running commands.
-    pub fn jobs(&self) -> &Jobs {
-        &self.jobs
+    /// Long-running commands, when the target owns jobs: [`std::io::ErrorKind::Unsupported`] for an
+    /// exec that has none.
+    pub fn jobs(&self) -> std::io::Result<&Jobs> {
+        self.jobs.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "this exec does not own jobs",
+            )
+        })
     }
 
     /// The exec this sandbox runs on, for anything the helpers do not cover.
@@ -156,10 +158,8 @@ impl Command<'_> {
         }
     }
 
-    /// Run to completion, handing `on_chunk` each chunk of output as it arrives. Over an exec that
-    /// streams (HTTP streaming, the template transports) that is live; over one that does not, `on_chunk`
-    /// is never called and the output is in the result. A command given [`stdin`](Self::stdin) is
-    /// not streamed.
+    /// Run to completion, handing `on_chunk` each chunk of output as it arrives. A command given
+    /// [`stdin`](Self::stdin) is not streamed.
     pub async fn stream(self, on_chunk: ChunkSink<'_>) -> std::io::Result<ExecResult> {
         if self.stdin.is_some() {
             return self.run_result().await;

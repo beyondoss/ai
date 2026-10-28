@@ -143,9 +143,6 @@ pub(crate) struct JobShared {
     kill: Mutex<Option<Kill>>,
     /// This job's key in [`LIVE_JOBS`].
     key: u64,
-    /// The runner reported a [`Kill`], which promises the output is live — see
-    /// `Bash::idle_window`.
-    pub live: AtomicBool,
     /// Where the command runs (no spill file when remote).
     pub remote: bool,
     /// Set when the sandbox runs it ([`crate::exec_endpoint::jobs`]): where to reach it.
@@ -179,8 +176,6 @@ pub(crate) struct JobOutput {
     /// reading it): the sandbox's offset of the next byte, for a sandbox job.
     pub offset: u64,
     pub last_output: Instant,
-    /// Whether any chunk came through the sink at all — see `Bash::finish_job`'s fallback.
-    pub streamed: bool,
 }
 
 impl JobShared {
@@ -190,12 +185,10 @@ impl JobShared {
                 acc: accumulator(!remote),
                 offset: 0,
                 last_output: Instant::now(),
-                streamed: false,
             }),
             notify: tokio::sync::Notify::new(),
             kill: Mutex::new(None),
             key: NEXT_JOB_KEY.fetch_add(1, Ordering::Relaxed),
-            live: AtomicBool::new(false),
             remote,
             sandbox: OnceLock::new(),
             released: AtomicBool::new(false),
@@ -253,7 +246,6 @@ impl JobShared {
                 .as_bytes(),
             );
             out.last_output = Instant::now();
-            out.streamed = true;
         }
         self.notify.notify_one();
     }
@@ -280,7 +272,6 @@ impl JobShared {
             out.offset += bytes.len() as u64;
             out.acc.append(bytes);
             out.last_output = Instant::now();
-            out.streamed = true;
         }
         self.notify.notify_one();
     }
@@ -296,10 +287,6 @@ impl JobShared {
         if !self.released() {
             lock(&LIVE_JOBS).push((self.key, kill));
         }
-        self.live.store(true, Ordering::Relaxed);
-        // The waiting call computed its idle deadline before the output was known to be live; wake
-        // it to recompute.
-        self.notify.notify_one();
     }
 
     /// Forget how to kill the command (it exited, or the caller is about to kill it), returning the

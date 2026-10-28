@@ -735,7 +735,6 @@ async fn assemble_run(
         exec_url,
         exec_header,
         exec_max_response_bytes,
-        exec_cmd,
         lifecycle_url,
         lifecycle_header,
         tools: tools_allow,
@@ -806,7 +805,6 @@ async fn assemble_run(
         )
         .await;
     let (exec_runner, lifecycle, fs_backend) = open_exec_backend(
-        exec_cmd,
         exec_header,
         exec_max_response_bytes,
         exec_url,
@@ -1761,7 +1759,6 @@ async fn connect_run_mcp(
 
 /// The remote exec runner (if any), the lifecycle sink and the filesystem backend that follows the runner.
 async fn open_exec_backend(
-    exec_cmd: Option<String>,
     exec_header: Vec<String>,
     exec_max_response_bytes: Option<u64>,
     exec_url: Option<String>,
@@ -1778,29 +1775,22 @@ async fn open_exec_backend(
     // Pointing at a remote endpoint swaps *one* thing: where the filesystem tools' I/O lands. The
     // tools, their names, descriptions and schemas are untouched, so the model cannot tell the
     // difference — see `tools::fs`.
-    let exec_runner: Option<std::sync::Arc<dyn tools::exec::CommandRunner>> =
-        match (&exec_url, &exec_cmd) {
-            (Some(url), _) => {
-                let mut runner = beyond_agent::exec_endpoint::HttpExecRunner::new(url.clone())
-                    .map_err(std::io::Error::other)?;
-                if let Some(max) = exec_max_response_bytes {
-                    runner =
-                        runner.with_max_response_bytes(usize::try_from(max).unwrap_or(usize::MAX));
-                }
-                for raw in &exec_header {
-                    let (name, value) =
-                        beyond_agent::exec_endpoint::HttpExecRunner::parse_header(raw)
-                            .map_err(std::io::Error::other)?;
-                    runner = runner.with_header(name, value);
-                }
-                Some(std::sync::Arc::new(runner))
+    let exec_runner: Option<std::sync::Arc<dyn tools::exec::CommandRunner>> = match &exec_url {
+        Some(url) => {
+            let mut runner = beyond_agent::exec_endpoint::HttpExecRunner::new(url.clone())
+                .map_err(std::io::Error::other)?;
+            if let Some(max) = exec_max_response_bytes {
+                runner = runner.with_max_response_bytes(usize::try_from(max).unwrap_or(usize::MAX));
             }
-            (None, Some(template)) => Some(std::sync::Arc::new(
-                beyond_agent::exec_endpoint::TemplateRunner::parse(template)
-                    .map_err(std::io::Error::other)?,
-            )),
-            (None, None) => None,
-        };
+            for raw in &exec_header {
+                let (name, value) = beyond_agent::exec_endpoint::HttpExecRunner::parse_header(raw)
+                    .map_err(std::io::Error::other)?;
+                runner = runner.with_header(name, value);
+            }
+            Some(std::sync::Arc::new(runner))
+        }
+        None => None,
+    };
     let lifecycle = beyond_agent::lifecycle::open(lifecycle_url.as_deref(), &lifecycle_header)
         .map_err(std::io::Error::other)?;
     let fs_backend: Option<std::sync::Arc<dyn tools::fs::FsBackend>> = match &exec_runner {

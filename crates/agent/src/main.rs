@@ -418,7 +418,7 @@ enum Command {
         web_timeout_ms: Option<u64>,
         /// Run the file tools on a remote exec endpoint (`POST {command, args, cwd}`) instead of
         /// this machine.
-        #[usage(long, env = "AI_AGENT_EXEC_URL", conflicts = "exec_cmd")]
+        #[usage(long, env = "AI_AGENT_EXEC_URL")]
         exec_url: Option<String>,
         /// A header for every exec request, `Name: value`. Repeatable.
         #[usage(long, env = "AI_AGENT_EXEC_HEADER")]
@@ -426,9 +426,6 @@ enum Command {
         /// Largest exec response accepted, in bytes. Default 16 MiB.
         #[usage(long, env = "AI_AGENT_EXEC_MAX_RESPONSE_BYTES")]
         exec_max_response_bytes: Option<u64>,
-        /// Run the file tools through a command template instead, e.g. `ssh host -- {}`.
-        #[usage(long, env = "AI_AGENT_EXEC_CMD", conflicts = "exec_url")]
-        exec_cmd: Option<String>,
         /// POST the run's lifecycle events (started, progress, finished) to this URL (`http(s)://`
         /// or `unix://`).
         #[usage(long, env = "AI_AGENT_LIFECYCLE_URL")]
@@ -792,7 +789,7 @@ enum Command {
         #[usage(long, env = "AI_AGENT_WEB_TIMEOUT_MS")]
         web_timeout_ms: Option<u64>,
         /// Default remote exec endpoint for every session's file tools (see `run --help`).
-        #[usage(long, env = "AI_AGENT_EXEC_URL", conflicts = "exec_cmd")]
+        #[usage(long, env = "AI_AGENT_EXEC_URL")]
         exec_url: Option<String>,
         /// A header for every exec request, `Name: value`. Repeatable.
         #[usage(long, env = "AI_AGENT_EXEC_HEADER")]
@@ -800,9 +797,6 @@ enum Command {
         /// Largest exec response accepted, in bytes. Default 16 MiB.
         #[usage(long, env = "AI_AGENT_EXEC_MAX_RESPONSE_BYTES")]
         exec_max_response_bytes: Option<u64>,
-        /// Run the file tools through a command template instead, e.g. `ssh host -- {}`.
-        #[usage(long, env = "AI_AGENT_EXEC_CMD", conflicts = "exec_url")]
-        exec_cmd: Option<String>,
         /// POST each prompt's lifecycle events (started, progress, finished) to this URL
         /// (`http(s)://` or `unix://`).
         #[usage(long, env = "AI_AGENT_LIFECYCLE_URL")]

@@ -68,7 +68,6 @@ async fn no_notify_setting_runs_anything_on_this_host() {
         .await;
         let runner = Arc::new(HttpExecRunner::new(&mock.url).unwrap());
         let jobs = runner.clone().sandbox_jobs().unwrap();
-        let _ = jobs.offers_notify().await;
         let r = runner
             .run(
                 "sh",

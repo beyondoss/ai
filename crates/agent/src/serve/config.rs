@@ -233,7 +233,6 @@ pub struct ServeConfig {
     /// always wins, because the cell is what the tools read.
     pub exec_url: Option<String>,
     pub exec_header: Vec<String>,
-    pub exec_cmd: Option<String>,
     /// `--exec-max-response-bytes`: the most any one HTTP exec response may be, for the default
     /// endpoint *and* every per-session `set_exec_endpoint` — the cap protects this process, which
     /// every tenant shares. [`crate::exec_endpoint::DEFAULT_MAX_RESPONSE_BYTES`] when unset.

@@ -13,7 +13,6 @@ impl SessionLoop {
         // with it. It takes effect on the very next tool call — the tools read the cell rather
         // than capturing a target — so no registry rebuild is involved and none can be missed.
         let url = cmd.get("url").and_then(Value::as_str);
-        let exec_cmd = cmd.get("command").and_then(Value::as_str);
         let headers: Vec<String> = cmd
             .get("headers")
             .and_then(Value::as_array)
@@ -23,21 +22,17 @@ impl SessionLoop {
                     .collect()
             })
             .unwrap_or_default();
-        let outcome = match (url, exec_cmd) {
-            (Some(_), Some(_)) => Err("give `url` or `command`, not both".to_string()),
-            (Some(u), None) => crate::exec_endpoint::ExecTarget::http(
+        let outcome = match url {
+            Some(u) => crate::exec_endpoint::ExecTarget::http(
                 u,
                 &headers,
                 self.cfg.exec_max_response_bytes,
             )
             .await
             .map(Some),
-            (None, Some(c)) => crate::exec_endpoint::ExecTarget::template(c)
-                .await
-                .map(Some),
-            // Neither: detach, back to this host. Explicit rather than an error so a client
+            // No url: detach, back to this host. Explicit rather than an error so a client
             // can hand a session back to local execution without tearing it down.
-            (None, None) => Ok(None),
+            None => Ok(None),
         };
         match outcome {
             Ok(target) => {
@@ -51,7 +46,6 @@ impl SessionLoop {
                 self.persistence.set_exec_endpoint(if target.is_some() {
                     Some(json!({
                         "url": url,
-                        "command": exec_cmd,
                         "headers": headers,
                     }))
                 } else {
@@ -62,11 +56,11 @@ impl SessionLoop {
                     id,
                     "set_exec_endpoint",
                     true,
-                    Some(
-                        json!({ "attached": url.is_some() || exec_cmd.is_some(), "engine": engine })
-                    ),
-                    None
-                )) { return false; }
+                    Some(json!({ "attached": url.is_some(), "engine": engine })),
+                    None,
+                )) {
+                    return false;
+                }
             }
             Err(e) => {
                 if !self.emit(response(id, "set_exec_endpoint", false, None, Some(&e))) {

@@ -1,7 +1,7 @@
 //! exec notify end to end, ends no callback delivers: the one accepted difference. After a job is
 //! let go of, an end whose callback is lost is noticed at the session's next real use of its
 //! sandbox or its next open, and reported once; a sandbox that dies is noticed the same way, and
-//! then takes today's error path. Native and baseline endpoints only: with no egress nothing is
+//! then takes today's error path. Native endpoints only: with no egress nothing is
 //! let go of, so nothing can be lost.
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -26,7 +26,7 @@ const USE_SPACING: Duration =
     Duration::from_millis(beyond_agent::tools::job_notify::kernel::USE_SPACING);
 
 /// A fleet whose path loses every callback after the job's proof: the native endpoint's own
-/// sender drops them, and the baseline's are refused at the front (the supervisor stops).
+/// sender drops them.
 async fn losing(mode: Mode, idle_timeout: Option<u64>) -> E2e {
     let f = E2e::start(Setup {
         idle_timeout,

@@ -269,13 +269,9 @@ In another, run `bash` through it with a `serve` command (the dummy key only sat
 # ... "result":"/tmp/ws\n" ...
 ```
 
-For a target with no HTTP surface, `--exec-cmd` takes an argv template; `{}`
-becomes separate argv entries, never a shell string:
-
-```sh
---exec-cmd 'ssh build-host -- {}'
---exec-cmd 'docker exec -i my-container {}'
-```
+A target with no public HTTP surface still works: run `execd` in it and forward its port
+(`docker run -p 127.0.0.1:8081:8080 …`, or `ssh -L 8081:127.0.0.1:8080 build-host`), then point
+`--exec-url` at the forwarded port.
 
 Install `ripgrep` on the target: without it `grep` falls back to POSIX `grep`,
 which ignores `.gitignore` and skips files holding non-UTF-8 bytes. Paths are

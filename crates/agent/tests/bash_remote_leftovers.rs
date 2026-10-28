@@ -1,13 +1,12 @@
 //! What a remote command leaves running (`nohup server &`, `cmd &`) becomes a job, exactly as a local
 //! shell's leftovers do: adopted the moment the shell exits, waited for, and stopped with the session.
 //! Before, the far side's leftovers were never tracked: a streaming endpoint ended the stream with the
-//! shell, a template transport's wrapper stopped watching after `wait $!`, and `nohup server &` held
+//! shell, and `nohup server &` held
 //! its port until the sandbox died.
 //!
-//! Both transports, each on this host: the conforming streaming mock (`{"shell_exit": N}`, then the stream
-//! stays open until the group is empty), and the template stand-in for `docker exec`, whose far
-//! command lives in its own session, out of reach of any local kill. The live suite
-//! (`exec_endpoint_live`) repeats this against a real container.
+//! Against the conforming streaming mock on this host (`{"shell_exit": N}`, then the stream stays
+//! open until the group is empty). The live suite (`exec_endpoint_live`) repeats this against a real
+//! container.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use crate::common;
@@ -15,26 +14,11 @@ use crate::common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use beyond_agent::exec_endpoint::{HttpExecRunner, TemplateRunner};
+use beyond_agent::exec_endpoint::HttpExecRunner;
 use beyond_agent::tools::exec::CommandRunner;
 use common::exec_mock::{ExecMock, MockOptions, StreamEnd};
 use common::remote_bash::{call, job_number, remote_bash};
 use serde_json::json;
-
-/// `sh -c 'setsid "$@" & wait $!' sh {}`: a transport whose far side lives in its own session, as
-/// `docker exec`'s does (see `exec_template_kill.rs`).
-fn detaching_transport() -> Arc<dyn CommandRunner> {
-    Arc::new(
-        TemplateRunner::new(vec![
-            "sh".into(),
-            "-c".into(),
-            r#"setsid "$@" & wait $!"#.into(),
-            "sh".into(),
-            "{}".into(),
-        ])
-        .unwrap(),
-    )
-}
 
 /// Live (non-zombie) processes whose command line is exactly `cmd`.
 fn running(cmd: &str) -> Vec<u32> {
@@ -134,30 +118,16 @@ async fn a_v12_leftover_is_adopted_and_stopped_with_the_session() {
     );
 }
 
-#[tokio::test]
-async fn a_template_leftover_is_adopted_and_stopped_with_the_session() {
-    adopted_then_stopped(detaching_transport(), "sleep 63.12").await;
-}
-
 /// A leftover that keeps the shell's stdout open used to look like a silent command: the call
 /// yielded on the idle window, as a *yielded* job the end of the turn kills. It is adopted at the
 /// shell's exit, like a local one.
 #[tokio::test]
 async fn a_leftover_holding_stdout_is_adopted_not_yielded() {
-    for (runner, cmd) in [
-        (detaching_transport(), "sleep 63.13"),
-        (
-            Arc::new(
-                HttpExecRunner::new(
-                    &ExecMock::start(tempfile::tempdir().unwrap().path())
-                        .await
-                        .url,
-                )
-                .unwrap(),
-            ) as Arc<dyn CommandRunner>,
-            "sleep 63.14",
-        ),
-    ] {
+    let dir = tempfile::tempdir().unwrap();
+    let mock = ExecMock::start(dir.path()).await;
+    let runner = Arc::new(HttpExecRunner::new(&mock.url).unwrap());
+    let cmd = "sleep 63.14";
+    {
         let _reap = Reap(cmd);
         let (bash, _jobs) = remote_bash(runner, Duration::from_secs(60));
         let out = tokio::time::timeout(
@@ -185,10 +155,8 @@ async fn a_leftover_holding_stdout_is_adopted_not_yielded() {
 async fn a_leftover_that_exits_ends_its_job() {
     let dir = tempfile::tempdir().unwrap();
     let mock = ExecMock::start(dir.path()).await;
-    for runner in [
-        detaching_transport(),
-        Arc::new(HttpExecRunner::new(&mock.url).unwrap()) as Arc<dyn CommandRunner>,
-    ] {
+    let runner = Arc::new(HttpExecRunner::new(&mock.url).unwrap());
+    {
         let (bash, jobs) = remote_bash(runner, Duration::from_secs(60));
         let out = call(
             bash.as_ref(),

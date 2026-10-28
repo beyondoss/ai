@@ -1,7 +1,7 @@
 //! Killing a local process group, and keeping the kill from being lost.
 //!
 //! Everything that spawns a local child as its own process-group leader (the host command runner,
-//! an MCP stdio server, [`TemplateRunner`](crate::exec_endpoint::TemplateRunner)'s local transport)
+//! an MCP stdio server)
 //! needs the same few things: an identity for the group that survives pid recycling ([`GroupId`]), a
 //! guard that kills the group when the owning future is dropped ([`GroupKillGuard`]), and a way to
 //! run a blocking kill on its own thread that the exit path can wait for

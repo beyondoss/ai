@@ -192,7 +192,7 @@ async fn setup_exec(
     //      process restart, exactly as `reset_exec_endpoint!` keeps it across a session switch —
     //      which is what makes a cold reconnect at the same `?session_id=` behave like a warm one
     //      instead of quietly moving that session's work onto the server.
-    //   3. **`--exec-url`/`--exec-cmd`**, the process-wide default. "A starting point, not a floor":
+    //   3. **`--exec-url`**, the process-wide default. "A starting point, not a floor":
     //      it is what a session with no record of its own gets, and it never overrides one that has.
     //   4. nothing — this host.
     //
@@ -251,23 +251,20 @@ async fn setup_exec(
                 // Fall through to the process-wide default rather than to this host: a flag the
                 // operator passed is a better guess than nothing, and a session whose sandbox has
                 // genuinely vanished can still be re-pointed with `set_exec_endpoint`.
-                None => match (&cfg.exec_url, &cfg.exec_cmd) {
-                    (Some(u), _) => match crate::exec_endpoint::ExecTarget::http(
-                        u,
-                        &cfg.exec_header,
-                        cfg.exec_max_response_bytes,
-                    )
-                    .await
-                    {
-                        Ok(t) => exec_cell.set(Some(t)),
-                        Err(e) => eprintln!("warning: --exec-url ignored: {e}"),
-                    },
-                    (None, Some(c)) => match crate::exec_endpoint::ExecTarget::template(c).await {
-                        Ok(t) => exec_cell.set(Some(t)),
-                        Err(e) => eprintln!("warning: --exec-cmd ignored: {e}"),
-                    },
-                    (None, None) => {}
-                },
+                None => {
+                    if let Some(u) = &cfg.exec_url {
+                        match crate::exec_endpoint::ExecTarget::http(
+                            u,
+                            &cfg.exec_header,
+                            cfg.exec_max_response_bytes,
+                        )
+                        .await
+                        {
+                            Ok(t) => exec_cell.set(Some(t)),
+                            Err(e) => eprintln!("warning: --exec-url ignored: {e}"),
+                        }
+                    }
+                }
             }
         }
     }

@@ -78,7 +78,8 @@ fn profiles() -> Vec<Profile> {
             },
             ..base()
         },
-        // The same layers, over a transport that is only `sh` on this host (the baseline jobs).
+        // The same layers, over a transport that is only `sh` on this host. It owns no jobs, so the
+        // jobs suite is not among them.
         Profile {
             name: "local-sh",
             suites: LAYER_SUITES,
@@ -88,8 +89,8 @@ fn profiles() -> Vec<Profile> {
     ]
 }
 
-/// What the transport-independent layers (files, jobs, helpers, bulk) are checked by.
-const LAYER_SUITES: &[&str] = &["files", "jobs", "helpers", "bulk"];
+/// What the transport-independent layers (files, helpers, bulk) are checked by.
+const LAYER_SUITES: &[&str] = &["files", "helpers", "bulk"];
 
 /// The in-process driver, as the evaluator's link.
 struct Reference(Driver);
@@ -229,7 +230,11 @@ async fn reference_agent_passes_every_scenario() {
             tally.skipped,
         );
         grand.known_defect += tally.known_defect;
-        grand.unsupported += tally.unsupported;
+        // A transport that owns no jobs does not offer the job ops: the scenarios that use them are
+        // unsupported for it, and for no other profile.
+        if !profile.local {
+            grand.unsupported += tally.unsupported;
+        }
         grand.passed += tally.passed;
         grand.failed += tally.failed;
         grand.skipped += tally.skipped;

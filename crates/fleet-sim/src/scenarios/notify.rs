@@ -5,8 +5,7 @@
 //! a real replica cannot show that a request was forwarded unchanged, or answer `411` on demand.
 //! Everything about where a callback ends up (E3, E7, and the takeover, ring-change and
 //! closed-session scenarios) runs real `serve --service` replicas started with the front's origin
-//! as `--notify-origin`, over both kinds of notify sandbox: one that keeps jobs natively and calls
-//! back itself, and the baseline, whose `setsid` supervisor calls back with `curl`.
+//! as `--notify-origin`, over a sandbox that keeps jobs natively and calls back itself.
 //!
 //! The job in every real-replica scenario waits on a flag file the scenario creates, so it ends
 //! exactly when the scenario says, however long a takeover on a shared filesystem takes.
