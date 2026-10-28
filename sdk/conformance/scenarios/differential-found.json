@@ -284,6 +284,88 @@
           }
         }
       ]
+    },
+    {
+      "id": "differential-found.search.neg-glob-does-not-prune-a-directory",
+      "description": "A glob restricts or excludes FILES; it never decides whether a directory is descended. `*.txt` excluded must still search `d.txt/x.md` (ripgrep's `--glob '!*.txt'` also matches the directory `d.txt` and would skip everything under it). The same holds for a positive glob: `*.md` finds the file under a directory that does not match it.",
+      "steps": [
+        {
+          "id": "s0",
+          "op": "exec",
+          "command": "mkdir",
+          "args": [
+            "-p",
+            "--",
+            "${ROOT}/d.txt"
+          ],
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "s1",
+          "op": "write",
+          "path": "${ROOT}/d.txt/x.md",
+          "data_b64": "YWxwaGEK",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "exclude",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "alpha",
+          "literal": true,
+          "ignore_case": false,
+          "glob": "*.txt",
+          "glob_exclude": true,
+          "limit": 100,
+          "before": 0,
+          "after": 0,
+          "expect": {
+            "ok": {
+              "truncated": false,
+              "note": null,
+              "hits": [
+                {
+                  "is_match": true,
+                  "line": 1,
+                  "path": "${ROOT}/d.txt/x.md",
+                  "text": "alpha"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "restrict",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "alpha",
+          "literal": true,
+          "ignore_case": false,
+          "glob": "*.md",
+          "glob_exclude": false,
+          "limit": 100,
+          "before": 0,
+          "after": 0,
+          "expect": {
+            "ok": {
+              "truncated": false,
+              "note": null,
+              "hits": [
+                {
+                  "is_match": true,
+                  "line": 1,
+                  "path": "${ROOT}/d.txt/x.md",
+                  "text": "alpha"
+                }
+              ]
+            }
+          }
+        }
+      ]
     }
   ]
 }

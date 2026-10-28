@@ -188,8 +188,51 @@ pub fn parse_driver(spec: &str) -> Result<Driver, String> {
     }
 }
 
+/// The host's cargo build lock: `$BEYOND_BUILD_LOCK`, else `$HOME/.cache/beyond-locks/rust-build.lock`.
+/// `Some` only when its directory exists and `flock` is on PATH (CI has neither, so builds run bare).
+fn build_lock() -> Option<std::path::PathBuf> {
+    let lock = match std::env::var_os("BEYOND_BUILD_LOCK") {
+        Some(p) => std::path::PathBuf::from(p),
+        None => std::path::PathBuf::from(std::env::var_os("HOME")?)
+            .join(".cache/beyond-locks/rust-build.lock"),
+    };
+    let dir_ok = lock.parent().is_some_and(|d| d.is_dir());
+    let flock_ok = std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("flock").is_file()));
+    (dir_ok && flock_ok && !held_by_ancestor(&lock)).then_some(lock)
+}
+
+/// Whether an ancestor already runs `flock ... LOCK` (`flock -o LOCK mise run test:clients`, say).
+/// Taking the lock again would wait on the process that holds it, forever.
+fn held_by_ancestor(lock: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let mut pid = std::process::id();
+    while pid > 1 {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        // Field 4 of /proc/PID/stat is the parent pid; it follows the parenthesised command name.
+        let ppid = stat
+            .rsplit(')')
+            .next()
+            .and_then(|r| r.split_whitespace().nth(1))
+            .and_then(|p| p.parse::<u32>().ok());
+        let Some(ppid) = ppid else { return false };
+        if let Ok(cmd) = std::fs::read(format!("/proc/{ppid}/cmdline")) {
+            let mut argv = cmd.split(|b| *b == 0);
+            let is_flock = argv.next().is_some_and(|a| a.ends_with(b"flock"));
+            if is_flock && argv.any(|a| a == lock.as_os_str().as_bytes()) {
+                return true;
+            }
+        }
+        pid = ppid;
+    }
+    false
+}
+
 /// The drivers of a registry file. Each `[[driver]]` has a `name`, a `build` command (optional) and
-/// a `run` command; commands run from the current directory (the repository root).
+/// a `run` command; commands run from the current directory (the repository root). A build runs
+/// under the host's build lock when there is one (see [`build_lock`]).
 pub fn registry(path: &Path, build: bool) -> Result<Vec<Driver>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let doc: toml::Table = text
@@ -211,7 +254,15 @@ pub fn registry(path: &Path, build: bool) -> Result<Vec<Driver>, String> {
         };
         if let (true, Some(cmd)) = (build, field("build")) {
             eprintln!("sandbox-matrix: building {name}: {cmd}");
-            let ok = std::process::Command::new("sh")
+            let mut c = match build_lock() {
+                Some(lock) => {
+                    let mut c = std::process::Command::new("flock");
+                    c.arg("-o").arg(lock).arg("sh");
+                    c
+                }
+                None => std::process::Command::new("sh"),
+            };
+            let ok = c
                 .arg("-c")
                 .arg(cmd)
                 .status()

@@ -427,6 +427,23 @@ search({ pattern, root, literal, ignore_case, glob?, glob_exclude, limit,
 `before` and `after` are clamped to **100**. `limit` counts matches, not
 context lines.
 
+#### What the glob decides
+
+The glob restricts or excludes **files**; it never decides whether a directory is
+descended. `glob = "*.md"` keeps the files whose path matches and still searches
+every directory, matching or not; `glob = "*.txt"` with `glob_exclude` drops
+the files that match and still searches a directory named `d.txt`. `rg --glob
+'!G'` cannot say this: it also matches directories, so `!*.txt` would skip
+everything under `d.txt/`, and no override form re-includes directories
+without whitelisting every file and directory past `.gitignore`. So an engine
+is asked to exclude only through a flag that is files-only (GNU `--exclude`), and
+`rg` is given no excluding glob at all: the client drops the hits whose path
+matches the glob (same `globset` matcher as busybox, below, but case-sensitive,
+like `rg --glob`), context hits included. Excluded files are still read by `rg`. A glob that does not parse is
+`invalid_query` (`bad glob: ...`) whichever engine runs. A root that is itself a
+file is searched whatever the glob says on `rg`; GNU `grep` applies it to a file
+named on the command line.
+
 #### Engine arguments
 
 The command is `rg` or `grep`, with **no shell**, each item one argument.
@@ -438,7 +455,7 @@ The command is `rg` or `grep`, with **no shell**, each item one argument.
 --hidden --crlf
 [--no-require-git]            unless the root is inside a git repository (below)
 [--ignore-case] [--fixed-strings]
-[--glob G | --glob !G]        the caller's glob; the second form when excluding
+[--glob G]                    the caller's glob, only when it restricts (never `!G`, see below)
 --glob !.git
 [-B before] [-A after]        each only when greater than 0
 --no-context-separator        always

@@ -79,9 +79,9 @@ export function rgArgs(q: SearchQuery, inGitRepo: boolean): string[] {
   if (!inGitRepo) args.push("--no-require-git");
   if (r.ignoreCase) args.push("--ignore-case");
   if (r.literal) args.push("--fixed-strings");
-  if (r.glob !== undefined) {
-    args.push("--glob", r.globExclude ? `!${r.glob}` : r.glob);
-  }
+  // Only a restricting glob goes to `rg`: its `--glob '!G'` also matches directories, so `!*.txt`
+  // would never descend into `d.txt/`. An excluding glob is applied to the hits (`files.ts`).
+  if (r.glob !== undefined && !r.globExclude) args.push("--glob", r.glob);
   args.push("--glob", "!.git");
   pushContext(args, r);
   // The group separator is the one record with no NUL, so it cannot be told from a path that starts
