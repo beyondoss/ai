@@ -294,10 +294,21 @@ impl Mcp {
         let bearer = std::env::var("CONFORMANCE_BEARER")
             .ok()
             .filter(|b| !b.is_empty());
-        Self::start_at(&url, bearer).await
+        let token_cmd = std::env::var("CONFORMANCE_TOKEN_CMD")
+            .ok()
+            .filter(|c| !c.is_empty());
+        Self::start_with(&url, bearer, token_cmd).await
     }
 
     async fn start_at(url: &str, bearer: Option<String>) -> Result<Self, Value> {
+        Self::start_with(url, bearer, None).await
+    }
+
+    async fn start_with(
+        url: &str,
+        bearer: Option<String>,
+        token_cmd: Option<String>,
+    ) -> Result<Self, Value> {
         let bin = std::env::var("SANDBOX_MCP_BIN").ok().unwrap_or_else(|| {
             let mut p = std::env::current_exe().expect("current exe");
             p.set_file_name("sandbox-mcp");
@@ -316,7 +327,9 @@ impl Mcp {
         let root = tempfile::tempdir().map_err(|e| err("io", e.to_string()))?;
         cmd.env("SANDBOX_LOCAL_ROOT", root.path());
         cmd.env("SANDBOX_URL", url);
-        if let Some(b) = bearer {
+        if let Some(c) = token_cmd {
+            cmd.env("SANDBOX_TOKEN_CMD", c);
+        } else if let Some(b) = bearer {
             cmd.env("SANDBOX_TOKEN", b);
         }
         if let Some(c) = std::env::var("CONFORMANCE_CAPS")

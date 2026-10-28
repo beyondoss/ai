@@ -21,6 +21,9 @@ fn config() -> Config {
     let bearer = std::env::var("CONFORMANCE_BEARER")
         .ok()
         .filter(|b| !b.is_empty());
+    let token_cmd = std::env::var("CONFORMANCE_TOKEN_CMD")
+        .ok()
+        .filter(|c| !c.is_empty());
     let caps: Value = std::env::var("CONFORMANCE_CAPS")
         .ok()
         .filter(|c| !c.is_empty())
@@ -29,6 +32,7 @@ fn config() -> Config {
     Config {
         url,
         bearer,
+        token_cmd,
         caps: CapsOverride {
             find_printf: caps["find_printf"].as_bool(),
             // Leaked once per process: the override is `'static` in the shared driver.

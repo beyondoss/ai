@@ -106,11 +106,22 @@ struct Reconnect(Config, bool);
 
 #[async_trait]
 impl Connector for Reconnect {
-    async fn connect(&self, bearer: Option<Option<String>>, url: Option<String>) -> Box<dyn Link> {
+    fn upstream(&self) -> Option<(String, Option<String>)> {
+        // Over plain commands there is no endpoint to put a proxy in front of.
+        (!self.1).then(|| (self.0.url.clone(), self.0.bearer.clone()))
+    }
+
+    async fn connect(
+        &self,
+        bearer: Option<Option<String>>,
+        url: Option<String>,
+        token_cmd: Option<String>,
+    ) -> Box<dyn Link> {
         let mut cfg = self.0.clone();
         if let Some(b) = bearer {
             cfg.bearer = b;
         }
+        cfg.token_cmd = token_cmd;
         if let Some(u) = url {
             cfg.url = u;
         }
@@ -155,7 +166,10 @@ fn scenario_files_are_well_formed() {
                     .as_str()
                     .unwrap_or_else(|| panic!("{id}: step without id"));
                 assert!(step_ids.insert(sid), "{id}: duplicate step id {sid}");
-                assert!(s["op"].is_string(), "{id}/{sid}: no op");
+                assert!(
+                    s["op"].is_string() || s.get("edge").is_some(),
+                    "{id}/{sid}: no op"
+                );
             }
             assert!(
                 !sc["steps"].as_array().unwrap().is_empty(),
@@ -185,6 +199,7 @@ async fn reference_agent_passes_every_scenario() {
         let cfg = Config {
             url: mock.as_ref().map(|m| m.url.clone()).unwrap_or_default(),
             bearer: profile.bearer.then(|| BEARER.to_string()),
+            token_cmd: None,
             caps: profile.caps,
             jobs_root: Some(work.join(".jobs")),
         };

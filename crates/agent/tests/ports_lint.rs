@@ -84,6 +84,8 @@ const ALLOWED: &[(&str, usize)] = &[
     ("sandbox-mcp/tests/e2e.rs", 1),
     // The MCP conformance driver's private execd binds port 0, keeps it, and announces it.
     ("sandbox-mcp/src/bin/sandbox-driver-mcp.rs", 1),
+    // The conformance edge in front of the upstream holds its listener for the run.
+    ("sandbox-conformance/src/edge.rs", 1),
 ];
 
 /// A source file with comments blanked out (newlines kept) and its string literals located.

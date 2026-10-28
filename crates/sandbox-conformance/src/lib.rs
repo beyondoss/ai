@@ -9,6 +9,7 @@
 pub mod backends;
 pub mod beyond;
 pub mod e2b;
+pub mod edge;
 pub mod eval;
 pub mod link;
 pub mod matrix;

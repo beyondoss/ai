@@ -14,6 +14,7 @@ async function main(): Promise<void> {
   const driver = new Driver({
     url,
     bearer: process.env.CONFORMANCE_BEARER,
+    tokenCmd: process.env.CONFORMANCE_TOKEN_CMD,
     caps: capsFromEnv(process.env.CONFORMANCE_CAPS),
   });
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
