@@ -89,18 +89,20 @@ browser.
 built beside it, and the harness crate should not depend on the thing it judges. It reports `driver: "sandbox-mcp"` in
 `hello` and implements each op by calling a tool; `CONFORMANCE_*` is translated to `SANDBOX_*` for the child it spawns.
 
-| op                                                                                      | how                                                                                 |
-| --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `exec`, `stat`, `mkdir`, `write`, `list`, `search`, `job_start`, `job_list`, `job_kill` | one tool call                                                                       |
-| `read`, `job_read`                                                                      | `read_file` / `job_output` asking for base64; `read` loops until `max` bytes or EOF |
-| `job_attach`                                                                            | `job_output` polled to the job's end (the client library's own follow)              |
-| `job_remove`, `job_wipe`                                                                | `job_list`, then `job_kill` with `remove` on the ended jobs / on every job          |
-| `capabilities`                                                                          | the `sandbox://capabilities` resource                                               |
-| `exec_stream`                                                                           | `unsupported`: a tool result is not streamed                                        |
-| `write_if_unchanged`                                                                    | `write_file` with `if_unchanged_since` (a number) or `create_only` (null)           |
+| op                                                                                      | how                                                                                                                               |
+| --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `exec`, `stat`, `mkdir`, `write`, `list`, `search`, `job_start`, `job_list`, `job_kill` | one tool call                                                                                                                     |
+| `read`, `job_read`                                                                      | `read_file` / `job_output` asking for base64; `read` loops until `max` bytes or EOF                                               |
+| `job_attach`                                                                            | `job_output` polled to the job's end (the client library's own follow)                                                            |
+| `job_remove`, `job_wipe`                                                                | `job_list`, then `job_kill` with `remove` on the ended jobs / on every job                                                        |
+| `capabilities`                                                                          | the `sandbox://capabilities` resource                                                                                             |
+| `exec_stream`                                                                           | `job_start` (stderr to a file of its own), `job_output` to the end, `job_kill` at the deadline, `read_file` of the stderr, remove |
+| `extract`                                                                               | `write_file` of the archive into a private `execd` whose `tar` prints it, then `download` from there                              |
+| `write_if_unchanged`                                                                    | `write_file` with `if_unchanged_since` (a number) or `create_only` (null)                                                         |
 
-An unsupported op is left out of `hello`'s list, so the harness counts the scenarios that need it as `unsupported`, never
-as passes.
+The driver lists every op. A job keeps the last 8 MiB of its output, so `stream.output.beyond-the-v11-cap` (20 MB) is a
+strict `xfail` for this driver; a status of 129 to 159 is reported as a signal, as the shell does. `extract` runs the real
+`download` tool and its extractor under `SANDBOX_LOCAL_ROOT`; only the sandbox's `tar` is a stand-in.
 
 ## Release
 

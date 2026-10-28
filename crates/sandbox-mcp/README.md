@@ -19,8 +19,8 @@ Paste that into `.mcp.json` (Claude Code), `claude_desktop_config.json`, or any 
 `cargo install --path crates/sandbox-mcp`.
 
 It passes the shared conformance matrix (`mise run test:clients`) with 0 failures on every backend, through a real MCP
-session: 463 checks pass on a plain `execd`, and 13 are reported `unsupported` (not skipped): all of them need the raw
-exec stream, which an MCP tool result cannot carry (see below).
+session, with no check reported `unsupported`: `exec_stream` runs as `job_start` plus `job_output`, and `extract` runs the
+real `download` tool against a private `execd` that serves the archive.
 
 ## Tools
 
@@ -75,8 +75,8 @@ that is not a loopback name.
 ## What is not offered
 
 `exec` returns the whole output at once: there is no streaming tool, because an MCP tool result is not streamed. Use
-`job_start` and `job_output` for anything long or noisy. So the conformance matrix's `exec_stream` op (frames, signals,
-heartbeats, a timeout that is a frame) is `unsupported`: the 13 checks that use it are the only ones.
+`job_start` and `job_output` for anything long or noisy. A job keeps the last 8 MiB of its output, so a command that writes more than that
+faster than it is read loses the head (the one `xfail` of this driver).
 
 To write without losing a concurrent change, pass `write_file` the `mtime` that `stat` returned, as `if_unchanged_since`
 (fractional seconds, exactly as `stat` gave it): a file changed in the meantime, even within the same second, or removed,

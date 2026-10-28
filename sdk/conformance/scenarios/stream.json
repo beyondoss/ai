@@ -86,6 +86,10 @@
               "exit_code": 0,
               "stdout_len": 20000000
             }
+          },
+          "xfail": {
+            "drivers": ["sandbox-mcp"],
+            "reason": "exec_stream is job_start plus job_output, and a job keeps only the last 8 MiB of its output (execd's job_output_retention): a command that writes 20 MB faster than an agent reads loses the head. A live stream has no such window."
           }
         }
       ]
