@@ -347,6 +347,29 @@ impl FsBackend for ShellFs {
 
     async fn search(&self, q: &SearchQuery) -> Result<SearchOutcome, FsError> {
         let engine = self.caps().await?.search_engine();
+        // Ripgrep gets only a restricting glob, so an excluding one is checked here: a bad one is
+        // still the caller's `invalid_query`, not a silently unfiltered search.
+        let excluded = match (&q.glob, engine) {
+            (Some((pattern, true)), SearchEngine::Ripgrep) => Some(
+                globset::Glob::new(pattern)
+                    .map_err(|e| FsError::InvalidQuery(format!("bad glob: {e}")))?
+                    .compile_matcher(),
+            ),
+            _ => None,
+        };
+        // Whose per-path errors are not worth a note: rg and busybox grep open the files an excluding
+        // glob skips (it is applied to their hits), so an unreadable one is not the caller's concern.
+        let skipped_errors = match (&q.glob, engine) {
+            (Some((_, true)), SearchEngine::Ripgrep) => excluded.clone(),
+            (Some((pattern, true)), SearchEngine::BusyboxGrep) => {
+                globset::GlobBuilder::new(pattern)
+                    .case_insensitive(q.ignore_case)
+                    .build()
+                    .ok()
+                    .map(|g| g.compile_matcher())
+            }
+            _ => None,
+        };
         let args = match engine {
             // The git-repo question is asked only on the rung that can act on it: `--no-require-git`
             // is a ripgrep flag, and the POSIX rungs honor no `.gitignore` at all.
@@ -359,7 +382,17 @@ impl FsBackend for ShellFs {
             SearchEngine::PosixGrep | SearchEngine::BusyboxGrep => "grep",
         };
 
-        let result = self.exec(program, &args).await?;
+        let mut result = self.exec(program, &args).await?;
+        if let Some(matcher) = &skipped_errors
+            && !result.stderr.is_empty()
+        {
+            let kept = drop_excluded_errors(&result.stderr, matcher);
+            // Every complaint was about an excluded file: the run was a success.
+            if kept.is_empty() && result.code == Some(2) {
+                result.code = Some(0);
+            }
+            result.stderr = kept;
+        }
 
         // Both `rg` and `grep` use exit 1 for "no matches" — a perfectly ordinary outcome, not a
         // failure. Exit 2 is shared by three different situations that must not be conflated: a
@@ -409,6 +442,11 @@ impl FsBackend for ShellFs {
         // The engine was asked to skip `.git` where it can; this is the guarantee for the rungs that
         // can't (busybox `grep`, and a `.git` *file* GNU `--exclude-dir` does not cover).
         hits.retain(|h| !super::is_under_git_dir(&q.root, &h.path));
+        if let Some(matcher) = &excluded {
+            // Files only: the glob never decides whether a directory is descended. A root that is
+            // itself a file is searched whatever the glob says, as ripgrep does for a restricting one.
+            hits.retain(|h| h.path.as_ref() == q.root || !matcher.is_match(&*h.path));
+        }
         // (A line longer than the runner's 128 KiB capture arrives already cut, which is flagged as
         // truncation below.)
         // `ExecResult` keeps only the first and last 128 KiB of each stream and drops the middle. On a
@@ -1436,6 +1474,66 @@ enum SearchFailure {
     Skipped(String),
 }
 
+const OS_ERRORS: [&str; 7] = [
+    "No such file or directory",
+    "Permission denied",
+    "Is a directory",
+    "Not a directory",
+    "Too many levels of symbolic links",
+    "Input/output error",
+    // rg reading a `.git` file (a gitdir pointer) that is not text.
+    "stream did not contain valid UTF-8",
+];
+
+/// `rg` appends ` (os error N)` to the OS message; the message is what a record ends in.
+fn strip_os_error(l: &str) -> &str {
+    let l = l.trim_end();
+    l.strip_suffix(')')
+        .and_then(|x| x.rsplit_once(" (os error ").map(|p| p.0))
+        .unwrap_or(l)
+}
+
+/// stderr as records that each end in an OS error (see [`classify_search_failure`]); `None` when it
+/// has none, or has text after the last one (the engine complaining about something else).
+fn os_error_records(stderr: &str) -> Option<Vec<&str>> {
+    let mut records: Vec<&str> = Vec::new();
+    let mut start = 0;
+    for line in stderr.split_inclusive('\n') {
+        let end = (line.as_ptr() as usize - stderr.as_ptr() as usize) + line.len();
+        let l = strip_os_error(line);
+        if OS_ERRORS.iter().any(|e| l.ends_with(e)) {
+            records.push(stderr[start..end].trim());
+            start = end;
+        }
+    }
+    (!records.is_empty() && stderr[start..].trim().is_empty()).then_some(records)
+}
+
+/// Drop the per-path errors about files an excluding glob skips: ripgrep opens them (the exclusion
+/// is applied to its hits), but the caller asked for them not to be searched, so an unreadable one
+/// is no reason for a note. Anything that is not purely per-path errors is returned unchanged.
+fn drop_excluded_errors(stderr: &str, excluded: &globset::GlobMatcher) -> String {
+    let Some(records) = os_error_records(stderr) else {
+        return stderr.to_string();
+    };
+    let kept: Vec<&str> = records
+        .into_iter()
+        .filter(|r| {
+            let msg = strip_os_error(r);
+            let path = OS_ERRORS
+                .iter()
+                .find_map(|e| msg.strip_suffix(e))
+                .and_then(|m| m.strip_suffix(": "))
+                .map(|m| {
+                    let m = m.strip_prefix("rg: ").unwrap_or(m);
+                    m.strip_prefix("grep: ").unwrap_or(m)
+                });
+            !path.is_some_and(|p| excluded.is_match(p))
+        })
+        .collect();
+    kept.join("\n")
+}
+
 /// Per-path read errors name the path and end in the OS message (`rg` appends ` (os error N)`).
 /// Anything else on stderr is the engine complaining about the pattern.
 ///
@@ -1444,36 +1542,9 @@ enum SearchFailure {
 /// through the first line that ends in an OS message. The search root is known, so its own error is
 /// found by looking for that exact string, newlines and all.
 fn classify_search_failure(stderr: &str, root: &str) -> SearchFailure {
-    const OS_ERRORS: [&str; 7] = [
-        "No such file or directory",
-        "Permission denied",
-        "Is a directory",
-        "Not a directory",
-        "Too many levels of symbolic links",
-        "Input/output error",
-        // rg reading a `.git` file (a gitdir pointer) that is not text.
-        "stream did not contain valid UTF-8",
-    ];
-    let ends_in_os_error = |l: &str| {
-        let l = l.trim_end();
-        let l = l
-            .strip_suffix(')')
-            .and_then(|x| x.rsplit_once(" (os error ").map(|p| p.0))
-            .unwrap_or(l);
-        OS_ERRORS.iter().any(|e| l.ends_with(e))
-    };
-    let mut records: Vec<&str> = Vec::new();
-    let mut start = 0;
-    for line in stderr.split_inclusive('\n') {
-        let end = (line.as_ptr() as usize - stderr.as_ptr() as usize) + line.len();
-        if ends_in_os_error(line) {
-            records.push(stderr[start..end].trim());
-            start = end;
-        }
-    }
-    if records.is_empty() || !stderr[start..].trim().is_empty() {
+    let Some(records) = os_error_records(stderr) else {
         return SearchFailure::BadRegex;
-    }
+    };
     // The root's own error is `PROGRAM: ROOT: [IO error for operation on ROOT: ]No such file or
     // directory`; a path under the root carries more path after ROOT, so matching the exact
     // `: ROOT: ` form tells them apart.
@@ -1538,13 +1609,13 @@ fn rg_args(q: &SearchQuery, in_git_repo: bool) -> Vec<String> {
     if q.literal {
         args.push("--fixed-strings".to_string());
     }
-    if let Some((pattern, negate)) = &q.glob {
+    // Only a restricting glob goes to ripgrep. Its `--glob '!G'` also matches *directories*, so
+    // `!*.txt` would never descend into `d.txt/` and silently skip everything under it; no override
+    // form re-includes the directories without also whitelisting every file and directory past
+    // `.gitignore`. An excluding glob is applied to the hits instead (see [`drop_excluded`]).
+    if let Some((pattern, false)) = &q.glob {
         args.push("--glob".to_string());
-        args.push(if *negate {
-            format!("!{pattern}")
-        } else {
-            pattern.clone()
-        });
+        args.push(pattern.clone());
     }
     // After the caller's glob on purpose: ripgrep gives the *last* matching glob precedence. Never
     // applied to the root itself, so an explicit search of `repo/.git` still searches it.
@@ -2503,12 +2574,17 @@ mod tests {
     }
 
     #[test]
-    fn a_negated_glob_becomes_a_bang_prefixed_rg_glob() {
+    fn a_negated_glob_is_not_an_rg_glob() {
+        // `--glob '!G'` also prunes a directory whose name matches; the hits are filtered instead.
         let mut q = query("x", PathBuf::from("."), 100);
         q.glob = Some(("*.test.rs".into(), true));
         let args = rg_args(&q, false);
-        let g = args.iter().position(|a| a == "--glob").unwrap();
-        assert_eq!(args[g + 1], "!*.test.rs");
+        assert!(!args.iter().any(|a| a.contains("test.rs")), "{args:?}");
+        assert_eq!(
+            args.iter().filter(|a| *a == "--glob").count(),
+            1,
+            "only !.git"
+        );
     }
 
     #[test]

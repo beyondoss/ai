@@ -8,6 +8,7 @@ import {
   SandboxError,
   TimeoutError,
 } from "./errors.js";
+import { compileGlob } from "./glob.js";
 import {
   GIT_SCRIPT,
   READ_SCRIPT,
@@ -17,6 +18,7 @@ import {
 } from "./scripts.js";
 import {
   classifySearchFailure,
+  dropExcludedErrors,
   finalize,
   grepArgs,
   isUnderGitDir,
@@ -396,16 +398,34 @@ export class Files {
     const caps = await this.capabilities();
     const engine = caps.searchEngine;
     const program = engine === "rg" ? "rg" : "grep";
+    // `rg` is given only a restricting glob (an excluding one would prune directories), so a bad
+    // excluding glob is rejected here and the exclusion applied to the hits below.
+    const excluded = engine === "rg" && q.glob !== undefined && q.globExclude
+      ? compileGlob(q.glob, false)
+      : null;
+    // Whose per-path errors are not worth a note: `rg` and busybox `grep` open the files an
+    // excluding glob skips (it is applied to their hits).
+    const skippedErrors = excluded
+      ?? (engine === "busybox-grep" && q.glob !== undefined && q.globExclude
+        ? compileGlob(q.glob, q.ignoreCase)
+        : null);
     const args = engine === "rg"
       ? rgArgs(q, await this.rootInGitRepo(q.root))
       : grepArgs(q, engine === "grep");
     const r = await this.exec(program, args);
 
     const stdout = text(r.stdout);
-    const stderr = text(r.stderr);
+    let stderr = text(r.stderr);
+    let exitCode = r.exitCode;
+    if (skippedErrors && stderr !== "") {
+      const kept = dropExcludedErrors(stderr, (p) => skippedErrors.test(p));
+      // Every complaint was about an excluded file: the run was a success.
+      if (kept === "" && exitCode === 2) exitCode = 0;
+      stderr = kept;
+    }
     let skipped: string | null = null;
-    if (r.exitCode !== 0 && r.exitCode !== 1) {
-      if (r.exitCode === 124) {
+    if (exitCode !== 0 && exitCode !== 1) {
+      if (exitCode === 124) {
         throw new TimeoutError(
           `${program} timed out after ${COMMAND_TIMEOUT_MS / 1000}s`,
         );
@@ -441,6 +461,11 @@ export class Files {
       }
     }
     hits = hits.filter((h) => !isUnderGitDir(q.root, h.path));
+    // Files only: the glob never decides whether a directory is descended. A root that is itself a
+    // file is searched whatever the glob says.
+    if (excluded) {
+      hits = hits.filter((h) => h.path === q.root || !excluded.test(h.path));
+    }
     const done = finalize(hits, q.limit);
     const first = stderr.trim().split("\n")[0] ?? "";
     let note = skipped ?? (first === "" ? null : first);

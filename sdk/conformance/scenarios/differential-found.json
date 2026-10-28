@@ -286,6 +286,88 @@
       ]
     },
     {
+      "id": "differential-found.search.neg-glob-does-not-prune-a-directory",
+      "description": "A glob restricts or excludes FILES; it never decides whether a directory is descended. `*.txt` excluded must still search `d.txt/x.md` (ripgrep's `--glob '!*.txt'` also matches the directory `d.txt` and would skip everything under it). The same holds for a positive glob: `*.md` finds the file under a directory that does not match it.",
+      "steps": [
+        {
+          "id": "s0",
+          "op": "exec",
+          "command": "mkdir",
+          "args": [
+            "-p",
+            "--",
+            "${ROOT}/d.txt"
+          ],
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "s1",
+          "op": "write",
+          "path": "${ROOT}/d.txt/x.md",
+          "data_b64": "YWxwaGEK",
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "exclude",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "alpha",
+          "literal": true,
+          "ignore_case": false,
+          "glob": "*.txt",
+          "glob_exclude": true,
+          "limit": 100,
+          "before": 0,
+          "after": 0,
+          "expect": {
+            "ok": {
+              "truncated": false,
+              "note": null,
+              "hits": [
+                {
+                  "is_match": true,
+                  "line": 1,
+                  "path": "${ROOT}/d.txt/x.md",
+                  "text": "alpha"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "restrict",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "alpha",
+          "literal": true,
+          "ignore_case": false,
+          "glob": "*.md",
+          "glob_exclude": false,
+          "limit": 100,
+          "before": 0,
+          "after": 0,
+          "expect": {
+            "ok": {
+              "truncated": false,
+              "note": null,
+              "hits": [
+                {
+                  "is_match": true,
+                  "line": 1,
+                  "path": "${ROOT}/d.txt/x.md",
+                  "text": "alpha"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
       "id": "differential-found.search.glob-reports-an-unsearchable-subtree",
       "description": "A directory that can be listed but not entered (mode 444) hides everything below it from the search. With a restricting glob the answer must still carry a note: GNU grep stats nothing it cannot enter, so with `--include` it skips the unsearchable entry `bb` in silence when its name does not satisfy the glob. The matches that can be read (`d/top.txt`) are returned.",
       "requires": {
@@ -351,10 +433,9 @@
     },
     {
       "id": "differential-found.search.exclude-glob-reports-an-unsearchable-subtree",
-      "description": "The same with an excluding glob: GNU grep `--exclude` skips an entry it cannot stat when its name matches the glob, whatever the entry is, so an unsearchable directory named like the glob (`bb`) hides its subtree in silence. Only the GNU grep rung is asked: ripgrep's `!bb` prunes a directory named `bb` (the other fix), which this scenario would then hide.",
+      "description": "The same with an excluding glob: GNU grep `--exclude` skips an entry it cannot stat when its name matches the glob, whatever the entry is, so an unsearchable directory named like the glob (`bb`) hides its subtree in silence.",
       "requires": {
-        "not_root": true,
-        "search_engine": "grep"
+        "not_root": true
       },
       "setup": [
         {
@@ -407,6 +488,68 @@
             "755",
             "--",
             "${ROOT}/d/sub"
+          ],
+          "expect": {
+            "ok": {}
+          }
+        }
+      ]
+    },
+    {
+      "id": "differential-found.search.exclude-glob-does-not-note-an-excluded-unreadable-file",
+      "description": "A file the excluding glob skips is not searched, so it cannot be a reason for a note. An unreadable `x.txt` under `glob: \"*.txt\"` excluded leaves the search complete: no note. (ripgrep opens the file, since the exclusion is applied to its hits, and so reports it; the client drops that report.)",
+      "requires": {
+        "not_root": true
+      },
+      "setup": [
+        {
+          "id": "setup",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "set -e; cd \"$1\"; echo foo > ok.md; echo foo > x.txt; chmod 000 x.txt",
+            "sh",
+            "${ROOT}"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "id": "search",
+          "op": "search",
+          "root": "${ROOT}",
+          "pattern": "foo",
+          "literal": true,
+          "ignore_case": false,
+          "glob": "*.txt",
+          "glob_exclude": true,
+          "limit": 100,
+          "before": 0,
+          "after": 0,
+          "expect": {
+            "ok": {
+              "truncated": false,
+              "note": null,
+              "hits": [
+                {
+                  "path": "${ROOT}/ok.md",
+                  "line": 1,
+                  "text": "foo",
+                  "is_match": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "id": "restore",
+          "op": "exec",
+          "command": "chmod",
+          "args": [
+            "644",
+            "--",
+            "${ROOT}/x.txt"
           ],
           "expect": {
             "ok": {}

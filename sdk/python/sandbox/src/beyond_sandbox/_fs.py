@@ -327,8 +327,10 @@ def rg_args(q: Query, in_git_repo: bool) -> list[str]:
         args.append("--ignore-case")
     if q.literal:
         args.append("--fixed-strings")
-    if q.glob is not None:
-        args += ["--glob", f"!{q.glob}" if q.glob_exclude else q.glob]
+    # only a restricting glob goes to rg: its ``--glob '!G'`` also matches directories, so ``!*.txt``
+    # would never descend into ``d.txt/``. An excluding glob is applied to the hits (``search``).
+    if q.glob is not None and not q.glob_exclude:
+        args += ["--glob", q.glob]
     # after the caller's glob on purpose: ripgrep gives the last matching glob precedence
     args += ["--glob", f"!{GIT_DIR}"]
     args += _context(q)
@@ -412,6 +414,48 @@ class SearchFailure:
     note: str = ""
 
 
+def _strip_os_error(line: str) -> str:
+    """``rg`` appends `` (os error N)`` to the OS message; the message is what a record ends in."""
+    line = line.rstrip()
+    if line.endswith(")") and " (os error " in line:
+        line = line[: line.rindex(" (os error ")]
+    return line
+
+
+def os_error_records(stderr: str) -> list[str] | None:
+    """stderr as records that each end in an OS error; None when there are none, or text follows
+    the last one (the engine complaining about something else)."""
+    records: list[str] = []
+    start = end = 0
+    for line in _split_lf(stderr):
+        end += len(line)
+        if any(_strip_os_error(line).endswith(e) for e in _OS_ERRORS):
+            records.append(stderr[start:end].strip())
+            start = end
+    return None if not records or stderr[start:].strip() else records
+
+
+def drop_excluded_errors(stderr: str, excluded: re.Pattern[str]) -> str:
+    """Drop the per-path errors about files an excluding glob skips: ``rg`` opens them (the
+    exclusion is applied to its hits), but the caller asked for them not to be searched, so an
+    unreadable one is no reason for a note. Stderr that is not purely per-path errors is returned
+    unchanged."""
+    records = os_error_records(stderr)
+    if records is None:
+        return stderr
+    kept: list[str] = []
+    for rec in records:
+        msg = _strip_os_error(rec)
+        path = None
+        for e in _OS_ERRORS:
+            if msg.endswith(e) and msg[: -len(e)].endswith(": "):
+                path = msg[: -len(e) - 2].removeprefix("rg: ").removeprefix("grep: ")
+                break
+        if path is None or excluded.fullmatch(path) is None:
+            kept.append(rec)
+    return "\n".join(kept)
+
+
 def classify_search_failure(stderr: str, root: str) -> SearchFailure:
     """The three causes share exit 2; only stderr tells them apart.
 
@@ -419,21 +463,8 @@ def classify_search_failure(stderr: str, root: str) -> SearchFailure:
     lines; the root's own error is found by its exact string (newlines included).
     """
 
-    def ends_in_os_error(line: str) -> bool:
-        line = line.rstrip()
-        if line.endswith(")") and " (os error " in line:
-            line = line[: line.rindex(" (os error ")]
-        return any(line.endswith(e) for e in _OS_ERRORS)
-
-    records: list[str] = []
-    start = 0
-    end = 0
-    for line in _split_lf(stderr):
-        end += len(line)
-        if ends_in_os_error(line):
-            records.append(stderr[start:end].strip())
-            start = end
-    if not records or stderr[start:].strip():
+    records = os_error_records(stderr)
+    if records is None:
         return SearchFailure("bad_regex")
     marker = f": {root}: "
     io_prefix = f"IO error for operation on {root}: "
@@ -813,16 +844,31 @@ def root_in_git_repo(state: FsState, root: str) -> Op[bool]:
 
 def search(q: Query, state: FsState, caps: Capabilities) -> Op[SearchResult]:
     engine = caps.search_engine
+    excluded = None
+    if engine == "rg" and q.glob is not None and q.glob_exclude:
+        try:  # rg is not given this glob, so a bad one is rejected here
+            excluded = re.compile(_glob_regex(q.glob), re.S)
+        except (ValueError, re.error) as e:
+            raise InvalidQuery(f"bad glob: {e}") from e
+    skipped_errors = excluded  # whose per-path errors are not worth a note
+    if engine == "busybox-grep" and q.glob is not None and q.glob_exclude:
+        skipped_errors = compile_glob(q.glob, q.ignore_case)
     if engine == "rg":
         args, program = rg_args(q, (yield from root_in_git_repo(state, q.root))), "rg"
     else:
         args, program = posix_grep_args(q, engine == "grep"), "grep"
     r = yield Run(program, args)
     stderr = r.stderr_text
+    exit_code = r.exit_code
+    if skipped_errors is not None and stderr:
+        kept = drop_excluded_errors(stderr, skipped_errors)
+        if not kept and exit_code == 2:  # every complaint was about an excluded file: a success
+            exit_code = 0
+        stderr = kept
     note: str | None = None
-    if r.exit_code in (0, 1):
+    if exit_code in (0, 1):
         pass
-    elif r.exit_code == 124:
+    elif exit_code == 124:
         raise Timeout(f"{program} timed out")
     else:
         failure = classify_search_failure(stderr, q.root)
@@ -844,6 +890,10 @@ def search(q: Query, state: FsState, caps: Capabilities) -> Op[SearchResult]:
         if second.exit_code in (0, 1, 2):
             window_long_lines(hits, longs, second.stdout_text)
     hits = [h for h in hits if not is_under_git_dir(q.root, h.path)]
+    if excluded is not None:
+        # files only: the glob never decides whether a directory is descended; a root that is itself
+        # a file is searched whatever the glob says
+        hits = [h for h in hits if h.path == q.root or excluded.fullmatch(h.path) is None]
     hits, truncated = finalize(hits, q.limit)
     if note is None:
         detail = stderr.strip()
