@@ -16,8 +16,6 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 base64 = "0.22"
-# The notify notifier script (`SH`) spliced into the job supervisor, and its URL check.
-beyond-exec-notify = { path = "../exec-notify" }
 getrandom = { version = "0.3", features = ["std"] }
 globset = "0.4"
 hex = "0.4"
@@ -35,6 +33,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+beyond-exec-notify = { path = "../exec-notify" }
 beyond-sandbox-conformance = { path = "../sandbox-conformance" }
 beyond-test-support = { path = "../test-support" }
 hmac = "0.12"
