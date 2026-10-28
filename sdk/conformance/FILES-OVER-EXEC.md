@@ -443,7 +443,9 @@ like `rg --glob`), context hits included. Excluded files are still read by `rg` 
 client-side too), so their per-path errors about an excluded file are dropped
 from stderr before it is read: a record whose path, between an optional `rg:`
 or `grep:` and the OS message, matches the glob (the same matcher as the hits).
-Only files: the glob never excludes a directory, and an unreadable directory
+Never the root's own error (`ROOT:` or `ROOT: IO error for operation on ROOT:`), which
+decides `not_found` or `not_a_directory` for the whole search, whatever the root is
+called. Only files: the glob never excludes a directory, and an unreadable directory
 named like the glob still hides files the caller wanted. So when at least one
 record matches the glob, the client runs `sh -c DIRS_SCRIPT sh PATH...` (script
 J) once with the paths of those records, and keeps the record of each path it

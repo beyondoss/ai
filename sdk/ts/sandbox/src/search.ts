@@ -401,6 +401,7 @@ function osErrorRecords(stderr: string): string[] | null {
 export function excludedErrorRecords(
   stderr: string,
   excluded: (path: string) => boolean,
+  root: string,
 ): Array<{ record: string; path: string | null }> | null {
   const records = osErrorRecords(stderr);
   if (records === null) return null;
@@ -413,7 +414,10 @@ export function excludedErrorRecords(
       path = path.slice(0, -2);
       if (path.startsWith("rg: ")) path = path.slice(4);
       else if (path.startsWith("grep: ")) path = path.slice(6);
-      return { record, path: excluded(path) ? path : null };
+      // The root's own error decides not_found / not_a_directory for the whole search: never
+      // dropped (rg adds `: IO error for operation on ROOT` after the root for some of them).
+      const isRoot = path === root || path.startsWith(`${root}: `);
+      return { record, path: !isRoot && excluded(path) ? path : null };
     }
     return { record, path: null };
   });

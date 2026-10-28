@@ -387,7 +387,9 @@ impl FsBackend for ShellFs {
             && !result.stderr.is_empty()
         {
             let stderr = std::mem::take(&mut result.stderr);
-            result.stderr = self.drop_excluded_errors(stderr, matcher).await;
+            result.stderr = self
+                .drop_excluded_errors(stderr, matcher, &q.root.to_string_lossy())
+                .await;
             // Every complaint was about an excluded file: the run was a success.
             if result.stderr.is_empty() && result.code == Some(2) {
                 result.code = Some(0);
@@ -969,8 +971,9 @@ impl ShellFs {
         &self,
         stderr: String,
         excluded: &globset::GlobMatcher,
+        root: &str,
     ) -> String {
-        let Some(records) = excluded_error_records(&stderr, excluded) else {
+        let Some(records) = excluded_error_records(&stderr, excluded, root) else {
             return stderr;
         };
         let matching: Vec<String> = records
@@ -1573,6 +1576,7 @@ fn os_error_records(stderr: &str) -> Option<Vec<&str>> {
 fn excluded_error_records<'a>(
     stderr: &'a str,
     excluded: &globset::GlobMatcher,
+    root: &str,
 ) -> Option<Vec<(&'a str, Option<&'a str>)>> {
     let records = os_error_records(stderr)?;
     Some(
@@ -1588,7 +1592,14 @@ fn excluded_error_records<'a>(
                         let m = m.strip_prefix("rg: ").unwrap_or(m);
                         m.strip_prefix("grep: ").unwrap_or(m)
                     })
-                    .filter(|p| excluded.is_match(p));
+                    // The root's own error decides not_found / not_a_directory for the whole search:
+                    // never dropped, whatever the root is called (rg adds `: IO error for operation
+                    // on ROOT` after the root for some of them).
+                    .filter(|p| {
+                        excluded.is_match(p)
+                            && *p != root
+                            && !p.strip_prefix(root).is_some_and(|r| r.starts_with(": "))
+                    });
                 (r, path)
             })
             .collect(),

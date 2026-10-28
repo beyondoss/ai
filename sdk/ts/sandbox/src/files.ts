@@ -422,6 +422,7 @@ export class Files {
       const kept = await this.dropExcludedErrors(
         stderr,
         (p) => skippedErrors.test(p),
+        q.root,
       );
       // Every complaint was about an excluded file: the run was a success.
       if (kept === "" && exitCode === 2) exitCode = 0;
@@ -521,8 +522,9 @@ export class Files {
   private async dropExcludedErrors(
     stderr: string,
     excluded: (path: string) => boolean,
+    root: string,
   ): Promise<string> {
-    const records = excludedErrorRecords(stderr, excluded);
+    const records = excludedErrorRecords(stderr, excluded, root);
     if (records === null) return stderr;
     const matching = records.flatMap((r) => r.path === null ? [] : [r.path]);
     if (matching.length === 0) return stderr;

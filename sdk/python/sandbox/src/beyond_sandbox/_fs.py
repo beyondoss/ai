@@ -435,7 +435,7 @@ def os_error_records(stderr: str) -> list[str] | None:
     return None if not records or stderr[start:].strip() else records
 
 
-def drop_excluded_errors(stderr: str, excluded: re.Pattern[str]) -> Op[str]:
+def drop_excluded_errors(stderr: str, excluded: re.Pattern[str], root: str) -> Op[str]:
     """``stderr`` without the per-path errors about files an excluding glob skips: ``rg`` and busybox
     ``grep`` open them (the exclusion is applied to their hits), so an unreadable excluded file is
     no reason for a note. The glob never excludes a directory, though, and an unreadable directory
@@ -452,7 +452,10 @@ def drop_excluded_errors(stderr: str, excluded: re.Pattern[str]) -> Op[str]:
         for e in _OS_ERRORS:
             if msg.endswith(e) and msg[: -len(e)].endswith(": "):
                 p = msg[: -len(e) - 2].removeprefix("rg: ").removeprefix("grep: ")
-                path = p if excluded.fullmatch(p) is not None else None
+                # the root's own error decides not_found / not_a_directory for the whole search:
+                # never dropped (rg adds ": IO error for operation on ROOT" after it for some)
+                is_root = p == root or p.startswith(f"{root}: ")
+                path = p if not is_root and excluded.fullmatch(p) is not None else None
                 break
         parsed.append((rec, path))
     matching = [p for _, p in parsed if p is not None]
@@ -872,7 +875,7 @@ def search(q: Query, state: FsState, caps: Capabilities) -> Op[SearchResult]:
     stderr = r.stderr_text
     exit_code = r.exit_code
     if skipped_errors is not None and stderr:
-        kept = yield from drop_excluded_errors(stderr, skipped_errors)
+        kept = yield from drop_excluded_errors(stderr, skipped_errors, q.root)
         if not kept and exit_code == 2:  # every complaint was about an excluded file: a success
             exit_code = 0
         stderr = kept

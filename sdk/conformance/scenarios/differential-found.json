@@ -620,6 +620,59 @@
           }
         }
       ]
+    },
+    {
+      "id": "differential-found.search.exclude-glob-never-hides-a-missing-root",
+      "description": "The root's own error decides the whole search. A missing root whose name matches the excluding glob is still not_found, and a root below a regular file whose name matches is still not_a_directory (not a success with no hits).",
+      "setup": [
+        {
+          "id": "setup",
+          "op": "write",
+          "path": "${ROOT}/alpha.txt",
+          "data_b64": "Zm9vCg==",
+          "expect": {
+            "ok": {}
+          }
+        }
+      ],
+      "steps": [
+        {
+          "id": "missing",
+          "op": "search",
+          "root": "${ROOT}/gone.txt",
+          "pattern": "foo",
+          "literal": true,
+          "ignore_case": false,
+          "glob": "*.txt",
+          "glob_exclude": true,
+          "limit": 100,
+          "before": 0,
+          "after": 0,
+          "expect": {
+            "error": {
+              "kind": "not_found"
+            }
+          }
+        },
+        {
+          "id": "below-file",
+          "op": "search",
+          "root": "${ROOT}/alpha.txt/note.txt",
+          "pattern": "foo",
+          "literal": true,
+          "ignore_case": false,
+          "glob": "*.txt",
+          "glob_exclude": true,
+          "limit": 100,
+          "before": 0,
+          "after": 0,
+          "expect": {
+            "error": {
+              "kind": "not_a_directory"
+            }
+          }
+        }
+      ]
     }
   ]
 }
