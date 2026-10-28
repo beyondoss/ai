@@ -201,16 +201,32 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("timed out"), "{err}");
         let pid = std::fs::read_to_string(&pidfile).unwrap();
-        let proc = format!("/proc/{}", pid.trim());
+        let stat_path = format!("/proc/{}/stat", pid.trim());
+        // A killed child stays in `/proc` as a zombie until the runtime reaps it. Blocking this
+        // thread would stall that reaper, so poll with the runtime and treat `Z` as already dead.
+        let mut last = String::new();
         for _ in 0..50 {
-            if !std::path::Path::new(&proc).exists() {
-                return;
+            match std::fs::read_to_string(&stat_path) {
+                Err(_) => return,
+                Ok(stat) if !live_sleep(&stat) => return,
+                Ok(stat) => last = stat,
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert!(
-            !std::path::Path::new(&proc).exists(),
-            "the token command was not killed"
-        );
+        panic!("the token command was not killed: {last}");
+    }
+
+    /// `pid (comm) state …` from `/proc`. Ours is still running only while `comm` is `sleep` and the
+    /// state is a live one. `Z` and `X` mean the signal landed; a missing file or another comm means
+    /// the pid was reaped or reused.
+    fn live_sleep(stat: &str) -> bool {
+        let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else {
+            return false;
+        };
+        if close <= open || &stat[open + 1..close] != "sleep" {
+            return false;
+        }
+        let state = stat[close + 1..].split_whitespace().next().unwrap_or("");
+        state != "Z" && state != "X"
     }
 }
