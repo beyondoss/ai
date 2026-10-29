@@ -162,6 +162,18 @@ export class Files {
     const r = await this.transport.run("sh", ["-c", PROBE_SCRIPT], {
       timeoutMs: PROBE_TIMEOUT_MS,
     });
+    if (r.exitCode !== 0) {
+      if (r.exitCode === 124) {
+        throw new TimeoutError(
+          `environment probe timed out after ${PROBE_TIMEOUT_MS / 1000}s`,
+        );
+      }
+      throw new IoError(
+        `environment probe failed: ${
+          text(r.stderr).trim() || `exit ${r.exitCode}`
+        }`,
+      );
+    }
     const found = new Set(
       text(r.stdout).split("\n").map((l) => l.trim()),
     );
@@ -204,13 +216,29 @@ export class Files {
 
   // ---- stat ----------------------------------------------------------------------------------
 
-  /** `null` when the path does not exist (a missing parent, a broken link, a path below a file). */
+  /**
+   * `null` when the path does not exist (a missing parent, a broken link, a path below a file).
+   * Exit 0/1 from the script are presence/absence; any other status is a failed stat (timeout,
+   * signal, …) and must not be read as absence — that would let {@link Files.writeIfUnchanged}
+   * with `expectedMtime: null` overwrite a file the client never successfully observed.
+   */
   async stat(path: string): Promise<Stat | null> {
-    await this.capabilities();
     const r = await this.exec("sh", sh(STAT_SCRIPT, [path]));
     const out = text(r.stdout);
-    if (r.exitCode !== 0 || out.trim() === "") return null;
-    return parseStat(out);
+    if (r.exitCode === 0) {
+      return out.trim() === "" ? null : parseStat(out);
+    }
+    if (r.exitCode === 1) return null;
+    if (r.exitCode === 124) {
+      throw new TimeoutError(
+        `stat ${path}: command exceeded its timeout`,
+      );
+    }
+    throw new IoError(
+      `stat ${path}: command exited ${r.exitCode}: ${
+        text(r.stderr).trim().split("\n")[0] || "command failed"
+      }`,
+    );
   }
 
   // ---- read ----------------------------------------------------------------------------------
@@ -268,7 +296,6 @@ export class Files {
    */
   async write(path: string, data: Uint8Array | string): Promise<void> {
     const bytes = typeof data === "string" ? utf8(data) : data;
-    await this.capabilities();
     const suffix = await randomHex64();
     let failed: SandboxError | undefined;
     try {
@@ -324,9 +351,8 @@ export class Files {
 
   // ---- mkdir ---------------------------------------------------------------------------------
 
-  /** `mkdir -p`: idempotent. */
+  /** `mkdir -p`: idempotent. Needs no environment probe. */
   async mkdir(path: string): Promise<void> {
-    await this.capabilities();
     const r = await this.exec("mkdir", ["-p", "--", path]);
     if (r.exitCode !== 0) {
       throw classifyFailure(`create ${path}`, text(r.stderr));
@@ -363,6 +389,9 @@ export class Files {
       throw classifyFailure(`ls ${path}`, text(listing.stderr));
     }
     const dirs = await this.exec("find", [...base, "-type", "d", "-print0"]);
+    if (dirs.exitCode !== 0 && dirs.stdout.length === 0) {
+      throw classifyFailure(`ls ${path}`, text(dirs.stderr));
+    }
     const dirSet = new Set(
       text(dirs.stdout)
         .split("\0")
@@ -581,7 +610,8 @@ export function parseDirEntries(
 ): DirEntry[] {
   const out: DirEntry[] = [];
   for (const record of stdout.split("\0")) {
-    if (record === "" || out.length >= limit) break;
+    if (out.length >= limit) break;
+    if (record === "") continue;
     const a = record.indexOf("\t");
     if (a < 0) continue;
     const b = record.indexOf("\t", a + 1);

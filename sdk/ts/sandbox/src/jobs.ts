@@ -35,7 +35,7 @@ export interface JobOutput {
 }
 
 function validScope(scope: string): void {
-  if (!/^[0-9a-z-]{1,64}$/.test(scope)) {
+  if (typeof scope !== "string" || !/^[0-9a-z-]{1,64}$/.test(scope)) {
     throw new InvalidRequestError(
       "a job scope is 1 to 64 characters of [0-9a-z-]",
     );

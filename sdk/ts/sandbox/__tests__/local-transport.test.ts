@@ -111,13 +111,13 @@ describe("a user's own transport", () => {
     expect((await files.list(dir)).map((e) => e.name)).not.toContain("no");
   });
 
-  it("reaches the sandbox with one probe round trip, then one per operation", async () => {
+  it("writes without a probe; the first read probes once, then one command per window", async () => {
     const t = new LocalTransport();
     const files = new Files(t);
     await files.write(`${dir}/b.txt`, "x");
-    expect(t.calls).toBe(2); // the probe, the write
+    expect(t.calls).toBe(1); // write needs nothing and never probes
     await files.readText(`${dir}/b.txt`);
-    expect(t.calls).toBe(3);
+    expect(t.calls).toBe(3); // probe + one read
   });
 
   it("writes content larger than one read window through stdin, in one command", async () => {
@@ -125,7 +125,7 @@ describe("a user's own transport", () => {
     const files = new Files(t);
     const data = new Uint8Array(100_000).map((_, i) => i % 251);
     await files.write(`${dir}/big`, data);
-    expect(t.calls).toBe(2); // the probe, one write
+    expect(t.calls).toBe(1); // write alone; no probe
     expect(
       Buffer.from(await files.read(`${dir}/big`)).equals(Buffer.from(data)),
     ).toBe(true);
@@ -155,14 +155,13 @@ describe("a user's own transport", () => {
 });
 
 describe("round trips of the first file operation on a fresh sandbox", () => {
-  it("issues one probe and one command, whatever the first operation is", async () => {
-    for (const op of ["read", "write"] as const) {
-      await new Files(new LocalTransport()).write(`${dir}/rt`, "x");
-      const t = new LocalTransport();
-      const files = new Files(t);
-      if (op === "write") await files.write(`${dir}/rt`, "y");
-      else await files.read(`${dir}/rt`);
-      expect(t.calls, op).toBe(2);
-    }
+  it("writes with one command; a first read probes once then reads", async () => {
+    await new Files(new LocalTransport()).write(`${dir}/rt`, "x");
+    const writeT = new LocalTransport();
+    await new Files(writeT).write(`${dir}/rt`, "y");
+    expect(writeT.calls).toBe(1);
+    const readT = new LocalTransport();
+    await new Files(readT).read(`${dir}/rt`);
+    expect(readT.calls).toBe(2); // probe + read
   });
 });

@@ -49,9 +49,10 @@ Transport  run, stream, jobs                           raw exec; replace it with
    `HttpTransport({ url, token })` is the default: `token` is a string, or `() => Promise<string>` which is called again once on
    a `401`, retrying that request once. That is the only retry the package makes.
 2. **`Files` and `Jobs`** take any `Transport`: `new Files(transport)`. They never touch anything but the transport, so a helper
-   you write has the same powers. `Files` looks at the sandbox once, in ONE `sh -c` round trip on the first file operation
-   (`rg` or GNU `grep` or busybox `grep`; `find -printf`; whether `dd`/`base64` can read windows), and a listing without
-   `-printf` takes two `find` passes. Writes always send their content on stdin.
+   you write has the same powers. `Files` looks at the sandbox once, in ONE `sh -c` round trip on the first operation that
+   needs it (`read`, `list`, `search` — a write needs nothing and never probes): `rg` or GNU `grep` or busybox `grep`;
+   `find -printf`; whether `dd`/`base64` can read windows. A listing without `-printf` takes two `find` passes. Writes
+   always send their content on stdin.
 3. **`Sandbox`** composes both and always exposes raw exec (`sb.exec`, `sb.stream`, `sb.transport`) and
    `sb.capabilities()` (the same probe as `sb.files.capabilities()`).
 

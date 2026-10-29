@@ -427,6 +427,14 @@ describe("parseStat", () => {
 });
 
 describe("parseDirEntries (find -printf)", () => {
+  it("skips empty NUL records instead of stopping the listing", () => {
+    const out = ["f\t1\ta", "", "f\t2\tb", ""].join("\0");
+    expect(parseDirEntries(out, 100, true).map((e) => e.name)).toEqual([
+      "a",
+      "b",
+    ]);
+  });
+
   const rec = (...r: string[]) => r.join("\0") + "\0";
   it("splits at the first two tabs only, and maps the types", () => {
     const out = rec("f\t5\ta\tb", "d\t4096\tsub", "p\t0\tfifo");
