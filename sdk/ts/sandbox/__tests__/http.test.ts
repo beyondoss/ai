@@ -542,7 +542,7 @@ describe("decodeFrameLine", () => {
     expect(() => dec("{\"stdout\":\"***\"}")).toThrow(/base64/);
   });
   it("ignores a non-integer exit_code instead of treating it as final", () => {
-    expect(dec('{"exit_code":1.5}')).toEqual(["heartbeat"]);
-    expect(dec('{"exit_code":null}')).toEqual(["heartbeat"]);
+    expect(dec("{\"exit_code\":1.5}")).toEqual(["heartbeat"]);
+    expect(dec("{\"exit_code\":null}")).toEqual(["heartbeat"]);
   });
 });

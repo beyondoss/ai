@@ -9,8 +9,8 @@ import {
   TransportError,
 } from "./errors.js";
 import {
-  isJobId,
   type Frame,
+  isJobId,
   type JobChunk,
   type JobFrame,
   type JobInfo,
