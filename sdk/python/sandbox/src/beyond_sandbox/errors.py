@@ -19,19 +19,19 @@ class SandboxError(Exception):
 
 
 # A command ran and failed (section 3.3).
-class NotFound(SandboxError):
+class NotFoundError(SandboxError):
     kind = "not_found"
 
 
-class IsDirectory(SandboxError):
+class IsDirectoryError(SandboxError):
     kind = "is_directory"
 
 
-class NotADirectory(SandboxError):
+class NotADirectoryError(SandboxError):
     kind = "not_a_directory"
 
 
-class PermissionDenied(SandboxError):
+class PermissionDeniedError(SandboxError):
     kind = "permission_denied"
 
 
@@ -40,20 +40,20 @@ class IoError(SandboxError):
 
 
 # The request or the caller.
-class InvalidQuery(SandboxError):
+class InvalidQueryError(SandboxError):
     kind = "invalid_query"
 
 
-class Conflict(SandboxError):
+class ConflictError(SandboxError):
     kind = "conflict"
 
 
-class InvalidRequest(SandboxError):
+class InvalidRequestError(SandboxError):
     kind = "invalid_request"
 
 
 # The transport (section 3.2).
-class TooLarge(SandboxError):
+class TooLargeError(SandboxError):
     kind = "too_large"
 
 
@@ -61,7 +61,7 @@ class AuthError(SandboxError):
     kind = "auth"
 
 
-class Timeout(SandboxError):
+class TimeoutError(SandboxError):
     kind = "timeout"
 
 
@@ -77,23 +77,30 @@ class EndpointError(SandboxError):
     kind = "endpoint"
 
 
+class NotOfferedError(SandboxError):
+    """The endpoint or transport lacks the capability (no stream, no jobs, …)."""
+
+    kind = "not_offered"
+
+
 _BY_KIND: dict[str, type[SandboxError]] = {
     cls.kind: cls
     for cls in (
-        NotFound,
-        IsDirectory,
-        NotADirectory,
-        PermissionDenied,
+        NotFoundError,
+        IsDirectoryError,
+        NotADirectoryError,
+        PermissionDeniedError,
         IoError,
-        InvalidQuery,
-        Conflict,
-        InvalidRequest,
-        TooLarge,
+        InvalidQueryError,
+        ConflictError,
+        InvalidRequestError,
+        TooLargeError,
         AuthError,
-        Timeout,
+        TimeoutError,
         TransportError,
         ProtocolError,
         EndpointError,
+        NotOfferedError,
     )
 }
 
@@ -111,11 +118,11 @@ def classify_stderr(detail: str) -> SandboxError:
         or "directory nonexistent" in low
         or "nonexistent directory" in low
     ):
-        return NotFound(detail)
+        return NotFoundError(detail)
     if "is a directory" in low:
-        return IsDirectory(detail)
+        return IsDirectoryError(detail)
     if "not a directory" in low:
-        return NotADirectory(detail)
+        return NotADirectoryError(detail)
     if "permission denied" in low:
-        return PermissionDenied(detail)
+        return PermissionDeniedError(detail)
     return IoError(detail)

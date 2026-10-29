@@ -8,7 +8,8 @@ from beyond_sandbox import Sandbox
 
 sb = Sandbox.connect("https://sandbox.example/exec", token="...")   # nothing is sent yet
 sb.exec("git", ["status", "--porcelain"], cwd="/work").stdout_text  # raw exec: a result, any exit code
-sb.files.write("/work/hello.py", b"print('hi')\n")                  # atomic, keeps mode, follows symlinks
+sb.files.write("/work/hello.py", "print('hi')\n")                   # atomic; str or bytes; keeps mode
+sb.files.read_text("/work/hello.py")                                # UTF-8 view of read (lossy, like stdout_text)
 sb.files.search("TODO", "/work", glob="*.py", before=1).hits        # rg, grep or busybox grep, whichever is there
 with sb.stream("make", ["-j8"], cwd="/work") as frames:             # output as it happens; leaving kills it
     for frame in frames: print(frame)
@@ -20,8 +21,8 @@ print(sb.jobs.read("my-session", "dev").data)                       # its output
 from beyond_sandbox import AsyncSandbox
 
 async with AsyncSandbox.connect("https://sandbox.example/exec", token="...") as sb:
-    await sb.files.write("/work/a.txt", b"x")
-    results = await asyncio.gather(sb.exec("uname"), sb.files.read("/work/a.txt"))
+    await sb.files.write("/work/a.txt", "x")
+    results = await asyncio.gather(sb.exec("uname"), sb.files.read_text("/work/a.txt"))
 ```
 
 It speaks the exec protocol (one `POST` per command; streaming; sandbox-native jobs), as
@@ -32,18 +33,19 @@ backend next to the Rust, MCP and TypeScript clients.
 
 ## Three layers, each usable alone
 
-| layer       | what                                                                            | import                                     |
-| ----------- | ------------------------------------------------------------------------------- | ------------------------------------------ |
-| 1 Transport | raw exec: `run`, `stream`, and jobs                                             | `HttpTransport`, `AsyncHttpTransport`      |
-| 2 Helpers   | `Files` (stat, read, write, write_if_unchanged, mkdir, list, search) and `Jobs` | `Files`, `Jobs`, `AsyncFiles`, `AsyncJobs` |
-| 3 Surface   | `Sandbox` gathers them and always keeps raw exec in reach                       | `Sandbox`, `AsyncSandbox`                  |
+| layer       | what                                                                                       | import                                     |
+| ----------- | ------------------------------------------------------------------------------------------ | ------------------------------------------ |
+| 1 Transport | raw exec: `run`, `stream`, and jobs                                                        | `HttpTransport`, `AsyncHttpTransport`      |
+| 2 Helpers   | `Files` (stat, read, read_text, write, write_if_unchanged, mkdir, list, search) and `Jobs` | `Files`, `Jobs`, `AsyncFiles`, `AsyncJobs` |
+| 3 Surface   | `Sandbox` gathers them and always keeps raw exec in reach                                  | `Sandbox`, `AsyncSandbox`                  |
 
 A helper is built on a transport's public `run` and nothing else, so everything in layer 2 works over
 any transport. `sandbox.transport` is the transport; `sandbox.exec` and `sandbox.stream` are its calls.
 
 Every failure is a `SandboxError` whose `kind` is the spec's error name (`not_found`, `is_directory`,
-`permission_denied`, `conflict`, `auth`, `timeout`, `too_large`, ...); each kind is
-also a class (`NotFound`, `Conflict`, `AuthError`, ...). A command that exits non-zero is a result, not an error.
+`permission_denied`, `conflict`, `auth`, `timeout`, `too_large`, `not_offered`, ...); each kind is
+also a class (`NotFoundError`, `ConflictError`, `AuthError`, `NotOfferedError`, ...). A command that
+exits non-zero is a result, not an error.
 
 ## Authentication
 
@@ -73,7 +75,7 @@ class LocalTransport:
         return ExecResult(p.returncode, p.stdout, p.stderr)
 
 files = Files(LocalTransport())
-files.write("/tmp/x", b"hello")     # the same atomic write and search, with no HTTP at all
+files.write("/tmp/x", "hello")      # the same atomic write and search, with no HTTP at all
 ```
 
 `HttpTransport` is the default implementation, not the definition. `Sandbox` and `Jobs` also need
@@ -121,7 +123,9 @@ Both return a `Transfer(files, dirs, links, bytes)`; `AsyncSandbox` has the same
 ## Behaviour worth knowing
 
 - `files.write` replaces a file atomically (temp beside the file, then `mv`), keeps its mode, writes
-  through symlinks, and never leaves a temp behind; the data travels as the command's stdin. `files.write_if_unchanged(path, data, expected_mtime)` raises `Conflict` on a mismatch
+  through symlinks, and never leaves a temp behind; `data` is `str` (UTF-8) or `bytes` and travels as
+  the command's stdin. `files.read_text` is `read` decoded the same way as `stdout_text`.
+  `files.write_if_unchanged(path, data, expected_mtime)` raises `ConflictError` on a mismatch
   (`None` means the file must not exist); it is two round trips, a guard rather than a lock.
 - `files.search` picks `rg`, GNU `grep` or busybox `grep`, reports the engine
   (`sandbox.capabilities().search_engine`), sorts by path components, counts only matches toward
@@ -132,7 +136,7 @@ Both return a `Transfer(files, dirs, links, bytes)`; `AsyncSandbox` has the same
   `cat` of a binary comes back intact. The file and job helpers decode that output as text in one
   place, `ExecResult.stdout_text` / `stderr_text`.
 - The response of a one-shot call is read incrementally and capped at 16 MiB (of decoded output, stdout and
-  stderr together); over the cap the call raises `TooLarge` and says the command ran. Streams are never
+  stderr together); over the cap the call raises `TooLargeError` and says the command ran. Streams are never
   buffered whole.
 - Closing a stream (`with`, `.close()`) kills the command. Jobs outlive the connection that started
   them: start with `jobs.start`, follow with `jobs.attach` or `jobs.follow`, stop with `jobs.kill`.

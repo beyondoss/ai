@@ -9,7 +9,7 @@ from typing import TypedDict
 from . import _fs
 from ._drive import Op, adrive, drive
 from .atransport import AsyncTransport
-from .errors import InvalidRequest
+from .errors import InvalidRequestError
 from .models import Capabilities, Entry, SearchResult, Stat
 from .transport import Transport
 
@@ -27,7 +27,7 @@ def apply_override(caps: Capabilities, override: CapsOverride | None) -> Capabil
     engine = override.get("search_engine")
     if engine is not None:
         if engine not in ("rg", "grep", "busybox-grep"):
-            raise InvalidRequest(f"unknown search engine {engine!r}")
+            raise InvalidRequestError(f"unknown search engine {engine!r}")
         caps = _fs.with_engine(caps, engine)
     return _fs.capabilities(
         caps.rg, caps.grep_null, override.get("find_printf", caps.find_printf), caps.read_window
@@ -36,7 +36,11 @@ def apply_override(caps: Capabilities, override: CapsOverride | None) -> Capabil
 
 def _count(name: str, value: int | None) -> None:
     if value is not None and (isinstance(value, bool) or value < 0):
-        raise InvalidRequest(f"`{name}` must be a non-negative integer")
+        raise InvalidRequestError(f"`{name}` must be a non-negative integer")
+
+
+def _bytes(data: bytes | str) -> bytes:
+    return data.encode("utf-8") if isinstance(data, str) else data
 
 
 def _query(
@@ -82,16 +86,26 @@ class Files:
         _count("max", max)
         return drive(_fs.read(path, offset, max, self.capabilities()), self._t)
 
-    def write(self, path: str, data: bytes) -> None:
-        """Replace the file's content atomically, keeping its mode and writing through symlinks."""
-        drive(_fs.write(path, data), self._t)
+    def read_text(self, path: str, offset: int = 0, max: int | None = None) -> str:  # noqa: A002
+        """:meth:`read` decoded as UTF-8 (invalid sequences replaced, same as ``stdout_text``)."""
+        return self.read(path, offset, max).decode("utf-8", "replace")
 
-    def write_if_unchanged(self, path: str, data: bytes, expected_mtime: float | None) -> None:
+    def write(self, path: str, data: bytes | str) -> None:
+        """Replace the file's content atomically, keeping its mode and writing through symlinks.
+
+        ``data`` may be ``str`` (encoded as UTF-8) or ``bytes``.
+        """
+        drive(_fs.write(path, _bytes(data)), self._t)
+
+    def write_if_unchanged(
+        self, path: str, data: bytes | str, expected_mtime: float | None
+    ) -> None:
         """Write unless the file's mtime (epoch seconds, with the fraction) differs; ``None`` means "must not exist".
 
-        Raises :class:`~beyond_sandbox.Conflict` on a mismatch. Two round trips: not a lock.
+        Raises :class:`~beyond_sandbox.ConflictError` on a mismatch. Two round trips: not a lock.
+        ``data`` may be ``str`` (UTF-8) or ``bytes``.
         """
-        drive(_fs.write_if_unchanged(path, data, expected_mtime), self._t)
+        drive(_fs.write_if_unchanged(path, _bytes(data), expected_mtime), self._t)
 
     def mkdir(self, path: str) -> None:
         """``mkdir -p``: idempotent."""
@@ -144,13 +158,17 @@ class AsyncFiles:
         _count("max", max)
         return await adrive(_fs.read(path, offset, max, await self.capabilities()), self._t)
 
-    async def write(self, path: str, data: bytes) -> None:
-        await adrive(_fs.write(path, data), self._t)
+    async def read_text(self, path: str, offset: int = 0, max: int | None = None) -> str:  # noqa: A002
+        """:meth:`read` decoded as UTF-8 (invalid sequences replaced, same as ``stdout_text``)."""
+        return (await self.read(path, offset, max)).decode("utf-8", "replace")
+
+    async def write(self, path: str, data: bytes | str) -> None:
+        await adrive(_fs.write(path, _bytes(data)), self._t)
 
     async def write_if_unchanged(
-        self, path: str, data: bytes, expected_mtime: float | None
+        self, path: str, data: bytes | str, expected_mtime: float | None
     ) -> None:
-        await adrive(_fs.write_if_unchanged(path, data, expected_mtime), self._t)
+        await adrive(_fs.write_if_unchanged(path, _bytes(data), expected_mtime), self._t)
 
     async def mkdir(self, path: str) -> None:
         await adrive(_fs.mkdir(path), self._t)

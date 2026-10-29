@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-from .errors import InvalidRequest
+from .errors import InvalidRequestError
 
 #: The longest response head accepted. Bounds what a broken endpoint can make us buffer.
 MAX_HEAD = 64 * 1024
@@ -44,9 +44,9 @@ def parse_url(url: str) -> Target:
         parts = urlsplit(url)
         port = parts.port
     except ValueError as e:
-        raise InvalidRequest(f"invalid exec URL {url!r}: {e}") from None
+        raise InvalidRequestError(f"invalid exec URL {url!r}: {e}") from None
     if parts.scheme not in ("http", "https") or not parts.hostname:
-        raise InvalidRequest(f"exec URL must be http or https with a host, got {url!r}")
+        raise InvalidRequestError(f"exec URL must be http or https with a host, got {url!r}")
     host = parts.hostname
     default = 443 if parts.scheme == "https" else 80
     shown = f"[{host}]" if ":" in host else host
@@ -71,7 +71,7 @@ def build_request(target: Target, headers: list[tuple[str, str]], body: bytes) -
     ]
     for name, value in headers:
         if any(c in name + value for c in "\r\n\0"):
-            raise InvalidRequest(f"header {name!r} contains a control character")
+            raise InvalidRequestError(f"header {name!r} contains a control character")
         lines.append(f"{name}: {value}")
     return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body
 

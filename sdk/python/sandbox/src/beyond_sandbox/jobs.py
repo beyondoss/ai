@@ -7,18 +7,28 @@ started it, and its output can be read from any offset.
 from __future__ import annotations
 
 import builtins
-from typing import Any, AsyncIterator, Iterator, Sequence
+from typing import AsyncIterator, Iterator, Sequence
 
 from . import _jobs
 from ._drive import _DONE, adrive, adrive_emit, aiter_events, drive, drive_iter
 from .atransport import AsyncJobTransport
-from .models import Attached, JobEnd, JobGap, JobInfo, JobOutput, JobRead, JobShellExit, Survivor
+from .models import (
+    Attached,
+    JobEnd,
+    JobFrame,
+    JobGap,
+    JobInfo,
+    JobOutput,
+    JobRead,
+    JobShellExit,
+    Survivor,
+)
 from .transport import JobTransport
 
 READ_MAX = _jobs.READ_MAX
 
 
-def _collect(a: Attached, ev: Any) -> None:
+def _collect(a: Attached, ev: JobFrame) -> None:
     if isinstance(ev, JobOutput):
         a.output += ev.data
     elif isinstance(ev, JobGap):
@@ -54,8 +64,8 @@ class Jobs:
         """Up to ``max`` bytes of output from ``offset``. An unknown job is ``gone``, not an error."""
         return drive(_jobs.read(scope, job, offset, max), self._t)
 
-    def follow(self, scope: str, job: str, offset: int = 0) -> Iterator[Any]:
-        """Events (:class:`JobOutput`, :class:`JobGap`, :class:`JobShellExit`), ending with a
+    def follow(self, scope: str, job: str, offset: int = 0) -> Iterator[JobFrame]:
+        """Events (:class:`JobOutput`, :class:`JobGap`, :class:`JobShellExit`, …), ending with a
         :class:`JobEnd` once the job's group is empty. Stopping early leaves the job running."""
         op = _jobs.follow(scope, job, offset)
         for item in drive_iter(op, self._t):
@@ -84,8 +94,8 @@ class Jobs:
         """Delete ended jobs; never a running one."""
         drive(_jobs.remove(scope, jobs), self._t)
 
-    def wipe(self, scope: str) -> builtins.list[str]:
-        """Kill and delete every job of the scope."""
+    def wipe(self, scope: str) -> builtins.list[Survivor]:
+        """Kill and delete every job of the scope; the groups that survived."""
         return drive(_jobs.wipe(scope), self._t)
 
 
@@ -114,7 +124,7 @@ class AsyncJobs:
     async def read(self, scope: str, job: str, offset: int = 0, max: int = READ_MAX) -> JobRead:  # noqa: A002
         return await adrive(_jobs.read(scope, job, offset, max), self._t)
 
-    async def follow(self, scope: str, job: str, offset: int = 0) -> AsyncIterator[Any]:
+    async def follow(self, scope: str, job: str, offset: int = 0) -> AsyncIterator[JobFrame]:
         """As :meth:`Jobs.follow`."""
         op = _jobs.follow(scope, job, offset)
         events = aiter_events(op, self._t)
@@ -131,7 +141,7 @@ class AsyncJobs:
         result = Attached(-1)
         op = _jobs.follow(scope, job, offset)
 
-        async def collect(ev: Any) -> None:
+        async def collect(ev: JobFrame) -> None:
             _collect(result, ev)
 
         end = await adrive_emit(op, self._t, collect)
@@ -146,5 +156,5 @@ class AsyncJobs:
     async def remove(self, scope: str, jobs: Sequence[str]) -> None:
         await adrive(_jobs.remove(scope, jobs), self._t)
 
-    async def wipe(self, scope: str) -> builtins.list[str]:
+    async def wipe(self, scope: str) -> builtins.list[Survivor]:
         return await adrive(_jobs.wipe(scope), self._t)

@@ -11,7 +11,7 @@ from typing import Sequence
 
 from . import _wire
 from ._drive import Call, Follow, Op
-from .errors import InvalidRequest, IoError
+from .errors import InvalidRequestError, IoError
 from .models import JobEnd, JobInfo, JobRead, Survivor
 
 #: The most one ``read`` returns by default: its base64 fits the smallest answer a runner keeps whole.
@@ -25,13 +25,13 @@ _SCOPE = re.compile(r"[0-9a-z-]{1,64}")
 
 def check_id(job: str) -> str:
     if not _JOB_ID.fullmatch(job):
-        raise InvalidRequest(f"bad job id {job!r}: 1 to 32 characters of [0-9a-z]")
+        raise InvalidRequestError(f"bad job id {job!r}: 1 to 32 characters of [0-9a-z]")
     return job
 
 
 def check_scope(scope: str) -> str:
     if not _SCOPE.fullmatch(scope):
-        raise InvalidRequest(f"bad job scope {scope!r}: 1 to 64 characters of [0-9a-z-]")
+        raise InvalidRequestError(f"bad job scope {scope!r}: 1 to 64 characters of [0-9a-z-]")
     return scope
 
 
@@ -94,7 +94,7 @@ def remove(scope: str, ids: Sequence[str]) -> Op[None]:
         yield Call(_wire.job_op("remove", scope, ids=list(ids)))
 
 
-def wipe(scope: str) -> Op[list[str]]:
+def wipe(scope: str) -> Op[list[Survivor]]:
     check_scope(scope)
     v = yield Call(_wire.job_op("wipe", scope, grace_ms=KILL_GRACE_MS))
-    return [s.detail for s in _wire.parse_survivors(v)]
+    return _wire.parse_survivors(v)

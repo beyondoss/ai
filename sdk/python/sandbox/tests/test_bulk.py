@@ -21,11 +21,11 @@ from beyond_sandbox import (
     AsyncSandbox,
     ExecResult,
     Exit,
-    InvalidRequest,
+    InvalidRequestError,
     IoError,
-    IsDirectory,
-    NotADirectory,
-    NotFound,
+    IsDirectoryError,
+    NotADirectoryError,
+    NotFoundError,
     ProtocolError,
     Sandbox,
     Stderr,
@@ -353,7 +353,7 @@ def test_what_it_cannot_make(tmp_path: Path) -> None:
     with pytest.raises(ProtocolError):
         _bulk.extract(b"this is not a tar archive at all" * 40, tmp_path)
     (tmp_path / "d").mkdir()
-    with pytest.raises(IsDirectory):
+    with pytest.raises(IsDirectoryError):
         _bulk.extract(raw_tar([f("d")]), tmp_path)
 
 
@@ -421,21 +421,21 @@ def test_failures(tmp_path: Path) -> None:
     (tmp_path / "f").write_bytes(b"file")
     (tmp_path / "s").mkdir()
     (tmp_path / "s" / "x").write_bytes(b"x")
-    with pytest.raises(NotADirectory):
+    with pytest.raises(NotADirectoryError):
         sb.upload(tmp_path / "s", str(tmp_path / "f"))
     assert (tmp_path / "f").read_bytes() == b"file"
     for bad in ("relative/dir", "/"):
-        with pytest.raises(InvalidRequest):
+        with pytest.raises(InvalidRequestError):
             sb.upload(tmp_path / "s", bad)
     os.mkfifo(tmp_path / "s" / "pipe")
-    with pytest.raises(InvalidRequest, match="pipe"):
+    with pytest.raises(InvalidRequestError, match="pipe"):
         sb.upload(tmp_path / "s", str(tmp_path / "d"))
     assert not (tmp_path / "d").exists()
-    with pytest.raises(NotFound):
+    with pytest.raises(NotFoundError):
         sb.download(str(tmp_path / "nope"), tmp_path / "back")
-    with pytest.raises(InvalidRequest):
+    with pytest.raises(InvalidRequestError):
         sb.download("nope", tmp_path / "back")
-    with pytest.raises(NotFound):
+    with pytest.raises(NotFoundError):
         sb.upload(tmp_path / "missing", str(tmp_path / "d"))
 
 

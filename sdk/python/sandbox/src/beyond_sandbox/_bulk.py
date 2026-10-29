@@ -20,7 +20,7 @@ from . import _scripts, _tar
 from ._drive import Op, Pipe, Run
 from ._fs import fail, new_suffix, sh
 from .errors import (
-    InvalidRequest,
+    InvalidRequestError,
     IoError,
     ProtocolError,
     SandboxError,
@@ -46,11 +46,11 @@ def local_error(path: object, e: OSError) -> SandboxError:
 
 def _remote_path(what: str, p: str, *, not_root: bool) -> None:
     if not p.startswith("/"):
-        raise InvalidRequest(f"{what} must be absolute: {p!r}")
+        raise InvalidRequestError(f"{what} must be absolute: {p!r}")
     if not_root and not p.rstrip("/"):
-        raise InvalidRequest(f"{what} must not be /")
+        raise InvalidRequestError(f"{what} must not be /")
     if "\0" in p:
-        raise InvalidRequest(f"{what} has a NUL")
+        raise InvalidRequestError(f"{what} has a NUL")
 
 
 # ---- upload: the archive, lazily ----------------------------------------------------------------
@@ -74,7 +74,7 @@ def _pieces(name: bytes, path: bytes, counts: _Counts) -> Iterator[bytes]:
     try:
         name.decode("utf-8")
     except UnicodeDecodeError:
-        raise InvalidRequest(f"{shown}: the name is not valid UTF-8") from None
+        raise InvalidRequestError(f"{shown}: the name is not valid UTF-8") from None
     mode = st.st_mode
     mtime = max(st.st_mtime_ns // 1_000_000_000, 0)
     e = _tar.Entry(name, b"0", stat_mod.S_IMODE(mode) & 0o777, 0, mtime)
@@ -128,7 +128,7 @@ def _pieces(name: bytes, path: bytes, counts: _Counts) -> Iterator[bytes]:
             if stat_mod.S_ISSOCK(mode)
             else "a device"
         )
-        raise InvalidRequest(f"{shown}: {what} cannot be uploaded")
+        raise InvalidRequestError(f"{shown}: {what} cannot be uploaded")
 
 
 def _all_pieces(sources: Any, counts: _Counts) -> Iterator[bytes]:
@@ -148,7 +148,7 @@ def _all_pieces(sources: Any, counts: _Counts) -> Iterator[bytes]:
             b = os.fsencode(p)
             base = os.path.basename(b.rstrip(b"/")) if b.rstrip(b"/") else b""
             if base in (b"", b".", b".."):
-                raise InvalidRequest(f"{os.fsdecode(b)}: no base name")
+                raise InvalidRequestError(f"{os.fsdecode(b)}: no base name")
             yield from _pieces(base, b, counts)
     yield _tar.END
 

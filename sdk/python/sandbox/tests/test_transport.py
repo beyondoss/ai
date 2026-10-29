@@ -25,10 +25,10 @@ from beyond_sandbox import (
     HttpTransport,
     ProtocolError,
     Stdout,
-    TooLarge,
+    TooLargeError,
     TransportError,
 )
-from beyond_sandbox.errors import Timeout
+from beyond_sandbox.errors import TimeoutError
 
 Handler = Callable[[BaseHTTPRequestHandler, dict[str, Any]], None]
 
@@ -188,7 +188,7 @@ def test_status_errors(ep: Endpoint) -> None:
         HttpTransport(ep.url).run("true")
     assert e.value.status == 500 and "boom" in e.value.detail
     ep.handler = lambda h, b: reply(h, 422, {"error": "output exceeded the cap"})
-    with pytest.raises(TooLarge):
+    with pytest.raises(TooLargeError):
         HttpTransport(ep.url).run("true")
 
 
@@ -202,7 +202,7 @@ def test_the_response_cap_stops_reading_and_says_the_command_ran(ep: Endpoint) -
     ep.handler = lambda h, b: reply(
         h, 200, {"exit_code": 0, "stdout": b64(b"x" * 20000), "stderr": ""}
     )
-    with pytest.raises(TooLarge) as e:
+    with pytest.raises(TooLargeError) as e:
         HttpTransport(ep.url, max_response_bytes=1000).run("true")
     assert "the command ran" in e.value.detail
 
@@ -216,7 +216,7 @@ def test_the_cap_applies_to_a_chunked_body_with_no_length(ep: Endpoint) -> None:
         h.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n0\r\n\r\n")
 
     ep.handler = handler
-    with pytest.raises(TooLarge):
+    with pytest.raises(TooLargeError):
         HttpTransport(ep.url, max_response_bytes=1000).run("true")
 
 
@@ -233,7 +233,7 @@ def test_the_request_deadline_is_timeout_plus_grace(
     monkeypatch.setattr(_wire, "GRACE_S", 0.3)
     ep.handler = lambda h, b: time.sleep(2)
     t0 = time.monotonic()
-    with pytest.raises(Timeout):
+    with pytest.raises(TimeoutError):
         HttpTransport(ep.url).run("true", timeout_ms=100)
     assert 0.3 <= time.monotonic() - t0 < 1.5
 
@@ -321,7 +321,7 @@ def test_async_run_refresh_and_errors(ep: Endpoint) -> None:
         ep.handler = lambda h, b: reply(
             h, 200, {"exit_code": 0, "stdout": b64(b"x" * 20000), "stderr": ""}
         )
-        with pytest.raises(TooLarge):
+        with pytest.raises(TooLargeError):
             await AsyncHttpTransport(ep.url, max_response_bytes=1000).run("true")
         with pytest.raises(TransportError):
             await AsyncHttpTransport("http://127.0.0.1:1/").run("true")
