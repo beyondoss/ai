@@ -382,3 +382,33 @@ def test_https_sync_and_async(tls_endpoint: tuple[Endpoint, ssl.SSLContext]) -> 
     # the default context does not trust a self-signed certificate
     with pytest.raises(TransportError):
         HttpTransport(ep.url).run("true")
+
+
+def test_default_tls_context_is_built_once(
+    tls_endpoint: tuple[Endpoint, ssl.SSLContext], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ssl_context=None`` must not rebuild the system trust store on every request."""
+    ep, ctx = tls_endpoint
+    ep.handler = lambda h, b: reply(h, 200, {"exit_code": 0, "stdout": b64(b"ok"), "stderr": ""})
+    calls = {"n": 0}
+    real = ssl.create_default_context
+
+    def counting(*args: object, **kwargs: object) -> ssl.SSLContext:
+        calls["n"] += 1
+        real()  # pay create_default_context; return the fixture ctx that trusts the bench CA
+        return ctx
+
+    monkeypatch.setattr(ssl, "create_default_context", counting)
+    t = HttpTransport(ep.url)
+    assert t.run("true").stdout == b"ok"
+    assert t.run("true").stdout == b"ok"
+    assert t.run("true").stdout == b"ok"
+    assert calls["n"] == 1
+
+    async def main() -> None:
+        at = AsyncHttpTransport(ep.url)
+        assert (await at.run("true")).stdout == b"ok"
+        assert (await at.run("true")).stdout == b"ok"
+        assert calls["n"] == 2  # one more for the async transport
+
+    asyncio.run(main())

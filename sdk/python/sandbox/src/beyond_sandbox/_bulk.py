@@ -162,10 +162,7 @@ def chunks(pieces: Iterable[bytes], chunk: int) -> Iterator[tuple[bytes, bool]]:
         while len(buf) >= chunk:
             yield bytes(buf[:chunk]), False
             del buf[:chunk]
-    # `pieces` ends with the end-of-archive blocks, so what is left is the tail.
-    while len(buf) > chunk:
-        yield bytes(buf[:chunk]), False
-        del buf[:chunk]
+    # `pieces` ends with the end-of-archive blocks, so what is left is the tail (< chunk).
     yield bytes(buf), True
 
 

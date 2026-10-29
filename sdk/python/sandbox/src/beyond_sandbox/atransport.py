@@ -137,7 +137,7 @@ class _Response:
             raise _wire.too_large(self._url, cap)
         body = bytearray()
         while True:
-            body += self._p.take()
+            self._p.take_into(body)
             if len(body) > cap:
                 await self.close()
                 raise _wire.too_large(self._url, cap)
@@ -221,6 +221,14 @@ class AsyncHttpTransport:
         self._ssl = ssl_context
         self._lock = asyncio.Lock()
 
+    def _tls_context(self) -> ssl.SSLContext:
+        """The SSL context for HTTPS: the one passed in, or a cached ``create_default_context``."""
+        ctx = self._ssl
+        if ctx is None:
+            ctx = ssl.create_default_context()
+            self._ssl = ctx
+        return ctx
+
     async def _bearer(self, refresh: bool) -> list[tuple[str, str]]:
         async with self._lock:
             if callable(self._token) and (refresh or self._token_value is None):
@@ -243,7 +251,7 @@ class AsyncHttpTransport:
         )
         t = self._target
         try:
-            ctx = (self._ssl or ssl.create_default_context()) if t.tls else None
+            ctx = self._tls_context() if t.tls else None
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(
                     t.host, t.port, ssl=ctx, server_hostname=t.host if t.tls else None
