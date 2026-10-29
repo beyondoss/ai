@@ -25,7 +25,6 @@ async with AsyncSandbox.connect("https://sandbox.example/exec", token="...") as 
     results = await asyncio.gather(sb.exec("uname"), sb.files.read_text("/work/a.txt"))
 ```
 
-
 It speaks the exec protocol (one `POST` per command; streaming; sandbox-native jobs), as
 served by [`execd`](../../../crates/execd) or any endpoint that implements it. Behaviour is specified
 by [FILES-OVER-EXEC.md](../../conformance/FILES-OVER-EXEC.md) and proven by the shared conformance
@@ -34,11 +33,11 @@ backend next to the Rust, MCP and TypeScript clients.
 
 ## Three layers, each usable alone
 
-| layer       | what                                                                            | import                                     |
-| ----------- | ------------------------------------------------------------------------------- | ------------------------------------------ |
-| 1 Transport | raw exec: `run`, `stream`, and jobs                                             | `HttpTransport`, `AsyncHttpTransport`      |
+| layer       | what                                                                                       | import                                     |
+| ----------- | ------------------------------------------------------------------------------------------ | ------------------------------------------ |
+| 1 Transport | raw exec: `run`, `stream`, and jobs                                                        | `HttpTransport`, `AsyncHttpTransport`      |
 | 2 Helpers   | `Files` (stat, read, read_text, write, write_if_unchanged, mkdir, list, search) and `Jobs` | `Files`, `Jobs`, `AsyncFiles`, `AsyncJobs` |
-| 3 Surface   | `Sandbox` gathers them and always keeps raw exec in reach                       | `Sandbox`, `AsyncSandbox`                  |
+| 3 Surface   | `Sandbox` gathers them and always keeps raw exec in reach                                  | `Sandbox`, `AsyncSandbox`                  |
 
 A helper is built on a transport's public `run` and nothing else, so everything in layer 2 works over
 any transport. `sandbox.transport` is the transport; `sandbox.exec` and `sandbox.stream` are its calls.
