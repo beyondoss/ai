@@ -58,6 +58,9 @@ function stripSpace(s: string): string {
  * Decodes with the platform, then re-encodes and compares: that rejects anything the decoder
  * silently skips (bad characters, wrong padding, bad length) and non-canonical trailing bits,
  * as the Rust client does. Both calls are native and linear.
+ *
+ * Measured (Node 22): a JS alphabet/trailing-bits pre-check + single decode was *slower* than
+ * this native decode+re-encode pair on multi-MiB inputs — keep the re-encode on Node.
  */
 export function fromBase64(s: string): Uint8Array | null {
   const clean = stripSpace(s);

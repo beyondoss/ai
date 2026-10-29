@@ -394,20 +394,23 @@ export class HttpTransport implements Transport {
   async *lines(ex: Exchange): AsyncGenerator<Uint8Array> {
     const reader = ex.res.body?.getReader();
     if (!reader) return;
+    // `start` is the first unread byte: we copy each line once and only compact
+    // the consumed prefix when appending the next network chunk (not on every NL).
     let buf: Uint8Array = new Uint8Array(0);
+    let start = 0;
     let scanned = 0;
     try {
       for (;;) {
         const nl = buf.indexOf(0x0a, scanned);
         if (nl >= 0) {
-          const line = buf.slice(0, nl);
-          buf = buf.slice(nl + 1);
-          scanned = 0;
+          const line = buf.slice(start, nl);
+          start = nl + 1;
+          scanned = start;
           yield line;
           continue;
         }
         scanned = buf.length;
-        if (buf.length > MAX_LINE) {
+        if (buf.length - start > MAX_LINE) {
           throw new ProtocolError(
             `exec endpoint ${this.url}: a frame exceeded ${MAX_LINE} bytes without a newline`,
           );
@@ -438,16 +441,26 @@ export class HttpTransport implements Transport {
           clearTimeout(silence);
         }
         if (next.done) {
-          if (buf.length > 0) {
+          if (start < buf.length) {
             throw new TransportError(
               `exec endpoint ${this.url}: the stream ended in the middle of a frame`,
             );
           }
           return;
         }
-        buf = buf.length === 0
-          ? new Uint8Array(next.value)
-          : concat([buf, next.value]);
+        if (start > 0) {
+          const rem = buf.subarray(start);
+          const merged = new Uint8Array(rem.length + next.value.length);
+          merged.set(rem, 0);
+          merged.set(next.value, rem.length);
+          buf = merged;
+          scanned = rem.length;
+          start = 0;
+        } else {
+          buf = buf.length === 0
+            ? new Uint8Array(next.value)
+            : concat([buf, next.value]);
+        }
       }
     } finally {
       reader.cancel().catch(() => {});
@@ -499,8 +512,21 @@ function errorText(e: unknown): string {
   return String(e);
 }
 
-function excerpt(body: Uint8Array): string {
-  return Array.from(text(body).trim()).slice(0, 400).join("");
+/**
+ * Up to 400 code points of a body for error detail. Only a UTF-8 prefix is
+ * decoded (enough for 400 4-byte characters), so a multi-MiB error body cannot
+ * force a full-body decode + `Array.from`.
+ */
+export function excerpt(body: Uint8Array): string {
+  const prefix = body.subarray(0, Math.min(body.length, 1600));
+  let out = "";
+  let n = 0;
+  for (const ch of text(prefix).trim()) {
+    if (n >= 400) break;
+    out += ch;
+    n++;
+  }
+  return out;
 }
 
 /** The error for an answer past the response cap: the command ran. */
