@@ -29,10 +29,10 @@ session, with 3 scenarios reported `unsupported` (those that need frames, or a s
 | `exec`       | run a shell command line (`sh -c`) and wait: `command`, `cwd`, `timeout_ms`, `stdin`. Always present: the escape hatch                                                                                                                                                                     |
 | `read_file`  | bytes of a file from `offset`, at most `max` (default 128 KiB); `encoding` `utf8` (default; base64 when the bytes are not UTF-8) or `base64`                                                                                                                                               |
 | `write_file` | create or replace a file atomically, from `content` or `content_base64`; creates missing parent directories (`create_parents: false` to fail instead); keeps an existing file's permissions; `if_unchanged_since` (the `stat` mtime) or `create_only` refuse a lost update with `conflict` |
-| `edit_file`  | replace `old_str` (must match once, or `replace_all`) with `new_str`; never overwrites a concurrent change                                                                                                                                                                                 |
+| `edit_file`  | replace `old_str` (must match once, or `replace_all`) with `new_str` in a UTF-8 file that fits in memory; never overwrites a concurrent change                                                                                                                                               |
 | `list_dir`   | entries with name, kind and size; `include_hidden`, `limit`                                                                                                                                                                                                                                |
 | `stat`       | exists, kind, size, mtime, writable                                                                                                                                                                                                                                                        |
-| `search`     | regular-expression search under a directory, with `context`, `glob`, `literal`, `ignore_case`, `limit`                                                                                                                                                                                     |
+| `search`     | regular-expression search under a directory, with `context`, `glob`, `literal`, `ignore_case`, `limit`; result includes `search_engine` (`rg` / `grep` / `busybox-grep`)                                                                                                                    |
 | `mkdir`      | create a directory and its parents                                                                                                                                                                                                                                                         |
 | `upload`     | copy a directory or file of this machine into a sandbox directory as tar (needs `SANDBOX_LOCAL_ROOT`)                                                                                                                                                                                      |
 | `download`   | copy a sandbox directory or file to a directory of this machine, never writing through a link (same)                                                                                                                                                                                       |
@@ -52,7 +52,9 @@ A failed call is a tool result with `isError: true` and `structuredContent.error
 `protocol`, `endpoint`, `not_offered`, `invalid_request`. An unreachable sandbox or a wrong token does not stop the server:
 the tools are listed, and each call says `transport` or `auth`.
 
-The resource `sandbox://capabilities` reports what the connected sandbox has: `search_engine` (`rg` honours `.gitignore`; `grep` does not), `find_printf`, `read_window`.
+The resource `sandbox://capabilities` reports what the connected sandbox has: `search_engine` (`rg` honours `.gitignore`; `grep` does not), `find_printf`, `read_window`. Every `search` result also includes `search_engine`, so an agent that never reads the resource still sees it.
+
+Optional tool arguments are omit-or-value in the schema (no JSON `null`). Tools carry MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`).
 
 ## Configuration
 

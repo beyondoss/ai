@@ -192,7 +192,12 @@ async fn files_edit_list_search_and_stat_work_through_the_tools() {
             json!({"pattern": "thr", "path": p("src"), "context": 1}),
         )
         .await;
-        let hits = ok(&s)["hits"].as_array().unwrap();
+        let s = ok(&s);
+        assert!(
+            ["rg", "grep", "busybox-grep"].contains(&s["search_engine"].as_str().unwrap()),
+            "{s}"
+        );
+        let hits = s["hits"].as_array().unwrap();
         assert!(
             hits.iter()
                 .any(|h| h["is_match"] == true && h["text"] == "three")

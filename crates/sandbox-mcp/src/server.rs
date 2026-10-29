@@ -22,6 +22,7 @@ use rmcp::model::{
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, schemars, tool, tool_handler, tool_router};
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -69,6 +70,65 @@ pub struct SandboxMcp {
 
 // ---- arguments ------------------------------------------------------------------------------
 
+/// An optional tool argument: omit the key or send a value — never JSON `null`.
+///
+/// Schemars' plain `Option<T>` advertises `type: [T, "null"]`, which invites models to send null.
+/// This wrapper keeps Rust `Option` ergonomics while the schema is omit-or-T only.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(transparent)]
+struct Opt<T>(Option<T>);
+
+impl<T> Opt<T> {
+    fn into_inner(self) -> Option<T> {
+        self.0
+    }
+
+    fn unwrap_or(self, default: T) -> T {
+        self.0.unwrap_or(default)
+    }
+
+    fn unwrap_or_default(self) -> T
+    where
+        T: Default,
+    {
+        self.0.unwrap_or_default()
+    }
+
+    fn map_or<U, F: FnOnce(T) -> U>(self, default: U, f: F) -> U {
+        self.0.map_or(default, f)
+    }
+
+    fn as_deref(&self) -> Option<&T::Target>
+    where
+        T: std::ops::Deref,
+    {
+        self.0.as_deref()
+    }
+}
+
+impl<T: JsonSchema> JsonSchema for Opt<T> {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        T::schema_name()
+    }
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Owned(format!("Opt<{}>", T::schema_id()))
+    }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        T::json_schema(generator)
+    }
+    fn inline_schema() -> bool {
+        true
+    }
+    fn _schemars_private_non_optional_json_schema(
+        generator: &mut schemars::SchemaGenerator,
+    ) -> schemars::Schema {
+        T::_schemars_private_non_optional_json_schema(generator)
+    }
+    fn _schemars_private_is_option() -> bool {
+        true
+    }
+}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UploadArgs {
@@ -78,7 +138,7 @@ pub struct UploadArgs {
     /// The sandbox directory to put it in (absolute; created if missing).
     remote_dir: String,
     /// When `local` is a directory: upload only these entries of it, each by its own name.
-    only: Option<Vec<String>>,
+    only: Opt<Vec<String>>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -99,13 +159,13 @@ pub struct ExecArgs {
     /// the one string you would type at a prompt; there is no separate argument list.
     command: String,
     /// Working directory. Default: the sandbox's own.
-    cwd: Option<String>,
+    cwd: Opt<String>,
     /// Kill the command after this many milliseconds. Default 120000.
-    timeout_ms: Option<u64>,
+    timeout_ms: Opt<u64>,
     /// Text for the command's standard input.
-    stdin: Option<String>,
+    stdin: Opt<String>,
     /// Bytes for the command's standard input, base64. Use instead of `stdin` for binary data.
-    stdin_base64: Option<String>,
+    stdin_base64: Opt<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -114,13 +174,13 @@ pub struct ReadFileArgs {
     /// Absolute path, or relative to the sandbox's working directory.
     path: String,
     /// Byte offset to start at. Default 0.
-    offset: Option<u64>,
+    offset: Opt<u64>,
     /// The most bytes to return. Default 131072. When the file is longer, `eof` is false: call
     /// again with `offset` set to the `next_offset` you were given.
-    max: Option<u64>,
+    max: Opt<u64>,
     /// `utf8` (default) returns text when the bytes are valid UTF-8 and base64 otherwise; `base64`
     /// always returns base64. The result's `encoding` says which you got.
-    encoding: Option<String>,
+    encoding: Opt<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -129,32 +189,33 @@ pub struct WriteFileArgs {
     /// Absolute path, or relative to the sandbox's working directory.
     path: String,
     /// The new contents as text. Give this or `content_base64`.
-    content: Option<String>,
+    content: Opt<String>,
     /// The new contents as base64, for binary files.
-    content_base64: Option<String>,
+    content_base64: Opt<String>,
     /// Write only if the file's mtime is still this: the `mtime` that `stat` returned, fraction
     /// included. If the file changed since (or was removed), nothing is written and the call fails
     /// with kind `conflict`. Leave out to write unconditionally.
-    if_unchanged_since: Option<f64>,
+    if_unchanged_since: Opt<f64>,
     /// Write only if no file exists at `path` yet (kind `conflict` if one does). Default false.
     /// Not combinable with `if_unchanged_since`.
-    create_only: Option<bool>,
+    create_only: Opt<bool>,
     /// Create missing parent directories (`mkdir -p`). Default true. With false, a missing parent
     /// fails with kind `not_found` and a detail naming the directory.
-    create_parents: Option<bool>,
+    create_parents: Opt<bool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EditFileArgs {
-    /// Path of an existing text file.
+    /// Path of an existing text file that fits in memory as UTF-8 text. For large or binary files
+    /// use `read_file` windows and `write_file`, or `exec`.
     path: String,
     /// The exact text to replace. Must occur once, unless `replace_all` is true.
     old_str: String,
     /// The text to put in its place.
     new_str: String,
     /// Replace every occurrence instead of requiring exactly one. Default false.
-    replace_all: Option<bool>,
+    replace_all: Opt<bool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -163,9 +224,9 @@ pub struct ListDirArgs {
     /// The directory.
     path: String,
     /// Include entries whose names start with a dot. Default false.
-    include_hidden: Option<bool>,
+    include_hidden: Opt<bool>,
     /// The most entries to return. Default 1000; `truncated` says when there were more.
-    limit: Option<u64>,
+    limit: Opt<u64>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -181,23 +242,23 @@ pub struct SearchArgs {
     /// What to find: a regular expression, or plain text with `literal`.
     pattern: String,
     /// The directory to search under. Default: the sandbox's working directory.
-    path: Option<String>,
+    path: Opt<String>,
     /// Lines of context before and after each match. Default 0.
-    context: Option<u64>,
+    context: Opt<u64>,
     /// Lines of context before each match; overrides `context`.
-    before: Option<u64>,
+    before: Opt<u64>,
     /// Lines of context after each match; overrides `context`.
-    after: Option<u64>,
+    after: Opt<u64>,
     /// The most hits to return (context lines count). Default 100; `truncated` says when there were more.
-    limit: Option<u64>,
+    limit: Opt<u64>,
     /// Treat `pattern` as plain text. Default false.
-    literal: Option<bool>,
+    literal: Opt<bool>,
     /// Ignore case. Default false.
-    ignore_case: Option<bool>,
+    ignore_case: Opt<bool>,
     /// Only search files whose names match this glob, e.g. `*.rs`.
-    glob: Option<String>,
+    glob: Opt<String>,
     /// Search every file except those matching `glob`. Default false.
-    glob_exclude: Option<bool>,
+    glob_exclude: Opt<bool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -207,20 +268,20 @@ pub struct JobStartArgs {
     /// work, e.g. `npm run dev` or `cd app && make 2>&1`. There is no separate argument list.
     command: String,
     /// Working directory. Default: the sandbox's own.
-    cwd: Option<String>,
+    cwd: Opt<String>,
     /// A short note shown in `job_list`.
-    label: Option<String>,
+    label: Opt<String>,
     /// The job's id: 1 to 32 characters of [0-9a-z]. Default: a random one, returned.
-    id: Option<String>,
+    id: Opt<String>,
     /// The group the job belongs to. Default: this server's.
-    scope: Option<String>,
+    scope: Opt<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct JobListArgs {
     /// The group to list. Default: this server's.
-    scope: Option<String>,
+    scope: Opt<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -229,14 +290,14 @@ pub struct JobOutputArgs {
     /// The job's id, from `job_start` or `job_list`.
     id: String,
     /// Byte offset in the job's combined output to start at. Default 0.
-    offset: Option<u64>,
+    offset: Opt<u64>,
     /// The most bytes to return. Default 131072. Call again with `offset` set to `next_offset`.
-    max: Option<u64>,
+    max: Opt<u64>,
     /// `utf8` (default) returns text when the bytes are valid UTF-8 and base64 otherwise; `base64`
     /// always returns base64. The result's `encoding` says which you got.
-    encoding: Option<String>,
+    encoding: Opt<String>,
     /// The group the job belongs to. Default: this server's.
-    scope: Option<String>,
+    scope: Opt<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -245,9 +306,9 @@ pub struct JobKillArgs {
     /// The jobs to stop.
     ids: Vec<String>,
     /// Also delete the stopped jobs and their output. Default false.
-    remove: Option<bool>,
+    remove: Opt<bool>,
     /// The group the jobs belong to. Default: this server's.
-    scope: Option<String>,
+    scope: Opt<String>,
 }
 
 // ---- helpers --------------------------------------------------------------------------------
@@ -409,16 +470,19 @@ impl SandboxMcp {
     pub async fn capabilities(&self) -> Out {
         let t = self.target().await?;
         let caps = t.files().capabilities().await?;
-        let engine = match caps.search_engine() {
-            SearchEngine::Ripgrep => "rg",
-            SearchEngine::PosixGrep => "grep",
-            SearchEngine::BusyboxGrep => "busybox-grep",
-        };
         Ok(json!({
-            "search_engine": engine,
+            "search_engine": search_engine_name(caps.search_engine()),
             "find_printf": caps.find_printf,
             "read_window": !caps.no_read_window,
         }))
+    }
+}
+
+fn search_engine_name(engine: SearchEngine) -> &'static str {
+    match engine {
+        SearchEngine::Ripgrep => "rg",
+        SearchEngine::PosixGrep => "grep",
+        SearchEngine::BusyboxGrep => "busybox-grep",
     }
 }
 
@@ -458,7 +522,8 @@ type ToolReply = Result<rmcp::model::CallToolResult, ErrorData>;
 impl SandboxMcp {
     #[tool(
         name = "exec",
-        description = "Run a shell command line in the sandbox (sh -c) and wait for it. `command` is the one string you would type at a prompt, e.g. `cd app && python -m pytest -q 2>&1 | tail -20`; pipes, &&, redirects and quotes work, and there is no separate args parameter. Returns exit_code, stdout and stderr, each with its encoding (utf8, or base64 when the bytes are not UTF-8); a non-zero exit is a normal result, not an error, and 127 means the command was not found. The whole output comes back, so for long-running or noisy commands use job_start and page the output with job_output."
+        description = "Run a shell command line in the sandbox (sh -c) and wait for it. `command` is the one string you would type at a prompt, e.g. `cd app && python -m pytest -q 2>&1 | tail -20`; pipes, &&, redirects and quotes work, and there is no separate args parameter. Returns exit_code, stdout and stderr, each with its encoding (utf8, or base64 when the bytes are not UTF-8); a non-zero exit is a normal result, not an error, and 127 means the command was not found. The whole output comes back, so for long-running or noisy commands use job_start and page the output with job_output.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     async fn exec(&self, Parameters(a): Parameters<ExecArgs>) -> ToolReply {
         Ok(reply(self.do_exec(a).await))
@@ -466,7 +531,8 @@ impl SandboxMcp {
 
     #[tool(
         name = "read_file",
-        description = "Read bytes of a file. Returns content, encoding (utf8, or base64 when the bytes are not UTF-8), bytes, eof and next_offset. At most max bytes (default 131072) come back: if eof is false, call again with offset = next_offset. Fails with not_found, is_directory or permission_denied."
+        description = "Read bytes of a file. Returns content, encoding (utf8, or base64 when the bytes are not UTF-8), bytes, eof and next_offset. At most max bytes (default 131072) come back: if eof is false, call again with offset = next_offset. Fails with not_found, is_directory or permission_denied.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn read_file(&self, Parameters(a): Parameters<ReadFileArgs>) -> ToolReply {
         Ok(reply(self.do_read(a).await))
@@ -474,7 +540,8 @@ impl SandboxMcp {
 
     #[tool(
         name = "write_file",
-        description = "Create a file or replace it entirely, atomically; an existing file keeps its permissions. Missing parent directories are created (create_parents: false to fail instead). Give content (text) or content_base64 (binary). To change part of a file use edit_file. To avoid overwriting a concurrent change, pass if_unchanged_since (the mtime from stat): a changed file fails with kind conflict and nothing is written. create_only refuses to replace a file that exists."
+        description = "Create a file or replace it entirely, atomically; an existing file keeps its permissions. Missing parent directories are created (create_parents: false to fail instead). Give content (text) or content_base64 (binary). To change part of a file use edit_file. To avoid overwriting a concurrent change, pass if_unchanged_since (the mtime from stat): a changed file fails with kind conflict and nothing is written. create_only refuses to replace a file that exists.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     async fn write_file(&self, Parameters(a): Parameters<WriteFileArgs>) -> ToolReply {
         Ok(reply(self.do_write(a).await))
@@ -482,7 +549,8 @@ impl SandboxMcp {
 
     #[tool(
         name = "edit_file",
-        description = "Replace text in an existing file. old_str must match exactly once (or set replace_all). Never overwrites a concurrent change: if the file changed after it was read, fails with kind conflict and writes nothing; read the file again and retry."
+        description = "Replace text in an existing UTF-8 file that fits in memory (the whole file is read, then written back). old_str must match exactly once (or set replace_all). Never overwrites a concurrent change: if the file changed after it was read, fails with kind conflict and writes nothing; read the file again and retry. For large or binary files use read_file windows and write_file, or exec.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     async fn edit_file(&self, Parameters(a): Parameters<EditFileArgs>) -> ToolReply {
         Ok(reply(self.do_edit(a).await))
@@ -490,7 +558,8 @@ impl SandboxMcp {
 
     #[tool(
         name = "list_dir",
-        description = "List a directory: entries with name, kind (file, dir or other) and size in bytes, sorted by name. Hidden entries are left out unless include_hidden. At most limit entries (default 1000); truncated says when there were more."
+        description = "List a directory: entries with name, kind (file, dir or other) and size in bytes, sorted by name. Hidden entries are left out unless include_hidden. At most limit entries (default 1000); truncated says when there were more.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_dir(&self, Parameters(a): Parameters<ListDirArgs>) -> ToolReply {
         Ok(reply(self.do_list(a).await))
@@ -498,7 +567,8 @@ impl SandboxMcp {
 
     #[tool(
         name = "stat",
-        description = "Describe a path. Returns exists; when it does, kind (file, dir or other), size in bytes, mtime (epoch seconds, with the fraction the filesystem records) and whether the sandbox user can write it. A missing path is exists: false, not an error."
+        description = "Describe a path. Returns exists; when it does, kind (file, dir or other), size in bytes, mtime (epoch seconds, with the fraction the filesystem records) and whether the sandbox user can write it. A missing path is exists: false, not an error.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn stat(&self, Parameters(a): Parameters<PathArgs>) -> ToolReply {
         Ok(reply(self.do_stat(a).await))
@@ -506,7 +576,8 @@ impl SandboxMcp {
 
     #[tool(
         name = "search",
-        description = "Search file contents under a directory for a regular expression (ripgrep when the sandbox has it, grep otherwise; see the sandbox://capabilities resource). Returns hits with path, line, text and is_match (false for context lines), and truncated. At most limit hits (default 100). Fails with kind invalid_query for a bad pattern or glob."
+        description = "Search file contents under a directory for a regular expression (ripgrep when the sandbox has it, grep otherwise). Returns search_engine (rg, grep, or busybox-grep; rg honours .gitignore), hits with path, line, text and is_match (false for context lines), and truncated. At most limit hits (default 100). Fails with kind invalid_query for a bad pattern or glob.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn search(&self, Parameters(a): Parameters<SearchArgs>) -> ToolReply {
         Ok(reply(self.do_search(a).await))
@@ -514,7 +585,8 @@ impl SandboxMcp {
 
     #[tool(
         name = "mkdir",
-        description = "Create a directory and any missing parents. Succeeds if it already exists."
+        description = "Create a directory and any missing parents. Succeeds if it already exists.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn mkdir(&self, Parameters(a): Parameters<PathArgs>) -> ToolReply {
         Ok(reply(self.do_mkdir(a).await))
@@ -522,7 +594,8 @@ impl SandboxMcp {
 
     #[tool(
         name = "upload",
-        description = "Copy a directory or file of the server's machine (a path under its local root) into a sandbox directory, as a tar stream: modes, symlinks and empty directories survive, large trees go in chunks. Returns files, dirs, links and bytes. Merges into a destination that exists; a destination that is a file fails with not_a_directory."
+        description = "Copy a directory or file of the server's machine (a path under its local root) into a sandbox directory, as a tar stream: modes, symlinks and empty directories survive, large trees go in chunks. Returns files, dirs, links and bytes. Merges into a destination that exists; a destination that is a file fails with not_a_directory.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     async fn upload(&self, Parameters(a): Parameters<UploadArgs>) -> ToolReply {
         Ok(reply(self.do_upload(a).await))
@@ -530,7 +603,8 @@ impl SandboxMcp {
 
     #[tool(
         name = "download",
-        description = "Copy a sandbox directory (its contents) or file into a directory of the server's machine (a path under its local root), as a tar stream. Links are copied as links and never followed, and nothing is written outside the target. Returns files, dirs, links and bytes."
+        description = "Copy a sandbox directory (its contents) or file into a directory of the server's machine (a path under its local root), as a tar stream. Links are copied as links and never followed, and nothing is written outside the target. Returns files, dirs, links and bytes.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     async fn download(&self, Parameters(a): Parameters<DownloadArgs>) -> ToolReply {
         Ok(reply(self.do_download(a).await))
@@ -538,7 +612,8 @@ impl SandboxMcp {
 
     #[tool(
         name = "job_start",
-        description = "Start a shell command line (sh -c, like exec) that keeps running after this call returns; the sandbox keeps it and its output. Returns the job id. Read output with job_output, check on it with job_list, stop it with job_kill. Use this for servers, builds and anything slower than a few seconds."
+        description = "Start a shell command line (sh -c, like exec) that keeps running after this call returns; the sandbox keeps it and its output. Returns the job id. Read output with job_output, check on it with job_list, stop it with job_kill. Use this for servers, builds and anything slower than a few seconds.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     async fn job_start(&self, Parameters(a): Parameters<JobStartArgs>) -> ToolReply {
         Ok(reply(self.do_job_start(a).await))
@@ -546,7 +621,8 @@ impl SandboxMcp {
 
     #[tool(
         name = "job_list",
-        description = "List jobs: id, state (running, exited, ended, lost or gone), code (the exit status once ended), signal (only when a signal killed the job's shell: code is then 128 + signal, and a job that merely exited 137 has no signal), label, started and ended (epoch seconds). exited means the shell is done but processes it started still run."
+        description = "List jobs: id, state (running, exited, ended, lost or gone), code (the exit status once ended), signal (only when a signal killed the job's shell: code is then 128 + signal, and a job that merely exited 137 has no signal), label, started and ended (epoch seconds). exited means the shell is done but processes it started still run.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn job_list(&self, Parameters(a): Parameters<JobListArgs>) -> ToolReply {
         Ok(reply(self.do_job_list(a).await))
@@ -554,7 +630,8 @@ impl SandboxMcp {
 
     #[tool(
         name = "job_output",
-        description = "Read a job's output (stdout and stderr together) from a byte offset. Returns state, code, signal (only when a signal killed the job's shell: code is then 128 + signal; a job that exited on its own has none), content, encoding (utf8, or base64 when the bytes are not UTF-8), offset, next_offset and end (the output's length so far). At most max bytes (default 131072) per call: to follow a job, call again with offset = next_offset until state is ended."
+        description = "Read a job's output (stdout and stderr together) from a byte offset. Returns state, code, signal (only when a signal killed the job's shell: code is then 128 + signal; a job that exited on its own has none), content, encoding (utf8, or base64 when the bytes are not UTF-8), offset, next_offset and end (the output's length so far). At most max bytes (default 131072) per call: to follow a job, call again with offset = next_offset until state is ended.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn job_output(&self, Parameters(a): Parameters<JobOutputArgs>) -> ToolReply {
         Ok(reply(self.do_job_output(a).await))
@@ -562,7 +639,8 @@ impl SandboxMcp {
 
     #[tool(
         name = "job_kill",
-        description = "Stop jobs: SIGTERM, a short grace, then SIGKILL. Returns survivors, the processes still alive afterwards (normally none). Stopping an ended job is not an error. With remove, the jobs and their output are deleted."
+        description = "Stop jobs: SIGTERM, a short grace, then SIGKILL. Returns survivors, the processes still alive afterwards (normally none). Stopping an ended job is not an error. With remove, the jobs and their output are deleted.",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     async fn job_kill(&self, Parameters(a): Parameters<JobKillArgs>) -> ToolReply {
         Ok(reply(self.do_job_kill(a).await))
@@ -571,7 +649,7 @@ impl SandboxMcp {
 
 impl SandboxMcp {
     async fn do_exec(&self, a: ExecArgs) -> Out {
-        let stdin = match (a.stdin, a.stdin_base64) {
+        let stdin = match (a.stdin.into_inner(), a.stdin_base64.into_inner()) {
             (Some(_), Some(_)) => {
                 return Err(ToolError::invalid("give stdin or stdin_base64, not both"));
             }
@@ -581,10 +659,10 @@ impl SandboxMcp {
         };
         let t = self.target().await?;
         let mut cmd = t.sandbox.exec("sh", ["-c".to_string(), a.command]);
-        if let Some(cwd) = a.cwd {
+        if let Some(cwd) = a.cwd.into_inner() {
             cmd = cmd.cwd(cwd);
         }
-        if let Some(ms) = a.timeout_ms {
+        if let Some(ms) = a.timeout_ms.into_inner() {
             cmd = cmd.timeout(Duration::from_millis(ms));
         }
         if let Some(stdin) = stdin {
@@ -623,7 +701,7 @@ impl SandboxMcp {
     }
 
     async fn do_write(&self, a: WriteFileArgs) -> Out {
-        let bytes = match (a.content, a.content_base64) {
+        let bytes = match (a.content.into_inner(), a.content_base64.into_inner()) {
             (Some(_), Some(_)) => {
                 return Err(ToolError::invalid(
                     "give content or content_base64, not both",
@@ -635,7 +713,7 @@ impl SandboxMcp {
         };
         let n = bytes.len();
         let create_only = a.create_only.unwrap_or(false);
-        let expected = match (a.if_unchanged_since, create_only) {
+        let expected = match (a.if_unchanged_since.into_inner(), create_only) {
             (Some(_), true) => {
                 return Err(ToolError::invalid(
                     "give if_unchanged_since or create_only, not both",
@@ -790,14 +868,16 @@ impl SandboxMcp {
             pattern: a.pattern,
             literal: a.literal.unwrap_or(false),
             ignore_case: a.ignore_case.unwrap_or(false),
-            glob: a.glob.map(|g| (g, a.glob_exclude.unwrap_or(false))),
+            glob: a.glob.into_inner().map(|g| (g, a.glob_exclude.unwrap_or(false))),
             root: PathBuf::from(a.path.as_deref().unwrap_or(".")),
             limit: a.limit.map_or(DEFAULT_SEARCH_LIMIT, count),
             before: count(a.before.unwrap_or(context)),
             after: count(a.after.unwrap_or(context)),
         };
         let t = self.target().await?;
-        let o = t.files().search(&q).await?;
+        let files = t.files();
+        let engine = search_engine_name(files.capabilities().await?.search_engine());
+        let o = files.search(&q).await?;
         let hits: Vec<Value> = o
             .hits
             .iter()
@@ -808,7 +888,12 @@ impl SandboxMcp {
                 })
             })
             .collect();
-        Ok(json!({ "hits": hits, "truncated": o.truncated, "note": o.first_error }))
+        Ok(json!({
+            "search_engine": engine,
+            "hits": hits,
+            "truncated": o.truncated,
+            "note": o.first_error,
+        }))
     }
 
     async fn do_mkdir(&self, a: PathArgs) -> Out {
@@ -859,7 +944,7 @@ impl SandboxMcp {
     async fn do_upload(&self, a: UploadArgs) -> Out {
         let local = self.local_path(&a.local)?;
         let sources = if local.is_dir() {
-            match &a.only {
+            match a.only.into_inner() {
                 None => beyond_sandbox::Sources::Dir(local),
                 Some(names) => {
                     let mut paths = Vec::new();
@@ -898,7 +983,7 @@ impl SandboxMcp {
         let spec = JobSpec {
             program: "sh".to_string(),
             args: vec!["-c".to_string(), a.command],
-            cwd: a.cwd,
+            cwd: a.cwd.into_inner(),
             label: a.label.unwrap_or_default(),
         };
         let t = self.target().await?;

@@ -34,6 +34,10 @@ MCP sessions; there is no per-session state, because the sandbox holds the state
 `job_output`, `job_kill`; with `SANDBOX_LOCAL_ROOT`, also `upload` and `download` (tar over exec between the server's machine and the sandbox, confined to that directory: paths are relative, `..` is refused, and an existing component that is a link leaving the root is refused). Without it the two routes are removed from the router, so the model never sees a tool that reads or writes its host. Each is one `do_*` method returning `Result<Value, ToolError>`; `reply` turns it into
 `CallToolResult::structured` (`isError: false`) or `structured_error` with `{"error": {"kind", "detail"}}`.
 
+- **MCP annotations.** Every tool carries `readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorldHint`
+  (sandbox is a closed world). Clients that honour them can confirm writes and skip confirmation on reads.
+- **Optional args are omit-or-value.** Schemas use an `Opt<T>` wrapper so optional fields are typed as `T` and left out of
+  `required`, never `type: [T, "null"]` — models omit keys instead of sending null.
 - **Errors are results.** `kind` is the DRIVER.md vocabulary. Arguments that do not fit a tool's schema are caught in
   `call_tool` (rmcp rejects them as `invalid_params`) and re-issued as `invalid_request` results, so the agent sees and
   fixes them.
@@ -47,8 +51,11 @@ MCP sessions; there is no per-session state, because the sandbox holds the state
   UTF-8 and base64 otherwise (`encoding` says which; `encoding: "base64"` forces it). A window that ends inside a multi-byte character gives that character up and
   reports `bytes` / `next_offset` for what it returned, so a client that follows `next_offset` never sees a split
   character. `exec` output is text: the client library already decodes it.
-- **`edit_file`** stats the file, reads it whole, requires exactly one match (or `replace_all`), and writes with
-  `write_if_unchanged` on the mtime it stat'ed. A false return is `conflict`; nothing is written.
+- **`edit_file`** stats the file, reads it whole into memory as UTF-8, requires exactly one match (or `replace_all`), and
+  writes with `write_if_unchanged` on the mtime it stat'ed. A false return is `conflict`; nothing is written. Large or
+  binary files belong on `read_file` / `write_file` or `exec` (the tool description says so).
+- **`search` returns `search_engine`.** Every successful search names the engine (`rg`, `grep`, or `busybox-grep`) so an
+  agent that never reads `sandbox://capabilities` still knows whether `.gitignore` is honoured.
 - **`write_file` makes missing parents.** The first attempt is the plain write; when it fails with the spec's
   `parent directory DIR does not exist` (FILES-OVER-EXEC.md section 5.3) the server runs `create_dir_all(parent)` and retries once, so
   a write into an existing directory costs no extra command. `create_parents: false` skips the retry (the conformance driver

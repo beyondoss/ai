@@ -1,5 +1,11 @@
 [
   {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
     "description": "Copy a sandbox directory (its contents) or file into a directory of the server's machine (a path under its local root), as a tar stream. Links are copied as links and never followed, and nothing is written outside the target. Returns files, dirs, links and bytes.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -23,6 +29,12 @@
     "name": "download"
   },
   {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
     "description": "Copy a directory or file of the server's machine (a path under its local root) into a sandbox directory, as a tar stream: modes, symlinks and empty directories survive, large trees go in chunks. Returns files, dirs, links and bytes. Merges into a destination that exists; a destination that is a file fails with not_a_directory.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -37,10 +49,7 @@
           "items": {
             "type": "string"
           },
-          "type": [
-            "array",
-            "null"
-          ]
+          "type": "array"
         },
         "remote_dir": {
           "description": "The sandbox directory to put it in (absolute; created if missing).",
