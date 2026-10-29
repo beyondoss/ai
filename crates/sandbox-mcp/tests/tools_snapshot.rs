@@ -100,7 +100,18 @@ async fn every_tool_and_every_argument_has_a_description() {
                 schema["description"].as_str().is_some(),
                 "{name}.{arg} has no description"
             );
+            // Optional args are omit-or-value, never `type: [T, "null"]`.
+            if let Some(types) = schema["type"].as_array() {
+                assert!(
+                    !types.iter().any(|v| v.as_str() == Some("null")),
+                    "{name}.{arg} advertises null: {schema}"
+                );
+            }
         }
+        assert!(
+            t.get("annotations").is_some(),
+            "{name} is missing MCP annotations"
+        );
     }
 }
 
