@@ -134,8 +134,16 @@ situations.
 | HTTP 422 whose body says the output exceeded the cap, or client cap | `too_large` |
 | any other non-2xx                                                   | `endpoint`  |
 | 200 whose body is not the expected JSON                             | `protocol`  |
+| a stream request answered 200 without `application/x-ndjson`        | `protocol`  |
 | a stream line that is not a frame (see below)                       | `protocol`  |
 | a stream ends without its final frame, or a `{"error"}` frame       | `transport` |
+
+A stream request is answered by a stream or by an error. A non-2xx answer to it is an error exactly as
+for a one-shot call, by the rows above (`auth`, `too_large`, `endpoint`). A **200** to it whose
+`Content-Type` is not `application/x-ndjson` is not a stream, whatever its body: it is `protocol`,
+never read as a one-shot answer (an object that looks like a result would be a clean empty exit 0,
+silent data loss). A client that reads such a body before failing may report its own error
+instead when the body is over the cap (`too_large`) or is not a one-shot answer (`protocol`).
 
 A stream line that is not a frame is `protocol`, not `transport`: the bytes arrived and the endpoint
 spoke something else. That is a line that is not a JSON object, an output field that is not

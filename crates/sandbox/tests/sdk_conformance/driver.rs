@@ -97,6 +97,7 @@ fn classify(msg: &str, kind: Option<std::io::ErrorKind>) -> Value {
         return err("transport", msg);
     }
     if msg.contains("unparseable JSON")
+        || msg.contains("not a stream")
         || msg.contains("unparseable frame")
         || msg.contains("unparseable job frame")
         || msg.contains("is not standard base64")

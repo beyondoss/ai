@@ -219,5 +219,10 @@ class ResponseReader:
 
     @property
     def is_ndjson(self) -> bool:
-        media = self.headers.get("content-type", "").split(";")[0].strip().lower()
-        return media == "application/x-ndjson"
+        return is_ndjson(self.headers)
+
+
+def is_ndjson(headers: dict[str, str]) -> bool:
+    """Whether a response says it is a stream (``Content-Type: application/x-ndjson``)."""
+    media = headers.get("content-type", "").split(";")[0].strip().lower()
+    return media == "application/x-ndjson"
