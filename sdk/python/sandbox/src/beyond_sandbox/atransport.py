@@ -23,7 +23,13 @@ from typing import (
 )
 
 from . import _http, _wire
-from .errors import ProtocolError, SandboxError, Timeout, TooLarge, TransportError
+from .errors import (
+    ProtocolError,
+    SandboxError,
+    TimeoutError,
+    TooLargeError,
+    TransportError,
+)
 from .models import ExecResult, Frame, JobFrame
 from .transport import DEFAULT_TIMEOUT_MS
 
@@ -106,13 +112,13 @@ class _Response:
     async def fill(self, silence: float | None) -> None:
         left = self._deadline - time.monotonic()
         if left <= 0:
-            raise Timeout(f"exec endpoint {self._url} timed out")
+            raise TimeoutError(f"exec endpoint {self._url} timed out")
         wait = left if silence is None else min(left, silence)
         try:
             self._p.feed(await asyncio.wait_for(self._r.read(65536), wait))
         except asyncio.TimeoutError:
             if time.monotonic() >= self._deadline:
-                raise Timeout(f"exec endpoint {self._url} timed out") from None
+                raise TimeoutError(f"exec endpoint {self._url} timed out") from None
             raise TransportError(
                 f"no frame for {silence:.0f} s: the endpoint stopped sending heartbeats, so the "
                 "connection is presumed dead"
@@ -245,7 +251,7 @@ class AsyncHttpTransport:
                 max(deadline - time.monotonic(), 0.001),
             )
         except asyncio.TimeoutError:
-            raise Timeout(f"exec endpoint {self.url} timed out") from None
+            raise TimeoutError(f"exec endpoint {self.url} timed out") from None
         except OSError as e:
             raise TransportError(f"exec endpoint {self.url} unreachable: {e}") from None
         parsed = _http.ResponseReader()
@@ -257,7 +263,7 @@ class AsyncHttpTransport:
                 await resp.fill(None)
         except asyncio.TimeoutError:
             await resp.close()
-            raise Timeout(f"exec endpoint {self.url} timed out") from None
+            raise TimeoutError(f"exec endpoint {self.url} timed out") from None
         except OSError as e:
             await resp.close()
             raise TransportError(f"exec endpoint {self.url} unreachable: {e}") from None
@@ -322,8 +328,8 @@ class AsyncHttpTransport:
         body = _wire.request_body(command, args, cwd=cwd, timeout_ms=30_000, job=job)
         try:
             return _wire.parse_json(self.url, await self._post(body, 30_000))
-        except TooLarge:
-            raise TooLarge("a job answer exceeded the response cap") from None
+        except TooLargeError:
+            raise TooLargeError("a job answer exceeded the response cap") from None
 
     async def job_stream(self, job: dict[str, Any]) -> AsyncJobFrameStream:
         body = _wire.request_body(

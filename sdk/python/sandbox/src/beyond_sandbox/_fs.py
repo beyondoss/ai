@@ -18,13 +18,13 @@ from typing import Sequence
 from . import _scripts
 from ._drive import Op, Run
 from .errors import (
-    Conflict,
-    InvalidQuery,
+    ConflictError,
+    InvalidQueryError,
     IoError,
-    NotADirectory,
-    NotFound,
+    NotADirectoryError,
+    NotFoundError,
     SandboxError,
-    Timeout,
+    TimeoutError,
     classify_stderr,
 )
 from .models import Capabilities, Entry, ExecResult, Hit, Kind, SearchResult, Stat
@@ -220,7 +220,7 @@ def write_if_unchanged(path: str, data: bytes, expected_mtime: float | None) -> 
     """Compare the mtimes (epoch seconds with the fraction, as ``stat`` gave it), then write. Two round trips; the guard is not a lock."""
     current = yield from stat(path)
     if (current.mtime if current else None) != expected_mtime:
-        raise Conflict("the file changed since it was read")
+        raise ConflictError("the file changed since it was read")
     yield from write(path, data)
 
 
@@ -863,7 +863,7 @@ def search(q: Query, state: FsState, caps: Capabilities) -> Op[SearchResult]:
         try:  # rg is not given this glob, so a bad one is rejected here
             excluded = re.compile(_glob_regex(q.glob), re.S)
         except (ValueError, re.error) as e:
-            raise InvalidQuery(f"bad glob: {e}") from e
+            raise InvalidQueryError(f"bad glob: {e}") from e
     skipped_errors = excluded  # whose per-path errors are not worth a note
     if engine == "busybox-grep" and q.glob is not None and q.glob_exclude:
         skipped_errors = compile_glob(q.glob, q.ignore_case)
@@ -883,14 +883,16 @@ def search(q: Query, state: FsState, caps: Capabilities) -> Op[SearchResult]:
     if exit_code in (0, 1):
         pass
     elif exit_code == 124:
-        raise Timeout(f"{program} timed out")
+        raise TimeoutError(f"{program} timed out")
     else:
         failure = classify_search_failure(stderr, q.root)
         if failure.kind == "bad_regex":
             detail = stderr.strip()
-            raise InvalidQuery(f"bad regex: {detail or program + ' rejected the pattern'}")
+            raise InvalidQueryError(f"bad regex: {detail or program + ' rejected the pattern'}")
         if failure.kind == "missing_root":
-            raise (NotADirectory if "Not a directory" in failure.note else NotFound)(failure.note)
+            raise (NotADirectoryError if "Not a directory" in failure.note else NotFoundError)(
+                failure.note
+            )
         note = failure.note
     stdout = r.stdout_text
     longs: list[LongLine] = []

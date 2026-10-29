@@ -27,7 +27,7 @@ import traceback
 from typing import Any, Callable, cast
 
 from . import AsyncSandbox, Exit, Sandbox, SandboxError, Signal, Stderr, Stdout, TimedOut, _bulk
-from .errors import InvalidRequest, IoError
+from .errors import InvalidRequestError, IoError
 from .files import CapsOverride
 from .models import Stat
 
@@ -58,7 +58,7 @@ OPS = [
 def _str(req: dict[str, Any], key: str) -> str:
     v = req.get(key)
     if not isinstance(v, str):
-        raise InvalidRequest(f"`{key}` must be a string")
+        raise InvalidRequestError(f"`{key}` must be a string")
     return v
 
 
@@ -66,7 +66,7 @@ def _opt_str(req: dict[str, Any], key: str) -> str | None:
     v = req.get(key)
     if v is None or isinstance(v, str):
         return v
-    raise InvalidRequest(f"`{key}` must be a string")
+    raise InvalidRequestError(f"`{key}` must be a string")
 
 
 def _count(req: dict[str, Any], key: str) -> int | None:
@@ -74,7 +74,7 @@ def _count(req: dict[str, Any], key: str) -> int | None:
     if v is None:
         return None
     if isinstance(v, bool) or not isinstance(v, int) or v < 0:
-        raise InvalidRequest(f"`{key}` must be a count")
+        raise InvalidRequestError(f"`{key}` must be a count")
     return v
 
 
@@ -89,7 +89,7 @@ def _number(req: dict[str, Any], key: str) -> float | None:
         or v != v
         or v == float("inf")
     ):
-        raise InvalidRequest(f"`{key}` must be a non-negative number")
+        raise InvalidRequestError(f"`{key}` must be a non-negative number")
     return v
 
 
@@ -98,7 +98,7 @@ def _flag(req: dict[str, Any], key: str) -> bool:
     if v is None:
         return False
     if not isinstance(v, bool):
-        raise InvalidRequest(f"`{key}` must be true or false")
+        raise InvalidRequestError(f"`{key}` must be true or false")
     return v
 
 
@@ -107,9 +107,9 @@ def _strings(req: dict[str, Any], key: str) -> list[str]:
     if v is None:
         return []
     if not isinstance(v, list):
-        raise InvalidRequest(f"`{key}` must be a list")
+        raise InvalidRequestError(f"`{key}` must be a list")
     if not all(isinstance(x, str) for x in v):
-        raise InvalidRequest(f"`{key}` must hold strings")
+        raise InvalidRequestError(f"`{key}` must hold strings")
     return v
 
 
@@ -117,7 +117,7 @@ def _bytes(req: dict[str, Any], key: str) -> bytes:
     try:
         return base64.b64decode(_str(req, key), validate=True)
     except (binascii.Error, ValueError) as e:
-        raise InvalidRequest(f"`{key}` is not base64: {e}") from None
+        raise InvalidRequestError(f"`{key}` is not base64: {e}") from None
 
 
 def _b64(b: bytes) -> str:
@@ -198,7 +198,7 @@ def plan(op: str, req: dict[str, Any]) -> Plan:
     if op == "write_if_unchanged":
         path, data = _str(req, "path"), _bytes(req, "data_b64")
         if "expected_mtime" not in req:
-            raise InvalidRequest(
+            raise InvalidRequestError(
                 "`expected_mtime` is required (null means the file must not exist)"
             )
         expected = _number(req, "expected_mtime")
@@ -246,7 +246,11 @@ def plan(op: str, req: dict[str, Any]) -> Plan:
 def _job_plan(op: str, req: dict[str, Any]) -> Plan:
     scope = _str(req, "scope")
     if op == "job_wipe":
-        return (lambda sb: sb.jobs.wipe(scope), lambda s: {"survivors": s})
+        # Conformance wire: wipe survivors are detail strings (see DRIVER.md / TS driver).
+        return (
+            lambda sb: sb.jobs.wipe(scope),
+            lambda ss: {"survivors": [s.detail for s in ss]},
+        )
     if op == "job_list":
         return (
             lambda sb: sb.jobs.list(scope),
@@ -351,7 +355,7 @@ def _tree(req: dict[str, Any], key: str) -> list[dict[str, Any]]:
     if v is None:
         return []
     if not isinstance(v, list) or not all(isinstance(e, dict) for e in v):
-        raise InvalidRequest(f"`{key}` must be a list of entries")
+        raise InvalidRequestError(f"`{key}` must be a list of entries")
     return v
 
 
@@ -374,7 +378,7 @@ def _materialize(root: str, entries: list[dict[str, Any]], outside: str) -> None
         try:
             mode = int(raw_mode, 8) if isinstance(raw_mode, str) else 0o644
         except ValueError:
-            raise InvalidRequest(f"bad mode {raw_mode!r}") from None
+            raise InvalidRequestError(f"bad mode {raw_mode!r}") from None
         kind = e.get("type", "file")
         if kind == "dir":
             os.makedirs(path, exist_ok=True)
@@ -390,7 +394,7 @@ def _materialize(root: str, entries: list[dict[str, Any]], outside: str) -> None
                     pat = _bytes(e, "pattern_b64")
                     left = _count(e, "size") or 0
                     if not pat:
-                        raise InvalidRequest("`pattern_b64` is empty")
+                        raise InvalidRequestError("`pattern_b64` is empty")
                     step = (1 << 20) - (1 << 20) % len(pat) if len(pat) <= 1 << 20 else len(pat)
                     block = pat * (step // len(pat))
                     while left > 0:
@@ -499,7 +503,7 @@ def _upload_args(
 ) -> tuple[str, list[dict[str, Any]], list[str] | None, int | None]:
     dest = _str(req, "path")
     if not isinstance(req.get("entries"), list):
-        raise InvalidRequest("`entries` must be a list")
+        raise InvalidRequestError("`entries` must be a list")
     sources = _strings(req, "sources") if req.get("sources") is not None else None
     return dest, _tree(req, "entries"), sources, _count(req, "chunk_bytes")
 
@@ -645,9 +649,9 @@ class Driver:
         try:
             req = json.loads(line)
         except ValueError:
-            raise InvalidRequest("the request is not JSON") from None
+            raise InvalidRequestError("the request is not JSON") from None
         if not isinstance(req, dict):
-            raise InvalidRequest("the request is not an object")
+            raise InvalidRequestError("the request is not an object")
         op = req.get("op")
         return req.get("id"), op if isinstance(op, str) else "", req
 

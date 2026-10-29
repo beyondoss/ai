@@ -17,11 +17,11 @@ import pytest
 from beyond_sandbox import (
     AsyncFiles,
     AsyncFrameStream,
-    Conflict,
+    ConflictError,
     ExecResult,
     Files,
     FrameStream,
-    NotFound,
+    NotFoundError,
     Sandbox,
 )
 from beyond_sandbox.atransport import AsyncJobFrameStream
@@ -132,9 +132,9 @@ def test_files_over_a_subprocess(tmp_path: Path) -> None:
     f.mkdir(str(tmp_path / "d" / "e"))
     assert sorted(e.name for e in f.list(str(tmp_path))) == ["a.txt", "d"]
     assert [(h.line, h.text) for h in f.search("wor", str(tmp_path)).hits] == [(2, "world")]
-    with pytest.raises(NotFound):
+    with pytest.raises(NotFoundError):
         f.read(str(tmp_path / "missing"))
-    with pytest.raises(Conflict):
+    with pytest.raises(ConflictError):
         f.write_if_unchanged(p, b"x", (st.mtime if st else 0) + 100)
     f.write_if_unchanged(p, b"new", st.mtime if st else None)
     assert f.read(p) == b"new"
@@ -142,10 +142,21 @@ def test_files_over_a_subprocess(tmp_path: Path) -> None:
     assert sorted(x.name for x in tmp_path.iterdir()) == ["a.txt", "d"]
 
 
+def test_files_accept_text_and_read_text(tmp_path: Path) -> None:
+    f = Files(LocalTransport())
+    p = str(tmp_path / "t.txt")
+    f.write(p, "café\n")
+    assert f.read(p) == "café\n".encode()
+    assert f.read_text(p) == "café\n"
+    st = f.stat(p)
+    f.write_if_unchanged(p, "ok", st.mtime if st else None)
+    assert f.read_text(p) == "ok"
+
+
 def test_a_missing_parent_is_said_in_plain_words(tmp_path: Path) -> None:
     f = Files(LocalTransport())
     missing = str(tmp_path / "no" / "such" / "dir")
-    with pytest.raises(NotFound) as e:
+    with pytest.raises(NotFoundError) as e:
         f.write(f"{missing}/f", b"x")
     assert e.value.detail == (
         f"write {missing}/f: parent directory {missing} does not exist: "

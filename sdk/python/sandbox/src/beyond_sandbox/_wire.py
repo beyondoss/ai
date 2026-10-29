@@ -8,7 +8,14 @@ import json
 import re
 from typing import Any, Callable, Generic, Sequence, TypeVar
 
-from .errors import AuthError, EndpointError, ProtocolError, SandboxError, TooLarge, TransportError
+from .errors import (
+    AuthError,
+    EndpointError,
+    ProtocolError,
+    SandboxError,
+    TooLargeError,
+    TransportError,
+)
 from .models import (
     ExecResult,
     Exit,
@@ -77,12 +84,12 @@ def status_error(url: str, status: int, body: bytes) -> SandboxError:
     if status in (401, 403):
         return AuthError(detail, status=status)
     if status == 422 and "cap" in text.lower():
-        return TooLarge(detail, status=status)
+        return TooLargeError(detail, status=status)
     return EndpointError(detail, status=status)
 
 
-def too_large(url: str, cap: int) -> TooLarge:
-    return TooLarge(
+def too_large(url: str, cap: int) -> TooLargeError:
+    return TooLargeError(
         f"exec endpoint {url}: the response exceeded the {cap}-byte cap and was discarded; the "
         "command ran, but its output is too large to return; narrow it (e.g. pipe through "
         "`head`) rather than re-running it unchanged"

@@ -7,6 +7,7 @@ these calls alone. Jobs need the ``job_*`` methods of :class:`JobTransport` on t
 
 from __future__ import annotations
 
+import builtins
 import contextlib
 import socket
 import ssl
@@ -16,7 +17,13 @@ from collections import deque
 from typing import Any, Callable, Iterator, Protocol, Sequence, Union, runtime_checkable
 
 from . import _http, _wire
-from .errors import ProtocolError, SandboxError, Timeout, TooLarge, TransportError
+from .errors import (
+    ProtocolError,
+    SandboxError,
+    TimeoutError,
+    TooLargeError,
+    TransportError,
+)
 from .models import ExecResult, Frame, JobFrame
 
 DEFAULT_TIMEOUT_MS = 120_000
@@ -106,15 +113,15 @@ class _Response:
     def _fill(self, silence: float | None) -> None:
         left = self._deadline - time.monotonic()
         if left <= 0:
-            raise Timeout(f"exec endpoint {self._url} timed out")
+            raise TimeoutError(f"exec endpoint {self._url} timed out")
         wait = left if silence is None else min(left, silence)
         try:
             self._sock.settimeout(wait)
             data = self._sock.recv(65536)
             self._reader.feed(data)
-        except TimeoutError:
+        except builtins.TimeoutError:
             if time.monotonic() >= self._deadline:
-                raise Timeout(f"exec endpoint {self._url} timed out") from None
+                raise TimeoutError(f"exec endpoint {self._url} timed out") from None
             raise TransportError(
                 f"no frame for {silence:.0f} s: the endpoint stopped sending heartbeats, so the "
                 "connection is presumed dead"
@@ -249,8 +256,8 @@ class HttpTransport:
                 ctx = self._ssl or ssl.create_default_context()
                 sock = ctx.wrap_socket(sock, server_hostname=t.host)
             return sock
-        except TimeoutError:
-            raise Timeout(f"exec endpoint {self.url} timed out") from None
+        except builtins.TimeoutError:
+            raise TimeoutError(f"exec endpoint {self.url} timed out") from None
         except OSError as e:
             raise TransportError(f"exec endpoint {self.url} unreachable: {e}") from None
 
@@ -266,9 +273,9 @@ class HttpTransport:
             sock.sendall(request)
             while not reader.head_done:
                 resp._fill(None)
-        except TimeoutError:
+        except builtins.TimeoutError:
             resp.close()
-            raise Timeout(f"exec endpoint {self.url} timed out") from None
+            raise TimeoutError(f"exec endpoint {self.url} timed out") from None
         except OSError as e:
             resp.close()
             raise TransportError(f"exec endpoint {self.url} unreachable: {e}") from None
@@ -337,8 +344,8 @@ class HttpTransport:
         body = _wire.request_body(command, args, cwd=cwd, timeout_ms=30_000, job=job)
         try:
             return _wire.parse_json(self.url, self._post(body, 30_000))
-        except TooLarge:
-            raise TooLarge("a job answer exceeded the response cap") from None
+        except TooLargeError:
+            raise TooLargeError("a job answer exceeded the response cap") from None
 
     def job_stream(self, job: dict[str, Any]) -> JobFrameStream:
         body = _wire.request_body(

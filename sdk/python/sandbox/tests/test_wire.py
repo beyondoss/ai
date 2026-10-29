@@ -11,7 +11,7 @@ import pytest
 
 from beyond_sandbox import _wire
 from beyond_sandbox._http import Malformed, ResponseReader, Truncated, build_request, parse_url
-from beyond_sandbox.errors import InvalidRequest, ProtocolError, TooLarge, TransportError
+from beyond_sandbox.errors import InvalidRequestError, ProtocolError, TooLargeError, TransportError
 from beyond_sandbox.models import (
     Exit,
     JobEnd,
@@ -204,7 +204,7 @@ def test_envelope_streams_are_base64_bytes() -> None:
 def test_the_cap_is_on_the_decoded_bytes_of_both_streams() -> None:
     body = json.dumps({"exit_code": 0, "stdout": "YWJj", "stderr": "ZGU="}).encode()  # 3 + 2
     assert _wire.parse_envelope("u", body, 5).stdout == b"abc"
-    with pytest.raises(TooLarge):
+    with pytest.raises(TooLargeError):
         _wire.parse_envelope("u", body, 4)
 
 
@@ -311,12 +311,12 @@ def test_urls() -> None:
     t = parse_url("http://[::1]:80")
     assert (t.host, t.port, t.path, t.host_header) == ("::1", 80, "/", "[::1]")
     for bad in ("ftp://x/", "http://", "x", "http://h:99999/"):
-        with pytest.raises(InvalidRequest):
+        with pytest.raises(InvalidRequestError):
             parse_url(bad)
 
 
 def test_a_header_with_a_newline_is_refused() -> None:
-    with pytest.raises(InvalidRequest):
+    with pytest.raises(InvalidRequestError):
         build_request(parse_url("http://h/"), [("Authorization", "Bearer a\r\nX: y")], b"")
 
 

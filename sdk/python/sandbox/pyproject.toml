@@ -47,5 +47,16 @@ ignore = [
   "UP035",
 ] # the formatter owns line length; Union aliases are runtime values
 
+# TimeoutError and NotADirectoryError are the public names for those kinds (and match
+# the TypeScript SDK). They intentionally shadow the stdlib exceptions of the same name.
+[tool.ruff.lint.per-file-ignores]
+"src/beyond_sandbox/errors.py" = ["A001"]
+"src/beyond_sandbox/__init__.py" = ["A004"]
+"src/beyond_sandbox/_fs.py" = ["A004"]
+"src/beyond_sandbox/atransport.py" = ["A004"]
+"src/beyond_sandbox/transport.py" = ["A004"]
+"tests/test_bulk.py" = ["A004"]
+"tests/test_transport.py" = ["A004"]
+
 [tool.ruff.format]
 exclude = ["src/beyond_sandbox/_scripts.py"]
