@@ -523,7 +523,12 @@ impl SandboxMcp {
     #[tool(
         name = "exec",
         description = "Run a shell command line in the sandbox (sh -c) and wait for it. `command` is the one string you would type at a prompt, e.g. `cd app && python -m pytest -q 2>&1 | tail -20`; pipes, &&, redirects and quotes work, and there is no separate args parameter. Returns exit_code, stdout and stderr, each with its encoding (utf8, or base64 when the bytes are not UTF-8); a non-zero exit is a normal result, not an error, and 127 means the command was not found. The whole output comes back, so for long-running or noisy commands use job_start and page the output with job_output.",
-        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn exec(&self, Parameters(a): Parameters<ExecArgs>) -> ToolReply {
         Ok(reply(self.do_exec(a).await))
@@ -541,7 +546,12 @@ impl SandboxMcp {
     #[tool(
         name = "write_file",
         description = "Create a file or replace it entirely, atomically; an existing file keeps its permissions. Missing parent directories are created (create_parents: false to fail instead). Give content (text) or content_base64 (binary). To change part of a file use edit_file. To avoid overwriting a concurrent change, pass if_unchanged_since (the mtime from stat): a changed file fails with kind conflict and nothing is written. create_only refuses to replace a file that exists.",
-        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn write_file(&self, Parameters(a): Parameters<WriteFileArgs>) -> ToolReply {
         Ok(reply(self.do_write(a).await))
@@ -550,7 +560,12 @@ impl SandboxMcp {
     #[tool(
         name = "edit_file",
         description = "Replace text in an existing UTF-8 file that fits in memory (the whole file is read, then written back). old_str must match exactly once (or set replace_all). Never overwrites a concurrent change: if the file changed after it was read, fails with kind conflict and writes nothing; read the file again and retry. For large or binary files use read_file windows and write_file, or exec.",
-        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn edit_file(&self, Parameters(a): Parameters<EditFileArgs>) -> ToolReply {
         Ok(reply(self.do_edit(a).await))
@@ -586,7 +601,12 @@ impl SandboxMcp {
     #[tool(
         name = "mkdir",
         description = "Create a directory and any missing parents. Succeeds if it already exists.",
-        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn mkdir(&self, Parameters(a): Parameters<PathArgs>) -> ToolReply {
         Ok(reply(self.do_mkdir(a).await))
@@ -595,7 +615,12 @@ impl SandboxMcp {
     #[tool(
         name = "upload",
         description = "Copy a directory or file of the server's machine (a path under its local root) into a sandbox directory, as a tar stream: modes, symlinks and empty directories survive, large trees go in chunks. Returns files, dirs, links and bytes. Merges into a destination that exists; a destination that is a file fails with not_a_directory.",
-        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn upload(&self, Parameters(a): Parameters<UploadArgs>) -> ToolReply {
         Ok(reply(self.do_upload(a).await))
@@ -604,7 +629,12 @@ impl SandboxMcp {
     #[tool(
         name = "download",
         description = "Copy a sandbox directory (its contents) or file into a directory of the server's machine (a path under its local root), as a tar stream. Links are copied as links and never followed, and nothing is written outside the target. Returns files, dirs, links and bytes.",
-        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn download(&self, Parameters(a): Parameters<DownloadArgs>) -> ToolReply {
         Ok(reply(self.do_download(a).await))
@@ -613,7 +643,12 @@ impl SandboxMcp {
     #[tool(
         name = "job_start",
         description = "Start a shell command line (sh -c, like exec) that keeps running after this call returns; the sandbox keeps it and its output. Returns the job id. Read output with job_output, check on it with job_list, stop it with job_kill. Use this for servers, builds and anything slower than a few seconds.",
-        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn job_start(&self, Parameters(a): Parameters<JobStartArgs>) -> ToolReply {
         Ok(reply(self.do_job_start(a).await))
@@ -640,7 +675,12 @@ impl SandboxMcp {
     #[tool(
         name = "job_kill",
         description = "Stop jobs: SIGTERM, a short grace, then SIGKILL. Returns survivors, the processes still alive afterwards (normally none). Stopping an ended job is not an error. With remove, the jobs and their output are deleted.",
-        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn job_kill(&self, Parameters(a): Parameters<JobKillArgs>) -> ToolReply {
         Ok(reply(self.do_job_kill(a).await))
@@ -868,7 +908,10 @@ impl SandboxMcp {
             pattern: a.pattern,
             literal: a.literal.unwrap_or(false),
             ignore_case: a.ignore_case.unwrap_or(false),
-            glob: a.glob.into_inner().map(|g| (g, a.glob_exclude.unwrap_or(false))),
+            glob: a
+                .glob
+                .into_inner()
+                .map(|g| (g, a.glob_exclude.unwrap_or(false))),
             root: PathBuf::from(a.path.as_deref().unwrap_or(".")),
             limit: a.limit.map_or(DEFAULT_SEARCH_LIMIT, count),
             before: count(a.before.unwrap_or(context)),
