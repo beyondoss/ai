@@ -214,9 +214,7 @@ impl From<SandboxError> for std::io::Error {
             ErrorKind::PermissionDenied => std::io::ErrorKind::PermissionDenied,
             ErrorKind::Timeout => std::io::ErrorKind::TimedOut,
             ErrorKind::TooLarge => std::io::ErrorKind::FileTooLarge,
-            ErrorKind::InvalidRequest | ErrorKind::InvalidQuery => {
-                std::io::ErrorKind::InvalidInput
-            }
+            ErrorKind::InvalidRequest | ErrorKind::InvalidQuery => std::io::ErrorKind::InvalidInput,
             ErrorKind::NotOffered => std::io::ErrorKind::Unsupported,
             ErrorKind::IsDirectory
             | ErrorKind::NotADirectory
