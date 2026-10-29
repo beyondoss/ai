@@ -15,7 +15,7 @@ variables alone ([Configuration](#configuration)).
 | `src/lib.rs`    | `Options`, the `Observer` trait, `serve` and `Handle`, and the derived limits                            |
 | `src/main.rs`   | the binary: bearer sources and the environment scrub, fail-closed start, subreaper, signals              |
 | `src/config.rs` | the binary's settings: every `EXECD_*` variable, parsed once at startup, and the usage text              |
-| `src/log.rs`    | the logger: one line per event to stderr, a level and a format (text or JSON), no subscriber             |
+| `src/log.rs`    | the logger: one text line per event to stderr, level via `EXECD_LOG` / `log::set_level`, no subscriber   |
 | `src/runas.rs`  | `EXECD_RUN_AS`: resolving the user, proving execd can switch, the switch helper                          |
 | `src/http.rs`   | hyper (HTTP/1.1 and h2c), routing, `/livez`, the bearer check, the request limit, the log line           |
 | `src/exec.rs`   | one-shot envelope and streams: pumps, the sink, heartbeat, leftovers, timeout, disconnect                |
