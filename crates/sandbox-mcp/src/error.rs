@@ -106,6 +106,7 @@ pub fn classify(msg: &str, kind: Option<std::io::ErrorKind>) -> ToolError {
         || msg.contains("unparseable job frame")
         || msg.contains("is not standard base64")
         || msg.contains("without a newline")
+        || msg.contains("unreadable job")
     {
         return err("protocol");
     }
@@ -149,6 +150,10 @@ mod tests {
         assert_eq!(k("exec endpoint returned 401"), "auth");
         assert_eq!(k("exec endpoint returned 500: boom"), "endpoint");
         assert_eq!(k("exec endpoint unreachable: refused"), "transport");
+        assert_eq!(
+            k("unreadable job answer: the endpoint did not report the job's start: nope"),
+            "protocol"
+        );
         assert_eq!(
             k(
                 "exec endpoint http://x answered a stream request with something that is not a stream"

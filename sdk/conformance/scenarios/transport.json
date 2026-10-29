@@ -930,12 +930,6 @@
             "error": {
               "kind": "protocol"
             }
-          },
-          "xfail": {
-            "drivers": [
-              "sandbox-mcp"
-            ],
-            "reason": "the MCP driver's stream is a job, whose start answer it cannot read (io)"
           }
         },
         {
@@ -963,12 +957,6 @@
             "error": {
               "kind": "protocol"
             }
-          },
-          "xfail": {
-            "drivers": [
-              "sandbox-mcp"
-            ],
-            "reason": "the MCP driver's stream is a job, whose start answer it cannot read (io)"
           }
         },
         {

@@ -102,6 +102,7 @@ fn classify(msg: &str, kind: Option<std::io::ErrorKind>) -> Value {
         || msg.contains("unparseable job frame")
         || msg.contains("is not standard base64")
         || msg.contains("without a newline")
+        || msg.contains("unreadable job")
     {
         return err("protocol", msg);
     }
