@@ -7,7 +7,8 @@ mod local_sh;
 use std::sync::Arc;
 use std::time::Duration;
 
-use beyond_sandbox::{Exec, FsBackend, Sandbox, TokenSource};
+use beyond_sandbox::exec_endpoint::jobs::{JobId, JobScope};
+use beyond_sandbox::{ErrorKind, Exec, FsBackend, Sandbox, SandboxError, TokenSource};
 use beyond_test_support::exec_mock::{ExecMock, MockOptions};
 
 /// A user's own helper: `git status --porcelain` as (code, path) pairs. It takes any [`Exec`] and
@@ -103,6 +104,30 @@ async fn a_sandbox_over_a_test_written_transport_has_all_three_layers() {
         .await
         .unwrap();
     assert_eq!(raw.code, Some(0));
+}
+
+#[test]
+fn job_scope_named_matches_sibling_sdks() {
+    let scope = JobScope::named("my-session").unwrap();
+    assert_eq!(scope.name(), "my-session");
+    let err = JobScope::named("Bad_Scope").unwrap_err();
+    assert_eq!(err.kind, ErrorKind::InvalidRequest);
+    assert!(JobId::parse("dev1").is_some());
+    assert!(JobId::parse("Dev1").is_none());
+}
+
+#[tokio::test]
+async fn stream_with_stdin_is_not_offered() {
+    let sandbox = Sandbox::over(Arc::new(local_sh::LocalSh)).await.unwrap();
+    let err = sandbox
+        .exec("cat", [] as [&str; 0])
+        .stdin("hi")
+        .stream(&|_| {})
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    let classified = SandboxError::from(err);
+    assert_eq!(classified.kind, ErrorKind::NotOffered);
 }
 
 #[tokio::test]

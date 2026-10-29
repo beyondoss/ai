@@ -5,11 +5,10 @@
 //! once for what's actually there ([`Capabilities`]) and picks the best available translation, so the
 //! same code works against a box we control and one we don't.
 //!
-//! Because it is generic over the runner rather than over a transport, it runs over
-//! [`RealRunner`](crate::testing::Host) on the host — against the very same files
-//! [`super::local::LocalFs`] sees. That is what makes the two backends differentially testable in CI
-//! with no VM, no container, and no infrastructure, and it is the main reason the seam is shaped this
-//! way.
+//! Because it is generic over the runner rather than over a transport, the same helpers run over a
+//! host `sh` transport in tests (and over HTTP in production) against the same files a host-disk
+//! backend would see. That is what makes the backends differentially testable in CI with no VM, no
+//! container, and no infrastructure.
 //!
 //! ## Never build a shell string
 //!
@@ -70,7 +69,7 @@ grep -rnZ -e __cap_probe__ -- /dev/null >/dev/null 2>&1; [ $? -le 1 ] && echo gr
 [ "$(printf abc | dd iflag=skip_bytes,count_bytes skip=1 count=1 status=none 2>/dev/null | base64 -w0 2>/dev/null)" = Yg== ] && echo read_window
 true"#;
 /// Raw bytes per `read_bytes` command: 96 KiB, which base64s to exactly 128 KiB — the head a runner's
-/// capture keeps whole ([`crate::tools::exec`]'s `STREAM_HEAD`), so a chunk is never cut.
+/// capture keeps whole ([`crate::exec::STREAM_HEAD`]), so a chunk is never cut.
 const READ_CHUNK: usize = 96 * 1024;
 const _: () = assert!(READ_CHUNK.div_ceil(3) * 4 <= crate::exec::STREAM_HEAD);
 
@@ -82,7 +81,7 @@ const _: () = assert!(READ_CHUNK.div_ceil(3) * 4 <= crate::exec::STREAM_HEAD);
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Capabilities {
     /// `rg` is present. Its flags map nearly 1:1 onto [`SearchQuery`] and it uses the same regex
-    /// engine as [`super::local::LocalFs`], so results match. Without it, see
+    /// engine as a host-disk ripgrep walker, so results match. Without it, see
     /// [`Capabilities::search_engine`].
     pub rg: bool,
     /// `grep -Z` — a NUL after the filename, so a path containing `:` or a newline stays parseable.
@@ -104,7 +103,7 @@ pub struct Capabilities {
 /// Which program a search will actually use — the fallback ladder, named so it can be logged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchEngine {
-    /// `rg`. Same regex crate, same `.gitignore` semantics, same binary-file skipping as `LocalFs`.
+    /// `rg`. Same regex crate, same `.gitignore` semantics, same binary-file skipping as a host walker.
     Ripgrep,
     /// GNU-flavored `grep -rnZIE`. **Does not honor `.gitignore`** — it will walk `target/` and
     /// `node_modules/` — and its ERE dialect is not Rust's regex dialect.
@@ -551,7 +550,7 @@ impl FsBackend for ShellFs {
         }
     }
 
-    /// Write-temp-then-`mv`, the same shape [`crate::tools::write_atomic`] uses locally, so a reader or
+    /// Write-temp-then-`mv`, the same shape a host atomic write uses locally, so a reader or
     /// a crash sees the old file or the new one and never a partial. The scripts keep the rest of the
     /// [`FsBackend::write_bytes`] contract too: the target is resolved through a symlink first
     /// (`resolve_target!`), and the temp is given the existing file's mode just before the `mv`
@@ -919,8 +918,8 @@ impl FsBackend for ShellFs {
 impl ShellFs {
     /// Whether `root` — or any of its ancestors — holds a `.git`, asked **on the target** and cached.
     ///
-    /// [`crate::tools::root_is_inside_git_repo`] answers the same question with host `stat`s, which is
-    /// right for [`super::local::LocalFs`] and meaningless here: the replica's `/work` is not the
+    /// The agent's host backend answers the same question with host `stat`s, which is
+    /// right on this machine and meaningless here: the replica's `/work` is not the
     /// sandbox's, so the host answer is a coin flip that decides whether `rg` gets `--no-require-git`
     /// and therefore whether `.gitignore` is honored at all. Getting it wrong is invisible — a search
     /// that quietly walks `node_modules/`, or one that quietly doesn't.
@@ -1032,7 +1031,7 @@ impl ShellFs {
     }
 }
 
-/// Compile the glob with exactly the settings [`super::local::LocalFs`] uses, so the two backends
+/// Compile the glob with exactly the settings a host-disk walker uses, so the two backends
 /// share one definition of what a pattern means.
 fn compile_glob_matcher(q: &GlobQuery) -> Result<globset::GlobMatcher, FsError> {
     globset::GlobBuilder::new(&q.pattern)
@@ -1093,7 +1092,7 @@ fn parse_stat(stdout: &str) -> Option<Meta> {
 /// which is why the NUL-capable rungs are preferred whenever available.
 ///
 /// The `glob` is applied here too, because busybox `grep` has no `--include`. It is the same
-/// `globset` matcher [`super::local::LocalFs`] uses, so glob *semantics* stay identical; only where
+/// `globset` matcher a host-disk walker uses, so glob *semantics* stay identical; only where
 /// the filtering happens changes.
 fn parse_colon_records(stdout: &str, q: &SearchQuery) -> Vec<Hit> {
     let glob = q.glob.as_ref().and_then(|(pattern, negate)| {
@@ -1357,7 +1356,7 @@ printf '
 const DIRS_SCRIPT: &str = r#"for p; do [ -d "$p" ] && printf '%s\0' "$p"; done"#;
 
 /// Walk `$1` and its ancestors looking for a `.git`, exiting 0 the moment one is found — the
-/// target-side twin of [`crate::tools::root_is_inside_git_repo`], step for step, so the two backends
+/// target-side twin of the agent's host git-root probe, step for step, so the two backends
 /// make the same `--no-require-git` decision about the same tree.
 ///
 /// Built from `dirname` and `[ -e ]` rather than `git rev-parse`: git is a *development* tool and a
@@ -1668,7 +1667,7 @@ fn incomplete_note(result: &Text) -> Option<String> {
     Some(detail.lines().next().unwrap_or(detail).to_string())
 }
 
-/// `rg` invocation. Flags chosen to match [`super::local::LocalFs`]'s walker configuration exactly:
+/// `rg` invocation. Flags chosen to match a host-disk ripgrep walker's configuration exactly:
 /// `--hidden` mirrors `WalkBuilder::hidden(false)`, and `--no-require-git` mirrors the
 /// `require_git(false)` applied outside a real repository so a plain checkout still honors its
 /// `.gitignore`.

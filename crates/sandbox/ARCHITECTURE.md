@@ -7,18 +7,19 @@ depends on it; it depends on neither `beyond-agent` nor `beyond-agent-core`.
 
 | file                               | what                                                                                                                         |
 | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `src/lib.rs`                       | the public names: `Exec`, `HttpExec`, `Files`, `Jobs`, `Sandbox`, `TokenSource`                                              |
+| `src/lib.rs`                       | the public names: `Exec`, `HttpExec`, `Files`, `Jobs`, `Sandbox`, `TokenSource`, `SandboxError`                              |
+| `src/error.rs`                     | `SandboxError` / `ErrorKind`: FILES-OVER-EXEC §3 vocabulary, classify from `io` / `FsError` / `BulkError`                    |
 | `src/exec.rs`                      | `CommandRunner` (`Exec`), `ExecResult`, `ExecOutput` (code and bytes), `Kill`/`LocalKill`/`kill_all`, bounded output capture |
 | `src/exec_endpoint.rs`             | the protocol spec (module doc), `HttpExecRunner`                                                                             |
 | `src/exec_endpoint/stream.rs`      | stream frames and the frame reader                                                                                           |
-| `src/exec_endpoint/jobs.rs`        | `SandboxJobs`, scopes, ids                                                                                                   |
+| `src/exec_endpoint/jobs.rs`        | `SandboxJobs`, scopes (`JobScope::named` / `for_session`), ids                                                               |
 | `src/exec_endpoint/jobs_native.rs` | the endpoint's jobs: `NativeJobs`, `HttpJobs`                                                                                |
 | `src/fs.rs`                        | `FsBackend`, its types, and the result policy every backend shares                                                           |
 | `src/fs/shell.rs`                  | `ShellFs` (`Files`): file operations as commands, the one lazy environment probe, parsers, `__fuzz`                          |
 | `src/bulk.rs`                      | `upload`/`download`/`extract`: tar over exec, the three scripts, the staged upload, `Sources`, `Transfer`, `BulkError`       |
 | `src/bulk/extract.rs`              | the policy layer over the `tar` crate for untrusted archives: never writes through a link, directory modes last              |
 | `src/procgroup.rs`                 | process-group identity and kill guards for local children                                                                    |
-| `src/sandbox.rs`                   | `Jobs`, `Sandbox`, the `Command` builder                                                                                     |
+| `src/sandbox.rs`                   | `Jobs` (with ergonomic `start`), `Sandbox`, the `Command` / `StartJob` builders                                              |
 | `src/token.rs`                     | `TokenSource` and the one-renewal bearer                                                                                     |
 | `src/tls.rs`                       | installs the `ring` rustls provider before a client is built                                                                 |
 | `src/testing.rs`                   | a plain local runner for unit tests                                                                                          |
@@ -107,6 +108,16 @@ stream built only on `Exec` (spec: `sdk/conformance/FILES-OVER-EXEC.md` 5.8). Th
 `SandboxJobs` is the operation set (run held, start kept, follow, read from an offset, keep, kill, list, remove, wipe).
 `NativeJobs` speaks the operations to an endpoint, and `HttpJobs` is the one an `HttpExec` hands out. The endpoint owns
 the processes, the output and the notify sender (`execd` is the reference); the client holds none of it.
+
+`JobScope::named` takes an opaque `[0-9a-z-]{1,64}` scope string (what the TypeScript and Python clients take).
+`JobScope::for_session` remains the Beyond agent helper that digests tenant + session. `Jobs::start` builds a kept
+job from program/args with optional cwd/label — the short path; `start_kept` still takes a full `JobSpec`.
+
+## Errors (`error.rs`)
+
+Layer-1 and most helpers still return `std::io::Error`. `SandboxError` is the FILES-OVER-EXEC kind vocabulary
+(`not_found`, `auth`, `protocol`, `not_offered`, …): convert with `From` / `SandboxError::classify`. Surfaces that
+speak to a conformance driver (MCP) use this type so kinds stay one implementation.
 
 ## Process-group machinery (`procgroup.rs`)
 

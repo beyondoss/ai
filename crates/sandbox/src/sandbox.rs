@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::exec::{ChunkSink, CommandRunner, ExecOutput, ExecResult};
 use crate::exec_endpoint::HttpExecRunner;
-use crate::exec_endpoint::jobs::SandboxJobs;
+use crate::exec_endpoint::jobs::{JobId, JobScope, JobSpec, SandboxJobs};
 use crate::fs::shell::ShellFs;
 use crate::token::TokenSource;
 
@@ -24,12 +24,81 @@ impl Jobs {
     pub fn over(exec: Arc<dyn CommandRunner>) -> Option<Self> {
         exec.sandbox_jobs().map(Self)
     }
+
+    /// Start a job the sandbox keeps from the start (no hold). Returns its process group once it
+    /// runs. Same shape as the TypeScript/Python `jobs.start`: program + args, with optional
+    /// [`cwd`](StartJob::cwd) / [`label`](StartJob::label) before [`.run()`](StartJob::run).
+    ///
+    /// ```no_run
+    /// # async fn demo(jobs: &beyond_sandbox::Jobs) -> std::io::Result<()> {
+    /// use beyond_sandbox::exec_endpoint::jobs::{JobId, JobScope};
+    /// let scope = JobScope::named("demo").map_err(std::io::Error::from)?;
+    /// let id = JobId::fresh();
+    /// jobs.start(&scope, &id, "npm", ["run", "dev"])
+    ///     .cwd("/work")
+    ///     .label("dev server")
+    ///     .run()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn start<'a, I, S>(
+        &'a self,
+        scope: &'a JobScope,
+        id: &'a JobId,
+        program: impl Into<String>,
+        args: I,
+    ) -> StartJob<'a>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        StartJob {
+            jobs: self,
+            scope,
+            id,
+            spec: JobSpec {
+                program: program.into(),
+                args: args.into_iter().map(Into::into).collect(),
+                cwd: None,
+                label: String::new(),
+            },
+        }
+    }
 }
 
 impl std::ops::Deref for Jobs {
     type Target = dyn SandboxJobs;
     fn deref(&self) -> &Self::Target {
         &*self.0
+    }
+}
+
+/// A kept job as [`Jobs::start`] builds it. Configure with [`cwd`](Self::cwd) /
+/// [`label`](Self::label), then [`run`](Self::run).
+pub struct StartJob<'a> {
+    jobs: &'a Jobs,
+    scope: &'a JobScope,
+    id: &'a JobId,
+    spec: JobSpec,
+}
+
+impl StartJob<'_> {
+    /// Run in this directory.
+    pub fn cwd(mut self, cwd: impl Into<String>) -> Self {
+        self.spec.cwd = Some(cwd.into());
+        self
+    }
+
+    /// One-line label; newlines are replaced before it is written.
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.spec.label = label.into();
+        self
+    }
+
+    /// Start the kept job; returns its process group once it runs.
+    pub async fn run(self) -> std::io::Result<u32> {
+        self.jobs.start_kept(self.scope, self.id, &self.spec).await
     }
 }
 
@@ -190,11 +259,18 @@ impl Command<'_> {
         }
     }
 
-    /// Run to completion, handing `on_chunk` each chunk of output as it arrives. A command given
-    /// [`stdin`](Self::stdin) is not streamed.
+    /// Run to completion, handing `on_chunk` each chunk of output as it arrives.
+    ///
+    /// A command given [`stdin`](Self::stdin) cannot be streamed: the one-shot path is the only
+    /// way to feed stdin today. Calling this with stdin set is
+    /// [`std::io::ErrorKind::Unsupported`] — use [`run`](Self::run) instead, so silence on the
+    /// sink is never mistaken for a live empty stream.
     pub async fn stream(self, on_chunk: ChunkSink<'_>) -> std::io::Result<ExecResult> {
         if self.stdin.is_some() {
-            return self.run_result().await;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "streaming a command with stdin is not offered; call run() instead",
+            ));
         }
         self.exec
             .run_streaming(

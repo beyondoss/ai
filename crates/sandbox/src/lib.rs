@@ -3,6 +3,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod bulk;
+pub mod error;
 pub mod exec;
 pub mod exec_endpoint;
 pub mod fs;
@@ -14,9 +15,10 @@ mod tls;
 mod token;
 
 pub use bulk::{BulkError, Sources, Transfer};
+pub use error::{ErrorKind, SandboxError};
 pub use exec::{CommandRunner as Exec, ExecOutput, ExecResult};
 pub use exec_endpoint::HttpExecRunner as HttpExec;
 pub use fs::FsBackend;
 pub use fs::shell::ShellFs as Files;
-pub use sandbox::{Command, Jobs, Sandbox};
+pub use sandbox::{Command, Jobs, Sandbox, StartJob};
 pub use token::TokenSource;
