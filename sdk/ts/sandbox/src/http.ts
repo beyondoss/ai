@@ -8,18 +8,19 @@ import {
   TooLargeError,
   TransportError,
 } from "./errors.js";
-import type {
-  Frame,
-  JobChunk,
-  JobFrame,
-  JobInfo,
-  JobOps,
-  JobSpec,
-  JobState,
-  RunOptions,
-  RunResult,
-  Survivor,
-  Transport,
+import {
+  type Frame,
+  isJobId,
+  type JobChunk,
+  type JobFrame,
+  type JobInfo,
+  type JobOps,
+  type JobSpec,
+  type JobState,
+  type RunOptions,
+  type RunResult,
+  type Survivor,
+  type Transport,
 } from "./transport.js";
 
 /** The response cap: a larger one-shot answer fails with `too_large` (the command ran). */
@@ -240,10 +241,12 @@ export class HttpTransport implements Transport {
         refreshed = true;
         continue;
       }
-      void over;
       const msg = `exec endpoint ${this.url} returned ${status}: ${detail}`;
       if (status === 401 || status === 403) throw new AuthError(msg);
-      if (status === 422 && detail.includes("cap")) {
+      // 422 + over-cap: the body may be empty (Content-Length over the cap) or truncated, so the
+      // excerpt can lack the word "cap" — `over` is then the client's own verdict that the answer
+      // was too large (the command ran).
+      if (status === 422 && (over || detail.includes("cap"))) {
         throw new TooLargeError(msg);
       }
       throw new EndpointError(msg, status);
@@ -260,6 +263,10 @@ export class HttpTransport implements Transport {
       throw new TransportError(`exec endpoint ${this.url}: aborted`);
     }
     const headers = await this.requestHeaders(refresh);
+    // Abort during token mint / header build never reaches the listener below: re-check.
+    if (signal?.aborted) {
+      throw new TransportError(`exec endpoint ${this.url}: aborted`);
+    }
     const ctl = new AbortController();
     let timedOut = false;
     let callerAborted = false;
@@ -618,14 +625,14 @@ export function decodeFrameLine(line: Uint8Array, url = "endpoint"): Decoded[] {
   if (v.stderr !== undefined && v.stderr !== null) {
     out.push({ type: "stderr", data: b64Field("stderr", v.stderr, url) });
   }
-  if (typeof v.shell_exit === "number") {
+  if (typeof v.shell_exit === "number" && Number.isInteger(v.shell_exit)) {
     out.push({ type: "shell_exit", code: v.shell_exit });
   }
   if (typeof v.error === "string") {
     out.push({ type: "error", message: v.error });
-  } else if (typeof v.exit_code === "number") {
+  } else if (typeof v.exit_code === "number" && Number.isInteger(v.exit_code)) {
     out.push({ type: "exit", code: v.exit_code });
-  } else if (typeof v.signal === "number") {
+  } else if (typeof v.signal === "number" && Number.isInteger(v.signal)) {
     out.push({ type: "signal", signal: v.signal });
   } else if (v.timed_out === true) out.push({ type: "timed_out" });
   if (out.length === 0) out.push("heartbeat");
@@ -718,7 +725,10 @@ class HttpJobs implements JobOps {
       job,
     });
     try {
-      const { body } = await this.t.readCapped(ex);
+      const { body, over } = await this.t.readCapped(ex);
+      if (over) {
+        throw new TooLargeError("a job answer exceeded the response cap");
+      }
       let started: unknown;
       try {
         const v: unknown = JSON.parse(text(body));
@@ -772,8 +782,8 @@ class HttpJobs implements JobOps {
       this.job("read", scope, { id, offset, max }),
     );
     const st = jobState(v.state, v.code);
-    const data = fromBase64(typeof v.data === "string" ? v.data : "");
-    if (!st || !data) throw badJob("read", v);
+    const data = typeof v.data === "string" ? fromBase64(v.data) : null;
+    if (!st || data === null) throw badJob("read", v);
     return {
       ...st,
       ...jobSignal(v, st),
@@ -796,6 +806,11 @@ class HttpJobs implements JobOps {
       job: this.job("attach", scope, { id, offset }),
     });
     try {
+      if (!isNdjson(ex.res)) {
+        throw new ProtocolError(
+          `exec endpoint ${this.t.url} answered a job stream with something that is not a stream`,
+        );
+      }
       for await (const line of this.t.lines(ex)) {
         const f = decodeJobFrame(line);
         if (f === "heartbeat") continue;
@@ -836,11 +851,6 @@ class HttpJobs implements JobOps {
   }
 }
 
-/** A job id is 1 to 32 characters of `[0-9a-z]`. */
-export function isJobId(s: string): boolean {
-  return /^[0-9a-z]{1,32}$/.test(s);
-}
-
 /** One line of a job stream: the stream frames plus `started` and `gap`. */
 export function decodeJobFrame(line: Uint8Array): JobFrame | "heartbeat" {
   let s = text(line);
@@ -878,13 +888,13 @@ export function decodeJobFrame(line: Uint8Array): JobFrame | "heartbeat" {
     return { type: "output", data };
   }
   if (typeof v.gap === "number") return { type: "gap", bytes: v.gap };
-  if (typeof v.shell_exit === "number") {
+  if (typeof v.shell_exit === "number" && Number.isInteger(v.shell_exit)) {
     return { type: "shell_exit", code: v.shell_exit };
   }
-  if (typeof v.exit_code === "number") {
+  if (typeof v.exit_code === "number" && Number.isInteger(v.exit_code)) {
     return { type: "exit", code: v.exit_code };
   }
-  if (typeof v.signal === "number") {
+  if (typeof v.signal === "number" && Number.isInteger(v.signal)) {
     return { type: "signal", signal: v.signal };
   }
   if (v.timed_out === true) {

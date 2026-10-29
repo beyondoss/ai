@@ -35,7 +35,8 @@ export const T_FILE = ch("0");
 export const T_HARD = ch("1");
 export const T_SYMLINK = ch("2");
 export const T_DIR = ch("5");
-const T_CONTIG = ch("7");
+/** Contiguous file (`7`): treated as a regular file for content and extraction. */
+export const T_CONTIG = ch("7");
 
 export const archiveError = (msg: string): SandboxError =>
   new SandboxError("protocol", msg);
@@ -208,6 +209,9 @@ export class TarParser {
   private zeroBlocks = 0;
   private longName: Bytes | undefined;
   private longLink: Bytes | undefined;
+  /** Pax `g` defaults: apply to every later member until overridden. */
+  private globalPax: Pax = {};
+  /** Pax `x` overrides for the next member only. */
   private pax: Pax = {};
 
   feed(input: Uint8Array, sink: TarSink): void {
@@ -295,7 +299,7 @@ export class TarParser {
     if (this.longLink) link = this.longLink;
     this.longName = undefined;
     this.longLink = undefined;
-    const pax = this.pax;
+    const pax: Pax = { ...this.globalPax, ...this.pax };
     this.pax = {};
     if (pax.path) name = pax.path;
     if (pax.link) link = pax.link;
@@ -317,35 +321,47 @@ export class TarParser {
   private meta(kind: number, buf: Uint8Array): void {
     if (kind === ch("L")) this.longName = strField(buf).slice();
     else if (kind === ch("K")) this.longLink = strField(buf).slice();
-    else if (kind === ch("x")) {
-      // `LEN KEY=VALUE\n`, LEN counting the whole record.
-      let rest = buf;
-      while (rest.length > 0) {
-        const sp = rest.indexOf(0x20);
-        if (sp < 0) throw archiveError("bad pax record");
-        const lenStr = new TextDecoder().decode(rest.subarray(0, sp));
-        const len = /^\d+$/.test(lenStr) ? Number(lenStr) : NaN;
-        if (!Number.isInteger(len)) throw archiveError("bad pax record length");
-        if (len <= sp + 1 || len > rest.length) {
-          throw archiveError("bad pax record length");
+    else if (kind === ch("x") || kind === ch("g")) {
+      // `g` updates defaults for later members; `x` overrides the next member only.
+      applyPax(buf, kind === ch("g") ? this.globalPax : this.pax);
+    }
+  }
+}
+
+/**
+ * Parse `LEN KEY=VALUE\n` pax records into `into`. `size` must be a decimal integer in the safe
+ * range: a scientific or oversize value would desync the content-length countdown on download.
+ */
+function applyPax(buf: Uint8Array, into: Pax): void {
+  let rest = buf;
+  while (rest.length > 0) {
+    const sp = rest.indexOf(0x20);
+    if (sp < 0) throw archiveError("bad pax record");
+    const lenStr = new TextDecoder().decode(rest.subarray(0, sp));
+    const len = /^\d+$/.test(lenStr) ? Number(lenStr) : NaN;
+    if (!Number.isSafeInteger(len)) throw archiveError("bad pax record length");
+    if (len <= sp + 1 || len > rest.length) {
+      throw archiveError("bad pax record length");
+    }
+    let rec = rest.subarray(sp + 1, len);
+    if (rec[rec.length - 1] === 0x0a) rec = rec.subarray(0, rec.length - 1);
+    const eq = rec.indexOf(0x3d);
+    if (eq >= 0) {
+      const k = new TextDecoder().decode(rec.subarray(0, eq));
+      const v = rec.slice(eq + 1);
+      if (k === "path") into.path = v;
+      else if (k === "linkpath") into.link = v;
+      else if (k === "size") {
+        const s = new TextDecoder().decode(v);
+        if (!/^\d+$/.test(s)) throw archiveError("bad pax size");
+        const n = Number(s);
+        if (!Number.isSafeInteger(n) || n < 0) {
+          throw archiveError("bad pax size");
         }
-        let rec = rest.subarray(sp + 1, len);
-        if (rec[rec.length - 1] === 0x0a) rec = rec.subarray(0, rec.length - 1);
-        const eq = rec.indexOf(0x3d);
-        if (eq >= 0) {
-          const k = new TextDecoder().decode(rec.subarray(0, eq));
-          const v = rec.slice(eq + 1);
-          if (k === "path") this.pax.path = v;
-          else if (k === "linkpath") this.pax.link = v;
-          else if (k === "size") {
-            const n = Number(new TextDecoder().decode(v));
-            if (Number.isInteger(n) && n >= 0) this.pax.size = n;
-          }
-        }
-        rest = rest.subarray(len);
+        into.size = n;
       }
     }
-    // `g`: global records are not used.
+    rest = rest.subarray(len);
   }
 }
 

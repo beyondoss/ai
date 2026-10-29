@@ -108,6 +108,11 @@ export interface Survivor {
   detail: string;
 }
 
+/** A job id is 1 to 32 characters of `[0-9a-z]`. */
+export function isJobId(s: string): boolean {
+  return /^[0-9a-z]{1,32}$/.test(s);
+}
+
 /**
  * The sandbox's jobs: commands it keeps. `scope` is the opaque name of one session's jobs; `id` is
  * 1 to 32 characters of `[0-9a-z]`.

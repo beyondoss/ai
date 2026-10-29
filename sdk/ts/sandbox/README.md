@@ -49,9 +49,10 @@ Transport  run, stream, jobs                           raw exec; replace it with
    `HttpTransport({ url, token })` is the default: `token` is a string, or `() => Promise<string>` which is called again once on
    a `401`, retrying that request once. That is the only retry the package makes.
 2. **`Files` and `Jobs`** take any `Transport`: `new Files(transport)`. They never touch anything but the transport, so a helper
-   you write has the same powers. `Files` looks at the sandbox once, in ONE `sh -c` round trip on the first file operation
-   (`rg` or GNU `grep` or busybox `grep`; `find -printf`; whether `dd`/`base64` can read windows), and a listing without
-   `-printf` takes two `find` passes. Writes always send their content on stdin.
+   you write has the same powers. `Files` looks at the sandbox once, in ONE `sh -c` round trip on the first operation that
+   needs it (`read`, `list`, `search` — a write needs nothing and never probes): `rg` or GNU `grep` or busybox `grep`;
+   `find -printf`; whether `dd`/`base64` can read windows. A listing without `-printf` takes two `find` passes. Writes
+   always send their content on stdin.
 3. **`Sandbox`** composes both and always exposes raw exec (`sb.exec`, `sb.stream`, `sb.transport`) and
    `sb.capabilities()` (the same probe as `sb.files.capabilities()`).
 
@@ -82,7 +83,7 @@ await sandbox.download("/work/out", "./out"); // a directory, or one file
 
 Trees move as a `tar` stream over raw exec: modes, mtimes and symlinks are kept, nothing is followed, and the sandbox needs only `sh` and a GNU or busybox `tar`. The archive is written and read by this package, so the local machine needs no `tar` and holds no more than about two 16 MiB chunks (`BULK_CHUNK_BYTES`) of it. An upload that fits one chunk is one command with the tar on stdin; a larger one goes to a stage file beside the destination in checked, offset-numbered appends and is extracted by a final command (a 50 MiB file takes five). A download streams the tar through the extractor and never buffers it whole.
 
-The sandbox is not trusted on download: a member with `..` or an absolute name, one below a symlink (made by the archive or already local), or a hard link to anything the archive did not write, is refused as `protocol` (`unsafe archive member ...`) and the stream is closed. A destination that is a file is `not_a_directory`; a read-only or full filesystem is `io`, and a destination the call created is removed on failure. The shared matrix runs this against GNU and busybox `tar`, a read-only mount, a locked directory and a 1 MiB disk (FILES-OVER-EXEC.md section 5.8).
+The sandbox is not trusted on download: a member with `..` or an absolute name, one below a symlink (made by the archive or already local), or a hard link to anything the archive did not write, is refused as `protocol` (`unsafe archive member ...`) and the stream is closed. A destination that is a file is `not_a_directory`; a read-only or full filesystem is `io`. Whatever was extracted before a failure stays in `localDir` (a partial download is an error, never a result). On upload, a remote `DEST` this call created is removed on failure; a `DEST` that already existed keeps whatever `tar` had written. The shared matrix runs this against GNU and busybox `tar`, a read-only mount, a locked directory and a 1 MiB disk (FILES-OVER-EXEC.md section 5.8).
 
 ### Jobs
 
