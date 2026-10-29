@@ -263,6 +263,10 @@ export class HttpTransport implements Transport {
       throw new TransportError(`exec endpoint ${this.url}: aborted`);
     }
     const headers = await this.requestHeaders(refresh);
+    // Abort during token mint / header build never reaches the listener below: re-check.
+    if (signal?.aborted) {
+      throw new TransportError(`exec endpoint ${this.url}: aborted`);
+    }
     const ctl = new AbortController();
     let timedOut = false;
     let callerAborted = false;
@@ -595,14 +599,14 @@ export function decodeFrameLine(line: Uint8Array, url = "endpoint"): Decoded[] {
   if (v.stderr !== undefined && v.stderr !== null) {
     out.push({ type: "stderr", data: b64Field("stderr", v.stderr, url) });
   }
-  if (typeof v.shell_exit === "number") {
+  if (typeof v.shell_exit === "number" && Number.isInteger(v.shell_exit)) {
     out.push({ type: "shell_exit", code: v.shell_exit });
   }
   if (typeof v.error === "string") {
     out.push({ type: "error", message: v.error });
-  } else if (typeof v.exit_code === "number") {
+  } else if (typeof v.exit_code === "number" && Number.isInteger(v.exit_code)) {
     out.push({ type: "exit", code: v.exit_code });
-  } else if (typeof v.signal === "number") {
+  } else if (typeof v.signal === "number" && Number.isInteger(v.signal)) {
     out.push({ type: "signal", signal: v.signal });
   } else if (v.timed_out === true) out.push({ type: "timed_out" });
   if (out.length === 0) out.push("heartbeat");
@@ -752,8 +756,8 @@ class HttpJobs implements JobOps {
       this.job("read", scope, { id, offset, max }),
     );
     const st = jobState(v.state, v.code);
-    const data = fromBase64(typeof v.data === "string" ? v.data : "");
-    if (!st || !data) throw badJob("read", v);
+    const data = typeof v.data === "string" ? fromBase64(v.data) : null;
+    if (!st || data === null) throw badJob("read", v);
     return {
       ...st,
       ...jobSignal(v, st),
@@ -858,13 +862,13 @@ export function decodeJobFrame(line: Uint8Array): JobFrame | "heartbeat" {
     return { type: "output", data };
   }
   if (typeof v.gap === "number") return { type: "gap", bytes: v.gap };
-  if (typeof v.shell_exit === "number") {
+  if (typeof v.shell_exit === "number" && Number.isInteger(v.shell_exit)) {
     return { type: "shell_exit", code: v.shell_exit };
   }
-  if (typeof v.exit_code === "number") {
+  if (typeof v.exit_code === "number" && Number.isInteger(v.exit_code)) {
     return { type: "exit", code: v.exit_code };
   }
-  if (typeof v.signal === "number") {
+  if (typeof v.signal === "number" && Number.isInteger(v.signal)) {
     return { type: "signal", signal: v.signal };
   }
   if (v.timed_out === true) {

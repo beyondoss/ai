@@ -27,6 +27,7 @@ import {
   BLOCK,
   END_BLOCKS,
   padLen,
+  T_CONTIG,
   T_DIR,
   T_FILE,
   T_HARD,
@@ -518,7 +519,7 @@ export class Extractor implements TarSink {
         break;
       }
       case T_FILE:
-      case 0x37: {
+      case T_CONTIG: {
         const path = this.parents(e.name, comps);
         if (this.clear(path)) throw this.isDirectory(path);
         let fd: number;

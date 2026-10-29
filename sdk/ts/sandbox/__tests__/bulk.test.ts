@@ -220,6 +220,33 @@ describe("tar", () => {
     p2.feed(u, s2.sink);
     expect(Buffer.from(s2.seen[0]!.e.name).toString()).toBe("pre/fix/file.txt");
   });
+
+  it("applies pax g defaults to later members and refuses a non-safe pax size", () => {
+    const rec = (k: string, v: string) => {
+      const body = ` ${k}=${v}\n`;
+      let len = body.length + 1;
+      while (String(len).length + body.length !== len) {
+        len = String(len).length + body.length;
+      }
+      return `${len}${body}`;
+    };
+    const g = rawTar(
+      [["./PaxHeaders.", "g", rec("path", "from-g"), "", 0]],
+      { end: false },
+    );
+    const f = rawTar([["short", "0", "x", "", 0o600]], { end: false });
+    const p = new TarParser();
+    const { sink, seen } = entries();
+    p.feed(Buffer.concat([g, f, new Uint8Array(1024)]), sink);
+    p.finish();
+    expect(Buffer.from(seen[0]!.e.name).toString()).toBe("from-g");
+
+    const bad = rawTar(
+      [["PaxHeader", "x", rec("size", "1e20"), "", 0]],
+      { end: false },
+    );
+    expect(() => new TarParser().feed(bad, entries().sink)).toThrow(/pax size/);
+  });
 });
 
 // ---- the extractor's rules --------------------------------------------------------------------

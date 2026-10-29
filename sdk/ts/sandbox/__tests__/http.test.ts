@@ -505,6 +505,23 @@ describe("AbortSignal on run", () => {
     await expect(p).rejects.toThrow(/aborted/);
     expect(await kindOf(p)).toBe("transport");
   });
+
+  it("honours abort that fires while the token source is awaited", async () => {
+    const e = await endpoint((_, res) => json(res, 200, ok()));
+    const ctl = new AbortController();
+    const t = new HttpTransport({
+      url: e.url,
+      token: async () => {
+        ctl.abort();
+        await new Promise((r) => setTimeout(r, 20));
+        return "late";
+      },
+    });
+    const p = t.run("x", [], { signal: ctl.signal });
+    await expect(p).rejects.toThrow(/aborted/);
+    expect(await kindOf(p)).toBe("transport");
+    expect(e.requests).toHaveLength(0);
+  });
 });
 
 describe("decodeFrameLine", () => {
@@ -523,5 +540,9 @@ describe("decodeFrameLine", () => {
   });
   it("requires standard base64", () => {
     expect(() => dec("{\"stdout\":\"***\"}")).toThrow(/base64/);
+  });
+  it("ignores a non-integer exit_code instead of treating it as final", () => {
+    expect(dec('{"exit_code":1.5}')).toEqual(["heartbeat"]);
+    expect(dec('{"exit_code":null}')).toEqual(["heartbeat"]);
   });
 });
