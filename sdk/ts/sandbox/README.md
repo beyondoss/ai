@@ -52,7 +52,8 @@ Transport  run, stream, jobs                           raw exec; replace it with
    you write has the same powers. `Files` looks at the sandbox once, in ONE `sh -c` round trip on the first file operation
    (`rg` or GNU `grep` or busybox `grep`; `find -printf`; whether `dd`/`base64` can read windows), and a listing without
    `-printf` takes two `find` passes. Writes always send their content on stdin.
-3. **`Sandbox`** composes both and always exposes raw exec (`sb.exec`, `sb.stream`, `sb.transport`).
+3. **`Sandbox`** composes both and always exposes raw exec (`sb.exec`, `sb.stream`, `sb.transport`) and
+   `sb.capabilities()` (the same probe as `sb.files.capabilities()`).
 
 ### Raw exec is bytes
 
@@ -85,17 +86,23 @@ The sandbox is not trusted on download: a member with `..` or an absolute name, 
 
 ### Jobs
 
-`jobs.start(scope, id, { command, args, cwd, label })`, `list`, `read(scope, id, { offset, max })`, `follow` / `attach`, `kill`,
-`remove`, `wipe`. A job is owned by the sandbox: it keeps running when you disconnect, and its last 8 MiB of output is
-readable from any offset. The sandbox keeps them; the client validates and forwards. `scope` is 1 to 64 of `[0-9a-z-]`, an id 1 to
-32 of `[0-9a-z]`.
+`jobs.start(scope, id, { command, args, cwd, label })`, `list`, `read(scope, id, { offset, max })`, `follow` (frames) /
+`collect` (follow to the end into one result; `attach` is a deprecated alias), `kill`, `remove`, `wipe`. A job is owned by
+the sandbox: it keeps running when you disconnect, and its last 8 MiB of output is readable from any offset. The sandbox
+keeps them; the client validates and forwards. `scope` is 1 to 64 of `[0-9a-z-]`, an id 1 to 32 of `[0-9a-z]`.
 
 ### Errors
 
 Every failure is a `SandboxError` with `kind` and `detail`, using the spec's vocabulary: `not_found`, `is_directory`,
 `not_a_directory`, `permission_denied`, `io` (a command ran and failed), `invalid_query`, `conflict`, `too_large` (the answer
 exceeded the 16 MiB response cap; the command ran), `auth`, `timeout`, `transport`, `protocol`, `endpoint`, `not_offered`,
-`invalid_request`. There are subclasses (`NotFoundError`, `AuthError`, ...) and `err.kind` for a switch.
+`invalid_request`. Each kind has a subclass (`NotFoundError`, `IsDirectoryError`, `IoError`, `AuthError`, ...) and
+`err.kind` for a switch; `errorFor(kind, detail)` builds the matching class when you only have the name.
+
+### AbortSignal
+
+`exec`, `stream`, and `transport.run` / `transport.stream` take an optional `signal`. Aborting it closes the request: for a
+stream that kills the command, the same as stopping iteration. The failure is `transport` with detail mentioning abort.
 
 ## Bring your own transport
 

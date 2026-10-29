@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { classifyFailure, errorDetail } from "../src/errors.js";
+import {
+  classifyFailure,
+  errorDetail,
+  errorFor,
+  IoError,
+  IsDirectoryError,
+  NotADirectoryError,
+  NotFoundError,
+  PermissionDeniedError,
+} from "../src/errors.js";
 import { parseDirEntries, parseStat } from "../src/files.js";
 import { compileGlob } from "../src/glob.js";
 import {
@@ -357,9 +366,37 @@ describe("classifyFailure (a command that ran and failed)", () => {
     );
   });
 
+  it("returns the matching subclass for instanceof", () => {
+    expect(classifyFailure("op", "No such file or directory")).toBeInstanceOf(
+      NotFoundError,
+    );
+    expect(classifyFailure("op", "Is a directory")).toBeInstanceOf(
+      IsDirectoryError,
+    );
+    expect(classifyFailure("op", "Not a directory")).toBeInstanceOf(
+      NotADirectoryError,
+    );
+    expect(classifyFailure("op", "Permission denied")).toBeInstanceOf(
+      PermissionDeniedError,
+    );
+    expect(classifyFailure("op", "boom")).toBeInstanceOf(IoError);
+  });
+
   it("does not classify by the path in the prefix", () => {
     expect(classifyFailure("read /no such file or directory/x", "weird").kind)
       .toBe("io");
+  });
+});
+
+describe("errorFor", () => {
+  it("builds the subclass of each kind", () => {
+    expect(errorFor("is_directory", "x")).toBeInstanceOf(IsDirectoryError);
+    expect(errorFor("not_a_directory", "x")).toBeInstanceOf(NotADirectoryError);
+    expect(errorFor("permission_denied", "x")).toBeInstanceOf(
+      PermissionDeniedError,
+    );
+    expect(errorFor("io", "x")).toBeInstanceOf(IoError);
+    expect(errorFor("not_found", "x")).toBeInstanceOf(NotFoundError);
   });
 });
 

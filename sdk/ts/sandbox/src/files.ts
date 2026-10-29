@@ -4,6 +4,8 @@ import {
   ConflictError,
   InvalidQueryError,
   InvalidRequestError,
+  IoError,
+  NotADirectoryError,
   NotFoundError,
   SandboxError,
   TimeoutError,
@@ -223,8 +225,7 @@ export class Files {
     const max = count("max", options.max, Infinity);
     const caps = await this.capabilities();
     if (!caps.readWindow) {
-      throw new SandboxError(
-        "io",
+      throw new IoError(
         `read ${path}: this target's dd or base64 does not support iflag=skip_bytes,count_bytes / -w0, so files cannot be read`,
       );
     }
@@ -241,8 +242,7 @@ export class Files {
       }
       const chunk = fromBase64(text(r.stdout).trim());
       if (!chunk) {
-        throw new SandboxError(
-          "io",
+        throw new IoError(
           `read ${path}: the command's output is not base64`,
         );
       }
@@ -446,7 +446,7 @@ export class Files {
       }
       if (f.kind === "missing_root") {
         throw f.line.includes("Not a directory")
-          ? new SandboxError("not_a_directory", f.line)
+          ? new NotADirectoryError(f.line)
           : new NotFoundError(f.line);
       }
       skipped = f.note;
