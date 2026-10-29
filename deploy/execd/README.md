@@ -58,12 +58,14 @@ EXECD_LISTEN=127.0.0.1:8080 EXECD_BEARER_FILE=/path/to/token execd &
 curl -fs http://127.0.0.1:8080/livez
 curl -s -X POST -H "authorization: Bearer $(cat /path/to/token)" \
   -d '{"command":"sh","args":["-c","echo hi"]}' http://127.0.0.1:8080/
-# {"exit_code":0,"stderr":"","stdout":"hi\n"}
+# {"exit_code":0,"stderr":"","stdout":"aGkK"}
 ```
+
+`stdout` and `stderr` are standard base64 of the command's bytes (`aGkK` is `hi\n`).
 
 ## Tests
 
-`test-install.sh` runs the installer in `alpine` (busybox `wget`) and `debian:bookworm-slim` (`curl`) against a local fake release served with `python3 -m http.server`: success, rerun, checksum mismatch (refused, no file left), mismatch over an existing install, unsupported architecture. In debian it also runs the installed `execd` with a bearer file. It then builds `Dockerfile.execd`, copies it into a throwaway `FROM alpine` image and runs `execd` there. Both runs use `probe.sh`: `/livez` answers 200 without auth, an unauthenticated exec gets 401, and an authenticated `sh -c 'echo hi'` returns `exit_code` 0 and stdout `hi\n`. It needs docker, python3 and a static musl build:
+`test-install.sh` runs the installer in `alpine` (busybox `wget`) and `debian:bookworm-slim` (`curl`) against a local fake release served with `python3 -m http.server`: success, rerun, checksum mismatch (refused, no file left), mismatch over an existing install, unsupported architecture. In debian it also runs the installed `execd` with a bearer file. It then builds `Dockerfile.execd`, copies it into a throwaway `FROM alpine` image and runs `execd` there. Both runs use `probe.sh`: `/livez` answers 200 without auth, an unauthenticated exec gets 401, and an authenticated `sh -c 'echo hi'` returns `exit_code` 0 and stdout `aGkK` (base64 of `hi\n`). It needs docker, python3 and a static musl build:
 
 ```sh
 RUSTFLAGS="-C relocation-model=static" \

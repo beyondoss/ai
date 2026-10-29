@@ -59,6 +59,16 @@ echo -n "$TOKEN" > /run/execd-bearer && chmod 600 /run/execd-bearer
 EXECD_LISTEN=0.0.0.0:8080 EXECD_BEARER_FILE=/run/execd-bearer EXECD_RUN_AS=sandbox execd   # as root
 ```
 
+Prove it locally (stdout and stderr are standard base64; `aGkK` is `hi\n`):
+
+```sh
+EXECD_LISTEN=127.0.0.1:8080 EXECD_BEARER_FILE=/run/execd-bearer execd &
+curl -fs http://127.0.0.1:8080/livez
+curl -s -X POST -H "Authorization: Bearer $(cat /run/execd-bearer)" \
+  -d '{"command":"sh","args":["-c","echo hi"]}' http://127.0.0.1:8080/
+# {"exit_code":0,"stderr":"","stdout":"aGkK"}
+```
+
 The tarballs, checksums and the other ways to install are in [`deploy/execd`](../../deploy/execd/README.md). To build from
 source (the crate is `beyond-execd`, the binary `execd`): `cargo install --path crates/execd`.
 
@@ -107,6 +117,16 @@ let server = execd::serve(listener, execd::Options::new("/work"))?;
 server.shutdown().await;
 ```
 
-An `Observer` set on `Options` is told of every request, stream and callback attempt; unset it costs one branch.
+What the binary does beyond `serve()`, and what an embedder should call:
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the request flow, the process model and what bounds every resource.
+| call | when | if omitted |
+| ---- | ---- | ---------- |
+| `helper_main()` first, before parsing anything | required with `Options::run_as` | `run_as` commands cannot start |
+| `log::set_level(Level)` | to see library logs | the library logs nothing |
+| `become_subreaper()` | PID 1 / orphan reaping | orphans go to the host's init; waiters poll every 50 ms |
+| `remove_stale_jobs_dirs(jobs_dir)` | after listening | crashed predecessors' job output dirs stay on disk |
+| `serve` / `Handle::shutdown` | always | — |
+
+An `Observer` set on `Options` is told of every request, stream and callback attempt; unset it costs one branch.
+`examples/embed.rs` is the minimal correct `main()`. See [ARCHITECTURE.md](ARCHITECTURE.md#embedding) for auth,
+idle timeout, activity, and `job_op_hook`.
