@@ -65,11 +65,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 **Public names vs rustdoc types.** The crate root re-exports the names you write in examples; the defining types keep
 the names the agent extracted them under:
 
-| you write   | defining type              |
-| ----------- | -------------------------- |
-| `Exec`      | `exec::CommandRunner`      |
-| `HttpExec`  | `exec_endpoint::HttpExecRunner` |
-| `Files`     | `fs::shell::ShellFs`       |
+| you write  | defining type                   |
+| ---------- | ------------------------------- |
+| `Exec`     | `exec::CommandRunner`           |
+| `HttpExec` | `exec_endpoint::HttpExecRunner` |
+| `Files`    | `fs::shell::ShellFs`            |
 
 Write a transport for anything that can speak the exec protocol (a vendor SDK, a test double) by implementing `Exec`:
 `run`, `run_streaming`, `run_streaming_tracked` and `run_attached`, plus `sandbox_jobs` for the target's jobs. A transport

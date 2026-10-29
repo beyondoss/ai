@@ -10,6 +10,7 @@ version: "1.1.0"
 Design or evaluate APIs, SDKs, CLIs, and frameworks as interfaces. Derives what developers need to accomplish, checks whether the surface matches ecosystem expectations, and diagnoses where the interface fails to signal its own capabilities and constraints.
 
 Works in two modes:
+
 - **Design mode** — greenfield. Shape the surface before writing code. Produce a concrete interface design: endpoints, method signatures, error shapes, config schema, composable primitives.
 - **Audit mode** — evaluate what exists. Find gaps between the jobs developers need to accomplish and how well the current surface serves them.
 
@@ -33,11 +34,11 @@ A well-formed job: _"When [situation], I want to [motivation], so I can [outcome
 
 Jobs operate at multiple levels:
 
-| Dimension | Question | Example |
-|-----------|----------|---------|
-| **Functional** | What are they literally trying to do? | Send a message to a queue without blocking the request |
-| **Emotional** | How do they want to feel? | Confident it won't silently drop messages |
-| **Social** | How do they want to be perceived? | Someone who ships resilient systems, not someone who loses data |
+| Dimension      | Question                              | Example                                                         |
+| -------------- | ------------------------------------- | --------------------------------------------------------------- |
+| **Functional** | What are they literally trying to do? | Send a message to a queue without blocking the request          |
+| **Emotional**  | How do they want to feel?             | Confident it won't silently drop messages                       |
+| **Social**     | How do they want to be perceived?     | Someone who ships resilient systems, not someone who loses data |
 
 The job is **stable and solution-agnostic** — it exists whether or not your service exists. Features are proposed solutions. Design that starts from features works backwards from answers. Start from jobs.
 
@@ -68,24 +69,29 @@ Don Norman's framework for physical interfaces applies directly to developer sur
 **Five properties — all apply to developer interfaces:**
 
 **Signifiers**: What signals what the interface can do?
+
 - Method names, parameter names, types, return types — these are signifiers.
 - A method named `send` signals less than `send_with_retry`. A parameter typed `Duration` signals more than one typed `u64`.
 - Weak signifiers force developers to read docs before they can act. Strong signifiers let them proceed on instinct.
 
 **Affordances**: What does the interface actually allow?
+
 - The real capabilities of the surface. What can be done?
 - The gap between affordances and signifiers is where bugs and confusion live. When an interface signals one thing and does another, trust breaks.
 
 **Feedback**: What does the interface tell you about what happened?
+
 - Errors should name what went wrong, not just that something went wrong.
 - Return types should make success and failure explicit — not buried in a nullable field or a status code you have to remember to check.
 - Silent failure (returns `nil`, drops messages, ignores unknown config) is the worst feedback: it signals success while hiding failure.
 
 **Conceptual model**: Does the interface's model match the developer's model?
+
 - If developers think of a queue as a FIFO list and the API exposes it as a weighted graph, they'll use it wrong no matter how well the methods are named.
 - Leaky abstractions expose the wrong model — implementation details that shouldn't be visible. Incomplete abstractions leave jobs half-served.
 
 **Constraints**: What does the interface make impossible or hard?
+
 - Good constraints guide developers toward correct use without requiring them to understand every invariant.
 - Bad constraints make the right thing hard and the wrong thing easy.
 
@@ -102,6 +108,7 @@ The three lenses converge on one question: **Does the interface keep its promise
 - **DOET** defines the signal: whether the interface communicates that it can keep the promise.
 
 A gap at any layer is a broken promise:
+
 - JTBD gap: the job isn't served — the developer can't accomplish what they came to do.
 - Jakob's Law gap: the convention is violated — the developer can't proceed on instinct and must pay a learning tax.
 - DOET gap: the signal is wrong — the developer can't tell what the interface does, or the interface does something other than what it signals.
@@ -128,6 +135,7 @@ Use when shaping a new surface before implementation, or when redesigning after 
 ### Step 1: Establish Context
 
 Ask or infer:
+
 - What domain is this serving? (queues, auth, payments, storage, etc.)
 - Who are the developers that will use it? (backend engineers, operators, coding agents, framework authors)
 - What stack or ecosystem? (Rust, Go, TypeScript, Python — this determines naming and idiom conventions)
@@ -163,6 +171,7 @@ These are the baselines. Deviations need explicit justification.
 For each layer in scope, produce a concrete interface design. Be specific — not "add a method for X" but the actual signature, shape, and behavior.
 
 **REST API design**:
+
 - Resource table: `METHOD /path` → description, request body, response body
 - Error shape (pick one and commit to it across the whole surface)
 - Pagination strategy (cursor, offset, keyset)
@@ -170,6 +179,7 @@ For each layer in scope, produce a concrete interface design. Be specific — no
 - Versioning approach
 
 **SDK design**:
+
 - Client initialization: what's required, what's optional, what has sensible defaults
 - Method signatures: show actual code in the target language
 - Return types: how are errors surfaced? (Result<T, E>, exceptions, callbacks)
@@ -177,12 +187,14 @@ For each layer in scope, produce a concrete interface design. Be specific — no
 - What does the 5-line happy-path look like? That's the signifier test.
 
 **CLI design**:
+
 - Command tree: `tool <resource> <verb> [flags]`
 - Output: human-readable default, `--json` for scripting
 - Exit codes: 0 success, 1 usage error, 2 runtime error
 - Config: where does it live, how is it scoped (global vs project)
 
 **Config design**:
+
 - Complete list of knobs with types, defaults, and valid ranges
 - Which are required vs optional
 - Env var names and config file equivalents
@@ -196,6 +208,7 @@ For each design decision, verify:
 **Jakob's Law check**: Does this match what the target ecosystem does? If it deviates, is the deviation documented and justified?
 
 **DOET check**:
+
 - Signifiers: does the name/type telegraph intent without documentation?
 - Affordances: does the interface do what it appears to do?
 - Feedback: what does success look like? What does failure look like? Is failure visible?
@@ -238,11 +251,13 @@ Use when evaluating an existing developer-facing surface.
 ### Step 1: Orient to the Project
 
 Read enough to build a confident picture of:
+
 - What domain this service operates in
 - Who calls it (operators, developers building on top of it, agents, machines)
 - What the full developer-facing surface looks like — REST API, SDK, CLI, config, error messages, webhooks, docs
 
 Start with:
+
 - `CLAUDE.md` or `README.md` — service model, constraints, philosophy
 - `ARCHITECTURE.md` — if present
 - Routing layer — the REST surface (`src/routes/`, `src/handlers/`, or equivalent)
@@ -284,21 +299,22 @@ Group by functional area. Note functional, emotional, and social dimensions wher
 ### Step 4: Evaluate Each Lens
 
 #### JTBD Evaluation
+
 For each job: is it served? At which layer? How well?
 
-| Job | Served? | Layer | Quality |
-|-----|---------|-------|---------|
+| Job                 | Served?            | Layer                     | Quality                   |
+| ------------------- | ------------------ | ------------------------- | ------------------------- |
 | When X, I want to Y | Yes / Partial / No | REST / SDK / CLI / Config | Clean / Friction / Broken |
 
 #### Jakob's Law Evaluation
 
 Identify ecosystem conventions for this type of surface. Compare:
 
-| Convention | Ecosystem standard | This surface | Gap? |
-|------------|-------------------|--------------|------|
-| Error shape | `{"error": {"code": "...", "message": "..."}}` | `{"error": "..."}` | Minor — missing structured code |
-| SDK method naming | `client.resource.verb()` | `client.verbResource()` | Major — inverted convention |
-| Config | ENV or config file, snake_case keys | Mixed camelCase/snake_case | Minor — inconsistent casing |
+| Convention        | Ecosystem standard                             | This surface               | Gap?                            |
+| ----------------- | ---------------------------------------------- | -------------------------- | ------------------------------- |
+| Error shape       | `{"error": {"code": "...", "message": "..."}}` | `{"error": "..."}`         | Minor — missing structured code |
+| SDK method naming | `client.resource.verb()`                       | `client.verbResource()`    | Major — inverted convention     |
+| Config            | ENV or config file, snake_case keys            | Mixed camelCase/snake_case | Minor — inconsistent casing     |
 
 Note intentional deviations separately. Is the deviation documented? Is the alternative demonstrably better?
 
@@ -306,13 +322,13 @@ Note intentional deviations separately. Is the deviation documented? Is the alte
 
 For each major surface area:
 
-| Property | Finding | Severity |
-|----------|---------|----------|
-| Signifiers — do names/types telegraph intent? | | |
-| Affordances — gap between signal and capability? | | |
-| Feedback — are errors actionable? Is failure visible? | | |
-| Conceptual model — matches the developer's model? | | |
-| Constraints — guides toward correct use? | | |
+| Property                                              | Finding | Severity |
+| ----------------------------------------------------- | ------- | -------- |
+| Signifiers — do names/types telegraph intent?         |         |          |
+| Affordances — gap between signal and capability?      |         |          |
+| Feedback — are errors actionable? Is failure visible? |         |          |
+| Conceptual model — matches the developer's model?     |         |          |
+| Constraints — guides toward correct use?              |         |          |
 
 ### Step 5: Evaluate Composability
 
@@ -326,6 +342,7 @@ For each major surface area:
 For each gap found, propose a change at the right layer. Not every gap requires an API change. A conceptual model gap might be fixed with docs. A signifier gap might be fixed by renaming a method. A missing job might require a new endpoint.
 
 Each proposal must include:
+
 - Which lens identified it (JTBD / Jakob's / DOET)
 - What gap it closes
 - Which layer the change lives at (REST, SDK, CLI, config, docs, error messages)
@@ -404,6 +421,7 @@ End with a verdict. If the surface is well-designed across all three lenses, say
 **Ecosystem baseline** (Rust): `Result<T, E>` returns, builder pattern for config, `async fn` by default.
 
 **Design**:
+
 ```rust
 // Happy path — common case is short
 let client = QueueClient::new("http://localhost:4000");
