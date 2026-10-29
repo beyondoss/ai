@@ -22,15 +22,15 @@ const root = join(__dirname, "..");
 function legacyIsSpace(c: number): boolean {
   if (c < 128) return c === 32 || (c >= 9 && c <= 13);
   return (
-    c === 0xa0 ||
-    c === 0x1680 ||
-    (c >= 0x2000 && c <= 0x200a) ||
-    c === 0x2028 ||
-    c === 0x2029 ||
-    c === 0x202f ||
-    c === 0x205f ||
-    c === 0x3000 ||
-    c === 0xfeff
+    c === 0xa0
+    || c === 0x1680
+    || (c >= 0x2000 && c <= 0x200a)
+    || c === 0x2028
+    || c === 0x2029
+    || c === 0x202f
+    || c === 0x205f
+    || c === 0x3000
+    || c === 0xfeff
   );
 }
 
@@ -225,15 +225,21 @@ function candidateValidateThenDecode(s: string): Uint8Array | null {
   return new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
 }
 
-for (const size of [256 * 1024, 1024 * 1024, 4 * 1024 * 1024, 12 * 1024 * 1024]) {
+for (
+  const size of [256 * 1024, 1024 * 1024, 4 * 1024 * 1024, 12 * 1024 * 1024]
+) {
   const { b64 } = makePayload(size);
   const a = legacyFromBase64(b64);
   const b = fromBase64(b64);
   const c = candidateValidateThenDecode(b64);
-  if (!a || !b || !c || a.length !== b.length || !a.every((v, i) => v === b[i])) {
+  if (
+    !a || !b || !c || a.length !== b.length || !a.every((v, i) => v === b[i])
+  ) {
     throw new Error(`decode mismatch at ${size}`);
   }
-  if (fromBase64("AB==") !== null || candidateValidateThenDecode("AB==") !== null) {
+  if (
+    fromBase64("AB==") !== null || candidateValidateThenDecode("AB==") !== null
+  ) {
     throw new Error("canonical reject failed");
   }
 
@@ -256,7 +262,11 @@ for (const size of [256 * 1024, 1024 * 1024, 4 * 1024 * 1024, 12 * 1024 * 1024])
     productionMs,
   });
   console.log(
-    `fromBase64 ${size}B: legacy/production ${fmt(legacyMs)} vs JS-validate candidate ${fmt(candidateMs)} (${speedup(legacyMs, candidateMs)}; production ${fmt(productionMs)})`,
+    `fromBase64 ${size}B: legacy/production ${
+      fmt(legacyMs)
+    } vs JS-validate candidate ${fmt(candidateMs)} (${
+      speedup(legacyMs, candidateMs)
+    }; production ${fmt(productionMs)})`,
   );
 }
 
@@ -276,7 +286,9 @@ for (const size of [256 * 1024, 1024 * 1024, 4 * 1024 * 1024, 12 * 1024 * 1024])
     speedup: speedup(legacyMs, newMs),
   });
   console.log(
-    `excerpt 4MiB: legacy ${fmt(legacyMs)} → new ${fmt(newMs)} (${speedup(legacyMs, newMs)})`,
+    `excerpt 4MiB: legacy ${fmt(legacyMs)} → new ${fmt(newMs)} (${
+      speedup(legacyMs, newMs)
+    })`,
   );
 }
 
@@ -299,7 +311,9 @@ for (const size of [256 * 1024, 1024 * 1024, 4 * 1024 * 1024, 12 * 1024 * 1024])
     speedup: speedup(legacyMs, newMs),
   });
   console.log(
-    `splitLines 4096 lines/1 chunk: legacy ${fmt(legacyMs)} → new ${fmt(newMs)} (${speedup(legacyMs, newMs)})`,
+    `splitLines 4096 lines/1 chunk: legacy ${fmt(legacyMs)} → new ${
+      fmt(newMs)
+    } (${speedup(legacyMs, newMs)})`,
   );
 }
 

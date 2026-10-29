@@ -10,22 +10,22 @@ Compares **legacy** (pre-fix, inlined in `scripts/bench-codec.ts`) against **cur
 
 ## Results (2026-10-29)
 
-| Suite | Input | Legacy | After / candidate | Speedup |
-| --- | --- | --- | --- | --- |
-| `excerpt` | 4 MiB body | 38.5 ms | **16 µs** | **~2400×** |
-| `splitLines` (NDJSON) | 4096 lines, one chunk | 56.7 ms | **2.0 ms** | **~29×** |
-| `fromBase64` | 256 KiB … 12 MiB | see below | JS-validate candidate | **rejected** |
+| Suite                 | Input                 | Legacy    | After / candidate     | Speedup      |
+| --------------------- | --------------------- | --------- | --------------------- | ------------ |
+| `excerpt`             | 4 MiB body            | 38.5 ms   | **16 µs**             | **~2400×**   |
+| `splitLines` (NDJSON) | 4096 lines, one chunk | 56.7 ms   | **2.0 ms**            | **~29×**     |
+| `fromBase64`          | 256 KiB … 12 MiB      | see below | JS-validate candidate | **rejected** |
 
 ### `fromBase64` — candidate rejected
 
 A JS alphabet + trailing-bits pre-check, then a single `Buffer.from` (no re-encode), was measured against the existing native decode + re-encode compare:
 
-| Decoded size | Legacy (decode+re-encode) | JS-validate + decode | Verdict |
-| --- | --- | --- | --- |
-| 256 KiB | 1.03 ms | 1.29 ms | legacy faster |
-| 1 MiB | 4.47 ms | 5.65 ms | legacy faster |
-| 4 MiB | 15.2 ms | 27.5 ms | legacy faster |
-| 12 MiB | ~48–61 ms | ~57 ms | within noise / no clear win |
+| Decoded size | Legacy (decode+re-encode) | JS-validate + decode | Verdict                     |
+| ------------ | ------------------------- | -------------------- | --------------------------- |
+| 256 KiB      | 1.03 ms                   | 1.29 ms              | legacy faster               |
+| 1 MiB        | 4.47 ms                   | 5.65 ms              | legacy faster               |
+| 4 MiB        | 15.2 ms                   | 27.5 ms              | legacy faster               |
+| 12 MiB       | ~48–61 ms                 | ~57 ms               | within noise / no clear win |
 
 **Production keeps decode+re-encode.** Native `Buffer#toString("base64")` beats a full JS scan of the base64 string on Node.
 
