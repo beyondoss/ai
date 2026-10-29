@@ -154,9 +154,13 @@ def stat(path: str) -> Op[Stat | None]:
 # ---- read ------------------------------------------------------------------------------------------
 
 
+# ASCII whitespace + '=' — stripped before base64 decode (same set as ``re.sub(rb"[\s=]", ...)``).
+_B64_IGNORE = b" \t\n\r\f\v="
+
+
 def decode_base64(s: bytes) -> bytes:
     """Standard base64, whitespace and padding ignored."""
-    cleaned = re.sub(rb"[\s=]", b"", s)
+    cleaned = s.translate(None, _B64_IGNORE)
     if len(cleaned) % 4 == 1:
         raise ValueError("truncated base64")
     try:

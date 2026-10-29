@@ -140,7 +140,7 @@ class _Response:
             raise _wire.too_large(self._url, cap)
         body = bytearray()
         while True:
-            body += self._reader.take()
+            self._reader.take_into(body)
             if len(body) > cap:
                 self.close()
                 raise _wire.too_large(self._url, cap)
@@ -234,6 +234,14 @@ class HttpTransport:
 
     # ---- the wire ---------------------------------------------------------------------------
 
+    def _tls_context(self) -> ssl.SSLContext:
+        """The SSL context for HTTPS: the one passed in, or a cached ``create_default_context``."""
+        ctx = self._ssl
+        if ctx is None:
+            ctx = ssl.create_default_context()
+            self._ssl = ctx
+        return ctx
+
     def _bearer(self, refresh: bool) -> list[tuple[str, str]]:
         with self._lock:
             if callable(self._token) and (refresh or self._token_value is None):
@@ -253,8 +261,7 @@ class HttpTransport:
                 (t.host, t.port), timeout=max(deadline - time.monotonic(), 0.001)
             )
             if t.tls:
-                ctx = self._ssl or ssl.create_default_context()
-                sock = ctx.wrap_socket(sock, server_hostname=t.host)
+                sock = self._tls_context().wrap_socket(sock, server_hostname=t.host)
             return sock
         except builtins.TimeoutError:
             raise TimeoutError(f"exec endpoint {self.url} timed out") from None

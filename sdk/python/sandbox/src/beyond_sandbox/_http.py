@@ -212,6 +212,14 @@ class ResponseReader:
         self._out.clear()
         return data
 
+    def take_into(self, dest: bytearray) -> int:
+        """Append pending body bytes into ``dest`` without an intermediate ``bytes`` copy."""
+        n = len(self._out)
+        if n:
+            dest += self._out
+            self._out.clear()
+        return n
+
     @property
     def content_length(self) -> int | None:
         value = self.headers.get("content-length", "")

@@ -142,7 +142,7 @@ Both return a `Transfer(files, dirs, links, bytes)`; `AsyncSandbox` has the same
   them: start with `jobs.start`, follow with `jobs.attach` or `jobs.follow`, stop with `jobs.kill`.
 - One connection per request, no pooling and no proxy support: the standard library's `socket` and
   `ssl`, or `asyncio` streams, and nothing else. TLS verifies the certificate against the system
-  roots; pass `ssl_context=` to change that.
+  roots (the default context is built once per transport); pass `ssl_context=` to change that.
 - The environment (busybox or GNU `find`, `rg` or `grep`, `dd`/`base64` flags) is probed once per
   `Sandbox` in a single `sh -c` round trip, on the first read, list or search; writes need no probe.
   A probe that fails (unreachable, `401`) raises from the call that needed it and is not remembered.
