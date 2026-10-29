@@ -119,13 +119,13 @@ server.shutdown().await;
 
 What the binary does beyond `serve()`, and what an embedder should call:
 
-| call | when | if omitted |
-| ---- | ---- | ---------- |
-| `helper_main()` first, before parsing anything | required with `Options::run_as` | `run_as` commands cannot start |
-| `log::set_level(Level)` | to see library logs | the library logs nothing |
-| `become_subreaper()` | PID 1 / orphan reaping | orphans go to the host's init; waiters poll every 50 ms |
-| `remove_stale_jobs_dirs(jobs_dir)` | after listening | crashed predecessors' job output dirs stay on disk |
-| `serve` / `Handle::shutdown` | always | — |
+| call                                           | when                            | if omitted                                              |
+| ---------------------------------------------- | ------------------------------- | ------------------------------------------------------- |
+| `helper_main()` first, before parsing anything | required with `Options::run_as` | `run_as` commands cannot start                          |
+| `log::set_level(Level)`                        | to see library logs             | the library logs nothing                                |
+| `become_subreaper()`                           | PID 1 / orphan reaping          | orphans go to the host's init; waiters poll every 50 ms |
+| `remove_stale_jobs_dirs(jobs_dir)`             | after listening                 | crashed predecessors' job output dirs stay on disk      |
+| `serve` / `Handle::shutdown`                   | always                          | —                                                       |
 
 An `Observer` set on `Options` is told of every request, stream and callback attempt; unset it costs one branch.
 `examples/embed.rs` is the minimal correct `main()`. See [ARCHITECTURE.md](ARCHITECTURE.md#embedding) for auth,
