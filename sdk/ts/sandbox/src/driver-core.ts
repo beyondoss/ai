@@ -286,7 +286,7 @@ export class Driver {
         };
       }
       case "job_attach": {
-        const a = await jobs.attach(
+        const a = await jobs.collect(
           str(req, "scope"),
           str(req, "job"),
           optCount(req, "offset") ?? 0,

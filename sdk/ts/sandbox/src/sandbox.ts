@@ -2,7 +2,7 @@ import { download, upload } from "./bulk.js";
 import type { Transfer, UploadOptions } from "./bulk.js";
 import { text, utf8 } from "./bytes.js";
 import { Files } from "./files.js";
-import type { FilesOptions } from "./files.js";
+import type { Capabilities, FilesOptions } from "./files.js";
 import { HttpTransport } from "./http.js";
 import type { HttpTransportOptions } from "./http.js";
 import { Jobs } from "./jobs.js";
@@ -56,8 +56,13 @@ export class Sandbox {
       ? options.transport
       : new HttpTransport(options);
     const sandbox = new Sandbox(transport, { files: options.files });
-    await sandbox.files.capabilities();
+    await sandbox.capabilities();
     return sandbox;
+  }
+
+  /** What the sandbox's environment offers (probed once, cached). Delegates to {@link Files.capabilities}. */
+  capabilities(): Promise<Capabilities> {
+    return this.files.capabilities();
   }
 
   /**

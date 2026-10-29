@@ -414,6 +414,57 @@ describe("HttpTransport.stream", () => {
       expect(frames.at(-1)!.type).toBe(type);
     }
   });
+
+  it("closes the stream when the caller's AbortSignal fires", async () => {
+    closed.length = 0;
+    const e = await streamingEndpoint((res) => {
+      res.write(JSON.stringify({ stdout: b64("first") }) + "\n");
+    });
+    const t = new HttpTransport({ url: e.url });
+    const ctl = new AbortController();
+    const p = (async () => {
+      for await (const f of t.stream("sleep", ["99"], { signal: ctl.signal })) {
+        expect(f.type).toBe("stdout");
+        ctl.abort();
+      }
+    })();
+    await expect(p).rejects.toThrow(/aborted/);
+    expect(await kindOf(p)).toBe("transport");
+    for (let i = 0; i < 50 && closed.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(closed.length).toBe(1);
+  });
+});
+
+describe("AbortSignal on run", () => {
+  it("rejects immediately when the signal is already aborted", async () => {
+    const e = await endpoint((_, res) => json(res, 200, ok()));
+    const ctl = new AbortController();
+    ctl.abort();
+    const p = new HttpTransport({ url: e.url }).run("true", [], {
+      signal: ctl.signal,
+    });
+    await expect(p).rejects.toThrow(/aborted/);
+    expect(await kindOf(p)).toBe("transport");
+    expect(e.requests).toHaveLength(0);
+  });
+
+  it("aborts a hung one-shot when the caller's signal fires", async () => {
+    const e = await endpoint(() => {
+      /* never answers */
+    });
+    const t = new HttpTransport({ url: e.url, deadlineGraceMs: 60_000 });
+    const ctl = new AbortController();
+    const p = t.run("sleep", ["99"], {
+      signal: ctl.signal,
+      timeoutMs: 60_000,
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    ctl.abort();
+    await expect(p).rejects.toThrow(/aborted/);
+    expect(await kindOf(p)).toBe("transport");
+  });
 });
 
 describe("decodeFrameLine", () => {

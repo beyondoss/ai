@@ -248,9 +248,14 @@ d("against a loopback execd", () => {
             args: ["-c", "echo one; sleep 0.3; echo two; exit 5"],
             label: "demo",
           });
-          const att = await sb.jobs.attach(scope, "job1");
+          const att = await sb.jobs.collect(scope, "job1");
           expect(att).toMatchObject({ exitCode: 5, gap: 0 });
           expect(dec(att.output)).toBe("one\ntwo\n");
+          // deprecated alias still works
+          expect(await sb.jobs.attach(scope, "job1")).toMatchObject({
+            exitCode: 5,
+            gap: 0,
+          });
           const c = await sb.jobs.read(scope, "job1", { offset: 4 });
           expect(c).toMatchObject({
             state: "ended",

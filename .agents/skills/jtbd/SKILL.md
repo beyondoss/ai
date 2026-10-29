@@ -27,11 +27,11 @@ Format: _"When [situation], I want to [motivation], so I can [outcome]."_
 
 Jobs operate at multiple levels:
 
-| Dimension | Question | Example |
-|-----------|----------|---------|
-| **Functional** | What are they literally trying to do? | Verify that a request came from an authenticated user |
-| **Emotional** | How do they want to feel? | Confident the auth check won't silently fail |
-| **Social** | How do they want to be perceived? | Like someone who ships secure systems, not someone who gets paged at 3am |
+| Dimension      | Question                              | Example                                                                  |
+| -------------- | ------------------------------------- | ------------------------------------------------------------------------ |
+| **Functional** | What are they literally trying to do? | Verify that a request came from an authenticated user                    |
+| **Emotional**  | How do they want to feel?             | Confident the auth check won't silently fail                             |
+| **Social**     | How do they want to be perceived?     | Like someone who ships secure systems, not someone who gets paged at 3am |
 
 ### Jobs vs features vs user stories
 
@@ -45,6 +45,7 @@ Good (job-shaped): "When a request arrives at my server, I want to know who made
 ### What to look for
 
 Jobs are usually **stable** — they change slowly. A job that existed three years ago probably still exists. Look for evidence of jobs in:
+
 - Route names and what actions they expose
 - Migration history (tables added reveal features added, which reveal jobs served)
 - Error types (what can go wrong reveals what the system is trying to do)
@@ -54,6 +55,7 @@ Jobs are usually **stable** — they change slowly. A job that existed three yea
 ### The job executor vs the job beneficiary
 
 In a developer-facing service, these are often different:
+
 - **Job executor**: the developer or operator who integrates the service
 - **Job beneficiary**: the end user whose authentication experience the service enables
 
@@ -80,6 +82,7 @@ Read the following files to understand what this service is and what it is meant
 - `Cargo.toml` or equivalent — to understand dependencies and tech choices
 
 Do not read every file. Read enough to build a confident picture of:
+
 - What domain this service operates in
 - Who calls it (operators, end users, machines)
 - What actions it exposes
@@ -120,11 +123,12 @@ Aim for 8–15 jobs. Every job must be grounded in evidence from the codebase �
 
 For each job, assess how well the current developer-facing surface serves it — not just the REST API:
 
-| Job | Served by | Surface layer | Gap? |
-|-----|-----------|---------------|------|
+| Job                 | Served by                              | Surface layer                    | Gap?                 |
+| ------------------- | -------------------------------------- | -------------------------------- | -------------------- |
 | When X, I want to Y | `POST /v1/...` or SDK method or config | REST / SDK / CLI / Config / Docs | None / Minor / Major |
 
 A gap is:
+
 - **None** — the job is served cleanly at an appropriate layer
 - **Minor** — the job is served but with friction (extra round-trips, missing SDK abstraction, raw HTTP required where a helper would be natural, cryptic errors)
 - **Major** — the job is not served at any layer, or requires a workaround that degrades reliability/safety/correctness
@@ -136,12 +140,14 @@ Consider layer-appropriate expectations: a developer should not need to hand-rol
 For each Minor or Major gap, propose a concrete improvement at the right layer. A gap in the REST API might be fixed there. A gap in ergonomics might call for an SDK helper, a better error message, or a config default — not a new endpoint.
 
 Follow the service's design constraints:
+
 - REST layer: resource orientation (nouns + HTTP verbs, not RPC), the service model (internal, single-project, not public SaaS)
 - SDK layer: idiomatic for the target language, thin over the REST API unless abstraction pays for itself
 - Config layer: sensible defaults, clear names, documented in one place
 - Error layer: actionable, include what went wrong and what to try
 
 Each proposal must include:
+
 - What job it closes
 - Which layer the change lives at (REST, SDK, CLI, config, docs, error messages)
 - The specific change (new endpoint, new method, new field, changed response shape, new config key)

@@ -13,7 +13,11 @@ import { basename } from "node:path";
 import { text, utf8 } from "./bytes.js";
 import {
   classifyFailure,
+  errorFor,
   InvalidRequestError,
+  IoError,
+  IsDirectoryError,
+  NotADirectoryError,
   SandboxError,
 } from "./errors.js";
 import type { ErrorKind } from "./errors.js";
@@ -98,7 +102,7 @@ export function localError(path: string, e: unknown): SandboxError {
       kind = "is_directory";
       break;
   }
-  return new SandboxError(kind, `${path}: ${msg}`, { cause: e });
+  return errorFor(kind, `${path}: ${msg}`, { cause: e });
 }
 
 // ---- upload -----------------------------------------------------------------------------------
@@ -208,10 +212,7 @@ async function* build(
             throw localError(shown, err);
           }
           if (got === 0) {
-            throw new SandboxError(
-              "io",
-              `${shown}: changed while being archived`,
-            );
+            throw new IoError(`${shown}: changed while being archived`);
           }
           pos += got;
           left -= got;
@@ -245,8 +246,7 @@ async function* build(
       throw localError(sources, e);
     }
     if (!st.isDirectory()) {
-      throw new SandboxError(
-        "not_a_directory",
+      throw new NotADirectoryError(
         `${sources}: Not a directory (os error 20)`,
       );
     }
@@ -315,7 +315,7 @@ export async function upload(
   const it = build(sources, chunk, counts);
   try {
     let cur = await it.next();
-    if (cur.done) throw new SandboxError("io", "upload aborted");
+    if (cur.done) throw new IoError("upload aborted");
     let next = await it.next();
     if (next.done) {
       // The whole archive is one chunk: one command with it on stdin.
@@ -486,10 +486,7 @@ export class Extractor implements TarSink {
   }
 
   private isDirectory(path: string): SandboxError {
-    return new SandboxError(
-      "is_directory",
-      `${path}: Is a directory (os error 21)`,
-    );
+    return new IsDirectoryError(`${path}: Is a directory (os error 21)`);
   }
 
   begin(e: TarEntry): void {
@@ -579,8 +576,7 @@ export class Extractor implements TarSink {
         break;
       }
       default:
-        throw new SandboxError(
-          "io",
+        throw new IoError(
           `${text(e.name)}: unsupported member type '${
             String.fromCharCode(e.kind)
           }'`,

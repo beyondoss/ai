@@ -68,6 +68,8 @@ interface Exchange {
   /** Release the exchange: stop the deadline and, unless the body is done, abandon it. */
   close(): void;
   timedOut(): boolean;
+  /** The caller's {@link AbortSignal} fired (not the client's own deadline). */
+  aborted(): boolean;
 }
 
 interface Body {
@@ -111,8 +113,9 @@ export class HttpTransport implements Transport {
     args: string[],
     options: RunOptions = {},
   ): Promise<RunResult> {
-    const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    const ex = await this.post({ command, args, ...options, timeoutMs });
+    const { signal, timeoutMs: t, ...rest } = options;
+    const timeoutMs = t ?? DEFAULT_TIMEOUT_MS;
+    const ex = await this.post({ command, args, ...rest, timeoutMs }, signal);
     try {
       return decodeOutput(
         this.parseObject(await this.readBounded(ex, bodyCap(this.cap))),
@@ -131,14 +134,15 @@ export class HttpTransport implements Transport {
     args: string[],
     options: RunOptions = {},
   ): AsyncGenerator<Frame> {
-    const timeoutMs = options.timeoutMs ?? STREAM_DEADLINE_MS;
+    const { signal, timeoutMs: t, ...rest } = options;
+    const timeoutMs = t ?? STREAM_DEADLINE_MS;
     const ex = await this.post({
       command,
       args,
-      ...options,
+      ...rest,
       timeoutMs,
       stream: true,
-    });
+    }, signal);
     try {
       if (!isNdjson(ex.res)) {
         throw new ProtocolError(
@@ -203,7 +207,7 @@ export class HttpTransport implements Transport {
   }
 
   /** POST one request. Resolves once the status is known to be a success. */
-  async post(body: Body): Promise<Exchange> {
+  async post(body: Body, signal?: AbortSignal): Promise<Exchange> {
     const payload: Record<string, unknown> = {
       command: body.command,
       args: body.args,
@@ -218,7 +222,7 @@ export class HttpTransport implements Transport {
 
     let refreshed = false;
     for (;;) {
-      const ex = await this.send(json, deadline, refreshed);
+      const ex = await this.send(json, deadline, refreshed, signal);
       if (ex.res.ok) return ex;
       const status = ex.res.status;
       let detail: string;
@@ -250,16 +254,32 @@ export class HttpTransport implements Transport {
     json: string,
     deadlineMs: number,
     refresh: boolean,
+    signal?: AbortSignal,
   ): Promise<Exchange> {
+    if (signal?.aborted) {
+      throw new TransportError(`exec endpoint ${this.url}: aborted`);
+    }
     const headers = await this.requestHeaders(refresh);
     const ctl = new AbortController();
     let timedOut = false;
+    let callerAborted = false;
+    let res: Response | undefined;
+    const onCallerAbort = () => {
+      callerAborted = true;
+      ctl.abort();
+      // After headers arrive, aborting fetch's signal does not stop the body: cancel it.
+      res?.body?.cancel().catch(() => {});
+    };
+    signal?.addEventListener("abort", onCallerAbort, { once: true });
     const timer = setTimeout(() => {
       timedOut = true;
       ctl.abort();
     }, deadlineMs);
     unref(timer);
-    let res: Response;
+    const detach = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onCallerAbort);
+    };
     try {
       res = await this.fetchFn(this.url, {
         method: "POST",
@@ -268,23 +288,31 @@ export class HttpTransport implements Transport {
         signal: ctl.signal,
       });
     } catch (e) {
-      clearTimeout(timer);
-      throw timedOut
-        ? new TimeoutError(`exec endpoint ${this.url} timed out`, { cause: e })
-        : new TransportError(
-          `exec endpoint ${this.url} unreachable: ${errorText(e)}`,
-          {
-            cause: e,
-          },
-        );
+      detach();
+      if (timedOut) {
+        throw new TimeoutError(`exec endpoint ${this.url} timed out`, {
+          cause: e,
+        });
+      }
+      if (callerAborted) {
+        throw new TransportError(`exec endpoint ${this.url}: aborted`, {
+          cause: e,
+        });
+      }
+      throw new TransportError(
+        `exec endpoint ${this.url} unreachable: ${errorText(e)}`,
+        { cause: e },
+      );
     }
+    const response = res;
     return {
-      res,
+      res: response,
       timedOut: () => timedOut,
+      aborted: () => callerAborted,
       close: () => {
-        clearTimeout(timer);
+        detach();
         if (!ctl.signal.aborted) ctl.abort();
-        res.body?.cancel().catch(() => {});
+        response.body?.cancel().catch(() => {});
       },
     };
   }
@@ -319,11 +347,19 @@ export class HttpTransport implements Transport {
 
   private bodyError(ex: Exchange, e: unknown): SandboxError {
     if (e instanceof SandboxError) return e;
-    return ex.timedOut()
-      ? new TimeoutError(`exec endpoint ${this.url} timed out`, { cause: e })
-      : new TransportError(`exec endpoint ${this.url}: ${errorText(e)}`, {
+    if (ex.timedOut()) {
+      return new TimeoutError(`exec endpoint ${this.url} timed out`, {
         cause: e,
       });
+    }
+    if (ex.aborted()) {
+      return new TransportError(`exec endpoint ${this.url}: aborted`, {
+        cause: e,
+      });
+    }
+    return new TransportError(`exec endpoint ${this.url}: ${errorText(e)}`, {
+      cause: e,
+    });
   }
 
   /** The whole body, at most `bound` bytes of it; more is the cap's error (the command ran). */

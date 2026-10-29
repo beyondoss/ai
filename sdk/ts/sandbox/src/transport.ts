@@ -12,6 +12,11 @@ export interface RunOptions {
   timeoutMs?: number;
   /** Bytes fed to the command's stdin, then closed. */
   stdin?: Uint8Array;
+  /**
+   * Abort the request. For a stream, closes the connection so the sandbox kills the command (same
+   * as stopping iteration). Reported as `transport` with detail mentioning abort.
+   */
+  signal?: AbortSignal;
 }
 
 /**

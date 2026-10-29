@@ -52,15 +52,15 @@ export class AuthError extends SandboxError {
 
 /** The endpoint's answer exceeded the response cap. The command ran. */
 export class TooLargeError extends SandboxError {
-  constructor(detail: string) {
-    super("too_large", detail);
+  constructor(detail: string, options?: { cause?: unknown }) {
+    super("too_large", detail, options);
   }
 }
 
 /** The endpoint answered with something that is not the protocol. */
 export class ProtocolError extends SandboxError {
-  constructor(detail: string) {
-    super("protocol", detail);
+  constructor(detail: string, options?: { cause?: unknown }) {
+    super("protocol", detail, options);
   }
 }
 
@@ -68,44 +68,117 @@ export class ProtocolError extends SandboxError {
 export class EndpointError extends SandboxError {
   readonly status: number;
 
-  constructor(detail: string, status: number) {
-    super("endpoint", detail);
+  constructor(detail: string, status: number, options?: { cause?: unknown }) {
+    super("endpoint", detail, options);
     this.status = status;
   }
 }
 
 /** The endpoint lacks the capability (it does not stream; it has no jobs). */
 export class NotOfferedError extends SandboxError {
-  constructor(detail: string) {
-    super("not_offered", detail);
+  constructor(detail: string, options?: { cause?: unknown }) {
+    super("not_offered", detail, options);
   }
 }
 
 /** The caller's arguments cannot form a request; nothing was sent. */
 export class InvalidRequestError extends SandboxError {
-  constructor(detail: string) {
-    super("invalid_request", detail);
+  constructor(detail: string, options?: { cause?: unknown }) {
+    super("invalid_request", detail, options);
   }
 }
 
 /** A path (or its parent) does not exist. */
 export class NotFoundError extends SandboxError {
-  constructor(detail: string) {
-    super("not_found", detail);
+  constructor(detail: string, options?: { cause?: unknown }) {
+    super("not_found", detail, options);
+  }
+}
+
+/** The path is a directory where a file was required. */
+export class IsDirectoryError extends SandboxError {
+  constructor(detail: string, options?: { cause?: unknown }) {
+    super("is_directory", detail, options);
+  }
+}
+
+/** The path is not a directory where one was required. */
+export class NotADirectoryError extends SandboxError {
+  constructor(detail: string, options?: { cause?: unknown }) {
+    super("not_a_directory", detail, options);
+  }
+}
+
+/** The sandbox refused access. */
+export class PermissionDeniedError extends SandboxError {
+  constructor(detail: string, options?: { cause?: unknown }) {
+    super("permission_denied", detail, options);
+  }
+}
+
+/** A command ran and failed for a reason that is not a more specific kind. */
+export class IoError extends SandboxError {
+  constructor(detail: string, options?: { cause?: unknown }) {
+    super("io", detail, options);
   }
 }
 
 /** `writeIfUnchanged`: the file's mtime is not the expected one. */
 export class ConflictError extends SandboxError {
-  constructor(detail: string) {
-    super("conflict", detail);
+  constructor(detail: string, options?: { cause?: unknown }) {
+    super("conflict", detail, options);
   }
 }
 
 /** The search pattern or glob was rejected. */
 export class InvalidQueryError extends SandboxError {
-  constructor(detail: string) {
-    super("invalid_query", detail);
+  constructor(detail: string, options?: { cause?: unknown }) {
+    super("invalid_query", detail, options);
+  }
+}
+
+/**
+ * The exception class of `kind`, for code that has only the name (and optional HTTP status /
+ * cause).
+ */
+export function errorFor(
+  kind: ErrorKind,
+  detail: string,
+  options?: { cause?: unknown; status?: number },
+): SandboxError {
+  const { cause, status } = options ?? {};
+  const o = cause !== undefined ? { cause } : undefined;
+  switch (kind) {
+    case "not_found":
+      return new NotFoundError(detail, o);
+    case "is_directory":
+      return new IsDirectoryError(detail, o);
+    case "not_a_directory":
+      return new NotADirectoryError(detail, o);
+    case "permission_denied":
+      return new PermissionDeniedError(detail, o);
+    case "io":
+      return new IoError(detail, o);
+    case "invalid_query":
+      return new InvalidQueryError(detail, o);
+    case "conflict":
+      return new ConflictError(detail, o);
+    case "too_large":
+      return new TooLargeError(detail, o);
+    case "auth":
+      return new AuthError(detail, o);
+    case "timeout":
+      return new TimeoutError(detail, o);
+    case "transport":
+      return new TransportError(detail, o);
+    case "protocol":
+      return new ProtocolError(detail, o);
+    case "endpoint":
+      return new EndpointError(detail, status ?? 0, o);
+    case "not_offered":
+      return new NotOfferedError(detail, o);
+    case "invalid_request":
+      return new InvalidRequestError(detail, o);
   }
 }
 
@@ -148,13 +221,13 @@ export function classifyFailure(prefix: string, stderr: string): SandboxError {
     return new NotFoundError(detail);
   }
   if (m.includes("is a directory")) {
-    return new SandboxError("is_directory", detail);
+    return new IsDirectoryError(detail);
   }
   if (m.includes("not a directory")) {
-    return new SandboxError("not_a_directory", detail);
+    return new NotADirectoryError(detail);
   }
   if (m.includes("permission denied")) {
-    return new SandboxError("permission_denied", detail);
+    return new PermissionDeniedError(detail);
   }
-  return new SandboxError("io", detail);
+  return new IoError(detail);
 }

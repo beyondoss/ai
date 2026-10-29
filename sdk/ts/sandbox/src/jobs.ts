@@ -97,8 +97,10 @@ export class Jobs {
   }
 
   /**
-   * Follow a job's output from `offset` to its end: frames in order, the last one `exit`. Stopping
-   * early detaches and never kills the job.
+   * Follow a job's output from `offset` to its end: frames in order, the last one `exit` or
+   * `signal`. Stopping early detaches and never kills the job. (The transport wire call is
+   * {@link Transport.jobs}.attach; this surface names the stream `follow` so it is not confused
+   * with {@link Jobs.collect}.)
    */
   async *follow(
     scope: string,
@@ -111,8 +113,11 @@ export class Jobs {
     yield* this.transport.jobs.attach(scope, id, offset);
   }
 
-  /** {@link Jobs.follow} to the end, collected. */
-  async attach(scope: string, id: string, offset = 0): Promise<JobOutput> {
+  /**
+   * {@link Jobs.follow} to the end, collected into one {@link JobOutput}. Prefer this over
+   * {@link Jobs.attach}, which is the same call kept for older callers.
+   */
+  async collect(scope: string, id: string, offset = 0): Promise<JobOutput> {
     const chunks: Uint8Array[] = [];
     let gap = 0;
     for await (const f of this.follow(scope, id, offset)) {
@@ -132,6 +137,11 @@ export class Jobs {
     throw new ProtocolError(
       "the job stream ended before the job's final frame",
     );
+  }
+
+  /** @deprecated Use {@link Jobs.collect}. Same as `collect`. */
+  attach(scope: string, id: string, offset = 0): Promise<JobOutput> {
+    return this.collect(scope, id, offset);
   }
 
   /**
