@@ -21,7 +21,8 @@ pub const JOBS_ROOT: &str = "/tmp/beyond-jobs";
 /// spare.
 pub const READ_MAX: usize = 128 * 1024;
 
-/// One session's jobs: a directory under [`JOBS_ROOT`] named by a digest of the tenant and session.
+/// One session's jobs: a directory under [`JOBS_ROOT`]. The name on the wire is an opaque
+/// string of 1–64 characters of `[0-9a-z-]` (same as the TypeScript and Python clients).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct JobScope {
     root: String,
@@ -29,7 +30,24 @@ pub struct JobScope {
 }
 
 impl JobScope {
-    /// The scope of `session_id` (of `tenant`, in service mode).
+    /// An opaque scope name, as the TypeScript and Python clients take one. The name is what
+    /// goes on the wire; it must be 1 to 64 characters of `[0-9a-z-]`.
+    pub fn named(name: impl AsRef<str>) -> Result<Self, crate::SandboxError> {
+        let name = name.as_ref();
+        if !is_scope_name(name) {
+            return Err(crate::SandboxError::invalid_request(format!(
+                "bad job scope {name:?}: 1 to 64 characters of [0-9a-z-]"
+            )));
+        }
+        Ok(Self {
+            root: JOBS_ROOT.to_string(),
+            name: name.to_string(),
+        })
+    }
+
+    /// The scope of `session_id` (of `tenant`, in service mode): a digest under [`JOBS_ROOT`].
+    /// Beyond's agent uses this so a replica cannot invent another session's scope; SDK callers
+    /// that pick their own name want [`Self::named`] instead.
     pub fn for_session(tenant: Option<&str>, session_id: &str) -> Self {
         let mut h = sha2::Sha256::new();
         h.update(b"beyond-jobs\0");
@@ -57,6 +75,12 @@ impl JobScope {
     pub fn name(&self) -> &str {
         &self.name
     }
+}
+
+fn is_scope_name(s: &str) -> bool {
+    (1..=64).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase() || b == b'-')
 }
 
 /// A job's directory name. The agent chooses it, so it is known before the job starts; it is never

@@ -1,23 +1,16 @@
-//! `FsBackend` — the seam between a filesystem tool and where its I/O actually lands.
+//! `FsBackend` — filesystem operations as a trait, so helpers do not care where the files live.
 //!
-//! The tools in this crate were welded to the host: `read`/`write`/`edit`/`ls`/`grep`/`find` called
-//! `std::fs` directly, while `bash` already went through
-//! [`CommandRunner`](super::exec::CommandRunner) — the one place the crate admitted that "where does
-//! this run" is a decision worth naming. This module is that same admission for the other half.
-//!
-//! Two implementations, both selected by the caller and held behind an `Arc`:
-//!
-//! - [`local::LocalFs`] — `std::fs` and ripgrep's in-process walker. The behavior that shipped before
-//!   this seam existed, moved rather than rewritten.
-//! - [`shell::ShellFs`] — the same operations expressed as *commands*, over any `CommandRunner`. It
-//!   works against a box that has nothing of ours installed on it.
+//! This crate's implementation is [`shell::ShellFs`] ([`Files`](crate::Files)): the same read /
+//! write / edit / list / search / glob jobs expressed as commands over any
+//! [`CommandRunner`](crate::Exec). It works against a box that has nothing of ours installed.
+//! The agent's host-disk backend (`LocalFs` in `beyond-agent`) implements the same trait on
+//! `std::fs`, which is why the shared result shaping below exists.
 //!
 //! **Most of a tool's behavior is not in the backend.** The split is deliberately drawn so that only
 //! the irreducibly filesystem-shaped part (walk a tree, match lines, read bytes) crosses the seam;
 //! everything downstream of that — line clipping, EOL normalization, sorting, limit trimming, and all
-//! rendering — stays shared, in this module or in the tool. That is what makes the two impls agree on
-//! the fiddly details for free instead of by vigilance: there is only one `clip`, one `trim_eol`, one
-//! [`finalize`], and both backends call them.
+//! rendering — stays shared in this module. That is what makes backends agree on the fiddly details
+//! for free instead of by vigilance: there is only one `clip`, one `trim_eol`, one [`finalize`].
 
 pub mod shell;
 
@@ -61,12 +54,12 @@ const WINDOW_MARK: &str = " [truncated; columns ";
 /// one user-dependent step (`~` expansion), and both silently produce a *plausible wrong answer*
 /// rather than an error when applied to a path that isn't on this machine. Making the world an
 /// explicit parameter means the choice is visible at every call site instead of being an emergent
-/// property of whether a syscall happened to fail. See
-/// [`write_key`](crate::tools::write_key).
-/// Owns its `home` rather than borrowing it. A backend whose target can be swapped at runtime (see
-/// `ExecCell`) reports its world from behind a lock, and a borrowed variant could not outlive that
-/// guard. The cost is one small `String` clone per path resolution, against a tool call that is
-/// already doing I/O.
+/// property of whether a syscall happened to fail.
+///
+/// Owns its `home` rather than borrowing it: a backend whose target can be swapped at runtime
+/// reports its world from behind a lock, and a borrowed variant could not outlive that guard. The
+/// cost is one small `String` clone per path resolution, against a tool call that is already doing
+/// I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathWorld {
     /// This host. `canonicalize` resolves real symlinks and `~` means this process's `$HOME`.
@@ -100,8 +93,8 @@ pub struct Hit {
 
 /// A prepared search, in terms a *shell* can also express — which is the whole constraint on its
 /// shape. The pattern and glob are carried as **strings**, not as a compiled `RegexMatcher` and
-/// `GlobMatcher`: those are ripgrep types that only [`local::LocalFs`] could ever hold, and putting
-/// them here would have made the trait un-implementable by anything else. Each backend compiles (or
+/// `GlobMatcher`: those are ripgrep types a host-disk backend might hold, and putting them here
+/// would have made the trait un-implementable by [`shell::ShellFs`]. Each backend compiles (or
 /// forwards) them itself, so a bad pattern surfaces from the backend rather than at parse time.
 #[derive(Debug, Clone)]
 pub struct SearchQuery {
@@ -242,7 +235,7 @@ pub const GIT_DIR: &str = ".git";
 /// Only components *after* `root` count, which is what keeps an explicit search inside `.git` (a
 /// root of `repo/.git` or `repo/.git/refs`) working: the caller asked for that tree by name.
 ///
-/// [`local::LocalFs`] applies the same rule at walk time (an entry named `.git` below depth 0 is
+/// A host-disk backend applies the same rule at walk time (an entry named `.git` below depth 0 is
 /// pruned, so its subtree is never read); [`shell::ShellFs`] asks its engine to skip `.git` where the
 /// engine can, and applies this to every path it gets back, so a rung with no such flag (POSIX
 /// `grep`, `find`) still cannot leak one.

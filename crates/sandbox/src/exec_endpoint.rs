@@ -900,7 +900,7 @@ pub struct HttpExecRunner {
     max_response_bytes: usize,
     /// Raised when the endpoint could not be reached or refused a request: a sign the sandbox
     /// behind it may have been replaced, so whatever was learned about it (the probe, the
-    /// capabilities above) should be learned again. Read by the [`ExecTarget`] that shares it.
+    /// capabilities above) should be learned again. The agent's lazy attach reads this flag.
     suspect: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
@@ -938,7 +938,7 @@ impl HttpExecRunner {
     }
 
     /// Raise `flag` whenever a request fails to reach the endpoint or is refused by it (a non-2xx
-    /// answer) — see [`ExecTarget::watching`].
+    /// answer), so a caller watching for a replaced sandbox can re-probe.
     pub fn with_suspect_flag(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
         self.suspect = Some(flag);
         self

@@ -2,8 +2,12 @@
 //! whose structured content is `{"error": {"kind", "detail"}}`, never a protocol error, so the
 //! agent can read it and react. `kind` is one of the kinds of `sdk/conformance/DRIVER.md`
 //! section 4, so a conformance driver can pass it through unchanged.
+//!
+//! Classification lives in [`beyond_sandbox::SandboxError`] so every surface shares one
+//! FILES-OVER-EXEC vocabulary.
 
 use beyond_sandbox::fs::FsError;
+use beyond_sandbox::{BulkError, SandboxError};
 use rmcp::model::CallToolResult;
 use serde_json::{Value, json};
 
@@ -34,9 +38,15 @@ impl ToolError {
     }
 }
 
+impl From<SandboxError> for ToolError {
+    fn from(e: SandboxError) -> Self {
+        Self::new(e.kind_str(), e.detail)
+    }
+}
+
 impl From<&std::io::Error> for ToolError {
     fn from(e: &std::io::Error) -> Self {
-        classify(&e.to_string(), Some(e.kind()))
+        Self::from(SandboxError::from(e))
     }
 }
 
@@ -46,24 +56,15 @@ impl From<std::io::Error> for ToolError {
     }
 }
 
-impl From<beyond_sandbox::BulkError> for ToolError {
-    fn from(e: beyond_sandbox::BulkError) -> Self {
-        use beyond_sandbox::BulkError;
-        match e {
-            BulkError::InvalidRequest(m) => Self::invalid(m),
-            BulkError::Archive(m) => Self::new("protocol", m),
-            BulkError::Command(m) => classify(&m, None),
-            BulkError::Io(e) => Self::from(e),
-        }
+impl From<BulkError> for ToolError {
+    fn from(e: BulkError) -> Self {
+        Self::from(SandboxError::from(e))
     }
 }
 
 impl From<FsError> for ToolError {
     fn from(e: FsError) -> Self {
-        match e {
-            FsError::InvalidQuery(m) => Self::new("invalid_query", m),
-            FsError::Backend(m) => classify(&m, None),
-        }
+        Self::from(SandboxError::from(e))
     }
 }
 
@@ -78,62 +79,7 @@ pub fn reply(r: Result<Value, ToolError>) -> CallToolResult {
 /// The kind of an error, from the text the client library produces (FILES-OVER-EXEC.md section 3.3
 /// and the exec client's own messages).
 pub fn classify(msg: &str, kind: Option<std::io::ErrorKind>) -> ToolError {
-    let err = |k: &'static str| ToolError::new(k, msg);
-    if kind == Some(std::io::ErrorKind::TimedOut) || msg.contains("timed out") {
-        return err("timeout");
-    }
-    if kind == Some(std::io::ErrorKind::Unsupported) {
-        return err("not_offered");
-    }
-    if msg.contains("returned 401")
-        || msg.contains("returned 403")
-        || msg.contains("token source failed")
-    {
-        return err("auth");
-    }
-    if msg.contains("exceeded the") && msg.contains("-byte cap") {
-        return err("too_large");
-    }
-    if msg.contains("returned 422") && msg.contains("cap") {
-        return err("too_large");
-    }
-    if msg.contains("unreachable") {
-        return err("transport");
-    }
-    if msg.contains("unparseable JSON")
-        || msg.contains("not a stream")
-        || msg.contains("unparseable frame")
-        || msg.contains("unparseable job frame")
-        || msg.contains("is not standard base64")
-        || msg.contains("without a newline")
-        || msg.contains("unreadable job")
-    {
-        return err("protocol");
-    }
-    if msg.contains("exec endpoint") && msg.contains(" returned ") {
-        return err("endpoint");
-    }
-    if msg.contains("exec endpoint") || msg.contains("job stream") {
-        return err("transport");
-    }
-    // A command that ran and failed: classify by what it said.
-    let m = msg.to_ascii_lowercase();
-    err(
-        if m.contains("no such file or directory")
-            || m.contains("directory nonexistent")
-            || m.contains("nonexistent directory")
-        {
-            "not_found"
-        } else if m.contains("is a directory") {
-            "is_directory"
-        } else if m.contains("not a directory") {
-            "not_a_directory"
-        } else if m.contains("permission denied") {
-            "permission_denied"
-        } else {
-            "io"
-        },
-    )
+    ToolError::from(SandboxError::classify(msg, kind))
 }
 
 #[cfg(test)]

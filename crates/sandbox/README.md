@@ -5,7 +5,7 @@ with the file and job helpers an agent needs built on top of it. It is the code 
 sandbox, extracted so anything else can use it.
 
 ```rust,no_run
-use beyond_sandbox::exec_endpoint::jobs::{JobId, JobScope, JobSpec};
+use beyond_sandbox::exec_endpoint::jobs::{JobId, JobScope};
 use beyond_sandbox::{FsBackend, Sandbox, TokenSource};
 
 #[tokio::main]
@@ -23,14 +23,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let hit = beyond_sandbox::fs::query("hi", "/work".into(), 10);
     println!("{} matches", sb.files().search(&hit).await?.hits.len());
-    let (scope, id) = (JobScope::for_session(None, "demo"), JobId::fresh());
-    let spec = JobSpec {
-        program: "npm".into(),
-        args: vec!["run".into(), "dev".into()],
-        cwd: Some("/work".into()),
-        label: "dev server".into(),
-    };
-    sb.jobs()?.start_kept(&scope, &id, &spec).await?; // keeps running after this process exits
+    let scope = JobScope::named("demo")?;
+    let id = JobId::fresh();
+    sb.jobs()?
+        .start(&scope, &id, "npm", ["run", "dev"])
+        .cwd("/work")
+        .label("dev server")
+        .run()
+        .await?; // keeps running after this process exits
     Ok(())
 }
 ```
@@ -62,6 +62,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | 2. helpers | files and search, jobs: built only on layer 1 | `Files::over(exec)`, `Jobs::over(exec)`                                      |
 | 3. surface | one object that owns all three                | `Sandbox::connect(url, token)`, `.exec(..)`, `.files()`, `.jobs()`, `.raw()` |
 
+**Public names vs rustdoc types.** The crate root re-exports the names you write in examples; the defining types keep
+the names the agent extracted them under:
+
+| you write   | defining type              |
+| ----------- | -------------------------- |
+| `Exec`      | `exec::CommandRunner`      |
+| `HttpExec`  | `exec_endpoint::HttpExecRunner` |
+| `Files`     | `fs::shell::ShellFs`       |
+
 Write a transport for anything that can speak the exec protocol (a vendor SDK, a test double) by implementing `Exec`:
 `run`, `run_streaming`, `run_streaming_tracked` and `run_attached`, plus `sandbox_jobs` for the target's jobs. A transport
 with no jobs of its own leaves `sandbox_jobs` at `None`, and `Sandbox::jobs()` answers `Unsupported`.
@@ -70,6 +79,10 @@ with no jobs of its own leaves `sandbox_jobs` at `None`, and `Sandbox::jobs()` a
 command wrote. The endpoint carries them as base64, so a `tar`, a `gzip` or a `cat` of a binary comes back intact, and
 there is no flag to ask for it. A transport of your own returns its bytes in `ExecResult`; `stdout_text()` is the one
 place they become text.
+
+**Errors.** Layer-1 calls return `std::io::Error`. For the FILES-OVER-EXEC kind vocabulary (`not_found`, `auth`,
+`protocol`, …), convert with `SandboxError::from(err)` or `SandboxError::classify` — the same kinds the TypeScript and
+Python clients report.
 
 ## Protocol and conformance
 
