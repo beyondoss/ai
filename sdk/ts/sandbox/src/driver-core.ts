@@ -147,17 +147,17 @@ const jobJson = (j: JobInfo): Json => ({
 
 export class Driver {
   private readonly cfg: DriverConfig;
-  private connected: Sandbox | undefined;
+  private connected: Promise<Sandbox> | undefined;
 
   constructor(cfg: DriverConfig) {
     this.cfg = cfg;
   }
 
   /**
-   * Build the surface on first use. Nothing is sent until an op needs the endpoint; a failure
-   * is that op's answer. The driver goes through `Sandbox`, so its wiring is under test too.
+   * Connect (and probe) on the first request that needs it; a failure is that op's answer. The
+   * driver goes through `Sandbox`, so its wiring is under test too.
    */
-  private connect(): Sandbox {
+  private connect(): Promise<Sandbox> {
     this.connected ??= Sandbox.connect({
       url: this.cfg.url,
       token: this.cfg.tokenCmd
@@ -189,7 +189,7 @@ export class Driver {
           },
         };
       }
-      return { id, ok: await this.dispatch(op, req, this.connect()) };
+      return { id, ok: await this.dispatch(op, req, await this.connect()) };
     } catch (e) {
       return { id, error: e instanceof Reject ? e.err : toError(e) };
     }

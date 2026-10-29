@@ -9,11 +9,10 @@ and web streams, on Node 18+ and Bun.
 ```ts
 import { Sandbox } from "@beyond.dev/sandbox";
 
-const sb = Sandbox.connect({
+const sb = await Sandbox.connect({
   url: process.env.EXEC_URL!,
   token: process.env.EXEC_TOKEN,
-}); // nothing is sent yet
-await sb.ready(); // optional: fail fast on a bad URL or token
+}); // probes once; a bad URL or token fails here
 
 const { exitCode, stdoutText } = await sb.exec("uname", ["-sr"]); // argv, not a shell string
 await sb.files.write("/work/hello.txt", "hello\n"); // atomic, keeps the file's mode
@@ -55,9 +54,9 @@ Transport  run, stream, jobs                           raw exec; replace it with
    you write has the same powers. `Files` looks at the sandbox once, in ONE `sh -c` round trip on the first operation that
    needs it (`read`, `list`, `search` — a write needs nothing and never probes): `rg` or GNU `grep` or busybox `grep`;
    `find -printf`; whether `dd`/`base64` can read windows. A listing without `-printf` takes two `find` passes. Writes
-   always send their content on stdin.
+   always send their content on stdin. `Sandbox.connect` runs that probe up front so a bad URL or token fails there.
 3. **`Sandbox`** composes both and always exposes raw exec (`sb.exec`, `sb.stream`, `sb.transport`) and
-   `sb.ready()` / `sb.capabilities()` (the same probe as `sb.files.capabilities()`).
+   `sb.capabilities()` (the same probe). `new Sandbox(transport)` skips the probe for tests and BYO transports.
 
 ### Why argv, not a shell string
 
@@ -69,14 +68,9 @@ a pipeline, run a **fixed** script and pass variables as `$1`, `$2`:
 ```ts
 await sb.exec("sh", ["-c", "find \"$1\" -name \"$2\"", "sh", dir, "*.ts"]);
 // or Files.sh for the same argv shape:
-import { Files, sh } from "@beyond.dev/sandbox";
+import { sh } from "@beyond.dev/sandbox";
 await transport.run("sh", sh("find \"$1\" -name \"$2\"", [dir, "*.ts"]));
 ```
-
-### Connect sends nothing
-
-`Sandbox.connect({ url, token })` only builds the client. Call `await sb.ready()` to probe immediately (bad token →
-`AuthError`), or let the first file helper that needs a probe do it. Writes and raw `exec` do not need the probe.
 
 ### Raw exec is bytes
 
@@ -154,7 +148,7 @@ machine, with no HTTP.
 ## Write your own helper
 
 A helper is a function of a `Transport`. Pass variable parts as arguments, never inside a shell string: a path like
-`'; rm -rf /` is then one inert argument.
+`` `; rm -rf /` `` is then one inert argument.
 
 ```ts
 async function gitStatus(t: Transport, dir: string): Promise<string[]> {

@@ -86,21 +86,14 @@ class Sandbox:
         ssl_context: ssl.SSLContext | None = None,
         override: CapsOverride | None = None,
     ) -> Sandbox:
-        """A sandbox behind an exec endpoint. Nothing is sent until the first call.
+        """Connect to an exec endpoint and probe once. A bad URL or token fails here.
 
-        A bad URL or token fails on :meth:`ready` or the first call that needs the endpoint
-        (same promise as the TypeScript and Rust clients).
+        For a transport you already hold with no probe, construct :class:`Sandbox` directly.
         """
         http = HttpTransport(url, token, headers=headers, ssl_context=ssl_context)
-        return cls(http, override=override)
-
-    def ready(self) -> Capabilities:
-        """Probe the endpoint once (capabilities).
-
-        Use when you want a bad URL or token to fail before the first real call; otherwise the
-        first helper that needs a probe does the same work.
-        """
-        return self.capabilities()
+        sb = cls(http, override=override)
+        sb.capabilities()
+        return sb
 
     def exec(
         self,
@@ -176,7 +169,7 @@ class AsyncSandbox:
         self.jobs = AsyncJobs(transport)
 
     @classmethod
-    def connect(
+    async def connect(
         cls,
         url: str,
         token: AsyncToken = None,
@@ -185,16 +178,14 @@ class AsyncSandbox:
         ssl_context: ssl.SSLContext | None = None,
         override: CapsOverride | None = None,
     ) -> AsyncSandbox:
-        """A sandbox behind an exec endpoint. Nothing is sent until the first call.
+        """Connect to an exec endpoint and probe once. A bad URL or token fails here.
 
-        A bad URL or token fails on :meth:`ready` or the first call that needs the endpoint.
+        For a transport you already hold with no probe, construct :class:`AsyncSandbox` directly.
         """
         http = AsyncHttpTransport(url, token, headers=headers, ssl_context=ssl_context)
-        return cls(http, override=override)
-
-    async def ready(self) -> Capabilities:
-        """Probe the endpoint once (capabilities). See :meth:`Sandbox.ready`."""
-        return await self.capabilities()
+        sb = cls(http, override=override)
+        await sb.capabilities()
+        return sb
 
     async def exec(
         self,

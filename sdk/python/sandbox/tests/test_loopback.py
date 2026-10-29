@@ -13,11 +13,10 @@ from pathlib import Path
 from beyond_sandbox import AsyncSandbox, Exit, Sandbox, Signal, Stderr, Stdout
 
 
-def test_ready_probes_without_connect_sending(execd_url: str) -> None:
-    sb = Sandbox.connect(execd_url)  # nothing is sent yet
-    caps = sb.ready()
-    assert caps.read_window
-    assert sb.capabilities() is caps  # cached; same object the next caller sees
+def test_connect_probes(execd_url: str) -> None:
+    sb = Sandbox.connect(execd_url)
+    assert sb.capabilities().read_window
+    assert sb.capabilities() is sb.capabilities()  # cached
 
 
 def test_exec_and_stream(execd_url: str) -> None:
@@ -95,7 +94,7 @@ def test_jobs(execd_url: str) -> None:
 
 def test_async_sandbox(execd_url: str, tmp_path: Path) -> None:
     async def main() -> None:
-        async with AsyncSandbox.connect(execd_url) as sb:
+        async with await AsyncSandbox.connect(execd_url) as sb:
             assert (await sb.exec("echo", ["hi"])).stdout == b"hi\n"
             frames = [f async for f in await sb.stream("sh", ["-c", "echo a; echo b >&2"])]
             assert {Stdout(b"a\n"), Stderr(b"b\n"), Exit(0)} == set(frames)

@@ -8,8 +8,7 @@ files, and keep background jobs. Pure Python, no dependencies, sync and asyncio,
 ```python
 from beyond_sandbox import Sandbox
 
-sb = Sandbox.connect("https://sandbox.example/exec", token="...")   # nothing is sent yet
-sb.ready()                                                          # optional: fail fast on a bad URL or token
+sb = Sandbox.connect("https://sandbox.example/exec", token="...")   # probes; bad URL/token fails here
 sb.exec("git", ["status", "--porcelain"], cwd="/work").stdout_text  # argv, not a shell string
 sb.files.write("/work/hello.py", "print('hi')\n")                   # atomic; str or bytes; keeps mode
 sb.files.read_text("/work/hello.py")                                # UTF-8 view of read (lossy, like stdout_text)
@@ -23,8 +22,7 @@ print(sb.jobs.read("my-session", "dev").data)                       # its output
 ```python
 from beyond_sandbox import AsyncSandbox
 
-async with AsyncSandbox.connect("https://sandbox.example/exec", token="...") as sb:
-    await sb.ready()
+async with await AsyncSandbox.connect("https://sandbox.example/exec", token="...") as sb:
     await sb.files.write("/work/a.txt", "x")
     results = await asyncio.gather(sb.exec("uname"), sb.files.read_text("/work/a.txt"))
 ```
@@ -62,12 +60,13 @@ interpolated. When you need a pipeline, run a **fixed** script and pass variable
 sb.exec("sh", ["-c", 'find "$1" -name "$2"', "sh", dir, "*.py"])
 ```
 
-## Connect sends nothing
+## Connect probes
 
-`Sandbox.connect(url, token=...)` only builds the client (positional URL, keyword options — idiomatic
-Python). Call `sb.ready()` to probe immediately (bad token → `AuthError`), or let the first file helper
-that needs a probe do it. Writes and raw `exec` do not need the probe. The TypeScript client uses the
-same lazy promise with an options-object `connect({ url, token })`.
+`Sandbox.connect(url, token=...)` builds the client and probes once (positional URL, keyword options —
+idiomatic Python). A bad token raises `AuthError` there. `await AsyncSandbox.connect(...)` does the
+same under asyncio. Construct `Sandbox(transport)` / `AsyncSandbox(transport)` when you already hold a
+transport and do not want a probe (tests, BYO). The TypeScript client uses the same eager promise with
+an options-object `await Sandbox.connect({ url, token })`.
 
 `jobs.start(scope, id, command, args, *, cwd=..., label=...)` is positional for the required pieces
 and keyword-only for the rest. The TypeScript client takes a `JobSpec` object instead — same wire
@@ -81,7 +80,7 @@ retry in the package; every other failure is reported as it happened.
 
 ```python
 Sandbox.connect(url, token=lambda: fetch_short_lived_token())
-AsyncSandbox.connect(url, token=fetch_token_async)          # a coroutine function works too
+await AsyncSandbox.connect(url, token=fetch_token_async)    # a coroutine function works too
 ```
 
 ## Bring your own transport
@@ -170,8 +169,9 @@ Both return a `Transfer(files, dirs, links, bytes)`; `AsyncSandbox` has the same
   `ssl`, or `asyncio` streams, and nothing else. TLS verifies the certificate against the system
   roots (the default context is built once per transport); pass `ssl_context=` to change that.
 - The environment (busybox or GNU `find`, `rg` or `grep`, `dd`/`base64` flags) is probed once per
-  `Sandbox` in a single `sh -c` round trip, on the first read, list or search; writes need no probe.
-  A probe that fails (unreachable, `401`) raises from the call that needed it and is not remembered.
+  `Sandbox` in a single `sh -c` round trip: `connect` runs it up front; constructing from a transport
+  probes on the first read, list or search. Writes need no probe. A probe that fails (unreachable,
+  `401`) raises and is not remembered.
 
 ## How it is built
 
