@@ -48,16 +48,23 @@ export class Sandbox {
   }
 
   /**
-   * Connect to an exec endpoint (`{url, token}`) or wrap your own transport (`{transport}`), and
-   * probe the sandbox once (one round trip) so a bad URL or token fails here, not on first use.
+   * Connect to an exec endpoint (`{url, token}`) or wrap your own transport (`{transport}`).
+   * Nothing is sent yet: a bad URL or token fails on {@link Sandbox.ready} or the first call that
+   * needs the endpoint (same promise as the Python and Rust clients).
    */
-  static async connect(options: ConnectOptions): Promise<Sandbox> {
+  static connect(options: ConnectOptions): Sandbox {
     const transport = "transport" in options
       ? options.transport
       : new HttpTransport(options);
-    const sandbox = new Sandbox(transport, { files: options.files });
-    await sandbox.capabilities();
-    return sandbox;
+    return new Sandbox(transport, { files: options.files });
+  }
+
+  /**
+   * Probe the endpoint once (capabilities). Use when you want a bad URL or token to fail before
+   * the first real call; otherwise the first helper that needs a probe does the same work.
+   */
+  ready(): Promise<Capabilities> {
+    return this.capabilities();
   }
 
   /** What the sandbox's environment offers (probed once, cached). Delegates to {@link Files.capabilities}. */

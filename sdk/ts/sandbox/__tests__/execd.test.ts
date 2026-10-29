@@ -17,13 +17,13 @@ const scratch = () => `${execd!.root}/t${process.pid}-${++n}`;
 const dec = (b: Uint8Array) => new TextDecoder().decode(b);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function connect(): Promise<Sandbox> {
+function connect(): Sandbox {
   return Sandbox.connect({ url: execd!.url, token: execd!.token });
 }
 
 d("against a loopback execd", () => {
   it("raw exec returns every byte value exactly, on both streams", async () => {
-    const sb = await connect();
+    const sb = connect();
     const r = await sb.exec("sh", [
       "-c",
       `${ALL_256}; ${ALL_256} >&2; exit 3`,
@@ -38,7 +38,7 @@ d("against a loopback execd", () => {
   });
 
   it("runs a command, with stdin, and reports a non-zero exit as a result", async () => {
-    const sb = await connect();
+    const sb = connect();
     const r = await sb.exec("sh", ["-c", "cat; echo err >&2; exit 3"], {
       stdin: "hello",
     });
@@ -51,18 +51,15 @@ d("against a loopback execd", () => {
     expect(nf.exitCode).toBe(127);
   });
 
-  it("fails connect with auth on a wrong token", async () => {
-    await expect(Sandbox.connect({ url: execd!.url, token: "wrong" })).rejects
-      .toMatchObject({
-        kind: "auth",
-      });
-    await expect(Sandbox.connect({ url: execd!.url })).rejects.toMatchObject({
-      kind: "auth",
-    });
+  it("connect sends nothing; ready fails with auth on a wrong or missing token", async () => {
+    const wrong = Sandbox.connect({ url: execd!.url, token: "wrong" });
+    await expect(wrong.ready()).rejects.toMatchObject({ kind: "auth" });
+    const missing = Sandbox.connect({ url: execd!.url });
+    await expect(missing.ready()).rejects.toMatchObject({ kind: "auth" });
   });
 
   it("errors over the response cap and says the command ran", async () => {
-    const sb = await Sandbox.connect({
+    const sb = Sandbox.connect({
       url: execd!.url,
       token: execd!.token,
       maxResponseBytes: 2000,
@@ -75,7 +72,7 @@ d("against a loopback execd", () => {
   });
 
   it("streams frames, and stopping the iteration kills the command's whole group", async () => {
-    const sb = await connect();
+    const sb = connect();
     const dir = scratch();
     await sb.files.mkdir(dir);
     const marker = join(dir, "alive");
@@ -96,7 +93,7 @@ d("against a loopback execd", () => {
   });
 
   it("reports exit, signal and timeout as the final frame, and heartbeats are not output", async () => {
-    const sb = await connect();
+    const sb = connect();
     const last = async (cmd: string, o = {}) => {
       let f: Frame | undefined;
       for await (f of sb.stream("sh", ["-c", cmd], o));
@@ -111,7 +108,7 @@ d("against a loopback execd", () => {
 
   describe("files", () => {
     it("round-trips bytes exactly, across read windows, with offset and max", async () => {
-      const sb = await connect();
+      const sb = connect();
       const dir = scratch();
       await sb.files.mkdir(dir);
       const data = randomBytes(300_000); // three windows of 96 KiB
@@ -134,7 +131,7 @@ d("against a loopback execd", () => {
     });
 
     it("reports the spec's error kinds", async () => {
-      const sb = await connect();
+      const sb = connect();
       const dir = scratch();
       await sb.files.mkdir(dir);
       await sb.files.write(`${dir}/f`, "x");
@@ -161,7 +158,7 @@ d("against a loopback execd", () => {
     });
 
     it("guards writes with the whole-second mtime", async () => {
-      const sb = await connect();
+      const sb = connect();
       const dir = scratch();
       await sb.files.mkdir(dir);
       await sb.files.writeIfUnchanged(`${dir}/g`, "one", null); // must not exist
@@ -179,7 +176,7 @@ d("against a loopback execd", () => {
     });
 
     it("lists with hidden names and limits, and searches with context and limits", async () => {
-      const sb = await connect();
+      const sb = connect();
       const dir = scratch();
       await sb.files.mkdir(`${dir}/sub`);
       await sb.files.write(
@@ -240,7 +237,7 @@ d("against a loopback execd", () => {
   {
     describe("jobs", () => {
       it("starts, reads from an offset, follows to the end, lists and removes", async () => {
-        const sb = await connect();
+        const sb = connect();
         const scope = `ts-jobs-${process.pid}`;
         try {
           await sb.jobs.start(scope, "job1", {
@@ -280,7 +277,7 @@ d("against a loopback execd", () => {
       });
 
       it("tells a job killed by a signal from one that exited 137", async () => {
-        const sb = await connect();
+        const sb = connect();
         const scope = `ts-signal-${process.pid}`;
         try {
           await sb.jobs.start(scope, "sig", {
@@ -320,7 +317,7 @@ d("against a loopback execd", () => {
       });
 
       it("kills the whole group, and refuses a bad id before sending anything", async () => {
-        const sb = await connect();
+        const sb = connect();
         const scope = `ts-kill-${process.pid}`;
         try {
           await sb.jobs.start(scope, "sleeper", {
@@ -357,7 +354,7 @@ d("against a loopback execd", () => {
   }
 
   it("exposes the raw layer on the Sandbox, and Files/Jobs work over the transport alone", async () => {
-    const sb = await connect();
+    const sb = connect();
     const r = await sb.transport.run("echo", ["raw"]);
     expect(dec(r.stdout)).toBe("raw\n");
     const dir = scratch();

@@ -1,18 +1,21 @@
 # @beyond.dev/sandbox
 
-**Use any sandbox from TypeScript with one URL.** Run commands, stream them, read and write files atomically, search, and keep
-background jobs, over the exec protocol that [`execd`](../../../crates/execd/README.md) speaks. No runtime
-dependencies: it is `fetch` and web streams, on Node 18+ and Bun.
+**Connect to any sandbox that speaks the exec protocol.** This package does **not** create, pause, or
+destroy VMs — lifecycle stays with the platform that gave you the URL (Beyond, E2B with
+[`execd`](../../../crates/execd/README.md) installed, Docker, …). Here you run commands, stream them,
+read and write files atomically, search, and keep background jobs. No runtime dependencies: `fetch`
+and web streams, on Node 18+ and Bun.
 
 ```ts
 import { Sandbox } from "@beyond.dev/sandbox";
 
-const sb = await Sandbox.connect({
+const sb = Sandbox.connect({
   url: process.env.EXEC_URL!,
   token: process.env.EXEC_TOKEN,
-});
+}); // nothing is sent yet
+await sb.ready(); // optional: fail fast on a bad URL or token
 
-const { exitCode, stdoutText } = await sb.exec("uname", ["-sr"]); // a non-zero exit is a result, not an error
+const { exitCode, stdoutText } = await sb.exec("uname", ["-sr"]); // argv, not a shell string
 await sb.files.write("/work/hello.txt", "hello\n"); // atomic, keeps the file's mode
 console.log(await sb.files.readText("/work/hello.txt"));
 
@@ -54,7 +57,26 @@ Transport  run, stream, jobs                           raw exec; replace it with
    `find -printf`; whether `dd`/`base64` can read windows. A listing without `-printf` takes two `find` passes. Writes
    always send their content on stdin.
 3. **`Sandbox`** composes both and always exposes raw exec (`sb.exec`, `sb.stream`, `sb.transport`) and
-   `sb.capabilities()` (the same probe as `sb.files.capabilities()`).
+   `sb.ready()` / `sb.capabilities()` (the same probe as `sb.files.capabilities()`).
+
+### Why argv, not a shell string
+
+`exec("ls", ["-l", path])` takes the program and each argument separately. A path like `` `; rm -rf /` `` is then one
+inert argument, never parsed by a shell. That matches the FILES-OVER-EXEC rule every helper follows. Other sandbox SDKs
+often take `commands.run("ls -l …")` as one string — convenient until a model-supplied path is interpolated. When you need
+a pipeline, run a **fixed** script and pass variables as `$1`, `$2`:
+
+```ts
+await sb.exec("sh", ["-c", "find \"$1\" -name \"$2\"", "sh", dir, "*.ts"]);
+// or Files.sh for the same argv shape:
+import { Files, sh } from "@beyond.dev/sandbox";
+await transport.run("sh", sh("find \"$1\" -name \"$2\"", [dir, "*.ts"]));
+```
+
+### Connect sends nothing
+
+`Sandbox.connect({ url, token })` only builds the client. Call `await sb.ready()` to probe immediately (bad token →
+`AuthError`), or let the first file helper that needs a probe do it. Writes and raw `exec` do not need the probe.
 
 ### Raw exec is bytes
 
@@ -91,6 +113,9 @@ The sandbox is not trusted on download: a member with `..` or an absolute name, 
 `collect` (follow to the end into one result; `attach` is a deprecated alias), `kill`, `remove`, `wipe`. A job is owned by
 the sandbox: it keeps running when you disconnect, and its last 8 MiB of output is readable from any offset. The sandbox
 keeps them; the client validates and forwards. `scope` is 1 to 64 of `[0-9a-z-]`, an id 1 to 32 of `[0-9a-z]`.
+
+The TypeScript surface takes a `JobSpec` options object (idiomatic optional `cwd` / `label`). The Python client uses
+positional `command, args` plus keyword-only options — same protocol, language-shaped call.
 
 ### Errors
 

@@ -86,9 +86,21 @@ class Sandbox:
         ssl_context: ssl.SSLContext | None = None,
         override: CapsOverride | None = None,
     ) -> Sandbox:
-        """A sandbox behind an exec endpoint. Nothing is sent until the first call."""
+        """A sandbox behind an exec endpoint. Nothing is sent until the first call.
+
+        A bad URL or token fails on :meth:`ready` or the first call that needs the endpoint
+        (same promise as the TypeScript and Rust clients).
+        """
         http = HttpTransport(url, token, headers=headers, ssl_context=ssl_context)
         return cls(http, override=override)
+
+    def ready(self) -> Capabilities:
+        """Probe the endpoint once (capabilities).
+
+        Use when you want a bad URL or token to fail before the first real call; otherwise the
+        first helper that needs a probe does the same work.
+        """
+        return self.capabilities()
 
     def exec(
         self,
@@ -173,8 +185,16 @@ class AsyncSandbox:
         ssl_context: ssl.SSLContext | None = None,
         override: CapsOverride | None = None,
     ) -> AsyncSandbox:
+        """A sandbox behind an exec endpoint. Nothing is sent until the first call.
+
+        A bad URL or token fails on :meth:`ready` or the first call that needs the endpoint.
+        """
         http = AsyncHttpTransport(url, token, headers=headers, ssl_context=ssl_context)
         return cls(http, override=override)
+
+    async def ready(self) -> Capabilities:
+        """Probe the endpoint once (capabilities). See :meth:`Sandbox.ready`."""
+        return await self.capabilities()
 
     async def exec(
         self,

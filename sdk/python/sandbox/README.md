@@ -1,13 +1,16 @@
 # beyond-sandbox
 
-Run commands in a sandbox, and read, write and search its files, over the exec protocol. Pure
-Python, no dependencies, sync and asyncio, fully typed.
+**Connect to any sandbox that speaks the exec protocol.** This package does **not** create, pause, or
+destroy VMs — lifecycle stays with the platform that gave you the URL (Beyond, E2B with
+[`execd`](../../../crates/execd) installed, Docker, …). Here you run commands, read, write and search
+files, and keep background jobs. Pure Python, no dependencies, sync and asyncio, fully typed.
 
 ```python
 from beyond_sandbox import Sandbox
 
 sb = Sandbox.connect("https://sandbox.example/exec", token="...")   # nothing is sent yet
-sb.exec("git", ["status", "--porcelain"], cwd="/work").stdout_text  # raw exec: a result, any exit code
+sb.ready()                                                          # optional: fail fast on a bad URL or token
+sb.exec("git", ["status", "--porcelain"], cwd="/work").stdout_text  # argv, not a shell string
 sb.files.write("/work/hello.py", "print('hi')\n")                   # atomic; str or bytes; keeps mode
 sb.files.read_text("/work/hello.py")                                # UTF-8 view of read (lossy, like stdout_text)
 sb.files.search("TODO", "/work", glob="*.py", before=1).hits        # rg, grep or busybox grep, whichever is there
@@ -21,6 +24,7 @@ print(sb.jobs.read("my-session", "dev").data)                       # its output
 from beyond_sandbox import AsyncSandbox
 
 async with AsyncSandbox.connect("https://sandbox.example/exec", token="...") as sb:
+    await sb.ready()
     await sb.files.write("/work/a.txt", "x")
     results = await asyncio.gather(sb.exec("uname"), sb.files.read_text("/work/a.txt"))
 ```
@@ -46,6 +50,28 @@ Every failure is a `SandboxError` whose `kind` is the spec's error name (`not_fo
 `permission_denied`, `conflict`, `auth`, `timeout`, `too_large`, `not_offered`, ...); each kind is
 also a class (`NotFoundError`, `ConflictError`, `AuthError`, `NotOfferedError`, ...). A command that
 exits non-zero is a result, not an error.
+
+## Why argv, not a shell string
+
+`exec("ls", ["-l", path])` takes the program and each argument separately. A path like `` `; rm -rf /` ``
+is then one inert argument, never parsed by a shell. That matches the FILES-OVER-EXEC rule every helper
+follows. Other sandbox SDKs often take one shell string — convenient until a model-supplied path is
+interpolated. When you need a pipeline, run a **fixed** script and pass variables as `$1`, `$2`:
+
+```python
+sb.exec("sh", ["-c", 'find "$1" -name "$2"', "sh", dir, "*.py"])
+```
+
+## Connect sends nothing
+
+`Sandbox.connect(url, token=...)` only builds the client (positional URL, keyword options — idiomatic
+Python). Call `sb.ready()` to probe immediately (bad token → `AuthError`), or let the first file helper
+that needs a probe do it. Writes and raw `exec` do not need the probe. The TypeScript client uses the
+same lazy promise with an options-object `connect({ url, token })`.
+
+`jobs.start(scope, id, command, args, *, cwd=..., label=...)` is positional for the required pieces
+and keyword-only for the rest. The TypeScript client takes a `JobSpec` object instead — same wire
+protocol, each language shaped for its callers.
 
 ## Authentication
 

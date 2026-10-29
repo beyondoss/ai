@@ -13,6 +13,13 @@ from pathlib import Path
 from beyond_sandbox import AsyncSandbox, Exit, Sandbox, Signal, Stderr, Stdout
 
 
+def test_ready_probes_without_connect_sending(execd_url: str) -> None:
+    sb = Sandbox.connect(execd_url)  # nothing is sent yet
+    caps = sb.ready()
+    assert caps.read_window
+    assert sb.capabilities() is caps  # cached; same object the next caller sees
+
+
 def test_exec_and_stream(execd_url: str) -> None:
     sb = Sandbox.connect(execd_url)
     r = sb.exec("sh", ["-c", "echo out; echo err >&2; exit 7"])
