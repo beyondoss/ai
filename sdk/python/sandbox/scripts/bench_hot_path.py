@@ -28,9 +28,11 @@ from typing import Any, Callable
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from beyond_sandbox import HttpTransport  # noqa: E402
-from beyond_sandbox import _fs, _http  # noqa: E402
-from beyond_sandbox.transport import _Response  # noqa: E402
+from beyond_sandbox import (  # noqa: E402
+    HttpTransport,
+    _fs,
+    _http,
+)
 
 
 def timed(n: int, fn: Callable[[], None], warmup: int = 2) -> dict[str, float]:
@@ -103,7 +105,9 @@ def make_tls_endpoint(tmpdir: Path) -> tuple[ThreadingHTTPServer, str, Any, Path
     server_ctx.load_cert_chain(cert, key)
     server.socket = server_ctx.wrap_socket(server.socket, server_side=True)
     url = f"https://127.0.0.1:{server.server_address[1]}/exec"
-    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
+    threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+    ).start()
     client_ctx = ssl.create_default_context(cafile=str(cert))
     return server, url, client_ctx, cert
 
@@ -172,8 +176,7 @@ def bench_body_accumulate(size: int, chunk: int, n: int) -> dict[str, Any]:
     """Simulate ResponseReader.take() + read_capped accumulation for ``size`` bytes."""
     payload = os.urandom(size)
     head = (
-        f"HTTP/1.1 200 OK\r\nContent-Length: {size}\r\n"
-        f"Content-Type: application/json\r\n\r\n"
+        f"HTTP/1.1 200 OK\r\nContent-Length: {size}\r\nContent-Type: application/json\r\n\r\n"
     ).encode()
 
     def via_take() -> None:
