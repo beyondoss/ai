@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { text, utf8 } from "../src/bytes.js";
-import { decodeFrameLine, HttpTransport } from "../src/http.js";
+import { decodeFrameLine, excerpt, HttpTransport } from "../src/http.js";
 import type { Frame } from "../src/transport.js";
 import { fakeEndpoint, json, ok } from "./fake-endpoint.js";
 
@@ -464,6 +464,17 @@ describe("AbortSignal on run", () => {
     ctl.abort();
     await expect(p).rejects.toThrow(/aborted/);
     expect(await kindOf(p)).toBe("transport");
+  });
+});
+
+describe("excerpt", () => {
+  it("returns at most 400 code points and does not require the whole body", () => {
+    const body = utf8(`${"á".repeat(500)}${"B".repeat(1024 * 1024)}`);
+    expect(excerpt(body)).toBe("á".repeat(400));
+  });
+  it("trims and handles an empty body", () => {
+    expect(excerpt(utf8("  hi  "))).toBe("hi");
+    expect(excerpt(new Uint8Array())).toBe("");
   });
 });
 
