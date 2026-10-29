@@ -155,6 +155,18 @@ describe("HttpTransport.run", () => {
     }
   });
 
+  it("maps a 422 whose body is over the client cap to too_large even without the word cap", async () => {
+    const e = await endpoint((_, res) => {
+      res.writeHead(422, { "content-length": "100000" });
+      res.write("x");
+    });
+    expect(
+      await kindOf(
+        new HttpTransport({ url: e.url, maxResponseBytes: 10 }).run("x", []),
+      ),
+    ).toBe("too_large");
+  });
+
   it("carries the status on an endpoint error", async () => {
     const f = await endpoint((_, res) => {
       res.writeHead(503);
@@ -434,6 +446,34 @@ describe("HttpTransport.stream", () => {
       await new Promise((r) => setTimeout(r, 20));
     }
     expect(closed.length).toBe(1);
+  });
+});
+
+describe("HttpTransport.jobs", () => {
+  it("reports too_large when a job-start answer exceeds the response cap", async () => {
+    const e = await endpoint((_, res) => {
+      res.writeHead(200, { "content-length": "100000" });
+      res.write("{");
+    });
+    const t = new HttpTransport({ url: e.url, maxResponseBytes: 10 });
+    expect(await kindOf(t.jobs.start("scope-1", "job1", { command: "true" })))
+      .toBe("too_large");
+  });
+
+  it("is a protocol error when a job attach is not a stream", async () => {
+    const e = await endpoint((_, res) => json(res, 200, { started: 1 }));
+    const run = async () => {
+      for await (
+        const f of new HttpTransport({ url: e.url }).jobs.attach(
+          "scope-1",
+          "job1",
+          0,
+        )
+      ) {
+        void f;
+      }
+    };
+    expect(await kindOf(run())).toBe("protocol");
   });
 });
 

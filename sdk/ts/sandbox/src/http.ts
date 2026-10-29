@@ -8,18 +8,19 @@ import {
   TooLargeError,
   TransportError,
 } from "./errors.js";
-import type {
-  Frame,
-  JobChunk,
-  JobFrame,
-  JobInfo,
-  JobOps,
-  JobSpec,
-  JobState,
-  RunOptions,
-  RunResult,
-  Survivor,
-  Transport,
+import {
+  isJobId,
+  type Frame,
+  type JobChunk,
+  type JobFrame,
+  type JobInfo,
+  type JobOps,
+  type JobSpec,
+  type JobState,
+  type RunOptions,
+  type RunResult,
+  type Survivor,
+  type Transport,
 } from "./transport.js";
 
 /** The response cap: a larger one-shot answer fails with `too_large` (the command ran). */
@@ -240,10 +241,12 @@ export class HttpTransport implements Transport {
         refreshed = true;
         continue;
       }
-      void over;
       const msg = `exec endpoint ${this.url} returned ${status}: ${detail}`;
       if (status === 401 || status === 403) throw new AuthError(msg);
-      if (status === 422 && detail.includes("cap")) {
+      // 422 + over-cap: the body may be empty (Content-Length over the cap) or truncated, so the
+      // excerpt can lack the word "cap" — `over` is then the client's own verdict that the answer
+      // was too large (the command ran).
+      if (status === 422 && (over || detail.includes("cap"))) {
         throw new TooLargeError(msg);
       }
       throw new EndpointError(msg, status);
@@ -692,7 +695,10 @@ class HttpJobs implements JobOps {
       job,
     });
     try {
-      const { body } = await this.t.readCapped(ex);
+      const { body, over } = await this.t.readCapped(ex);
+      if (over) {
+        throw new TooLargeError("a job answer exceeded the response cap");
+      }
       let started: unknown;
       try {
         const v: unknown = JSON.parse(text(body));
@@ -770,6 +776,11 @@ class HttpJobs implements JobOps {
       job: this.job("attach", scope, { id, offset }),
     });
     try {
+      if (!isNdjson(ex.res)) {
+        throw new ProtocolError(
+          `exec endpoint ${this.t.url} answered a job stream with something that is not a stream`,
+        );
+      }
       for await (const line of this.t.lines(ex)) {
         const f = decodeJobFrame(line);
         if (f === "heartbeat") continue;
@@ -808,11 +819,6 @@ class HttpJobs implements JobOps {
       ),
     );
   }
-}
-
-/** A job id is 1 to 32 characters of `[0-9a-z]`. */
-export function isJobId(s: string): boolean {
-  return /^[0-9a-z]{1,32}$/.test(s);
 }
 
 /** One line of a job stream: the stream frames plus `started` and `gap`. */

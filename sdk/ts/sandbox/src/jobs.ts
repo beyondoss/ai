@@ -1,6 +1,6 @@
 import { concat } from "./bytes.js";
 import { InvalidRequestError, ProtocolError } from "./errors.js";
-import { isJobId } from "./http.js";
+import { isJobId } from "./transport.js";
 import type {
   JobChunk,
   JobFrame,
