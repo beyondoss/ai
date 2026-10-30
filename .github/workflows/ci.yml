@@ -225,6 +225,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
+      # agent_tools_mcp runs `@beyond.dev/tools` under Bun (pinned in mise.toml) with the workspace's
+      # zod; the tests fail rather than skip when `CI` is set and bun is missing. They are in agent-rest.
+      - name: install the TypeScript workspace
+        if: matrix.name == 'agent-rest'
+        run: npm ci
+        working-directory: sdk/ts
       # agent-code-mode is the one shard that cannot use the archive: it needs `--features code-mode`
       # (QuickJS), which would change the feature set of every other binary. It compiles for itself,
       # but only the agent's own dependency graph (`-p beyond-agent`), not the workspace.

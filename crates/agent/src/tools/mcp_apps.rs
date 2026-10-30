@@ -560,6 +560,7 @@ impl AppsView {
                         name: tool.name().to_owned(),
                         description: tool.description().to_owned(),
                         input_schema: tool.input_schema(),
+                        subagent_visible: tool.available_in_subagents(),
                         remote: remote.to_owned(),
                         ui: up.apps.tools[remote].clone(),
                         resource_uri: uri.clone(),
@@ -1121,6 +1122,8 @@ struct AppTool {
     name: String,
     description: String,
     input_schema: Value,
+    /// The wrapped tool's own `available_in_subagents`.
+    subagent_visible: bool,
     remote: String,
     ui: ToolUi,
     resource_uri: String,
@@ -1143,6 +1146,10 @@ impl Tool for AppTool {
 
     fn input_schema(&self) -> Value {
         self.input_schema.clone()
+    }
+
+    fn available_in_subagents(&self) -> bool {
+        self.subagent_visible
     }
 
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
@@ -1375,7 +1382,12 @@ impl AppTool {
             });
         }
         drop(guard);
-        crate::tools::mcp::tool_output_from_result(self.server.name(), &self.remote, result?, false)
+        crate::tools::mcp::tool_output_from_result(
+            self.server.name(),
+            &self.remote,
+            result?,
+            self.server.handle.sandbox_connector(),
+        )
     }
 }
 

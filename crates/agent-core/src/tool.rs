@@ -413,8 +413,8 @@ pub trait Tool: Send + Sync {
 
     /// Whether a subagent's registry should include this tool.
     ///
-    /// The default is true. The only opt-out is a bundle-saved sandbox connector whose
-    /// own tool set `availableInSubagents: false`. Every other tool, including every
+    /// The default is true. The only opt-out is a sandbox connector's tool that set
+    /// `availableInSubagents: false`. Every other tool, including every
     /// other MCP server, stays in the child's kit.
     fn available_in_subagents(&self) -> bool {
         true

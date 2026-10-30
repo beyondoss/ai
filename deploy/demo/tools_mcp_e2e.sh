@@ -2,15 +2,14 @@
 # End-to-end proof: Eve-shaped tools/*.ts → tools-mcp → E2B → MCP tools/call.
 #
 # Composes:
-#   - sdk/ts/agent-tools-mcp (defineTool, serve, compile AOT→JIT fallback)
+#   - sdk/ts/agent-tools-mcp (defineTool, serve, bun build --compile)
 #   - E2B REST + envd (same style as deploy/demo/mcp-outside-agent/run.sh)
 #   - deploy/demo/agents/tools
 #
-# Host: prove AOT compile (or --jit fallback) + manifest + local call.
+# Host: prove the compiled binary + manifest + local call.
 # E2B: install Bun in guest, run tools-mcp from uploaded sources, MCP round-trip.
 #
 #     ./deploy/demo/tools_mcp_e2e.sh
-#     ./deploy/demo/tools_mcp_e2e.sh --jit
 #     ./deploy/demo/tools_mcp_e2e.sh --local
 set -euo pipefail
 
@@ -29,11 +28,9 @@ if [ -f "$ROOT/.env" ]; then
 fi
 
 MODE=e2b
-FORCE_JIT=0
 for arg in "$@"; do
   case "$arg" in
     --local) MODE=local ;;
-    --jit) FORCE_JIT=1 ;;
     -h|--help) sed -n '2,16p' "$0" | tr -d '#'; exit 0 ;;
     *) echo "unknown arg: $arg" >&2; exit 2 ;;
   esac
@@ -80,16 +77,10 @@ vm_bash() { # script
 
 # --- 1) Host compile ------------------------------------------------------------------------------
 say "compile host tools-mcp"
-rm -f "$PKG/bin/tools-mcp" "$PKG/bin/tools-mcp.mode"
-if [ "$FORCE_JIT" = 1 ]; then
-  FORCE_NO_AOT=1 OUT="$PKG/bin/tools-mcp" bash "$PKG/scripts/compile.sh"
-  [ "$(cat "$PKG/bin/tools-mcp.mode")" = jit ] || fail "expected jit"
-else
-  OUT="$PKG/bin/tools-mcp" bash "$PKG/scripts/compile.sh"
-fi
+rm -f "$PKG/bin/tools-mcp"
+OUT="$PKG/bin/tools-mcp" bash "$PKG/scripts/compile.sh"
 HOST_BIN=$PKG/bin/tools-mcp
-COMPILE_MODE=$(cat "$PKG/bin/tools-mcp.mode")
-pass "host binary mode=$COMPILE_MODE size=$(ls -lh "$HOST_BIN" | awk '{print $5}')"
+pass "host binary size=$(ls -lh "$HOST_BIN" | awk '{print $5}')"
 
 # --- 2) Manifest + local call (real eve/tools + Zod, not a plain-object fake) --------------------
 say "manifest + local call"
@@ -223,5 +214,5 @@ echo "$CALL" | jq -e '.result.structuredContent.city=="SF" and .result.structure
   || fail "call: $CALL"
 pass "tools/call on E2B"
 
-say "all good (host_compile=$COMPILE_MODE)"
+say "all good"
 echo "OK"

@@ -58,7 +58,7 @@ bun run src/cli.ts manifest --dir examples/weather/tools --name tools -o .mcp-to
 # Serve MCP on loopback. Sandbox root is the cwd (or --workspace), not --dir.
 bun run src/cli.ts serve --dir examples/weather/tools --workspace . --http 127.0.0.1:8931
 
-# AOT guest binary (JIT fallback if AOT refuses disk imports)
+# Compiled guest binary (bun build --compile; still imports tools/*.ts from disk)
 npm run compile   # → bin/tools-mcp
 
 # Proofs

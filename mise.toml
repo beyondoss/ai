@@ -2,6 +2,8 @@
 dprint = "latest"
 rust = { version = "1.92", components = "rustfmt,clippy,llvm-tools-preview", targets = "aarch64-unknown-linux-gnu,x86_64-unknown-linux-gnu" }
 yamlfmt = "latest"
+# Runs `@beyond.dev/tools` (sdk/ts/agent-tools-mcp) for the agent's agent_tools_mcp tests, and builds its binary.
+bun = "1.4.4"
 cargo-binstall = "latest"
 "cargo:cross" = "latest"
 # nats-server for the e2e harness (real JetStream KV backing slipstream).
@@ -275,7 +277,7 @@ run = "npm run build"
 dir = "sdk/ts"
 
 [tasks."compile:agent-tools-mcp"]
-description = "AOT+trim+smol binary for in-sandbox tools MCP (bun compile). Build on the guest OS/arch. OUT= overrides bin/tools-mcp."
+description = "Compiled (bun build --compile, minify, smol) binary for in-sandbox tools MCP. Build on the guest OS/arch. OUT= overrides bin/tools-mcp."
 run = "npm run compile -w @beyond.dev/tools"
 dir = "sdk/ts"
 

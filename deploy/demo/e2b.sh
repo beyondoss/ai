@@ -320,7 +320,7 @@ $(browser_bridge_script)
 curl -sf -m 2 localhost:$BRIDGE_PORT/healthz" | grep -q ok
 }
 
-# Start @beyond.dev/tools (AOT linux binary) after the bundle is seeded.
+# Start @beyond.dev/tools (compiled linux binary) after the bundle is seeded.
 # $3 is an https URL of the binary (presigned), or a local path already on the VM.
 vm_tools_start() { # id token tools-mcp-binary-or-url
   local id=$1 tok=$2 src=$3

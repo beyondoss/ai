@@ -71,18 +71,7 @@ pub struct CachedTool {
     pub remote_name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
-    /// MCP `outputSchema`, when the server advertised one. Recorded so a re-list compares
-    /// the same tool the server sent. The model-facing description is left as the server
-    /// wrote it: `ToolDef` has no output-schema field, and the description is not a place
-    /// to hide one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_schema: Option<serde_json::Value>,
-    /// MCP tool annotations, when the server sent any. Recorded for the same re-list
-    /// comparison. They do not change scheduling: `conservative_exclusive` means the
-    /// call's write set cannot be named, which a hint does not say.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<CachedAnnotations>,
-    /// `Some(false)` hides a bundle guest's tool from subagents. `None` means they
+    /// `Some(false)` hides a sandbox connector's tool from subagents. `None` means they
     /// inherit it. Ignored for every other MCP server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_in_subagents: Option<bool>,
@@ -90,30 +79,6 @@ pub struct CachedTool {
     /// manifest ([`ManifestDir::for_apps`]); absent from every plain one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<crate::tools::mcp_apps::ToolUi>,
-}
-
-/// MCP `annotations` as the manifest records them. Hints the server sent, kept so a
-/// re-list matches. The host does not schedule from them.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct CachedAnnotations {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub read_only_hint: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub destructive_hint: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idempotent_hint: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub open_world_hint: Option<bool>,
-}
-
-impl CachedAnnotations {
-    pub fn is_empty(&self) -> bool {
-        self.read_only_hint.is_none()
-            && self.destructive_hint.is_none()
-            && self.idempotent_hint.is_none()
-            && self.open_world_hint.is_none()
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -488,8 +453,6 @@ mod tests {
             remote_name: name.into(),
             description: String::new(),
             input_schema: serde_json::json!({ "type": "object" }),
-            output_schema: None,
-            annotations: None,
             available_in_subagents: None,
             ui: None,
         };
@@ -745,8 +708,6 @@ mod tests {
             r#"{"remote_name":"get_weather","description":"d","input_schema":{"type":"object"}}"#,
         )
         .unwrap();
-        assert!(tool.output_schema.is_none());
-        assert!(tool.annotations.is_none());
         assert!(tool.available_in_subagents.is_none());
         assert!(tool.ui.is_none());
     }

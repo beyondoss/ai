@@ -821,47 +821,29 @@ impl Relist {
     }
 }
 
-/// A `tools/list` entry as the manifest records it — and as a re-listing is compared.
-/// Bundle-guest `_meta` on a successful `tools/call`. `@beyond.dev/tools` sets this
-/// when `endsTurn` is true or its function returns true. A failed call does not.
-/// Honored only for a connector whose menu came from the bundle (`Dial::saved`);
-/// any other MCP server's result is just a result.
+/// `_meta` on a successful `tools/call`. `@beyond.dev/tools` sets this when `endsTurn`
+/// is true or its function returns true. A failed call does not. Honored only for a
+/// sandbox connector ([`McpConnection::sandbox_connector`]); any other MCP server's
+/// result is just a result.
 const ENDS_TURN_META: &str = "beyond.dev/endsTurn";
 
-/// `tools/list` `_meta` key. `false` hides the tool from subagents. Only read for a
-/// bundle-saved connector, and only `false` is stored, so a manifest that omits the
-/// field matches a live list that omitted the key.
+/// `tools/list` `_meta` key. `false` hides the tool from subagents. Only honored for a
+/// sandbox connector, and only `false` is stored, so a manifest that omits the field
+/// matches a live list that omitted the key.
 const AVAILABLE_IN_SUBAGENTS_META: &str = "beyond.dev/availableInSubagents";
 
+/// A `tools/list` entry as the manifest records it — and as a re-listing is compared.
 fn cached_tool(t: &rmcp::model::Tool) -> crate::tools::mcp_manifest::CachedTool {
     crate::tools::mcp_manifest::CachedTool {
         remote_name: t.name.to_string(),
         description: t.description.as_deref().unwrap_or_default().to_string(),
         input_schema: t.schema_as_json_value(),
-        output_schema: t
-            .output_schema
-            .as_ref()
-            .map(|schema| serde_json::Value::Object(schema.as_ref().clone())),
-        annotations: cached_annotations(t),
         available_in_subagents: available_in_subagents_flag(t),
         // Both flavors: a server may send `_meta.ui` whether or not it was negotiated (the official
         // SDK's `registerAppTool` always does), and an app-only tool must stay hidden from the model
         // either way.
         ui: crate::tools::mcp_apps::ToolUi::from_meta(t.meta.as_deref()),
     }
-}
-
-fn cached_annotations(
-    t: &rmcp::model::Tool,
-) -> Option<crate::tools::mcp_manifest::CachedAnnotations> {
-    let annotations = t.annotations.as_ref()?;
-    let cached = crate::tools::mcp_manifest::CachedAnnotations {
-        read_only_hint: annotations.read_only_hint,
-        destructive_hint: annotations.destructive_hint,
-        idempotent_hint: annotations.idempotent_hint,
-        open_world_hint: annotations.open_world_hint,
-    };
-    (!cached.is_empty()).then_some(cached)
 }
 
 fn available_in_subagents_flag(t: &rmcp::model::Tool) -> Option<bool> {
@@ -896,15 +878,15 @@ fn mcp_tool(
     } else {
         t.description
     };
-    // Eve's `endsTurn` / `availableInSubagents` ride `_meta` on this package's own
-    // menu. A bundle-saved connector is that menu. Every other server is plain MCP.
-    let bundle_guest = conn.dial.saved.is_some();
+    // Eve's `endsTurn` / `availableInSubagents` ride `_meta` on `@beyond.dev/tools`, which
+    // runs in the sandbox. A sandbox connector is that server. Every other one is plain MCP.
+    let sandbox_connector = conn.sandbox_connector();
     Some(Arc::new(McpTool {
         name,
         description,
         input_schema: t.input_schema,
-        bundle_guest,
-        subagent_visible: !(bundle_guest && t.available_in_subagents == Some(false)),
+        sandbox_connector,
+        subagent_visible: !(sandbox_connector && t.available_in_subagents == Some(false)),
         remote_name: t.remote_name,
         server_name: server.clone(),
         conn: conn.clone(),
@@ -1176,10 +1158,10 @@ struct McpTool {
     name: String,
     description: String,
     input_schema: Value,
-    /// This tool came from the bundle's saved menu (`Dial::saved`). Only then does
-    /// `beyond.dev/endsTurn` end the run, and `availableInSubagents: false` hide it.
-    bundle_guest: bool,
-    /// `false` when a bundle guest set `availableInSubagents: false`.
+    /// This tool's server is a sandbox connector. Only then does `beyond.dev/endsTurn`
+    /// end the run, and `availableInSubagents: false` hide the tool.
+    sandbox_connector: bool,
+    /// `false` when a sandbox connector's tool set `availableInSubagents: false`.
     subagent_visible: bool,
     /// The bare tool name as the *server* knows it (unprefixed) — what actually goes out over
     /// `tools/call`.
@@ -1382,6 +1364,12 @@ fn register_for_reaping(conn: &Arc<McpConnection>, idle: Duration) {
 }
 
 impl McpConnection {
+    /// Whether this is a sandbox connector ([`crate::grant::McpConnector::sandbox`]): the
+    /// server runs in the sandbox, so it is the bundle's own tools server, not a third party.
+    pub(crate) fn sandbox_connector(&self) -> bool {
+        self.dial.http.as_ref().is_some_and(|h| h.sandbox)
+    }
+
     fn new(
         config: McpServerConfig,
         dial: Dial,
@@ -1507,7 +1495,7 @@ impl McpConnection {
     /// browser page) inside a VM that sleeps for free, so its session lives as long as the agent's.
     async fn reap_if_idle(&self) -> bool {
         let after = self.idle_after;
-        if after.is_zero() || self.dial.http.as_ref().is_some_and(|h| h.sandbox) {
+        if after.is_zero() || self.sandbox_connector() {
             return false;
         }
         let idle =
@@ -1612,7 +1600,7 @@ impl McpTool {
             &self.server_name,
             &self.remote_name,
             result?,
-            self.bundle_guest,
+            self.sandbox_connector,
         )
     }
 }
@@ -1678,6 +1666,10 @@ pub(crate) struct McpServerHandle {
 impl McpServerHandle {
     pub(crate) fn name(&self) -> &str {
         &self.name
+    }
+
+    pub(crate) fn sandbox_connector(&self) -> bool {
+        self.conn.sandbox_connector()
     }
 
     pub(crate) async fn call_tool(
@@ -2453,10 +2445,8 @@ impl McpCatalog {
             ResumeError::Unreachable(format!("mcp server `{server}` is not reachable: {e}"))
         })?;
         match await_task(&conn, client, host, record, seed, progress).await {
-            Ok(result) => {
-                tool_output_from_result(&server, &tool, result, conn.dial.saved.is_some())
-                    .map_err(ResumeError::Final)
-            }
+            Ok(result) => tool_output_from_result(&server, &tool, result, conn.sandbox_connector())
+                .map_err(ResumeError::Final),
             Err(TaskFailure::ConnectionLost(why)) => Err(ResumeError::Unreachable(why)),
             Err(TaskFailure::Final(e)) => Err(ResumeError::Final(e)),
         }
@@ -2567,7 +2557,7 @@ pub(crate) fn tool_output_from_result(
     server_name: &str,
     remote_name: &str,
     result: CallToolResult,
-    bundle_guest: bool,
+    sandbox_connector: bool,
 ) -> Result<ToolOutput, ToolError> {
     let mut text = String::new();
     let mut images = Vec::new();
@@ -2604,10 +2594,10 @@ pub(crate) fn tool_output_from_result(
             text
         }));
     }
-    // `terminate` ends the run. That is Eve's `endsTurn` for this bundle's own tools,
+    // `terminate` ends the run. That is Eve's `endsTurn` for the sandbox's own tools,
     // and nothing else: a GitHub or Playwright result must not stop the agent because
     // it happened to set a `_meta` key.
-    let terminate = bundle_guest
+    let terminate = sandbox_connector
         && result.meta.as_ref().is_some_and(|meta| {
             meta.get(ENDS_TURN_META)
                 .and_then(serde_json::Value::as_bool)
@@ -4657,7 +4647,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bundle_guest_ends_the_run_only_when_it_says_so() {
+    fn a_sandbox_connector_ends_the_run_only_when_it_says_so() {
         use rmcp::model::{CallToolResult, ContentBlock, MetaObject};
         let ended = || {
             let mut ended = CallToolResult::success(vec![ContentBlock::text("ok")]);

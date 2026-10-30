@@ -6,14 +6,17 @@
 //! - `connect_granted_sandbox_calls_get_weather` dials the live server and calls `get_weather`.
 //! - `saved_menu_honors_ends_turn_from_the_live_call` stamps `.mcp-tools.json` with the guest,
 //!   advertises that menu without a handshake, then `tools/call`s the live server. `endsTurn`
-//!   sets `ToolOutput.terminate` only on that saved-menu path. The same call with no saved
-//!   menu leaves `terminate` false.
-//! - The `serve --service` tests run the agent binary: a saved menu plus a successful
-//!   `endsTurn` call ends the run without another model turn. The same server, with no
-//!   saved menu, does not.
+//!   sets `ToolOutput.terminate` and `availableInSubagents: false` hides the tool for a sandbox
+//!   connector, whether or not a menu was saved. A connector that is not a sandbox one gets neither.
+//! - The `serve --service` tests run the agent binary: a sandbox connector's successful `endsTurn`
+//!   call ends the run without another model turn, with or without a saved menu and in an
+//!   apps-capable session. A connector that is not `mcp_sandbox` does not end it.
 //!
-//! Needs `bun` on PATH and the workspace package at `sdk/ts/agent-tools-mcp`.
-//! Skips when bun is missing or `BEYOND_AI_SKIP_AGENT_TOOLS_MCP=1`.
+//! Needs `bun` on PATH and the workspace package at `sdk/ts/agent-tools-mcp` (with the workspace's
+//! `npm ci` done), or `TOOLS_MCP_BIN=<path to the compiled tools-mcp>` to run the same tests against
+//! the `npm run compile` binary instead of `bun src/cli.ts`.
+//! Skips when neither is available or `BEYOND_AI_SKIP_AGENT_TOOLS_MCP=1`; under `CI` a missing
+//! runtime fails the test instead, so a misconfigured job cannot pass without running them.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::BTreeMap;
@@ -30,9 +33,37 @@ use beyond_agent::tools::mcp_manifest::CachedTool;
 use beyond_agent::tools::web::ssrf::EgressPolicy;
 use serde_json::json;
 
+/// The compiled binary under test, when `TOOLS_MCP_BIN` names one.
+fn compiled_bin() -> Option<PathBuf> {
+    std::env::var_os("TOOLS_MCP_BIN")
+        .map(|p| PathBuf::from(p).canonicalize().expect("TOOLS_MCP_BIN"))
+}
+
 fn skip() -> bool {
-    std::env::var_os("BEYOND_AI_SKIP_AGENT_TOOLS_MCP").is_some()
-        || Command::new("bun").arg("--version").output().is_err()
+    if std::env::var_os("BEYOND_AI_SKIP_AGENT_TOOLS_MCP").is_some() {
+        return true;
+    }
+    // The guest modules are TypeScript either way, but the compiled binary carries its own runtime.
+    if compiled_bin().is_some() || Command::new("bun").arg("--version").output().is_ok() {
+        return false;
+    }
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "bun is not on PATH and CI is set: these tests would pass without running"
+    );
+    true
+}
+
+/// `tools-mcp <args>`: the compiled binary, else the package CLI under Bun.
+fn tools_mcp_cmd() -> Command {
+    match compiled_bin() {
+        Some(bin) => Command::new(bin),
+        None => {
+            let mut cmd = Command::new("bun");
+            cmd.arg("run").arg(package_root().join("src/cli.ts"));
+            cmd
+        }
+    }
 }
 
 fn package_root() -> PathBuf {
@@ -57,8 +88,7 @@ impl Drop for ToolsMcp {
 
 fn spawn_tools_mcp(tools_dir: &Path) -> ToolsMcp {
     let pkg = package_root();
-    let cli = pkg.join("src/cli.ts");
-    assert!(cli.is_file(), "missing {}", cli.display());
+    assert!(pkg.join("src/cli.ts").is_file());
 
     // Port from beyond_test_support::ports (ports_lint); drop so bun can bind it.
     let listener = beyond_test_support::ports::listener();
@@ -66,9 +96,7 @@ fn spawn_tools_mcp(tools_dir: &Path) -> ToolsMcp {
     drop(listener);
     let bind = format!("127.0.0.1:{port}");
 
-    let mut child = Command::new("bun")
-        .arg("run")
-        .arg(&cli)
+    let mut child = tools_mcp_cmd()
         .args([
             "serve",
             "--dir",
@@ -269,9 +297,7 @@ export default defineTool({{
     /// The guest's own manifest writer. The host parses this file as `Dial::saved`.
     fn manifest(&self) -> BTreeMap<String, Vec<CachedTool>> {
         let out = self.root.join(".mcp-tools.json");
-        let output = Command::new("bun")
-            .arg("run")
-            .arg(package_root().join("src/cli.ts"))
+        let output = tools_mcp_cmd()
             .arg("manifest")
             .arg("--dir")
             .arg(self.tools_dir())
@@ -311,11 +337,19 @@ fn pick(live: &McpTools, name: &str) -> Arc<dyn Tool> {
 }
 
 async fn connect(url: &str, saved: &BTreeMap<String, Vec<CachedTool>>) -> McpTools {
+    connect_as(url, saved, true).await
+}
+
+async fn connect_as(
+    url: &str,
+    saved: &BTreeMap<String, Vec<CachedTool>>,
+    sandbox: bool,
+) -> McpTools {
     let egress = McpEgress::new(EgressPolicy::new(true, &[])).unwrap();
     let connector = McpConnector {
         name: "tools".into(),
         url: url.to_string(),
-        sandbox: true,
+        sandbox,
         managed: false,
     };
     let (live, _catalog, warnings) = mcp::connect_granted(
@@ -366,7 +400,7 @@ async fn saved_menu_honors_ends_turn_from_the_live_call() {
     let done = finish.run(json!({})).await.expect("finish");
     assert!(
         done.terminate,
-        "saved menu + endsTurn meta must end the run: {done:?}"
+        "a sandbox connector's endsTurn meta must end the run: {done:?}"
     );
     assert!(done.text.contains("done"), "{done:?}");
 
@@ -404,18 +438,40 @@ async fn saved_menu_honors_ends_turn_from_the_live_call() {
 
     assert!(!pick(&live, "mcp__tools__quiet").available_in_subagents());
 
-    let plain = connect(&mcp.url, &BTreeMap::new()).await;
+    // No saved menu: the connector dials live, and is still the sandbox's own server.
+    let live = connect(&mcp.url, &BTreeMap::new()).await;
+    let finish = pick(&live, "mcp__tools__finish")
+        .run(json!({}))
+        .await
+        .expect("finish");
+    assert!(
+        finish.terminate,
+        "a sandbox connector ends the run without a saved menu too: {finish:?}"
+    );
+    assert!(!pick(&live, "mcp__tools__quiet").available_in_subagents());
+}
+
+/// The same server reached as an ordinary connector: its `_meta` is only metadata.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connector_that_is_not_a_sandbox_one_ignores_the_tool_flags() {
+    if skip() {
+        eprintln!("skip: bun not on PATH (or BEYOND_AI_SKIP_AGENT_TOOLS_MCP=1)");
+        return;
+    }
+    let guest = TurnTools::new();
+    let mcp = spawn_tools_mcp(&guest.tools_dir());
+    let plain = connect_as(&mcp.url, &BTreeMap::new(), false).await;
     let finish = pick(&plain, "mcp__tools__finish")
         .run(json!({}))
         .await
         .expect("finish");
     assert!(
         !finish.terminate,
-        "the same endsTurn result must not end the run when the menu was not saved: {finish:?}"
+        "only a sandbox connector's endsTurn ends the run: {finish:?}"
     );
     assert!(
         pick(&plain, "mcp__tools__quiet").available_in_subagents(),
-        "availableInSubagents is a bundle-menu flag"
+        "availableInSubagents is honored only for a sandbox connector"
     );
 }
 
@@ -436,9 +492,21 @@ mod service {
     use crate::common;
 
     async fn open(svc: &Service, server: &BundleServer, bytes: &[u8], mcp_url: &str) -> TestWs {
+        open_as(svc, server, bytes, mcp_url, true).await
+    }
+
+    async fn open_as(
+        svc: &Service,
+        server: &BundleServer,
+        bytes: &[u8],
+        mcp_url: &str,
+        sandbox: bool,
+    ) -> TestWs {
         let token = svc.token_with("t1", "s1.ends", |c| {
             c.mcp = vec![("tools".into(), mcp_url.to_string())];
-            c.mcp_sandbox = vec!["tools".into()];
+            if sandbox {
+                c.mcp_sandbox = vec!["tools".into()];
+            }
             c.bundle = Some(Bundle {
                 url: server.url.clone(),
                 sha256: sha256_hex(bytes),
@@ -511,10 +579,64 @@ mod service {
         );
     }
 
-    /// Same server and the same `endsTurn` tool. No `.mcp-tools.json`, so the connector dials
-    /// at open and the meta key does not end the run. The second scripted turn is that proof.
+    /// No `.mcp-tools.json`: the connector dials at open. It is still a sandbox connector, so the
+    /// run ends after the tool with no second model turn scripted.
     #[tokio::test(flavor = "multi_thread")]
-    async fn ends_turn_without_a_saved_menu_reaches_the_model_again() {
+    async fn ends_turn_without_a_saved_menu_stops_the_agent_run() {
+        if skip() {
+            eprintln!("skip: bun not on PATH (or BEYOND_AI_SKIP_AGENT_TOOLS_MCP=1)");
+            return;
+        }
+        let guest = TurnTools::new();
+        let bytes = tar(&[file("AGENTS.md", "be brief\n")]);
+        let bundle = BundleServer::start(bytes.clone());
+        let mcp = spawn_tools_mcp(&guest.tools_dir());
+        let (base, requests) =
+            spawn_model_server(vec![turn_tool_use("t1", "mcp__tools__finish", "{}")]);
+        let (svc, _cache) = service(&base).await;
+        let mut ws = open(&svc, &bundle, &bytes, &mcp.url).await;
+        let frames = prompt(&svc, &mut ws, "p1", "finish").await;
+        assert!(serde_json::to_string(&frames).unwrap().contains("done"));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    /// An apps-capable session dials its own (apps) connection with no saved menu, so this is the
+    /// gate that must not depend on one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ends_turn_in_an_apps_session_stops_the_agent_run() {
+        if skip() {
+            eprintln!("skip: bun not on PATH (or BEYOND_AI_SKIP_AGENT_TOOLS_MCP=1)");
+            return;
+        }
+        let guest = TurnTools::new();
+        let _saved = guest.manifest();
+        let manifest = std::fs::read_to_string(guest.root.join(".mcp-tools.json")).unwrap();
+        let bytes = tar(&[
+            file("AGENTS.md", "be brief\n"),
+            file(".mcp-tools.json", &manifest),
+        ]);
+        let bundle = BundleServer::start(bytes.clone());
+        let mcp = spawn_tools_mcp(&guest.tools_dir());
+        let (base, requests) =
+            spawn_model_server(vec![turn_tool_use("t1", "mcp__tools__finish", "{}")]);
+        let (svc, _cache) = service(&base).await;
+        let mut ws = open(&svc, &bundle, &bytes, &mcp.url).await;
+        ws_send(&mut ws, json!({"type": "set_mcp_apps", "enabled": true})).await;
+        let declared = ws_read_until_response(&mut ws, "set_mcp_apps").await;
+        assert_eq!(declared.last().unwrap()["success"], true, "{declared:?}");
+        prompt(&svc, &mut ws, "p1", "finish").await;
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "endsTurn must stop an apps session's run too: {:?}",
+            requests.lock().unwrap()
+        );
+    }
+
+    /// The same server granted as an ordinary connector (not `mcp_sandbox`): `_meta` is only
+    /// metadata, so the second scripted turn is reached.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ends_turn_from_a_non_sandbox_connector_reaches_the_model_again() {
         if skip() {
             eprintln!("skip: bun not on PATH (or BEYOND_AI_SKIP_AGENT_TOOLS_MCP=1)");
             return;
@@ -528,7 +650,7 @@ mod service {
             turn_text("after"),
         ]);
         let (svc, _cache) = service(&base).await;
-        let mut ws = open(&svc, &bundle, &bytes, &mcp.url).await;
+        let mut ws = open_as(&svc, &bundle, &bytes, &mcp.url, false).await;
         prompt(&svc, &mut ws, "p1", "finish").await;
         let seen = requests.lock().unwrap().clone();
         assert!(

@@ -147,7 +147,7 @@ export type RpcDispatch = {
 
 /**
  * Minimal MCP surface: initialize, tools/list, tools/call.
- * Enough for beyond-agent + `.mcp-tools.json` stamp; keep the surface small for AOT+trim.
+ * Enough for beyond-agent + `.mcp-tools.json` stamp; keep the surface small for the compiled binary.
  */
 export async function handleRpc(
   body: JsonRpcRequest,
