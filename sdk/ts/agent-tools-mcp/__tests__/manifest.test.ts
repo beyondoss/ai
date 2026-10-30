@@ -4,6 +4,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 
+import { createToolContext } from "../src/context.js";
 import { defineTool } from "../src/define-tool.js";
 import { loadTools } from "../src/load.js";
 import { writeManifest } from "../src/manifest.js";
@@ -49,7 +50,7 @@ describe("agent-tools-mcp", () => {
         params: { name: "get_weather", arguments: { city: "NYC" } },
       },
       tools,
-      { env: process.env, workspaceRoot: dir },
+      { workspaceRoot: dir },
     );
     expect(r?.result).toMatchObject({
       structuredContent: { city: "NYC", condition: "sunny", temperatureF: 72 },
@@ -77,10 +78,11 @@ describe("agent-tools-mcp", () => {
     await expect(validateToolInput(tool.inputSchema, {})).rejects.toThrow();
 
     expect(
-      await runTool(tool, { city: "NYC" }, {
-        env: process.env,
-        workspaceRoot: "/tmp",
-      }),
+      await runTool(
+        tool,
+        { city: "NYC" },
+        createToolContext({ workspaceRoot: "/tmp", toolName: "get_weather" }),
+      ),
     ).toMatchObject({ city: "NYC", temperatureF: 72 });
 
     const bad = await handleRpc(
@@ -91,7 +93,7 @@ describe("agent-tools-mcp", () => {
         params: { name: "get_weather", arguments: { city: "" } },
       },
       [{ name: "get_weather", def: tool, sourcePath: "get_weather.ts" }],
-      { env: process.env, workspaceRoot: "/tmp" },
+      { workspaceRoot: "/tmp" },
     );
     expect(bad?.result).toMatchObject({ isError: true });
   });

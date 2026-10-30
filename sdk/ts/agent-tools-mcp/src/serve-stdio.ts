@@ -1,8 +1,7 @@
 import readline from "node:readline";
 
-import type { ToolContext } from "./define-tool.js";
 import type { LoadedTool } from "./load.js";
-import { handleRpc } from "./rpc.js";
+import { handleRpc, type RpcContextBase } from "./rpc.js";
 
 /**
  * Line-delimited JSON-RPC on stdin/stdout — what `deploy/demo/mcp-tools.sh` drives
@@ -10,7 +9,7 @@ import { handleRpc } from "./rpc.js";
  */
 export async function serveStdio(opts: {
   tools: LoadedTool[];
-  ctx: ToolContext;
+  base: RpcContextBase;
 }): Promise<void> {
   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   for await (const line of rl) {
@@ -31,12 +30,12 @@ export async function serveStdio(opts: {
     }
     if (Array.isArray(body)) {
       for (const item of body) {
-        const r = await handleRpc(item as never, opts.tools, opts.ctx);
+        const r = await handleRpc(item as never, opts.tools, opts.base);
         if (r) process.stdout.write(`${JSON.stringify(r)}\n`);
       }
       continue;
     }
-    const r = await handleRpc(body as never, opts.tools, opts.ctx);
+    const r = await handleRpc(body as never, opts.tools, opts.base);
     if (r) process.stdout.write(`${JSON.stringify(r)}\n`);
   }
 }

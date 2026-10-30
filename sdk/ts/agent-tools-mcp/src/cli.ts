@@ -8,12 +8,12 @@
  */
 import path from "node:path";
 
+import type { RpcContextBase } from "./rpc.js";
 import { loadTools } from "./load.js";
 import { writeManifest } from "./manifest.js";
 import { handleRpc } from "./rpc.js";
 import { serveHttp } from "./serve-http.js";
 import { serveStdio } from "./serve-stdio.js";
-import type { ToolContext } from "./define-tool.js";
 
 function usage(): never {
   console.error(`Usage:
@@ -48,10 +48,10 @@ function takeHttpFlag(argv: string[]): string | true | undefined {
   return v;
 }
 
-function ctx(): ToolContext {
+function rpcBase(workspaceRoot = process.cwd()): RpcContextBase {
   return {
     env: process.env,
-    workspaceRoot: process.cwd(),
+    workspaceRoot,
   };
 }
 
@@ -84,10 +84,15 @@ async function main(): Promise<void> {
     }
     if (httpRaw !== undefined) {
       const bind = parseHttpBind(httpRaw === true ? undefined : httpRaw);
-      await serveHttp({ tools, ctx: ctx(), host: bind.host, port: bind.port });
+      await serveHttp({
+        tools,
+        base: rpcBase(path.resolve(dir)),
+        host: bind.host,
+        port: bind.port,
+      });
       await new Promise(() => {});
     } else {
-      await serveStdio({ tools, ctx: ctx() });
+      await serveStdio({ tools, base: rpcBase(path.resolve(dir)) });
     }
     return;
   }
@@ -126,7 +131,7 @@ async function main(): Promise<void> {
         params: { name, arguments: args },
       },
       tools,
-      ctx(),
+      rpcBase(path.resolve(dir)),
     );
     process.stdout.write(`${JSON.stringify(r, null, 2)}\n`);
     if (r && "result" in r && r.result && typeof r.result === "object" && r.result !== null && "isError" in r.result) {

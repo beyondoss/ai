@@ -35,9 +35,9 @@
     "build": "tsdown",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "parity": "vitest run __tests__/eve-parity.test.ts __tests__/eve-ctx.test.ts",
     "compile": "bash scripts/compile.sh",
-    "manifest:example": "bun run src/cli.ts manifest --dir examples/weather/tools --name tools",
-    "parity": "vitest run __tests__/eve-parity.test.ts"
+    "manifest:example": "bun run src/cli.ts manifest --dir examples/weather/tools --name tools"
   },
   "dependencies": {
     "@standard-schema/spec": "^1.0.0"

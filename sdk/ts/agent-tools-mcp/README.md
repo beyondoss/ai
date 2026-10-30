@@ -17,7 +17,12 @@ export default defineTool({
 
 ## Eve parity — how we prove it
 
-**`npm run parity`** runs `__tests__/eve-parity.test.ts` — one test per Eve docs claim ([eve.dev/docs/tools](https://eve.dev/docs/tools)). All must pass. That includes Zod/Standard Schema/JSON Schema, validate-before-execute, JSON Schema `default` fill, `deferred` omit from list, `endsTurn` model description append, and `outputSchema` validate.
+**`npm run parity`** (and `npm test`) must pass:
+
+- `__tests__/eve-parity.test.ts` — Eve docs tool definition claims ([eve.dev/docs/tools](https://eve.dev/docs/tools))
+- `__tests__/eve-ctx.test.ts` — Eve `ctx` including **`ctx.getSandbox()`** write/run ([eve.dev/docs/sandbox](https://eve.dev/docs/sandbox)), plus `callId` / `toolName` / `session` wired on `tools/call`
+
+`ctx.to()` throws in this guest (Eve channel host API). Everything else on the documented tools `ctx` is present.
 
 ## Commands
 

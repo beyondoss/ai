@@ -1,4 +1,4 @@
-import type { ToolContext } from "./define-tool.js";
+import { createToolContext, type CreateToolContextInput } from "./context.js";
 import type { LoadedTool } from "./load.js";
 import { runTool } from "./run-tool.js";
 import { ToolInputValidationError } from "./schema.js";
@@ -17,6 +17,9 @@ type JsonRpcResponse = {
   error?: { code: number; message: string; data?: unknown };
 };
 
+/** Session-wide bits; per-call `toolName` / `callId` are filled in on tools/call. */
+export type RpcContextBase = Omit<CreateToolContextInput, "toolName" | "callId">;
+
 /**
  * Minimal MCP surface: initialize, tools/list, tools/call.
  * Enough for beyond-agent + `.mcp-tools.json` stamp; keep the surface small for AOT+trim.
@@ -24,7 +27,7 @@ type JsonRpcResponse = {
 export async function handleRpc(
   body: JsonRpcRequest,
   tools: LoadedTool[],
-  ctx: ToolContext,
+  base: RpcContextBase,
 ): Promise<JsonRpcResponse | null> {
   const id = body.id ?? null;
   const method = body.method;
@@ -46,7 +49,6 @@ export async function handleRpc(
   }
 
   if (method === "tools/list") {
-    // Eve: deferred tools are omitted from the default tool list (still callable by name).
     const listed = tools.filter((t) => !t.def.deferred);
     return {
       jsonrpc: "2.0",
@@ -80,11 +82,13 @@ export async function handleRpc(
       };
     }
     const args = body.params?.arguments ?? {};
+    const ctx = createToolContext({
+      ...base,
+      toolName: tool.name,
+      callId: id === null || id === undefined ? crypto.randomUUID() : String(id),
+    });
     try {
-      const result = await runTool(tool.def, args, {
-        ...ctx,
-        toolName: tool.name,
-      });
+      const result = await runTool(tool.def, args, ctx);
       const text =
         typeof result === "string" ? result : JSON.stringify(result ?? null);
       return {
@@ -122,7 +126,6 @@ export async function handleRpc(
   };
 }
 
-/** Eve docs: when endsTurn is true, append this after a blank line to the model-facing description. */
 const ENDS_TURN_SENTENCE =
   "Calling this tool ends your turn once it succeeds: do not write a reply or call other tools in the same step. If it fails, you will see the error and can continue.";
 

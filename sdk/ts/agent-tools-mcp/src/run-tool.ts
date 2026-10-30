@@ -1,4 +1,5 @@
-import type { DefinedTool, ToolContext } from "./define-tool.js";
+import type { ToolContext } from "./context.js";
+import type { DefinedTool } from "./define-tool.js";
 import { ToolInputValidationError, validateToolInput } from "./schema.js";
 
 /** Drain async generators (Eve allows them); return the last yielded value. */

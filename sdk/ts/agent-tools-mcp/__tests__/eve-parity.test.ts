@@ -12,6 +12,7 @@ import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 
+import { createToolContext } from "../src/context.js";
 import { defineTool } from "../src/define-tool.js";
 import { loadTools } from "../src/load.js";
 import { handleRpc } from "../src/rpc.js";
@@ -21,7 +22,9 @@ import {
   validateToolInput,
 } from "../src/schema.js";
 
-const ctx = { env: process.env, workspaceRoot: "/tmp" };
+const rpcBase = { workspaceRoot: "/tmp" };
+const ctx = () =>
+  createToolContext({ workspaceRoot: "/tmp", toolName: "t", callId: "c" });
 
 describe("Eve parity: defineTool authoring (docs/tools)", () => {
   it("docs snippet: Zod inputSchema + execute({ city })", async () => {
@@ -33,7 +36,7 @@ describe("Eve parity: defineTool authoring (docs/tools)", () => {
         return { city, condition: "Sunny", temperatureF: 72 };
       },
     });
-    expect(await runTool(tool, { city: "NYC" }, ctx)).toEqual({
+    expect(await runTool(tool, { city: "NYC" }, ctx())).toEqual({
       city: "NYC",
       condition: "Sunny",
       temperatureF: 72,
@@ -78,7 +81,7 @@ export default defineTool({
       inputSchema: z.object({}),
       execute: () => ({ ok: true }),
     });
-    expect(await runTool(tool, {}, ctx)).toEqual({ ok: true });
+    expect(await runTool(tool, {}, ctx())).toEqual({ ok: true });
   });
 
   it("Zod / Standard Schema: validate before execute (reject bad input)", async () => {
@@ -91,7 +94,7 @@ export default defineTool({
         return {};
       },
     });
-    await expect(runTool(tool, { city: "" }, ctx)).rejects.toThrow();
+    await expect(runTool(tool, { city: "" }, ctx())).rejects.toThrow();
     expect(ran).toBe(false);
   });
 
@@ -120,7 +123,7 @@ export default defineTool({
       },
       execute: (input) => input,
     });
-    await expect(runTool(tool, {}, ctx)).rejects.toThrow(/city/);
+    await expect(runTool(tool, {}, ctx())).rejects.toThrow(/city/);
   });
 
   it("Zod → JSON Schema for tools/list (MCP)", async () => {
@@ -132,7 +135,7 @@ export default defineTool({
     const list = await handleRpc(
       { jsonrpc: "2.0", id: 1, method: "tools/list" },
       [{ name: "get_weather", def: tool, sourcePath: "x" }],
-      ctx,
+      rpcBase,
     );
     const schema = (list?.result as { tools: { inputSchema: Record<string, unknown> }[] })
       .tools[0]?.inputSchema;
@@ -147,7 +150,7 @@ export default defineTool({
       execute: ({ city }) => ({ city, huge: "secret" }),
       toModelOutput: (out) => ({ city: out.city }),
     });
-    expect(await runTool(tool, { city: "SF" }, ctx)).toEqual({ city: "SF" });
+    expect(await runTool(tool, { city: "SF" }, ctx())).toEqual({ city: "SF" });
   });
 
   it("execute may be sync", async () => {
@@ -156,7 +159,7 @@ export default defineTool({
       inputSchema: z.object({ n: z.number() }),
       execute: ({ n }) => n * 2,
     });
-    expect(await runTool(tool, { n: 21 }, ctx)).toBe(42);
+    expect(await runTool(tool, { n: 21 }, ctx())).toBe(42);
   });
 
   it("execute may be an async generator (last yield)", async () => {
@@ -168,7 +171,7 @@ export default defineTool({
         yield "b";
       },
     });
-    expect(await runTool(tool, {}, ctx)).toBe("b");
+    expect(await runTool(tool, {}, ctx())).toBe("b");
   });
 });
 
@@ -184,7 +187,7 @@ describe("Eve parity: defaults, deferred, endsTurn, outputSchema", () => {
       },
       execute: (input) => input,
     });
-    expect(await runTool(tool, {}, ctx)).toEqual({ city: "SF" });
+    expect(await runTool(tool, {}, ctx())).toEqual({ city: "SF" });
   });
 
   it("deferred: true omits tool from tools/list (still callable)", async () => {
@@ -197,7 +200,7 @@ describe("Eve parity: defaults, deferred, endsTurn, outputSchema", () => {
     const list = await handleRpc(
       { jsonrpc: "2.0", id: 1, method: "tools/list" },
       [{ name: "export_report", def: tool, sourcePath: "x" }],
-      ctx,
+      rpcBase,
     );
     const names = (
       list?.result as { tools: { name: string }[] }
@@ -212,7 +215,7 @@ describe("Eve parity: defaults, deferred, endsTurn, outputSchema", () => {
         params: { name: "export_report", arguments: { reportId: "r1" } },
       },
       [{ name: "export_report", def: tool, sourcePath: "x" }],
-      ctx,
+      rpcBase,
     );
     expect(call?.result).toMatchObject({
       structuredContent: { reportId: "r1" },
@@ -229,7 +232,7 @@ describe("Eve parity: defaults, deferred, endsTurn, outputSchema", () => {
     const list = await handleRpc(
       { jsonrpc: "2.0", id: 1, method: "tools/list" },
       [{ name: "react", def: tool, sourcePath: "x" }],
-      ctx,
+      rpcBase,
     );
     const desc = (list?.result as { tools: { description: string }[] }).tools[0]
       ?.description;
@@ -245,7 +248,7 @@ describe("Eve parity: defaults, deferred, endsTurn, outputSchema", () => {
       outputSchema: z.object({ city: z.string(), temperatureF: z.number() }),
       execute: ({ city }) => ({ city }), // missing temperatureF
     });
-    await expect(runTool(tool, { city: "X" }, ctx)).rejects.toThrow(/outputSchema/);
+    await expect(runTool(tool, { city: "X" }, ctx())).rejects.toThrow(/outputSchema/);
   });
 });
 

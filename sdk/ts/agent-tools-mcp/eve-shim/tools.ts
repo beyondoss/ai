@@ -1,9 +1,11 @@
 /** Package export target for `eve/tools` (exports must stay inside this package). */
 export {
+  createToolContext,
   defineTool,
   type DefinedTool,
   type InferToolInput,
   type JsonSchema,
+  type SandboxHandle,
   type ToolAnnotations,
   type ToolContext,
   type ToolDefinition,

@@ -1,12 +1,11 @@
 import { randomUUID } from "node:crypto";
 
-import type { ToolContext } from "./define-tool.js";
 import type { LoadedTool } from "./load.js";
-import { handleRpc } from "./rpc.js";
+import { handleRpc, type RpcContextBase } from "./rpc.js";
 
 export type ServeHttpOptions = {
   tools: LoadedTool[];
-  ctx: ToolContext;
+  base: RpcContextBase;
   host?: string;
   port?: number;
   /** When set, print one ready line on stderr. Default true. */
@@ -103,13 +102,13 @@ export async function serveHttp(
       if (Array.isArray(body)) {
         const out = [];
         for (const item of body) {
-          const r = await handleRpc(item as never, opts.tools, opts.ctx);
+          const r = await handleRpc(item as never, opts.tools, opts.base);
           if (r) out.push(r);
         }
         return new Response(JSON.stringify(out), { status: 200, headers });
       }
 
-      const r = await handleRpc(body as never, opts.tools, opts.ctx);
+      const r = await handleRpc(body as never, opts.tools, opts.base);
       if (r == null) {
         if (session) {
           return new Response(null, {
