@@ -71,16 +71,19 @@ pub struct CachedTool {
     pub remote_name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
-    /// MCP `outputSchema`, when the server advertised one. The model-facing description
-    /// repeats a compact form of it ([`crate::tools::mcp::with_output_note`]); this field is
-    /// what a re-list compares, so the menu and the live server stay the same bytes.
+    /// MCP `outputSchema`, when the server advertised one. Recorded so a re-list compares
+    /// the same tool the server sent. The model-facing description is left as the server
+    /// wrote it: `ToolDef` has no output-schema field, and the description is not a place
+    /// to hide one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<serde_json::Value>,
-    /// MCP tool annotations. Absent when the server sent none. Scheduling uses only the
-    /// hints that are set — see [`CachedAnnotations::schedules_exclusively`].
+    /// MCP tool annotations, when the server sent any. Recorded for the same re-list
+    /// comparison. They do not change scheduling: `conservative_exclusive` means the
+    /// call's write set cannot be named, which a hint does not say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<CachedAnnotations>,
-    /// `Some(false)` hides the tool from subagents. `None` means they inherit it.
+    /// `Some(false)` hides a bundle guest's tool from subagents. `None` means they
+    /// inherit it. Ignored for every other MCP server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_in_subagents: Option<bool>,
     /// The tool's MCP Apps `_meta.ui` (view resource, visibility). Recorded only in the apps
@@ -89,8 +92,8 @@ pub struct CachedTool {
     pub ui: Option<crate::tools::mcp_apps::ToolUi>,
 }
 
-/// MCP `annotations` as the manifest records them. Hints, not a grant: only an explicit
-/// value changes how the agent schedules the tool.
+/// MCP `annotations` as the manifest records them. Hints the server sent, kept so a
+/// re-list matches. The host does not schedule from them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CachedAnnotations {
@@ -105,17 +108,6 @@ pub struct CachedAnnotations {
 }
 
 impl CachedAnnotations {
-    /// `readOnlyHint: true` stays concurrent. An explicit `readOnlyHint: false` or
-    /// `destructiveHint: true` runs the turn one call at a time. A missing hint does
-    /// not: MCP's default `destructiveHint: true` would serialize every server that
-    /// never set annotations.
-    pub fn schedules_exclusively(&self) -> bool {
-        if self.read_only_hint == Some(true) {
-            return false;
-        }
-        self.read_only_hint == Some(false) || self.destructive_hint == Some(true)
-    }
-
     pub fn is_empty(&self) -> bool {
         self.read_only_hint.is_none()
             && self.destructive_hint.is_none()
@@ -757,27 +749,5 @@ mod tests {
         assert!(tool.annotations.is_none());
         assert!(tool.available_in_subagents.is_none());
         assert!(tool.ui.is_none());
-    }
-
-    #[test]
-    fn an_explicit_mutating_hint_is_exclusive_and_read_only_is_not() {
-        let absent = CachedAnnotations::default();
-        assert!(!absent.schedules_exclusively());
-        let destructive = CachedAnnotations {
-            destructive_hint: Some(true),
-            ..CachedAnnotations::default()
-        };
-        assert!(destructive.schedules_exclusively());
-        let read_only = CachedAnnotations {
-            read_only_hint: Some(true),
-            destructive_hint: Some(true),
-            ..CachedAnnotations::default()
-        };
-        assert!(!read_only.schedules_exclusively());
-        let additive = CachedAnnotations {
-            read_only_hint: Some(false),
-            ..CachedAnnotations::default()
-        };
-        assert!(additive.schedules_exclusively());
     }
 }

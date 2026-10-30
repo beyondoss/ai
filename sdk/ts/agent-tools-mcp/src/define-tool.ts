@@ -16,11 +16,9 @@ export type {
 } from "./sandbox-handle.js";
 
 /**
- * MCP tool annotations. Sent on `tools/list` and stamped into `.mcp-tools.json`.
- *
- * The agent schedules from the hints that are actually set: `readOnlyHint: true`
- * stays concurrent, and `readOnlyHint: false` or `destructiveHint: true` runs
- * the turn one call at a time. A missing hint does not change scheduling.
+ * MCP tool annotations. Sent on `tools/list` and stamped into `.mcp-tools.json`
+ * so a re-list sees the same tool. The host records them and does not schedule
+ * from them.
  */
 export type ToolAnnotations = {
   readOnlyHint?: boolean;

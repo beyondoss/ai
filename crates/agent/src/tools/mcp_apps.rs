@@ -1375,7 +1375,7 @@ impl AppTool {
             });
         }
         drop(guard);
-        crate::tools::mcp::tool_output_from_result(self.server.name(), &self.remote, result?)
+        crate::tools::mcp::tool_output_from_result(self.server.name(), &self.remote, result?, false)
     }
 }
 

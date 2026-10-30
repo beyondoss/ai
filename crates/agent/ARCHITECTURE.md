@@ -6241,12 +6241,14 @@ fetch it, `bundle.sha256` what it must hash to). `bundle.rs` does the rest:
   the first tool call creates the sandbox and dials live. `--dir` is only the tool modules.
   `ctx.workspaceRoot` and `getSandbox()` are the process cwd (the seeded bundle) or `--workspace`.
   Optional `CachedTool` fields `output_schema`, `annotations`, and `available_in_subagents` ride
-  along; a missing key means none. `endsTurn: true` is part of the saved description, and a
-  successful call sets `_meta["beyond.dev/endsTurn"]`, which `tool_output_from_result` turns into
-  `ToolOutput.terminate`. `notifications/cancelled` aborts that call. An explicit
-  `readOnlyHint: false` or `destructiveHint: true` makes the tool `conservative_exclusive`;
-  `availableInSubagents: false` (`_meta["beyond.dev/availableInSubagents"]`) drops it from subagent
-  registries. HTTP `tools/call` requires the `Mcp-Session-Id` from `initialize`. Demo:
+  along so a re-list compares the tool the server sent; a missing key means none. They do not
+  rewrite the model-facing description, and annotations do not change scheduling.
+  `endsTurn: true` is part of the saved description. A successful call from this bundle's own
+  connector (`Dial::saved`) may set `_meta["beyond.dev/endsTurn"]`, which ends that run; the same
+  key on any other MCP server does not. `availableInSubagents: false` on that same connector
+  (`_meta["beyond.dev/availableInSubagents"]`) drops the tool from subagent registries.
+  `notifications/cancelled` aborts that call. HTTP `tools/call` requires the `Mcp-Session-Id`
+  from `initialize`. Demo:
   `deploy/demo/demo.sh tools`, `deploy/demo/tools_agent_e2e.sh`, `tests/agent_tools_mcp.rs` /
   `tests/agent_tools_e2b.rs`.
 - **Skill scripts.** When a sandbox does exist, how the bundle's files reach it (so a skill's script

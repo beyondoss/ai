@@ -822,13 +822,15 @@ impl Relist {
 }
 
 /// A `tools/list` entry as the manifest records it — and as a re-listing is compared.
-/// Guest `_meta` on a successful `tools/call`. `@beyond.dev/tools` sets this
+/// Bundle-guest `_meta` on a successful `tools/call`. `@beyond.dev/tools` sets this
 /// when `endsTurn` is true or its function returns true. A failed call does not.
+/// Honored only for a connector whose menu came from the bundle (`Dial::saved`);
+/// any other MCP server's result is just a result.
 const ENDS_TURN_META: &str = "beyond.dev/endsTurn";
 
-/// `tools/list` `_meta` key. `false` hides the tool from subagents; anything else
-/// (including a missing key) leaves it visible. Only `false` is stored, so a manifest
-/// that omits the field matches a live list that omitted the key.
+/// `tools/list` `_meta` key. `false` hides the tool from subagents. Only read for a
+/// bundle-saved connector, and only `false` is stored, so a manifest that omits the
+/// field matches a live list that omitted the key.
 const AVAILABLE_IN_SUBAGENTS_META: &str = "beyond.dev/availableInSubagents";
 
 fn cached_tool(t: &rmcp::model::Tool) -> crate::tools::mcp_manifest::CachedTool {
@@ -874,37 +876,6 @@ fn available_in_subagents_flag(t: &rmcp::model::Tool) -> Option<bool> {
     }
 }
 
-const OUTPUT_SCHEMA_NOTE_LIMIT: usize = 2_000;
-
-/// Append a compact output schema so the model sees the shape `ToolDef` cannot carry.
-pub(crate) fn with_output_note(
-    description: String,
-    output_schema: Option<&serde_json::Value>,
-) -> String {
-    let Some(schema) = output_schema else {
-        return description;
-    };
-    if schema.is_null() {
-        return description;
-    }
-    let Ok(compact) = serde_json::to_string(schema) else {
-        return description;
-    };
-    if compact.is_empty() {
-        return description;
-    }
-    let shown = if compact.len() > OUTPUT_SCHEMA_NOTE_LIMIT {
-        let mut end = OUTPUT_SCHEMA_NOTE_LIMIT;
-        while end > 0 && !compact.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…", &compact[..end])
-    } else {
-        compact
-    };
-    format!("{description}\n\nOutput JSON Schema: {shown}")
-}
-
 /// The model-facing tool for one listed entry, or `None` when it is not the model's (an app-only
 /// tool) or its registered name is already taken.
 fn mcp_tool(
@@ -925,20 +896,22 @@ fn mcp_tool(
     } else {
         t.description
     };
-    let description = with_output_note(description, t.output_schema.as_ref());
+    // Eve's `endsTurn` / `availableInSubagents` ride `_meta` on this package's own
+    // menu. A bundle-saved connector is that menu. Every other server is plain MCP.
+    let bundle_guest = conn.dial.saved.is_some();
     Some(Arc::new(McpTool {
         name,
         description,
         input_schema: t.input_schema,
-        annotations: t.annotations,
-        subagent_visible: t.available_in_subagents != Some(false),
+        bundle_guest,
+        subagent_visible: !(bundle_guest && t.available_in_subagents == Some(false)),
         remote_name: t.remote_name,
         server_name: server.clone(),
         conn: conn.clone(),
     }))
 }
 
-/// Drop tools whose author set `availableInSubagents: false`. Every other tool stays.
+/// Drop tools that opted out of subagents. Every other tool stays.
 pub fn for_subagent(tools: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn Tool>> {
     tools
         .into_iter()
@@ -1198,16 +1171,15 @@ pub fn server_names_from_tools(tools: &[Arc<dyn Tool>]) -> Vec<String> {
 }
 
 /// One MCP-discovered tool. `run` forwards to the remote server's `tools/call`.
-/// Annotations and `availableInSubagents` are the local exceptions: they change scheduling
-/// and whether a subagent inherits the tool, not what the call does.
 struct McpTool {
     /// Registered/advertised name: `mcp__<server>__<tool>` (see [`registered_name`]).
     name: String,
     description: String,
     input_schema: Value,
-    /// MCP annotations the server actually sent. Drives [`Tool::conservative_exclusive`].
-    annotations: Option<crate::tools::mcp_manifest::CachedAnnotations>,
-    /// `false` when the server set `availableInSubagents: false`.
+    /// This tool came from the bundle's saved menu (`Dial::saved`). Only then does
+    /// `beyond.dev/endsTurn` end the run, and `availableInSubagents: false` hide it.
+    bundle_guest: bool,
+    /// `false` when a bundle guest set `availableInSubagents: false`.
     subagent_visible: bool,
     /// The bare tool name as the *server* knows it (unprefixed) — what actually goes out over
     /// `tools/call`.
@@ -1582,12 +1554,6 @@ impl Tool for McpTool {
         self.input_schema.clone()
     }
 
-    fn conservative_exclusive(&self) -> bool {
-        self.annotations
-            .as_ref()
-            .is_some_and(crate::tools::mcp_manifest::CachedAnnotations::schedules_exclusively)
-    }
-
     fn available_in_subagents(&self) -> bool {
         self.subagent_visible
     }
@@ -1642,7 +1608,12 @@ impl McpTool {
         // A call that made its server change its tools (an `enable_toolset`) is answered once the
         // re-listing it set off has landed, so the model's next request already offers them.
         self.conn.dial.relist.settled().await;
-        tool_output_from_result(&self.server_name, &self.remote_name, result?)
+        tool_output_from_result(
+            &self.server_name,
+            &self.remote_name,
+            result?,
+            self.bundle_guest,
+        )
     }
 }
 
@@ -2483,7 +2454,8 @@ impl McpCatalog {
         })?;
         match await_task(&conn, client, host, record, seed, progress).await {
             Ok(result) => {
-                tool_output_from_result(&server, &tool, result).map_err(ResumeError::Final)
+                tool_output_from_result(&server, &tool, result, conn.dial.saved.is_some())
+                    .map_err(ResumeError::Final)
             }
             Err(TaskFailure::ConnectionLost(why)) => Err(ResumeError::Unreachable(why)),
             Err(TaskFailure::Final(e)) => Err(ResumeError::Final(e)),
@@ -2595,6 +2567,7 @@ pub(crate) fn tool_output_from_result(
     server_name: &str,
     remote_name: &str,
     result: CallToolResult,
+    bundle_guest: bool,
 ) -> Result<ToolOutput, ToolError> {
     let mut text = String::new();
     let mut images = Vec::new();
@@ -2631,11 +2604,15 @@ pub(crate) fn tool_output_from_result(
             text
         }));
     }
-    let terminate = result.meta.as_ref().is_some_and(|meta| {
-        meta.get(ENDS_TURN_META)
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-    });
+    // `terminate` ends the run. That is Eve's `endsTurn` for this bundle's own tools,
+    // and nothing else: a GitHub or Playwright result must not stop the agent because
+    // it happened to set a `_meta` key.
+    let terminate = bundle_guest
+        && result.meta.as_ref().is_some_and(|meta| {
+            meta.get(ENDS_TURN_META)
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        });
     Ok(ToolOutput {
         text,
         images,
@@ -4527,7 +4504,9 @@ mod tests {
         use rmcp::model::{AudioContent, EmbeddedResource};
         let run = |block| {
             let result = CallToolResult::success(vec![block]);
-            tool_output_from_result("s", "t", result).unwrap().text
+            tool_output_from_result("s", "t", result, false)
+                .unwrap()
+                .text
         };
 
         let audio = run(ContentBlock::Audio(AudioContent::new(
@@ -4678,30 +4657,35 @@ mod tests {
     }
 
     #[test]
-    fn a_successful_call_ends_the_turn_only_when_the_guest_says_so() {
+    fn a_bundle_guest_ends_the_run_only_when_it_says_so() {
         use rmcp::model::{CallToolResult, ContentBlock, MetaObject};
+        let ended = || {
+            let mut ended = CallToolResult::success(vec![ContentBlock::text("ok")]);
+            let mut meta = MetaObject::new();
+            meta.insert(ENDS_TURN_META.to_string(), serde_json::Value::Bool(true));
+            ended.meta = Some(meta);
+            ended
+        };
         let plain = CallToolResult::success(vec![ContentBlock::text("ok")]);
-        assert!(!tool_output_from_result("s", "t", plain).unwrap().terminate);
-
-        let mut ended = CallToolResult::success(vec![ContentBlock::text("ok")]);
-        let mut meta = MetaObject::new();
-        meta.insert(ENDS_TURN_META.to_string(), serde_json::Value::Bool(true));
-        ended.meta = Some(meta);
-        assert!(tool_output_from_result("s", "t", ended).unwrap().terminate);
+        assert!(
+            !tool_output_from_result("s", "t", plain, true)
+                .unwrap()
+                .terminate
+        );
+        assert!(
+            !tool_output_from_result("s", "t", ended(), false)
+                .unwrap()
+                .terminate,
+            "a normal MCP server does not end the run"
+        );
+        assert!(
+            tool_output_from_result("s", "t", ended(), true)
+                .unwrap()
+                .terminate
+        );
 
         let err = CallToolResult::error(vec![ContentBlock::text("no")]);
-        assert!(tool_output_from_result("s", "t", err).is_err());
-    }
-
-    #[test]
-    fn the_output_schema_note_is_appended_only_when_the_server_sent_one() {
-        assert_eq!(with_output_note("Weather".into(), None), "Weather");
-        let noted = with_output_note(
-            "Weather".into(),
-            Some(&serde_json::json!({"type": "object"})),
-        );
-        assert!(noted.starts_with("Weather\n\nOutput JSON Schema: "));
-        assert!(noted.contains("\"type\":\"object\""));
+        assert!(tool_output_from_result("s", "t", err, true).is_err());
     }
 
     struct SubagentShown;
