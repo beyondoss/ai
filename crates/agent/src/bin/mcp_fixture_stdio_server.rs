@@ -10,6 +10,8 @@
 //! - `echo` / `add` / `ping` / `fail` / `echo_env` / `image` / `slow_progress` — see prior docs.
 //! - `echo_args`: returns the exact `arguments` object it received, as JSON text.
 //! - `hold`: sleeps `ms` milliseconds, then returns `held` (a call that outlasts an idle window).
+//! - `hold_cancellable`: waits (up to 30 s) for `notifications/cancelled` naming this call's request
+//!   id; writes that id to `MCP_FIXTURE_REQUEST_CANCEL_FLAG` and answers with an error.
 //! - `ask_user`: nested `elicitation/create` mid-`tools/call` — classic server→client elicitation.
 //! - `ask_user_mrtr`: returns SEP-2322 `input_required` with an elicitation input request; on retry
 //!   with `inputResponses` completes — proves MRTR under protocol `2026-07-28`.
@@ -197,6 +199,18 @@ async fn main() {
         }
 
         if method == "tools/call"
+            && params.get("name").and_then(Value::as_str) == Some("hold_cancellable")
+        {
+            if write_hold_cancellable(&mut lines, &mut stdout, id)
+                .await
+                .is_err()
+            {
+                break;
+            }
+            continue;
+        }
+
+        if method == "tools/call"
             && list_changes()
             && params.get("name").and_then(Value::as_str) == Some("unlock")
         {
@@ -262,6 +276,35 @@ async fn write_json_line(stdout: &mut Stdout, value: &Value) -> Result<(), std::
     encoded.push(b'\n');
     stdout.write_all(&encoded).await?;
     stdout.flush().await
+}
+
+/// `hold_cancellable`: serve nothing else until the client sends `notifications/cancelled` for this
+/// call's id (recorded in `MCP_FIXTURE_REQUEST_CANCEL_FLAG`), or 30 s pass.
+async fn write_hold_cancellable(
+    lines: &mut Lines<BufReader<Stdin>>,
+    stdout: &mut Stdout,
+    call_id: Value,
+) -> Result<(), std::io::Error> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while let Ok(Ok(Some(line))) = tokio::time::timeout_at(deadline, lines.next_line()).await {
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if msg.get("method").and_then(Value::as_str) == Some("notifications/cancelled")
+            && msg.pointer("/params/requestId") == Some(&call_id)
+        {
+            if let Ok(path) = std::env::var("MCP_FIXTURE_REQUEST_CANCEL_FLAG") {
+                write_atomically(&path, &call_id.to_string());
+            }
+            break;
+        }
+    }
+    let result = json!({
+        "jsonrpc": "2.0",
+        "id": call_id,
+        "error": { "code": -32800, "message": "cancelled" }
+    });
+    write_json_line(stdout, &result).await
 }
 
 async fn write_slow_progress(
@@ -599,6 +642,11 @@ fn tool_defs() -> Value {
             "name": "hold",
             "description": "Waits `ms` milliseconds, then returns `held`.",
             "inputSchema": { "type": "object", "properties": { "ms": { "type": "integer" } } },
+        },
+        {
+            "name": "hold_cancellable",
+            "description": "Waits until the client cancels this call.",
+            "inputSchema": { "type": "object", "properties": {} },
         },
         {
             "name": "slow_progress",
