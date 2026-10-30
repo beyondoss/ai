@@ -1,7 +1,7 @@
 import readline from "node:readline";
 
 import type { LoadedTool } from "./load.js";
-import { handleRpc, type RpcContextBase } from "./rpc.js";
+import { handleRpc, RpcCalls, type RpcContextBase } from "./rpc.js";
 
 /**
  * Line-delimited JSON-RPC on stdin/stdout — what `deploy/demo/mcp-tools.sh` drives
@@ -15,6 +15,7 @@ export async function serveStdio(opts: {
     input: process.stdin,
     crlfDelay: Infinity,
   });
+  const calls = new RpcCalls();
   for await (const line of rl) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -35,12 +36,14 @@ export async function serveStdio(opts: {
     }
     if (Array.isArray(body)) {
       for (const item of body) {
-        const r = await handleRpc(item as never, opts.tools, opts.base);
+        const r = await handleRpc(item as never, opts.tools, opts.base, {
+          calls,
+        });
         if (r) process.stdout.write(`${JSON.stringify(r)}\n`);
       }
       continue;
     }
-    const r = await handleRpc(body as never, opts.tools, opts.base);
+    const r = await handleRpc(body as never, opts.tools, opts.base, { calls });
     if (r) process.stdout.write(`${JSON.stringify(r)}\n`);
   }
 }

@@ -343,7 +343,7 @@ TOOLS=\$VM_HOME/workspace/tools
 test -d \"\$TOOLS\" || { echo \"tools dir missing: \$TOOLS\" >&2; exit 1; }
 curl -sf -m 2 localhost:\$BRIDGE_PORT/healthz >/dev/null || (
   cd \$VM_HOME/workspace
-  setsid nohup \"\$BIN\" serve --dir \"\$TOOLS\" --http 0.0.0.0:\$BRIDGE_PORT \
+  setsid nohup \"\$BIN\" serve --dir \"\$TOOLS\" --workspace \"\$VM_HOME/workspace\" --http 0.0.0.0:\$BRIDGE_PORT \
     >/tmp/tools-mcp.log 2>&1 </dev/null &
 )
 for i in \$(seq 1 150); do

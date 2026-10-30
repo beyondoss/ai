@@ -16,8 +16,13 @@ export { loadTools } from "./load.js";
 export type { LoadedTool } from "./load.js";
 export { toolsToCached, writeManifest } from "./manifest.js";
 export type { CachedTool, ManifestFile } from "./manifest.js";
-export { handleRpc } from "./rpc.js";
-export type { RpcContextBase } from "./rpc.js";
+export {
+  AVAILABLE_IN_SUBAGENTS_META_KEY,
+  ENDS_TURN_META_KEY,
+  handleRpc,
+  RpcCalls,
+} from "./rpc.js";
+export type { RpcContextBase, RpcDispatch } from "./rpc.js";
 export { runTool } from "./run-tool.js";
 export { createLocalSandboxHandle } from "./sandbox-handle.js";
 export type {

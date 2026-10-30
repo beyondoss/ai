@@ -228,7 +228,7 @@ set +e
 export PATH=\"\$HOME/.bun/bin:\$PATH\"
 # Resolve eve/zod from workspace/node_modules (tools/*.ts live under workspace/).
 cd /home/user/workspace
-bun /home/user/tools-mcp/src/cli.ts serve --dir /home/user/workspace/tools --http 127.0.0.1:$BRIDGE_PORT \
+bun /home/user/tools-mcp/src/cli.ts serve --dir /home/user/workspace/tools --workspace /home/user/workspace --http 127.0.0.1:$BRIDGE_PORT \
   >/tmp/tools-mcp.log 2>&1 </dev/null &
 BPID=\$!
 for i in \$(seq 1 100); do

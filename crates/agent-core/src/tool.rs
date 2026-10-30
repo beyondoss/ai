@@ -411,6 +411,14 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Whether a subagent's registry should include this tool.
+    ///
+    /// Eve's `availableInSubagents: false`. The default is true: a tool is part of the child's
+    /// kit unless it opts out. MCP tools read the flag from the server's `_meta`.
+    fn available_in_subagents(&self) -> bool {
+        true
+    }
+
     /// The advertised definition sent to the model. Derived from the accessors; override only if a
     /// tool needs a non-default shape.
     fn definition(&self) -> ToolDef {

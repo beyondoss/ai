@@ -25,7 +25,7 @@ tools themselves — the replica holds the conversation; the sandbox only runs y
 
 |                            | The fact                                                                                                                                                                                                           | The proof                                                                      |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------ |
-| **Eve-shaped author API**  | `defineTool`, Zod / Standard Schema / plain JSON Schema, validate-before-execute, `ctx.getSandbox()`, `callId` / `toolName` / `session` / `abortSignal`. `ctx.to()` throws (Eve channel host API; not this guest). | `npm run parity` — `__tests__/eve-parity.test.ts`, `__tests__/eve-ctx.test.ts` |
+| **Eve-shaped author API**  | `defineTool`, Zod / Standard Schema / plain JSON Schema, validate-before-execute, `ctx.getSandbox()` rooted at the bundle (cwd / `--workspace`), `callId` / `toolName` / `session` / `abortSignal` (a `notifications/cancelled` aborts the call and its child process). `endsTurn: true` is in the cold-open menu and, on success, sets `_meta["beyond.dev/endsTurn"]`. `ctx.to()` throws (Eve channel host API; not this guest). | `npm run parity` — `__tests__/eve-parity.test.ts`, `__tests__/eve-ctx.test.ts` |
 | **Cold open, hot call**    | Session open advertises tools from `.mcp-tools.json` with **no VM**. The first `tools/call` creates the sandbox, seeds the bundle, starts `tools-mcp`, and forwards.                                               | `deploy/demo/demo.sh tools`, ARCHITECTURE “Agent tools as sandbox MCP”         |
 | **One tar, two consumers** | The replica fetches the bundle for the **menu**; the exec front seeds the same bytes into the VM for **execution**.                                                                                                | `tools_agent_e2e.sh`, grant `sandbox: true` + front `tools=` URL               |
 | **Real agent path**        | `mcp::connect_granted` with `sandbox: true` — same client path as browser MCP — returns live `get_weather`.                                                                                                        | `crates/agent/tests/agent_tools_mcp.rs`, `./deploy/demo/tools_agent_e2e.sh`    |
@@ -55,8 +55,8 @@ bun run src/cli.ts call --dir examples/weather/tools get_weather '{"city":"NYC"}
 # Stamp the cold-open menu
 bun run src/cli.ts manifest --dir examples/weather/tools --name tools -o .mcp-tools.json
 
-# Serve MCP on loopback
-bun run src/cli.ts serve --dir examples/weather/tools --http 127.0.0.1:8931
+# Serve MCP on loopback. Sandbox root is the cwd (or --workspace), not --dir.
+bun run src/cli.ts serve --dir examples/weather/tools --workspace . --http 127.0.0.1:8931
 
 # AOT guest binary (JIT fallback if AOT refuses disk imports)
 npm run compile   # → bin/tools-mcp
@@ -100,7 +100,9 @@ cannot remap that bare path). Use the shipped shim:
 3. Publish a **linux** `tools-mcp` binary (`npm run compile` on linux/amd64, or Docker)
 4. Grant a sandbox connector whose URL is the exec front with `tools=<https URL of that binary>`
 5. On first MCP dial the front: creates the VM → seeds the bundle →
-   `cd workspace && tools-mcp serve --dir tools` → bridges MCP
+   `cd workspace && tools-mcp serve --dir tools --workspace "$workspace"` → bridges MCP.
+   `--dir` is the tool modules. `--workspace` (default: the process cwd) is
+   `ctx.workspaceRoot` and the root of `ctx.getSandbox()`.
 
 Demo wiring: `./deploy/demo/demo.sh tools` (`CHECKS_tools`, `uc_prepare_tools`).
 

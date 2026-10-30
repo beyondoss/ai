@@ -6237,9 +6237,18 @@ fetch it, `bundle.sha256` what it must hash to). `bundle.rs` does the rest:
   `@beyond.dev/agent-tools-mcp` (`tools-mcp` binary). The grant names a `sandbox: true` connector whose
   URL is the exec front with `tools=<https URL of the linux binary>`; the front seeds the bundle, starts
   the binary against the seeded `tools/` directory, and bridges MCP. A `.mcp-tools.json` stamped at
-  bundle build (CLI `manifest`) cold-opens the menu without a VM; the first tool call creates the
-  sandbox and dials live. Demo: `deploy/demo/demo.sh tools`, `deploy/demo/tools_agent_e2e.sh`,
-  `tests/agent_tools_mcp.rs` / `tests/agent_tools_e2b.rs`.
+  bundle build (CLI `manifest`, written via temp file and `rename`) cold-opens the menu without a VM;
+  the first tool call creates the sandbox and dials live. `--dir` is only the tool modules.
+  `ctx.workspaceRoot` and `getSandbox()` are the process cwd (the seeded bundle) or `--workspace`.
+  Optional `CachedTool` fields `output_schema`, `annotations`, and `available_in_subagents` ride
+  along; a missing key means none. `endsTurn: true` is part of the saved description, and a
+  successful call sets `_meta["beyond.dev/endsTurn"]`, which `tool_output_from_result` turns into
+  `ToolOutput.terminate`. `notifications/cancelled` aborts that call. An explicit
+  `readOnlyHint: false` or `destructiveHint: true` makes the tool `conservative_exclusive`;
+  `availableInSubagents: false` (`_meta["beyond.dev/availableInSubagents"]`) drops it from subagent
+  registries. HTTP `tools/call` requires the `Mcp-Session-Id` from `initialize`. Demo:
+  `deploy/demo/demo.sh tools`, `deploy/demo/tools_agent_e2e.sh`, `tests/agent_tools_mcp.rs` /
+  `tests/agent_tools_e2b.rs`.
 - **Skill scripts.** When a sandbox does exist, how the bundle's files reach it (so a skill's script
   can run there) is the control plane's job; the replica never copies the bundle into a sandbox. The
   demo's `mint-grant --bundle url=sha256` carries the claim.

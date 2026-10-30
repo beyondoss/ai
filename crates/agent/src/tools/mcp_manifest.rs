@@ -71,10 +71,57 @@ pub struct CachedTool {
     pub remote_name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    /// MCP `outputSchema`, when the server advertised one. The model-facing description
+    /// repeats a compact form of it ([`crate::tools::mcp::with_output_note`]); this field is
+    /// what a re-list compares, so the menu and the live server stay the same bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
+    /// MCP tool annotations. Absent when the server sent none. Scheduling uses only the
+    /// hints that are set — see [`CachedAnnotations::schedules_exclusively`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<CachedAnnotations>,
+    /// `Some(false)` hides the tool from subagents. `None` means they inherit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_in_subagents: Option<bool>,
     /// The tool's MCP Apps `_meta.ui` (view resource, visibility). Recorded only in the apps
     /// manifest ([`ManifestDir::for_apps`]); absent from every plain one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<crate::tools::mcp_apps::ToolUi>,
+}
+
+/// MCP `annotations` as the manifest records them. Hints, not a grant: only an explicit
+/// value changes how the agent schedules the tool.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedAnnotations {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destructive_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotent_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_world_hint: Option<bool>,
+}
+
+impl CachedAnnotations {
+    /// `readOnlyHint: true` stays concurrent. An explicit `readOnlyHint: false` or
+    /// `destructiveHint: true` runs the turn one call at a time. A missing hint does
+    /// not: MCP's default `destructiveHint: true` would serialize every server that
+    /// never set annotations.
+    pub fn schedules_exclusively(&self) -> bool {
+        if self.read_only_hint == Some(true) {
+            return false;
+        }
+        self.read_only_hint == Some(false) || self.destructive_hint == Some(true)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.read_only_hint.is_none()
+            && self.destructive_hint.is_none()
+            && self.idempotent_hint.is_none()
+            && self.open_world_hint.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -449,6 +496,9 @@ mod tests {
             remote_name: name.into(),
             description: String::new(),
             input_schema: serde_json::json!({ "type": "object" }),
+            output_schema: None,
+            annotations: None,
+            available_in_subagents: None,
             ui: None,
         };
         let prompt = CachedPrompt {
@@ -695,5 +745,39 @@ mod tests {
             },
         };
         assert_ne!(invocation_key(&s), invocation_key(&h));
+    }
+
+    #[test]
+    fn a_saved_tool_without_the_optional_fields_still_parses() {
+        let tool: CachedTool = serde_json::from_str(
+            r#"{"remote_name":"get_weather","description":"d","input_schema":{"type":"object"}}"#,
+        )
+        .unwrap();
+        assert!(tool.output_schema.is_none());
+        assert!(tool.annotations.is_none());
+        assert!(tool.available_in_subagents.is_none());
+        assert!(tool.ui.is_none());
+    }
+
+    #[test]
+    fn an_explicit_mutating_hint_is_exclusive_and_read_only_is_not() {
+        let absent = CachedAnnotations::default();
+        assert!(!absent.schedules_exclusively());
+        let destructive = CachedAnnotations {
+            destructive_hint: Some(true),
+            ..CachedAnnotations::default()
+        };
+        assert!(destructive.schedules_exclusively());
+        let read_only = CachedAnnotations {
+            read_only_hint: Some(true),
+            destructive_hint: Some(true),
+            ..CachedAnnotations::default()
+        };
+        assert!(!read_only.schedules_exclusively());
+        let additive = CachedAnnotations {
+            read_only_hint: Some(false),
+            ..CachedAnnotations::default()
+        };
+        assert!(additive.schedules_exclusively());
     }
 }

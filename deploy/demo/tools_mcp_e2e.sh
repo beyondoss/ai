@@ -184,7 +184,7 @@ START_OUT=$(vm_bash "
 set -e
 export PATH=\"\$HOME/.bun/bin:\$PATH\"
 cd /home/user/workspace
-setsid nohup bun /home/user/tools-mcp/src/cli.ts serve --dir /home/user/workspace/tools --http 0.0.0.0:$BRIDGE_PORT \
+setsid nohup bun /home/user/tools-mcp/src/cli.ts serve --dir /home/user/workspace/tools --workspace /home/user/workspace --http 0.0.0.0:$BRIDGE_PORT \
   >/tmp/tools-mcp.log 2>&1 </dev/null &
 for i in \$(seq 1 200); do
   curl -sf -m 2 localhost:$BRIDGE_PORT/healthz && echo READY && exit 0

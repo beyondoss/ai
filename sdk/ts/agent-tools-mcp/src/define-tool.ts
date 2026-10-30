@@ -15,7 +15,13 @@ export type {
   SandboxRunResult,
 } from "./sandbox-handle.js";
 
-/** MCP tool annotations the cell already understands. */
+/**
+ * MCP tool annotations. Sent on `tools/list` and stamped into `.mcp-tools.json`.
+ *
+ * The agent schedules from the hints that are actually set: `readOnlyHint: true`
+ * stays concurrent, and `readOnlyHint: false` or `destructiveHint: true` runs
+ * the turn one call at a time. A missing hint does not change scheduling.
+ */
 export type ToolAnnotations = {
   readOnlyHint?: boolean;
   destructiveHint?: boolean;
@@ -43,6 +49,10 @@ export type ToolDefinition<
   outputSchema?: ToolInputSchema;
   execute: (input: InferToolInput<S>, ctx: ToolContext) => ToolExecuteResult<O>;
   annotations?: ToolAnnotations;
+  /**
+   * When `false`, subagents do not inherit this tool. Omitted means they do.
+   * Stamped on the manifest and on `tools/list` `_meta`.
+   */
   availableInSubagents?: boolean;
   deferred?: boolean;
   endsTurn?: boolean | ((output: O) => boolean | Promise<boolean>);
@@ -55,6 +65,8 @@ export type DefinedTool<
   O = unknown,
 > = ToolDefinition<S, O> & {
   readonly jsonInputSchema: JsonSchema;
+  /** Present when `outputSchema` converted. Advertised as MCP `outputSchema`. */
+  readonly jsonOutputSchema?: JsonSchema;
 };
 
 export function defineTool<S extends ToolInputSchema, O = unknown>(
@@ -76,9 +88,13 @@ export function defineTool<S extends ToolInputSchema, O = unknown>(
   }
 
   const jsonInputSchema = inputSchemaToJsonSchema(def.inputSchema);
+  const jsonOutputSchema = def.outputSchema != null
+    ? inputSchemaToJsonSchema(def.outputSchema)
+    : undefined;
   return Object.freeze({
     ...def,
     jsonInputSchema,
+    ...(jsonOutputSchema !== undefined ? { jsonOutputSchema } : {}),
   });
 }
 

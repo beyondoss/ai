@@ -14,12 +14,13 @@ import type { RpcContextBase } from "./rpc.js";
 import { handleRpc } from "./rpc.js";
 import { serveHttp } from "./serve-http.js";
 import { serveStdio } from "./serve-stdio.js";
+import { resolveWorkspace } from "./workspace.js";
 
 function usage(): never {
   console.error(`Usage:
-  beyond-agent-tools-mcp serve --dir <toolsDir> [--http [host:]port]
+  beyond-agent-tools-mcp serve --dir <toolsDir> [--workspace <root>] [--http [host:]port]
   beyond-agent-tools-mcp manifest --dir <toolsDir> --name <connector> [-o .mcp-tools.json]
-  beyond-agent-tools-mcp call --dir <toolsDir> <name> '<json-args>'`);
+  beyond-agent-tools-mcp call --dir <toolsDir> [--workspace <root>] <name> '<json-args>'`);
   process.exit(2);
 }
 
@@ -76,6 +77,7 @@ async function main(): Promise<void> {
 
   if (cmd === "serve") {
     const dir = takeFlag(argv, "--dir");
+    const workspace = takeFlag(argv, "--workspace");
     if (!dir) usage();
     const httpRaw = takeHttpFlag(argv);
     if (argv.length) usage();
@@ -84,17 +86,18 @@ async function main(): Promise<void> {
       console.error(`no tools in ${path.resolve(dir)}`);
       process.exit(1);
     }
+    const root = resolveWorkspace(workspace);
     if (httpRaw !== undefined) {
       const bind = parseHttpBind(httpRaw === true ? undefined : httpRaw);
       await serveHttp({
         tools,
-        base: rpcBase(path.resolve(dir)),
+        base: rpcBase(root),
         host: bind.host,
         port: bind.port,
       });
       await new Promise(() => {});
     } else {
-      await serveStdio({ tools, base: rpcBase(path.resolve(dir)) });
+      await serveStdio({ tools, base: rpcBase(root) });
     }
     return;
   }
@@ -117,6 +120,7 @@ async function main(): Promise<void> {
 
   if (cmd === "call") {
     const dir = takeFlag(argv, "--dir");
+    const workspace = takeFlag(argv, "--workspace");
     const name = argv.shift();
     const argsJson = argv.shift() ?? "{}";
     if (!dir || !name || argv.length) usage();
@@ -136,7 +140,7 @@ async function main(): Promise<void> {
         params: { name, arguments: args },
       },
       tools,
-      rpcBase(path.resolve(dir)),
+      rpcBase(resolveWorkspace(workspace)),
     );
     process.stdout.write(`${JSON.stringify(r, null, 2)}\n`);
     if (

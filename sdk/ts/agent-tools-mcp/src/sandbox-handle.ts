@@ -108,18 +108,12 @@ export function createLocalSandboxHandle(
           : ["ignore", "pipe", "pipe"],
       });
 
-      async function* lines(
-        stream: NodeJS.ReadableStream | null,
-      ): AsyncIterable<string> {
-        if (!stream) return;
-        for await (const chunk of stream) {
-          yield String(chunk);
-        }
-      }
-
+      // Attach the readers now. Flowing mode drains the pipes even when the
+      // caller only waits on exitCode, and the iterator yields lines (no
+      // trailing newline), not raw chunks.
       const proc: SandboxProcess = {
-        stdout: lines(child.stdout),
-        stderr: lines(child.stderr),
+        stdout: readLines(child.stdout),
+        stderr: readLines(child.stderr),
         exitCode: new Promise((resolve, reject) => {
           child.on("error", reject);
           child.on("close", (code) => resolve(code ?? 1));
@@ -133,5 +127,59 @@ export function createLocalSandboxHandle(
     },
     async stop() {},
     async delete() {},
+  };
+}
+
+/** Split a child pipe into lines. The `'data'` listener is attached immediately so an unread stream cannot fill the pipe and stall `exitCode`. */
+function readLines(
+  stream: NodeJS.ReadableStream | null,
+): AsyncIterable<string> {
+  const lines: string[] = [];
+  let pending = "";
+  let done = !stream;
+  let notify: (() => void) | null = null;
+  const wake = () => {
+    notify?.();
+    notify = null;
+  };
+  const push = (line: string) => {
+    lines.push(line.endsWith("\r") ? line.slice(0, -1) : line);
+    wake();
+  };
+  if (stream) {
+    stream.on("data", (chunk: Buffer | string) => {
+      pending += String(chunk);
+      for (;;) {
+        const nl = pending.indexOf("\n");
+        if (nl < 0) break;
+        push(pending.slice(0, nl));
+        pending = pending.slice(nl + 1);
+      }
+    });
+    const finish = () => {
+      if (pending.length) push(pending);
+      pending = "";
+      done = true;
+      wake();
+    };
+    stream.on("end", finish);
+    stream.on("error", finish);
+  }
+
+  return {
+    [Symbol.asyncIterator]() {
+      return {
+        async next(): Promise<IteratorResult<string>> {
+          for (;;) {
+            const line = lines.shift();
+            if (line !== undefined) return { value: line, done: false };
+            if (done) return { value: undefined, done: true };
+            await new Promise<void>((resolve) => {
+              notify = resolve;
+            });
+          }
+        },
+      };
+    },
   };
 }

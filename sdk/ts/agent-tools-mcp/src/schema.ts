@@ -86,7 +86,9 @@ export function inputSchemaToJsonSchema(schema: ToolInputSchema): JsonSchema {
   }
 
   if (isPlainJsonSchema(schema)) {
-    return stripDollarSchema({ ...schema });
+    const json = stripDollarSchema({ ...schema });
+    assertEvaluableJsonSchema(json);
+    return json;
   }
 
   // Zod 4 module helper (peer).
@@ -149,6 +151,7 @@ export async function validateToolInput<S extends ToolInputSchema>(
   }
 
   if (isPlainJsonSchema(schema)) {
+    assertEvaluableJsonSchema(schema);
     // Eve: fill omitted properties from `default`, then validate.
     const withDefaults = applyJsonSchemaDefaults(schema, raw);
     const checked = validatePlainJsonSchema(schema, withDefaults, []);
@@ -163,32 +166,118 @@ export async function validateToolInput<S extends ToolInputSchema>(
   );
 }
 
+/** Deep-copy a JSON value so a tool cannot mutate the schema's `default`. */
+function cloneJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(cloneJson);
+  if (isRecord(value)) {
+    const out: Record<string, unknown> = {};
+    for (const [key, inner] of Object.entries(value)) out[key] = cloneJson(inner);
+    return out;
+  }
+  return value;
+}
+
 /** Eve: fill omitted properties from their JSON Schema `default` values (recursive). */
 export function applyJsonSchemaDefaults(
   schema: JsonSchema,
   raw: unknown,
 ): unknown {
-  if (!isRecord(schema.properties)) {
+  if (!isRecord(schema.properties) || !isRecord(raw)) {
     return raw;
   }
-  const base = raw !== null && typeof raw === "object" && !Array.isArray(raw)
-    ? { ...(raw as Record<string, unknown>) }
-    : {};
+  const base: Record<string, unknown> = { ...raw };
 
   for (const [key, propSchema] of Object.entries(schema.properties)) {
     if (!isRecord(propSchema)) continue;
     if (!(key in base) && "default" in propSchema) {
-      base[key] = propSchema.default;
-    } else if (key in base && isRecord(propSchema.properties)) {
+      const filled = cloneJson(propSchema.default);
+      base[key] = isRecord(propSchema.properties) && isRecord(filled)
+        ? applyJsonSchemaDefaults(propSchema, filled)
+        : filled;
+    } else if (
+      key in base
+      && isRecord(propSchema.properties)
+      && isRecord(base[key])
+    ) {
       base[key] = applyJsonSchemaDefaults(propSchema, base[key]);
     }
   }
   return base;
 }
 
+const UNEVALUABLE_KEYWORDS = [
+  "$ref",
+  "anyOf",
+  "oneOf",
+  "allOf",
+  "not",
+  "if",
+  "then",
+  "else",
+  "patternProperties",
+  "unevaluatedProperties",
+  "unevaluatedItems",
+  "prefixItems",
+  "contains",
+  "dependentSchemas",
+  "dependentRequired",
+  "propertyNames",
+] as const;
+
 /**
- * Pragmatic JSON Schema 2020-12 / draft-07 subset (type, properties, required, additionalProperties).
- * Unknown keywords are ignored (Eve: when unevaluable, pass through — we still try the common path).
+ * Refuse a plain JSON Schema this server would otherwise accept and then not check.
+ * Zod / Standard Schema inputs never come through here.
+ */
+export function assertEvaluableJsonSchema(
+  schema: JsonSchema,
+  path = "",
+): void {
+  const at = path ? ` at ${path}` : "";
+  for (const key of UNEVALUABLE_KEYWORDS) {
+    if (key in schema) {
+      throw new Error(
+        `JSON Schema keyword "${key}" cannot be checked${at}; use Zod or a schema this server can evaluate`,
+      );
+    }
+  }
+  if (isRecord(schema.additionalProperties)) {
+    throw new Error(
+      `JSON Schema additionalProperties as a schema cannot be checked${at}`,
+    );
+  }
+  if (schema.multipleOf === 0) {
+    throw new Error(`JSON Schema multipleOf must not be 0${at}`);
+  }
+  if (typeof schema.pattern === "string") {
+    try {
+      new RegExp(schema.pattern);
+    } catch {
+      throw new Error(`JSON Schema pattern is not a valid regex${at}`);
+    }
+  }
+  for (const key of ["exclusiveMinimum", "exclusiveMaximum"] as const) {
+    const bound = schema[key];
+    if (bound !== undefined && typeof bound !== "number") {
+      throw new Error(`JSON Schema ${key} must be a number${at}`);
+    }
+  }
+  if (isRecord(schema.properties)) {
+    for (const [key, prop] of Object.entries(schema.properties)) {
+      if (isRecord(prop)) {
+        assertEvaluableJsonSchema(prop, path ? `${path}.${key}` : key);
+      }
+    }
+  }
+  if (isRecord(schema.items)) {
+    assertEvaluableJsonSchema(schema.items, `${path}[]`);
+  }
+}
+
+/**
+ * JSON Schema subset this server actually checks: type, properties, required,
+ * additionalProperties: false, items, enum, const, and numeric / string / array bounds.
+ * `format` stays an annotation (Eve). Keywords we cannot check are rejected by
+ * {@link assertEvaluableJsonSchema} before a tool is advertised.
  */
 function validatePlainJsonSchema(
   schema: JsonSchema,
@@ -197,11 +286,62 @@ function validatePlainJsonSchema(
 ): string | undefined {
   const loc = path.length ? path.join(".") : "(root)";
 
+  if ("const" in schema && !jsonEqual(value, schema.const)) {
+    return `${loc}: expected ${JSON.stringify(schema.const)}`;
+  }
+  if (
+    Array.isArray(schema.enum)
+    && !schema.enum.some((candidate) => jsonEqual(candidate, value))
+  ) {
+    return `${loc}: expected one of ${
+      schema.enum.map((candidate) => JSON.stringify(candidate)).join(", ")
+    }`;
+  }
+
   if (schema.type !== undefined) {
     const types = Array.isArray(schema.type) ? schema.type : [schema.type];
     const ok = types.some((t) => matchesJsonType(t, value));
     if (!ok) {
       return `${loc}: expected ${types.join("|")}, got ${describeType(value)}`;
+    }
+  }
+
+  if (typeof value === "string") {
+    if (typeof schema.minLength === "number" && value.length < schema.minLength) {
+      return `${loc}: shorter than minLength ${schema.minLength}`;
+    }
+    if (typeof schema.maxLength === "number" && value.length > schema.maxLength) {
+      return `${loc}: longer than maxLength ${schema.maxLength}`;
+    }
+    if (typeof schema.pattern === "string" && !new RegExp(schema.pattern).test(value)) {
+      return `${loc}: does not match pattern`;
+    }
+  }
+
+  if (typeof value === "number") {
+    if (typeof schema.minimum === "number" && value < schema.minimum) {
+      return `${loc}: less than minimum ${schema.minimum}`;
+    }
+    if (typeof schema.maximum === "number" && value > schema.maximum) {
+      return `${loc}: greater than maximum ${schema.maximum}`;
+    }
+    if (
+      typeof schema.exclusiveMinimum === "number"
+      && value <= schema.exclusiveMinimum
+    ) {
+      return `${loc}: not greater than exclusiveMinimum ${schema.exclusiveMinimum}`;
+    }
+    if (
+      typeof schema.exclusiveMaximum === "number"
+      && value >= schema.exclusiveMaximum
+    ) {
+      return `${loc}: not less than exclusiveMaximum ${schema.exclusiveMaximum}`;
+    }
+    if (typeof schema.multipleOf === "number" && schema.multipleOf !== 0) {
+      const quotient = value / schema.multipleOf;
+      if (Math.abs(quotient - Math.round(quotient)) > 1e-9) {
+        return `${loc}: not a multiple of ${schema.multipleOf}`;
+      }
     }
   }
 
@@ -233,12 +373,36 @@ function validatePlainJsonSchema(
         if (!(key in props)) return `${loc}: unexpected property "${key}"`;
       }
     }
+
+    if (
+      typeof schema.minProperties === "number"
+      && Object.keys(obj).length < schema.minProperties
+    ) {
+      return `${loc}: fewer than minProperties ${schema.minProperties}`;
+    }
+    if (
+      typeof schema.maxProperties === "number"
+      && Object.keys(obj).length > schema.maxProperties
+    ) {
+      return `${loc}: more than maxProperties ${schema.maxProperties}`;
+    }
   }
 
-  if (Array.isArray(value) && isRecord(schema.items)) {
-    for (let i = 0; i < value.length; i++) {
-      const err = validatePlainJsonSchema(schema.items, value[i], [...path, i]);
-      if (err) return err;
+  if (Array.isArray(value)) {
+    if (typeof schema.minItems === "number" && value.length < schema.minItems) {
+      return `${loc}: fewer than minItems ${schema.minItems}`;
+    }
+    if (typeof schema.maxItems === "number" && value.length > schema.maxItems) {
+      return `${loc}: more than maxItems ${schema.maxItems}`;
+    }
+    if (isRecord(schema.items)) {
+      for (let i = 0; i < value.length; i++) {
+        const err = validatePlainJsonSchema(schema.items, value[i], [
+          ...path,
+          i,
+        ]);
+        if (err) return err;
+      }
     }
   }
 
@@ -265,6 +429,24 @@ function matchesJsonType(type: unknown, value: unknown): boolean {
     default:
       return true; // unknown type name → Eve: do not reject
   }
+}
+
+function jsonEqual(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) {
+    return false;
+  }
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
+      return false;
+    }
+    return a.every((item, i) => jsonEqual(item, b[i]));
+  }
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  const keys = Object.keys(left);
+  if (keys.length !== Object.keys(right).length) return false;
+  return keys.every((key) => jsonEqual(left[key], right[key]));
 }
 
 function describeType(value: unknown): string {

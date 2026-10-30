@@ -822,16 +822,87 @@ impl Relist {
 }
 
 /// A `tools/list` entry as the manifest records it — and as a re-listing is compared.
+/// Guest `_meta` on a successful `tools/call`. `@beyond.dev/agent-tools-mcp` sets this
+/// when `endsTurn` is true or its function returns true. A failed call does not.
+const ENDS_TURN_META: &str = "beyond.dev/endsTurn";
+
+/// `tools/list` `_meta` key. `false` hides the tool from subagents; anything else
+/// (including a missing key) leaves it visible. Only `false` is stored, so a manifest
+/// that omits the field matches a live list that omitted the key.
+const AVAILABLE_IN_SUBAGENTS_META: &str = "beyond.dev/availableInSubagents";
+
 fn cached_tool(t: &rmcp::model::Tool) -> crate::tools::mcp_manifest::CachedTool {
     crate::tools::mcp_manifest::CachedTool {
         remote_name: t.name.to_string(),
         description: t.description.as_deref().unwrap_or_default().to_string(),
         input_schema: t.schema_as_json_value(),
+        output_schema: t
+            .output_schema
+            .as_ref()
+            .map(|schema| serde_json::Value::Object(schema.as_ref().clone())),
+        annotations: cached_annotations(t),
+        available_in_subagents: available_in_subagents_flag(t),
         // Both flavors: a server may send `_meta.ui` whether or not it was negotiated (the official
         // SDK's `registerAppTool` always does), and an app-only tool must stay hidden from the model
         // either way.
         ui: crate::tools::mcp_apps::ToolUi::from_meta(t.meta.as_deref()),
     }
+}
+
+fn cached_annotations(
+    t: &rmcp::model::Tool,
+) -> Option<crate::tools::mcp_manifest::CachedAnnotations> {
+    let annotations = t.annotations.as_ref()?;
+    let cached = crate::tools::mcp_manifest::CachedAnnotations {
+        read_only_hint: annotations.read_only_hint,
+        destructive_hint: annotations.destructive_hint,
+        idempotent_hint: annotations.idempotent_hint,
+        open_world_hint: annotations.open_world_hint,
+    };
+    (!cached.is_empty()).then_some(cached)
+}
+
+fn available_in_subagents_flag(t: &rmcp::model::Tool) -> Option<bool> {
+    match t
+        .meta
+        .as_deref()
+        .and_then(|meta| meta.get(AVAILABLE_IN_SUBAGENTS_META))
+        .and_then(serde_json::Value::as_bool)
+    {
+        Some(false) => Some(false),
+        _ => None,
+    }
+}
+
+const OUTPUT_SCHEMA_NOTE_LIMIT: usize = 2_000;
+
+/// Append a compact output schema so the model sees the shape `ToolDef` cannot carry.
+pub(crate) fn with_output_note(
+    description: String,
+    output_schema: Option<&serde_json::Value>,
+) -> String {
+    let Some(schema) = output_schema else {
+        return description;
+    };
+    if schema.is_null() {
+        return description;
+    }
+    let Ok(compact) = serde_json::to_string(schema) else {
+        return description;
+    };
+    if compact.is_empty() {
+        return description;
+    }
+    let shown = if compact.len() > OUTPUT_SCHEMA_NOTE_LIMIT {
+        let mut end = OUTPUT_SCHEMA_NOTE_LIMIT;
+        while end > 0 && !compact.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &compact[..end])
+    } else {
+        compact
+    };
+    format!("{description}\n\nOutput JSON Schema: {shown}")
 }
 
 /// The model-facing tool for one listed entry, or `None` when it is not the model's (an app-only
@@ -854,14 +925,25 @@ fn mcp_tool(
     } else {
         t.description
     };
+    let description = with_output_note(description, t.output_schema.as_ref());
     Some(Arc::new(McpTool {
         name,
         description,
         input_schema: t.input_schema,
+        annotations: t.annotations,
+        subagent_visible: t.available_in_subagents != Some(false),
         remote_name: t.remote_name,
         server_name: server.clone(),
         conn: conn.clone(),
     }))
+}
+
+/// Drop tools whose author set `availableInSubagents: false`. Every other tool stays.
+pub fn for_subagent(tools: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn Tool>> {
+    tools
+        .into_iter()
+        .filter(|tool| tool.available_in_subagents())
+        .collect()
 }
 
 /// Session-scoped gate over which configured MCP servers' tools are advertised to the model.
@@ -1115,13 +1197,18 @@ pub fn server_names_from_tools(tools: &[Arc<dyn Tool>]) -> Vec<String> {
     names
 }
 
-/// One MCP-discovered tool. Holds no local behavior at all — `run` forwards straight to the remote
-/// server's `tools/call`; every byte of actual behavior lives on the other end of `client`.
+/// One MCP-discovered tool. `run` forwards to the remote server's `tools/call`.
+/// Annotations and `availableInSubagents` are the local exceptions: they change scheduling
+/// and whether a subagent inherits the tool, not what the call does.
 struct McpTool {
     /// Registered/advertised name: `mcp__<server>__<tool>` (see [`registered_name`]).
     name: String,
     description: String,
     input_schema: Value,
+    /// MCP annotations the server actually sent. Drives [`Tool::conservative_exclusive`].
+    annotations: Option<crate::tools::mcp_manifest::CachedAnnotations>,
+    /// `false` when the server set `availableInSubagents: false`.
+    subagent_visible: bool,
     /// The bare tool name as the *server* knows it (unprefixed) — what actually goes out over
     /// `tools/call`.
     remote_name: String,
@@ -1493,6 +1580,16 @@ impl Tool for McpTool {
 
     fn input_schema(&self) -> Value {
         self.input_schema.clone()
+    }
+
+    fn conservative_exclusive(&self) -> bool {
+        self.annotations
+            .as_ref()
+            .is_some_and(crate::tools::mcp_manifest::CachedAnnotations::schedules_exclusively)
+    }
+
+    fn available_in_subagents(&self) -> bool {
+        self.subagent_visible
     }
 
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
@@ -2534,10 +2631,15 @@ pub(crate) fn tool_output_from_result(
             text
         }));
     }
+    let terminate = result.meta.as_ref().is_some_and(|meta| {
+        meta.get(ENDS_TURN_META)
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    });
     Ok(ToolOutput {
         text,
         images,
-        terminate: false,
+        terminate,
     })
 }
 
@@ -4573,5 +4675,86 @@ mod tests {
         assert!(!gate.allows("a"));
         gate.set(None);
         assert!(gate.allows("a"));
+    }
+
+    #[test]
+    fn a_successful_call_ends_the_turn_only_when_the_guest_says_so() {
+        use rmcp::model::{CallToolResult, ContentBlock, MetaObject};
+        let plain = CallToolResult::success(vec![ContentBlock::text("ok")]);
+        assert!(!tool_output_from_result("s", "t", plain).unwrap().terminate);
+
+        let mut ended = CallToolResult::success(vec![ContentBlock::text("ok")]);
+        let mut meta = MetaObject::new();
+        meta.insert(ENDS_TURN_META.to_string(), serde_json::Value::Bool(true));
+        ended.meta = Some(meta);
+        assert!(tool_output_from_result("s", "t", ended).unwrap().terminate);
+
+        let err = CallToolResult::error(vec![ContentBlock::text("no")]);
+        assert!(tool_output_from_result("s", "t", err).is_err());
+    }
+
+    #[test]
+    fn the_output_schema_note_is_appended_only_when_the_server_sent_one() {
+        assert_eq!(with_output_note("Weather".into(), None), "Weather");
+        let noted = with_output_note(
+            "Weather".into(),
+            Some(&serde_json::json!({"type": "object"})),
+        );
+        assert!(noted.starts_with("Weather\n\nOutput JSON Schema: "));
+        assert!(noted.contains("\"type\":\"object\""));
+    }
+
+    struct SubagentShown;
+    struct SubagentHidden;
+
+    #[async_trait::async_trait]
+    impl agent_core::Tool for SubagentShown {
+        fn name(&self) -> &str {
+            "shown"
+        }
+        fn description(&self) -> &str {
+            ""
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn run(
+            &self,
+            _: serde_json::Value,
+        ) -> Result<agent_core::ToolOutput, agent_core::ToolError> {
+            Ok(agent_core::ToolOutput::text(""))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl agent_core::Tool for SubagentHidden {
+        fn name(&self) -> &str {
+            "hidden"
+        }
+        fn description(&self) -> &str {
+            ""
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn run(
+            &self,
+            _: serde_json::Value,
+        ) -> Result<agent_core::ToolOutput, agent_core::ToolError> {
+            Ok(agent_core::ToolOutput::text(""))
+        }
+        fn available_in_subagents(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn for_subagent_drops_tools_that_opt_out() {
+        let kept = for_subagent(vec![
+            std::sync::Arc::new(SubagentShown),
+            std::sync::Arc::new(SubagentHidden),
+        ]);
+        let names: Vec<_> = kept.iter().map(|tool| tool.name().to_string()).collect();
+        assert_eq!(names, ["shown"]);
     }
 }
