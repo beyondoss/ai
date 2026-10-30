@@ -319,6 +319,42 @@ vm_browser_start() { # id token rustwright-binary-or-url
 $(browser_bridge_script)
 curl -sf -m 2 localhost:$BRIDGE_PORT/healthz" | grep -q ok
 }
+
+# Start @beyond.dev/agent-tools-mcp (AOT linux binary) after the bundle is seeded.
+# $3 is an https URL of the binary (presigned), or a local path already on the VM.
+vm_tools_start() { # id token tools-mcp-binary-or-url
+  local id=$1 tok=$2 src=$3
+  vm_run "$id" "$tok" "
+set -e
+BRIDGE_PORT=${BRIDGE_PORT:-8931}
+VM_HOME=\${VM_HOME:-/home/user}
+BIN=\$VM_HOME/tools-mcp
+if [ ! -x \"\$BIN\" ]; then
+  if [[ \"$src\" == http* ]]; then
+    curl -fsS -m 120 -o \"\$BIN\" '$src'
+  else
+    cp '$src' \"\$BIN\"
+  fi
+  chmod 755 \"\$BIN\"
+fi
+# tools/ lives in the seeded workspace (bundle root).
+TOOLS=\$VM_HOME/workspace/tools
+test -d \"\$TOOLS\" || { echo \"tools dir missing: \$TOOLS\" >&2; exit 1; }
+curl -sf -m 2 localhost:\$BRIDGE_PORT/healthz >/dev/null || (
+  setsid nohup \"\$BIN\" serve --dir \"\$TOOLS\" --http 0.0.0.0:\$BRIDGE_PORT \
+    >/tmp/tools-mcp.log 2>&1 </dev/null &
+)
+for i in \$(seq 1 150); do
+  curl -sf -m 2 localhost:\$BRIDGE_PORT/healthz >/dev/null && exit 0
+  sleep 0.1
+done
+echo \"tools-mcp failed to listen; log:\" >&2
+tail -n 40 /tmp/tools-mcp.log >&2 || true
+exit 1
+" | grep -q . || return 1
+  vm_run "$id" "$tok" "curl -sf -m 2 localhost:${BRIDGE_PORT:-8931}/healthz" | grep -q ok
+}
+
 vm_bridge_url() { echo "https://$BRIDGE_PORT-$(vm_field "$1" id).e2b.app/mcp"; }
 
 # Pause a VM (E2B keeps its memory and processes) and resume it; each prints how long the call took.

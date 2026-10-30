@@ -1,6 +1,6 @@
 {
   "private": true,
-  "workspaces": ["sandbox"],
+  "workspaces": ["sandbox", "agent-tools-mcp"],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",

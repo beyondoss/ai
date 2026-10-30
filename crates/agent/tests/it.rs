@@ -18,6 +18,8 @@ mod common;
 mod mcp_tasks_env;
 
 mod agent_frontmatter_run;
+mod agent_tools_e2b;
+mod agent_tools_mcp;
 mod auth_cli;
 mod bash_background_remote;
 mod bash_background_run;
