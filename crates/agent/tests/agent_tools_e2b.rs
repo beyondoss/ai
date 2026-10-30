@@ -30,7 +30,9 @@ use common::{
 use serde_json::{Value, json};
 
 fn mcp_url() -> Option<String> {
-    std::env::var("TOOLS_MCP_URL").ok().filter(|s| !s.is_empty())
+    std::env::var("TOOLS_MCP_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 fn tools_manifest() -> String {
@@ -94,14 +96,15 @@ async fn connect_granted_sandbox_calls_get_weather() {
         .find(|t| t.name() == "mcp__tools__get_weather")
         .cloned()
         .unwrap_or_else(|| {
-            let names: Vec<_> = live.snapshot().iter().map(|t| t.name().to_string()).collect();
+            let names: Vec<_> = live
+                .snapshot()
+                .iter()
+                .map(|t| t.name().to_string())
+                .collect();
             panic!("get_weather not advertised; have {names:?}");
         });
 
-    let out = tool
-        .run(json!({ "city": "SF" }))
-        .await
-        .expect("tools/call");
+    let out = tool.run(json!({ "city": "SF" })).await.expect("tools/call");
     assert!(
         out.text.contains("SF") && (out.text.contains("sunny") || out.text.contains("72")),
         "unexpected tool result: {out:?}"

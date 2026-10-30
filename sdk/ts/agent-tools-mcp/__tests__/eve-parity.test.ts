@@ -17,10 +17,7 @@ import { defineTool } from "../src/define-tool.js";
 import { loadTools } from "../src/load.js";
 import { handleRpc } from "../src/rpc.js";
 import { runTool } from "../src/run-tool.js";
-import {
-  inputSchemaToJsonSchema,
-  validateToolInput,
-} from "../src/schema.js";
+import { inputSchemaToJsonSchema, validateToolInput } from "../src/schema.js";
 
 const rpcBase = { workspaceRoot: "/tmp" };
 const ctx = () =>
@@ -47,9 +44,12 @@ describe("Eve parity: defineTool authoring (docs/tools)", () => {
     const dir = await mkdtemp(path.join(tmpdir(), "eve-parity-"));
     await writeFile(
       path.join(dir, "get_weather.ts"),
-      `import { defineTool } from ${JSON.stringify(
-        pathToFileURL(path.join(import.meta.dirname, "../src/eve-tools.ts")).href,
-      )};
+      `import { defineTool } from ${
+        JSON.stringify(
+          pathToFileURL(path.join(import.meta.dirname, "../src/eve-tools.ts"))
+            .href,
+        )
+      };
 
 import { z } from "zod";
 export default defineTool({
@@ -71,7 +71,7 @@ export default defineTool({
         // @ts-expect-error parity: Eve requires inputSchema
         inputSchema: undefined,
         execute: () => ({}),
-      }),
+      })
     ).toThrow(/inputSchema/);
   });
 
@@ -107,7 +107,7 @@ export default defineTool({
         properties: { city: { type: "string" } },
         required: ["city"],
       },
-      execute: ({ city }: { city: string }) => ({ city }),
+      execute: (input) => ({ city: String(input.city) }),
     });
     expect(tool.jsonInputSchema.$schema).toBeUndefined();
     expect(inputSchemaToJsonSchema(tool.inputSchema).$schema).toBeUndefined();
@@ -137,8 +137,9 @@ export default defineTool({
       [{ name: "get_weather", def: tool, sourcePath: "x" }],
       rpcBase,
     );
-    const schema = (list?.result as { tools: { inputSchema: Record<string, unknown> }[] })
-      .tools[0]?.inputSchema;
+    const schema =
+      (list?.result as { tools: { inputSchema: Record<string, unknown> }[] })
+        .tools[0]?.inputSchema;
     expect(schema?.type).toBe("object");
     expect(schema?.$schema).toBeUndefined();
   });
@@ -248,7 +249,9 @@ describe("Eve parity: defaults, deferred, endsTurn, outputSchema", () => {
       outputSchema: z.object({ city: z.string(), temperatureF: z.number() }),
       execute: ({ city }) => ({ city }), // missing temperatureF
     });
-    await expect(runTool(tool, { city: "X" }, ctx())).rejects.toThrow(/outputSchema/);
+    await expect(runTool(tool, { city: "X" }, ctx())).rejects.toThrow(
+      /outputSchema/,
+    );
   });
 });
 

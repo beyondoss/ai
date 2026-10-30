@@ -26,7 +26,7 @@ export type SandboxSpawnOptions = SandboxRunOptions & {
 export type SandboxProcess = {
   stdout: AsyncIterable<string>;
   stderr: AsyncIterable<string>;
-  stdin?: import("node:stream").Writable;
+  stdin?: import("node:stream").Writable | undefined;
   exitCode: Promise<number>;
   kill: (signal?: NodeJS.Signals) => void;
 };
@@ -103,7 +103,9 @@ export function createLocalSandboxHandle(
           AI_AGENT: env?.AI_AGENT ?? process.env.AI_AGENT ?? "beyond",
         },
         signal: sig,
-        stdio: wantStdin ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
+        stdio: wantStdin
+          ? ["pipe", "pipe", "pipe"]
+          : ["ignore", "pipe", "pipe"],
       });
 
       async function* lines(
@@ -115,10 +117,9 @@ export function createLocalSandboxHandle(
         }
       }
 
-      return {
+      const proc: SandboxProcess = {
         stdout: lines(child.stdout),
         stderr: lines(child.stderr),
-        stdin: wantStdin ? (child.stdin ?? undefined) : undefined,
         exitCode: new Promise((resolve, reject) => {
           child.on("error", reject);
           child.on("close", (code) => resolve(code ?? 1));
@@ -127,6 +128,8 @@ export function createLocalSandboxHandle(
           child.kill(s);
         },
       };
+      if (wantStdin && child.stdin) proc.stdin = child.stdin;
+      return proc;
     },
     async stop() {},
     async delete() {},

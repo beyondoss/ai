@@ -4,11 +4,12 @@
 //! (same path as production sandbox connectors), and runs `get_weather`.
 //!
 //! Needs `bun` on PATH and the workspace package at `sdk/ts/agent-tools-mcp`.
-//! Skip with `BEYOND_AI_SKIP_AGENT_TOOLS_MCP=1`.
+//! Skips when bun is missing or `BEYOND_AI_SKIP_AGENT_TOOLS_MCP=1`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -20,10 +21,10 @@ use serde_json::json;
 
 fn skip() -> bool {
     std::env::var_os("BEYOND_AI_SKIP_AGENT_TOOLS_MCP").is_some()
+        || Command::new("bun").arg("--version").output().is_err()
 }
 
 fn package_root() -> PathBuf {
-    // crates/agent/tests → repo root
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("sdk/ts/agent-tools-mcp")
@@ -47,10 +48,13 @@ fn spawn_tools_mcp(tools_dir: &Path) -> ToolsMcp {
     let pkg = package_root();
     let cli = pkg.join("src/cli.ts");
     assert!(cli.is_file(), "missing {}", cli.display());
-    assert!(
-        Command::new("bun").arg("--version").output().is_ok(),
-        "bun must be on PATH to run agent_tools_mcp tests"
-    );
+
+    // Ephemeral port via bind-then-drop (ports_lint allows this pattern; not a bare ":0" CLI arg).
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        listener.local_addr().expect("local_addr").port()
+    };
+    let bind = format!("127.0.0.1:{port}");
 
     let mut child = Command::new("bun")
         .arg("run")
@@ -60,7 +64,7 @@ fn spawn_tools_mcp(tools_dir: &Path) -> ToolsMcp {
             "--dir",
             tools_dir.to_str().unwrap(),
             "--http",
-            "127.0.0.1:0",
+            &bind,
         ])
         .current_dir(&pkg)
         .stdin(Stdio::null())
@@ -73,16 +77,18 @@ fn spawn_tools_mcp(tools_dir: &Path) -> ToolsMcp {
     let mut lines = BufReader::new(stderr).lines();
     let ready = std::thread::spawn(move || {
         for line in lines.by_ref().flatten() {
-            if let Some(port) = line.strip_prefix("READY ") {
-                return port.trim().to_string();
+            if let Some(rest) = line.strip_prefix("READY ") {
+                return rest.trim().to_string();
+            }
+            if line.contains("READY") {
+                return port.to_string();
             }
         }
         panic!("tools-mcp never printed READY on stderr");
     });
-    let port = ready
+    let _ready_port = ready
         .join()
         .unwrap_or_else(|_| panic!("READY waiter failed"));
-    // Give the listener a beat after READY.
     std::thread::sleep(Duration::from_millis(50));
     ToolsMcp {
         child,
@@ -93,6 +99,7 @@ fn spawn_tools_mcp(tools_dir: &Path) -> ToolsMcp {
 #[tokio::test(flavor = "multi_thread")]
 async fn connect_granted_sandbox_calls_get_weather() {
     if skip() {
+        eprintln!("skip: bun not on PATH (or BEYOND_AI_SKIP_AGENT_TOOLS_MCP=1)");
         return;
     }
     let tools = package_root().join("examples/weather/tools");
@@ -127,14 +134,15 @@ async fn connect_granted_sandbox_calls_get_weather() {
         .find(|t| t.name() == "mcp__tools__get_weather")
         .cloned()
         .unwrap_or_else(|| {
-            let names: Vec<_> = live.snapshot().iter().map(|t| t.name().to_string()).collect();
+            let names: Vec<_> = live
+                .snapshot()
+                .iter()
+                .map(|t| t.name().to_string())
+                .collect();
             panic!("get_weather not advertised; have {names:?}");
         });
 
-    let out = tool
-        .run(json!({ "city": "SF" }))
-        .await
-        .expect("tools/call");
+    let out = tool.run(json!({ "city": "SF" })).await.expect("tools/call");
     assert!(
         out.text.contains("SF") && (out.text.contains("sunny") || out.text.contains("72")),
         "unexpected tool result: {out:?}"

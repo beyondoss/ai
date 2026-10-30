@@ -43,7 +43,10 @@ export async function serveHttp(
       const url = new URL(req.url);
       const path = url.pathname.replace(/\/+$/, "") || "/";
 
-      if (req.method === "GET" && (path === "/healthz" || path.endsWith("/healthz"))) {
+      if (
+        req.method === "GET"
+        && (path === "/healthz" || path.endsWith("/healthz"))
+      ) {
         return new Response("ok");
       }
 
@@ -77,11 +80,10 @@ export async function serveHttp(
       }
 
       const incomingSession = req.headers.get("mcp-session-id");
-      const isInit =
-        !Array.isArray(body) &&
-        body !== null &&
-        typeof body === "object" &&
-        (body as JsonRpc).method === "initialize";
+      const isInit = !Array.isArray(body)
+        && body !== null
+        && typeof body === "object"
+        && (body as JsonRpc).method === "initialize";
 
       let session = incomingSession;
       if (isInit && !session) {
@@ -121,7 +123,6 @@ export async function serveHttp(
       return new Response(JSON.stringify(r), { status: 200, headers });
     },
   });
-
 
   if (opts.readyLine ?? true) {
     console.error(`READY ${server.port}`);

@@ -18,7 +18,10 @@ type JsonRpcResponse = {
 };
 
 /** Session-wide bits; per-call `toolName` / `callId` are filled in on tools/call. */
-export type RpcContextBase = Omit<CreateToolContextInput, "toolName" | "callId">;
+export type RpcContextBase = Omit<
+  CreateToolContextInput,
+  "toolName" | "callId"
+>;
 
 /**
  * Minimal MCP surface: initialize, tools/list, tools/call.
@@ -32,7 +35,10 @@ export async function handleRpc(
   const id = body.id ?? null;
   const method = body.method;
 
-  if (method === "notifications/initialized" || method === "notifications/cancelled") {
+  if (
+    method === "notifications/initialized"
+    || method === "notifications/cancelled"
+  ) {
     return null;
   }
 
@@ -56,7 +62,10 @@ export async function handleRpc(
       result: {
         tools: listed.map((t) => ({
           name: t.name,
-          description: modelFacingDescription(t.def.description, t.def.endsTurn),
+          description: modelFacingDescription(
+            t.def.description,
+            t.def.endsTurn,
+          ),
           inputSchema: t.def.jsonInputSchema,
           ...(t.def.annotations ? { annotations: t.def.annotations } : {}),
         })),
@@ -85,12 +94,15 @@ export async function handleRpc(
     const ctx = createToolContext({
       ...base,
       toolName: tool.name,
-      callId: id === null || id === undefined ? crypto.randomUUID() : String(id),
+      callId: id === null || id === undefined
+        ? crypto.randomUUID()
+        : String(id),
     });
     try {
       const result = await runTool(tool.def, args, ctx);
-      const text =
-        typeof result === "string" ? result : JSON.stringify(result ?? null);
+      const text = typeof result === "string"
+        ? result
+        : JSON.stringify(result ?? null);
       return {
         jsonrpc: "2.0",
         id,
@@ -101,8 +113,9 @@ export async function handleRpc(
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      const data =
-        err instanceof ToolInputValidationError ? { issues: err.issues } : undefined;
+      const data = err instanceof ToolInputValidationError
+        ? { issues: err.issues }
+        : undefined;
       return {
         jsonrpc: "2.0",
         id,
@@ -131,7 +144,10 @@ const ENDS_TURN_SENTENCE =
 
 function modelFacingDescription(
   description: string,
-  endsTurn: boolean | ((output: never) => boolean | Promise<boolean>) | undefined,
+  endsTurn:
+    | boolean
+    | ((output: never) => boolean | Promise<boolean>)
+    | undefined,
 ): string {
   if (endsTurn === true) {
     return `${description}\n\n${ENDS_TURN_SENTENCE}`;

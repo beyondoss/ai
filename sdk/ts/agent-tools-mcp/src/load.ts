@@ -2,12 +2,18 @@ import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { defineTool, type DefinedTool } from "./define-tool.js";
-import { inputSchemaToJsonSchema, isPlainJsonSchema, isStandardSchema } from "./schema.js";
+import { type DefinedTool, defineTool } from "./define-tool.js";
+import type { RunnableTool } from "./run-tool.js";
+import {
+  inputSchemaToJsonSchema,
+  isPlainJsonSchema,
+  isStandardSchema,
+} from "./schema.js";
 
 export type LoadedTool = {
   name: string;
-  def: DefinedTool;
+  /** Concrete Zod tools erase here at the load boundary. */
+  def: RunnableTool;
   sourcePath: string;
 };
 
@@ -21,10 +27,10 @@ function looksLikeToolDef(value: unknown): value is {
   if (value === null || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
   return (
-    typeof v.description === "string" &&
-    v.inputSchema !== null &&
-    v.inputSchema !== undefined &&
-    typeof v.execute === "function"
+    typeof v.description === "string"
+    && v.inputSchema !== null
+    && v.inputSchema !== undefined
+    && typeof v.execute === "function"
   );
 }
 
@@ -38,7 +44,10 @@ function asDefinedTool(value: unknown, sourcePath: string): DefinedTool {
       `${sourcePath}: default export must be defineTool({ description, inputSchema, execute })`,
     );
   }
-  if (!isStandardSchema(value.inputSchema) && !isPlainJsonSchema(value.inputSchema)) {
+  if (
+    !isStandardSchema(value.inputSchema)
+    && !isPlainJsonSchema(value.inputSchema)
+  ) {
     throw new Error(
       `${sourcePath}: inputSchema must be Zod/Standard Schema or a plain JSON Schema object`,
     );

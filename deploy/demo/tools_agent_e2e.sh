@@ -161,22 +161,44 @@ bun --version
 mkdir -p /home/user/tools-mcp/src /home/user/workspace/tools /home/user/bin
 ' >/dev/null || fail "install bun"
 
-for f in cli.ts define-tool.ts load.ts manifest.ts rpc.ts run-tool.ts schema.ts serve-http.ts serve-stdio.ts eve-tools.ts index.ts bun-shim.d.ts; do
+for f in cli.ts context.ts define-tool.ts load.ts manifest.ts rpc.ts run-tool.ts sandbox-handle.ts schema.ts serve-http.ts serve-stdio.ts eve-tools.ts index.ts bun-shim.d.ts; do
   vm_put "/home/user/tools-mcp/src/$f" "$PKG/src/$f"
 done
-vm_put /home/user/tools-mcp/package.json "$PKG/package.json"
+# Guest package.json: runtime deps only (host package.json pulls vitest/tsdown via bun install).
+jq -n '{
+  name: "@beyond.dev/agent-tools-mcp",
+  version: "0.1.0-dev",
+  type: "module",
+  dependencies: {
+    "@standard-schema/spec": "^1.0.0",
+    "zod": "4.1.5"
+  }
+}' >"$STAGE/tools-mcp.package.json"
+vm_put /home/user/tools-mcp/package.json "$STAGE/tools-mcp.package.json"
 vm_put /home/user/workspace/tools/get_weather.ts "$STAGE/tools/get_weather.ts"
-vm_put /home/user/workspace/package.json "$STAGE/package.json"
+# Guest must not see host file: deps from agents/tools/package.json.
+printf '%s\n' '{"type":"module","dependencies":{"zod":"4.1.5"}}' >"$STAGE/guest-package.json"
+vm_put /home/user/workspace/package.json "$STAGE/guest-package.json"
 vm_put /home/user/workspace/AGENTS.md "$STAGE/AGENTS.md"
 vm_put /home/user/workspace/.mcp.json "$STAGE/.mcp.json"
+# Eve shim files (Bun rejects absolute paths in package "exports").
+printf '%s\n' 'export { createToolContext, defineTool } from "/home/user/tools-mcp/src/eve-tools.ts";' \
+  >"$STAGE/eve-tools.ts"
+printf '%s\n' '{"name":"eve","type":"module","exports":{"./tools":"./tools.ts"}}' \
+  >"$STAGE/eve-package.json"
 vm_bash '
 set -e
 export PATH="$HOME/.bun/bin:$PATH"
+which bun
 cd /home/user/tools-mcp && bun install --silent
+cd /home/user/workspace && bun install --silent
 mkdir -p /home/user/workspace/node_modules/eve
-printf "%s\n" "{\"name\":\"eve\",\"type\":\"module\",\"exports\":{\"./tools\":\"/home/user/tools-mcp/src/eve-tools.ts\"}}" > /home/user/workspace/node_modules/eve/package.json
-cd /home/user/workspace && bun add zod@^4.1.5 --silent
-' >/dev/null || fail "bun install workspace"
+test -d /home/user/workspace/node_modules/zod
+echo INSTALL_OK
+' || fail "bun install workspace"
+vm_put /home/user/workspace/node_modules/eve/tools.ts "$STAGE/eve-tools.ts"
+vm_put /home/user/workspace/node_modules/eve/package.json "$STAGE/eve-package.json"
+pass "workspace deps"
 
 # Provider key as a file — never on argv.
 # shellcheck disable=SC2086
@@ -204,8 +226,9 @@ say "start tools-mcp"
 vm_bash "
 set +e
 export PATH=\"\$HOME/.bun/bin:\$PATH\"
-cd /home/user/tools-mcp
-bun run src/cli.ts serve --dir /home/user/workspace/tools --http 127.0.0.1:$BRIDGE_PORT \
+# Resolve eve/zod from workspace/node_modules (tools/*.ts live under workspace/).
+cd /home/user/workspace
+bun /home/user/tools-mcp/src/cli.ts serve --dir /home/user/workspace/tools --http 127.0.0.1:$BRIDGE_PORT \
   >/tmp/tools-mcp.log 2>&1 </dev/null &
 BPID=\$!
 for i in \$(seq 1 100); do
@@ -214,7 +237,7 @@ for i in \$(seq 1 100); do
     echo READY >/tmp/tools-mcp.ready
     exit 0
   fi
-  kill -0 \$BPID 2>/dev/null || { echo bun_died; break; }
+  kill -0 \$BPID 2>/dev/null || { echo bun_died; cat /tmp/tools-mcp.log; break; }
   sleep 0.1
 done
 exit 1

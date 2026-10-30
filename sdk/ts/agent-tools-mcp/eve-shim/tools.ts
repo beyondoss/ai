@@ -1,8 +1,8 @@
 /** Package export target for `eve/tools` (exports must stay inside this package). */
 export {
   createToolContext,
-  defineTool,
   type DefinedTool,
+  defineTool,
   type InferToolInput,
   type JsonSchema,
   type SandboxHandle,
@@ -12,4 +12,4 @@ export {
   type ToolExecuteResult,
   type ToolInputSchema,
   ToolInputValidationError,
-} from "../src/eve-tools.ts";
+} from "@beyond.dev/agent-tools-mcp/eve-tools";

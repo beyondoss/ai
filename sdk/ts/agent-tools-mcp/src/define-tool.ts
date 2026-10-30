@@ -1,22 +1,18 @@
 import type { ToolContext } from "./context.js";
-import type {
-  InferToolInput,
-  JsonSchema,
-  ToolInputSchema,
-} from "./schema.js";
+import type { InferToolInput, JsonSchema, ToolInputSchema } from "./schema.js";
 import { inputSchemaToJsonSchema } from "./schema.js";
 
 export type { ToolContext } from "./context.js";
 export type {
+  CreateToolContextInput,
   ToolChannel,
   ToolSession,
-  CreateToolContextInput,
 } from "./context.js";
 export { createToolContext } from "./context.js";
 export type {
   SandboxHandle,
-  SandboxRunResult,
   SandboxProcess,
+  SandboxRunResult,
 } from "./sandbox-handle.js";
 
 /** MCP tool annotations the cell already understands. */

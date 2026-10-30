@@ -11,7 +11,8 @@ import { z } from "zod";
 import { createToolContext } from "../src/context.ts";
 import { defineTool } from "../src/eve-tools.ts";
 
-const dir = process.env.DEMO_DIR ?? (await mkdtemp(path.join(tmpdir(), "get-sandbox-")));
+const dir = process.env.DEMO_DIR
+  ?? (await mkdtemp(path.join(tmpdir(), "get-sandbox-")));
 
 console.log("workspace:", dir);
 
@@ -49,5 +50,8 @@ const ctx = createToolContext({
 
 const out = await tool.execute({ script: "print(40 + 2)\n" }, ctx);
 console.log("tool returned:", out);
-console.log("file on disk:", JSON.stringify(readFileSync(path.join(dir, "analysis.py"), "utf8")));
+console.log(
+  "file on disk:",
+  JSON.stringify(readFileSync(path.join(dir, "analysis.py"), "utf8")),
+);
 console.log("OK — getSandbox = write/run/read in the tool workspace");

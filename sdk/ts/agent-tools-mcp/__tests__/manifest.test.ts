@@ -74,7 +74,8 @@ describe("agent-tools-mcp", () => {
     expect(await validateToolInput(tool.inputSchema, { city: "SF" })).toEqual({
       city: "SF",
     });
-    await expect(validateToolInput(tool.inputSchema, { city: "" })).rejects.toThrow();
+    await expect(validateToolInput(tool.inputSchema, { city: "" })).rejects
+      .toThrow();
     await expect(validateToolInput(tool.inputSchema, {})).rejects.toThrow();
 
     expect(

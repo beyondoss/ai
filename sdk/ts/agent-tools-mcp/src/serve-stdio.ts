@@ -11,7 +11,10 @@ export async function serveStdio(opts: {
   tools: LoadedTool[];
   base: RpcContextBase;
 }): Promise<void> {
-  const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  const rl = readline.createInterface({
+    input: process.stdin,
+    crlfDelay: Infinity,
+  });
   for await (const line of rl) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -20,11 +23,13 @@ export async function serveStdio(opts: {
       body = JSON.parse(trimmed);
     } catch {
       process.stdout.write(
-        `${JSON.stringify({
-          jsonrpc: "2.0",
-          id: null,
-          error: { code: -32700, message: "Parse error" },
-        })}\n`,
+        `${
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: null,
+            error: { code: -32700, message: "Parse error" },
+          })
+        }\n`,
       );
       continue;
     }

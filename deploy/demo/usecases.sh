@@ -9,6 +9,8 @@
 #                                        a browser, all from the folder
 #     ./deploy/demo/demo.sh browser      a browser in a sandbox that does not exist until the model uses
 #                                        it, then sleeps: no held connection, state that survives a pause
+#     ./deploy/demo/demo.sh tools        Eve-shaped tools/*.ts as sandbox MCP (agent-tools-mcp): menu from
+#                                        .mcp-tools.json at open; first tool call makes the VM and starts tools-mcp
 #
 # Each needs `SANDBOX=both ./deploy/demo/up.sh`. This file only defines: the check lists and titles, each
 # use case's preparation, its grants and its checks. demo.sh sources it and supplies the runner
@@ -20,6 +22,7 @@ UC_AGENTS=$HERE/agents
 CHECKS_assistant=(persona-applied remote-mcp-real managed-mcp-no-key memory-across-sessions limits-enforced skill-from-bundle no-sandbox-at-all)
 CHECKS_coding=(vm-created-on-first-tool skill-used fix-verified subagent-from-folder app-as-background-job browser-sees-localhost)
 CHECKS_browser=(vm-created-on-first-tool browser-reads-page no-held-connection idle-cost state-survives-pause state-survives-idle-reap)
+CHECKS_tools=(vm-created-on-first-tool weather-from-tools-mcp)
 CHECK_TITLE+=(
   [persona-applied]="AGENTS.md sets the model and the tools"
   [remote-mcp-real]="A public remote MCP server (DeepWiki), from .mcp.json"
@@ -29,6 +32,7 @@ CHECK_TITLE+=(
   [skill-from-bundle]="The model reads a skill from the bundle, with no sandbox"
   [no-sandbox-at-all]="The agent has no sandbox: its grant names none, and none saw a request"
   [vm-created-on-first-tool]="The sandbox VM is created by the first sandbox tool call"
+  [weather-from-tools-mcp]="get_weather via tools-mcp in the sandbox returns temperatureF"
   [skill-used]="The model reads the folder's skill and runs its script"
   [fix-verified]="The failing test passes, checked in the sandbox"
   [subagent-from-folder]="The reviewer subagent from .agents/agents is called"
@@ -45,11 +49,13 @@ declare -A UC_TITLE=(
   [assistant]="assistant: an agent with no sandbox and no keys"
   [coding]="coding: an agent that fixes, runs and reviews code in its own sandbox"
   [browser]="browser: a real browser in a sandbox that sleeps"
+  [tools]="tools: Eve-shaped tools/*.ts as sandbox MCP"
 )
 declare -A UC_SUMMARY=(
   [assistant]="A folder with an AGENTS.md, a .mcp.json and a skill, deployed as a bundle. The agent has no sandbox at all: its grant names no exec endpoint. It has memory, a read-only view of its own folder (the skill), a public MCP server and one managed connector (a stand-in endpoint on AWS that holds the real key); the grant caps its models."
   [coding]="A folder with a failing Python app, a skill with a script, a reviewer subagent and an AGENTS.md, deployed as a bundle. The agent's own E2B microVM does not exist until the first sandbox tool call makes it (and seeds it from the bundle); then it fixes the bug, reviews it, runs the app as a background job and looks at the page with a browser in the same VM."
   [browser]="A folder with an AGENTS.md, a .mcp.json and a page, deployed as a bundle together with the browser server's tool list (saved by running the server once at bundle build). The browser (rustwright-mcp behind a supergateway bridge) runs inside an E2B microVM that does not exist until the model first calls a browser tool, and is then paused and resumed; the grant names it as a connector that holds no standing stream."
+  [tools]="A folder with AGENTS.md and tools/get_weather.ts (defineTool + Zod), packed with .mcp-tools.json and node_modules so eve/tools resolves. The grant names a sandbox:true tools connector on the exec front (tools= binary URL). Session open advertises get_weather with no VM; the first call creates the VM, seeds the bundle, starts tools-mcp, and returns temperatureF:72."
 )
 
 # ---- helpers shared by the use cases -----------------------------------------------------------------
@@ -135,6 +141,16 @@ _grant_browser() { # session [tamper]
     --mcp "browser=$(_front_mcp_url)" --mcp-sandbox browser --limits-models gpt-5-mini ${2:+--tamper}
 }
 
+# Eve-shaped tools MCP: front mcp URL carries tools=<linux tools-mcp binary> instead of browser=.
+_front_tools_mcp_url() {
+  echo "http://sandbox.$DNS:$FRONT_PORT/mcp/$SESS_T?bundle=$(jq -rn --arg u "$BUNDLE_URL" '$u|@uri')&tools=$(jq -rn --arg u "$TOOLS_MCP_URL" '$u|@uri')"
+}
+_grant_tools() { # session [tamper]
+  "$DEMO" mint-grant --tenant "$UC_TENANT" --session "$1" --shard demo --workspace "$VM_HOME/workspace" \
+    --exec-url "$(_front_url "$SESS_T")" --bundle "$BUNDLE_URL=$BUNDLE_SHA" \
+    --mcp "tools=$(_front_tools_mcp_url)" --mcp-sandbox tools --limits-models gpt-5-mini ${2:+--tamper}
+}
+
 # ---- preparation -------------------------------------------------------------------------------------------
 
 uc_prepare() { # called by demo.sh once, before the checks
@@ -148,6 +164,7 @@ uc_prepare() { # called by demo.sh once, before the checks
     assistant) uc_prepare_assistant ;;
     coding) uc_prepare_coding ;;
     browser) uc_prepare_browser ;;
+    tools) uc_prepare_tools ;;
     oidc) uc_prepare_oidc ;;
   esac
 }
@@ -235,7 +252,7 @@ uc_session_open_json() {
   sleep 6   # the stubs' lines reach CloudWatch a few seconds late
   reqs=$(cw sandbox/ "$((START_MS - 120000))" '"exec_request"' | jq -c '[.[]|(.m|fromjson? // empty)|select(.event=="exec_request")|.ts_ms]')
   fronts='[]'
-  [ "$MODE" != coding ] && [ "$MODE" != browser ] || fronts=$(cw front/ "$((START_MS - 120000))" '"exec_request"' | jq -c '[.[]|(.m|fromjson? // empty)|select(.event=="exec_request" or .event=="mcp_request")|.ts_ms]')
+  [ "$MODE" != coding ] && [ "$MODE" != browser ] && [ "$MODE" != tools ] || fronts=$(cw front/ "$((START_MS - 120000))" '"exec_request"' | jq -c '[.[]|(.m|fromjson? // empty)|select(.event=="exec_request" or .event=="mcp_request")|.ts_ms]')
   jq -sc --argjson r "$reqs" --argjson f "$fronts" --arg mode "$MODE" --argjson vm "${VM_AT_OPEN:-null}" '
     map(. as $s | $s + {exec_requests: ([$r[] | select(. >= ($s.started_ms - 500) and . <= ($s.ready_ms + 1500))] | length),
         front_forwarded: ([$f[] | select(. >= ($s.started_ms - 500) and . <= ($s.ready_ms + 1500))] | length)})
@@ -293,6 +310,79 @@ uc_prepare_browser() {
   VM_AT_OPEN=$(vm_count_for "$SESS_B") || VM_AT_OPEN=null
   uc_open "$SESS_B"
   VM_AT_OPEN_AFTER=$(vm_count_for "$SESS_B") || VM_AT_OPEN_AFTER=null
+  echo "  E2B sandboxes for this session before the open: $VM_AT_OPEN, after it: $VM_AT_OPEN_AFTER"
+  VM_AT_OPEN=${VM_AT_OPEN_AFTER}
+}
+
+# linux-amd64 tools-mcp for the E2B guest (compile on host when already linux/amd64; else Docker).
+_tools_mcp_linux_bin() { # out-path
+  local out=$1 pkg root
+  root=$(cd "$HERE/../.." && pwd)
+  pkg=$root/sdk/ts/agent-tools-mcp
+  (cd "$pkg" && npm install --silent)
+  if [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ]; then
+    OUT="$out" bash "$pkg/scripts/compile.sh" || return 1
+    return 0
+  fi
+  command -v docker >/dev/null || { echo "demo: docker required to compile linux tools-mcp on $(uname -s)/$(uname -m)" >&2; return 1; }
+  mkdir -p "$(dirname "$out")"
+  local out_dir name
+  out_dir=$(cd "$(dirname "$out")" && pwd)
+  name=$(basename "$out")
+  docker run --rm --platform linux/amd64 \
+    -v "$pkg:/app" -v "$out_dir:/out" \
+    oven/bun:1.2 \
+    bash -lc "cd /app && OUT=/out/${name}-linux bash scripts/compile.sh" \
+    || return 1
+  mv "$out_dir/${name}-linux" "$out"
+}
+
+# Copy real node_modules into the stage (tar must not carry host abs symlinks into the guest).
+_uc_stage_tools_deps() {
+  local pkg root zod_dir spec_dir
+  root=$(cd "$HERE/../.." && pwd)
+  pkg=$root/sdk/ts/agent-tools-mcp
+  (cd "$pkg" && npm install --silent)
+  zod_dir=$(cd "$pkg" && node -e "console.log(require('path').dirname(require.resolve('zod')))")
+  spec_dir=$(cd "$pkg" && node -e "let p=require.resolve('@standard-schema/spec');const fs=require('fs');const path=require('path');for(;;){if(fs.existsSync(path.join(p,'package.json'))){console.log(p);break}const n=path.dirname(p);if(n===p)process.exit(1);p=n}")
+  mkdir -p "$STAGE/node_modules/@beyond.dev" "$STAGE/node_modules/@standard-schema"
+  rm -rf "$STAGE/node_modules/@beyond.dev/agent-tools-mcp" "$STAGE/node_modules/eve" \
+    "$STAGE/node_modules/zod" "$STAGE/node_modules/@standard-schema/spec"
+  mkdir -p "$STAGE/node_modules/@beyond.dev/agent-tools-mcp"
+  cp -a "$pkg/package.json" "$pkg/src" "$STAGE/node_modules/@beyond.dev/agent-tools-mcp/"
+  cp -a "$pkg/eve-shim" "$STAGE/node_modules/eve"
+  cp -a "$zod_dir" "$STAGE/node_modules/zod"
+  cp -a "$spec_dir" "$STAGE/node_modules/@standard-schema/spec"
+  # Drop broken file: deps in the staged agent package.json; resolution is via node_modules.
+  jq 'del(.dependencies)' "$STAGE/package.json" > "$STAGE/package.json.tmp" && mv "$STAGE/package.json.tmp" "$STAGE/package.json"
+}
+
+uc_prepare_tools() {
+  [ "$USE_E2B" = 1 ] && [ "$USECASES" = 1 ] || uc_need "E2B and the exec front"
+  SESS_T=demo.u${SID}t
+  FRONT_PORT=8084
+  local pkg root bin sha bucket
+  root=$(cd "$HERE/../.." && pwd)
+  pkg=$root/sdk/ts/agent-tools-mcp
+  uc_stage
+  _uc_stage_tools_deps
+  command -v bun >/dev/null || { echo "demo: bun required to stamp .mcp-tools.json" >&2; exit 1; }
+  bun "$pkg/src/cli.ts" manifest --dir "$STAGE/tools" --name tools -o "$STAGE/.mcp-tools.json" \
+    || { echo "demo: tools manifest failed" >&2; exit 1; }
+  echo "  saved tool list  $(jq '.tools|length' "$STAGE/.mcp-tools.json") tools tools, from defineTool modules"
+  bin=$WORK/tools-mcp
+  _tools_mcp_linux_bin "$bin" || { echo "demo: tools-mcp compile failed" >&2; exit 1; }
+  [ -x "$bin" ] || { echo "demo: tools-mcp binary missing at $bin" >&2; exit 1; }
+  uc_bundle || { echo "demo: could not publish the bundle" >&2; exit 1; }
+  sha=$(sha256sum "$bin" | cut -d' ' -f1)
+  bucket=$(bundle_bucket)
+  command aws --region "$REGION" s3 cp "$bin" "s3://$bucket/tools-mcp-$sha" --only-show-errors \
+    || { echo "demo: could not publish tools-mcp" >&2; exit 1; }
+  TOOLS_MCP_URL=$(command aws --region "$REGION" s3 presign "s3://$bucket/tools-mcp-$sha" --expires-in 21600) || exit 1
+  GRANT_FN=_grant_tools
+  VM_AT_OPEN=$(vm_count_for "$SESS_T") || VM_AT_OPEN=null
+  uc_open "$SESS_T"
+  VM_AT_OPEN_AFTER=$(vm_count_for "$SESS_T") || VM_AT_OPEN_AFTER=null
   echo "  E2B sandboxes for this session before the open: $VM_AT_OPEN, after it: $VM_AT_OPEN_AFTER"
   VM_AT_OPEN=${VM_AT_OPEN_AFTER}
 }
@@ -555,6 +645,7 @@ vm_in() { # session script -> runs it in the session's VM
 
 check_vm_created_on_first_tool() {
   [ "$MODE" != browser ] || { _vm_created_on_first_browser_tool; return; }
+  [ "$MODE" != tools ] || { _vm_created_on_first_tools_tool; return; }
   local ready=$UC_READY_MS out tool t_tool t_end t_sent fl first_req create_start vm_up seeded rows model_done vms_after tool_out ok
   out=$(chat "$SESS_C" --timeout-secs 600 --prompt "Use the bash tool to run: ls app; uname -a   Then tell me in one sentence what you see.")
   note_calls "$SESS_C" "$out"
@@ -643,6 +734,72 @@ _vm_created_on_first_browser_tool() {
       "$(jq -nc --argjson a "$((t_end - t_tool))" '{label:"first browser call to its result (VM made inside it)",value:$a,unit:"ms"}')"
   else
     result 0 "vms_at_open=${VM_AT_OPEN:-?} ready=$ready first_req=$first_req create=$create_start tool=$t_tool model_done=$model_done vms_after=$vms_after tool_end=$t_end nav=${nav:0:160}"
+  fi
+}
+
+# tools use case: menu from .mcp-tools.json at open; first mcp__tools__* call makes the VM + tools-mcp.
+_vm_created_on_first_tools_tool() {
+  local ready=$UC_READY_MS out tool t_tool t_end t_sent fl first_req create_start vm_up seeded tools_up model_done vms_after tool_out ok
+  out=$(chat "$SESS_T" --timeout-secs 600 --prompt "What is the weather in Seattle? Use get_weather. Quote the condition and temperatureF from the tool.")
+  note_calls "$SESS_T" "$out"
+  tool=$(jq -c '[.tools[]|select(.name|startswith("mcp__tools__"))][0] // null' <<<"$out")
+  t_tool=$(jq -r '.t_ms // 0' <<<"$tool")
+  t_end=$(jq -r '.end_ms // 0' <<<"$tool")
+  t_sent=$(jq -r .sent_at_ms <<<"$out")
+  tool_out=$(jq -r '.output // ""' <<<"$tool")
+  for _ in $(seq 1 20); do
+    fl=$(cw front/ "$((ready - 60000))" | jq -c --arg s "$SESS_T" '[.[]|(.m|fromjson? // empty)|select(.src=="front" and .detail.session==$s)]')
+    [ "$(jq '[.[]|select(.event=="tools_ready")]|length' <<<"$fl")" -ge 1 ] && break
+    sleep 3
+  done
+  _fl() { jq -r --arg e "$1" '[.[]|select(.event==$e)][0].ts_ms // 0' <<<"$fl"; }
+  first_req=$(_fl first_request)
+  create_start=$(_fl vm_create_start)
+  vm_up=$(_fl vm_ready)
+  seeded=$(_fl vm_seeded)
+  tools_up=$(_fl tools_ready)
+  vms_after=$(vm_count_for "$SESS_T" || echo -1)
+  if vm_adopt "$SESS_T"; then
+    jq --argjson c "$create_start" '.created_ms = $c' "$VMDIR/$SESS_T.json" > "$VMDIR/$SESS_T.json.tmp" && mv "$VMDIR/$SESS_T.json.tmp" "$VMDIR/$SESS_T.json"
+  fi
+  model_done=$(jq '[.[]|((.start_unix_secs*1000) + .latency_ms)]|min // 0' <<<"$(uc_rows_since "$t_sent" 1)")
+  echo "  session ready at $ready; VMs for it at open: ${VM_AT_OPEN:-?}"
+  echo "  the model's first tools call started $t_tool; the front was first asked at $first_req (+$((first_req - ready)) ms after open)"
+  echo "  VM create began $create_start, VM serving $vm_up, seeded $seeded, tools-mcp up $tools_up"
+  echo "  the first tools result arrived at $t_end; E2B VMs for it now: $vms_after; out=${tool_out:0:160}"
+  ok=0
+  if [ "${VM_AT_OPEN:-1}" = 0 ] && [ "$create_start" -gt "$ready" ] && [ "$first_req" -ge "$((t_tool - 1500))" ] && [ "$create_start" -ge "$((model_done - 1500))" ] \
+    && [ "$vms_after" = 1 ] && [ "$t_end" -gt "$create_start" ] && [[ $tool_out == *72* || $tool_out == *temperatureF* || $tool_out == *sunny* ]]; then ok=1; fi
+  if [ "$ok" = 1 ]; then
+    result 1 "no VM at open; get_weather was offered from .mcp-tools.json; the first tools call made the VM, seeded the bundle, started tools-mcp, and returned weather" \
+      "$(jq -nc --argjson ready "$ready" --argjson fr "$first_req" --argjson cs "$create_start" --argjson up "$vm_up" --argjson sd "$seeded" --argjson tu "$tools_up" --argjson te "$t_end" --argjson tt "$t_tool" --argjson md "$model_done" \
+        '{vms_at_open:0, session_ready_ms:$ready, first_model_call_answered_ms:$md, tool_call_started_ms:$tt, front_first_request_ms:$fr, vm_create_started_ms:$cs, vm_serving_ms:$up, vm_seeded_ms:$sd, tools_ready_ms:$tu, first_tool_result_ms:$te,
+          open_to_vm_create_ms:($cs-$ready), vm_provision_ms:($up-$cs), seed_from_bundle_ms:($sd-$up), tools_stack_ms:($tu-$sd), first_tool_call_to_result_ms:($te-$tt)}')" \
+      "$(jq -nc --argjson a "$((t_end - t_tool))" '{label:"first tools call to its result (VM made inside it)",value:$a,unit:"ms"}')"
+  else
+    result 0 "vms_at_open=${VM_AT_OPEN:-?} ready=$ready first_req=$first_req create=$create_start tool=$t_tool model_done=$model_done vms_after=$vms_after tool_end=$t_end out=${tool_out:0:160}"
+  fi
+}
+
+# ============================================================================================================
+# tools
+# ============================================================================================================
+
+check_weather_from_tools_mcp() {
+  local out text tool_out ok
+  out=$(chat "$SESS_T" --timeout-secs 300 --prompt "Call get_weather for Portland and tell me only the temperatureF number from the tool result.")
+  note_calls "$SESS_T" "$out"
+  tool_out=$(uc_tool_out "$out" 'mcp__tools__get_weather')
+  text=$(jq -r .text <<<"$out")
+  echo "  tool out: ${tool_out:0:200}"
+  echo "  text: ${text:0:200}"
+  ok=0
+  if [[ $tool_out == *72* ]] || [[ $text == *72* ]]; then ok=1; fi
+  if [ "$ok" = 1 ]; then
+    result 1 "get_weather via tools-mcp returned temperatureF 72" \
+      "$(jq -nc --arg o "$tool_out" --arg t "$text" '{tool_output:$o, text:$t}')"
+  else
+    result 0 "expected temperatureF 72; tool=${tool_out:0:160} text=${text:0:160}"
   fi
 }
 

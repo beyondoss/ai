@@ -8,9 +8,9 @@
  */
 import path from "node:path";
 
-import type { RpcContextBase } from "./rpc.js";
 import { loadTools } from "./load.js";
 import { writeManifest } from "./manifest.js";
+import type { RpcContextBase } from "./rpc.js";
 import { handleRpc } from "./rpc.js";
 import { serveHttp } from "./serve-http.js";
 import { serveStdio } from "./serve-stdio.js";
@@ -55,7 +55,9 @@ function rpcBase(workspaceRoot = process.cwd()): RpcContextBase {
   };
 }
 
-function parseHttpBind(raw: string | undefined): { host: string; port: number } {
+function parseHttpBind(
+  raw: string | undefined,
+): { host: string; port: number } {
   // Default 0.0.0.0 so an E2B port mapping can reach the process; local callers use 127.0.0.1 explicitly.
   if (!raw || raw === "true") return { host: "0.0.0.0", port: 8931 };
   if (raw.includes(":")) {
@@ -100,12 +102,15 @@ async function main(): Promise<void> {
   if (cmd === "manifest") {
     const dir = takeFlag(argv, "--dir");
     const name = takeFlag(argv, "--name") ?? "tools";
-    const out = takeFlag(argv, "-o") ?? takeFlag(argv, "--out") ?? ".mcp-tools.json";
+    const out = takeFlag(argv, "-o") ?? takeFlag(argv, "--out")
+      ?? ".mcp-tools.json";
     if (!dir || argv.length) usage();
     const tools = await loadTools(dir);
     const file = await writeManifest(tools, { name, out });
     console.error(
-      `wrote ${out} (${file[name]?.length ?? 0} tools under connector "${name}")`,
+      `wrote ${out} (${
+        file[name]?.length ?? 0
+      } tools under connector "${name}")`,
     );
     return;
   }
@@ -134,7 +139,10 @@ async function main(): Promise<void> {
       rpcBase(path.resolve(dir)),
     );
     process.stdout.write(`${JSON.stringify(r, null, 2)}\n`);
-    if (r && "result" in r && r.result && typeof r.result === "object" && r.result !== null && "isError" in r.result) {
+    if (
+      r && "result" in r && r.result && typeof r.result === "object"
+      && r.result !== null && "isError" in r.result
+    ) {
       process.exit(1);
     }
     return;

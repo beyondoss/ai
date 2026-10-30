@@ -147,12 +147,26 @@ bun --version
 mkdir -p /home/user/tools-mcp/src /home/user/workspace/tools
 ' >/dev/null || fail "install bun"
 
-for f in cli.ts define-tool.ts load.ts manifest.ts rpc.ts run-tool.ts schema.ts serve-http.ts serve-stdio.ts eve-tools.ts index.ts bun-shim.d.ts; do
+for f in cli.ts context.ts define-tool.ts load.ts manifest.ts rpc.ts run-tool.ts sandbox-handle.ts schema.ts serve-http.ts serve-stdio.ts eve-tools.ts index.ts bun-shim.d.ts; do
   vm_put "/home/user/tools-mcp/src/$f" "$PKG/src/$f"
 done
-vm_put /home/user/tools-mcp/package.json "$PKG/package.json"
+jq -n '{
+  name: "@beyond.dev/agent-tools-mcp",
+  version: "0.1.0-dev",
+  type: "module",
+  dependencies: {
+    "@standard-schema/spec": "^1.0.0",
+    "zod": "4.1.5"
+  }
+}' >"$STAGE/tools-mcp.package.json"
+vm_put /home/user/tools-mcp/package.json "$STAGE/tools-mcp.package.json"
 vm_put /home/user/workspace/tools/get_weather.ts "$STAGE/tools/get_weather.ts"
-vm_put /home/user/workspace/package.json "$STAGE/package.json"
+printf '%s\n' '{"type":"module","dependencies":{"zod":"4.1.5"}}' >"$STAGE/guest-package.json"
+vm_put /home/user/workspace/package.json "$STAGE/guest-package.json"
+printf '%s\n' 'export { createToolContext, defineTool } from "/home/user/tools-mcp/src/eve-tools.ts";' \
+  >"$STAGE/eve-tools.ts"
+printf '%s\n' '{"name":"eve","type":"module","exports":{"./tools":"./tools.ts"}}' \
+  >"$STAGE/eve-package.json"
 pass "sources uploaded"
 
 say "start tools-mcp"
@@ -160,12 +174,17 @@ START_OUT=$(vm_bash "
 set -e
 export PATH=\"\$HOME/.bun/bin:\$PATH\"
 cd /home/user/tools-mcp && bun install --silent
-# Eve path: node_modules/eve/tools → guest eve-tools.ts
+cd /home/user/workspace && bun install --silent
 mkdir -p /home/user/workspace/node_modules/eve
-printf '%s\\n' '{\"name\":\"eve\",\"type\":\"module\",\"exports\":{\"./tools\":\"/home/user/tools-mcp/src/eve-tools.ts\"}}' > /home/user/workspace/node_modules/eve/package.json
-cd /home/user/workspace && bun add zod@^4.1.5 --silent
-cd /home/user/tools-mcp
-setsid nohup bun run src/cli.ts serve --dir /home/user/workspace/tools --http 0.0.0.0:$BRIDGE_PORT \
+echo DEPS_OK
+") || fail "bun install guest"
+vm_put /home/user/workspace/node_modules/eve/tools.ts "$STAGE/eve-tools.ts"
+vm_put /home/user/workspace/node_modules/eve/package.json "$STAGE/eve-package.json"
+START_OUT=$(vm_bash "
+set -e
+export PATH=\"\$HOME/.bun/bin:\$PATH\"
+cd /home/user/workspace
+setsid nohup bun /home/user/tools-mcp/src/cli.ts serve --dir /home/user/workspace/tools --http 0.0.0.0:$BRIDGE_PORT \
   >/tmp/tools-mcp.log 2>&1 </dev/null &
 for i in \$(seq 1 200); do
   curl -sf -m 2 localhost:$BRIDGE_PORT/healthz && echo READY && exit 0

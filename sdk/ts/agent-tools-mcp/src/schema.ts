@@ -27,9 +27,9 @@ export function isStandardSchema(
   if (!isRecord(schema)) return false;
   const standard = schema["~standard"];
   return (
-    isRecord(standard) &&
-    standard.version === 1 &&
-    typeof standard.validate === "function"
+    isRecord(standard)
+    && standard.version === 1
+    && typeof standard.validate === "function"
   );
 }
 
@@ -40,12 +40,12 @@ export function isStandardSchema(
 export function isPlainJsonSchema(schema: unknown): schema is JsonSchema {
   if (!isRecord(schema) || isStandardSchema(schema)) return false;
   return (
-    "type" in schema ||
-    "properties" in schema ||
-    "anyOf" in schema ||
-    "oneOf" in schema ||
-    "allOf" in schema ||
-    "$ref" in schema
+    "type" in schema
+    || "properties" in schema
+    || "anyOf" in schema
+    || "oneOf" in schema
+    || "allOf" in schema
+    || "$ref" in schema
   );
 }
 
@@ -60,11 +60,13 @@ export function stripDollarSchema(schema: JsonSchema): JsonSchema {
  */
 export function inputSchemaToJsonSchema(schema: ToolInputSchema): JsonSchema {
   if (isStandardSchema(schema)) {
-    const props = schema["~standard"] as StandardSchemaV1.Props<unknown, unknown> & {
-      jsonSchema?: {
-        input?: (opts?: { target?: string }) => JsonSchema;
+    const props = schema["~standard"] as
+      & StandardSchemaV1.Props<unknown, unknown>
+      & {
+        jsonSchema?: {
+          input?: (opts?: { target?: string }) => JsonSchema;
+        };
       };
-    };
     const fromStandard = props.jsonSchema?.input?.({ target: "draft-2020-12" });
     if (fromStandard && isRecord(fromStandard)) {
       return stripDollarSchema(fromStandard);
@@ -73,12 +75,13 @@ export function inputSchemaToJsonSchema(schema: ToolInputSchema): JsonSchema {
 
   // Zod 4 instance method (when Standard JSON Schema trait is absent).
   if (
-    isRecord(schema) &&
-    typeof schema.toJSONSchema === "function"
+    isRecord(schema)
+    && typeof schema.toJSONSchema === "function"
   ) {
-    const raw = (schema.toJSONSchema as (opts?: { target?: string }) => unknown)({
-      target: "draft-2020-12",
-    });
+    const raw =
+      (schema.toJSONSchema as (opts?: { target?: string }) => unknown)({
+        target: "draft-2020-12",
+      });
     if (isRecord(raw)) return stripDollarSchema(raw);
   }
 
@@ -92,7 +95,9 @@ export function inputSchemaToJsonSchema(schema: ToolInputSchema): JsonSchema {
       toJSONSchema?: (s: unknown, opts?: { target?: string }) => JsonSchema;
     };
     if (typeof z.toJSONSchema === "function") {
-      return stripDollarSchema(z.toJSONSchema(schema, { target: "draft-2020-12" }));
+      return stripDollarSchema(
+        z.toJSONSchema(schema, { target: "draft-2020-12" }),
+      );
     }
   } catch {
     /* zod not installed at resolve time — agent may still pass Standard Schema */
@@ -153,18 +158,22 @@ export async function validateToolInput<S extends ToolInputSchema>(
     return withDefaults as InferToolInput<S>;
   }
 
-  throw new Error("inputSchema must be a Zod/Standard Schema or a plain JSON Schema object");
+  throw new Error(
+    "inputSchema must be a Zod/Standard Schema or a plain JSON Schema object",
+  );
 }
 
 /** Eve: fill omitted properties from their JSON Schema `default` values (recursive). */
-export function applyJsonSchemaDefaults(schema: JsonSchema, raw: unknown): unknown {
+export function applyJsonSchemaDefaults(
+  schema: JsonSchema,
+  raw: unknown,
+): unknown {
   if (!isRecord(schema.properties)) {
     return raw;
   }
-  const base =
-    raw !== null && typeof raw === "object" && !Array.isArray(raw)
-      ? { ...(raw as Record<string, unknown>) }
-      : {};
+  const base = raw !== null && typeof raw === "object" && !Array.isArray(raw)
+    ? { ...(raw as Record<string, unknown>) }
+    : {};
 
   for (const [key, propSchema] of Object.entries(schema.properties)) {
     if (!isRecord(propSchema)) continue;
@@ -211,7 +220,10 @@ function validatePlainJsonSchema(
       for (const [key, propSchema] of Object.entries(props)) {
         if (!(key in obj)) continue;
         if (!isRecord(propSchema)) continue;
-        const err = validatePlainJsonSchema(propSchema, obj[key], [...path, key]);
+        const err = validatePlainJsonSchema(propSchema, obj[key], [
+          ...path,
+          key,
+        ]);
         if (err) return err;
       }
     }
@@ -236,7 +248,8 @@ function validatePlainJsonSchema(
 function matchesJsonType(type: unknown, value: unknown): boolean {
   switch (type) {
     case "object":
-      return value !== null && typeof value === "object" && !Array.isArray(value);
+      return value !== null && typeof value === "object"
+        && !Array.isArray(value);
     case "array":
       return Array.isArray(value);
     case "string":

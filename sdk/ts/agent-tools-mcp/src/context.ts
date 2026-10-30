@@ -59,18 +59,20 @@ export type CreateToolContextInput = {
 export function createToolContext(input: CreateToolContextInput): ToolContext {
   const workspaceRoot = input.workspaceRoot;
   const abortSignal = input.abortSignal ?? new AbortController().signal;
-  const session: ToolSession = {
-    id:
-      input.session?.id ??
-      input.env?.BEYOND_SESSION_ID ??
-      process.env.BEYOND_SESSION_ID ??
-      "local",
-    turn: input.session?.turn,
-    auth: input.session?.auth,
-    parent: input.session?.parent,
-  };
 
-  return {
+  const session: ToolSession = {
+    id: input.session?.id
+      ?? input.env?.BEYOND_SESSION_ID
+      ?? process.env.BEYOND_SESSION_ID
+      ?? "local",
+  };
+  if (input.session?.turn !== undefined) session.turn = input.session.turn;
+  if (input.session?.auth !== undefined) session.auth = input.session.auth;
+  if (input.session?.parent !== undefined) {
+    session.parent = input.session.parent;
+  }
+
+  const ctx: ToolContext = {
     env: input.env ?? process.env,
     workspaceRoot,
     session,
@@ -78,12 +80,14 @@ export function createToolContext(input: CreateToolContextInput): ToolContext {
     toolName: input.toolName,
     messages: input.messages ?? [],
     abortSignal,
-    channel: input.channel,
-    getSandbox: async () => createLocalSandboxHandle(workspaceRoot, abortSignal),
+    getSandbox: async () =>
+      createLocalSandboxHandle(workspaceRoot, abortSignal),
     to: () => {
       throw new Error(
         "ctx.to() is an Eve channel host API; not available in the Beyond tools-mcp guest",
       );
     },
   };
+  if (input.channel !== undefined) ctx.channel = input.channel;
+  return ctx;
 }
