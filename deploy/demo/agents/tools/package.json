@@ -1,7 +1,7 @@
 {
   "type": "module",
   "dependencies": {
-    "@beyond.dev/agent-tools-mcp": "file:../../../../sdk/ts/agent-tools-mcp",
+    "@beyond.dev/tools": "file:../../../../sdk/ts/agent-tools-mcp",
     "eve": "file:../../../../sdk/ts/agent-tools-mcp/eve-shim",
     "zod": "^4.1.5"
   }

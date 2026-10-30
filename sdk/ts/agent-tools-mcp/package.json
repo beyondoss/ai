@@ -1,5 +1,5 @@
 {
-  "name": "@beyond.dev/agent-tools-mcp",
+  "name": "@beyond.dev/tools",
   "version": "0.1.0-dev",
   "description": "Eve/Agent-SDK-compatible defineTool (Zod/Standard Schema) as an MCP server in a Beyond sandbox.",
   "type": "module",

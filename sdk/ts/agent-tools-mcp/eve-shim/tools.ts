@@ -12,4 +12,4 @@ export {
   type ToolExecuteResult,
   type ToolInputSchema,
   ToolInputValidationError,
-} from "@beyond.dev/agent-tools-mcp/eve-tools";
+} from "@beyond.dev/tools/eve-tools";

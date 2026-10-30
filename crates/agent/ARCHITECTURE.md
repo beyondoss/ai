@@ -6234,7 +6234,7 @@ fetch it, `bundle.sha256` what it must hash to). `bundle.rs` does the rest:
   `tests/serve_service_bundle_mcp_tools.rs`.
 - **Agent tools as sandbox MCP.** A folder of Eve-shaped `tools/*.ts` modules (`defineTool` + Zod,
   `import { defineTool } from "eve/tools"`) can run as an MCP server inside the sandbox via
-  `@beyond.dev/agent-tools-mcp` (`tools-mcp` binary). The grant names a `sandbox: true` connector whose
+  `@beyond.dev/tools` (`tools-mcp` binary). The grant names a `sandbox: true` connector whose
   URL is the exec front with `tools=<https URL of the linux binary>`; the front seeds the bundle, starts
   the binary against the seeded `tools/` directory, and bridges MCP. A `.mcp-tools.json` stamped at
   bundle build (CLI `manifest`, written via temp file and `rename`) cold-opens the menu without a VM;

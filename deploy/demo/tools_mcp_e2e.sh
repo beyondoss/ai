@@ -102,7 +102,7 @@ ZOD_DIR=$(cd "$PKG" && node -e "console.log(require('path').dirname(require.reso
 # Walk up from the package entry to its package root (exports often hide package.json).
 SPEC_DIR=$(cd "$PKG" && node -e "let p=require.resolve('@standard-schema/spec');const fs=require('fs');const path=require('path');for(;;){if(fs.existsSync(path.join(p,'package.json'))){console.log(p);break}const n=path.dirname(p);if(n===p)process.exit(1);p=n}")
 mkdir -p "$STAGE/node_modules/@beyond.dev" "$STAGE/node_modules/@standard-schema"
-ln -sfn "$PKG" "$STAGE/node_modules/@beyond.dev/agent-tools-mcp"
+ln -sfn "$PKG" "$STAGE/node_modules/@beyond.dev/tools"
 ln -sfn "$PKG/eve-shim" "$STAGE/node_modules/eve"
 ln -sfn "$ZOD_DIR" "$STAGE/node_modules/zod"
 ln -sfn "$SPEC_DIR" "$STAGE/node_modules/@standard-schema/spec"
@@ -147,11 +147,11 @@ bun --version
 mkdir -p /home/user/tools-mcp/src /home/user/workspace/tools
 ' >/dev/null || fail "install bun"
 
-for f in cli.ts context.ts define-tool.ts load.ts manifest.ts rpc.ts run-tool.ts sandbox-handle.ts schema.ts serve-http.ts serve-stdio.ts eve-tools.ts index.ts bun-shim.d.ts; do
+for f in cli.ts context.ts define-tool.ts load.ts manifest.ts rpc.ts run-tool.ts sandbox-handle.ts schema.ts serve-http.ts serve-stdio.ts workspace.ts eve-tools.ts index.ts bun-shim.d.ts; do
   vm_put "/home/user/tools-mcp/src/$f" "$PKG/src/$f"
 done
 jq -n '{
-  name: "@beyond.dev/agent-tools-mcp",
+  name: "@beyond.dev/tools",
   version: "0.1.0-dev",
   type: "module",
   dependencies: {

@@ -1,4 +1,4 @@
-# @beyond.dev/agent-tools-mcp
+# @beyond.dev/tools
 
 **Write Eve tools. Run them in a Beyond sandbox.** Same `defineTool` + Zod you would
 ship on [eve.dev](https://eve.dev/docs/tools), served as MCP inside the guest so
@@ -86,7 +86,7 @@ cannot remap that bare path). Use the shipped shim:
 ```json
 {
   "dependencies": {
-    "@beyond.dev/agent-tools-mcp": "…",
+    "@beyond.dev/tools": "…",
     "eve": "file:…/agent-tools-mcp/eve-shim",
     "zod": "^4"
   }

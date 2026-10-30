@@ -1,4 +1,4 @@
-//! Gate 1: `@beyond.dev/agent-tools-mcp` is a real MCP server for **this** agent's client.
+//! Gate 1: `@beyond.dev/tools` is a real MCP server for **this** agent's client.
 //!
 //! Spawns the package CLI (Bun), connects with `sandbox: true` via `mcp::connect_granted`
 //! (same path as production sandbox connectors), and runs `get_weather`.

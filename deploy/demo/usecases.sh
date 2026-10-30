@@ -346,10 +346,10 @@ _uc_stage_tools_deps() {
   zod_dir=$(cd "$pkg" && node -e "console.log(require('path').dirname(require.resolve('zod')))")
   spec_dir=$(cd "$pkg" && node -e "let p=require.resolve('@standard-schema/spec');const fs=require('fs');const path=require('path');for(;;){if(fs.existsSync(path.join(p,'package.json'))){console.log(p);break}const n=path.dirname(p);if(n===p)process.exit(1);p=n}")
   mkdir -p "$STAGE/node_modules/@beyond.dev" "$STAGE/node_modules/@standard-schema"
-  rm -rf "$STAGE/node_modules/@beyond.dev/agent-tools-mcp" "$STAGE/node_modules/eve" \
+  rm -rf "$STAGE/node_modules/@beyond.dev/tools" "$STAGE/node_modules/eve" \
     "$STAGE/node_modules/zod" "$STAGE/node_modules/@standard-schema/spec"
-  mkdir -p "$STAGE/node_modules/@beyond.dev/agent-tools-mcp"
-  cp -a "$pkg/package.json" "$pkg/src" "$STAGE/node_modules/@beyond.dev/agent-tools-mcp/"
+  mkdir -p "$STAGE/node_modules/@beyond.dev/tools"
+  cp -a "$pkg/package.json" "$pkg/src" "$STAGE/node_modules/@beyond.dev/tools/"
   cp -a "$pkg/eve-shim" "$STAGE/node_modules/eve"
   cp -a "$zod_dir" "$STAGE/node_modules/zod"
   cp -a "$spec_dir" "$STAGE/node_modules/@standard-schema/spec"

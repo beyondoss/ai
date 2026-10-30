@@ -262,7 +262,7 @@ if [ -f target/nextest/verify-isolated/junit.xml ]; then reports="$reports --jun
 cargo run -q -p beyond-verify -- gate $reports
 """
 
-# ---- TypeScript SDK (sdk/ts: npm workspace root; sandbox client + agent-tools-mcp) ----
+# ---- TypeScript SDK (sdk/ts: npm workspace root; sandbox client + @beyond.dev/tools) ----
 
 [tasks."install:ts"]
 description = "Install the TypeScript SDK's dependencies (npm ci in sdk/ts)."
@@ -270,13 +270,13 @@ run = "npm ci"
 dir = "sdk/ts"
 
 [tasks."build:ts"]
-description = "Build the TypeScript SDK (tsdown): sandbox + agent-tools-mcp dist."
+description = "Build the TypeScript SDK (tsdown): sandbox + @beyond.dev/tools dist."
 run = "npm run build"
 dir = "sdk/ts"
 
 [tasks."compile:agent-tools-mcp"]
 description = "AOT+trim+smol binary for in-sandbox tools MCP (bun compile). Build on the guest OS/arch. OUT= overrides bin/tools-mcp."
-run = "npm run compile -w @beyond.dev/agent-tools-mcp"
+run = "npm run compile -w @beyond.dev/tools"
 dir = "sdk/ts"
 
 [tasks."check:ts"]

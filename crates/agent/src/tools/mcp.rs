@@ -822,7 +822,7 @@ impl Relist {
 }
 
 /// A `tools/list` entry as the manifest records it — and as a re-listing is compared.
-/// Guest `_meta` on a successful `tools/call`. `@beyond.dev/agent-tools-mcp` sets this
+/// Guest `_meta` on a successful `tools/call`. `@beyond.dev/tools` sets this
 /// when `endsTurn` is true or its function returns true. A failed call does not.
 const ENDS_TURN_META: &str = "beyond.dev/endsTurn";
 
