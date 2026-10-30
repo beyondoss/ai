@@ -5,6 +5,10 @@
 # the seeded workspace at start. --smol trims the runtime's memory use; --minify shrinks the
 # bundled CLI.
 #
+# --compile-autoload-package-json: the tools import `eve/tools` by bare name from the bundle's
+# node_modules. A compiled executable resolves nothing from disk (even a plain package) unless it
+# reads package.json at runtime.
+#
 # Build on the guest OS/arch (linux-x64 Docker for E2B). OUT= overrides the path.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -20,6 +24,7 @@ fi
 bun build --compile \
   --minify \
   --compile-exec-argv=--smol \
+  --compile-autoload-package-json \
   "$ENTRY" \
   --outfile "$OUT"
 

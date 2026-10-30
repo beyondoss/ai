@@ -57,7 +57,7 @@ fn skip() -> bool {
 /// `tools-mcp <args>`: the compiled binary, else the package CLI under Bun.
 fn tools_mcp_cmd() -> Command {
     match compiled_bin() {
-        Some(bin) => Command::new(bin),
+        Some(tools_mcp) => Command::new(tools_mcp),
         None => {
             let mut cmd = Command::new("bun");
             cmd.arg("run").arg(package_root().join("src/cli.ts"));
@@ -472,6 +472,71 @@ async fn a_connector_that_is_not_a_sandbox_one_ignores_the_tool_flags() {
     assert!(
         pick(&plain, "mcp__tools__quiet").available_in_subagents(),
         "availableInSubagents is honored only for a sandbox connector"
+    );
+}
+
+/// The production bundle shape: tools import `eve/tools` and `zod` by bare name, resolved from the
+/// bundle's own `node_modules` (a copy of `eve-shim` and of this package's `package.json` + `src`).
+/// Only the compiled binary can fail this: `bun src/cli.ts` resolves packages on its own, while a
+/// `bun build --compile` executable needs `--compile-autoload-package-json` to read the `exports` maps.
+#[test]
+fn compiled_binary_resolves_eve_tools_from_the_bundles_node_modules() {
+    let Some(tools_mcp) = compiled_bin() else {
+        eprintln!("skip: set TOOLS_MCP_BIN to the compiled tools-mcp");
+        return;
+    };
+    let pkg = package_root();
+    let root = tempfile::tempdir().unwrap();
+    let nm = root.path().join("node_modules");
+    let copy = |from: &Path, to: &Path| {
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        let ok = Command::new("cp")
+            .arg("-a")
+            .arg(from)
+            .arg(to)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "cp {} {}", from.display(), to.display());
+    };
+    copy(&pkg.join("eve-shim"), &nm.join("eve"));
+    copy(&pkg.join("package.json"), &nm.join("@beyond.dev/tools/package.json"));
+    copy(&pkg.join("src"), &nm.join("@beyond.dev/tools/src"));
+    copy(
+        &package_root().join("../node_modules/zod"),
+        &nm.join("zod"),
+    );
+    copy(
+        &package_root().join("../node_modules/@standard-schema"),
+        &nm.join("@standard-schema"),
+    );
+    std::fs::write(root.path().join("package.json"), r#"{"type":"module"}"#).unwrap();
+    let tools = root.path().join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    std::fs::write(
+        tools.join("ping.ts"),
+        r#"import { defineTool } from "eve/tools";
+import { z } from "zod";
+export default defineTool({
+  description: "Ping.",
+  inputSchema: z.object({}),
+  async execute() { return { pong: true }; },
+});
+"#,
+    )
+    .unwrap();
+    let out = Command::new(tools_mcp)
+        .args(["manifest", "--dir"])
+        .arg(&tools)
+        .args(["--name", "tools", "-o"])
+        .arg(root.path().join(".mcp-tools.json"))
+        .current_dir(root.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "the compiled binary could not load a bundle's tools: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
