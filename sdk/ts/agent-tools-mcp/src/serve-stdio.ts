@@ -1,7 +1,7 @@
 import readline from "node:readline";
 
 import type { LoadedTool } from "./load.js";
-import { handleRpc, serializeRpc, type RpcContextBase } from "./rpc.js";
+import { handleRpc, type RpcContextBase, serializeRpc } from "./rpc.js";
 
 /**
  * Line-delimited JSON-RPC on stdin/stdout — what `deploy/demo/mcp-tools.sh` drives

@@ -110,7 +110,7 @@ describe("serializeRpc matches JSON.stringify without a second walk", () => {
     { nested: { flags: [true, false], note: "say \"hi\"\nnext" } },
     ["a", 1, null],
     "plain",
-    'say "hi" \\ \u2028',
+    "say \"hi\" \\ \u2028",
     "",
     0,
     -0,
@@ -155,9 +155,12 @@ describe("serializeRpc matches JSON.stringify without a second walk", () => {
     const wire = serializeRpc(response);
     expect(walks).toBe(1);
     const parsed = JSON.parse(wire) as {
-      result: { content: { text: string }[]; structuredContent: { walks: number } };
+      result: {
+        content: { text: string }[];
+        structuredContent: { walks: number };
+      };
     };
-    expect(parsed.result.content[0]?.text).toBe('{"walks":1}');
+    expect(parsed.result.content[0]?.text).toBe("{\"walks\":1}");
     expect(parsed.result.structuredContent).toEqual({ walks: 1 });
   });
 
