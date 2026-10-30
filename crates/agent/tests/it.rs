@@ -70,6 +70,7 @@ mod mcp_apps_events;
 mod mcp_apps_resilience;
 mod mcp_apps_security;
 mod mcp_apps_session;
+mod mcp_cancel_propagates;
 mod mcp_client;
 mod mcp_elicitation;
 mod mcp_events_busy;

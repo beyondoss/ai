@@ -1885,13 +1885,16 @@ async fn call_tool_tracked(
         )
         .await?;
     call.bind(handle.id.clone());
+    let cancel = CancelOnDrop::arm(client.peer(), handle.id.clone());
     // rmcp chose the progress token for this request; progress for it is this call's alone.
     let _progress = progress.map(|p| {
         client
             .service()
             .track_progress(handle.progress_token.clone(), p.clone())
     });
-    match handle.await_response().await? {
+    let response = handle.await_response().await;
+    cancel.disarm();
+    match response? {
         ServerResult::CallToolResult(result) => Ok(CallToolResponse::Complete(result)),
         ServerResult::InputRequiredResult(result) => Ok(CallToolResponse::InputRequired(result)),
         ServerResult::CreateTaskResult(result) => Ok(CallToolResponse::Task(result)),
@@ -1915,7 +1918,63 @@ pub(crate) async fn request_tracked(
         .send_request_with_option(request, PeerRequestOptions::no_options())
         .await?;
     call.bind(handle.id.clone());
-    handle.await_response().await
+    let cancel = CancelOnDrop::arm(client.peer(), handle.id.clone());
+    let response = handle.await_response().await;
+    cancel.disarm();
+    response
+}
+
+/// Held for as long as one request is outstanding. If the future awaiting its response is dropped
+/// first (an abort, a cancelled run, a closed session), the server is told with
+/// `notifications/cancelled` for that request id (MCP 2025-06-18 "Cancellation"), so a slow tool
+/// stops instead of running on unobserved. Disarmed once the response (or an error) is back: a
+/// request already answered is never cancelled. The server may ignore it, and rmcp discards a late
+/// response.
+///
+/// The send is one fire-and-forget task on the current runtime. It is bounded by the connection:
+/// it ends when the notification is queued to (or refused by) rmcp's service loop, which is gone
+/// once the connection closes; the runtime frees it. No runtime (a drop during shutdown) means no
+/// send, and the connection is closing anyway.
+struct CancelOnDrop {
+    armed: Option<(
+        rmcp::service::Peer<rmcp::service::RoleClient>,
+        rmcp::model::RequestId,
+    )>,
+}
+
+impl CancelOnDrop {
+    fn arm(
+        peer: &rmcp::service::Peer<rmcp::service::RoleClient>,
+        id: rmcp::model::RequestId,
+    ) -> Self {
+        Self {
+            armed: Some((peer.clone(), id)),
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = None;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        let Some((peer, id)) = self.armed.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            let reason = "the client no longer needs the result".to_owned();
+            let _ = peer
+                .notify_cancelled(rmcp::model::CancelledNotificationParam::new(
+                    Some(id),
+                    Some(reason),
+                ))
+                .await;
+        });
+    }
 }
 
 /// The `tool_progress` `details` key carrying a task's current [`McpTaskRecord`].
