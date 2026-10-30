@@ -22,9 +22,9 @@ print(sb.jobs.read("my-session", "dev").data)                       # its output
 ```python
 from beyond_sandbox import AsyncSandbox
 
-async with await AsyncSandbox.connect("https://sandbox.example/exec", token="...") as sb:
-    await sb.files.write("/work/a.txt", "x")
-    results = await asyncio.gather(sb.exec("uname"), sb.files.read_text("/work/a.txt"))
+sb = await AsyncSandbox.connect("https://sandbox.example/exec", token="...")
+await sb.files.write("/work/a.txt", "x")
+results = await asyncio.gather(sb.exec("uname"), sb.files.read_text("/work/a.txt"))
 ```
 
 It speaks the exec protocol (one `POST` per command; streaming; sandbox-native jobs), as
