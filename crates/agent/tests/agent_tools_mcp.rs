@@ -9,7 +9,6 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -49,11 +48,10 @@ fn spawn_tools_mcp(tools_dir: &Path) -> ToolsMcp {
     let cli = pkg.join("src/cli.ts");
     assert!(cli.is_file(), "missing {}", cli.display());
 
-    // Ephemeral port via bind-then-drop (ports_lint allows this pattern; not a bare ":0" CLI arg).
-    let port = {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-        listener.local_addr().expect("local_addr").port()
-    };
+    // Port from beyond_test_support::ports (ports_lint); drop so bun can bind it.
+    let listener = beyond_test_support::ports::listener();
+    let port = listener.local_addr().expect("local_addr").port();
+    drop(listener);
     let bind = format!("127.0.0.1:{port}");
 
     let mut child = Command::new("bun")
