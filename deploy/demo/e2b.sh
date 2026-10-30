@@ -347,7 +347,7 @@ curl -sf -m 2 localhost:\$BRIDGE_PORT/healthz >/dev/null || (
     >/tmp/tools-mcp.log 2>&1 </dev/null &
 )
 for i in \$(seq 1 150); do
-  curl -sf -m 2 localhost:\$BRIDGE_PORT/healthz >/dev/null && exit 0
+  curl -sf -m 2 localhost:\$BRIDGE_PORT/healthz >/dev/null && { echo started; exit 0; }
   sleep 0.1
 done
 echo \"tools-mcp failed to listen; log:\" >&2
