@@ -52,7 +52,9 @@ export async function writeManifest(
   const dir = path.dirname(opts.out);
   const tmp = path.join(
     dir,
-    `.${path.basename(opts.out)}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`,
+    `.${path.basename(opts.out)}.${process.pid}.${
+      randomBytes(4).toString("hex")
+    }.tmp`,
   );
   try {
     await writeFile(tmp, body, "utf8");

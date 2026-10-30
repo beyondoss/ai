@@ -171,7 +171,9 @@ function cloneJson(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(cloneJson);
   if (isRecord(value)) {
     const out: Record<string, unknown> = {};
-    for (const [key, inner] of Object.entries(value)) out[key] = cloneJson(inner);
+    for (const [key, inner] of Object.entries(value)) {
+      out[key] = cloneJson(inner);
+    }
     return out;
   }
   return value;
@@ -307,13 +309,20 @@ function validatePlainJsonSchema(
   }
 
   if (typeof value === "string") {
-    if (typeof schema.minLength === "number" && value.length < schema.minLength) {
+    if (
+      typeof schema.minLength === "number" && value.length < schema.minLength
+    ) {
       return `${loc}: shorter than minLength ${schema.minLength}`;
     }
-    if (typeof schema.maxLength === "number" && value.length > schema.maxLength) {
+    if (
+      typeof schema.maxLength === "number" && value.length > schema.maxLength
+    ) {
       return `${loc}: longer than maxLength ${schema.maxLength}`;
     }
-    if (typeof schema.pattern === "string" && !new RegExp(schema.pattern).test(value)) {
+    if (
+      typeof schema.pattern === "string"
+      && !new RegExp(schema.pattern).test(value)
+    ) {
       return `${loc}: does not match pattern`;
     }
   }
@@ -433,7 +442,9 @@ function matchesJsonType(type: unknown, value: unknown): boolean {
 
 function jsonEqual(a: unknown, b: unknown): boolean {
   if (Object.is(a, b)) return true;
-  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) {
+  if (
+    typeof a !== "object" || typeof b !== "object" || a === null || b === null
+  ) {
     return false;
   }
   if (Array.isArray(a) || Array.isArray(b)) {

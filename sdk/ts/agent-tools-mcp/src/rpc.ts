@@ -33,7 +33,8 @@ export const ENDS_TURN_META_KEY = "beyond.dev/endsTurn";
  * `tools/list` `_meta` key. `false` means subagents do not inherit the tool.
  * Omitted means they do.
  */
-export const AVAILABLE_IN_SUBAGENTS_META_KEY = "beyond.dev/availableInSubagents";
+export const AVAILABLE_IN_SUBAGENTS_META_KEY =
+  "beyond.dev/availableInSubagents";
 
 type InFlight = {
   controller: AbortController;
@@ -148,7 +149,9 @@ export async function handleRpc(
             ),
             inputSchema: t.def.jsonInputSchema,
           };
-          if (t.def.jsonOutputSchema) tool.outputSchema = t.def.jsonOutputSchema;
+          if (t.def.jsonOutputSchema) {
+            tool.outputSchema = t.def.jsonOutputSchema;
+          }
           if (t.def.annotations) tool.annotations = t.def.annotations;
           if (t.def.availableInSubagents === false) {
             tool._meta = { [AVAILABLE_IN_SUBAGENTS_META_KEY]: false };

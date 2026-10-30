@@ -11,10 +11,7 @@ import { z } from "zod";
 import { defineTool } from "../src/define-tool.js";
 import { loadTools } from "../src/load.js";
 import { writeManifest } from "../src/manifest.js";
-import {
-  AVAILABLE_IN_SUBAGENTS_META_KEY,
-  handleRpc,
-} from "../src/rpc.js";
+import { AVAILABLE_IN_SUBAGENTS_META_KEY, handleRpc } from "../src/rpc.js";
 import { createLocalSandboxHandle } from "../src/sandbox-handle.js";
 import { validateToolInput } from "../src/schema.js";
 import { sessionGate } from "../src/serve-http.js";
@@ -22,8 +19,12 @@ import { resolveWorkspace } from "../src/workspace.js";
 
 describe("audit fixes", () => {
   it("workspace root is cwd or --workspace, not the tools directory", () => {
-    expect(resolveWorkspace(undefined, "/bundle")).toBe(path.resolve("/bundle"));
-    expect(resolveWorkspace("/explicit", "/bundle")).toBe(path.resolve("/explicit"));
+    expect(resolveWorkspace(undefined, "/bundle")).toBe(
+      path.resolve("/bundle"),
+    );
+    expect(resolveWorkspace("/explicit", "/bundle")).toBe(
+      path.resolve("/explicit"),
+    );
   });
 
   it("manifest write leaves no temp file", async () => {
@@ -52,7 +53,9 @@ describe("audit fixes", () => {
     };\n`;
     await writeFile(path.join(dir, "get_weather.ts"), source, "utf8");
     await writeFile(path.join(dir, "get_weather.js"), source, "utf8");
-    await expect(loadTools(dir)).rejects.toThrow(/duplicate tool name "get_weather"/);
+    await expect(loadTools(dir)).rejects.toThrow(
+      /duplicate tool name "get_weather"/,
+    );
   });
 
   it("spawn yields lines and exitCode resolves without a reader", async () => {
@@ -74,14 +77,19 @@ describe("audit fixes", () => {
     const sessions = new Set<string>();
     const init = sessionGate(sessions, { isInit: true, session: null });
     expect(init.ok).toBe(true);
-    if (!init.ok || !init.session) throw new Error("initialize did not mint a session");
+    if (!init.ok || !init.session) {
+      throw new Error("initialize did not mint a session");
+    }
     expect(
       sessionGate(sessions, { isInit: false, session: null }),
     ).toEqual({ ok: false, status: 400, message: "missing Mcp-Session-Id" });
     expect(
       sessionGate(sessions, { isInit: false, session: "nope" }),
     ).toEqual({ ok: false, status: 404, message: "session not found" });
-    const again = sessionGate(sessions, { isInit: false, session: init.session });
+    const again = sessionGate(sessions, {
+      isInit: false,
+      session: init.session,
+    });
     expect(again.ok).toBe(true);
   });
 
@@ -96,7 +104,9 @@ describe("audit fixes", () => {
         },
       },
     };
-    const first = await validateToolInput(schema, {}) as { opts: { n: number } };
+    const first = await validateToolInput(schema, {}) as {
+      opts: { n: number };
+    };
     first.opts.n = 9;
     expect(await validateToolInput(schema, {})).toEqual({ opts: { n: 1 } });
     await expect(validateToolInput(schema, "nope")).rejects.toThrow(/object/);
@@ -135,6 +145,8 @@ describe("audit fixes", () => {
     });
     expect(manifest.tools?.[0]?.available_in_subagents).toBe(false);
     expect(manifest.tools?.[0]?.annotations?.readOnlyHint).toBe(false);
-    expect(manifest.tools?.[0]?.output_schema).toMatchObject({ type: "object" });
+    expect(manifest.tools?.[0]?.output_schema).toMatchObject({
+      type: "object",
+    });
   });
 });

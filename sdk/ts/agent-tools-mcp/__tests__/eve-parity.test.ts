@@ -316,8 +316,9 @@ describe("Eve parity: defaults, deferred, endsTurn, outputSchema", () => {
       [{ name: "t", def: tool, sourcePath: "t.ts" }],
       rpcBase,
     );
-    const listed = (list?.result as { tools: { outputSchema?: { type?: string } }[] })
-      .tools[0];
+    const listed =
+      (list?.result as { tools: { outputSchema?: { type?: string } }[] })
+        .tools[0];
     expect(listed?.outputSchema?.type).toBe("object");
   });
 });
