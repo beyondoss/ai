@@ -231,6 +231,15 @@ jobs:
         if: matrix.name == 'agent-rest'
         run: npm ci
         working-directory: sdk/ts
+      # The compiled binary is what ships into sandboxes, and it resolves packages differently from
+      # `bun src/cli.ts`, so agent_tools_mcp runs against it (and its compiled-binary test fails, not
+      # skips, without it). TOOLS_MCP_BIN reaches nextest through GITHUB_ENV -> the `test` step's
+      # environment -> its `--setenv` list.
+      - name: compile tools-mcp
+        if: matrix.name == 'agent-rest'
+        run: |
+          sdk/ts/agent-tools-mcp/scripts/compile.sh
+          echo "TOOLS_MCP_BIN=$PWD/sdk/ts/agent-tools-mcp/bin/tools-mcp" >> "$GITHUB_ENV"
       # agent-code-mode is the one shard that cannot use the archive: it needs `--features code-mode`
       # (QuickJS), which would change the feature set of every other binary. It compiles for itself,
       # but only the agent's own dependency graph (`-p beyond-agent`), not the workspace.

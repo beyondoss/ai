@@ -482,6 +482,10 @@ async fn a_connector_that_is_not_a_sandbox_one_ignores_the_tool_flags() {
 #[test]
 fn compiled_binary_resolves_eve_tools_from_the_bundles_node_modules() {
     let Some(tools_mcp) = compiled_bin() else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "TOOLS_MCP_BIN is unset and CI is set: the compiled-binary test would pass without running"
+        );
         eprintln!("skip: set TOOLS_MCP_BIN to the compiled tools-mcp");
         return;
     };
