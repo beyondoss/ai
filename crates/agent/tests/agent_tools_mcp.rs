@@ -500,12 +500,12 @@ fn compiled_binary_resolves_eve_tools_from_the_bundles_node_modules() {
         assert!(ok, "cp {} {}", from.display(), to.display());
     };
     copy(&pkg.join("eve-shim"), &nm.join("eve"));
-    copy(&pkg.join("package.json"), &nm.join("@beyond.dev/tools/package.json"));
-    copy(&pkg.join("src"), &nm.join("@beyond.dev/tools/src"));
     copy(
-        &package_root().join("../node_modules/zod"),
-        &nm.join("zod"),
+        &pkg.join("package.json"),
+        &nm.join("@beyond.dev/tools/package.json"),
     );
+    copy(&pkg.join("src"), &nm.join("@beyond.dev/tools/src"));
+    copy(&package_root().join("../node_modules/zod"), &nm.join("zod"));
     copy(
         &package_root().join("../node_modules/@standard-schema"),
         &nm.join("@standard-schema"),
