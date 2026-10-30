@@ -49,7 +49,8 @@ export class Sandbox {
 
   /**
    * Connect to an exec endpoint (`{url, token}`) or wrap your own transport (`{transport}`), and
-   * probe the sandbox once (one round trip) so a bad URL or token fails here, not on first use.
+   * probe once. A bad URL or token fails here. For a transport you already hold with no probe,
+   * use {@link Sandbox}’s constructor.
    */
   static async connect(options: ConnectOptions): Promise<Sandbox> {
     const transport = "transport" in options

@@ -143,10 +143,12 @@ async fn connect_reaches_an_endpoint_with_a_bearer_and_streams() {
     )
     .await;
 
-    // Connecting sends nothing; the first request is where a wrong bearer is refused.
-    let wrong = Sandbox::connect(mock.url.clone(), "nope").await.unwrap();
-    let refused = wrong.exec("true", [] as [&str; 0]).run().await;
-    assert!(refused.unwrap_err().to_string().contains("401"));
+    // connect probes: a wrong bearer fails there, not on a later call.
+    let err = match Sandbox::connect(mock.url.clone(), "nope").await {
+        Ok(_) => panic!("wrong bearer must fail at connect"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("401"), "expected 401, got: {err}");
 
     let sandbox = Sandbox::connect(mock.url.clone(), TokenSource::fixed("secret"))
         .await

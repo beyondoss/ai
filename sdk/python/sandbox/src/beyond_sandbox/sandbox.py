@@ -86,9 +86,14 @@ class Sandbox:
         ssl_context: ssl.SSLContext | None = None,
         override: CapsOverride | None = None,
     ) -> Sandbox:
-        """A sandbox behind an exec endpoint. Nothing is sent until the first call."""
+        """Connect to an exec endpoint and probe once. A bad URL or token fails here.
+
+        For a transport you already hold with no probe, construct :class:`Sandbox` directly.
+        """
         http = HttpTransport(url, token, headers=headers, ssl_context=ssl_context)
-        return cls(http, override=override)
+        sb = cls(http, override=override)
+        sb.capabilities()
+        return sb
 
     def exec(
         self,
@@ -164,7 +169,7 @@ class AsyncSandbox:
         self.jobs = AsyncJobs(transport)
 
     @classmethod
-    def connect(
+    async def connect(
         cls,
         url: str,
         token: AsyncToken = None,
@@ -173,8 +178,14 @@ class AsyncSandbox:
         ssl_context: ssl.SSLContext | None = None,
         override: CapsOverride | None = None,
     ) -> AsyncSandbox:
+        """Connect to an exec endpoint and probe once. A bad URL or token fails here.
+
+        For a transport you already hold with no probe, construct :class:`AsyncSandbox` directly.
+        """
         http = AsyncHttpTransport(url, token, headers=headers, ssl_context=ssl_context)
-        return cls(http, override=override)
+        sb = cls(http, override=override)
+        await sb.capabilities()
+        return sb
 
     async def exec(
         self,

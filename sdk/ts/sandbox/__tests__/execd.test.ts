@@ -51,11 +51,10 @@ d("against a loopback execd", () => {
     expect(nf.exitCode).toBe(127);
   });
 
-  it("fails connect with auth on a wrong token", async () => {
-    await expect(Sandbox.connect({ url: execd!.url, token: "wrong" })).rejects
-      .toMatchObject({
-        kind: "auth",
-      });
+  it("connect probes and fails with auth on a wrong or missing token", async () => {
+    await expect(
+      Sandbox.connect({ url: execd!.url, token: "wrong" }),
+    ).rejects.toMatchObject({ kind: "auth" });
     await expect(Sandbox.connect({ url: execd!.url })).rejects.toMatchObject({
       kind: "auth",
     });

@@ -147,28 +147,24 @@ const jobJson = (j: JobInfo): Json => ({
 
 export class Driver {
   private readonly cfg: DriverConfig;
-  private connected:
-    | Promise<
-      Sandbox | DriverError
-    >
-    | undefined;
+  private connected: Promise<Sandbox> | undefined;
 
   constructor(cfg: DriverConfig) {
     this.cfg = cfg;
   }
 
   /**
-   * Connect and probe on the first request that needs it; a failure is every op's answer. The
-   * driver goes through `Sandbox`, the surface a user holds, so its wiring is under test too.
+   * Connect (and probe) on the first request that needs it; a failure is that op's answer. The
+   * driver goes through `Sandbox`, so its wiring is under test too.
    */
-  private connect() {
+  private connect(): Promise<Sandbox> {
     this.connected ??= Sandbox.connect({
       url: this.cfg.url,
       token: this.cfg.tokenCmd
         ? tokenFromCommand(this.cfg.tokenCmd)
         : this.cfg.bearer || undefined,
       files: { overrides: this.cfg.caps },
-    }).catch(toError);
+    });
     return this.connected;
   }
 
@@ -193,9 +189,7 @@ export class Driver {
           },
         };
       }
-      const conn = await this.connect();
-      if ("kind" in conn) throw new Reject(conn);
-      return { id, ok: await this.dispatch(op, req, conn) };
+      return { id, ok: await this.dispatch(op, req, await this.connect()) };
     } catch (e) {
       return { id, error: e instanceof Reject ? e.err : toError(e) };
     }

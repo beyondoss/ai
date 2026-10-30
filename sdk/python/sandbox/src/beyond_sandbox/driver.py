@@ -27,9 +27,11 @@ import traceback
 from typing import Any, Callable, cast
 
 from . import AsyncSandbox, Exit, Sandbox, SandboxError, Signal, Stderr, Stdout, TimedOut, _bulk
+from .atransport import AsyncHttpTransport
 from .errors import InvalidRequestError, IoError
 from .files import CapsOverride
 from .models import Stat
+from .transport import HttpTransport
 
 Result = dict[str, Any]
 
@@ -639,11 +641,26 @@ class Driver:
         cmd = os.environ.get("CONFORMANCE_TOKEN_CMD")
         if cmd:
             token = _token_from(cmd, use_async)
-        override = _override()
-        if use_async:
-            self.sb: Any = AsyncSandbox.connect(url, token, override=override)
-        else:
-            self.sb = Sandbox.connect(url, token, override=override)
+        self._url = url
+        self._token = token
+        self._override = _override()
+        # Public Sandbox.connect probes; the driver defers that until an op needs the endpoint
+        # so hello/bad-request answers work without a live URL.
+        self.sb: Any = None
+
+    def _ensure_sync(self) -> Any:
+        # Construct without probing: plan()/Jobs validate client-side first, so a bad job id
+        # stays invalid_request instead of racing a transport error. Public Sandbox.connect still probes.
+        if self.sb is None:
+            self.sb = Sandbox(HttpTransport(self._url, self._token), override=self._override)
+        return self.sb
+
+    async def _ensure_async(self) -> Any:
+        if self.sb is None:
+            self.sb = AsyncSandbox(
+                AsyncHttpTransport(self._url, self._token), override=self._override
+            )
+        return self.sb
 
     def parse(self, line: str) -> tuple[Any, str, dict[str, Any]]:
         try:
@@ -658,7 +675,7 @@ class Driver:
     def meta(self, op: str) -> Any:
         if op == "hello":
             return {"driver": self.name, "protocol": 1, "ops": OPS, "features": FEATURES}
-        return self.sb.capabilities()
+        return self._ensure_sync().capabilities()
 
     @staticmethod
     def caps_result(c: Any) -> Result:
@@ -677,11 +694,13 @@ class Driver:
             if op == "hello":
                 return {"id": id_, "ok": self.meta(op)}
             if op == "capabilities":
-                return {"id": id_, "ok": self.caps_result(self.meta(op))}
+                sb = self._ensure_sync()
+                return {"id": id_, "ok": self.caps_result(sb.capabilities())}
             if op in _BULK_OPS:
-                return {"id": id_, "ok": _bulk_sync(op, req, self.sb)}
+                return {"id": id_, "ok": _bulk_sync(op, req, self._ensure_sync())}
+            # Validate the request before connecting so a bad payload is never a transport error.
             call, shape = plan(op, req)
-            return {"id": id_, "ok": shape(call(self.sb))}
+            return {"id": id_, "ok": shape(call(self._ensure_sync()))}
         except Exception as e:
             return _fail(id_, e)
 
@@ -694,11 +713,14 @@ class Driver:
             if op == "hello":
                 return {"id": id_, "ok": self.meta(op)}
             if op == "capabilities":
-                return {"id": id_, "ok": self.caps_result(await self.meta(op))}
+                sb = await self._ensure_async()
+                return {"id": id_, "ok": self.caps_result(await sb.capabilities())}
             if op in _BULK_OPS:
-                return {"id": id_, "ok": await _bulk_async(op, req, self.sb)}
+                sb = await self._ensure_async()
+                return {"id": id_, "ok": await _bulk_async(op, req, sb)}
             call, shape = plan(op, req)
-            result = call(self.sb)
+            sb = await self._ensure_async()
+            result = call(sb)
             if inspect.isawaitable(result):
                 result = await result
             return {"id": id_, "ok": shape(result)}
@@ -729,7 +751,8 @@ async def _serve_async(driver: Driver) -> None:
     while line := sys.stdin.readline():
         if line.strip():
             _emit(await driver.ahandle(line))
-    await driver.sb.aclose()
+    if driver.sb is not None:
+        await driver.sb.aclose()
 
 
 if __name__ == "__main__":

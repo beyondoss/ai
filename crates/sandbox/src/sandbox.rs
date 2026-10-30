@@ -112,8 +112,9 @@ pub struct Sandbox {
 }
 
 impl Sandbox {
-    /// Connect to the exec endpoint at `url`, authenticating with `token`. Sends nothing: the file helpers
-    /// look at the sandbox's tools once, in one command, when the first one needs to know.
+    /// Connect to the exec endpoint at `url`, authenticating with `token`, and probe once.
+    /// A bad URL or token fails here. For an [`Exec`](crate::Exec) you already hold with no probe,
+    /// use [`Self::over`] or [`Self::with_capabilities`].
     pub async fn connect(
         url: impl Into<String>,
         token: impl Into<TokenSource>,
@@ -121,10 +122,13 @@ impl Sandbox {
         let exec = HttpExecRunner::new(url)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
             .bearer(token);
-        Self::over(Arc::new(exec)).await
+        let sb = Self::over(Arc::new(exec)).await?;
+        sb.files.capabilities().await?;
+        Ok(sb)
     }
 
-    /// A sandbox over any [`Exec`](crate::Exec): a vendor SDK, a test double.
+    /// A sandbox over any [`Exec`](crate::Exec): a vendor SDK, a test double. Does not probe;
+    /// the file helpers look at the target once when the first one needs to know.
     pub async fn over(exec: Arc<dyn CommandRunner>) -> std::io::Result<Self> {
         let files = Arc::new(ShellFs::connect(exec.clone()).await?);
         let jobs = Jobs::over(exec.clone());

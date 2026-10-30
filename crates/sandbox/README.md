@@ -1,8 +1,9 @@
 # beyond-sandbox
 
-**Run commands, edit files and keep jobs in any sandbox, from Rust.** One client for the exec protocol,
-with the file and job helpers an agent needs built on top of it. It is the code the Beyond agent itself runs in a
-sandbox, extracted so anything else can use it.
+**Connect to any sandbox that speaks the exec protocol, from Rust.** This crate does **not** create,
+pause, or destroy VMs — lifecycle stays with the platform that gave you the URL. One client for the
+exec protocol, with the file and job helpers an agent needs built on top of it. It is the code the
+Beyond agent itself runs in a sandbox, extracted so anything else can use it.
 
 ```rust,no_run
 use beyond_sandbox::exec_endpoint::jobs::{JobId, JobScope};
@@ -11,11 +12,13 @@ use beyond_sandbox::{FsBackend, Sandbox, TokenSource};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The token source is asked again, once, if the endpoint answers 401 (Beyond's expire within 24 h).
+    // connect probes once; a bad URL or token fails here.
     let sb = Sandbox::connect(
         "https://exec.example/run",
         TokenSource::command(["mint-exec-token"]),
     )
     .await?;
+    // argv, not a shell string: each argument is inert (a path like `; rm -rf /` stays one arg).
     let uname = sb.exec("uname", ["-a"]).run().await?; // stdout and stderr are the bytes the command wrote
     println!("{}", uname.stdout_text());
     sb.files()
@@ -56,11 +59,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Three layers, each usable alone
 
-| layer      | what                                          | you use                                                                      |
-| ---------- | --------------------------------------------- | ---------------------------------------------------------------------------- |
-| 1. exec    | run a command: one-shot, streamed, with stdin | `Exec` (the trait), `HttpExec`, or your own                                  |
-| 2. helpers | files and search, jobs: built only on layer 1 | `Files::over(exec)`, `Jobs::over(exec)`                                      |
-| 3. surface | one object that owns all three                | `Sandbox::connect(url, token)`, `.exec(..)`, `.files()`, `.jobs()`, `.raw()` |
+| layer      | what                                          | you use                                                                               |
+| ---------- | --------------------------------------------- | ------------------------------------------------------------------------------------- |
+| 1. exec    | run a command: one-shot, streamed, with stdin | `Exec` (the trait), `HttpExec`, or your own                                           |
+| 2. helpers | files and search, jobs: built only on layer 1 | `Files::over(exec)`, `Jobs::over(exec)`                                               |
+| 3. surface | one object that owns all three                | `Sandbox::connect(url, token)` (probes), `.exec(..)`, `.files()`, `.jobs()`, `.raw()` |
 
 **Public names vs rustdoc types.** The crate root re-exports the names you write in examples; the defining types keep
 the names the agent extracted them under:

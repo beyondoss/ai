@@ -27,7 +27,7 @@ depends on it; it depends on neither `beyond-agent` nor `beyond-agent-core`.
 ## Layers
 
 ```
-Sandbox            layer 3   connect, .exec() .files() .jobs() .raw()          src/sandbox.rs
+Sandbox            layer 3   connect (probes), .exec() .files() .jobs() .raw() src/sandbox.rs
 Files  Jobs        layer 2   built only on layer 1                              src/fs/shell.rs, src/exec_endpoint/jobs*.rs
 Exec               layer 1   run, run_streaming(_tracked), run_attached,        src/exec.rs
                              run_with_stdin, sandbox_jobs, ready
@@ -36,7 +36,7 @@ Exec               layer 1   run, run_streaming(_tracked), run_attached,        
 
 **Layer 1 is one trait.** `Exec` is `exec::CommandRunner`. `run`, `run_streaming`, `run_streaming_tracked` and
 `run_attached` are required: every implementation streams and can be stopped. `run_with_stdin` answers `Unsupported`
-unless overridden, `ready` is a no-op, and `sandbox_jobs` is `None` for a runner whose commands run on this host.
+unless overridden, `ready` is a no-op (lazy attach for an embedding program), and `sandbox_jobs` is `None` for a runner whose commands run on this host.
 Calling a sink is a promise that every byte of both streams went through it.
 
 **Layer 2 never reaches below the trait.** `ShellFs` (`Files`) builds every file operation from `Exec::run` and
@@ -47,6 +47,8 @@ Calling a sink is a promise that every byte of both streams went through it.
 
 **Layer 3 is a holder.** `Sandbox` owns an `Arc<dyn Exec>`, the `ShellFs` over it and the `Jobs`, and hands the
 raw `Exec` back (`.raw()`), so nothing the helpers do is out of reach of a caller who needs something else.
+`Sandbox::connect` probes capabilities once so a bad URL or token fails there; `Sandbox::over` /
+`with_capabilities` skip that for tests and BYO transports.
 
 ## The HTTP client (`exec_endpoint.rs`)
 

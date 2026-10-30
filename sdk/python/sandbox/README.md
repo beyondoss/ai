@@ -1,13 +1,15 @@
 # beyond-sandbox
 
-Run commands in a sandbox, and read, write and search its files, over the exec protocol. Pure
-Python, no dependencies, sync and asyncio, fully typed.
+**Connect to any sandbox that speaks the exec protocol.** This package does **not** create, pause, or
+destroy VMs — lifecycle stays with the platform that gave you the URL (Beyond, E2B with
+[`execd`](../../../crates/execd) installed, Docker, …). Here you run commands, read, write and search
+files, and keep background jobs. Pure Python, no dependencies, sync and asyncio, fully typed.
 
 ```python
 from beyond_sandbox import Sandbox
 
-sb = Sandbox.connect("https://sandbox.example/exec", token="...")   # nothing is sent yet
-sb.exec("git", ["status", "--porcelain"], cwd="/work").stdout_text  # raw exec: a result, any exit code
+sb = Sandbox.connect("https://sandbox.example/exec", token="...")   # probes; bad URL/token fails here
+sb.exec("git", ["status", "--porcelain"], cwd="/work").stdout_text  # argv, not a shell string
 sb.files.write("/work/hello.py", "print('hi')\n")                   # atomic; str or bytes; keeps mode
 sb.files.read_text("/work/hello.py")                                # UTF-8 view of read (lossy, like stdout_text)
 sb.files.search("TODO", "/work", glob="*.py", before=1).hits        # rg, grep or busybox grep, whichever is there
@@ -20,9 +22,9 @@ print(sb.jobs.read("my-session", "dev").data)                       # its output
 ```python
 from beyond_sandbox import AsyncSandbox
 
-async with AsyncSandbox.connect("https://sandbox.example/exec", token="...") as sb:
-    await sb.files.write("/work/a.txt", "x")
-    results = await asyncio.gather(sb.exec("uname"), sb.files.read_text("/work/a.txt"))
+sb = await AsyncSandbox.connect("https://sandbox.example/exec", token="...")
+await sb.files.write("/work/a.txt", "x")
+results = await asyncio.gather(sb.exec("uname"), sb.files.read_text("/work/a.txt"))
 ```
 
 It speaks the exec protocol (one `POST` per command; streaming; sandbox-native jobs), as
@@ -47,6 +49,29 @@ Every failure is a `SandboxError` whose `kind` is the spec's error name (`not_fo
 also a class (`NotFoundError`, `ConflictError`, `AuthError`, `NotOfferedError`, ...). A command that
 exits non-zero is a result, not an error.
 
+## Why argv, not a shell string
+
+`exec("ls", ["-l", path])` takes the program and each argument separately. A path like `` `; rm -rf /` ``
+is then one inert argument, never parsed by a shell. That matches the FILES-OVER-EXEC rule every helper
+follows. Other sandbox SDKs often take one shell string — convenient until a model-supplied path is
+interpolated. When you need a pipeline, run a **fixed** script and pass variables as `$1`, `$2`:
+
+```python
+sb.exec("sh", ["-c", 'find "$1" -name "$2"', "sh", dir, "*.py"])
+```
+
+## Connect probes
+
+`Sandbox.connect(url, token=...)` builds the client and probes once (positional URL, keyword options —
+idiomatic Python). A bad token raises `AuthError` there. `await AsyncSandbox.connect(...)` does the
+same under asyncio. Construct `Sandbox(transport)` / `AsyncSandbox(transport)` when you already hold a
+transport and do not want a probe (tests, BYO). The TypeScript client uses the same eager promise with
+an options-object `await Sandbox.connect({ url, token })`.
+
+`jobs.start(scope, id, command, args, *, cwd=..., label=...)` is positional for the required pieces
+and keyword-only for the rest. The TypeScript client takes a `JobSpec` object instead — same wire
+protocol, each language shaped for its callers.
+
 ## Authentication
 
 `token` is a string, or a function that returns one. The function is called on first use and once
@@ -55,7 +80,7 @@ retry in the package; every other failure is reported as it happened.
 
 ```python
 Sandbox.connect(url, token=lambda: fetch_short_lived_token())
-AsyncSandbox.connect(url, token=fetch_token_async)          # a coroutine function works too
+await AsyncSandbox.connect(url, token=fetch_token_async)    # a coroutine function works too
 ```
 
 ## Bring your own transport
@@ -144,8 +169,9 @@ Both return a `Transfer(files, dirs, links, bytes)`; `AsyncSandbox` has the same
   `ssl`, or `asyncio` streams, and nothing else. TLS verifies the certificate against the system
   roots (the default context is built once per transport); pass `ssl_context=` to change that.
 - The environment (busybox or GNU `find`, `rg` or `grep`, `dd`/`base64` flags) is probed once per
-  `Sandbox` in a single `sh -c` round trip, on the first read, list or search; writes need no probe.
-  A probe that fails (unreachable, `401`) raises from the call that needed it and is not remembered.
+  `Sandbox` in a single `sh -c` round trip: `connect` runs it up front; constructing from a transport
+  probes on the first read, list or search. Writes need no probe. A probe that fails (unreachable,
+  `401`) raises and is not remembered.
 
 ## How it is built
 
