@@ -161,12 +161,22 @@ bun --version
 mkdir -p /home/user/tools-mcp/src /home/user/workspace/tools /home/user/bin
 ' >/dev/null || fail "install bun"
 
-for f in cli.ts define-tool.ts load.ts manifest.ts rpc.ts serve-http.ts serve-stdio.ts eve-tools.ts index.ts bun-shim.d.ts; do
+for f in cli.ts define-tool.ts load.ts manifest.ts rpc.ts run-tool.ts schema.ts serve-http.ts serve-stdio.ts eve-tools.ts index.ts bun-shim.d.ts; do
   vm_put "/home/user/tools-mcp/src/$f" "$PKG/src/$f"
 done
+vm_put /home/user/tools-mcp/package.json "$PKG/package.json"
 vm_put /home/user/workspace/tools/get_weather.ts "$STAGE/tools/get_weather.ts"
+vm_put /home/user/workspace/package.json "$STAGE/package.json"
 vm_put /home/user/workspace/AGENTS.md "$STAGE/AGENTS.md"
 vm_put /home/user/workspace/.mcp.json "$STAGE/.mcp.json"
+vm_bash '
+set -e
+export PATH="$HOME/.bun/bin:$PATH"
+cd /home/user/tools-mcp && bun install --silent
+mkdir -p /home/user/workspace/node_modules/eve
+printf "%s\n" "{\"name\":\"eve\",\"type\":\"module\",\"exports\":{\"./tools\":\"/home/user/tools-mcp/src/eve-tools.ts\"}}" > /home/user/workspace/node_modules/eve/package.json
+cd /home/user/workspace && bun add zod@^4.1.5 --silent
+' >/dev/null || fail "bun install workspace"
 
 # Provider key as a file — never on argv.
 # shellcheck disable=SC2086

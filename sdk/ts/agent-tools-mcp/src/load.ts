@@ -2,25 +2,53 @@ import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-import type { ToolDefinition } from "./define-tool.js";
+import { defineTool, type DefinedTool } from "./define-tool.js";
+import { inputSchemaToJsonSchema, isPlainJsonSchema, isStandardSchema } from "./schema.js";
 
 export type LoadedTool = {
   name: string;
-  def: ToolDefinition;
+  def: DefinedTool;
   sourcePath: string;
 };
 
 const TOOL_EXT = /\.(ts|mts|js|mjs)$/;
 
-function isToolDefinition(value: unknown): value is ToolDefinition {
+function looksLikeToolDef(value: unknown): value is {
+  description: string;
+  inputSchema: unknown;
+  execute: (...args: never[]) => unknown;
+} {
   if (value === null || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
   return (
     typeof v.description === "string" &&
     v.inputSchema !== null &&
-    typeof v.inputSchema === "object" &&
+    v.inputSchema !== undefined &&
     typeof v.execute === "function"
   );
+}
+
+/** Accept `defineTool(...)` results or a raw Eve-shaped object (normalize through defineTool). */
+function asDefinedTool(value: unknown, sourcePath: string): DefinedTool {
+  if (looksLikeToolDef(value) && "jsonInputSchema" in (value as object)) {
+    return value as DefinedTool;
+  }
+  if (!looksLikeToolDef(value)) {
+    throw new Error(
+      `${sourcePath}: default export must be defineTool({ description, inputSchema, execute })`,
+    );
+  }
+  if (!isStandardSchema(value.inputSchema) && !isPlainJsonSchema(value.inputSchema)) {
+    throw new Error(
+      `${sourcePath}: inputSchema must be Zod/Standard Schema or a plain JSON Schema object`,
+    );
+  }
+  try {
+    return defineTool(value as Parameters<typeof defineTool>[0]);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`${sourcePath}: ${msg}`);
+  }
 }
 
 /** Load every `tools/*.{ts,js}` default export as a tool named by its file stem. */
@@ -37,16 +65,14 @@ export async function loadTools(dir: string): Promise<LoadedTool[]> {
     const mod = (await import(pathToFileURL(sourcePath).href)) as {
       default?: unknown;
     };
-    if (!isToolDefinition(mod.default)) {
-      throw new Error(
-        `${sourcePath}: default export must be defineTool({ description, inputSchema, execute })`,
-      );
-    }
+    const def = asDefinedTool(mod.default, sourcePath);
+    // Re-check JSON Schema is materializable (defineTool already did; keep assert for raw paths).
+    inputSchemaToJsonSchema(def.inputSchema);
     const name = file.replace(TOOL_EXT, "");
     if (!name) {
       throw new Error(`${sourcePath}: empty tool name`);
     }
-    out.push({ name, def: mod.default, sourcePath });
+    out.push({ name, def, sourcePath });
   }
   return out;
 }

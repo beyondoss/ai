@@ -1,5 +1,7 @@
 import type { ToolContext } from "./define-tool.js";
 import type { LoadedTool } from "./load.js";
+import { runTool } from "./run-tool.js";
+import { ToolInputValidationError } from "./schema.js";
 
 type JsonRpcRequest = {
   jsonrpc?: string;
@@ -51,7 +53,7 @@ export async function handleRpc(
         tools: tools.map((t) => ({
           name: t.name,
           description: t.def.description,
-          inputSchema: t.def.inputSchema,
+          inputSchema: t.def.jsonInputSchema,
           ...(t.def.annotations ? { annotations: t.def.annotations } : {}),
         })),
       },
@@ -75,9 +77,12 @@ export async function handleRpc(
         error: { code: -32602, message: `unknown tool: ${name}` },
       };
     }
-    const args = (body.params?.arguments ?? {}) as Record<string, unknown>;
+    const args = body.params?.arguments ?? {};
     try {
-      const result = await tool.def.execute(args, ctx);
+      const result = await runTool(tool.def, args, {
+        ...ctx,
+        toolName: tool.name,
+      });
       const text =
         typeof result === "string" ? result : JSON.stringify(result ?? null);
       return {
@@ -90,12 +95,15 @@ export async function handleRpc(
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      const data =
+        err instanceof ToolInputValidationError ? { issues: err.issues } : undefined;
       return {
         jsonrpc: "2.0",
         id,
         result: {
           content: [{ type: "text", text: message }],
           isError: true,
+          ...(data ? { _meta: data } : {}),
         },
       };
     }

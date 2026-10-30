@@ -15,7 +15,7 @@ export function toolsToCached(tools: LoadedTool[]): CachedTool[] {
   return tools.map((t) => ({
     remote_name: t.name,
     description: t.def.description,
-    input_schema: t.def.inputSchema,
+    input_schema: t.def.jsonInputSchema,
   }));
 }
 

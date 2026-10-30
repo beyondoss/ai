@@ -91,16 +91,31 @@ HOST_BIN=$PKG/bin/tools-mcp
 COMPILE_MODE=$(cat "$PKG/bin/tools-mcp.mode")
 pass "host binary mode=$COMPILE_MODE size=$(ls -lh "$HOST_BIN" | awk '{print $5}')"
 
-# --- 2) Manifest + local call --------------------------------------------------------------------
+# --- 2) Manifest + local call (real eve/tools + Zod, not a plain-object fake) --------------------
 say "manifest + local call"
 STAGE=$(mktemp -d)
 cp -R "$AGENT_DIR/." "$STAGE/"
+# Resolve `import … from "eve/tools"` + zod. STAGE is under /tmp so file: relatives
+# in package.json break — link abs paths instead (same modules an install would get).
+(cd "$PKG" && npm install --silent)
+ZOD_DIR=$(cd "$PKG" && node -e "console.log(require('path').dirname(require.resolve('zod')))")
+# Walk up from the package entry to its package root (exports often hide package.json).
+SPEC_DIR=$(cd "$PKG" && node -e "let p=require.resolve('@standard-schema/spec');const fs=require('fs');const path=require('path');for(;;){if(fs.existsSync(path.join(p,'package.json'))){console.log(p);break}const n=path.dirname(p);if(n===p)process.exit(1);p=n}")
+mkdir -p "$STAGE/node_modules/@beyond.dev" "$STAGE/node_modules/@standard-schema"
+ln -sfn "$PKG" "$STAGE/node_modules/@beyond.dev/agent-tools-mcp"
+ln -sfn "$PKG/eve-shim" "$STAGE/node_modules/eve"
+ln -sfn "$ZOD_DIR" "$STAGE/node_modules/zod"
+ln -sfn "$SPEC_DIR" "$STAGE/node_modules/@standard-schema/spec"
 "$HOST_BIN" manifest --dir "$STAGE/tools" --name tools -o "$STAGE/.mcp-tools.json"
 jq -e '.tools | length == 1 and .[0].remote_name == "get_weather"' "$STAGE/.mcp-tools.json" >/dev/null \
   || fail "manifest"
+# Zod → JSON Schema must have landed in the cached tool list.
+jq -e '.tools[0].input_schema.type == "object"' "$STAGE/.mcp-tools.json" >/dev/null || fail "zod json schema"
 CALL=$("$HOST_BIN" call --dir "$STAGE/tools" get_weather '{"city":"NYC"}')
 echo "$CALL" | jq -e '.result.structuredContent.temperatureF == 72' >/dev/null || fail "call: $CALL"
-pass "local manifest + call"
+BAD=$("$HOST_BIN" call --dir "$STAGE/tools" get_weather '{"city":""}' || true)
+echo "$BAD" | jq -e '.result.isError == true' >/dev/null || fail "expected Zod reject empty city: $BAD"
+pass "local manifest + call (Zod validate)"
 
 if [ "$MODE" = local ]; then
   say "local-only done"
@@ -132,16 +147,23 @@ bun --version
 mkdir -p /home/user/tools-mcp/src /home/user/workspace/tools
 ' >/dev/null || fail "install bun"
 
-for f in cli.ts define-tool.ts load.ts manifest.ts rpc.ts serve-http.ts serve-stdio.ts eve-tools.ts index.ts bun-shim.d.ts; do
+for f in cli.ts define-tool.ts load.ts manifest.ts rpc.ts run-tool.ts schema.ts serve-http.ts serve-stdio.ts eve-tools.ts index.ts bun-shim.d.ts; do
   vm_put "/home/user/tools-mcp/src/$f" "$PKG/src/$f"
 done
+vm_put /home/user/tools-mcp/package.json "$PKG/package.json"
 vm_put /home/user/workspace/tools/get_weather.ts "$STAGE/tools/get_weather.ts"
+vm_put /home/user/workspace/package.json "$STAGE/package.json"
 pass "sources uploaded"
 
 say "start tools-mcp"
 START_OUT=$(vm_bash "
 set -e
 export PATH=\"\$HOME/.bun/bin:\$PATH\"
+cd /home/user/tools-mcp && bun install --silent
+# Eve path: node_modules/eve/tools → guest eve-tools.ts
+mkdir -p /home/user/workspace/node_modules/eve
+printf '%s\\n' '{\"name\":\"eve\",\"type\":\"module\",\"exports\":{\"./tools\":\"/home/user/tools-mcp/src/eve-tools.ts\"}}' > /home/user/workspace/node_modules/eve/package.json
+cd /home/user/workspace && bun add zod@^4.1.5 --silent
 cd /home/user/tools-mcp
 setsid nohup bun run src/cli.ts serve --dir /home/user/workspace/tools --http 0.0.0.0:$BRIDGE_PORT \
   >/tmp/tools-mcp.log 2>&1 </dev/null &

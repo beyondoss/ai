@@ -1,41 +1,54 @@
 # @beyond.dev/agent-tools-mcp
 
-Run **Eve / Agent-SDK-shaped `tools/*.ts`** as an MCP server **inside a Beyond sandbox**.
-
-The Beyond agent cell is already an MCP client (`sandbox: true` connectors + bundle `.mcp-tools.json`). This package is the missing guest: load `defineTool` modules, speak a minimal MCP surface (`initialize` / `tools/list` / `tools/call`), stamp the manifest at pack time, and ship a **Bun AOT + `--trim` + `--smol`** executable.
-
-```bash
-# local
-bun run src/cli.ts call --dir examples/weather/tools get_weather '{"city":"NYC"}'
-bun run src/cli.ts manifest --dir examples/weather/tools --name tools -o /tmp/.mcp-tools.json
-bun run src/cli.ts serve --dir examples/weather/tools --http 8931
-
-# in-sandbox binary (build on the guest OS/arch)
-npm run compile   # → bin/tools-mcp
-./bin/tools-mcp serve --dir ./tools --http 127.0.0.1:8931
-```
-
-## Author shape
+**Eve / Agent-SDK-compatible `defineTool`** for Beyond sandboxes: Zod (or any Standard Schema, or plain JSON Schema), validate-before-execute, filename = tool name, MCP guest for `beyond-agent`.
 
 ```ts
-// tools/get_weather.ts
-import { defineTool } from "eve/tools"; // alias to @beyond.dev/agent-tools-mcp/eve-tools
+import { defineTool } from "eve/tools"; // → @beyond.dev/agent-tools-mcp/eve-tools
+import { z } from "zod";
 
 export default defineTool({
-  description: "Get the weather for a city",
-  inputSchema: { type: "object", properties: { city: { type: "string" } }, required: ["city"] },
+  description: "Get the current weather for a city.",
+  inputSchema: z.object({ city: z.string().min(1) }),
   async execute({ city }, ctx) {
-    return { city, condition: "sunny" };
+    return { city, condition: "sunny", temperatureF: 72 };
   },
 });
 ```
 
-Agent `package.json`:
+## Eve parity (tools surface)
+
+| Eve | This package |
+| --- | --- |
+| `defineTool` from `eve/tools` | Yes (`eve-tools` export / `imports` map) |
+| Filename stem = tool name | Yes (`tools/get_weather.ts` → `get_weather`) |
+| `inputSchema`: Zod / Standard Schema / JSON Schema | Yes |
+| Infer `execute` input from Zod / Standard Schema | Yes |
+| Validate input before `execute` | Yes |
+| JSON Schema to the model (strip `$schema`) | Yes (`jsonInputSchema` → MCP + `.mcp-tools.json`) |
+| `outputSchema`, `toModelOutput`, async generators | Partial (`toModelOutput` + async iter drain; `outputSchema` typed/stored) |
+| `endsTurn`, `deferred`, `availableInSubagents` | Accepted on the def; Beyond agent loop does not enforce yet |
+| Full Eve `ctx` (sandbox handle, approvals, …) | `env`, `workspaceRoot`, `toolName`, `signal` |
+| Eve agent runtime / connections / workflows | No — Beyond hosts the agent; this is the **tool guest** |
+
+## Commands
+
+```bash
+bun run src/cli.ts call --dir examples/weather/tools get_weather '{"city":"NYC"}'
+bun run src/cli.ts manifest --dir examples/weather/tools --name tools -o /tmp/.mcp-tools.json
+bun run src/cli.ts serve --dir examples/weather/tools --http 8931
+npm run compile   # → bin/tools-mcp (AOT, JIT fallback)
+```
+
+## Agent project
+
+`import { defineTool } from "eve/tools"` needs a package named `eve` (Node does not remap bare `eve/tools` via `imports`). Use the shipped shim:
 
 ```json
 {
-  "imports": {
-    "eve/tools": "@beyond.dev/agent-tools-mcp/eve-tools"
+  "dependencies": {
+    "@beyond.dev/agent-tools-mcp": "…",
+    "eve": "file:…/agent-tools-mcp/eve-shim",
+    "zod": "^4"
   }
 }
 ```
@@ -43,30 +56,14 @@ Agent `package.json`:
 ## Bundle + grant
 
 1. `beyond-agent-tools-mcp manifest --dir tools --name tools -o .mcp-tools.json`
-2. Pack the agent folder (ustar) including `tools/`, the compiled `tools-mcp` binary, and `.mcp-tools.json`
+2. Pack the agent folder (ustar) including `tools/`, deps, compiled `tools-mcp`, `.mcp-tools.json`
 3. Grant: `mcp: [{ name: "tools", url: "<exec-front>/mcp/<session>?…", sandbox: true }]`
-4. Front on first MCP dial: seed bundle → `./tools-mcp serve --dir tools --http …` → forward
+4. Front on first MCP dial: seed bundle → `tools-mcp serve --dir tools` → forward
 
-Harness (`beyond-agent`) needs no protocol changes.
-
-## Compile flags (AOT with JIT fallback)
-
-`scripts/compile.sh` is part of the **pack workflow**, not a separate experiment:
-
-1. Try **AOT**: `bun compile --trim --aot-allow-code-from-disk --compile-exec-argv=--smol`
-2. If AOT fails (types, experimental compiler, …) → **JIT-in-binary**: `bun compile --no-aot --trim --compile-exec-argv=--smol`
-3. Writes `bin/tools-mcp` and `bin/tools-mcp.mode` (`aot` or `jit`)
-
-`FORCE_NO_AOT=1` skips to JIT (used by `deploy/demo/tools_mcp_e2e.sh --jit` to prove the fallback artifact).
-
-`--aot-allow-code-from-disk` is AOT-only (Bun requires `--aot`). JIT executables load `tools/*.ts` from disk without that flag.
-
-End-to-end proof (host compile + E2B MCP round-trip):
+## Proof
 
 ```bash
-./deploy/demo/tools_mcp_e2e.sh          # needs E2B_API_KEY
-./deploy/demo/tools_mcp_e2e.sh --local  # compile + manifest + call only
-./deploy/demo/tools_mcp_e2e.sh --jit --local
+./deploy/demo/tools_mcp_e2e.sh --local
+./deploy/demo/tools_mcp_e2e.sh          # E2B_API_KEY
+./deploy/demo/tools_agent_e2e.sh        # agent → E2B → get_weather
 ```
-
-Measure RSS on a real Linux sandbox before tuning `--max-old-space-size`.
