@@ -1,0 +1,15 @@
+{
+  "name": "eve",
+  "version": "0.0.0-beyond",
+  "private": true,
+  "type": "module",
+  "description": "Shim so `import { defineTool } from \"eve/tools\"` resolves to @beyond.dev/agent-tools-mcp (Eve-compatible path).",
+  "exports": {
+    "./tools": {
+      "bun": "./tools.ts",
+      "types": "./tools.ts",
+      "import": "./tools.ts",
+      "default": "./tools.ts"
+    }
+  }
+}

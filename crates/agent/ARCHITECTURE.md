@@ -6232,6 +6232,14 @@ fetch it, `bundle.sha256` what it must hash to). `bundle.rs` does the rest:
   cache). Without the file, or for a connector that is not `sandbox`, nothing changes. The lists are
   held per session, copied from the file into that connector's dial, and freed with the session.
   `tests/serve_service_bundle_mcp_tools.rs`.
+- **Agent tools as sandbox MCP.** A folder of Eve-shaped `tools/*.ts` modules (`defineTool` + Zod,
+  `import { defineTool } from "eve/tools"`) can run as an MCP server inside the sandbox via
+  `@beyond.dev/agent-tools-mcp` (`tools-mcp` binary). The grant names a `sandbox: true` connector whose
+  URL is the exec front with `tools=<https URL of the linux binary>`; the front seeds the bundle, starts
+  the binary against the seeded `tools/` directory, and bridges MCP. A `.mcp-tools.json` stamped at
+  bundle build (CLI `manifest`) cold-opens the menu without a VM; the first tool call creates the
+  sandbox and dials live. Demo: `deploy/demo/demo.sh tools`, `deploy/demo/tools_agent_e2e.sh`,
+  `tests/agent_tools_mcp.rs` / `tests/agent_tools_e2b.rs`.
 - **Skill scripts.** When a sandbox does exist, how the bundle's files reach it (so a skill's script
   can run there) is the control plane's job; the replica never copies the bundle into a sandbox. The
   demo's `mint-grant --bundle url=sha256` carries the claim.

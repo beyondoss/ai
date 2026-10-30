@@ -63,8 +63,8 @@ fi
 MODE=${1:-core}
 case "$MODE" in
   core | kill | all) ;;
-  assistant | coding | browser | oidc) USECASE=1 ;;
-  *) echo "usage: demo.sh [core|kill|all|assistant|coding|browser|oidc]" >&2; exit 2 ;;
+  assistant | coding | browser | tools | oidc) USECASE=1 ;;
+  *) echo "usage: demo.sh [core|kill|all|assistant|coding|browser|tools|oidc]" >&2; exit 2 ;;
 esac
 USECASE=${USECASE:-}
 declare -n CHECKS="CHECKS_$MODE"

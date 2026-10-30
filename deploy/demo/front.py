@@ -9,14 +9,14 @@ seeds the agent folder into it from the bundle, and from then on forwards every 
 streaming the answer back as it arrives. A session that never calls a sandbox tool never costs a VM.
 
 A sandbox MCP server is fronted the same way: `http://<front>:8084/mcp/<session>?bundle=<tar url>&browser=<url
-of the rustwright-mcp binary>&site=<dir>` is the connector's stable address. The first request for a
-session creates its VM like an exec request does and, because it is an MCP request, also installs the
-browser stack and starts the bridge (`vm_browser_start`) before forwarding to it. The
+of the rustwright-mcp binary>&site=<dir>` is the connector's stable address. For Eve-shaped tools,
+pass `tools=<https url of the linux tools-mcp binary>` instead of `browser=`; after seed the front
+runs `vm_tools_start` (AOT or JIT-fallback binary serving MCP on the bridge port). The
 agent advertises the server's tools from a list saved in its bundle, so nothing dials this address (and
 no VM exists) until the model first calls one of them.
 
 One JSON line per event goes to stdout (CloudWatch): `first_request`, `vm_create_start`, `vm_ready`,
-`vm_seeded`, `browser_ready`, and `exec_request` / `mcp_request` for every request forwarded. The E2B key comes from the environment
+`vm_seeded`, `browser_ready` / `tools_ready`, and `exec_request` / `mcp_request` for every request forwarded. The E2B key comes from the environment
 and is only ever handed to the helper functions in e2b.sh.
 """
 import http.client
@@ -63,13 +63,14 @@ def log(event, **detail):
 
 # Runs in bash so the creation is the demo's own tested code. The folder is fetched by the VM itself
 # (a presigned URL), so the bytes never pass through here.
+# $1=session $2=bundle $3=browser $4=site $5=tools-mcp-url
 SCRIPT = r'''
 . "$E2B_SH"
 BRIDGE_PORT=${BRIDGE_PORT:-8931}
 vm_for "$1" || exit 1
 id=$(vm_field "$1" id); tok=$(vm_field "$1" envd_token)
 echo READY
-# The browser stack and the bridge come up while the bundle is being fetched: they do not need it.
+# The browser stack can come up while the bundle is being fetched; tools-mcp needs the seeded tools/.
 if [ -n "$3" ]; then
   vm_browser_start "$id" "$tok" "$3" & bpid=$!
 fi
@@ -79,22 +80,30 @@ fi
 echo SEEDED
 if [ -n "$3" ]; then
   wait "$bpid" || exit 4
-  # The page it serves is in the bundle, so it starts once the bundle is there.
   [ -z "$4" ] || vm_site_start "$id" "$tok" "$VM_HOME/workspace/$4"
   echo BROWSER
+fi
+if [ -n "$5" ]; then
+  vm_tools_start "$id" "$tok" "$5" || exit 5
+  echo TOOLS
 fi
 '''
 
 
-def make_vm(session, bundle, browser="", site=""):
+def make_vm(session, bundle, browser="", site="", tools=""):
     env = dict(os.environ, VMDIR=VMDIR, EXECD=EXECD, CA_FILE=CA_FILE, E2B_SH=E2B_SH,
                VM_PRIVATE="1", TAG_KEY="beyond-ai-demo", SANDBOX_PORT="8081")
     env.setdefault("NAME", os.environ.get("DEMO_NAME", "demo"))
     if browser and os.environ.get("E2B_BROWSER_TEMPLATE"):
         env["E2B_TEMPLATE"] = os.environ["E2B_BROWSER_TEMPLATE"]  # the browser stack is already in it
     log("vm_create_start", session=session)
-    p = subprocess.Popen(["bash", "-c", SCRIPT, "front", session, bundle or "", browser, site], env=env,
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    p = subprocess.Popen(
+        ["bash", "-c", SCRIPT, "front", session, bundle or "", browser, site, tools],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
     for line in p.stdout:
         if line.strip() == "READY":
             log("vm_ready", session=session)
@@ -102,6 +111,8 @@ def make_vm(session, bundle, browser="", site=""):
             log("vm_seeded", session=session, bundle=bool(bundle))
         elif line.strip() == "BROWSER":
             log("browser_ready", session=session)
+        elif line.strip() == "TOOLS":
+            log("tools_ready", session=session)
     err = p.stderr.read()
     if p.wait() != 0:
         # vm_for kills its own failures; one that came later (seeding, the browser) left a live VM and
@@ -139,7 +150,7 @@ def drop(session, s, kill=True):
     log("vm_dropped", session=session)
 
 
-def vm_for(session, bundle, browser="", site=""):
+def vm_for(session, bundle, browser="", site="", tools=""):
     with sessions_lock:
         old = [(k, v) for k, v in sessions.items() if v["vm"] and time.time() - v["born"] > VM_TTL]
     for k, v in old:  # past its timeout: E2B has already killed it
@@ -149,7 +160,7 @@ def vm_for(session, bundle, browser="", site=""):
     with s["lock"]:
         if s["vm"] is None:
             log("first_request", session=session)
-            s["vm"] = make_vm(session, bundle, browser, site)
+            s["vm"] = make_vm(session, bundle, browser, site, tools)
             s["born"] = time.time()
         return s["vm"], s
 
@@ -193,18 +204,23 @@ class Front(BaseHTTPRequestHandler):
         kind, session = m.groups()
         q = parse_qs(u.query)
         bundle = (q.get("bundle") or [""])[0]
-        browser, site = "", ""
+        browser, site, tools = "", "", ""
         if kind == "mcp":
             browser = (q.get("browser") or [""])[0]
             site = (q.get("site") or [""])[0]
+            tools = (q.get("tools") or [""])[0]
+            if browser and tools:
+                return self.reply(400, {"error": "pass browser= or tools=, not both"})
             if (browser and not browser.startswith("https://")) or not re.fullmatch(r"[A-Za-z0-9._/-]*", site) or ".." in site:
                 return self.reply(400, {"error": "browser must be an https URL; site a relative directory"})
+            if tools and not tools.startswith("https://"):
+                return self.reply(400, {"error": "tools must be an https URL of the tools-mcp binary"})
         # A VM that cannot be reached (past its timeout, or killed) never saw the request, so the
         # request is safe to repeat on a fresh one: a sandbox that has gone is woken, not answered
         # with an error. A second failure in a row is the caller's to retry.
         for attempt in (1, 2):
             try:
-                vm, entry = vm_for(session, bundle, browser, site)
+                vm, entry = vm_for(session, bundle, browser, site, tools)
             except Exception as e:  # the next request tries again
                 with sessions_lock:
                     sessions.pop(session, None)
