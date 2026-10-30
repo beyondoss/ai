@@ -4,11 +4,7 @@ import { pathToFileURL } from "node:url";
 
 import { type DefinedTool, defineTool } from "./define-tool.js";
 import type { RunnableTool } from "./run-tool.js";
-import {
-  inputSchemaToJsonSchema,
-  isPlainJsonSchema,
-  isStandardSchema,
-} from "./schema.js";
+import { isPlainJsonSchema, isStandardSchema } from "./schema.js";
 
 export type LoadedTool = {
   name: string;
@@ -60,7 +56,11 @@ function asDefinedTool(value: unknown, sourcePath: string): DefinedTool {
   }
 }
 
-/** Load every `tools/*.{ts,js}` default export as a tool named by its file stem. */
+/**
+ * Load every `tools/*.{ts,js}` default export as a tool named by its file stem.
+ * JSON Schema comes from `defineTool` (`jsonInputSchema`) or from a module that
+ * already set it. It is not compiled again here.
+ */
 export async function loadTools(dir: string): Promise<LoadedTool[]> {
   const root = path.resolve(dir);
   const names = await readdir(root);
@@ -76,8 +76,6 @@ export async function loadTools(dir: string): Promise<LoadedTool[]> {
       default?: unknown;
     };
     const def = asDefinedTool(mod.default, sourcePath);
-    // Re-check JSON Schema is materializable (defineTool already did; keep assert for raw paths).
-    inputSchemaToJsonSchema(def.inputSchema);
     const name = file.replace(TOOL_EXT, "");
     if (!name) {
       throw new Error(`${sourcePath}: empty tool name`);

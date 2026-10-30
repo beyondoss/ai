@@ -10,12 +10,61 @@ type JsonRpcRequest = {
   params?: Record<string, unknown>;
 };
 
-type JsonRpcResponse = {
+export type JsonRpcResponse = {
   jsonrpc: "2.0";
   id: string | number | null;
   result?: unknown;
   error?: { code: number; message: string; data?: unknown };
 };
+
+/**
+ * Wire bytes for a response whose tool value was already stringified once.
+ * `JSON.stringify` of the envelope would walk `structuredContent` again.
+ */
+const wireByResponse = new WeakMap<JsonRpcResponse, string>();
+
+function serializeOne(message: JsonRpcResponse): string {
+  return wireByResponse.get(message) ?? JSON.stringify(message);
+}
+
+/** JSON-RPC bytes. Tool successes reuse the stringify from `handleRpc`. */
+export function serializeRpc(
+  message: JsonRpcResponse | readonly JsonRpcResponse[],
+): string {
+  if (Array.isArray(message)) {
+    return `[${message.map((item) => serializeOne(item)).join(",")}]`;
+  }
+  // `Array.isArray` does not narrow a readonly array out of this union.
+  return serializeOne(message as JsonRpcResponse);
+}
+
+/** MCP `structuredContent` is a JSON object. Arrays and scalars stay in the text block. */
+function structuredObject(
+  value: unknown,
+): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function rememberToolWire(
+  response: JsonRpcResponse,
+  text: string,
+  value: unknown,
+  endsTurn: boolean,
+): void {
+  const idJson = JSON.stringify(response.id);
+  const encodedText = JSON.stringify(text);
+  // `text` is the one walk of `value`. Splice it in so writing the envelope
+  // does not call `toJSON` again. Field order matches the result object.
+  let extra = "";
+  if (structuredObject(value)) extra += `,"structuredContent":${text}`;
+  if (endsTurn) {
+    extra += `,"_meta":${JSON.stringify({ [ENDS_TURN_META_KEY]: true })}`;
+  }
+  wireByResponse.set(
+    response,
+    `{"jsonrpc":"2.0","id":${idJson},"result":{"content":[{"type":"text","text":${encodedText}}]${extra}}}`,
+  );
+}
 
 /** Session-wide bits; per-call `toolName` / `callId` are filled in on tools/call. */
 export type RpcContextBase = Omit<
@@ -192,21 +241,21 @@ export async function handleRpc(
     });
     try {
       const run = await executeTool(tool.def, args, ctx);
-      const text = typeof run.value === "string"
+      // One walk of the value. `serializeRpc` reuses it instead of walking
+      // `structuredContent` again when the envelope is written.
+      const text: unknown = typeof run.value === "string"
         ? run.value
         : JSON.stringify(run.value ?? null);
       const result: Record<string, unknown> = {
-        content: [{ type: "text", text }],
+        content: [{ type: "text", text: text as string }],
       };
-      if (
-        run.value !== null
-        && typeof run.value === "object"
-        && !Array.isArray(run.value)
-      ) {
-        result.structuredContent = run.value;
-      }
+      if (structuredObject(run.value)) result.structuredContent = run.value;
       if (run.endsTurn) result._meta = { [ENDS_TURN_META_KEY]: true };
-      return { jsonrpc: "2.0", id, result };
+      const response: JsonRpcResponse = { jsonrpc: "2.0", id, result };
+      if (typeof text === "string") {
+        rememberToolWire(response, text, run.value, run.endsTurn);
+      }
+      return response;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const data = err instanceof ToolInputValidationError

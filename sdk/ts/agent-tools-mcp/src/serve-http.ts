@@ -1,7 +1,12 @@
 import { randomUUID } from "node:crypto";
 
 import type { LoadedTool } from "./load.js";
-import { handleRpc, RpcCalls, type RpcContextBase } from "./rpc.js";
+import {
+  handleRpc,
+  RpcCalls,
+  type RpcContextBase,
+  serializeRpc,
+} from "./rpc.js";
 
 export type SessionDecision =
   | { ok: true; session: string | null }
@@ -140,7 +145,7 @@ export async function serveHttp(
           );
           if (r) out.push(r);
         }
-        return new Response(JSON.stringify(out), { status: 200, headers });
+        return new Response(serializeRpc(out), { status: 200, headers });
       }
 
       const r = await handleRpc(body as never, opts.tools, opts.base, dispatch);
@@ -153,7 +158,7 @@ export async function serveHttp(
         }
         return new Response(null, { status: 202 });
       }
-      return new Response(JSON.stringify(r), { status: 200, headers });
+      return new Response(serializeRpc(r), { status: 200, headers });
     },
   });
 
