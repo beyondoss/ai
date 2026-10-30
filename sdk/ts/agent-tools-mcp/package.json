@@ -36,7 +36,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "compile": "bash scripts/compile.sh",
-    "manifest:example": "bun run src/cli.ts manifest --dir examples/weather/tools --name tools"
+    "manifest:example": "bun run src/cli.ts manifest --dir examples/weather/tools --name tools",
+    "parity": "vitest run __tests__/eve-parity.test.ts"
   },
   "dependencies": {
     "@standard-schema/spec": "^1.0.0"

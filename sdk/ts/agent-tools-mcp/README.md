@@ -15,20 +15,17 @@ export default defineTool({
 });
 ```
 
-## Eve parity (tools surface)
+## Eve parity — how we prove it
 
-| Eve | This package |
-| --- | --- |
-| `defineTool` from `eve/tools` | Yes (`eve-tools` export / `imports` map) |
-| Filename stem = tool name | Yes (`tools/get_weather.ts` → `get_weather`) |
-| `inputSchema`: Zod / Standard Schema / JSON Schema | Yes |
-| Infer `execute` input from Zod / Standard Schema | Yes |
-| Validate input before `execute` | Yes |
-| JSON Schema to the model (strip `$schema`) | Yes (`jsonInputSchema` → MCP + `.mcp-tools.json`) |
-| `outputSchema`, `toModelOutput`, async generators | Partial (`toModelOutput` + async iter drain; `outputSchema` typed/stored) |
-| `endsTurn`, `deferred`, `availableInSubagents` | Accepted on the def; Beyond agent loop does not enforce yet |
-| Full Eve `ctx` (sandbox handle, approvals, …) | `env`, `workspaceRoot`, `toolName`, `signal` |
-| Eve agent runtime / connections / workflows | No — Beyond hosts the agent; this is the **tool guest** |
+Claims are not the proof. **`npm run parity`** runs `__tests__/eve-parity.test.ts`, one test per Eve docs claim ([eve.dev/docs/tools](https://eve.dev/docs/tools)):
+
+- **Passing tests** = behavior we assert matches Eve.
+- **`it.fails` (expected fail)** = Eve behavior we do **not** have yet. The suite stays green only while those gaps remain broken — when we implement one, we flip it to `it` or CI fails.
+
+```bash
+npm run parity
+# → N passed | M expected fail
+```
 
 ## Commands
 
