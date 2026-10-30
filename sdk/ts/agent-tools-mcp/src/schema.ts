@@ -144,14 +144,37 @@ export async function validateToolInput<S extends ToolInputSchema>(
   }
 
   if (isPlainJsonSchema(schema)) {
-    const checked = validatePlainJsonSchema(schema, raw, []);
+    // Eve: fill omitted properties from `default`, then validate.
+    const withDefaults = applyJsonSchemaDefaults(schema, raw);
+    const checked = validatePlainJsonSchema(schema, withDefaults, []);
     if (checked !== undefined) {
       throw new ToolInputValidationError(checked);
     }
-    return raw as InferToolInput<S>;
+    return withDefaults as InferToolInput<S>;
   }
 
   throw new Error("inputSchema must be a Zod/Standard Schema or a plain JSON Schema object");
+}
+
+/** Eve: fill omitted properties from their JSON Schema `default` values (recursive). */
+export function applyJsonSchemaDefaults(schema: JsonSchema, raw: unknown): unknown {
+  if (!isRecord(schema.properties)) {
+    return raw;
+  }
+  const base =
+    raw !== null && typeof raw === "object" && !Array.isArray(raw)
+      ? { ...(raw as Record<string, unknown>) }
+      : {};
+
+  for (const [key, propSchema] of Object.entries(schema.properties)) {
+    if (!isRecord(propSchema)) continue;
+    if (!(key in base) && "default" in propSchema) {
+      base[key] = propSchema.default;
+    } else if (key in base && isRecord(propSchema.properties)) {
+      base[key] = applyJsonSchemaDefaults(propSchema, base[key]);
+    }
+  }
+  return base;
 }
 
 /**

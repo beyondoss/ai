@@ -1,5 +1,5 @@
 import type { DefinedTool, ToolContext } from "./define-tool.js";
-import { validateToolInput } from "./schema.js";
+import { ToolInputValidationError, validateToolInput } from "./schema.js";
 
 /** Drain async generators (Eve allows them); return the last yielded value. */
 async function settleExecute<O>(result: O | Promise<O> | AsyncIterable<O>): Promise<O> {
@@ -19,8 +19,7 @@ async function settleExecute<O>(result: O | Promise<O> | AsyncIterable<O>): Prom
 }
 
 /**
- * Eve order: validate input → execute → optional toModelOutput.
- * Validation failures throw `ToolInputValidationError`.
+ * Eve order: validate input → execute → validate outputSchema → optional toModelOutput.
  */
 export async function runTool(
   tool: DefinedTool,
@@ -29,6 +28,19 @@ export async function runTool(
 ): Promise<unknown> {
   const input = await validateToolInput(tool.inputSchema, rawArgs ?? {});
   const output = await settleExecute(tool.execute(input, ctx));
+  if (tool.outputSchema) {
+    try {
+      await validateToolInput(tool.outputSchema, output);
+    } catch (err) {
+      if (err instanceof ToolInputValidationError) {
+        throw new ToolInputValidationError(
+          `outputSchema: ${err.message}`,
+          err.issues,
+        );
+      }
+      throw err;
+    }
+  }
   if (tool.toModelOutput) {
     return tool.toModelOutput(output as never);
   }

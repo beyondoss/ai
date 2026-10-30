@@ -172,79 +172,81 @@ export default defineTool({
   });
 });
 
-describe("Eve parity: known gaps (must stay fails until implemented)", () => {
-  it.fails(
-    "JSON Schema: fill omitted properties from default (Eve docs)",
-    async () => {
-      const tool = defineTool({
-        description: "t",
-        inputSchema: {
-          type: "object",
-          properties: {
-            city: { type: "string", default: "SF" },
-          },
+describe("Eve parity: defaults, deferred, endsTurn, outputSchema", () => {
+  it("JSON Schema: fill omitted properties from default (Eve docs)", async () => {
+    const tool = defineTool({
+      description: "t",
+      inputSchema: {
+        type: "object",
+        properties: {
+          city: { type: "string", default: "SF" },
         },
-        execute: (input) => input,
-      });
-      // Eve fills defaults before execute. We do not yet.
-      expect(await runTool(tool, {}, ctx)).toEqual({ city: "SF" });
-    },
-  );
+      },
+      execute: (input) => input,
+    });
+    expect(await runTool(tool, {}, ctx)).toEqual({ city: "SF" });
+  });
 
-  it.fails(
-    "deferred: true omits tool from tools/list",
-    async () => {
-      const tool = defineTool({
-        deferred: true,
-        description: "Export a finished report as a PDF.",
-        inputSchema: z.object({ reportId: z.string() }),
-        execute: ({ reportId }) => ({ reportId }),
-      });
-      const list = await handleRpc(
-        { jsonrpc: "2.0", id: 1, method: "tools/list" },
-        [{ name: "export_report", def: tool, sourcePath: "x" }],
-        ctx,
-      );
-      const names = (
-        list?.result as { tools: { name: string }[] }
-      ).tools.map((t) => t.name);
-      expect(names).not.toContain("export_report");
-    },
-  );
+  it("deferred: true omits tool from tools/list (still callable)", async () => {
+    const tool = defineTool({
+      deferred: true,
+      description: "Export a finished report as a PDF.",
+      inputSchema: z.object({ reportId: z.string() }),
+      execute: ({ reportId }) => ({ reportId }),
+    });
+    const list = await handleRpc(
+      { jsonrpc: "2.0", id: 1, method: "tools/list" },
+      [{ name: "export_report", def: tool, sourcePath: "x" }],
+      ctx,
+    );
+    const names = (
+      list?.result as { tools: { name: string }[] }
+    ).tools.map((t) => t.name);
+    expect(names).not.toContain("export_report");
 
-  it.fails(
-    "endsTurn: true appends Eve turn-ending sentence to model description",
-    async () => {
-      const tool = defineTool({
-        description: "React to the current message.",
-        endsTurn: true,
-        inputSchema: z.object({ emoji: z.string() }),
-        execute: ({ emoji }) => ({ emoji }),
-      });
-      const list = await handleRpc(
-        { jsonrpc: "2.0", id: 1, method: "tools/list" },
-        [{ name: "react", def: tool, sourcePath: "x" }],
-        ctx,
-      );
-      const desc = (list?.result as { tools: { description: string }[] }).tools[0]
-        ?.description;
-      expect(desc).toContain("Calling this tool ends your turn once it succeeds");
-    },
-  );
+    const call = await handleRpc(
+      {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "export_report", arguments: { reportId: "r1" } },
+      },
+      [{ name: "export_report", def: tool, sourcePath: "x" }],
+      ctx,
+    );
+    expect(call?.result).toMatchObject({
+      structuredContent: { reportId: "r1" },
+    });
+  });
 
-  it.fails(
-    "outputSchema validates execute return (Eve)",
-    async () => {
-      const tool = defineTool({
-        description: "t",
-        inputSchema: z.object({ city: z.string() }),
-        outputSchema: z.object({ city: z.string(), temperatureF: z.number() }),
-        execute: ({ city }) => ({ city }), // missing temperatureF
-      });
-      await expect(runTool(tool, { city: "X" }, ctx)).rejects.toThrow();
-    },
-  );
+  it("endsTurn: true appends Eve turn-ending sentence to model description", async () => {
+    const tool = defineTool({
+      description: "React to the current message.",
+      endsTurn: true,
+      inputSchema: z.object({ emoji: z.string() }),
+      execute: ({ emoji }) => ({ emoji }),
+    });
+    const list = await handleRpc(
+      { jsonrpc: "2.0", id: 1, method: "tools/list" },
+      [{ name: "react", def: tool, sourcePath: "x" }],
+      ctx,
+    );
+    const desc = (list?.result as { tools: { description: string }[] }).tools[0]
+      ?.description;
+    expect(desc).toContain("Calling this tool ends your turn once it succeeds");
+    // eve info / authored description unchanged on the def
+    expect(tool.description).toBe("React to the current message.");
+  });
 
+  it("outputSchema validates execute return (Eve)", async () => {
+    const tool = defineTool({
+      description: "t",
+      inputSchema: z.object({ city: z.string() }),
+      outputSchema: z.object({ city: z.string(), temperatureF: z.number() }),
+      execute: ({ city }) => ({ city }), // missing temperatureF
+    });
+    await expect(runTool(tool, { city: "X" }, ctx)).rejects.toThrow(/outputSchema/);
+  });
 });
 
 describe("Eve parity: JSON Schema format annotation", () => {

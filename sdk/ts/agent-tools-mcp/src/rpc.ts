@@ -46,13 +46,15 @@ export async function handleRpc(
   }
 
   if (method === "tools/list") {
+    // Eve: deferred tools are omitted from the default tool list (still callable by name).
+    const listed = tools.filter((t) => !t.def.deferred);
     return {
       jsonrpc: "2.0",
       id,
       result: {
-        tools: tools.map((t) => ({
+        tools: listed.map((t) => ({
           name: t.name,
-          description: t.def.description,
+          description: modelFacingDescription(t.def.description, t.def.endsTurn),
           inputSchema: t.def.jsonInputSchema,
           ...(t.def.annotations ? { annotations: t.def.annotations } : {}),
         })),
@@ -118,4 +120,18 @@ export async function handleRpc(
     id,
     error: { code: -32601, message: `Method not found: ${method ?? ""}` },
   };
+}
+
+/** Eve docs: when endsTurn is true, append this after a blank line to the model-facing description. */
+const ENDS_TURN_SENTENCE =
+  "Calling this tool ends your turn once it succeeds: do not write a reply or call other tools in the same step. If it fails, you will see the error and can continue.";
+
+function modelFacingDescription(
+  description: string,
+  endsTurn: boolean | ((output: never) => boolean | Promise<boolean>) | undefined,
+): string {
+  if (endsTurn === true) {
+    return `${description}\n\n${ENDS_TURN_SENTENCE}`;
+  }
+  return description;
 }

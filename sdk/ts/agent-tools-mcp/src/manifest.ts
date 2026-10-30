@@ -12,11 +12,14 @@ export type CachedTool = {
 export type ManifestFile = Record<string, CachedTool[]>;
 
 export function toolsToCached(tools: LoadedTool[]): CachedTool[] {
-  return tools.map((t) => ({
-    remote_name: t.name,
-    description: t.def.description,
-    input_schema: t.def.jsonInputSchema,
-  }));
+  // Eve: deferred tools are not in the model's default list (cold-open menu matches).
+  return tools
+    .filter((t) => !t.def.deferred)
+    .map((t) => ({
+      remote_name: t.name,
+      description: t.def.description,
+      input_schema: t.def.jsonInputSchema,
+    }));
 }
 
 /** Write `{"<connector>": [CachedTool, ...]}` for the bundle root. */

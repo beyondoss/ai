@@ -17,15 +17,7 @@ export default defineTool({
 
 ## Eve parity — how we prove it
 
-Claims are not the proof. **`npm run parity`** runs `__tests__/eve-parity.test.ts`, one test per Eve docs claim ([eve.dev/docs/tools](https://eve.dev/docs/tools)):
-
-- **Passing tests** = behavior we assert matches Eve.
-- **`it.fails` (expected fail)** = Eve behavior we do **not** have yet. The suite stays green only while those gaps remain broken — when we implement one, we flip it to `it` or CI fails.
-
-```bash
-npm run parity
-# → N passed | M expected fail
-```
+**`npm run parity`** runs `__tests__/eve-parity.test.ts` — one test per Eve docs claim ([eve.dev/docs/tools](https://eve.dev/docs/tools)). All must pass. That includes Zod/Standard Schema/JSON Schema, validate-before-execute, JSON Schema `default` fill, `deferred` omit from list, `endsTurn` model description append, and `outputSchema` validate.
 
 ## Commands
 
